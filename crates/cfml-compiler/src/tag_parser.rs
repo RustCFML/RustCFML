@@ -397,7 +397,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             ("} else {\n".to_string(), tag_end - start)
         }
         "cfloop" => {
-            parse_cfloop_tag(&attrs, tag_end - start)
+            parse_cfloop_tag(&attrs, chars, tag_end, len, imports, tag_end - start)
         }
         "cfscript" => {
             // Everything between <cfscript> and </cfscript> is raw script
@@ -1812,6 +1812,10 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
 
 fn parse_cfloop_tag(
     attrs: &std::collections::HashMap<String, String>,
+    chars: &[char],
+    tag_end: usize,
+    len: usize,
+    imports: &mut std::collections::HashMap<String, String>,
     consumed: usize,
 ) -> (String, usize) {
     // Different loop types based on attributes
@@ -1875,15 +1879,49 @@ fn parse_cfloop_tag(
         }
     } else if let Some(collection) = attrs.get("collection") {
         let collection = strip_hashes(collection);
-        let item = attrs.get("item").cloned().unwrap_or("item".to_string());
-        let key = attrs.get("key");
+        let item = attrs.get("item").map(|v| strip_hashes(v));
+        let key = attrs
+            .get("key")
+            .or_else(|| attrs.get("index"))
+            .map(|v| strip_hashes(v));
         if let Some(key) = key {
+            if let Some(item) = item {
+                if let Some(body_start) = find_closing_tag(chars, tag_end, len, "cfloop") {
+                    let body_source: String = chars[tag_end..body_start].iter().collect();
+                    let body_script = tags_to_script_impl(&body_source, imports);
+                    let close_end = find_tag_end(chars, body_start, len);
+                    (
+                        format!(
+                            "for (var {} in structKeyArray({})) {{ var {} = {}[{}];\n{}\n{}[{}] = {};\n}}\n",
+                            key, collection, item, collection, key, body_script, collection, key, item
+                        ),
+                        close_end - (tag_end - consumed),
+                    )
+                } else {
+                    (
+                        format!(
+                            "for (var {} in structKeyArray({})) {{ var {} = {}[{}];\n",
+                            key, collection, item, collection, key
+                        ),
+                        consumed,
+                    )
+                }
+            } else {
+                (
+                    format!("for (var {} in structKeyArray({})) {{\n", key, collection),
+                    consumed,
+                )
+            }
+        } else if let Some(item) = item {
             (
-                format!("for (var {} in structKeyArray({})) {{ var {} = {}[{}];\n", key, collection, item, collection, key),
+                format!("for (var {} in structKeyArray({})) {{\n", item, collection),
                 consumed,
             )
         } else {
-            (format!("for (var {} in {}) {{\n", item, collection), consumed)
+            (
+                "throw(\"cfloop collection requires an item, index, or key attribute.\");\n".to_string(),
+                consumed,
+            )
         }
     } else {
         // Infinite loop? Just use while(true)
@@ -2566,5 +2604,22 @@ mod tests {
         let input = r#"<cfloop from="1" to="10" index="i">body</cfloop>"#;
         let result = tags_to_script(input);
         assert!(result.contains("for (var i = 1; i <= 10; i = i + 1)"));
+    }
+
+    #[test]
+    fn test_cfloop_collection_sets_item_and_index() {
+        let input =
+            r##"<cfloop collection="#tables#" item="table" index="table_key">body</cfloop>"##;
+        let result = tags_to_script(input);
+        assert!(result.contains("for (var table_key in structKeyArray(tables))"));
+        assert!(result.contains("var table = tables[table_key];"));
+        assert!(result.contains("tables[table_key] = table;"));
+    }
+
+    #[test]
+    fn test_cfloop_collection_item_only_iterates_keys() {
+        let input = r##"<cfloop collection="#tables#" item="table_name">body</cfloop>"##;
+        let result = tags_to_script(input);
+        assert!(result.contains("for (var table_name in structKeyArray(tables))"));
     }
 }
