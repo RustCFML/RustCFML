@@ -1824,10 +1824,15 @@ fn parse_cfloop_tag(
         let from = strip_hashes(from);
         let to = strip_hashes(to);
         let step = strip_hashes(&step);
+        let comparison = if step.trim_start().starts_with('-') {
+            ">="
+        } else {
+            "<="
+        };
         (
             format!(
-                "for (var {} = {}; {} <= {}; {} = {} + {}) {{\n",
-                index, from, index, to, index, index, step
+                "for (var {} = {}; {} {} {}; {} = {} + {}) {{\n",
+                index, from, index, comparison, to, index, index, step
             ),
             consumed,
         )
