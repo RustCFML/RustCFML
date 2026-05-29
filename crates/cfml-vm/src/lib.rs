@@ -11011,6 +11011,28 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Return the page path exposed to Application.cfc lifecycle methods.
+    ///
+    /// The VM keeps `source_file` as the physical path for include and
+    /// component resolution, but CFML engines pass web-root-relative paths
+    /// such as `/_moopa.cfm` to onRequestStart/onRequest/onRequestEnd.
+    fn lifecycle_target_page(&self) -> String {
+        let source = self.source_file.clone().unwrap_or_default();
+        let canonical_source = self.vfs.canonicalize(&source).unwrap_or(source.clone());
+        let source_path = std::path::Path::new(&canonical_source);
+
+        if let Some(ref server_state) = self.server_state {
+            if let Some(ref webroot) = server_state.webroot {
+                if let Ok(relative) = source_path.strip_prefix(webroot) {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    return format!("/{}", relative.trim_start_matches('/'));
+                }
+            }
+        }
+
+        source
+    }
+
     /// Execute with Application.cfc lifecycle
     pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
         // 1. Find Application.cfc
@@ -11324,7 +11346,7 @@ impl CfmlVirtualMachine {
         }
 
         // 6. onRequestStart
-        let target_page = self.source_file.clone().unwrap_or_default();
+        let target_page = self.lifecycle_target_page();
         match self.call_lifecycle_method(
             &mut template,
             "onRequestStart",
