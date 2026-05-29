@@ -8438,7 +8438,8 @@ impl CfmlVirtualMachine {
             // object (which the member was called on) becomes the second arg.
             if matches!(object, CfmlValue::String(_)) && args.len() >= 2 {
                 match name {
-                    "find" | "findNoCase" | "insert" => {
+                    "find" | "findNoCase" | "insert" | "reFind" | "reFindNoCase"
+                    | "reMatch" | "reMatchNoCase" => {
                         args.swap(0, 1);
                     }
                     _ => {}
