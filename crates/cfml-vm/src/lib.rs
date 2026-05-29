@@ -1997,11 +1997,14 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::Call(arg_count) => {
+                BytecodeOp::Call(arg_count) | BytecodeOp::CallWithArgSources(arg_count, _) => {
                     // Identify which local variables are being passed as args
                     // (for pass-by-reference writeback of complex types)
                     // ip was already incremented past this Call op, so use ip-1
-                    let arg_sources = find_arg_sources(&func.instructions, ip - 1, *arg_count);
+                    let arg_sources = match &func.instructions[ip - 1] {
+                        BytecodeOp::CallWithArgSources(_, sources) => sources.clone(),
+                        _ => find_arg_source_paths(&func.instructions, ip - 1, *arg_count),
+                    };
 
                     let mut args = Vec::with_capacity(*arg_count);
                     for _ in 0..*arg_count {
@@ -2082,9 +2085,13 @@ impl CfmlVirtualMachine {
                                     for (idx_str, modified_val) in ref_wb {
                                         if let Ok(param_idx) = idx_str.parse::<usize>() {
                                             if param_idx < arg_sources.len() {
-                                                if let Some(ref source_var) = arg_sources[param_idx]
+                                                if let Some(ref source_path) = arg_sources[param_idx]
                                                 {
-                                                    locals.insert(source_var.clone(), modified_val);
+                                                    self.write_arg_ref_back(
+                                                        source_path,
+                                                        modified_val,
+                                                        &mut locals,
+                                                    );
                                                 }
                                             }
                                         }
@@ -2118,11 +2125,14 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::CallNamed(names, arg_count) => {
+                BytecodeOp::CallNamed(names, arg_count)
+                | BytecodeOp::CallNamedWithArgSources(names, arg_count, _) => {
                     // Identify arg sources for pass-by-reference writeback
                     // ip was already incremented past this op, so use ip-1
-                    let named_arg_sources =
-                        find_arg_sources(&func.instructions, ip - 1, *arg_count);
+                    let named_arg_sources = match &func.instructions[ip - 1] {
+                        BytecodeOp::CallNamedWithArgSources(_, _, sources) => sources.clone(),
+                        _ => find_arg_source_paths(&func.instructions, ip - 1, *arg_count),
+                    };
 
                     let mut named_values = Vec::with_capacity(*arg_count);
                     for _ in 0..*arg_count {
@@ -2250,12 +2260,13 @@ impl CfmlVirtualMachine {
                                                     };
                                                     if matches && call_idx < named_arg_sources.len()
                                                     {
-                                                        if let Some(ref source_var) =
+                                                        if let Some(ref source_path) =
                                                             named_arg_sources[call_idx]
                                                         {
-                                                            locals.insert(
-                                                                source_var.clone(),
+                                                            self.write_arg_ref_back(
+                                                                source_path,
                                                                 modified_val.clone(),
+                                                                &mut locals,
                                                             );
                                                         }
                                                         break;
@@ -2449,6 +2460,7 @@ impl CfmlVirtualMachine {
                     let index = stack.pop().unwrap_or(CfmlValue::Null);
                     let mut collection = stack.pop().unwrap_or(CfmlValue::Null);
                     let value = stack.pop().unwrap_or(CfmlValue::Null);
+                    let old_collection = collection.clone();
                     match &mut collection {
                         CfmlValue::Array(arr) => {
                             let idx = match &index {
@@ -2490,6 +2502,11 @@ impl CfmlVirtualMachine {
                             Arc::make_mut(s).insert(key, value);
                         }
                         _ => {}
+                    }
+                    for (old_struct, new_struct) in Self::collect_struct_alias_replacements(&old_collection, &collection) {
+                        if !Arc::ptr_eq(&old_struct, &new_struct) {
+                            self.replace_struct_aliases(&old_struct, &new_struct, &mut locals);
+                        }
                     }
                     stack.push(collection);
                 }
@@ -2660,6 +2677,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::SetProperty(name) => {
                     if let Some(value) = stack.pop() {
                         if let Some(mut obj) = stack.pop() {
+                            let old_obj = obj.clone();
                             // CFC with a Rust-backed parent: route writes the
                             // native side recognises before touching the CFC
                             // struct, so Rust state stays first-class. The
@@ -2716,6 +2734,11 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             obj.set(name.clone(), value);
+                            for (old_struct, new_struct) in Self::collect_struct_alias_replacements(&old_obj, &obj) {
+                                if !Arc::ptr_eq(&old_struct, &new_struct) {
+                                    self.replace_struct_aliases(&old_struct, &new_struct, &mut locals);
+                                }
+                            }
                             stack.push(obj);
                         }
                     }
@@ -7583,6 +7606,211 @@ impl CfmlVirtualMachine {
         }
     }
 
+    fn get_path_value(root: &CfmlValue, path: &[String]) -> Option<CfmlValue> {
+        if path.is_empty() {
+            return Some(root.clone());
+        }
+
+        match root {
+            CfmlValue::Struct(s) => {
+                let key = &path[0];
+                let next = s
+                    .get(key)
+                    .or_else(|| s.get(&key.to_uppercase()))
+                    .or_else(|| s.get(&key.to_lowercase()))
+                    .or_else(|| {
+                        let key_lower = key.to_lowercase();
+                        s.iter()
+                            .find(|(candidate, _)| candidate.to_lowercase() == key_lower)
+                            .map(|(_, value)| value)
+                    })?;
+                Self::get_path_value(next, &path[1..])
+            }
+            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => {
+                let index = path[0].parse::<usize>().ok()?.saturating_sub(1);
+                let next = a.get(index)?;
+                Self::get_path_value(next, &path[1..])
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_struct_alias_replacements(
+        old_value: &CfmlValue,
+        new_value: &CfmlValue,
+    ) -> Vec<(
+        Arc<IndexMap<String, CfmlValue>>,
+        Arc<IndexMap<String, CfmlValue>>,
+    )> {
+        let mut replacements = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        Self::collect_struct_alias_replacements_inner(
+            old_value,
+            new_value,
+            &mut replacements,
+            &mut visited,
+        );
+        replacements
+    }
+
+    fn collect_struct_alias_replacements_inner(
+        old_value: &CfmlValue,
+        new_value: &CfmlValue,
+        replacements: &mut Vec<(
+            Arc<IndexMap<String, CfmlValue>>,
+            Arc<IndexMap<String, CfmlValue>>,
+        )>,
+        visited: &mut std::collections::HashSet<(usize, usize)>,
+    ) {
+        match (old_value, new_value) {
+            (CfmlValue::Struct(old_struct), CfmlValue::Struct(new_struct)) => {
+                let pair = (Arc::as_ptr(old_struct) as usize, Arc::as_ptr(new_struct) as usize);
+                if !visited.insert(pair) {
+                    return;
+                }
+                replacements.push((old_struct.clone(), new_struct.clone()));
+
+                for (key, old_child) in old_struct.iter() {
+                    if let Some(new_child) = new_struct.get(key) {
+                        Self::collect_struct_alias_replacements_inner(
+                            old_child,
+                            new_child,
+                            replacements,
+                            visited,
+                        );
+                    }
+                }
+            }
+            (CfmlValue::Array(old_array), CfmlValue::Array(new_array))
+            | (CfmlValue::QueryColumn(old_array), CfmlValue::QueryColumn(new_array)) => {
+                for (old_child, new_child) in old_array.iter().zip(new_array.iter()) {
+                    Self::collect_struct_alias_replacements_inner(
+                        old_child,
+                        new_child,
+                        replacements,
+                        visited,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn replace_struct_aliases(
+        &mut self,
+        old_struct: &Arc<IndexMap<String, CfmlValue>>,
+        new_struct: &Arc<IndexMap<String, CfmlValue>>,
+        locals: &mut IndexMap<String, CfmlValue>,
+    ) {
+        let mut visited = std::collections::HashSet::new();
+        for value in locals.values_mut() {
+            Self::replace_struct_aliases_in_value(value, old_struct, new_struct, &mut visited);
+        }
+        for value in self.globals.values_mut() {
+            Self::replace_struct_aliases_in_value(value, old_struct, new_struct, &mut visited);
+        }
+        for value in self.request_scope.values_mut() {
+            Self::replace_struct_aliases_in_value(value, old_struct, new_struct, &mut visited);
+        }
+        if let Some(ref app_scope) = self.application_scope {
+            if let Ok(mut scope) = app_scope.lock() {
+                for value in scope.values_mut() {
+                    Self::replace_struct_aliases_in_value(
+                        value,
+                        old_struct,
+                        new_struct,
+                        &mut visited,
+                    );
+                }
+            }
+        }
+    }
+
+    fn replace_struct_aliases_in_value(
+        value: &mut CfmlValue,
+        old_struct: &Arc<IndexMap<String, CfmlValue>>,
+        new_struct: &Arc<IndexMap<String, CfmlValue>>,
+        visited: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        match value {
+            CfmlValue::Struct(s) => {
+                if Arc::ptr_eq(s, old_struct) {
+                    *value = CfmlValue::Struct(new_struct.clone());
+                    return true;
+                }
+
+                let ptr = Arc::as_ptr(s) as usize;
+                if !visited.insert(ptr) {
+                    return false;
+                }
+
+                let mut changed_children = Vec::new();
+                for (key, child) in s.iter() {
+                    let mut child_value = child.clone();
+                    if Self::replace_struct_aliases_in_value(
+                        &mut child_value,
+                        old_struct,
+                        new_struct,
+                        visited,
+                    ) {
+                        changed_children.push((key.clone(), child_value));
+                    }
+                }
+
+                if changed_children.is_empty() {
+                    return false;
+                }
+
+                let map = Arc::make_mut(s);
+                for (key, child_value) in changed_children {
+                    map.insert(key, child_value);
+                }
+                true
+            }
+            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => {
+                let ptr = Arc::as_ptr(a) as usize;
+                if !visited.insert(ptr) {
+                    return false;
+                }
+
+                let mut changed_children = Vec::new();
+                for (index, child) in a.iter().enumerate() {
+                    let mut child_value = child.clone();
+                    if Self::replace_struct_aliases_in_value(
+                        &mut child_value,
+                        old_struct,
+                        new_struct,
+                        visited,
+                    ) {
+                        changed_children.push((index, child_value));
+                    }
+                }
+
+                if changed_children.is_empty() {
+                    return false;
+                }
+
+                let array = Arc::make_mut(a);
+                for (index, child_value) in changed_children {
+                    array[index] = child_value;
+                }
+                true
+            }
+            CfmlValue::Query(q) => {
+                let mut changed = false;
+                for row in &mut q.rows {
+                    for child in row.values_mut() {
+                        changed = Self::replace_struct_aliases_in_value(
+                            child, old_struct, new_struct, visited,
+                        ) || changed;
+                    }
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
     /// Load a variable by name, checking locals, globals, and special scopes (application, request, local/variables).
     fn scope_aware_load(
         &self,
@@ -7732,6 +7960,47 @@ impl CfmlVirtualMachine {
             self.globals.insert(name.to_string(), val);
         } else {
             locals.insert(name.to_string(), val);
+        }
+    }
+
+    fn write_arg_ref_back(
+        &mut self,
+        source_path: &[String],
+        modified_val: CfmlValue,
+        locals: &mut IndexMap<String, CfmlValue>,
+    ) {
+        if source_path.is_empty() {
+            return;
+        }
+
+        let root_name = &source_path[0];
+        if source_path.len() == 1 {
+            let alias_replacements = self
+                .scope_aware_load(root_name, locals)
+                .map(|old| Self::collect_struct_alias_replacements(&old, &modified_val))
+                .unwrap_or_default();
+            self.scope_aware_store(root_name, modified_val, locals);
+            for (old_struct, new_struct) in alias_replacements {
+                if !Arc::ptr_eq(&old_struct, &new_struct) {
+                    self.replace_struct_aliases(&old_struct, &new_struct, locals);
+                }
+            }
+            return;
+        }
+
+        if let Some(mut root_obj) = self.scope_aware_load(root_name, locals) {
+            let old_value = Self::get_path_value(&root_obj, &source_path[1..]);
+            let alias_replacements = old_value
+                .as_ref()
+                .map(|old| Self::collect_struct_alias_replacements(old, &modified_val))
+                .unwrap_or_default();
+            Self::deep_set(&mut root_obj, &source_path[1..], modified_val);
+            self.scope_aware_store(root_name, root_obj, locals);
+            for (old_struct, new_struct) in alias_replacements {
+                if !Arc::ptr_eq(&old_struct, &new_struct) {
+                    self.replace_struct_aliases(&old_struct, &new_struct, locals);
+                }
+            }
         }
     }
 
@@ -11655,8 +11924,8 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::ForLoopStep(_, _, _, _, _) => (0, 0),
         BytecodeOp::Return => (0, 1),
         // Call: pops func + N args, pushes 1 result
-        BytecodeOp::Call(n) => (1, n + 1),
-        BytecodeOp::CallNamed(_, n) => (1, n + 1),
+        BytecodeOp::Call(n) | BytecodeOp::CallWithArgSources(n, _) => (1, n + 1),
+        BytecodeOp::CallNamed(_, n) | BytecodeOp::CallNamedWithArgSources(_, n, _) => (1, n + 1),
         BytecodeOp::CallSpread => (1, 3), // func, array, count — approximate
         // Collections
         BytecodeOp::BuildArray(n) => (1, *n),
@@ -11734,6 +12003,17 @@ fn find_arg_sources(ops: &[BytecodeOp], call_ip: usize, arg_count: usize) -> Vec
         depth += pops as i32;
     }
     sources
+}
+
+fn find_arg_source_paths(
+    ops: &[BytecodeOp],
+    call_ip: usize,
+    arg_count: usize,
+) -> Vec<Option<Vec<String>>> {
+    find_arg_sources(ops, call_ip, arg_count)
+        .into_iter()
+        .map(|source| source.map(|name| vec![name]))
+        .collect()
 }
 
 // ---- precisionEvaluate: recursive-descent parser operating on rust_decimal::Decimal ----

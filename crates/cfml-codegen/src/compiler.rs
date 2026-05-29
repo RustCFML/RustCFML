@@ -190,6 +190,7 @@ pub enum BytecodeOp {
     /// TRUE arm (back to body); falling through means the loop has finished.
     ForLoopStep(String, i64, CmpOp, i64, usize),
     Call(usize),
+    CallWithArgSources(usize, Vec<Option<Vec<String>>>),
     Return,
 
     // Collections
@@ -269,6 +270,7 @@ pub enum BytecodeOp {
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
     CallNamed(Vec<String>, usize),
+    CallNamedWithArgSources(Vec<String>, usize, Vec<Option<Vec<String>>>),
 
     // Explicit super(args) constructor call for a CFC whose parent is a Rust class.
     // Pops arg_count values, looks up the constructor registered under
@@ -371,6 +373,42 @@ impl CfmlCompiler {
         } else {
             None
         }
+    }
+
+    fn argument_write_back_path(expr: &Expression) -> Option<Vec<String>> {
+        fn collect_path(expr: &Expression, path: &mut Vec<String>) -> bool {
+            match expr {
+                Expression::Identifier(ident) => {
+                    path.push(ident.name.clone());
+                    true
+                }
+                Expression::This(_) | Expression::Super(_) => {
+                    path.push("this".to_string());
+                    true
+                }
+                Expression::MemberAccess(access) => {
+                    if collect_path(&access.object, path) {
+                        path.push(access.member.clone());
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Expression::NamedArgument(named) => collect_path(&named.value, path),
+                _ => false,
+            }
+        }
+
+        let mut path = Vec::new();
+        if collect_path(expr, &mut path) {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    fn argument_write_back_paths(args: &[Expression]) -> Vec<Option<Vec<String>>> {
+        args.iter().map(Self::argument_write_back_path).collect()
     }
 
     pub fn compile(mut self, ast: Program) -> BytecodeProgram {
@@ -2413,7 +2451,12 @@ impl CfmlCompiler {
                             self.compile_expression(arg, instructions);
                         }
                     }
-                    instructions.push(BytecodeOp::CallNamed(names, call.arguments.len()));
+                    let arg_sources = Self::argument_write_back_paths(&call.arguments);
+                    instructions.push(BytecodeOp::CallNamedWithArgSources(
+                        names,
+                        call.arguments.len(),
+                        arg_sources,
+                    ));
                 } else {
                     // Push function reference first
                     if let Expression::Identifier(ident) = &*call.name {
@@ -2425,7 +2468,11 @@ impl CfmlCompiler {
                     for arg in &call.arguments {
                         self.compile_expression(arg, instructions);
                     }
-                    instructions.push(BytecodeOp::Call(call.arguments.len()));
+                    let arg_sources = Self::argument_write_back_paths(&call.arguments);
+                    instructions.push(BytecodeOp::CallWithArgSources(
+                        call.arguments.len(),
+                        arg_sources,
+                    ));
                 }
             }
             Expression::MethodCall(call) => {
