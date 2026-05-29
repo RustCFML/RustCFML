@@ -520,6 +520,10 @@ pub struct CfmlVirtualMachine {
     pub request_scope: IndexMap<String, CfmlValue>,
     /// Application scope — shared across requests (Arc<Mutex> for thread safety)
     pub application_scope: Option<Arc<Mutex<IndexMap<String, CfmlValue>>>>,
+    /// Name of the application currently attached to application_scope.
+    current_application_name: Option<String>,
+    /// Set when applicationStop() has cleared the attached application during this request.
+    application_stopped: bool,
     /// Server-level state — persists across requests in --serve mode
     pub server_state: Option<ServerState>,
     /// HTTP response headers set by cfheader
@@ -720,6 +724,8 @@ impl CfmlVirtualMachine {
             closure_parent_writeback: None,
             request_scope: IndexMap::new(),
             application_scope: None,
+            current_application_name: None,
+            application_stopped: false,
             server_state: None,
             response_headers: Vec::new(),
             response_status: None,
@@ -4330,6 +4336,7 @@ impl CfmlVirtualMachine {
                 | "sessioninvalidate"
                 | "sessionrotate"
                 | "sessiongetmetadata"
+                | "applicationstop"
                 | "getauthuser"
                 | "isuserinrole"
                 | "isuserloggedin"
@@ -6601,6 +6608,10 @@ impl CfmlVirtualMachine {
                     }
                     self.transaction_conn = None;
                     self.transaction_datasource = None;
+                    return Ok(CfmlValue::Null);
+                }
+                "applicationstop" => {
+                    self.stop_current_application();
                     return Ok(CfmlValue::Null);
                 }
                 "__cflog" => {
@@ -11437,8 +11448,32 @@ impl CfmlVirtualMachine {
         source
     }
 
+    fn stop_current_application(&mut self) {
+        if let Some(app_name) = self.current_application_name.clone() {
+            if let Some(ref server_state) = self.server_state {
+                server_state.applications.modify(&app_name, &mut |app| {
+                    app.variables.clear();
+                    app.started = false;
+                    app.cached_functions.clear();
+                    app.cached_functions_original_offset = 0;
+                });
+            }
+        }
+
+        if let Some(ref app_scope) = self.application_scope {
+            if let Ok(mut scope) = app_scope.lock() {
+                scope.clear();
+            }
+        }
+
+        self.application_stopped = true;
+    }
+
     /// Execute with Application.cfc lifecycle
     pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
+        self.application_stopped = false;
+        self.current_application_name = None;
+
         // 1. Find Application.cfc
         let app_cfc_path = self.find_application_cfc();
 
@@ -11593,6 +11628,7 @@ impl CfmlVirtualMachine {
             }
             let app_snapshot = server_state.applications.get(&app_name).unwrap();
             let scope = Arc::new(Mutex::new(app_snapshot.variables.clone()));
+            self.current_application_name = Some(app_name.clone());
             self.application_scope = Some(scope.clone());
 
             // 5. onApplicationStart (if not yet started)
@@ -11839,22 +11875,24 @@ impl CfmlVirtualMachine {
         // and any function values that the application scope captured during the
         // request (e.g. `application._taffy.factory.getBean`) end up with body
         // indices beyond the restored program length.
-        if let Some(ref server_state) = self.server_state.clone() {
-            if let Some(ref app_scope) = self.application_scope {
-                if let Ok(scope) = app_scope.lock() {
-                    let scope_snapshot = scope.clone();
-                    let program_functions = self.program.functions.clone();
-                    server_state.applications.modify(&app_name, &mut |app| {
-                        app.variables = scope_snapshot.clone();
-                        // Refresh cache from current program. Use the
-                        // original offset captured the first time
-                        // onApplicationStart ran; that anchor stays
-                        // constant for the lifetime of the application.
-                        let offset = app.cached_functions_original_offset;
-                        if offset > 0 && program_functions.len() > offset {
-                            app.cached_functions = program_functions[offset..].to_vec();
-                        }
-                    });
+        if !self.application_stopped {
+            if let Some(ref server_state) = self.server_state.clone() {
+                if let Some(ref app_scope) = self.application_scope {
+                    if let Ok(scope) = app_scope.lock() {
+                        let scope_snapshot = scope.clone();
+                        let program_functions = self.program.functions.clone();
+                        server_state.applications.modify(&app_name, &mut |app| {
+                            app.variables = scope_snapshot.clone();
+                            // Refresh cache from current program. Use the
+                            // original offset captured the first time
+                            // onApplicationStart ran; that anchor stays
+                            // constant for the lifetime of the application.
+                            let offset = app.cached_functions_original_offset;
+                            if offset > 0 && program_functions.len() > offset {
+                                app.cached_functions = program_functions[offset..].to_vec();
+                            }
+                        });
+                    }
                 }
             }
         }

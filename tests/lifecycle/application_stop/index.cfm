@@ -1,0 +1,1 @@
+<cfoutput>#application.seed#</cfoutput>
