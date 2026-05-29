@@ -8386,6 +8386,13 @@ impl CfmlVirtualMachine {
                 _ => None,
             },
             CfmlValue::Struct(s) => match method_lower.as_str() {
+                _ if (s.contains_key("__variables") || s.contains_key("__name"))
+                    && s.iter().any(|(key, value)| {
+                        key.eq_ignore_ascii_case(method) && matches!(value, CfmlValue::Function(_))
+                    }) =>
+                {
+                    None
+                }
                 "count" | "len" | "size" => Some("structCount"),
                 "keyexists" => Some("structKeyExists"),
                 "keylist" => Some("structKeyList"),
