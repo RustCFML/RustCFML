@@ -9132,8 +9132,17 @@ impl CfmlVirtualMachine {
         if self.mappings.is_empty() {
             return None;
         }
-        // Convert dot-path to slash-path: "taffy.core.api" → "/taffy/core/api"
-        let slash_path = format!("/{}", class_name.replace('.', "/"));
+        // Convert dot-path to slash-path: "taffy.core.api" -> "/taffy/core/api".
+        // Leading-slash component names are CFML mapping-relative paths, not
+        // necessarily OS-absolute filesystem paths.
+        let slash_path = if class_name.starts_with('/') {
+            class_name
+                .strip_suffix(".cfc")
+                .unwrap_or(class_name)
+                .to_string()
+        } else {
+            format!("/{}", class_name.replace('.', "/"))
+        };
         let slash_lower = slash_path.to_lowercase();
 
         for mapping in &self.mappings {
@@ -9745,6 +9754,8 @@ impl CfmlVirtualMachine {
                 };
                 if self.vfs.exists(&p) {
                     p
+                } else if let Some(mapped) = self.resolve_path_with_mappings(class_name) {
+                    mapped
                 } else if let Some(ref source) = self.source_file {
                     // Try relative to source file
                     let source_dir = std::path::Path::new(source)
