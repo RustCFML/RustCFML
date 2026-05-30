@@ -87,6 +87,7 @@ try { include "functions/test_function_references.cfm"; } catch (any e) { writeO
 
 // --- Member Functions ---
 try { include "members/test_string_members.cfm"; } catch (any e) { writeOutput("ERROR | members/test_string_members.cfm | " & e.message & chr(10)); }
+try { include "members/test_string_member_regex.cfm"; } catch (any e) { writeOutput("ERROR | members/test_string_member_regex.cfm | " & e.message & chr(10)); }
 try { include "members/test_array_members.cfm"; } catch (any e) { writeOutput("ERROR | members/test_array_members.cfm | " & e.message & chr(10)); }
 try { include "members/test_struct_members.cfm"; } catch (any e) { writeOutput("ERROR | members/test_struct_members.cfm | " & e.message & chr(10)); }
 try { include "members/test_number_members.cfm"; } catch (any e) { writeOutput("ERROR | members/test_number_members.cfm | " & e.message & chr(10)); }
