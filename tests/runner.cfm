@@ -22,6 +22,7 @@ try { include "core/test_error_handling.cfm"; } catch (any e) { writeOutput("ERR
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arrow_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arrow_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arguments_writeback.cfm | " & e.message & chr(10)); }
+try { include "core/test_argument_reference_nested.cfm"; } catch (any e) { writeOutput("ERROR | core/test_argument_reference_nested.cfm | " & e.message & chr(10)); }
 try { include "core/test_language_features.cfm"; } catch (any e) { writeOutput("ERROR | core/test_language_features.cfm | " & e.message & chr(10)); }
 try { include "core/test_scopes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scopes.cfm | " & e.message & chr(10)); }
 try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_server_scope.cfm | " & e.message & chr(10)); }
