@@ -2,7 +2,11 @@
   "server": {
     "port": 9999,
     "welcomeFiles": ["index.cfm", "default.cfm"],
-    "maxRequestBodySize": 5242880
+    "maxRequestBodySize": 5242880,
+    "fallback": {
+      "template": "/server/front_controller_fallback.cfm",
+      "routeParam": "route"
+    }
   },
   "runtime": {
     "locale": "en-GB",

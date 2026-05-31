@@ -143,6 +143,9 @@ try { include "tags/test_tags_whitespace.cfm"; } catch (any e) { writeOutput("ER
 try { include "includes/test_variables_scope_includes.cfm"; } catch (any e) { writeOutput("ERROR | includes/test_variables_scope_includes.cfm | " & e.message & chr(10)); }
 try { include "includes/test_named_args_includes.cfm"; } catch (any e) { writeOutput("ERROR | includes/test_named_args_includes.cfm | " & e.message & chr(10)); }
 
+// --- Server ---
+try { include "server/test_front_controller_fallback.cfm"; } catch (any e) { writeOutput("ERROR | server/test_front_controller_fallback.cfm | " & e.message & chr(10)); }
+
 // --- Java Shims ---
 try { include "java_shims/test_all.cfm"; } catch (any e) { writeOutput("ERROR | java_shims/test_all.cfm | " & e.message & chr(10)); }
 try { include "java_shims/test_comprehensive.cfm"; } catch (any e) { writeOutput("ERROR | java_shims/test_comprehensive.cfm | " & e.message & chr(10)); }
