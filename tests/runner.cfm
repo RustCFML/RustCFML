@@ -238,6 +238,16 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+//   - reserved_word_identifiers: extends component_soft_keyword to two more words
+//     that are SOFT keywords on Lucee/ACF/BoxLang but hard-reserved on RustCFML:
+//     `new` as a function name (Wheels' model().new() core API) and `extends`/
+//     `implements` as parameter names. Failing decls live in fixtures.
+try { include "core/test_reserved_word_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_reserved_word_identifiers.cfm | " & e.message & chr(10)); }
+//   - quoted_catch_type: a catch clause may name the exception type as a quoted
+//     string (`catch ("My.Type" e)`) on Lucee/ACF/BoxLang. RustCFML expects a
+//     bare identifier. This is the next Wheels boot blocker after the header
+//     gaps (Public.cfc onApplicationStart). Failing catch lives in a fixture.
+try { include "core/test_quoted_catch_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_quoted_catch_type.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
