@@ -85,6 +85,7 @@ if (serverPort == "" || serverPort == "0") {
     assertTrue("location header set",
         structKeyExists(locResult.responseheader, "Location")
         && findNoCase("redirect-target", locResult.responseheader["Location"]) > 0);
+
 }
 
 suiteEnd();
