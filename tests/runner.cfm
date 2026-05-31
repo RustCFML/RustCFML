@@ -209,6 +209,12 @@ try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutp
 //     for everything except the `local` scope. Wrapped in try/catch so the
 //     throw fails its assertions without aborting the run.
 try { include "core/test_undefined_var_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undefined_var_autovivify.cfm | " & e.message & chr(10)); }
+//   - cfinvoke_component_attr: `component` is a soft keyword on Lucee/ACF/BoxLang
+//     but a hard reserved keyword on RustCFML, so `cfinvoke component=...` (and a
+//     bare `component = x`) fail to PARSE. Wheels' Global.cfc::$cfinvoke() uses
+//     this exact shape, so wheels.Global degrades to a non-object and the whole
+//     framework boots-but-serves-empty. Parse failure contained in a fixture.
+try { include "tags/test_cfinvoke_component_attr.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_component_attr.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
