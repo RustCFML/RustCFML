@@ -234,6 +234,15 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+//   - component_declaration_attributes: follow-on to component_soft_keyword.
+//     Component-header metadata attributes are order-independent and may be
+//     written quoted or unquoted on Lucee/ACF/BoxLang. Two shapes the Wheels
+//     boot cascade relies on still fail to parse on RustCFML: (A) `extends`
+//     placed AFTER another attribute (component output="false" extends="..."),
+//     and (B) an unquoted boolean attribute value (component output=false).
+//     Failing headers live in fixtures (parse errors escape try/catch); via
+//     createObject they degrade to a non-object, so the assertions show the gap.
+try { include "core/test_component_declaration_attributes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_component_declaration_attributes.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
