@@ -72,4 +72,19 @@
 <cfmodule template="customtags/echo_attr.cfm" value="mod-hyphen-ok">
 <cfscript>assert("cfmodule attr with hyphen", echoed, "mod-hyphen-ok");</cfscript>
 
+<!--- Test 15: cfmodule template supports hash interpolation --->
+<cfset echoed = "">
+<cfset modulePath = "customtags/echo_attr.cfm">
+<cfset dynamicModuleError = "">
+<cftry>
+    <cfmodule template="#modulePath#" value="dynamic-module">
+    <cfcatch type="any">
+        <cfset dynamicModuleError = cfcatch.message>
+    </cfcatch>
+</cftry>
+<cfscript>
+    assert("cfmodule dynamic template error", dynamicModuleError, "");
+    assert("cfmodule dynamic template", echoed, "dynamic-module");
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
