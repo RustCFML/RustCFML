@@ -84,6 +84,7 @@ try { include "stdlib/test_bitmask_functions.cfm"; } catch (any e) { writeOutput
 try { include "stdlib/test_xml_dom_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_xml_dom_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_misc_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_misc_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_len_scalar_coercion.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_len_scalar_coercion.cfm | " & e.message & chr(10)); }
+try { include "stdlib/test_preserve_single_quotes.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_preserve_single_quotes.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_valuelist_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_valuelist_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_callstack.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_callstack.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_precisionevaluate.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_precisionevaluate.cfm | " & e.message & chr(10)); }
