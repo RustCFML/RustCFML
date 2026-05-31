@@ -107,6 +107,7 @@ try { include "oop/test_inheritance.cfm"; } catch (any e) { writeOutput("ERROR |
 try { include "oop/test_inherited_helpers.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_helpers.cfm | " & e.message & chr(10)); }
 try { include "oop/test_interfaces.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_interfaces.cfm | " & e.message & chr(10)); }
 try { include "oop/test_metadata.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata.cfm | " & e.message & chr(10)); }
+try { include "oop/test_soft_keyword_function_name.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_soft_keyword_function_name.cfm | " & e.message & chr(10)); }
 try { include "oop/test_property_attributes.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_property_attributes.cfm | " & e.message & chr(10)); }
 try { include "oop/test_struct_method_dispatch.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_struct_method_dispatch.cfm | " & e.message & chr(10)); }
 try { include "oop/test_external_prop.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_external_prop.cfm | " & e.message & chr(10)); }
