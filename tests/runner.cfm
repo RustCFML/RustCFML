@@ -238,6 +238,10 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+// Moopa route metadata can use keyword property names in dotted loop targets
+// (for example local.package). Lucee accepts this; RustCFML currently fails
+// to parse the loop target, so keep this fatal repro last.
+try { include "core/test_forin_keyword_member_access.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_keyword_member_access.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
