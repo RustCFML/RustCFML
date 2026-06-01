@@ -49,3 +49,12 @@ rebinding behavior after cached code is reused.
 The useful assertion is against RustCFML VM metadata, not a direct CFML output.
 I did not find a clean CFML-only runner test that observes this invariant
 without depending on surrounding cache/rebinding internals.
+
+This PR therefore includes a focused Rust integration test:
+
+```text
+crates/cfml-vm/tests/compiled_function_source_file.rs
+```
+
+The test compiles a CFC through `compile_file_cached()` and asserts that the
+compiled `read` function has `source_file` set to the CFC path.
