@@ -310,6 +310,12 @@ try { include "core/test_quoted_catch_type.cfm"; } catch (any e) { writeOutput("
 //     inside a braced `case`/`default` body. Both surfaced while booting Wheels.
 try { include "core/test_chained_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_chained_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_switch_braced_case.cfm"; } catch (any e) { writeOutput("ERROR | core/test_switch_braced_case.cfm | " & e.message & chr(10)); }
+//   - undeclared_named_args: calling a function with more named args than it
+//     declares keeps the extras reachable by name in `arguments` on
+//     Lucee/ACF/BoxLang; RustCFML stores them positionally (numeric keys).
+//     Wheels' $createObjectFromRoot forwards such extras (pluginPath, ...) to a
+//     target method — they arrive empty, breaking the boot plugin scan.
+try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undeclared_named_args.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
