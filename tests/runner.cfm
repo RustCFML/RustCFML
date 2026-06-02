@@ -310,6 +310,12 @@ try { include "core/test_quoted_catch_type.cfm"; } catch (any e) { writeOutput("
 //     inside a braced `case`/`default` body. Both surfaced while booting Wheels.
 try { include "core/test_chained_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_chained_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_switch_braced_case.cfm"; } catch (any e) { writeOutput("ERROR | core/test_switch_braced_case.cfm | " & e.message & chr(10)); }
+//   - cfdirectory_function_form: cfdirectory invoked as a script function with
+//     named args (action/directory/name, or attributeCollection) throws
+//     "cfdirectory requires a struct argument" on RustCFML, while directoryList()
+//     works and attributeCollection works on other tags. Wheels' Global.cfc
+//     $directory() wrapper hits it during onApplicationStart plugin discovery.
+try { include "tags/test_cfdirectory_function_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_function_form.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
