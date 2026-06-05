@@ -14,6 +14,11 @@ assertNotNull("getMetadata returns value", md);
 assertTrue("metadata is struct", isStruct(md));
 assertTrue("metadata has name", structKeyExists(md, "name"));
 
+// getMetadata() must also expose `fullname` — the fully-qualified component path
+// (distinct from the unqualified `name`). Lucee and Adobe both return it.
+assertTrue("metadata has fullname", structKeyExists(md, "fullname"));
+assertTrue("fullname includes the component name", findNoCase("Greeter", md.fullname ?: "") > 0);
+
 // getMetadata on Dog (has extends)
 d = createObject("component", "oop.Dog").init();
 dmd = getMetadata(d);
