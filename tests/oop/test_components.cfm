@@ -38,5 +38,12 @@ assertTrue("isStruct on component", isStruct(g));
 assertTrue("greet method exists", structKeyExists(g, "greet"));
 assertTrue("getGreeting method exists", structKeyExists(g, "getGreeting"));
 
+// Single-argument createObject() shorthand.
+// createObject("path") is shorthand for createObject("component","path") and must
+// return an instantiated component, identical to the two-arg form used above.
+gShort = createObject("oop.Greeter");
+assertTrue("single-arg createObject returns an object", isObject(gShort));
+assert("single-arg createObject instance is usable", gShort.init().greet("World"), "Hello, World!");
+
 suiteEnd();
 </cfscript>
