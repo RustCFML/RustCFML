@@ -240,6 +240,7 @@ try { include "native/test_cfc_extends_rust.cfm"; } catch (any e) { writeOutput(
 try { include "core/test_local_at_template_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_at_template_scope.cfm | " & e.message & chr(10)); }
 try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata_name_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
+try { include "tags/test_script_cfquery_statement_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_script_cfquery_statement_body.cfm | " & e.message & chr(10)); }
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_member_loop_var.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_keyword_member_access.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_keyword_member_access.cfm | " & e.message & chr(10)); }
