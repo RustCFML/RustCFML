@@ -168,6 +168,7 @@ try { include "tags/test_tags_cfhttp_interpolation.cfm"; } catch (any e) { write
 try { include "tags/test_tags_cfhttpparam_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfhttpparam_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tag_string_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tag_string_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tag_attribute_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tag_attribute_interpolation.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cflog_cfmail_attribute_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cflog_cfmail_attribute_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfzip.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfzip.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_tld.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_tld.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_whitespace.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_whitespace.cfm | " & e.message & chr(10)); }
