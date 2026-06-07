@@ -37,6 +37,7 @@ try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }
+try { include "core/test_single_hash_type_preservation.cfm"; } catch (any e) { writeOutput("ERROR | core/test_single_hash_type_preservation.cfm | " & e.message & chr(10)); }
 
 // --- Data Types ---
 try { include "types/test_null.cfm"; } catch (any e) { writeOutput("ERROR | types/test_null.cfm | " & e.message & chr(10)); }
