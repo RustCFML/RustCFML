@@ -317,6 +317,12 @@ try { include "core/test_isinstanceof_interface_chain.cfm"; } catch (any e) { wr
 //     the first `.` ("Expected RParen, found Dot"). Parse-only (Lucee enforces
 //     the type at call time, so the test never calls with a mismatched value).
 try { include "core/test_dotted_param_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_dotted_param_type.cfm | " & e.message & chr(10)); }
+//   - typed_toplevel_function_return_type: a TOP-LEVEL (non-component) cfscript
+//     function may carry a return-type annotation (`struct function f()`), like
+//     a component method. RustCFML misparses the leading type token at the top
+//     level as a bare expression statement ("Variable 'struct' is undefined").
+//     Surfaced booting Wheels (vendor/wheels/public/helpers.cfm:293).
+try { include "core/test_typed_toplevel_function_return_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_typed_toplevel_function_return_type.cfm | " & e.message & chr(10)); }
 //   - for_increment_compound: the for-loop increment clause accepts compound
 //     assignment (for (i=1; i<=10; i+=2)). RustCFML used to reject it
 //     ("Expected RParen, found PlusEqual"). Used in vendor/wheels/model/bulk.cfc.
