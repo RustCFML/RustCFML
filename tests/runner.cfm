@@ -70,6 +70,7 @@ try { include "stdlib/test_struct_higher_order.cfm"; } catch (any e) { writeOutp
 try { include "stdlib/test_math_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_math_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_date_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_date_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_list_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_list_functions.cfm | " & e.message & chr(10)); }
+try { include "stdlib/test_list_rest_literal_remainder.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_list_rest_literal_remainder.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_list_higher_order.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_list_higher_order.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_query_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_query_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_query_higher_order.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_query_higher_order.cfm | " & e.message & chr(10)); }
