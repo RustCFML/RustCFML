@@ -359,6 +359,12 @@ try { include "core/test_param_dotted_lhs.cfm"; } catch (any e) { writeOutput("E
 //     possible since structs are reference types) must terminate rather than
 //     overflow the native stack.
 try { include "core/test_as_string_cycle_safety.cfm"; } catch (any e) { writeOutput("ERROR | core/test_as_string_cycle_safety.cfm | " & e.message & chr(10)); }
+//   - single_part_interpolation_preserves_type: a quoted literal that is exactly
+//     one interpolation token ("#expr#") yields the VALUE with its type intact
+//     (struct stays a struct, array stays an array) rather than stringifying.
+//     Multi-part literals still concatenate. Surfaced while booting Wheels
+//     (contentFor/section plumbing round-trips single-token values).
+try { include "core/test_single_part_interpolation_preserves_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_single_part_interpolation_preserves_type.cfm | " & e.message & chr(10)); }
 //   - lock_finally_semantics: try/finally + lock { } must run the finally on a
 //     `return` (release the lock) and re-propagate exceptions thrown inside.
 try { include "core/test_lock_finally_semantics.cfm"; } catch (any e) { writeOutput("ERROR | core/test_lock_finally_semantics.cfm | " & e.message & chr(10)); }
