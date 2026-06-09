@@ -350,6 +350,13 @@ try { include "core/test_switch_fallthrough.cfm"; } catch (any e) { writeOutput(
 try { include "core/test_application_scope_persist.cfm"; } catch (any e) { writeOutput("ERROR | core/test_application_scope_persist.cfm | " & e.message & chr(10)); }
 try { include "core/test_session_scope_persist.cfm"; } catch (any e) { writeOutput("ERROR | core/test_session_scope_persist.cfm | " & e.message & chr(10)); }
 try { include "core/test_application_metadata.cfm"; } catch (any e) { writeOutput("ERROR | core/test_application_metadata.cfm | " & e.message & chr(10)); }
+//   - named_args_no_numeric_alias: a named-argument call to a function that
+//     DECLARES params must populate the arguments scope by name only. When a
+//     named arg lands in a declared positional slot, RustCFML leaks a spurious
+//     numeric key (e.g. "2"), inflating StructCount and poisoning for-in /
+//     option-forwarding. Surfaced while booting Wheels (contentFor section
+//     detection reads StructKeyList(arguments)).
+try { include "core/test_named_args_no_numeric_alias.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_args_no_numeric_alias.cfm | " & e.message & chr(10)); }
 //   - param_dotted_lhs: the cfscript `param` shorthand must accept a dotted /
 //     scoped lvalue (`param arguments.obj.key = default`), not just a bare
 //     identifier. Surfaced while booting WireBox (Injector.cfc uses
