@@ -48,6 +48,7 @@ try { include "types/test_array.cfm"; } catch (any e) { writeOutput("ERROR | typ
 try { include "types/test_array_append_grow.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_append_grow.cfm | " & e.message & chr(10)); }
 try { include "types/test_array_reference_semantics.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_reference_semantics.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct.cfm | " & e.message & chr(10)); }
+try { include "types/test_struct_literal_null_key.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct_literal_null_key.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct_reference_semantics.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct_reference_semantics.cfm | " & e.message & chr(10)); }
 try { include "types/test_ordered_struct_literals.cfm"; } catch (any e) { writeOutput("ERROR | types/test_ordered_struct_literals.cfm | " & e.message & chr(10)); }
 try { include "types/test_nested_writeback.cfm"; } catch (any e) { writeOutput("ERROR | types/test_nested_writeback.cfm | " & e.message & chr(10)); }
