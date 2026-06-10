@@ -255,6 +255,18 @@ try { include "native/test_cfc_extends_rust.cfm"; } catch (any e) { writeOutput(
 //     which degrades to a non-object silently instead of aborting. Both
 //     modes fail their assertions without taking down the run.
 try { include "core/test_local_at_template_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_at_template_scope.cfm | " & e.message & chr(10)); }
+//   - local_scope_absence_leak: a callee that never declares `local.rv` must
+//     get a fresh, EMPTY local — StructKeyExists(local, "rv") false and
+//     isNull(local.rv) true even when the caller holds a same-named local.rv.
+//     READ-side residual of the v0.92.0 per-frame fix (PR #77,
+//     test_local_scope_frame_isolation.cfm): declarations are isolated, but
+//     absence-checks/reads still see the caller's slot. Surfaced booting
+//     Wheels: the $callback() default-true tail
+//     `if (!StructKeyExists(local, "rv")) { local.rv = true; }` inherited the
+//     caller's false, so every model callback chain failed and save() aborted
+//     before its INSERT, silently. Runtime-level (wrong values, no parse
+//     error), so registration is safe.
+try { include "core/test_local_scope_absence_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_scope_absence_leak.cfm | " & e.message & chr(10)); }
 try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata_name_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
