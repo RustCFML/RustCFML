@@ -389,6 +389,11 @@ try { include "core/test_logical_short_circuit.cfm"; } catch (any e) { writeOutp
 //   - getFunctionCalledName: a UDF injected under multiple aliases reports the
 //     alias it was called by — the primitive WireBox delegation dispatches on.
 try { include "core/test_get_function_called_name.cfm"; } catch (any e) { writeOutput("ERROR | core/test_get_function_called_name.cfm | " & e.message & chr(10)); }
+//   - new_udf_dispatch_and_null_call: a bare sibling call to a UDF literally
+//     named `new` (the Wheels model-create shape) must dispatch to the UDF,
+//     and a method call on a null receiver must throw — composed, the two
+//     gaps turn Wheels' create() into a silent no-op that reports success.
+try { include "core/test_new_udf_dispatch_and_null_call.cfm"; } catch (any e) { writeOutput("ERROR | core/test_new_udf_dispatch_and_null_call.cfm | " & e.message & chr(10)); }
 //   - delegate annotation metadata: bare + arbitrary-named property annotations
 //     are captured, and component-level annotations surface top-level in
 //     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.
