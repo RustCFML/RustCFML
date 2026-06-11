@@ -34,6 +34,18 @@ try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput
 try { include "core/test_argument_reference_nested.cfm"; } catch (any e) { writeOutput("ERROR | core/test_argument_reference_nested.cfm | " & e.message & chr(10)); }
 try { include "core/test_language_features.cfm"; } catch (any e) { writeOutput("ERROR | core/test_language_features.cfm | " & e.message & chr(10)); }
 try { include "core/test_scopes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scopes.cfm | " & e.message & chr(10)); }
+//   - this_dot_call_detaches_writes: inside a component method, a `this.`-DOT
+//     qualified method call (this.noop()) detaches the frame's `this` binding
+//     onto a data-complete SHALLOW COPY on RustCFML 0.108.0 -- every later
+//     this-write in that frame (and in frames it calls, any call shape) lands
+//     on the detached copy: visible in-frame, DISCARDED when the detaching
+//     frame returns. Bare calls, bracket calls (this["noop"]()), dot-READS,
+//     and dot-calls on other objects do not detach; variables-scope writes
+//     survive; nested-struct mutations escape (the copy is shallow -- pinned).
+//     Broke Wheels model persistence twice over (generated PK vanishing after
+//     create(), stale dirty-state after update()). Runtime-level: fails 3
+//     assertions, does NOT abort the run.
+try { include "core/test_this_dot_call_detaches_writes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_this_dot_call_detaches_writes.cfm | " & e.message & chr(10)); }
 try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_server_scope.cfm | " & e.message & chr(10)); }
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
