@@ -31,6 +31,19 @@ try { include "core/test_builtin_shadowing.cfm"; } catch (any e) { writeOutput("
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arrow_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arrow_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arguments_writeback.cfm | " & e.message & chr(10)); }
+//   - local_shadows_arguments: `local` and `arguments` are separate scopes
+//     within ONE frame — after `local.X = ...` (or `var X = ...`), an explicit
+//     `arguments.X` read must still resolve to the passed value / declared
+//     default, not the local value. Bare `X` reads (scope cascade: local wins)
+//     are pinned as controls so a fix can't overcorrect. Surfaced booting
+//     Wheels: URLFor() declares `string params = ""` and builds a route-params
+//     struct in `local.params`; its `Len(arguments.params)` query-string check
+//     saw the struct, so EVERY generated URL (linkTo / startFormTag /
+//     redirectTo) grew a ?%7Bcontroller...%7D= junk query string. Sibling of
+//     #77 (fixed v0.92.0) / #93 (open) — same scoped-name-resolution family,
+//     but conflating the local and arguments views of a single frame.
+//     Runtime-level (wrong values, no parse error), so registration is safe.
+try { include "core/test_local_shadows_arguments.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_shadows_arguments.cfm | " & e.message & chr(10)); }
 try { include "core/test_argument_reference_nested.cfm"; } catch (any e) { writeOutput("ERROR | core/test_argument_reference_nested.cfm | " & e.message & chr(10)); }
 try { include "core/test_language_features.cfm"; } catch (any e) { writeOutput("ERROR | core/test_language_features.cfm | " & e.message & chr(10)); }
 try { include "core/test_scopes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scopes.cfm | " & e.message & chr(10)); }
