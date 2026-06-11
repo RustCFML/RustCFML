@@ -163,6 +163,7 @@ try { include "tags/test_tags_cfqueryparam_attribute_collection.cfm"; } catch (a
 try { include "tags/test_queryexecute_param_structs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_queryexecute_param_structs.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfqueryparam_interpolated_value.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfqueryparam_interpolated_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_quoted_identifier.cfm | " & e.message & chr(10)); }
+try { include "tags/test_pg_vector_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_vector_param_binds.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_mapping_path.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_mapping_path.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_function_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_function_form.cfm | " & e.message & chr(10)); }
