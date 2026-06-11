@@ -166,6 +166,7 @@ try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { write
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_mapping_path.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_mapping_path.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_function_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_function_form.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cfdirectory_recurse_symlink.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_recurse_symlink.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfhttpparam_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhttpparam_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfmail_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfmail_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfstoredproc_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfstoredproc_runtime_body.cfm | " & e.message & chr(10)); }
