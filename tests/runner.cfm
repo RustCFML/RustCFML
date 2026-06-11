@@ -15,6 +15,22 @@ try { include "config/test_app_datasources.cfm"; } catch (any e) { writeOutput("
 try { include "core/test_variables.cfm"; } catch (any e) { writeOutput("ERROR | core/test_variables.cfm | " & e.message & chr(10)); }
 try { include "core/test_access_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_access_identifiers.cfm | " & e.message & chr(10)); }
 try { include "core/test_function_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_function_scope_capture.cfm | " & e.message & chr(10)); }
+//   - bare_call_caller_stack_leak: a function called by BARE NAME inside a
+//     CFC method must resolve against the method's own frame and the
+//     component's variables/this scope only — NEVER through the
+//     arguments/locals of ANCESTOR frames on the call stack. RustCFML
+//     resolves bare-name calls dynamically: any ancestor frame holding
+//     same-named data (a struct param, a var) makes the callee's bare call
+//     throw "Variable is not a function", and the shadowing cascades through
+//     the whole stack (a grandparent's param breaks a grandchild's call).
+//     variables.fn()/this.fn() are immune. Surfaced booting Wheels: the
+//     $invokeOnSelf trampoline's `$args` param shadowed every bare
+//     `$args(...)` call below it on the stack (redirectTo()'s URL building
+//     among them) — every POST redirect 500'd. Likely the same frame-fusion
+//     family as the per-frame `local` gaps. Runtime-level (the bare call
+//     throws a catchable runtime error; no parse error), so registration is
+//     safe.
+try { include "core/test_bare_call_caller_stack_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_bare_call_caller_stack_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_closure_env_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_env_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undeclared_named_args.cfm | " & e.message & chr(10)); }
