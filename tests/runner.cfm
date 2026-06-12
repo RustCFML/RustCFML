@@ -480,6 +480,18 @@ try { include "core/test_get_function_called_name.cfm"; } catch (any e) { writeO
 //     and a method call on a null receiver must throw — composed, the two
 //     gaps turn Wheels' create() into a silent no-op that reports success.
 try { include "core/test_new_udf_dispatch_and_null_call.cfm"; } catch (any e) { writeOutput("ERROR | core/test_new_udf_dispatch_and_null_call.cfm | " & e.message & chr(10)); }
+//   - null_return_no_key: assigning a null/void function return must NOT
+//     create the target variable — StructKeyExists/isDefined stay false in
+//     every scope (local, var, variables, unscoped), a pre-existing variable
+//     is deleted by the assignment, and only isNull() on a read of the name
+//     answers true. RustCFML materializes a null-valued key instead, so
+//     Wheels' universal `local.rv = $invoke(...); if (!StructKeyExists(local,
+//     "rv")) local.rv = true;` default-true fallback never fires — every
+//     model callback chain returns null/falsy and save() aborts before the
+//     INSERT, silently. The OTHER half of the old $callback() breaker (the
+//     caller-local-leak half was fixed in v0.118 / PR #93). Runtime-level
+//     (no parse error), so registration is safe.
+try { include "core/test_null_return_no_key.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_return_no_key.cfm | " & e.message & chr(10)); }
 //   - struct_key_case_parity: struct keys are case-insensitive on WRITE, not
 //     just read — a differently-cased write must update the existing key in
 //     place (one key; first-written casing wins the key list), never fork a
