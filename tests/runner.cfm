@@ -368,6 +368,18 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+//   - cfinvoke_call_form_marshaling: the cf-PREFIXED parenthesized CALL form
+//     cfinvoke(...) — the spelling Lucee accepts and Wheels' Global.cfc
+//     $invoke() uses — runs but marshals nothing: the method attr is never
+//     read out of attributeCollection ("Method '' not found in component"),
+//     returnVariable is silently dropped in EVERY form, and the componentless
+//     form resolves the METHOD name as a COMPONENT path instead of
+//     dispatching the sibling method. cfquery(attributeCollection) honors the
+//     same spelling (in-suite control), so only cfinvoke's attribute
+//     marshaling is broken. This family alone kept pristine Wheels from
+//     booting: onApplicationStart -> $loadRoutes -> $simpleLock -> $invoke ->
+//     cfinvoke died, 500ing every request.
+try { include "tags/test_cfinvoke_tag_marshaling.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_tag_marshaling.cfm | " & e.message & chr(10)); }
 //   - script_transaction_attrs: cfscript `transaction action="begin" { ... }`
 //     (the attribute form of the transaction tag, with a body).
 try { include "tags/test_script_transaction_attrs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_script_transaction_attrs.cfm | " & e.message & chr(10)); }
