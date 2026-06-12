@@ -219,6 +219,14 @@ try { include "tags/test_cfdbinfo.cfm"; } catch (any e) { writeOutput("ERROR | t
 try { include "tags/test_cfdirectory_mapping_path.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_mapping_path.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_function_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_function_form.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_recurse_symlink.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_recurse_symlink.cfm | " & e.message & chr(10)); }
+// cfdirectory attributeCollection must deliver the name= listing query the
+// same way the direct named-attribute form does (Wheels Global.cfc::$directory
+// boots through exactly this shape; Plugins.cfc::$folders QoQs the result at
+// onApplicationStart). 0.130.0 fails in both modes: CLI drops the attribute
+// struct entirely (throws "cfdirectory: directory not found: " with an empty
+// path); serve mode runs the listing but binds the query to no scope.
+// Runtime-level in both modes (the test catches the CLI throw) -> runner-safe.
+try { include "tags/test_cfdirectory_attrcoll_name.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_attrcoll_name.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfhttpparam_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhttpparam_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfmail_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfmail_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfstoredproc_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfstoredproc_runtime_body.cfm | " & e.message & chr(10)); }
