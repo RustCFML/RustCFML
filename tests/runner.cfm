@@ -80,6 +80,15 @@ try { include "core/test_scopes.cfm"; } catch (any e) { writeOutput("ERROR | cor
 //     assertions, does NOT abort the run.
 try { include "core/test_this_dot_call_detaches_writes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_this_dot_call_detaches_writes.cfm | " & e.message & chr(10)); }
 try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_server_scope.cfm | " & e.message & chr(10)); }
+//   - pagecontext_request_response: getPageContext().getRequest() /
+//     .getResponse() must return non-null servlet-bridge objects in EVERY
+//     execution context (Lucee synthesizes them even under a CLI task:
+//     getRequestURL() = "http://localhost/index.cfm"). RustCFML returns a
+//     stub with null request/response — masked until v0.119.0's correct
+//     method-on-null throw, which turned the chain Wheels runs on every
+//     request (GetPageContext().getRequest().getRequestURL(),
+//     vendor/wheels/Global.cfc:2403) into a request-killing 500.
+try { include "core/test_pagecontext_request_response.cfm"; } catch (any e) { writeOutput("ERROR | core/test_pagecontext_request_response.cfm | " & e.message & chr(10)); }
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }
