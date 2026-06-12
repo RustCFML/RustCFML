@@ -32,6 +32,13 @@ try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutp
 try { include "core/test_invoke_undeclared_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_undeclared_keys.cfm | " & e.message & chr(10)); }
 try { include "core/test_struct_method_sequential.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_method_sequential.cfm | " & e.message & chr(10)); }
 try { include "core/test_include_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_include_scope_capture.cfm | " & e.message & chr(10)); }
+//   - savecontent_scoped_target: savecontent's variable= attribute must
+//     deliver the capture to SCOPE-QUALIFIED targets (variable="local.cap" /
+//     "variables.cap"), not just unqualified ones. RustCFML silently dropped
+//     the scoped capture — Wheels renders EVERY view through
+//     savecontent variable="local.$wheels" { include ... } (Global.cfc), so
+//     all views came back empty on an otherwise-booting framework.
+try { include "core/test_savecontent_scoped_target.cfm"; } catch (any e) { writeOutput("ERROR | core/test_savecontent_scoped_target.cfm | " & e.message & chr(10)); }
 try { include "core/test_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_operators.cfm | " & e.message & chr(10)); }
 try { include "core/test_subscript_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_subscript_autovivify.cfm | " & e.message & chr(10)); }
 try { include "core/test_control_flow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_control_flow.cfm | " & e.message & chr(10)); }
