@@ -346,6 +346,17 @@ try { include "core/test_forin_string_list.cfm"; } catch (any e) { writeOutput("
 //     for everything except the `local` scope. Wrapped in try/catch so the
 //     throw fails its assertions without aborting the run.
 try { include "core/test_undefined_var_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undefined_var_autovivify.cfm | " & e.message & chr(10)); }
+//   - scoped_nested_autoviv: residual of undefined_var_autovivify -- a nested
+//     write on a SCOPE-QUALIFIED undeclared variable (variables.X.name = ...,
+//     request.X.name, local.X.name inside a function) must auto-create X as
+//     a struct. RustCFML throws "Variable 'X' is undefined" at template
+//     level and SILENTLY drops the write everywhere else (scope key
+//     registered, container not a struct, member readback ""). Wheels'
+//     Controller.cfc $initControllerClass opens with
+//     `variables.$class.name = ...` on a never-seeded $class, so controller
+//     class init loses every field with no error anywhere. Runtime gap:
+//     risky writes are wrapped so the throw fails assertions, not the run.
+try { include "core/test_scoped_nested_autoviv.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scoped_nested_autoviv.cfm | " & e.message & chr(10)); }
 //   - multiword_operators: RustCFML rejects multi-word comparison operators
 //     (IS NOT, DOES NOT CONTAIN, GREATER THAN, ...) while accepting all
 //     single-word forms. A CFC using one fails to parse -> non-object.
