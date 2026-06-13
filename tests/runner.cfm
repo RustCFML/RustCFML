@@ -20,6 +20,7 @@ try { include "core/test_bare_call_shadowing_semantics.cfm"; } catch (any e) { w
 try { include "core/test_closure_env_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_env_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undeclared_named_args.cfm | " & e.message & chr(10)); }
+try { include "core/test_local_arguments_scope_independence.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_arguments_scope_independence.cfm | " & e.message & chr(10)); }
 //   - invoke_undeclared_keys: the argument struct of the positional BIF
 //     invoke(obj, method, argStruct) is a named-argument collection — EVERY
 //     key must reach the callee's arguments scope, declared param or not,
