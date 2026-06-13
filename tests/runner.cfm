@@ -224,6 +224,7 @@ try { include "tags/test_pg_vector_param_binds.cfm"; } catch (any e) { writeOutp
 try { include "tags/test_pg_error_cause_chain.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_error_cause_chain.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_extended_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_extended_param_binds.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_quoted_identifier.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cte_with_query.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cte_with_query.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_result_delivery.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_result_delivery.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdbinfo.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdbinfo.cfm | " & e.message & chr(10)); }
