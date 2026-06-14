@@ -96,6 +96,7 @@ try { include "core/test_pagecontext_request_response.cfm"; } catch (any e) { wr
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }
+try { include "core/test_isnumeric_boolean.cfm"; } catch (any e) { writeOutput("ERROR | core/test_isnumeric_boolean.cfm | " & e.message & chr(10)); }
 
 // --- Data Types ---
 try { include "types/test_null.cfm"; } catch (any e) { writeOutput("ERROR | types/test_null.cfm | " & e.message & chr(10)); }
