@@ -218,6 +218,15 @@ try { include "tags/test_tags_cfstoredproc.cfm"; } catch (any e) { writeOutput("
 try { include "tags/test_tags_cfqueryparam_attribute_collection.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfqueryparam_attribute_collection.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfhttp_multiparam_url.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhttp_multiparam_url.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfqueryparam_interpolated_value.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfqueryparam_interpolated_value.cfm | " & e.message & chr(10)); }
+//   - cfqueryparam_script_form: cfqueryparam must be callable as a script
+//     statement (positional AND attributeCollection) inside a script
+//     cfquery(){} block, like the <cfqueryparam> tag. RustCFML throws
+//     "Variable 'cfqueryparam' is undefined". vendor/wheels/databaseAdapters/
+//     Base.cfc emits exactly this shape for every bound value, so INSERT,
+//     UPDATE, soft-delete, and parameterized WHERE all throw on RustCFML —
+//     the ORM persistence layer is blocked. Runtime gap (undefined-identifier
+//     throw, catchable since v0.125), runner-safe.
+try { include "tags/test_cfqueryparam_script_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfqueryparam_script_form.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_temporal_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_temporal_param_binds.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_jsonb_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_jsonb_param_binds.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_vector_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_vector_param_binds.cfm | " & e.message & chr(10)); }
