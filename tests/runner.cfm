@@ -415,6 +415,13 @@ try { include "tags/test_cfinvoke_tag_marshaling.cfm"; } catch (any e) { writeOu
 //   - script_transaction_attrs: cfscript `transaction action="begin" { ... }`
 //     (the attribute form of the transaction tag, with a body).
 try { include "tags/test_script_transaction_attrs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_script_transaction_attrs.cfm | " & e.message & chr(10)); }
+//   - transaction_action_statement: the body-less cfscript transaction
+//     STATEMENT form `transaction action="commit";` / `="rollback";` /
+//     `="begin";` (no `{ ... }` block) — the spelling every Wheels migration
+//     template emits inside up()/down(). Distinct from script_transaction_attrs
+//     above (which has a body). A bare transaction{} block is the in-suite
+//     control.
+try { include "tags/test_transaction_action_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_transaction_action_statement.cfm | " & e.message & chr(10)); }
 //   - component_declaration_attributes: follow-on to component_soft_keyword.
 //     Component-header metadata attributes are order-independent and may be
 //     written quoted or unquoted on Lucee/ACF/BoxLang. Two shapes the Wheels
