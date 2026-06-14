@@ -45,6 +45,14 @@ try { include "core/test_subscript_autovivify.cfm"; } catch (any e) { writeOutpu
 // auto-viv gap that blocked Wheels $initControllerClass. Fixed in the compiler by routing
 // multi-level scope-rooted nested writes through the runtime scope-path store.
 try { include "core/test_scoped_nested_autoviv.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scoped_nested_autoviv.cfm | " & e.message & chr(10)); }
+// THIS-scope nested auto-vivification (this.paths.migrate = ...): the residual auto-viv
+// gap that #111 left behind. #111 (v0.136) fixed variables/local/request and those still
+// pass on 0.153.0, but the `this` scope was MISSED -- a nested write to an undeclared
+// this.X is lost silently (key registers, IsStruct(this.X) -> false, member vanishes).
+// Blocks Wheels Migrator.cfc init() (this.paths.migrate/sql/templates with no prior
+// this.paths = {}), making the whole migrator unusable. Runtime-level (wrong value, no
+// parse error) so registration is safe. Controls pin that #111 holds + isolate THIS scope.
+try { include "core/test_this_scope_nested_autoviv.cfm"; } catch (any e) { writeOutput("ERROR | core/test_this_scope_nested_autoviv.cfm | " & e.message & chr(10)); }
 try { include "core/test_control_flow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_control_flow.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_negative_step.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_negative_step.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_array_item_index.cfm | " & e.message & chr(10)); }
