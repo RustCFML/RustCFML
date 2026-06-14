@@ -196,6 +196,15 @@ try { include "oop/test_dynamic_lhs_assign.cfm"; } catch (any e) { writeOutput("
 try { include "oop/test_getmetadata_properties.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_properties.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_bool_attr.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_bool_attr.cfm | " & e.message & chr(10)); }
 try { include "oop/test_chained_writeback_clobber.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_chained_writeback_clobber.cfm | " & e.message & chr(10)); }
+//   - inherited_bare_component_resolution: a bare CreateObject("component","X")
+//     in an INHERITED method must resolve relative to the package of the
+//     component that lexically DEFINES the method (the parent), not the runtime
+//     subclass's package. RustCFML resolves against the concrete subclass dir
+//     and fails when the subclass lives elsewhere. Inherited-method sibling of
+//     #132. Blocks the Wheels migrator: user migrations (app/migrator/) extend
+//     wheels.migrator.Migration whose inherited createTable() bare-resolves its
+//     sibling TableDefinition (vendor/wheels/migrator/). Runtime-level, runner-safe.
+try { include "oop/test_inherited_bare_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_resolution.cfm | " & e.message & chr(10)); }
 // Bare component name resolves relative to the CALLING CFC's package. From
 // inside oop.relcomp.Maker, createObject("component","Sibling") must find
 // oop.relcomp.Sibling. Was the deepest blocker for the Wheels migrator
