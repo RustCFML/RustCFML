@@ -196,6 +196,19 @@ try { include "oop/test_dynamic_lhs_assign.cfm"; } catch (any e) { writeOutput("
 try { include "oop/test_getmetadata_properties.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_properties.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_bool_attr.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_bool_attr.cfm | " & e.message & chr(10)); }
 try { include "oop/test_chained_writeback_clobber.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_chained_writeback_clobber.cfm | " & e.message & chr(10)); }
+// --- relative_component_resolution: a bare (unqualified) component name in
+//     createObject("component", "Sibling") must resolve against the CALLING
+//     CFC's package first. Maker (in oop.relcomp) calls bare "Sibling" and
+//     should find its package sibling oop.relcomp.Sibling. RustCFML 0.153.0
+//     does not search the caller package -> "Could not find the component
+//     [Sibling]"; Lucee/ACF/BoxLang resolve it. The createObject form is
+//     catchable (viaCreate returns "ERR:..." -> a wrong-VALUE assertion
+//     failure, no file abort), so it is runner-safe; the `new Sibling()`
+//     spelling shares the defect but throws UNCATCHABLY on RustCFML and is
+//     deliberately not asserted. Deepest blocker for the Wheels migrator
+//     TableDefinition DSL (createTable/t.string/t.references/t.timestamps/
+//     changeTable all route through relative createObject of siblings).
+try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_relative_component_resolution.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }
