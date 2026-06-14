@@ -81,6 +81,36 @@ if (NOT pgskip) {
             [], { datasource: pgdsn });
         assert("ISO string binds to timestamp", r5.s[1] ?: "", "2026-01-02 03:04:05");
 
+        // --- gap: ISO 8601 / RFC 3339 strings WITH a timezone offset or
+        //     fractional seconds bind to timestamptz. This is the exact shape
+        //     RustCFML serializes a timestamptz column TO in JSON output
+        //     ("2026-06-10T07:20:42.177+00:00"), so an app that reads a record
+        //     and saves it back must be able to re-bind the engine's own
+        //     emitted value. ---
+        queryExecute("UPDATE #tbl# SET ts = ? WHERE id = 1",
+            ["2026-06-10T07:20:42+00:00"], { datasource: pgdsn });
+        r5a = queryExecute("SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS s FROM #tbl# WHERE id = 1",
+            [], { datasource: pgdsn });
+        assert("ISO 8601 with offset binds to timestamptz", r5a.s[1] ?: "", "2026-06-10 07:20:42");
+
+        queryExecute("UPDATE #tbl# SET ts = ? WHERE id = 1",
+            ["2026-06-10T07:20:42.177+00:00"], { datasource: pgdsn });
+        r5b = queryExecute("SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS s FROM #tbl# WHERE id = 1",
+            [], { datasource: pgdsn });
+        assert("ISO 8601 with fractional seconds + offset binds to timestamptz", r5b.s[1] ?: "", "2026-06-10 07:20:42");
+
+        queryExecute("UPDATE #tbl# SET ts = ? WHERE id = 1",
+            ["2026-06-10T07:20:42.177Z"], { datasource: pgdsn });
+        r5c = queryExecute("SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS s FROM #tbl# WHERE id = 1",
+            [], { datasource: pgdsn });
+        assert("ISO 8601 with Z (Zulu) suffix binds to timestamptz", r5c.s[1] ?: "", "2026-06-10 07:20:42");
+
+        queryExecute("UPDATE #tbl# SET tsn = ? WHERE id = 1",
+            ["2026-06-10T07:20:42.177"], { datasource: pgdsn });
+        r5d = queryExecute("SELECT to_char(tsn, 'YYYY-MM-DD HH24:MI:SS') AS s FROM #tbl# WHERE id = 1",
+            [], { datasource: pgdsn });
+        assert("ISO 8601 'T' with fractional seconds (no tz) binds to timestamp", r5d.s[1] ?: "", "2026-06-10 07:20:42");
+
         // --- gap: cfqueryparam-style struct with cf_sql_timestamp ---
         queryExecute("UPDATE #tbl# SET ts = ? WHERE id = 1",
             [{ value: createDateTime(2024, 6, 1, 12, 0, 0), cfsqltype: "cf_sql_timestamp" }],
