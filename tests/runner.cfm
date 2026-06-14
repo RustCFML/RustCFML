@@ -404,6 +404,16 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+//   - cfinvoke_argumentcollection_positional: cfinvoke's argumentCollection is
+//     a full argument collection — NUMERIC string keys forward as POSITIONAL
+//     args (named keys as named), like fn(argumentCollection=st) / invoke().
+//     RustCFML forwards named keys but DROPS numeric-keyed (positional)
+//     entries. Wheels' Global.cfc $invoke() rebuilds the dynamic call's
+//     positional args as a numeric-keyed argumentCollection, so onMissingMethod
+//     association methods (post.createComment(struct), dependent=delete's
+//     deleteAll<Assoc>()) lose their positional arg — the FK (named) survives,
+//     the attributes struct (positional) is dropped. Runtime gap, runner-safe.
+try { include "tags/test_cfinvoke_argumentcollection_positional.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_argumentcollection_positional.cfm | " & e.message & chr(10)); }
 //   - cfinvoke_call_form_marshaling: the cf-PREFIXED parenthesized CALL form
 //     cfinvoke(...) — the spelling Lucee accepts and Wheels' Global.cfc
 //     $invoke() uses — must marshal attributeCollection, deliver
