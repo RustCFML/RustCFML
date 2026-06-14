@@ -207,6 +207,15 @@ try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { wr
 // Inherited-method sibling of #132: a bare CreateObject inside an inherited method must
 // resolve against the PARENT (defining) component's package, not the concrete subclass's dir.
 try { include "oop/test_inherited_bare_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_resolution.cfm | " & e.message & chr(10)); }
+//   - inherited_bare_component_via_child_method: follow-on to #133. A bare
+//     CreateObject("component","X") in an inherited method must resolve to the
+//     DEFINING component's package even when reached via a CHILD-defined method
+//     on a subclass in a different dir. #133 fixed the direct-call case (the
+//     CONTROL here passes); RustCFML still resolves against the outermost child
+//     frame's dir for the indirect case. This is the exact Wheels migrator shape
+//     (migration up() -> inherited createTable() -> CreateObject("TableDefinition")),
+//     the sole remaining migrator blocker. Runtime-level, runner-safe.
+try { include "oop/test_inherited_bare_component_via_child_method.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_via_child_method.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }
