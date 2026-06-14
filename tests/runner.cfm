@@ -495,6 +495,18 @@ try { include "core/test_named_args_no_numeric_alias.cfm"; } catch (any e) { wri
 //     setting as an empty value and the ORM introspected the wrong (default
 //     in-memory) database.
 try { include "core/test_named_args_array_view.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_args_array_view.cfm | " & e.message & chr(10)); }
+//   - onmissingmethod_named_keys: when a call falls through to onMissingMethod,
+//     the missingMethodArguments struct must key NAMED args by their NAMES
+//     (obj.probe(label="x") -> "label"), not by numeric position. RustCFML
+//     0.153.0 keys the named-call struct by position ("1","2"), dropping the
+//     names, so a handler that reads missingMethodArguments.status sees
+//     nothing. Positional calls correctly use numeric keys on both engines
+//     (CONTROL). Distinct from invoke()/cfinvoke marshaling (#95, #126) and
+//     the declared-param numeric-alias leak (#82). Surfaced laddering Wheels'
+//     dynamic query scopes scope(name=,handler=) — model("Post").byStatus(
+//     status="published") delivers {1="published"}, so arguments.status is
+//     undefined and the scope's WHERE clause is empty.
+try { include "core/test_onmissingmethod_named_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_onmissingmethod_named_keys.cfm | " & e.message & chr(10)); }
 //   - param_dotted_lhs: the cfscript `param` shorthand must accept a dotted /
 //     scoped lvalue (`param arguments.obj.key = default`), not just a bare
 //     identifier. Surfaced while booting WireBox (Injector.cfc uses
