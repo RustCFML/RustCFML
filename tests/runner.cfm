@@ -229,6 +229,16 @@ try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { write
 try { include "tags/test_cfquery_result_delivery.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_result_delivery.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdbinfo.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdbinfo.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_mapping_path.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_mapping_path.cfm | " & e.message & chr(10)); }
+//   - expandpath_leading_double_slash: a leading "//" must normalize to a
+//     single "/" before this.mappings resolution — expandPath("//x") ==
+//     expandPath("/x"), resolving the same mapping. RustCFML resolves
+//     expandPath("/wheelsmapprobe") via the mapping but lets "//wheelsmapprobe"
+//     fall through to a docroot-relative path, missing the mapping. The stock
+//     `wheels new` Application.cfc declares a /plugins mapping and boot joins
+//     webPath("/") & "/plugins" = "//plugins", so Plugins.cfc's
+//     cfdirectory(ExpandPath("//plugins")) hits a nonexistent dir, throws, and
+//     $init aborts — every request 500s on a pristine Wheels app.
+try { include "tags/test_expandpath_leading_double_slash.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_expandpath_leading_double_slash.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_function_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_function_form.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_recurse_symlink.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_recurse_symlink.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_attrcoll_name.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_attrcoll_name.cfm | " & e.message & chr(10)); }
