@@ -232,6 +232,7 @@ try { include "tags/test_pg_jsonb_param_binds.cfm"; } catch (any e) { writeOutpu
 try { include "tags/test_pg_vector_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_vector_param_binds.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_error_cause_chain.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_error_cause_chain.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_extended_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_extended_param_binds.cfm | " & e.message & chr(10)); }
+try { include "tags/test_pg_pool_checkout_validation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_pool_checkout_validation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_quoted_identifier.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cte_with_query.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cte_with_query.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
