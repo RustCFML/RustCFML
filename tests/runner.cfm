@@ -172,6 +172,13 @@ try { include "members/test_number_members.cfm"; } catch (any e) { writeOutput("
 
 // --- OOP ---
 try { include "oop/test_components.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_components.cfm | " & e.message & chr(10)); }
+//   - component_internals_serialize_leak: iterating a component (for(k in obj))
+//     or SerializeJSON(obj) must expose only data members, never engine
+//     internals. RustCFML leaks __name/__source_file/__variables into both, and
+//     SerializeJSON emits methods as null keys. Breaks Wheels model
+//     properties() (for-in over `this`) and renderWith(data=modelObject) — a
+//     single-record JSON response comes back as ~379 internal keys. Runtime-safe.
+try { include "oop/test_component_internals_serialize_leak.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_internals_serialize_leak.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_method_builtin_name.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_builtin_name.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_return_type.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_return_type.cfm | " & e.message & chr(10)); }
 try { include "oop/test_inheritance.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inheritance.cfm | " & e.message & chr(10)); }
