@@ -503,6 +503,13 @@ try { include "core/test_application_metadata.cfm"; } catch (any e) { writeOutpu
 //     option-forwarding. Surfaced while booting Wheels (contentFor section
 //     detection reads StructKeyList(arguments)).
 try { include "core/test_named_args_no_numeric_alias.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_args_no_numeric_alias.cfm | " & e.message & chr(10)); }
+//   - serializejson_arguments_sentinels: RustCFML tags arguments-derived structs
+//     with internal __arguments_scope/__arguments_params keys; structKeyList/
+//     Count/Exists/for-in filter them but SerializeJSON does not, so
+//     structAppend(s, arguments) then serializeJSON(s) leaks the sentinels.
+//     Lucee has no such keys. Hits Wheels helpers that copy the arguments scope
+//     into option structs and serialize/spool them. Runtime-safe.
+try { include "core/test_serializejson_arguments_sentinels.cfm"; } catch (any e) { writeOutput("ERROR | core/test_serializejson_arguments_sentinels.cfm | " & e.message & chr(10)); }
 //   - named_args_array_view: the arguments scope of a NAMED-argument call must
 //     stay array-addressable (hybrid array/struct) exactly like a positional
 //     call — ArrayLen(arguments) counts the args and arguments[1] reads the
