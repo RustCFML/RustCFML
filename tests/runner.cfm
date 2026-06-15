@@ -207,6 +207,10 @@ try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { wr
 // Inherited-method sibling of #132: a bare CreateObject inside an inherited method must
 // resolve against the PARENT (defining) component's package, not the concrete subclass's dir.
 try { include "oop/test_inherited_bare_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_resolution.cfm | " & e.message & chr(10)); }
+// cfinvoke method="<name>" must dispatch an unknown method to onMissingMethod (as a
+// direct dot-call does). RustCFML 0.161.0 throws "Method not found"; breaks Wheels
+// hasMany dependent=delete/deleteAll/removeAll cascade (deleteAll<assoc> via cfinvoke).
+try { include "oop/test_cfinvoke_onmissingmethod.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_cfinvoke_onmissingmethod.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }
