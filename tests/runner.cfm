@@ -361,6 +361,9 @@ try { include "core/test_local_at_template_scope.cfm"; } catch (any e) { writeOu
 try { include "core/test_local_scope_absence_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_scope_absence_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_local_arguments_scope_independence.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_arguments_scope_independence.cfm | " & e.message & chr(10)); }
 try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata_name_value.cfm | " & e.message & chr(10)); }
+// A parent's displayName attribute must NOT be copied onto a child's leaf metadata.
+// RustCFML 0.161.0 propagates it; Lucee/ACF/BoxLang leave it absent on the leaf.
+try { include "oop/test_getmetadata_inherited_displayname.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_inherited_displayname.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_member_loop_var.cfm | " & e.message & chr(10)); }
