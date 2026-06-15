@@ -6493,6 +6493,47 @@ struct PostgresConnectionManager {
     url: String,
 }
 
+/// Per-connection prepared-statement cache. tokio-postgres' `query(&str)` awaits
+/// a fresh `prepare()` (a Parse round-trip) before binding, so every
+/// parameterized query costs TWO round-trips. Caching the prepared `Statement`
+/// per connection makes the steady state ONE round-trip (bind/execute against
+/// the already-parsed statement) — matching pgjdbc/Lucee.
+#[cfg(feature = "postgres_db")]
+type PgStmtCache = HashMap<String, postgres::Statement>;
+
+/// A pooled PostgreSQL connection plus its prepared-statement cache. The cache
+/// is connection-scoped (server-side prepared statements belong to one session)
+/// and lives as long as the connection sits in the r2d2 pool.
+#[cfg(feature = "postgres_db")]
+struct PgConn {
+    client: postgres::Client,
+    stmt_cache: PgStmtCache,
+}
+
+/// Prepare `sql` once per connection, then hand back the cached `Statement`.
+#[cfg(feature = "postgres_db")]
+fn pg_prepare_cached(
+    client: &mut postgres::Client,
+    cache: &mut PgStmtCache,
+    sql: &str,
+) -> Result<postgres::Statement, postgres::Error> {
+    if let Some(stmt) = cache.get(sql) {
+        return Ok(stmt.clone());
+    }
+    let stmt = client.prepare(sql)?;
+    cache.insert(sql.to_string(), stmt.clone());
+    Ok(stmt)
+}
+
+/// True when the error is PostgreSQL's "cached plan must not change result type"
+/// — raised when DDL alters a table a cached statement references. The fix is to
+/// evict the stale statement and re-prepare (same as pgjdbc).
+#[cfg(feature = "postgres_db")]
+fn is_stale_cached_plan(e: &postgres::Error) -> bool {
+    e.as_db_error()
+        .map_or(false, |db| db.message().contains("cached plan must not change result type"))
+}
+
 /// Error type for the Postgres connection manager. TLS setup can fail with
 /// non-`postgres::Error` causes (cert-store load, rustls config), so the
 /// manager surfaces a single concrete error rather than `postgres::Error`.
@@ -6519,15 +6560,16 @@ impl From<postgres::Error> for PgConnError {
 
 #[cfg(feature = "postgres_db")]
 impl r2d2::ManageConnection for PostgresConnectionManager {
-    type Connection = postgres::Client;
+    type Connection = PgConn;
     type Error = PgConnError;
 
     fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        connect_postgres(&self.url)
+        let client = connect_postgres(&self.url)?;
+        Ok(PgConn { client, stmt_cache: HashMap::new() })
     }
 
     fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.simple_query("SELECT 1").map(|_| ()).map_err(Into::into)
+        conn.client.simple_query("SELECT 1").map(|_| ()).map_err(Into::into)
     }
 
     fn has_broken(&self, conn: &mut Self::Connection) -> bool {
@@ -6537,7 +6579,7 @@ impl r2d2::ManageConnection for PostgresConnectionManager {
         // true. `is_closed()` flips once the background connection task has
         // terminated (e.g. the server closed an idle socket), so a closed
         // connection is evicted rather than handed back out.
-        conn.is_closed()
+        conn.client.is_closed()
     }
 }
 
@@ -7435,9 +7477,10 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
 #[cfg(feature = "postgres_db")]
 fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     let pool = get_postgres_pool(url)?;
-    let mut client = pool.get()
+    let mut conn = pool.get()
         .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
-    run_postgres_statements(&mut client, sql, params_arg, return_type)
+    let pg = &mut *conn;
+    run_postgres_statements(&mut pg.client, &mut pg.stmt_cache, sql, params_arg, return_type)
 }
 
 /// Shared PostgreSQL execution for both the pooled (`execute_postgres`) and
@@ -7470,6 +7513,7 @@ fn format_pg_error(context: &str, e: &postgres::Error) -> String {
 #[cfg(feature = "postgres_db")]
 fn run_postgres_statements(
     client: &mut postgres::Client,
+    cache: &mut PgStmtCache,
     sql: &str,
     params_arg: &CfmlValue,
     return_type: &str,
@@ -7484,8 +7528,21 @@ fn run_postgres_statements(
         let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = pg_params.iter()
             .map(|v| v as &(dyn postgres::types::ToSql + Sync))
             .collect();
-        let rows = client.query(stmt.sql.as_str(), &param_refs)
-            .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL query error", &e)))?;
+        // Cached prepared statement → one round-trip in steady state. On a stale
+        // cached plan (DDL changed the table), evict and re-prepare once.
+        let prepared = pg_prepare_cached(client, cache, stmt.sql.as_str())
+            .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL prepare error", &e)))?;
+        let rows = match client.query(&prepared, &param_refs) {
+            Ok(r) => r,
+            Err(e) if is_stale_cached_plan(&e) => {
+                cache.remove(stmt.sql.as_str());
+                let prepared = pg_prepare_cached(client, cache, stmt.sql.as_str())
+                    .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL prepare error", &e)))?;
+                client.query(&prepared, &param_refs)
+                    .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL query error", &e)))?
+            }
+            Err(e) => return Err(CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL query error", &e))),
+        };
 
         let columns: Vec<String> = if let Some(first_row) = rows.first() {
             first_row.columns().iter().map(|c| c.name().to_string()).collect()
@@ -7509,8 +7566,19 @@ fn run_postgres_statements(
             let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = pg_params.iter()
                 .map(|v| v as &(dyn postgres::types::ToSql + Sync))
                 .collect();
-            let affected = client.execute(stmt.sql.as_str(), &param_refs)
-                .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL error", &e)))?;
+            let prepared = pg_prepare_cached(client, cache, stmt.sql.as_str())
+                .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL prepare error", &e)))?;
+            let affected = match client.execute(&prepared, &param_refs) {
+                Ok(n) => n,
+                Err(e) if is_stale_cached_plan(&e) => {
+                    cache.remove(stmt.sql.as_str());
+                    let prepared = pg_prepare_cached(client, cache, stmt.sql.as_str())
+                        .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL prepare error", &e)))?;
+                    client.execute(&prepared, &param_refs)
+                        .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL error", &e)))?
+                }
+                Err(e) => return Err(CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL error", &e))),
+            };
             total += affected as i64;
         }
         build_mutation_result(total, 0, sql) // PG uses RETURNING, not last_insert_id
@@ -8385,7 +8453,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
             let pool = get_postgres_pool(&url)?;
             let mut conn = pool.get()
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: PostgreSQL pool error: {}", e)))?;
-            conn.simple_query("BEGIN")
+            conn.client.simple_query("BEGIN")
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: BEGIN error: {}", e)))?;
             Ok(TransactionConn::Postgres(conn))
         }
@@ -8413,7 +8481,7 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
-            c.simple_query("COMMIT").map(|_| ())
+            c.client.simple_query("COMMIT").map(|_| ())
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: COMMIT error: {}", e)))
         }
         #[allow(unreachable_patterns)]
@@ -8438,7 +8506,7 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
-            c.simple_query("ROLLBACK").map(|_| ())
+            c.client.simple_query("ROLLBACK").map(|_| ())
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: ROLLBACK error: {}", e)))
         }
         #[allow(unreachable_patterns)]
@@ -8460,7 +8528,7 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
-            execute_postgres_with_conn(c, sql, params_arg, return_type)
+            execute_postgres_with_conn(&mut c.client, sql, params_arg, return_type)
         }
         #[allow(unreachable_patterns)]
         _ => Err(CfmlError::runtime("Transaction: unsupported driver".to_string())),
@@ -8555,7 +8623,10 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
 
 #[cfg(feature = "postgres_db")]
 fn execute_postgres_with_conn(client: &mut postgres::Client, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
-    run_postgres_statements(client, sql, params_arg, return_type)
+    // Transaction path: a transaction is short-lived, so use a local statement
+    // cache (still de-dupes repeated SQL within the transaction).
+    let mut cache = PgStmtCache::new();
+    run_postgres_statements(client, &mut cache, sql, params_arg, return_type)
 }
 
 // -----------------------------------------------
