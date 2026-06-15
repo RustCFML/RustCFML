@@ -19,6 +19,10 @@ try { include "core/test_bare_call_caller_stack_leak.cfm"; } catch (any e) { wri
 try { include "core/test_null_return_no_key.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_return_no_key.cfm | " & e.message & chr(10)); }
 try { include "core/test_bare_call_shadowing_semantics.cfm"; } catch (any e) { writeOutput("ERROR | core/test_bare_call_shadowing_semantics.cfm | " & e.message & chr(10)); }
 try { include "core/test_closure_env_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_env_leak.cfm | " & e.message & chr(10)); }
+// A named exclusive lock must be reentrant within the same thread: re-acquiring an
+// already-held named lock must not block. RustCFML 0.161.0 self-deadlocks (inner
+// re-acquire times out + throws), surfacing as request hangs.
+try { include "core/test_named_lock_reentrant.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_lock_reentrant.cfm | " & e.message & chr(10)); }
 try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undeclared_named_args.cfm | " & e.message & chr(10)); }
 //   - invoke_undeclared_keys: the argument struct of the positional BIF
