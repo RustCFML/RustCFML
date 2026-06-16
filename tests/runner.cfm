@@ -119,6 +119,7 @@ try { include "types/test_binary.cfm"; } catch (any e) { writeOutput("ERROR | ty
 try { include "types/test_hash_in_strings.cfm"; } catch (any e) { writeOutput("ERROR | types/test_hash_in_strings.cfm | " & e.message & chr(10)); }
 try { include "comments/test_hash_in_comments.cfm"; } catch (any e) { writeOutput("ERROR | comments/test_hash_in_comments.cfm | " & e.message & chr(10)); }
 try { include "comments/test_tags_in_block_comments.cfm"; } catch (any e) { writeOutput("ERROR | comments/test_tags_in_block_comments.cfm | " & e.message & chr(10)); }
+try { include "comments/test_cfset_expression_comments.cfm"; } catch (any e) { writeOutput("ERROR | comments/test_cfset_expression_comments.cfm | " & e.message & chr(10)); }
 
 // --- Standard Library ---
 try { include "stdlib/test_string_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions.cfm | " & e.message & chr(10)); }
