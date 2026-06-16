@@ -252,6 +252,7 @@ try { include "tags/test_tags_misc.cfm"; } catch (any e) { writeOutput("ERROR | 
 try { include "tags/test_tags_customtag.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_customtag.cfm | " & e.message & chr(10)); }
 try { include "tags/test_custom_tag_attribute_collection.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_custom_tag_attribute_collection.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_customtag_lifecycle.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_customtag_lifecycle.cfm | " & e.message & chr(10)); }
+try { include "tags/test_tags_cfexit.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfexit.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_buffer_recovery.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_buffer_recovery.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfexecute.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfexecute.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfmail.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfmail.cfm | " & e.message & chr(10)); }
