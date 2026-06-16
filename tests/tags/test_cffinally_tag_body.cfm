@@ -6,10 +6,11 @@ suiteBegin("Tags: cffinally tag body");
     ============================================================
     Background
     ============================================================
-    The tag form <cftry> ... <cfcatch> ... <cffinally> ... </cftry> transpiles
-    to a CFScript try/catch/finally. On Lucee 5/6/7, Adobe ColdFusion, and
-    BoxLang the finally block parses and always runs (after normal completion
-    and after a caught exception).
+    The tag form <cftry> ... <cfcatch> ... <cffinally> ... </cftry> and the
+    catchless <cftry> ... <cffinally> ... </cftry> form both transpile to
+    CFScript try/finally shapes. On Lucee 5/6/7, Adobe ColdFusion, and BoxLang
+    the finally block parses and always runs (after normal completion and after
+    a caught exception).
 
     On RustCFML the whitespace (newlines/indentation) between </cfcatch> and
     <cffinally> -- and between a <cftry> body and <cffinally> -- was emitted as
@@ -60,6 +61,8 @@ assert("try/catch/finally (no exception) parses and runs finally",
     loadRun("CffinallyHappyPathFixture"), "try,finally");
 assert("try/catch/finally (caught exception) runs catch then finally",
     loadRun("CffinallyAfterThrowFixture"), "try,catch,finally");
+assert("try/finally without catch parses and runs finally",
+    loadRun("CffinallyWithoutCatchFixture"), "try,finally");
 
 suiteEnd();
 </cfscript>
