@@ -124,6 +124,8 @@ try { include "comments/test_tags_in_block_comments.cfm"; } catch (any e) { writ
 try { include "stdlib/test_string_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_string_functions_regex.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions_regex.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_string_functions_encoding.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions_encoding.cfm | " & e.message & chr(10)); }
+// EncodeForHTMLAttribute must encode attribute-dangerous chars (space, =) per OWASP/Lucee; RustCFML leaves them raw.
+try { include "functions/test_encodeforhtmlattribute_space_equals.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_encodeforhtmlattribute_space_equals.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_array_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_array_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_array_higher_order.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_array_higher_order.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_struct_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_struct_functions.cfm | " & e.message & chr(10)); }
