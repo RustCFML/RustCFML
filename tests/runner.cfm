@@ -241,6 +241,7 @@ try { include "oop/test_inherited_bare_component_via_child_method.cfm"; } catch 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_control.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_control.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cfloop_list_literal.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfloop_list_literal.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_include.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_include.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfinclude_css.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinclude_css.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cffunction_hoisting.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cffunction_hoisting.cfm | " & e.message & chr(10)); }
