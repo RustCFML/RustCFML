@@ -35,5 +35,15 @@ bareNames = function(string extends = "", string implements = "") {
 };
 assert("`extends`/`implements` resolve as bare parameter references", bareNames("x", "y"), "x/y");
 
+// `imp` is legal as an ordinary local variable name on Lucee. It appears in
+// short-lived impersonation-context locals (for example, `var imp = ...`) and
+// must not be tokenized as a hard keyword in expression contexts.
+function impIdentifierProbe() {
+	var imp = "ok";
+	return imp;
+}
+
+assert("`imp` is usable as a local variable name", impIdentifierProbe(), "ok");
+
 suiteEnd();
 </cfscript>
