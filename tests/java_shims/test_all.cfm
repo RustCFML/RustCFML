@@ -43,6 +43,20 @@ assertTrue( "System.getProperty user.dir", test5 );
 out = system.out;
 assertTrue( "System.out exists", isObject( out ) );
 
+// Test Date — real-world Lucee code commonly uses java.util.Date(0) as an
+// epoch base date for dateDiff/dateAdd calculations.
+writeOutput( "\n--- Testing Date ---\n" );
+dateError = "";
+dateMillis = "";
+try {
+    epochDate = createObject( "java", "java.util.Date" ).init( javacast( "int", 0 ) );
+    dateMillis = epochDate.getTime();
+} catch ( any e ) {
+    dateError = e.message;
+}
+assert( "Date init does not throw", dateError, "" );
+assert( "Date getTime epoch millis", dateMillis, 0 );
+
 // Test File
 writeOutput( "\n--- Testing File ---\n" );
 file = createObject( "java", "java.io.File" ).init( "/tmp/test.txt" );
