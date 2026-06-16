@@ -305,6 +305,7 @@ try { include "tags/test_tag_attribute_interpolation_sweep.cfm"; } catch (any e)
 try { include "tags/test_tags_cfhttpparam_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfhttpparam_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tag_string_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tag_string_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tag_attribute_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tag_attribute_interpolation.cfm | " & e.message & chr(10)); }
+try { include "tags/test_tag_attribute_escaped_hash.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tag_attribute_escaped_hash.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cffinally_tag_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cffinally_tag_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cflog_cfmail_attribute_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cflog_cfmail_attribute_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfzip.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfzip.cfm | " & e.message & chr(10)); }
