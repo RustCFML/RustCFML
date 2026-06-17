@@ -47,6 +47,9 @@ assert("string.ucFirst()", "hello world".ucFirst(), "Hello world");
 // --- compare ---
 assert("string.compare() equal", "Hello".compare("Hello"), 0);
 
+// --- toString ---
+assert("string.toString() returns receiver text", "hello".toString(), "hello");
+
 // --- getToken (member form; string-first signature, no arg swap) ---
 // Regression: the member form returned empty while the standalone getToken()
 // worked. WireBox's delegate shorthand parser uses `item.getToken(1, "=")`.
