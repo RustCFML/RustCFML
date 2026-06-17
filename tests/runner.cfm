@@ -549,6 +549,7 @@ try { include "core/test_switch_braced_case.cfm"; } catch (any e) { writeOutput(
 try { include "core/test_switch_fallthrough.cfm"; } catch (any e) { writeOutput("ERROR | core/test_switch_fallthrough.cfm | " & e.message & chr(10)); }
 try { include "core/test_application_scope_persist.cfm"; } catch (any e) { writeOutput("ERROR | core/test_application_scope_persist.cfm | " & e.message & chr(10)); }
 try { include "core/test_session_scope_persist.cfm"; } catch (any e) { writeOutput("ERROR | core/test_session_scope_persist.cfm | " & e.message & chr(10)); }
+try { include "core/test_session_commit.cfm"; } catch (any e) { writeOutput("ERROR | core/test_session_commit.cfm | " & e.message & chr(10)); }
 try { include "core/test_application_metadata.cfm"; } catch (any e) { writeOutput("ERROR | core/test_application_metadata.cfm | " & e.message & chr(10)); }
 //   - named_args_no_numeric_alias: a named-argument call to a function that
 //     DECLARES params must populate the arguments scope by name only. When a
