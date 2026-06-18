@@ -330,6 +330,7 @@ try { include "includes/test_closure_in_swapped_program.cfm"; } catch (any e) { 
 try { include "lifecycle/test_session_app_namespace.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_session_app_namespace.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_mapping_coverage.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_mapping_coverage.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_lifecycle_case_override.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_lifecycle_case_override.cfm | " & e.message & chr(10)); }
+try { include "lifecycle/test_application_lifecycle_super_this.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_lifecycle_super_this.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_load_errors.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_load_errors.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_scope_custom_tag.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_scope_custom_tag.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_onerror_onabort.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_onerror_onabort.cfm | " & e.message & chr(10)); }

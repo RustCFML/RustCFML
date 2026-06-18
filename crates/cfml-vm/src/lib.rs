@@ -5523,7 +5523,7 @@ impl CfmlVirtualMachine {
                         } else if let CfmlValue::Struct(ref s) = object {
                             if s.contains_key("__is_super") {
                                 // Super dispatch — find the parent's function by stored index
-                                let prop = object.get(&method_name).unwrap_or(CfmlValue::Null);
+                                let prop = s.get_ci(method_name.as_str()).unwrap_or(CfmlValue::Null);
                                 if let CfmlValue::Function(ref f) = &prop {
                                     // Extract the stored global_id from the body.
                                     let func_idx =
