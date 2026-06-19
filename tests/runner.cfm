@@ -295,6 +295,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_pg_error_cause_chain.cfm">
 <cf_runtest file="tags/test_pg_extended_param_binds.cfm">
 <cf_runtest file="tags/test_pg_pool_checkout_validation.cfm">
+<cf_runtest file="tags/test_pg_pool_stale_connection_retry.cfm">
 <cf_runtest file="tags/test_cfquery_quoted_identifier.cfm">
 <cf_runtest file="tags/test_cte_with_query.cfm">
 <cf_runtest file="tags/test_tags_cfquery_control_tags.cfm">
