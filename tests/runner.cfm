@@ -512,6 +512,12 @@ include "harness.cfm";
 <!--- above (which has a body). A bare transaction{} block is the in-suite --->
 <!--- control. --->
 <cf_runtest file="tags/test_transaction_action_statement.cfm">
+<!--- - nested_transaction: a transaction{} block nested inside another --->
+<!--- transaction{} block. Lucee/ACF/BoxLang run the inner as a savepoint and --->
+<!--- complete; RustCFML throws "nested transactions are not supported". Wheels --->
+<!--- model save()/create() inside an outer app transaction hits this (84 specs --->
+<!--- in the core suite). --->
+<cf_runtest file="tags/test_nested_transaction.cfm">
 <!--- - component_declaration_attributes: follow-on to component_soft_keyword. --->
 <!--- Component-header metadata attributes are order-independent and may be --->
 <!--- written quoted or unquoted on Lucee/ACF/BoxLang. Two shapes the Wheels --->
