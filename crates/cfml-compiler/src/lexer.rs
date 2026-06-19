@@ -304,13 +304,40 @@ impl Lexer {
                     let mut expr_str = String::new();
                     let mut depth = 0;
                     // Scan to the matching (depth-0) '#'. A lone, unbalanced '#'
-                    // must NOT run past the end of the string literal: if we reach
-                    // the closing quote (at depth <= 0, i.e. not inside a nested
-                    // call) the interpolation was never terminated. Report it at
-                    // the opening '#', not at some far-off EOF (GitHub #181).
+                    // must NOT run past the end of the string literal. Quoted
+                    // literals inside the interpolation expression are still part
+                    // of that expression, even when they use the same quote as the
+                    // outer string (for example: "#flag ? "YES" : ""#").
                     while !self.is_at_end() && !(self.current() == '#' && depth == 0) {
-                        if self.current() == '(' { depth += 1; }
-                        if self.current() == ')' { depth -= 1; }
+                        if (self.current() == '"' || self.current() == '\'')
+                            && self.can_start_interpolation_string_literal(&expr_str)
+                        {
+                            let nested_quote = self.current();
+                            expr_str.push(nested_quote);
+                            self.advance();
+
+                            while !self.is_at_end() {
+                                let c = self.current();
+                                expr_str.push(c);
+                                self.advance();
+
+                                if c == nested_quote {
+                                    if !self.is_at_end() && self.current() == nested_quote {
+                                        expr_str.push(self.current());
+                                        self.advance();
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        if self.current() == '(' {
+                            depth += 1;
+                        }
+                        if self.current() == ')' {
+                            depth -= 1;
+                        }
                         if self.current() == quote && depth <= 0 {
                             self.tokens.push(TokenWithLoc {
                                 token: Token::Error(format!(
@@ -403,6 +430,65 @@ impl Lexer {
                 });
             }
         }
+    }
+
+    fn can_start_interpolation_string_literal(&self, expr_str: &str) -> bool {
+        let trimmed = expr_str.trim_end();
+        let Some(previous) = trimmed.chars().last() else {
+            return true;
+        };
+
+        if matches!(
+            previous,
+            '(' | '['
+                | '{'
+                | ','
+                | ':'
+                | '?'
+                | '='
+                | '!'
+                | '<'
+                | '>'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '&'
+                | '|'
+                | '^'
+        ) {
+            return true;
+        }
+
+        if previous.is_ascii_alphanumeric() || previous == '_' || previous == '$' {
+            let word = trimmed
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            return matches!(
+                word.as_str(),
+                "and"
+                    | "or"
+                    | "xor"
+                    | "eq"
+                    | "neq"
+                    | "ne"
+                    | "gt"
+                    | "gte"
+                    | "lt"
+                    | "lte"
+                    | "contains"
+                    | "is"
+                    | "mod"
+                    | "eqv"
+                    | "imp"
+            );
+        }
+
+        false
     }
 
     fn number(&mut self, first: char) {
@@ -520,7 +606,8 @@ mod tests {
         assert_eq!(err.location.start.column, 22);
         // It must not have devoured the trailing bar(...) call.
         assert!(
-            toks.iter().any(|t| matches!(&t.token, Token::Identifier(s) if s == "bar")),
+            toks.iter()
+                .any(|t| matches!(&t.token, Token::Identifier(s) if s == "bar")),
             "interpolation ran past the string and swallowed later tokens"
         );
     }
@@ -543,6 +630,24 @@ mod tests {
             assert!(
                 lone_hash_error(&toks).is_none(),
                 "valid string wrongly flagged: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_quote_string_literals_inside_interpolation_do_not_error() {
+        for src in [
+            r###""value=#flag ? "YES" : ""#""###,
+            r###""statement=#flag ? "UNIQUE" : ""# INDEX #name#""###,
+            r###""enabled=#status EQ "active" ? "yes" : "no"#""###,
+            r###""quoted=#flag ? "A ""quoted"" value" : "fallback"#""###,
+            r###""hash=#replace("a##b", "##", "-")#""###,
+            r###"'value=#flag ? 'YES' : ''#'"###,
+        ] {
+            let toks = tokenize(src.to_string());
+            assert!(
+                lone_hash_error(&toks).is_none(),
+                "valid same-quote interpolation wrongly flagged: {src}"
             );
         }
     }

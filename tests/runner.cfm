@@ -126,6 +126,7 @@ include "harness.cfm";
 <cf_runtest file="types/test_query_reference.cfm">
 <cf_runtest file="types/test_binary.cfm">
 <cf_runtest file="types/test_hash_in_strings.cfm">
+<cf_runtest file="types/test_string_interpolation_nested_strings.cfm">
 <cf_runtest file="comments/test_hash_in_comments.cfm">
 <cf_runtest file="comments/test_tags_in_block_comments.cfm">
 
