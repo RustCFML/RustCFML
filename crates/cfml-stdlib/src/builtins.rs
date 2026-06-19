@@ -7476,6 +7476,135 @@ fn is_select_query(sql: &str) -> bool {
     )
 }
 
+/// PostgreSQL also returns rows from DML statements with a top-level
+/// `RETURNING` clause. Those must run through `query`, not `execute`; the
+/// postgres crate rejects row-returning statements on the execute path.
+#[cfg(feature = "postgres_db")]
+fn postgres_returns_rows(sql: &str) -> bool {
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let kw = trimmed[..kw_len].to_ascii_uppercase();
+
+    if matches!(
+        kw.as_str(),
+        "SELECT" | "WITH" | "CALL" | "EXEC" | "EXECUTE" | "VALUES" | "SHOW" | "PRAGMA"
+            | "EXPLAIN" | "DESCRIBE" | "DESC"
+    ) {
+        return true;
+    }
+
+    matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        && sql_has_top_level_keyword(trimmed, "RETURNING")
+}
+
+#[cfg(feature = "postgres_db")]
+fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '\'' || c == '"' {
+            i = skip_sql_quoted(&chars, i, c);
+            continue;
+        }
+
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+
+        if c == '$' {
+            if let Some(next) = skip_postgres_dollar_quote(&chars, i) {
+                i = next;
+                continue;
+            }
+        }
+
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ => {
+                if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
+                    let start = i;
+                    i += 1;
+                    while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                        i += 1;
+                    }
+                    let word: String = chars[start..i].iter().collect();
+                    if word.eq_ignore_ascii_case(target) {
+                        return true;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    false
+}
+
+#[cfg(feature = "postgres_db")]
+fn skip_sql_quoted(chars: &[char], start: usize, quote: char) -> usize {
+    let mut i = start + 1;
+    while i < chars.len() {
+        if chars[i] == quote {
+            if chars.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+#[cfg(feature = "postgres_db")]
+fn skip_postgres_dollar_quote(chars: &[char], start: usize) -> Option<usize> {
+    let mut tag_end = start + 1;
+    while tag_end < chars.len() && (chars[tag_end].is_ascii_alphanumeric() || chars[tag_end] == '_') {
+        tag_end += 1;
+    }
+    if chars.get(tag_end) != Some(&'$') {
+        return None;
+    }
+
+    let delimiter: Vec<char> = chars[start..=tag_end].to_vec();
+    let mut i = tag_end + 1;
+    while i + delimiter.len() <= chars.len() {
+        if chars[i..i + delimiter.len()] == delimiter[..] {
+            return Some(i + delimiter.len());
+        }
+        i += 1;
+    }
+    Some(chars.len())
+}
+
 /// Dynamic-driver-only `queryExecute` for builds that don't enable any
 /// of the per-engine DB features (e.g. the Cloudflare Workers host,
 /// which uses the dynamic-driver registry to plug in D1). Looks up
@@ -7917,10 +8046,10 @@ fn run_postgres_statements(
     params_arg: &CfmlValue,
     return_type: &str,
 ) -> CfmlResult {
-    let select = is_select_query(sql);
-    let statements = crate::pg_sql::prepare_pg_statements(sql, params_arg, !select)?;
+    let returns_rows = postgres_returns_rows(sql);
+    let statements = crate::pg_sql::prepare_pg_statements(sql, params_arg, !returns_rows)?;
 
-    if select {
+    if returns_rows {
         // split=false guarantees exactly one statement.
         let stmt = &statements[0];
         let pg_params: Vec<PgParam> = stmt.params.iter().map(cfml_to_pg_param).collect();
@@ -7943,11 +8072,7 @@ fn run_postgres_statements(
             Err(e) => return Err(CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL query error", &e))),
         };
 
-        let columns: Vec<String> = if let Some(first_row) = rows.first() {
-            first_row.columns().iter().map(|c| c.name().to_string()).collect()
-        } else {
-            vec![]
-        };
+        let columns: Vec<String> = prepared.columns().iter().map(|c| c.name().to_string()).collect();
 
         let mut result_rows: Vec<ValueMap> = Vec::with_capacity(rows.len());
         for row in &rows {
