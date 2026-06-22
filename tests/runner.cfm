@@ -185,6 +185,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_writedump.cfm">
 <cf_runtest file="stdlib/test_cfdirectory_type_filter.cfm">
 <cf_runtest file="stdlib/test_cfhttp.cfm">
+<cf_runtest file="stdlib/test_cfhttp_binary_response.cfm">
 
 <!--- --- Function References --- --->
 <cf_runtest file="functions/test_function_references.cfm">

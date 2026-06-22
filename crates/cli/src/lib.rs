@@ -1762,11 +1762,15 @@ fn build_success_response(
         &response.response_headers,
     );
 
-    // Determine body
+    // Determine body. Binary cfcontent payloads must stay raw bytes; stringifying
+    // a CfmlValue::Binary would emit the diagnostic placeholder instead.
     let body = if let Some(ref body_override) = response.response_body {
-        body_override.as_string()
+        match body_override {
+            CfmlValue::Binary(bytes) => axum::body::Body::from(bytes.clone()),
+            other => axum::body::Body::from(other.as_string()),
+        }
     } else {
-        response.output
+        axum::body::Body::from(response.output)
     };
 
     // Determine status code
@@ -1795,7 +1799,7 @@ fn build_success_response(
         }
     }
 
-    builder.body(axum::body::Body::from(body)).unwrap()
+    builder.body(body).unwrap()
 }
 
 use cfml_vm::web::{ResolvedFile, resolve_file};
@@ -3036,4 +3040,3 @@ fn embedded_status(pid_file: &str) {
     }
     exit(0);
 }
-

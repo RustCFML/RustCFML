@@ -888,7 +888,18 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // format_attr_value emits literal segments quoted and only evaluates
             // the #...# parts; strip_hashes would collapse the whole value into a
             // bare (mis-parsed) expression like `baseUrlpath`.
-            for key in ["url", "method", "timeout", "charset", "username", "password", "useragent", "proxyserver", "multipart"] {
+            for key in [
+                "url",
+                "method",
+                "timeout",
+                "charset",
+                "username",
+                "password",
+                "useragent",
+                "proxyserver",
+                "multipart",
+                "getasbinary",
+            ] {
                 if let Some(v) = attrs.get(key) {
                     opts.push(format!("{}: {}", key, format_attr_value(v, quoted.contains(key))));
                 }
