@@ -291,6 +291,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfhtmlhead_body.cfm">
 <cf_runtest file="tags/test_tags_cfexit.cfm">
 <cf_runtest file="tags/test_tags_customtag.cfm">
+<cf_runtest file="tags/test_custom_tag_caller_cfc_method.cfm">
 <cf_runtest file="tags/test_custom_tag_attribute_collection.cfm">
 <cf_runtest file="tags/test_tags_customtag_lifecycle.cfm">
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
