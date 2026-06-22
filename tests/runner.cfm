@@ -322,6 +322,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_pg_pool_stale_connection_retry.cfm">
 <cf_runtest file="tags/test_mssql_pool_stale_connection_retry.cfm">
 <cf_runtest file="tags/test_cfquery_quoted_identifier.cfm">
+<cf_runtest file="tags/test_cfquery_sql_line_comments.cfm">
 <cf_runtest file="tags/test_cte_with_query.cfm">
 <cf_runtest file="tags/test_tags_cfquery_control_tags.cfm">
 <cf_runtest file="tags/test_cfquery_result_delivery.cfm">
