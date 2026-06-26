@@ -1,0 +1,3 @@
+component {
+	public function baseFn() {}
+}

@@ -714,6 +714,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_cfinvoke_sibling_scope.cfm">
 <cf_runtest file="oop/test_cfinvoke_overlay_writeback.cfm">
 <cf_runtest file="oop/test_mixin_private_scope_dispatch.cfm">
+<cf_runtest file="oop/test_getmetadata_fidelity.cfm">
 
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">
