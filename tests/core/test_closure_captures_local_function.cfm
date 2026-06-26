@@ -42,4 +42,57 @@ assert("nested closure captures an enclosing var-scoped string", result.str, "ca
 assert("nested closure can call an enclosing var-scoped function", result.fn, "fn:ok");
 
 suiteEnd();
+
+
+suiteBegin("Closure captures enclosing var-scoped function (deferred / nested-closure)");
+
+// ============================================================
+// Second gap, surfaced laddering the Wheels suite on RustCFML 0.309.0. The
+// single-level case above is now fixed, but the shape the Wheels core specs
+// actually use is still broken: the capturing closure is DEFINED INSIDE an
+// intermediate closure's body and INVOKED AFTER that intermediate has returned
+// — i.e. describe(() => { it(() => { helper(); }); }), where TestBox stores the
+// it() body and runs it later. RustCFML loses the grandparent var-scoped
+// function expression across that intermediate boundary and throws
+// "Variable 'fnVal' is undefined". Lucee/ACF/BoxLang keep the capture.
+//
+// This is the exact shape of MigratorInfoSpec / OrphanDetectionSpec /
+// MigratorReconciliationSpec — `var insertOrphan = function(){...}` declared in
+// run(), called from inside it() closures nested under describe() — which error
+// "Variable 'insertOrphan' is undefined" on 0.309 (12 specs).
+// ============================================================
+
+function buildDeferredScope() {
+	// var-scoped function expression in the ENCLOSING (grandparent) fn
+	var fnVal = function (required string x) {
+		return "fn:" & arguments.x;
+	};
+	var stored = [];
+	// an intermediate closure that runs its argument synchronously (like describe())
+	var intermediate = function (required any body) {
+		arguments.body();
+	};
+	intermediate(() => {
+		// inner closure DEFINED HERE (inside the intermediate's body), capturing the
+		// grandparent fnVal, and STORED for later invocation (like it()'s body)
+		arrayAppend(stored, () => {
+			return fnVal("ok");
+		});
+	});
+	var out = {};
+	// pull the stored closure out before calling — arr[idx]() call syntax is rejected
+	// by the Lucee/ACF parsers, so keep this cross-engine safe
+	var deferred = stored[1];
+	try { out.fn = deferred(); }          // invoke AFTER the intermediate returned
+	catch (any e) { out.fn = "ERR:" & e.message; }
+	return out;
+}
+
+deferredResult = buildDeferredScope();
+
+// THE GAP: a closure defined inside an intermediate closure and invoked later must
+// still see the enclosing var-scoped FUNCTION expression.
+assert("deferred nested closure can call an enclosing var-scoped function", deferredResult.fn, "fn:ok");
+
+suiteEnd();
 </cfscript>
