@@ -266,6 +266,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_inherited_helpers.cfm">
 <cf_runtest file="oop/test_mixin_self_dispatch.cfm">
 <cf_runtest file="oop/test_component_body_chained_assignment_aliasing.cfm">
+<cf_runtest file="oop/test_inherited_chained_assignment_aliasing.cfm">
 <cf_runtest file="oop/test_implicit_accessor_constructor.cfm">
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_implements_unqualified_sibling.cfm">

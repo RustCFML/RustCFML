@@ -20152,6 +20152,50 @@ impl CfmlVirtualMachine {
             parent
         };
 
+        // Record which members the parent exposes as ONE shared reference in
+        // both its `this` scope (a top-level key) and its `variables` scope
+        // (`__variables`) — the aliasing a pseudo-constructor
+        // `variables.x = this.x = new Foo()` establishes (GitHub #221). The
+        // `__variables` merge below re-inserts a fresh variables map, and the
+        // child may carry a stale independent copy of an inherited member in
+        // its own `__variables`, either of which splits that single reference
+        // into two. We capture the shared keys here (while `parent` still holds
+        // the correct backing-store identities) and re-establish the sharing
+        // after the merge, so a subclass instance's `variables.x` and `this.x`
+        // stay one reference exactly as the parent built them (GitHub #227).
+        let parent_shared_keys: Vec<String> = if let CfmlValue::Struct(ref ps) = parent {
+            let pvars = ps
+                .get("__variables")
+                .and_then(|v| v.as_struct())
+                .unwrap_or_default();
+            let backing = |v: &CfmlValue| -> Option<usize> {
+                match v {
+                    CfmlValue::Struct(s) => Some(s.backing_ptr()),
+                    CfmlValue::Array(a) => Some(a.backing_ptr()),
+                    _ => None,
+                }
+            };
+            ps.iter()
+                .filter_map(|(k, v)| {
+                    if k.starts_with("__") {
+                        return None;
+                    }
+                    let tb = backing(&v)?;
+                    let shared = pvars
+                        .get(&k)
+                        .and_then(|vv| backing(&vv))
+                        .map_or(false, |vb| vb == tb);
+                    if shared {
+                        Some(k)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Now merge: start with parent, layer child on top
         let child_map = match child {
             CfmlValue::Struct(s) => s,
@@ -20317,6 +20361,29 @@ impl CfmlVirtualMachine {
                 .map(|s| CfmlValue::string(s))
                 .collect();
             parent_map.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+        }
+
+        // Re-establish the parent's `this`<->`variables` shared references
+        // (GitHub #227): for each member the parent built as one shared object
+        // in both scopes, point the merged `__variables` entry back at the
+        // merged top-level (`this`) entry so the subclass instance keeps a
+        // single reference. Skip any member the child redeclared at the `this`
+        // level — the child's own construction already shares those correctly.
+        for k in &parent_shared_keys {
+            if child_map.get_ci(k).is_some() {
+                continue;
+            }
+            let this_val = match parent_map.get(k).cloned() {
+                Some(v @ (CfmlValue::Struct(_) | CfmlValue::Array(_))) => v,
+                _ => continue,
+            };
+            if let Some(vars) = parent_map
+                .get_mut("__variables")
+                .and_then(|v| v.as_cfml_struct())
+            {
+                vars.remove_ci(k);
+                vars.insert(k.clone(), this_val);
+            }
         }
 
         CfmlValue::strukt(parent_map)
