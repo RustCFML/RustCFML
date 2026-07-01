@@ -4286,23 +4286,39 @@ impl Parser {
             // are surfaced as parameter annotations in getMetadata() (WireBox DI
             // reads `param.inject`).
             let mut annotations: Vec<(String, String)> = Vec::new();
+            // A bareword token usable as an annotation key: a plain identifier
+            // or a soft keyword (public, required, default, …).
+            let key_string = |p: &Self, n: usize| -> Option<String> {
+                if let Token::Identifier(ref s) = p.peek(n) {
+                    Some(s.clone())
+                } else {
+                    p.token_as_string(&p.peek(n).clone())
+                }
+            };
             loop {
-                let is_attr_key = matches!(self.peek(1), Token::Equal)
-                    && (matches!(self.peek(0), Token::Identifier(_))
-                        || self.token_as_string(&self.peek(0).clone()).is_some());
-                if !is_attr_key {
+                if key_string(self, 0).is_none() {
                     break;
                 }
-                let key = if let Token::Identifier(ref s) = self.peek(0) {
-                    let s = s.clone();
-                    self.advance();
-                    s
-                } else if let Some(s) = self.token_as_string(&self.peek(0).clone()) {
-                    self.advance();
-                    s
-                } else {
+                // Namespaced attribute keys — `colddoc:generic="x.Y"` from a tag
+                // attribute like `<cfargument colddoc:generic="...">`. Lucee
+                // accepts these and surfaces them in metadata; without this the
+                // `:` fell through as an unexpected token ("Expected RParen,
+                // found Colon"). Detect `ident : ident =`.
+                let namespaced = matches!(self.peek(1), Token::Colon)
+                    && key_string(self, 2).is_some()
+                    && matches!(self.peek(3), Token::Equal);
+                let plain = matches!(self.peek(1), Token::Equal);
+                if !namespaced && !plain {
                     break;
-                };
+                }
+                let mut key = key_string(self, 0).unwrap();
+                self.advance();
+                if namespaced {
+                    self.advance(); // consume ':'
+                    key.push(':');
+                    key.push_str(&key_string(self, 0).unwrap());
+                    self.advance();
+                }
                 self.consume(&Token::Equal)?;
                 if let Token::String(ref v) = self.peek(0) {
                     let v = v.clone();

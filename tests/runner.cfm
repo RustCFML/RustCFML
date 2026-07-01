@@ -347,6 +347,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_include.cfm">
 <cf_runtest file="tags/test_cfinclude_css.cfm">
 <cf_runtest file="tags/test_tags_cffunction_hoisting.cfm">
+<cf_runtest file="tags/test_tags_cfargument_namespaced_attr.cfm">
 <cf_runtest file="tags/test_tags_savecontent.cfm">
 <cf_runtest file="tags/test_tags_param.cfm">
 <cf_runtest file="tags/test_tags_param_dynamic.cfm">

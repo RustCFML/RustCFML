@@ -259,6 +259,16 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
             if j + 2 >= len && !(j >= 3 && chars[j - 1] == '>' && chars[j - 2] == '-' && chars[j - 3] == '-') {
                 j = len; // unclosed comment, skip to end
             }
+            // Preserve the newlines that lived inside the comment so downstream
+            // line numbers still line up with the source. Dropping the comment
+            // outright (a multi-line `<!----- … ----->` banner is common) shifted
+            // every subsequent tag up by the comment's height, so parse errors
+            // were reported on the wrong line (GitHub #226).
+            for c in &chars[i..j] {
+                if *c == '\n' {
+                    result.push('\n');
+                }
+            }
             i = j;
             continue;
         }
