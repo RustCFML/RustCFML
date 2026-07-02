@@ -1338,16 +1338,27 @@ pub fn handle_java_concurrentlinkedqueue(
         "add" | "offer" => {
             // Append IN PLACE through the shared shim (real Java queues are
             // reference types: `variables.q.add(x)` and a `q` passed into a
-            // function must both see it). Snapshot+return-new only survived
-            // reassignment writeback. Java's add/offer return boolean true.
+            // function must both see it). Java's add/offer return boolean true.
+            //
+            // The push MUST mutate the existing backing array under its own write
+            // lock rather than snapshot-copy-then-replace: a ConcurrentLinkedQueue
+            // is expected to be thread-safe, and the old read-copy-replace lost
+            // concurrent adds (10 threads × 5 items surfaced ~48/50 — GH #234).
+            // A single with_write per add serialises appends on the shared Arc, so
+            // no update is lost.
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(item) = args.first() {
-                    let mut q = match shim.get("__queue") {
-                        Some(CfmlValue::Array(a)) => a.snapshot(),
-                        _ => Vec::new(),
-                    };
-                    q.push(item.clone());
-                    shim.insert("__queue".to_string(), CfmlValue::array(q));
+                    match shim.get("__queue") {
+                        Some(CfmlValue::Array(a)) => {
+                            a.with_write(|v| v.push(item.clone()));
+                        }
+                        _ => {
+                            shim.insert(
+                                "__queue".to_string(),
+                                CfmlValue::array(vec![item.clone()]),
+                            );
+                        }
+                    }
                 }
                 Ok(CfmlValue::Bool(true))
             } else {
@@ -1358,16 +1369,19 @@ pub fn handle_java_concurrentlinkedqueue(
             // Remove and RETURN the head element, mutating the queue in place.
             // (The old impl returned the queue struct and discarded the head.)
             if let CfmlValue::Struct(ref shim) = object {
-                let mut q = match shim.get("__queue") {
-                    Some(CfmlValue::Array(a)) => a.snapshot(),
-                    _ => Vec::new(),
-                };
-                if q.is_empty() {
-                    return Ok(CfmlValue::Null);
+                // Pop the head in place on the shared backing array (same
+                // reasoning as add/offer — keep the Arc stable and the mutation
+                // atomic under one write lock).
+                if let Some(CfmlValue::Array(a)) = shim.get("__queue") {
+                    return Ok(a.with_write(|v| {
+                        if v.is_empty() {
+                            CfmlValue::Null
+                        } else {
+                            v.remove(0)
+                        }
+                    }));
                 }
-                let head = q.remove(0);
-                shim.insert("__queue".to_string(), CfmlValue::array(q));
-                Ok(head)
+                Ok(CfmlValue::Null)
             } else {
                 Ok(CfmlValue::Null)
             }

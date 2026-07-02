@@ -909,19 +909,47 @@ impl Parser {
                 "run" => {
                     // Parse body block
                     let body = self.parse_block()?;
-                    // → __cfthread_run(name, function() { body })
+                    // → __cfthread_run(name, function() { body } [, {custom attrs}])
                     let closure = Expression::Closure(Box::new(Closure {
                         params: vec![],
                         body,
                         location: stmt_loc.clone(),
                         metadata: Vec::new(),
                     }));
+                    // Every attribute except the reserved control ones becomes the
+                    // thread's `attributes` scope, bound from the parent at spawn —
+                    // matching the tag form (tag_parser.rs). Without this, a
+                    // script-form `thread ... svc="#obj#" { attributes.svc.foo() }`
+                    // saw `attributes` undefined inside the body (GH #234).
+                    let attr_pairs: Vec<(Expression, Expression)> = attrs
+                        .iter()
+                        .filter(|(k, _)| {
+                            !matches!(k.as_str(), "action" | "name" | "priority" | "timeout")
+                        })
+                        .map(|(k, v)| {
+                            (
+                                Expression::Literal(Literal {
+                                    value: LiteralValue::String(k.clone()),
+                                    location: stmt_loc.clone(),
+                                }),
+                                v.clone(),
+                            )
+                        })
+                        .collect();
+                    let mut arguments = vec![thread_name, closure];
+                    if !attr_pairs.is_empty() {
+                        arguments.push(Expression::Struct(Struct {
+                            pairs: attr_pairs,
+                            ordered: false,
+                            location: stmt_loc.clone(),
+                        }));
+                    }
                     let call = Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
                             name: "__cfthread_run".to_string(),
                             location: stmt_loc.clone(),
                         })),
-                        arguments: vec![thread_name, closure],
+                        arguments,
                         location: stmt_loc.clone(),
                     }));
                     return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
