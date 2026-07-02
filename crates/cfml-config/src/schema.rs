@@ -682,6 +682,9 @@ pub struct ObservabilityCfg {
     pub enabled: bool,
     /// Threshold-gated cooperative sampling profiler (Phase 2).
     pub profiler: ProfilerCfg,
+    /// OpenTelemetry traces + RED metrics (Phase 3). Only active in a build with
+    /// the `obs-otel` Cargo feature.
+    pub otel: OtelCfg,
 }
 
 impl Default for ObservabilityCfg {
@@ -689,6 +692,78 @@ impl Default for ObservabilityCfg {
         Self {
             enabled: false,
             profiler: ProfilerCfg::default(),
+            otel: OtelCfg::default(),
+        }
+    }
+}
+
+/// OpenTelemetry configuration. Distributed traces export over OTLP (HTTP/
+/// protobuf); RED metrics are exposed on a native Prometheus scrape endpoint.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct OtelCfg {
+    /// Arm OpenTelemetry (default off).
+    pub enabled: bool,
+    /// OTLP collector base endpoint (HTTP). The signal path (`/v1/traces`) is
+    /// appended by the exporter. Default the OTLP/HTTP port 4318 on localhost.
+    pub endpoint: String,
+    /// `http/protobuf` (default) or `http/json`.
+    pub protocol: String,
+    /// `service.name` resource attribute.
+    #[serde(rename = "serviceName")]
+    pub service_name: String,
+    /// Head sampling ratio (0.0–1.0). Applied as `ParentBased(TraceIdRatioBased)`
+    /// so a sampled inbound `traceparent` is always continued.
+    #[serde(rename = "sampleRatio")]
+    pub sample_ratio: f64,
+    /// Only user functions at or below this call depth get a span (bounds
+    /// spans-per-request). Queries and the request root are always spanned.
+    #[serde(rename = "spanDepthCap")]
+    pub span_depth_cap: usize,
+    /// Component/method name globs that may be spanned (`*` = all within the cap).
+    #[serde(rename = "spanAllowList")]
+    pub span_allow_list: Vec<String>,
+    /// OTLP export timeout (ms).
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: u64,
+    /// RED metrics settings.
+    pub metrics: OtelMetricsCfg,
+}
+
+impl Default for OtelCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://localhost:4318".into(),
+            protocol: "http/protobuf".into(),
+            service_name: "rustcfml".into(),
+            sample_ratio: 0.05,
+            span_depth_cap: 3,
+            span_allow_list: vec!["*".into()],
+            timeout_ms: 30000,
+            metrics: OtelMetricsCfg::default(),
+        }
+    }
+}
+
+/// RED metrics export. Metrics are exposed on a native Prometheus scrape
+/// endpoint (the `opentelemetry-prometheus` bridge lags the core line, so the
+/// standalone `prometheus` crate backs this instead — OTLP metric *push* is a
+/// documented follow-up; traces still push over OTLP).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct OtelMetricsCfg {
+    pub enabled: bool,
+    /// Path Prometheus scrapes for the RED metrics text exposition.
+    #[serde(rename = "prometheusPath")]
+    pub prometheus_path: String,
+}
+
+impl Default for OtelMetricsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prometheus_path: "/__rustcfml/metrics".into(),
         }
     }
 }

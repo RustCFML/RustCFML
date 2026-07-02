@@ -3,6 +3,10 @@ mod rewrite;
 mod session;
 mod socketio;
 mod websocket;
+/// OpenTelemetry integration (observability Phase 3). Host-only, behind the
+/// `obs-otel` feature — the heavy OTLP/reqwest/prometheus deps never reach wasm.
+#[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+mod otel;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -819,6 +823,14 @@ fn compile_and_run(
     // sample its own call stack if it runs past the threshold.
     vm.maybe_arm_profiler();
 
+    // OpenTelemetry (Phase 3): open the request root span + install the
+    // per-request span-building observer. No-op (returns None) unless OTel was
+    // initialised at server start, so CLI/one-shot runs pay nothing.
+    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+    let otel_req = otel::begin_request(&mut vm);
+    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+    let otel_start = std::time::Instant::now();
+
     // Start logging this request's container allocations so the request-boundary
     // cycle collector can reclaim any reference cycles it built (the serve-mode
     // leak fix). Armed only in serve mode; a no-op otherwise. See cfml_common::cycle_gc.
@@ -867,6 +879,22 @@ fn compile_and_run(
     // publish it to the hub for the /__rustcfml/profiler admin endpoint, and
     // deregister. A no-op when nothing was sampled.
     vm.finish_profiler();
+
+    // OpenTelemetry (Phase 3): close the request root span + record RED metrics.
+    // Reads the outcome BEFORE the redirect/abort remap below so the status code
+    // reflects redirect (302) / abort (200) / error (500) accurately.
+    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+    if let Some((ref root, ref route)) = otel_req {
+        // Coarse error label — the message is high-cardinality (never a metric
+        // label); the exception *type* is recorded on the span by on_error.
+        let (status, err): (u16, Option<&str>) = match &result {
+            Ok(_) => (200, None),
+            Err(e) if e.message == "__cflocation_redirect" => (302, None),
+            Err(e) if e.message == "__cfabort" => (200, None),
+            Err(_) => (500, Some("error")),
+        };
+        otel::end_request(root, route, status, otel_start.elapsed().as_secs_f64(), err);
+    }
 
     // Catch redirect errors as success
     let result = match result {
@@ -1474,6 +1502,22 @@ async fn async_run_server(
         }
     }
 
+    // OpenTelemetry (Phase 3): initialise the global tracer provider + OTLP
+    // batch exporter and the Prometheus metric registry. Off by default; the
+    // per-request span-building observer is installed only when this succeeds.
+    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+    {
+        let ocfg = &cfconfig.observability.otel;
+        if cfconfig.observability.enabled && ocfg.enabled {
+            if otel::init(ocfg).is_some() {
+                println!(
+                    "OpenTelemetry enabled — traces → OTLP {} (sampleRatio {}), metrics → {}",
+                    ocfg.endpoint, ocfg.sample_ratio, ocfg.metrics.prometheus_path
+                );
+            }
+        }
+    }
+
     // Populate the global datasource registry from cfconfig so cfquery /
     // queryExecute can resolve `datasource="myDSN"` lookups. Done once per
     // process; replaying with new values is idempotent for tests.
@@ -1621,6 +1665,8 @@ async fn async_run_server(
                     })
                     .await
                     .unwrap();
+                #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+                otel::shutdown();
                 let _ = std::fs::remove_file(&cleanup_path);
             }
             #[cfg(not(unix))]
@@ -1654,6 +1700,8 @@ async fn async_run_server(
                 })
                 .await
                 .unwrap();
+            #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+            otel::shutdown();
         }
     }
 }
@@ -1742,6 +1790,20 @@ async fn handle_request(
     if raw_path == "/__rustcfml/profiler" {
         if let Some(resp) = profiler_endpoint(&state) {
             return resp;
+        }
+    }
+
+    // OpenTelemetry RED metrics scrape endpoint (Phase 3). Prometheus text
+    // exposition; 404s (falls through) when metrics are off.
+    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+    if raw_path == state.cfconfig.observability.otel.metrics.prometheus_path {
+        if let Some(text) = otel::render_metrics() {
+            use axum::response::IntoResponse;
+            return (
+                [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                text,
+            )
+                .into_response();
         }
     }
 

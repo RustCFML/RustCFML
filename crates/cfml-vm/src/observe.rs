@@ -136,6 +136,33 @@ pub struct LogEvent<'a> {
     pub file: &'a str,
 }
 
+/// A user function / method / closure is about to execute. `depth` is the call
+/// depth *before* this frame (0 for a call made from top-level page code), so an
+/// observer can apply a depth cap. Fired only when an observer sets the
+/// `FUNCTION` interest — the hot path is otherwise a bitand+branch.
+pub struct FnEnter<'a> {
+    pub name: &'a str,
+    /// The name the function was invoked under at the call site (may differ from
+    /// `name` for aliased/delegated methods).
+    pub called_name: &'a str,
+    pub depth: usize,
+}
+
+/// A user function returned — on a normal return AND on exception unwind (fired
+/// from the call wrapper, which runs on both paths). `is_error` is true when the
+/// body returned an `Err` (so a span can be closed with Error status).
+pub struct FnExit<'a> {
+    pub name: &'a str,
+    pub depth: usize,
+    pub is_error: bool,
+}
+
+/// A `<cftransaction>` boundary. `action` is `begin` / `commit` / `rollback`.
+pub struct TxnEvent<'a> {
+    pub action: &'a str,
+    pub datasource: &'a str,
+}
+
 /// One observer = one subscriber. The VM holds at most one composed observer
 /// today (the footer collector); a `Composite` fan-out can be added when a
 /// second subscriber ships.
@@ -148,4 +175,74 @@ pub trait VmObserver: Send + Sync {
     fn on_error(&self, _e: &ErrorEvent) {}
     fn on_log(&self, _l: &LogEvent) {}
     fn on_bif(&self, _name: &str) {}
+    /// Hot — fired per function call only when `FUNCTION` interest is set.
+    fn on_fn_enter(&self, _f: &FnEnter) {}
+    /// Symmetric with [`Self::on_fn_enter`]; also fires on exception unwind.
+    fn on_fn_exit(&self, _f: &FnExit) {}
+    fn on_transaction(&self, _t: &TxnEvent) {}
+}
+
+/// Fans a single VM observer slot out to several subscribers (e.g. the debug
+/// footer collector *and* the OpenTelemetry exporter in one request). Its
+/// `interest()` is the OR of its members', so a hook fires if *any* member
+/// wants it; each member re-checks its own interest cheaply inside its handler.
+pub struct Composite {
+    observers: Vec<std::sync::Arc<dyn VmObserver>>,
+    interest: Interest,
+}
+
+impl Composite {
+    pub fn new(observers: Vec<std::sync::Arc<dyn VmObserver>>) -> Self {
+        let mut interest = Interest::NONE;
+        for o in &observers {
+            interest |= o.interest();
+        }
+        Self { observers, interest }
+    }
+}
+
+impl VmObserver for Composite {
+    fn interest(&self) -> Interest {
+        self.interest
+    }
+    fn on_query(&self, q: &QueryEvent) {
+        for o in &self.observers {
+            o.on_query(q);
+        }
+    }
+    fn on_template(&self, t: &TemplateEvent) {
+        for o in &self.observers {
+            o.on_template(t);
+        }
+    }
+    fn on_error(&self, e: &ErrorEvent) {
+        for o in &self.observers {
+            o.on_error(e);
+        }
+    }
+    fn on_log(&self, l: &LogEvent) {
+        for o in &self.observers {
+            o.on_log(l);
+        }
+    }
+    fn on_bif(&self, name: &str) {
+        for o in &self.observers {
+            o.on_bif(name);
+        }
+    }
+    fn on_fn_enter(&self, f: &FnEnter) {
+        for o in &self.observers {
+            o.on_fn_enter(f);
+        }
+    }
+    fn on_fn_exit(&self, f: &FnExit) {
+        for o in &self.observers {
+            o.on_fn_exit(f);
+        }
+    }
+    fn on_transaction(&self, t: &TxnEvent) {
+        for o in &self.observers {
+            o.on_transaction(t);
+        }
+    }
 }

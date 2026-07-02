@@ -60,8 +60,26 @@ socketioxide = "0.16.3"
 # to swap in DHAT's global allocator and dump `dhat-heap.json` on clean shutdown.
 dhat = { version = "0.3", optional = true }
 
+# ── OpenTelemetry (observability Phase 3) — host-only, behind `obs-otel` ──
+# Pinned as a compatible set (all track the opentelemetry 0.32 line). OTLP export
+# uses HTTP/protobuf (reqwest) rather than gRPC/tonic to keep the dep tree light;
+# the thread-based BatchSpanProcessor exports traces off the request path. RED
+# metrics are exposed via a native Prometheus scrape endpoint using the standalone
+# `prometheus` crate — deliberately NOT `opentelemetry-prometheus`, whose 0.31
+# release lags the 0.32 core line and would fork the dependency tree onto two
+# incompatible `opentelemetry` versions. None of these reach the wasm crates.
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", optional = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry-semantic-conventions = { version = "0.32", optional = true }
+prometheus = { version = "0.14", optional = true }
+
 [features]
 default = ["memcached", "cluster", "jit"]
+# OpenTelemetry distributed traces (OTLP push) + RED metrics (native Prometheus
+# scrape endpoint). Host-only; never enabled by the wasm crates. Implies the VM's
+# `observability` hook bus.
+obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:prometheus", "opentelemetry_sdk/testing"]
 # Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
 # whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
 dhat-heap = ["dep:dhat"]

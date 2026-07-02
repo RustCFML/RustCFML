@@ -20,7 +20,8 @@ pub use env::expand_env_vars;
 pub use resolve::{resolve_config_path, LoadMode};
 pub use schema::{
     CacheCfg, CacheProperties, DatasourceCfg, DebuggingCfg, Discovery, LoggerCfg, LoggingCfg,
-    MailServerCfg, RuntimeCfg, RustCfmlConfig, SecurityCfg, ServerCfg, UrlRewritingCfg,
+    MailServerCfg, ObservabilityCfg, OtelCfg, OtelMetricsCfg, ProfilerCfg, RuntimeCfg,
+    RustCfmlConfig, SecurityCfg, ServerCfg, UrlRewritingCfg,
 };
 
 /// Re-export of `serde_json::Value` used when callers want to convert the

@@ -2051,6 +2051,31 @@ impl CfmlVirtualMachine {
         self.observer = Some(obs);
     }
 
+    /// Install an additional hook-bus observer, composing it with any already
+    /// installed (e.g. the OpenTelemetry exporter alongside the debug footer).
+    /// The cached interest mask becomes the OR of both, so a hook fires if either
+    /// wants it. Public so the CLI can attach the OTel observer per request.
+    #[cfg(feature = "observability")]
+    pub fn install_observer(&mut self, obs: std::sync::Arc<dyn observe::VmObserver>) {
+        let composed: std::sync::Arc<dyn observe::VmObserver> = match self.observer.take() {
+            Some(existing) => {
+                std::sync::Arc::new(observe::Composite::new(vec![existing, obs]))
+            }
+            None => obs,
+        };
+        self.set_observer(composed);
+    }
+
+    /// Read a single value from a web scope (`cgi`/`url`/`form`/…) as a string,
+    /// case-insensitively. Used by the CLI's OpenTelemetry layer to read request
+    /// metadata (method, route, `traceparent`) off the already-populated scopes.
+    #[cfg(feature = "observability")]
+    pub fn web_scope_value(&self, scope: &str, key: &str) -> Option<String> {
+        self.scope_struct(scope)
+            .and_then(|s| s.get_ci(key))
+            .map(|v| v.as_string())
+    }
+
     /// Find a web scope (`cgi`/`url`/`form`/…) by case-insensitive name.
     #[cfg(feature = "observability")]
     fn scope_struct(&self, scope: &str) -> Option<&CfmlStruct> {
@@ -2163,7 +2188,7 @@ impl CfmlVirtualMachine {
         };
         let collector = std::sync::Arc::new(debug_footer::DebugCollector::new(fcfg));
         self.debug_collector = Some(collector.clone());
-        self.set_observer(collector);
+        self.install_observer(collector);
     }
 
     /// True when the footer is active for this request (gates 1 & 2 passed and a
@@ -3314,6 +3339,29 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let call_depth_before = self.call_stack.len();
         let try_depth_before = self.try_stack.len();
+
+        // Function enter/exit hook (Phase 3 — OTel spans). Fired from the call
+        // WRAPPER, not the body: the body has many early-return paths (`?` on
+        // every op) but this wrapper always runs its epilogue, so enter/exit are
+        // perfectly balanced even on exception unwind. Gated by `FUNCTION`
+        // interest, so it is a bitand+branch unless a span-building observer is
+        // attached; `__main__` is the request root (covered by the root span) and
+        // is skipped, matching the frame-push skip below.
+        #[cfg(feature = "observability")]
+        let fn_hook = func.name != "__main__"
+            && self.interest.contains(observe::Interest::FUNCTION)
+            && self.observer.is_some();
+        #[cfg(feature = "observability")]
+        if fn_hook {
+            if let Some(o) = &self.observer {
+                o.on_fn_enter(&observe::FnEnter {
+                    name: &func.name,
+                    called_name: &func.name,
+                    depth: call_depth_before,
+                });
+            }
+        }
+
         let result = self.execute_function_body(func, args, parent_scope);
         // Never grow past where we started: a complete call must leave the
         // call/try stacks exactly as it found them. truncate() only shrinks, so a
@@ -3321,6 +3369,17 @@ impl CfmlVirtualMachine {
         // (len < before) are both untouched; only a leaked frame is reclaimed.
         self.call_stack.truncate(call_depth_before);
         self.try_stack.truncate(try_depth_before);
+
+        #[cfg(feature = "observability")]
+        if fn_hook {
+            if let Some(o) = &self.observer {
+                o.on_fn_exit(&observe::FnExit {
+                    name: &func.name,
+                    depth: call_depth_before,
+                    is_error: result.is_err(),
+                });
+            }
+        }
         result
     }
 

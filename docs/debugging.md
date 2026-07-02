@@ -210,12 +210,70 @@ separately. Interpreted functions (the overwhelming majority of a real request,
 and everything in serve mode where the per-request JIT rarely warms up) are
 attributed correctly.
 
+## OpenTelemetry traces + metrics
+
+The third observability layer exports **distributed traces** and **RED metrics**
+as standard OpenTelemetry, so a slow or errored request in production can be
+inspected in Grafana Tempo / Jaeger / Honeycomb / Datadog without runtime
+degradation. It is only present in a build compiled with the **`obs-otel`** Cargo
+feature (host-only — never in the wasm/worker build) and is off until configured.
+
+```bash
+cargo build --release --features obs-otel
+```
+
+- **Traces** reproduce the request → CFC-method → query transaction tree as OTel
+  spans and export over **OTLP (HTTP/protobuf)** on a background batch thread, so
+  export never sits on the request path. Head sampling
+  (`ParentBased(TraceIdRatioBased)`) keeps overhead low; an inbound W3C
+  `traceparent` is always continued. A **span allow-list + depth cap** bound how
+  many spans a request emits — the request root, DB queries and template renders
+  are always spanned; user functions are spanned only at/under `spanDepthCap` and
+  matching `spanAllowList`. Uncaught exceptions record an `exception` span event
+  and set the span status to Error; a `try/catch`-recovered exception does not.
+- **RED metrics** (request rate, errors, duration + DB query count/duration) are
+  exposed on a native **Prometheus scrape endpoint** (`/__rustcfml/metrics` by
+  default) that Prometheus can scrape directly — no collector required.
+
+```jsonc
+{
+  "observability": {
+    "enabled": true,
+    "otel": {
+      "enabled": true,
+      "endpoint": "http://localhost:4318",   // OTLP/HTTP collector; /v1/traces is appended
+      "serviceName": "rustcfml",
+      "sampleRatio": 0.05,                    // head sampling (0.0–1.0)
+      "spanDepthCap": 3,                      // user fns at/under this depth may be spanned
+      "spanAllowList": ["*"],                 // name globs eligible for a span
+      "metrics": { "enabled": true, "prometheusPath": "/__rustcfml/metrics" }
+    }
+  }
+}
+```
+
+Semantic conventions emitted: HTTP server (`http.request.method`, `http.route`,
+`url.path`, `http.response.status_code`, `client.address`, …) on the root span;
+DB client (`db.system.name`, `db.query.text`, `db.operation.name`,
+`db.namespace`, `db.response.returned_rows`) on query spans.
+
+> **Metrics-export note.** RustCFML exposes metrics via the standalone
+> `prometheus` crate rather than `opentelemetry-prometheus` (whose release lags
+> the core OTel line and would fork the dependency tree). **Traces** push over
+> OTLP; **metric** OTLP *push* is a documented follow-up — a collector scraping
+> the Prometheus endpoint (or its `prometheusexporter`) covers that case one hop
+> downstream. Transaction spans on functions the JIT compiles to native code
+> share the profiler's [attribution limitation](known-issues.md) (JIT'd numeric
+> leaves don't get their own span).
+
 ## Notes & limitations
 
 - The footer is a web-page artifact and auto-renders on web requests only; in
   CLI runs the data is still collected and reachable via `getDebugData()`.
 - Per-template **Load** (compile/startup) time is not yet broken out separately —
   it folds into Application time.
-- The remaining observability roadmap layers — OpenTelemetry traces + metrics
-  and a DAP step debugger — are designed and build on the same hook bus, but are
-  not yet shipped.
+- The remaining observability roadmap layer — a DAP step debugger — is designed
+  and builds on the same hook bus, but is not yet shipped.
+- OTLP **metric** push (traces already push over OTLP) and `<cftransaction>`
+  spans are documented follow-ups; the `TxnEvent` hook is wired into the bus but
+  not yet emitted.
