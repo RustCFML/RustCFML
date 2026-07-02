@@ -15,8 +15,16 @@ cfml-common = { path = "../cfml-common" }
 cfml-compiler = { path = "../cfml-compiler" }
 cfml-codegen = { path = "../cfml-codegen" }
 cfml-vm = { path = "../cfml-vm", default-features = false, features = ["std"] }
-cfml-stdlib = { path = "../cfml-stdlib", default-features = false }
+# Enable the pure-Rust stdlib features that build fine on wasm32 (verified). The
+# crate opts out of `default` (which drags in native-only http/database/smtp via
+# ureq→ring, rusqlite→C, lettre→native-TLS — none have a wasm target), then
+# re-adds every feature that IS wasm-compatible so the demo has full stdlib
+# parity: xml/html/yaml/jsonschema/zip + security (crypto/hashing). Without this
+# they were silently absent (e.g. isValid("xml",…), xmlParse, encrypt, bcrypt).
+# `security` pulls `rand`→`getrandom`, which needs its `js` backend on wasm.
+cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security"] }
 js-sys = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
 
 [dependencies.web-sys]
 version = "0.3"

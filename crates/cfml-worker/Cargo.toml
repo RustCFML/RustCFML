@@ -17,7 +17,11 @@ cfml-common = { path = "../cfml-common" }
 cfml-compiler = { path = "../cfml-compiler" }
 cfml-codegen = { path = "../cfml-codegen" }
 cfml-vm = { path = "../cfml-vm", default-features = false, features = ["std"] }
-cfml-stdlib = { path = "../cfml-stdlib", default-features = false }
+# Re-add the wasm-compatible stdlib features (see crates/wasm/Cargo.toml for the
+# rationale). Native-only http/database/smtp stay OUT — the worker provides those
+# via JS bindings (fetch, D1). getrandom's `js` backend (Web Crypto) works in the
+# Workers runtime, satisfying `security`→rand.
+cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security"] }
 cfml-config = { path = "../cfml-config" }
 indexmap = { workspace = true }
 serde = { version = "1", features = ["derive"] }
@@ -28,3 +32,5 @@ worker = "0.8"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+# `security`→rand→getrandom needs its `js` backend (Web Crypto) on wasm32.
+getrandom = { version = "0.2", features = ["js"] }
