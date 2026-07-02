@@ -11744,6 +11744,9 @@ impl CfmlVirtualMachine {
                                 "java.net.inetaddress" => {
                                     handle_java_inetaddress("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.net.url" => {
+                                    java_shims::handle_java_url("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.io.file" => {
                                     handle_java_file("init", empty_args, &CfmlValue::Null)
                                 }
@@ -16580,6 +16583,7 @@ impl CfmlVirtualMachine {
                         handle_java_thread(&m, all_args, object)
                     }
                     "java.net.inetaddress" => handle_java_inetaddress(&m, all_args, object),
+                    "java.net.url" => java_shims::handle_java_url(&m, all_args, object),
                     "java.io.file" => handle_java_file(&m, all_args, object),
                     "java.lang.system" => handle_java_system(&m, all_args, object),
                     "java.lang.stringbuilder" | "java.lang.stringbuffer" => {

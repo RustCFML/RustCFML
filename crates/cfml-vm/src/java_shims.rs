@@ -407,6 +407,205 @@ pub fn handle_java_inetaddress(
     }
 }
 
+/// Default TCP port for a scheme, matching java.net.URL.getDefaultPort().
+/// Unknown schemes return -1 (Java's sentinel for "no default").
+fn url_default_port(protocol: &str) -> i64 {
+    match protocol.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        "ftp" => 21,
+        "file" => -1,
+        _ => -1,
+    }
+}
+
+/// Parse a spec string into the java.net.URL component parts. No JVM, no I/O —
+/// a best-effort structural parse covering the accessor surface real CFML code
+/// uses (protocol/host/port/path/query/ref/authority/file). Follows java.net.URL
+/// conventions: getPort() is -1 when the URL omits the port (default port is a
+/// separate getDefaultPort()); getFile() is path+"?"+query; getPath() is bare.
+fn parse_url_parts(spec: &str) -> ValueMap {
+    let mut m = ValueMap::default();
+    let mut rest = spec.trim();
+
+    // protocol: leading "<scheme>:" (scheme is [A-Za-z][A-Za-z0-9+.-]*)
+    let mut protocol = String::new();
+    if let Some(colon) = rest.find(':') {
+        let candidate = &rest[..colon];
+        if !candidate.is_empty()
+            && candidate.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
+        {
+            protocol = candidate.to_string();
+            rest = &rest[colon + 1..];
+        }
+    }
+
+    // fragment (ref): split off trailing "#..."
+    let mut reference = String::new();
+    if let Some(hash) = rest.find('#') {
+        reference = rest[hash + 1..].to_string();
+        rest = &rest[..hash];
+    }
+
+    // authority: present when the remainder begins with "//"
+    let mut authority = String::new();
+    let mut userinfo = String::new();
+    let mut host = String::new();
+    let mut port: i64 = -1;
+    if let Some(after) = rest.strip_prefix("//") {
+        let auth_end = after.find(['/', '?']).unwrap_or(after.len());
+        authority = after[..auth_end].to_string();
+        rest = &after[auth_end..];
+
+        let mut auth_body = authority.as_str();
+        if let Some(at) = auth_body.rfind('@') {
+            userinfo = auth_body[..at].to_string();
+            auth_body = &auth_body[at + 1..];
+        }
+        // host:port — an IPv6 literal is bracketed [::1]:8080
+        if let Some(rb) = auth_body.rfind(']') {
+            host = auth_body[..=rb].to_string();
+            if let Some(colon) = auth_body[rb + 1..].find(':') {
+                if let Ok(p) = auth_body[rb + 1 + colon + 1..].parse::<i64>() {
+                    port = p;
+                }
+            }
+        } else if let Some(colon) = auth_body.rfind(':') {
+            host = auth_body[..colon].to_string();
+            if let Ok(p) = auth_body[colon + 1..].parse::<i64>() {
+                port = p;
+            }
+        } else {
+            host = auth_body.to_string();
+        }
+    }
+
+    // query: split off trailing "?..."
+    let mut query = String::new();
+    if let Some(q) = rest.find('?') {
+        query = rest[q + 1..].to_string();
+        rest = &rest[..q];
+    }
+    let path = rest.to_string();
+
+    let file = if query.is_empty() {
+        path.clone()
+    } else {
+        format!("{}?{}", path, query)
+    };
+
+    m.insert("__java_class".to_string(), CfmlValue::string("java.net.url".to_string()));
+    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    m.insert("__spec".to_string(), CfmlValue::string(spec.to_string()));
+    m.insert("__protocol".to_string(), CfmlValue::string(protocol));
+    m.insert("__authority".to_string(), CfmlValue::string(authority));
+    m.insert("__userinfo".to_string(), CfmlValue::string(userinfo));
+    m.insert("__host".to_string(), CfmlValue::string(host));
+    m.insert("__port".to_string(), CfmlValue::Int(port));
+    m.insert("__path".to_string(), CfmlValue::string(path));
+    m.insert("__query".to_string(), CfmlValue::string(query));
+    m.insert("__ref".to_string(), CfmlValue::string(reference));
+    m.insert("__file".to_string(), CfmlValue::string(file));
+    m
+}
+
+/// `java.net.URL` shim (no JVM). Covers the parse/accessor surface; network I/O
+/// (openConnection/openStream/getContent) throws — there is no JVM behind it.
+/// See GH #231.
+pub fn handle_java_url(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    let get = |key: &str| -> CfmlValue {
+        if let CfmlValue::Struct(ref s) = object {
+            s.get(key).unwrap_or(CfmlValue::Null)
+        } else {
+            CfmlValue::Null
+        }
+    };
+    match method {
+        // `createObject("java","java.net.URL")` lands here with empty args: return
+        // the bare class-reference shim so a chained `.init(spec)` can build it.
+        "init" => {
+            match args.len() {
+                0 => {
+                    let mut shim = ValueMap::default();
+                    shim.insert(
+                        "__java_class".to_string(),
+                        CfmlValue::string("java.net.url".to_string()),
+                    );
+                    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                    Ok(CfmlValue::strukt(shim))
+                }
+                1 => Ok(CfmlValue::strukt(parse_url_parts(&args[0].as_string()))),
+                // URL(protocol, host, port, file) / URL(protocol, host, file):
+                // reassemble into a spec then parse for uniform accessors.
+                _ => {
+                    let protocol = args[0].as_string();
+                    let host = args[1].as_string();
+                    let (port, file) = if args.len() >= 4 {
+                        (args[2].as_string(), args[3].as_string())
+                    } else {
+                        (String::new(), args[2].as_string())
+                    };
+                    let hostport = if port.is_empty() || port == "-1" {
+                        host
+                    } else {
+                        format!("{}:{}", host, port)
+                    };
+                    let file = if file.is_empty() || file.starts_with('/') || file.starts_with('?') {
+                        file
+                    } else {
+                        format!("/{}", file)
+                    };
+                    let spec = format!("{}://{}{}", protocol, hostport, file);
+                    Ok(CfmlValue::strukt(parse_url_parts(&spec)))
+                }
+            }
+        }
+        "getprotocol" => Ok(get("__protocol")),
+        "gethost" => Ok(get("__host")),
+        "getport" => Ok(match get("__port") {
+            CfmlValue::Null => CfmlValue::Int(-1),
+            v => v,
+        }),
+        "getdefaultport" => {
+            let protocol = get("__protocol").as_string();
+            Ok(CfmlValue::Int(url_default_port(&protocol)))
+        }
+        "getpath" => Ok(get("__path")),
+        "getquery" => {
+            // Java returns null (not "") when there is no query component.
+            match get("__query") {
+                CfmlValue::String(s) if s.is_empty() => Ok(CfmlValue::Null),
+                v => Ok(v),
+            }
+        }
+        "getref" => match get("__ref") {
+            CfmlValue::String(s) if s.is_empty() => Ok(CfmlValue::Null),
+            v => Ok(v),
+        },
+        "getfile" => Ok(get("__file")),
+        "getauthority" => match get("__authority") {
+            CfmlValue::String(s) if s.is_empty() => Ok(CfmlValue::Null),
+            v => Ok(v),
+        },
+        "getuserinfo" => match get("__userinfo") {
+            CfmlValue::String(s) if s.is_empty() => Ok(CfmlValue::Null),
+            v => Ok(v),
+        },
+        "tostring" | "toexternalform" => Ok(get("__spec")),
+        "openconnection" | "openstream" | "getcontent" | "getinputstream" => {
+            Err(CfmlError::runtime(format!(
+                "java.net.URL.{}() requires network I/O, which RustCFML has no JVM \
+                 to provide. Use <cfhttp> for HTTP requests.",
+                method
+            )))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
 pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     match method {
         "init" => {
