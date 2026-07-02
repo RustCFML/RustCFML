@@ -189,6 +189,20 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
             if in_class && n == 'b' {
                 out.push_str("\\x08");
                 prev_was_shorthand = false;
+            } else if !in_class && (n == '<' || n == '>') {
+                // Java/Lucee/ACF treat `\<` and `\>` as escaped LITERAL angle
+                // brackets, NOT word boundaries (Java's `Pattern` has no `\<`/`\>`
+                // — word boundaries are `\b`). The Rust `regex` crate DID add
+                // `\<`/`\>` as start/end-of-word boundaries, which silently changed
+                // the match set: Wheels formsdateplainSpec's
+                // `ReMatchNoCase("\<option", html)` matched every "option" WORD (4
+                // opening + 4 closing tags = 8) instead of the 4 literal `<option`
+                // opens, so `minuteStep=15` reported 8 options where 4 were
+                // expected. Emit the bare bracket (`<`/`>` are literals in regex)
+                // to keep Lucee semantics. Inside a character class `\<`/`\>` are
+                // already literal, so this only touches the outside-class case.
+                out.push(n);
+                prev_was_shorthand = false;
             } else {
                 out.push(c);
                 out.push(n);

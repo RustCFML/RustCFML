@@ -43,4 +43,24 @@ assert("range [0-9] preserved", reFind("[0-9]", "ab12"), 3);
 assertTrue("leading hyphen literal [-a]", reFind("[-a]", "x-y") GT 0);
 
 suiteEnd();
+
+// ---------------------------------------------------------------------------
+suiteBegin("Regex \< and \> are literal angle brackets (not word boundaries)");
+
+// Java/Lucee/ACF regex has no `\<` / `\>` word-boundary escapes (word
+// boundaries are `\b`); `\<` and `\>` are escaped LITERAL angle brackets. The
+// Rust `regex` crate added `\<`/`\>` as start/end-of-word boundaries, which
+// silently changed the match set. Wheels formsdateplainSpec asserts
+// `ReMatchNoCase("\<option", html)` counts the OPENING <option> tags only —
+// with the word-boundary reading it matched every "option" WORD (opening AND
+// closing tags), so minuteStep=15 reported 8 options instead of 4.
+html = '<option value="0">00</option><option value="15">15</option>';
+assert("reMatch \<option counts literal opens", arrayLen(reMatchNoCase("\<option", html)), 2);
+assert("reMatch <option (bare) same as \<option", arrayLen(reMatchNoCase("<option", html)), 2);
+assert("reMatch option\> counts literal closes-ish", arrayLen(reMatchNoCase("option\>", html)), 2);
+assert("reFind \<option at start", reFindNoCase("\<option", html), 1);
+// \b (real word boundary) is unaffected by this change.
+assert("\boption\b still a word boundary", arrayLen(reMatchNoCase("\boption\b", html)), 4);
+
+suiteEnd();
 </cfscript>
