@@ -31,10 +31,9 @@ assert("4-arg host", u3.getHost(), "localhost");
 assert("4-arg port", u3.getPort(), 9000);
 assert("4-arg path", u3.getPath(), "/api/v1");
 
-// network I/O explicitly throws (no JVM)
-assertThrows("openStream() throws (no JVM)", function(){
-    createObject("java","java.net.URL").init("http://example.com").openStream();
-});
+// NB: network I/O (openStream/openConnection) throws on RustCFML because there
+// is no JVM — not asserted here since real Lucee/ACF would attempt live I/O, so
+// the behaviour is intentionally engine-specific and outside the parity bar.
 
 suiteEnd();
 </cfscript>

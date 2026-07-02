@@ -4936,7 +4936,12 @@ fn fn_ws_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     let mut visited: Vec<usize> = Vec::new();
-    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited);
+    // serializeJSON(data [, serializeQueryByColumns] [, useSecureJSONPrefix]).
+    // The second arg controls query layout: false (default) emits row-oriented
+    // DATA (array of row arrays); true emits column-oriented DATA (a struct
+    // keyed by uppercased column name) plus a ROWCOUNT. Matches Lucee 6.
+    let by_columns = args.get(1).map(|v| v.is_true()).unwrap_or(false);
+    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited, by_columns);
     let flags = security_flags();
     if flags.secure_json && !flags.secure_json_prefix.is_empty() {
         Ok(CfmlValue::string(format!("{}{}", flags.secure_json_prefix, body)))
@@ -4980,7 +4985,7 @@ fn json_escape_str(s: &str) -> String {
     out
 }
 
-fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
+fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) -> String {
     match val {
         CfmlValue::Null => "null".to_string(),
         CfmlValue::Bool(b) => b.to_string(),
@@ -4993,7 +4998,7 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
                 return "null".to_string();
             }
             visited.push(ptr);
-            let items: Vec<String> = arr.iter().map(|v| serialize_value(&v, visited)).collect();
+            let items: Vec<String> = arr.iter().map(|v| serialize_value(&v, visited, by_columns)).collect();
             visited.pop();
             format!("[{}]", items.join(","))
         }
@@ -5003,21 +5008,52 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
                 return "null".to_string();
             }
             visited.push(ptr);
-            let out = serialize_struct(s, visited);
+            let out = serialize_struct(s, visited, by_columns);
             visited.pop();
             out
         }
         CfmlValue::Query(q) => {
+            // Lucee/ACF serialize a query to a {COLUMNS, DATA} envelope (NOT an
+            // array of row structs), so deserializeJSON can rebuild a native
+            // Query. COLUMNS keeps the declared column case. Row-oriented DATA
+            // (default) is an array of per-row arrays; column-oriented DATA
+            // (serializeQueryByColumns=true) is a struct keyed by UPPERCASED
+            // column name, and the envelope leads with ROWCOUNT. Verified vs
+            // Lucee 6. See GH #231's sibling, GH #232.
             q.with_read(|d| {
                 let row_count = d.row_count();
-                let rows: Vec<String> = (0..row_count).map(|r| {
-                    let fields: Vec<String> = d.columns.iter().enumerate().map(|(ci, col)| {
-                        let val = &d.data[ci][r];
-                        format!("\"{}\":{}", json_escape_str(col), serialize_value(val, visited))
+                let columns: Vec<String> = d
+                    .columns
+                    .iter()
+                    .map(|c| format!("\"{}\"", json_escape_str(c)))
+                    .collect();
+                let columns_json = format!("[{}]", columns.join(","));
+                if by_columns {
+                    let cols: Vec<String> = d.columns.iter().enumerate().map(|(ci, col)| {
+                        let vals: Vec<String> = (0..row_count)
+                            .map(|r| serialize_value(&d.data[ci][r], visited, by_columns))
+                            .collect();
+                        format!("\"{}\":[{}]", json_escape_str(&col.to_uppercase()), vals.join(","))
                     }).collect();
-                    format!("{{{}}}", fields.join(","))
-                }).collect();
-                format!("[{}]", rows.join(","))
+                    format!(
+                        "{{\"ROWCOUNT\":{},\"COLUMNS\":{},\"DATA\":{{{}}}}}",
+                        row_count,
+                        columns_json,
+                        cols.join(",")
+                    )
+                } else {
+                    let rows: Vec<String> = (0..row_count).map(|r| {
+                        let fields: Vec<String> = d.columns.iter().enumerate()
+                            .map(|(ci, _)| serialize_value(&d.data[ci][r], visited, by_columns))
+                            .collect();
+                        format!("[{}]", fields.join(","))
+                    }).collect();
+                    format!(
+                        "{{\"COLUMNS\":{},\"DATA\":[{}]}}",
+                        columns_json,
+                        rows.join(",")
+                    )
+                }
             })
         }
         CfmlValue::NativeObject(obj) => {
@@ -5034,13 +5070,13 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
             // first-row scalar in scalar contexts. Serializing a struct/array
             // holding a query cell must emit the value, not drop it to null
             // (Lucee/ACF/BoxLang treat a query cell as a simple value).
-            serialize_value(val.query_column_scalar(), visited)
+            serialize_value(val.query_column_scalar(), visited, by_columns)
         }
         _ => "null".to_string(),
     }
 }
 
-fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
+fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) -> String {
     // A struct carrying CFC instance markers (`__variables` plus a
     // `this`/`__name` marker) is a component instance — this engine
     // materialises CFCs as marker-bearing structs. Lucee/ACF serialize
@@ -5071,7 +5107,7 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
             }
             !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
         })
-        .map(|(k, v)| format!("\"{}\":{}", json_escape_str(&k), serialize_value(&v, visited)))
+        .map(|(k, v)| format!("\"{}\":{}", json_escape_str(&k), serialize_value(&v, visited, by_columns)))
         .collect();
     format!("{{{}}}", items.join(","))
 }
@@ -5178,13 +5214,78 @@ fn serialize_cfml_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
 
 pub fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     let json = get_str(&args, 0);
+    // deserializeJSON(json [, strictMapping]). strictMapping defaults to true.
+    // When false, a {COLUMNS, DATA} object is reconstructed into a native Query
+    // (the inverse of serializeJSON(query, …)) — matching Lucee/ACF. GH #232.
+    let strict = args.get(1).map(|v| v.is_true()).unwrap_or(true);
     match serde_json::from_str::<serde_json::Value>(&json) {
-        Ok(value) => Ok(serde_json_to_cfml(value)),
+        Ok(value) => Ok(serde_json_to_cfml_strict(value, strict)),
         Err(e) => Err(CfmlError::runtime(format!("Invalid JSON: {}", e))),
     }
 }
 
-fn serde_json_to_cfml(value: serde_json::Value) -> CfmlValue {
+/// Try to reconstruct a native Query from a deserialized JSON object with the
+/// Lucee/ACF `{COLUMNS:[...], DATA:...}` envelope. DATA is either row-oriented
+/// (an array of per-row arrays) or column-oriented (a struct keyed by the
+/// UPPERCASED column name -> array of that column's values). Returns None when
+/// the object isn't query-shaped, so the caller falls back to a plain struct.
+fn try_query_from_json_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    strict: bool,
+) -> Option<CfmlValue> {
+    let find = |name: &str| obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v);
+    let columns_val = find("COLUMNS")?;
+    let data_val = find("DATA")?;
+    let columns: Vec<String> = match columns_val {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))
+            .collect(),
+        _ => return None,
+    };
+    let mut rows: Vec<ValueMap> = Vec::new();
+    match data_val {
+        // Row-oriented: [[c0,c1,...], ...]
+        serde_json::Value::Array(data_rows) => {
+            for row in data_rows {
+                let cells = match row {
+                    serde_json::Value::Array(cells) => cells,
+                    _ => return None,
+                };
+                let mut r = ValueMap::default();
+                for (i, col) in columns.iter().enumerate() {
+                    let cell = cells.get(i).cloned().unwrap_or(serde_json::Value::Null);
+                    r.insert(col.clone(), serde_json_to_cfml_strict(cell, strict));
+                }
+                rows.push(r);
+            }
+        }
+        // Column-oriented: {"COL":[v0,v1,...], ...}, keys uppercased by serialize.
+        serde_json::Value::Object(cols) => {
+            let col_arrays: Vec<&Vec<serde_json::Value>> = columns
+                .iter()
+                .map(|c| {
+                    cols.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(c))
+                        .and_then(|(_, v)| v.as_array())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let row_count = col_arrays.iter().map(|a| a.len()).max().unwrap_or(0);
+            for ri in 0..row_count {
+                let mut r = ValueMap::default();
+                for (ci, col) in columns.iter().enumerate() {
+                    let cell = col_arrays[ci].get(ri).cloned().unwrap_or(serde_json::Value::Null);
+                    r.insert(col.clone(), serde_json_to_cfml_strict(cell, strict));
+                }
+                rows.push(r);
+            }
+        }
+        _ => return None,
+    }
+    Some(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)))
+}
+
+fn serde_json_to_cfml_strict(value: serde_json::Value, strict: bool) -> CfmlValue {
     match value {
         serde_json::Value::Null => CfmlValue::Null,
         serde_json::Value::Bool(b) => CfmlValue::Bool(b),
@@ -5199,12 +5300,20 @@ fn serde_json_to_cfml(value: serde_json::Value) -> CfmlValue {
         }
         serde_json::Value::String(s) => CfmlValue::string(s),
         serde_json::Value::Array(arr) => {
-            CfmlValue::array(arr.into_iter().map(serde_json_to_cfml).collect())
+            CfmlValue::array(arr.into_iter().map(|v| serde_json_to_cfml_strict(v, strict)).collect())
         }
         serde_json::Value::Object(obj) => {
+            // Non-strict mapping reconstructs a native Query from the {COLUMNS,
+            // DATA} envelope (Lucee/ACF query-JSON round trip); strict mapping
+            // (the default) always keeps it a struct.
+            if !strict {
+                if let Some(q) = try_query_from_json_object(&obj, strict) {
+                    return q;
+                }
+            }
             let mut map = ValueMap::default();
             for (k, v) in obj {
-                map.insert(k, serde_json_to_cfml(v));
+                map.insert(k, serde_json_to_cfml_strict(v, strict));
             }
             CfmlValue::strukt(map)
         }
@@ -5907,49 +6016,50 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
     }
 
     // Fallback for non-component values: match against the value's native Java
-    // identity, mirroring getClass().getName() (see cfml-vm/src/lib.rs). Lucee/ACF
-    // treat CFML arrays as java.util.List, structs as java.util.Map, etc., so
-    // isInstanceOf(arr, "java.util.List") and isInstanceOf(arr, "Array") are true.
-    // A component Struct (one carrying __name / __java_class) is NOT eligible here:
-    // if its metadata above didn't match, the answer is genuinely false.
+    // identity, mirroring how Lucee's isInstanceOf walks the concrete runtime
+    // class's type hierarchy. The alias sets below are taken VERBATIM from what
+    // Lucee 6 returns true for (probed against a live server) — notably Lucee
+    // does NOT accept the bare CFML type names "Array"/"Struct"/"Boolean"/
+    // "Query" here (only the Java/Lucee class + interface names), but DOES accept
+    // "String" and "numeric". A numeric is a java.lang.Double regardless of
+    // Int/Double storage, so neither maps to java.lang.Integer. A component
+    // Struct (carrying __name / __java_class) is NOT eligible: if its metadata
+    // above didn't match, the answer is genuinely false. Verified vs Lucee 6.1.
     let native_aliases: &[&str] = match obj {
         CfmlValue::Array(_) => &[
-            "array",
-            "lucee.runtime.type.arrayimpl",
-            "lucee.runtime.type.array",
             "java.util.list",
             "java.util.collection",
             "java.lang.iterable",
+            "lucee.runtime.type.arrayimpl",
+            "lucee.runtime.type.array",
         ],
         CfmlValue::Struct(s)
             if !s.contains_key("__name") && !s.contains_key("__java_class") =>
         {
             &[
-                "struct",
+                "java.util.map",
                 "lucee.runtime.type.structimpl",
                 "lucee.runtime.type.struct",
-                "java.util.map",
             ]
         }
         CfmlValue::Query(_) => &[
-            "query",
             "lucee.runtime.type.queryimpl",
             "lucee.runtime.type.query",
         ],
-        CfmlValue::String(_) => &["string", "java.lang.string", "java.lang.charsequence"],
-        CfmlValue::Bool(_) => &["boolean", "java.lang.boolean"],
-        CfmlValue::Int(_) => &[
-            "numeric",
-            "java.lang.integer",
-            "java.lang.number",
-            "java.lang.long",
+        CfmlValue::String(_) => &[
+            "string",
+            "java.lang.string",
+            "java.lang.charsequence",
+            "java.lang.comparable",
         ],
-        CfmlValue::Double(_) => &[
+        CfmlValue::Bool(_) => &["java.lang.boolean"],
+        // A CFML numeric is a java.lang.Double in Lucee irrespective of whether
+        // RustCFML stored it as Int or Double, so both map to the same aliases.
+        CfmlValue::Int(_) | CfmlValue::Double(_) => &[
             "numeric",
             "java.lang.double",
             "java.lang.number",
         ],
-        CfmlValue::Binary(_) => &["binary", "[b", "byte[]"],
         _ => &[],
     };
     if native_aliases.iter().any(|a| *a == type_lower) {
@@ -11950,13 +12060,13 @@ fn fn_jwt_sign(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             let mut visited = Vec::new();
-            serialize_value(&CfmlValue::strukt(map), &mut visited)
+            serialize_value(&CfmlValue::strukt(map), &mut visited, false)
         }
         CfmlValue::String(s) => (**s).clone(),
         CfmlValue::Null => "{}".to_string(),
         other => {
             let mut visited = Vec::new();
-            serialize_value(other, &mut visited)
+            serialize_value(other, &mut visited, false)
         }
     };
     let payload_b64 = base64url_encode(payload_json.as_bytes());

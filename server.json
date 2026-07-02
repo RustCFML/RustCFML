@@ -6,7 +6,7 @@
     "noOpen":true,
     "web":{
         "http":{
-            "port":"8585"
+            "port":"8599"
         }
     }
 }
