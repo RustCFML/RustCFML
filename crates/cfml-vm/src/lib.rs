@@ -9258,15 +9258,21 @@ impl CfmlVirtualMachine {
                     if let Some(CfmlValue::Array(arr)) = args.first() {
                         let callback = args[1].clone();
                         let mut items = arr.snapshot();
-                        // Stable insertion sort (swap only on strictly > 0, so
-                        // equal elements keep their relative order). Mirrors the
+                        // Stable insertion sort matching Lucee: move each element
+                        // left past its neighbour while cmp(item, leftNeighbour) < 0.
+                        // For any consistent (antisymmetric) comparator this is
+                        // identical to "swap left,right while cmp(left,right) > 0";
+                        // it only differs for the degenerate always-negative
+                        // comparator TestBox uses to REVERSE an array (a `()=>-1`
+                        // comparator fully reverses on Lucee, was a no-op here —
+                        // GH #233 nested-beforeEach ordering). Mirrors the
                         // `arr.sort(fn)` member handler.
                         let n = items.len();
                         let mut i = 1;
                         while i < n {
                             let mut j = i;
                             while j > 0 {
-                                let cb_args = vec![items[j - 1].clone(), items[j].clone()];
+                                let cb_args = vec![items[j].clone(), items[j - 1].clone()];
                                 self.closure_parent_writeback = None;
                                 let r = self.call_function(&callback, cb_args, parent_locals)?;
                                 if let Some(ref wb) = self.closure_parent_writeback {
@@ -9281,7 +9287,7 @@ impl CfmlVirtualMachine {
                                     }
                                     _ => 0,
                                 };
-                                if cmp > 0 {
+                                if cmp < 0 {
                                     items.swap(j - 1, j);
                                     j -= 1;
                                 } else {
@@ -17037,13 +17043,17 @@ impl CfmlVirtualMachine {
                         let callback = extra_args.first().cloned().unwrap();
                         let mut items = arr.snapshot();
                         let n = items.len();
-                        // Stable insertion sort (only swaps on strictly > 0, so
-                        // equal elements keep their relative order).
+                        // Stable insertion sort matching Lucee: move each element
+                        // left while cmp(item, leftNeighbour) < 0. Identical to the
+                        // old "cmp(left,right) > 0" test for any consistent
+                        // comparator; differs only for a degenerate always-negative
+                        // comparator (which fully reverses on Lucee). See GH #233
+                        // and the standalone arraySort handler for the full note.
                         let mut i = 1;
                         while i < n {
                             let mut j = i;
                             while j > 0 {
-                                let cb_args = vec![items[j - 1].clone(), items[j].clone()];
+                                let cb_args = vec![items[j].clone(), items[j - 1].clone()];
                                 self.closure_parent_writeback = None;
                                 let r =
                                     self.call_function(&callback, cb_args, &ValueMap::default())?;
@@ -17065,7 +17075,7 @@ impl CfmlVirtualMachine {
                                     }
                                     _ => 0,
                                 };
-                                if cmp > 0 {
+                                if cmp < 0 {
                                     items.swap(j - 1, j);
                                     j -= 1;
                                 } else {
