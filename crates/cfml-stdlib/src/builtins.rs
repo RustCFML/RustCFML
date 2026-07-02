@@ -2276,6 +2276,20 @@ fn fn_array_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
 fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
     match (a, b) {
         (CfmlValue::Struct(sa), CfmlValue::Struct(sb)) => {
+            // Identity short-circuit: two references to the SAME backing handle
+            // are equal without walking their contents. This is both correct (a
+            // value equals itself) and essential for cycle safety — a
+            // self-referential struct graph (e.g. a Wheels model with a circular
+            // association: `profile.author = author; author.profile = profile`)
+            // would otherwise recurse forever here. Lucee compares CFC instances
+            // by reference, so `arrayContains(visited, obj)` detects an
+            // already-seen object by identity, which is exactly how Wheels'
+            // `allErrors(includeAssociations=true)` breaks the cycle. (Wheels
+            // model.errorsSpec "handles circular reference" stack-overflowed the
+            // whole TestBox suite without this.)
+            if sa.backing_ptr() == sb.backing_ptr() {
+                return true;
+            }
             if sa.len() != sb.len() {
                 return false;
             }
@@ -2292,6 +2306,11 @@ fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
             true
         }
         (CfmlValue::Array(aa), CfmlValue::Array(ab)) => {
+            // Same identity short-circuit as Struct (above) — same backing
+            // handle is equal without recursing, so a cyclic array graph is safe.
+            if aa.backing_ptr() == ab.backing_ptr() {
+                return true;
+            }
             let sa = aa.snapshot();
             let sb = ab.snapshot();
             sa.len() == sb.len()

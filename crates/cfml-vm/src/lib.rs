@@ -4115,6 +4115,22 @@ impl CfmlVirtualMachine {
                                 if let Some(v) = saved_vars {
                                     locals.insert("__variables".to_string(), v);
                                 }
+                                // Forward-sync the merged keys into the shared closure
+                                // env (only ones it already holds — don't pollute).
+                                // A `local.i = local.i + 1` loop step compiles to
+                                // SetProperty on the `local` struct + this StoreLocal,
+                                // NOT a bare StoreLocal("i"), so without this the env's
+                                // copy of `i` goes stale and reconcile_closure_env_into_
+                                // locals reverts the live counter → infinite loop
+                                // (Wheels `model()` ORM init hung the whole suite).
+                                if let Some(ref env) = closure_env {
+                                    let mut m = env.write().unwrap();
+                                    for (k, v) in s.iter() {
+                                        if k != "__variables" && m.contains_key(k.as_str()) {
+                                            m.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                }
                             }
                         } else if name_lower == "variables"
                             && !declared_locals.contains(name.as_str())
