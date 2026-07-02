@@ -274,6 +274,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_implements_unqualified_sibling.cfm">
 <cf_runtest file="oop/test_unqualified_new_package_relative.cfm">
 <cf_runtest file="oop/test_runtime_added_method_via_structappend.cfm">
+<cf_runtest file="oop/test_injected_method_instance_isolation.cfm">
 <cf_runtest file="oop/test_metadata.cfm">
 <cf_runtest file="oop/test_mock_mixin_injection.cfm">
 <cf_runtest file="oop/test_mock204_backref_writeback.cfm">
