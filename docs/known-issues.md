@@ -268,25 +268,35 @@ conscious, privacy-friendly divergence. `onSessionStart` timing also shifts for
 existing apps: first write, not first hit. Opt back into the historical eager
 behaviour with `this.lazySessionCreation = false` (alias `this.lazySessions`).
 
-### 12c. Session scope is data-only 🛑 *(divergence — was a silent null)*
+### 12c. Session scope: live objects in memory, data-only on serializing stores 🛑 *(partial divergence)*
 
-The `session` scope persists **data values only** — no components, closures /
-functions, or native objects — enforced on **every store, memory included**.
-A violation throws and names the offending key path:
+The **default in-memory store keeps live object references**, so a component,
+closure, or native object stored in `session` round-trips as the same live
+object — matching Lucee/ACF in-memory sessions (this is what ColdBox/WireBox
+session-scoped beans need). No divergence there.
+
+A **serializing store** (datasource, memcached, KV/Workers, cluster) persists
+**data values only** — no components, closures/functions, or native objects,
+since they cannot survive the serialize→store→deserialize round trip. A violation
+throws and names the offending key path:
 
 ```
 session.cart.items[3].product is a component; the session scope only persists
 data values (no components, closures, functions, or native objects)
 ```
 
-The status quo this replaces was worse than a breaking change: on the external
-stores a component in session serialised to a **silent `null`** and vanished on
-the next request. Making that loud is a fix. Two layers enforce it: a shallow
-check at the `session.x = ...` write site (fails fast at the call), and a
-persist-time deep walk (the airtight gate — also catches values smuggled in via
-reference mutation, e.g. `local.x = {}; session.box = local.x; local.x.p = new C()`).
-Dates are strings and binary/query have JSON round-trip forms, so the allowed
-set covers everything that round-trips.
+**Divergence from Lucee (deliberate).** On a serializing store Lucee *attempts*
+Java serialization, which may succeed for a serializable CFC or silently
+corrupt/duplicate it; RustCFML has no CFC serialization, so it rejects loudly
+rather than dropping the value to a **silent `null`** on the next request (the
+worse status quo this fix also removed for the memory store). Two layers enforce
+it on serializing stores: a check at the `session.x = ...` write site (fails fast
+at the call, **catchable**), and a persist-time deep walk (the airtight gate,
+which also catches values smuggled in via reference mutation, e.g.
+`local.x = {}; session.box = local.x; local.x.p = new C()`; this fires at the
+request boundary and is **not** catchable). Dates are strings and binary/query
+have JSON round-trip forms, so the allowed set covers everything that serializes.
+Behaviour verified against Lucee (in-memory allows a CFC; #236, v0.397.0).
 
 ### 12d. Session expiry — background reaper + read-path exactness — *new*
 

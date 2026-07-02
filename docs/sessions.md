@@ -125,14 +125,37 @@ across Lucee and BoxLang. See
 **[Configuration → caches and sessionStorage](configuration.md#caches-and-sessionstorage)**
 for the full reference, a multi-node walkthrough, and a troubleshooting table.
 
-### Data-only rule *(divergence)*
+### Live objects in session — allowed in memory, data-only on serializing stores
 
-The `session` scope persists **data values only** — no components, closures,
-functions, or native objects. A violation throws and names the offending key
-path, on every store (memory included). This replaces a worse status quo where
-an object in session silently serialised to `null` on the external stores and
-vanished. Dates, binary, and queries have round-trip forms, so everything that
-can round-trip is allowed.
+The **default in-memory store keeps live object references**, so a component,
+closure, or native object stored in `session` round-trips as the same live
+object — matching Lucee/ACF in-memory sessions. This is what ColdBox/WireBox
+session-scoped beans rely on.
+
+```cfml
+session.myBean = new Bean();   // in-memory: fine — isObject(session.myBean) is true
+```
+
+A **serializing store** (datasource, memcached, KV/Workers, cluster) can only
+hold plain data — a live CFC/closure/native object cannot survive the
+serialize→store→deserialize round trip. On those stores the **data-only rule**
+applies: writing a non-data value throws and names the offending key path.
+
+```
+session.cart.items[3].product is a component; the session scope only persists
+data values (no components, closures, functions, or native objects)
+```
+
+> **Divergence from Lucee (deliberate).** On a serializing store Lucee *attempts*
+> to serialize the object (Java serialization), which may succeed for a
+> serializable CFC or silently corrupt/duplicate it. RustCFML has no CFC
+> serialization, so it **rejects loudly** rather than dropping the value to a
+> silent `null` on the next request. The direct-write case
+> (`session.x = new C()`) throws at the assignment and **is catchable**; a value
+> smuggled in via reference mutation (`local.x = {}; session.box = local.x;
+> local.x.p = new C()`) is caught by the airtight persist-time deep walk at the
+> request boundary and is *not* catchable. Dates, binary, and queries have
+> round-trip forms, so everything that can serialize is allowed on every store.
 
 ## Expiry
 
