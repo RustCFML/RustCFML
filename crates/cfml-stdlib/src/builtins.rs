@@ -3501,6 +3501,18 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 let s = value.as_string();
                 Ok(CfmlValue::Bool(SSN_REGEX.is_match(&s)))
             }
+            // Lucee/ACF: isValid("xml", x) / isValid("json", x) delegate to
+            // IsXml/IsJson. Without these, the type name fell through to the
+            // catch-all `false`, so `isValid("xml", <well-formed xml>)` was
+            // always false even though IsXml(x) was true — TestBox's
+            // `.toBeXML()` (→ isValid("xml", …)) failed on Wheels renderWith's
+            // valid XML output (controller.renderingSpec). The `xml` arm is
+            // gated on the `xml` feature (like IsXml itself, which pulls in
+            // quick_xml); on builds without it (the wasm worker) `isValid("xml",…)`
+            // falls through to the catch-all, matching the absence of IsXml there.
+            #[cfg(feature = "xml")]
+            "xml" => fn_is_xml(vec![value.clone()]),
+            "json" => fn_is_json(vec![value.clone()]),
             _ => Ok(CfmlValue::Bool(false)),
         }
     } else {

@@ -229,5 +229,17 @@ assertTrue("isValid uuid", isValid("uuid", createUUID()));
 assertTrue("isValid regex match", isValid("regex", "hello", "^[a-z]+$"));
 assertFalse("isValid regex no match", isValid("regex", "HELLO", "^[a-z]+$"));
 
+// xml — delegates to IsXml (Lucee/ACF). Was always false, breaking TestBox
+// .toBeXML() on Wheels renderWith's valid XML (controller.renderingSpec).
+assertTrue("isValid xml with decl", isValid("xml", '<?xml version="1.0"?><root><a>1</a></root>'));
+assertTrue("isValid xml no decl", isValid("xml", "<root><a>1</a></root>"));
+assertFalse("isValid xml on plain text", isValid("xml", "not xml at all"));
+assertFalse("isValid xml on malformed", isValid("xml", "<root><a>1</root>"));
+
+// json — delegates to IsJson (Lucee/ACF).
+assertTrue("isValid json object", isValid("json", '{"a":1}'));
+assertTrue("isValid json array", isValid("json", '[1,2,3]'));
+assertFalse("isValid json bad", isValid("json", "{a:}"));
+
 suiteEnd();
 </cfscript>
