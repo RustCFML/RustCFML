@@ -34,6 +34,40 @@ component {
 		return body();
 	}
 
+	// Exercise the FUSED counted-loop shape: a CONSTANT limit + `i++` compiles to
+	// ForLoopStep / JumpIfLocalCmpConstFalse (not Increment). Those fused ops read
+	// and write only `locals`, so when the unscoped counter lives in the component
+	// scope (`__variables`) the first step missed it, re-seeded `locals.i = step`,
+	// and the first iteration ran TWICE — a 4-count loop produced 5 elements
+	// (Wheels model.miscellaneousSpec `objectid` off-by-one). Passes on Lucee 7.
+	function runCounted() {
+		body = () => {
+			out = [];
+			for (i = 1; i lte 4; i++) {
+				arrayAppend(out, i);
+			}
+			return arrayToList(out);
+		};
+		return body();
+	}
+
+	// Same fused shape, but reached through a stored/re-invoked closure (deeper
+	// capture, mirroring TestBox's describe/it registration).
+	function runCountedNested() {
+		specs = [];
+		reg = (f) => {
+			arrayAppend(specs, f);
+		};
+		reg(() => {
+			out = [];
+			for (i = 1; i lte 30; i++) {
+				arrayAppend(out, i);
+			}
+			return arrayLen(out);
+		});
+		return specs[1]();
+	}
+
 	// Same, but exercise `+=` (AddLocalConst) and `--` (Decrement) on unscoped
 	// component-scope vars too.
 	function runDelta() {

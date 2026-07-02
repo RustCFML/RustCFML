@@ -5116,7 +5116,24 @@ impl CfmlVirtualMachine {
                         // full CFML comparison semantics. Keeps correctness
                         // for unusual cases (string loop var, null, etc.).
                         other => {
-                            let left = other.cloned().unwrap_or(CfmlValue::Null);
+                            // An UNSCOPED loop counter inside a CFC/closure
+                            // component-scope context lands in `__variables`, not
+                            // `locals` (the routing apply_numeric_delta already
+                            // handles for Increment). When the counter is absent
+                            // from locals, consult `__variables` so this fused
+                            // condition test agrees with where the value lives —
+                            // otherwise it reads a stale/missing value and the loop
+                            // miscounts (Wheels miscellaneousSpec objectid
+                            // off-by-one). Only on the miss path, so the hot
+                            // plain-local case pays nothing.
+                            let left = match other {
+                                Some(v) => v.clone(),
+                                None => locals
+                                    .get("__variables")
+                                    .and_then(|v| v.as_cfml_struct())
+                                    .and_then(|s| s.get_ci(name.as_str()))
+                                    .unwrap_or(CfmlValue::Null),
+                            };
                             let right = CfmlValue::Int(*c);
                             match cmp {
                                 CmpOp::Lt => cfml_compare(&left, &right) < 0,
@@ -5138,21 +5155,48 @@ impl CfmlVirtualMachine {
                     //   Increment(name)   // or Decrement if step is -1
                     //   JumpIfLocalCmpConstTrue(name, limit, cmp, target)
                     // but one dispatch instead of two.
-                    let new_val = match locals.get(name.as_str()) {
-                        Some(CfmlValue::Int(i)) => CfmlValue::Int(*i + *step),
-                        Some(CfmlValue::Double(d)) => CfmlValue::Double(*d + (*step as f64)),
+                    let (new_val, wrote_vars) = match locals.get(name.as_str()) {
+                        Some(CfmlValue::Int(i)) => (CfmlValue::Int(*i + *step), false),
+                        Some(CfmlValue::Double(d)) => (CfmlValue::Double(*d + (*step as f64)), false),
                         _ => {
-                            // Loop var changed type mid-loop (user mutated it).
-                            // Fall back to a safe step of 0 so we don't silently
-                            // coerce; loop will likely exit on the next cmp.
-                            CfmlValue::Int(*step)
+                            // The counter isn't a numeric local. An UNSCOPED
+                            // counter inside a CFC/closure component-scope context
+                            // lands in `__variables`, not `locals` (the same
+                            // routing apply_numeric_delta handles for Increment).
+                            // Advance it there so the fused step stays in sync with
+                            // where the value lives — otherwise the first step
+                            // misses it, re-seeds `locals.<name> = step`, and the
+                            // first iteration runs twice (Wheels miscellaneousSpec
+                            // `objectid` off-by-one). Only on the miss path, so the
+                            // hot plain-local case is unaffected.
+                            let vars_cur = locals
+                                .get("__variables")
+                                .and_then(|v| v.as_cfml_struct())
+                                .and_then(|s| s.get_ci(name.as_str()));
+                            match vars_cur {
+                                Some(CfmlValue::Int(i)) => (CfmlValue::Int(i + *step), true),
+                                Some(CfmlValue::Double(d)) => {
+                                    (CfmlValue::Double(d + (*step as f64)), true)
+                                }
+                                // Loop var changed type / absent everywhere: keep
+                                // the prior safe-step-into-locals behaviour.
+                                _ => (CfmlValue::Int(*step), false),
+                            }
                         }
                     };
-                    locals.insert(name.clone(), new_val.clone());
-                    if let Some(ref env) = closure_env {
-                        let mut m = env.write().unwrap();
-                        if m.contains_key(name.as_str()) {
-                            m.insert(name.clone(), new_val.clone());
+                    if wrote_vars {
+                        if let Some(vars) =
+                            locals.get("__variables").and_then(|v| v.as_cfml_struct())
+                        {
+                            vars.insert(name.clone(), new_val.clone());
+                        }
+                    } else {
+                        locals.insert(name.clone(), new_val.clone());
+                        if let Some(ref env) = closure_env {
+                            let mut m = env.write().unwrap();
+                            if m.contains_key(name.as_str()) {
+                                m.insert(name.clone(), new_val.clone());
+                            }
                         }
                     }
                     // Test and jump-back.

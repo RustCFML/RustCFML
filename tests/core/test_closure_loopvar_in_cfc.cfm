@@ -21,5 +21,13 @@ assert("unscoped i++ in CFC-method closure terminates", f.runLoop(), "i=6,cnt=5"
 // vars must also mutate, not no-op.
 assert("unscoped += and -- in CFC-method closure", f.runDelta(), "i=10,iters=5,down=1");
 
+// FUSED counted-loop shape (constant limit + i++ → ForLoopStep): an unscoped
+// counter in __variables must not run the first iteration twice. `lte 4` yields
+// exactly 4 elements, not 5.
+assert("fused counted loop, unscoped counter in CFC-method closure", f.runCounted(), "1,2,3,4");
+
+// Same, reached through a stored/re-invoked closure. 30 iterations → length 30.
+assert("fused counted loop via nested closure", f.runCountedNested(), 30);
+
 suiteEnd();
 </cfscript>
