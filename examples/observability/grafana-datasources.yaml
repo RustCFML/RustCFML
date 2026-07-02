@@ -1,0 +1,11 @@
+# Auto-provisions Tempo as a Grafana datasource so Explore → Tempo works with no
+# manual setup in the demo stack.
+apiVersion: 1
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    jsonData:
+      httpMethod: GET

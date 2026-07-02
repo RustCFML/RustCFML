@@ -1,0 +1,48 @@
+# Local observability stack for RustCFML — Phase 4 of the observability plan.
+#
+# One command brings up the full "keep the interesting traces" picture:
+#   OTel Collector (tail sampling) → Tempo (trace store) → Grafana (view).
+# Point a RustCFML `obs-otel` build at the collector and drive some slow/errored
+# requests; only those traces are retained and visible in Grafana.
+#
+#   1. Build + run RustCFML with OTel on (see docs/debugging.md):
+#        cargo run --release --features obs-otel -- --serve ./www
+#      with .cfconfig.json → observability.otel.endpoint = "http://localhost:4318"
+#   2. docker compose -f examples/observability/docker-compose.yml up
+#   3. Open Grafana at http://localhost:3000 (anonymous admin), Explore → Tempo.
+#
+# This is a dev/demo stack (no auth, in-memory-ish storage) — not for production.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4318:4318"   # OTLP/HTTP — RustCFML pushes here
+      - "4317:4317"   # OTLP/gRPC
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+    ports:
+      - "3200:3200"   # Tempo query API
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    volumes:
+      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/ds.yaml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo

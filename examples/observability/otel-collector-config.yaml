@@ -1,0 +1,68 @@
+# OpenTelemetry Collector config for RustCFML — Phase 4 of the observability
+# plan (tail sampling). RustCFML exports spans over OTLP/HTTP (protobuf) to this
+# collector; the collector keeps only the *interesting* traces (slow or errored)
+# and forwards them to a trace backend (Tempo here), off the application host so
+# the hot path stays cheap.
+#
+# See docs/observability-ops.md for the full write-up, incl. the multi-instance
+# (load-balancing) topology.
+
+receivers:
+  otlp:
+    protocols:
+      # RustCFML's obs-otel build pushes OTLP/HTTP protobuf. gRPC is enabled too
+      # so other producers (or a future grpc transport) work against the same
+      # collector.
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Tail sampling — the decision is made AFTER all spans of a trace arrive, so we
+  # can keep a trace because it was slow or errored (which a head sampler at the
+  # app can't know up front). `decision_wait` must exceed a request's realistic
+  # duration; `num_traces` bounds in-flight memory (watch the
+  # `otelcol_processor_tail_sampling_sampling_trace_dropped_too_early` metric).
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      # Keep every errored trace.
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      # Keep every trace slower than 3s (FusionReactor's threshold capture).
+      - name: slow
+        type: latency
+        latency:
+          threshold_ms: 3000
+      # Keep a small baseline of normal traffic for context / SLO math.
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+
+  # Bound export batches; keeps memory steady under load.
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  # Tempo (or any OTLP trace backend). `otlp/tempo` pushes gRPC to Tempo's 4317.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Uncomment to also see traces on the collector's own stdout while debugging.
+  # debug:
+  #   verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [otlp/tempo]

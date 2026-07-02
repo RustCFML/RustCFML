@@ -80,6 +80,10 @@ default = ["memcached", "cluster", "jit"]
 # scrape endpoint). Host-only; never enabled by the wasm crates. Implies the VM's
 # `observability` hook bus.
 obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:prometheus", "opentelemetry_sdk/testing"]
+# Native CPU/wall-clock sampling profiler (`--profile`), emitting a flamegraph +
+# pprof protobuf. Unix-only (uses SIGPROF/setitimer) — the `pprof` dependency is
+# declared under the unix target table; never built for wasm or Windows.
+obs-pprof = ["dep:pprof"]
 # Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
 # whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
 dhat-heap = ["dep:dhat"]
@@ -97,3 +101,5 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Native sampling profiler (obs-pprof feature). Unix-only: pprof-rs uses SIGPROF.
+pprof = { version = "0.15", optional = true, features = ["flamegraph", "protobuf-codec"] }

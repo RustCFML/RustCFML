@@ -7,6 +7,10 @@ mod websocket;
 /// `obs-otel` feature — the heavy OTLP/reqwest/prometheus deps never reach wasm.
 #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
 mod otel;
+/// Native CPU/wall-clock sampling profiler (observability Phase 6). Unix-only,
+/// behind the `obs-pprof` feature — wraps pprof-rs (SIGPROF).
+#[cfg(all(feature = "obs-pprof", unix))]
+mod pprof_profile;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -205,6 +209,14 @@ struct Args {
     /// looking diagnostic only — does not change execution behaviour.
     #[arg(long)]
     jit_coverage: bool,
+
+    /// Native CPU/wall-clock sampling profiler (observability Phase 6). Samples
+    /// the Rust call stack at ~100 Hz for the duration of a one-shot run and, on
+    /// exit, writes `rustcfml-profile.svg` (flamegraph) + `rustcfml-profile.pb`
+    /// (pprof protobuf, loadable in `go tool pprof` / speedscope / Pyroscope).
+    /// Requires a build with `--features obs-pprof`; Unix-only.
+    #[arg(long)]
+    profile: bool,
 }
 
 /// Process-global flag set by the `--jit-stats` CLI option. Polled after
@@ -461,7 +473,25 @@ fn real_main() {
         exit(1);
     }
 
+    // Native sampling profiler (Phase 6): arm it around the whole run when
+    // `--profile` is set. Held until `finish()` writes the flamegraph + pprof.
+    #[cfg(all(feature = "obs-pprof", unix))]
+    let _profiler = if args.profile {
+        pprof_profile::start("rustcfml-profile")
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "obs-pprof", unix)))]
+    if args.profile {
+        eprintln!("--profile requires a build with `--features obs-pprof` (Unix only)");
+    }
+
     execute_file(&path, args.debug);
+
+    #[cfg(all(feature = "obs-pprof", unix))]
+    if let Some(session) = _profiler {
+        session.finish();
+    }
 }
 
 fn execute_file(path: &PathBuf, debug: bool) {

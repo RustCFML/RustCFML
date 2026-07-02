@@ -266,6 +266,38 @@ DB client (`db.system.name`, `db.query.text`, `db.operation.name`,
 > share the profiler's [attribution limitation](known-issues.md) (JIT'd numeric
 > leaves don't get their own span).
 
+## Native CPU/wall-clock profiler (`--profile`)
+
+The sampling profiler above works at the *CFML* level (which function is running).
+The **native** profiler works one layer down — it samples the **Rust** call stack
+(bytecode dispatch, BIF internals, allocator pressure), the hot spots the CFML
+sampler can't see. It wraps [pprof-rs](https://docs.rs/pprof): a `SIGPROF` timer
+samples at ~100 Hz with a malloc-free signal handler.
+
+Build with the `obs-pprof` feature (Unix-only — it uses `SIGPROF`) and run a
+one-shot script with `--profile`:
+
+```bash
+cargo build --release --features obs-pprof
+./target/release/rustcfml --profile mybench.cfm
+```
+
+On exit it writes two files in the working directory:
+
+- **`rustcfml-profile.svg`** — an interactive flamegraph (open in a browser).
+- **`rustcfml-profile.pb`** — a pprof protobuf, loadable in `go tool pprof`,
+  [speedscope](https://www.speedscope.app/), or Grafana Pyroscope.
+
+Continuous profiling in serve mode (the Grafana Pyroscope SDK, route-tagged) is a
+documented follow-up; the ad-hoc `--profile` path covers the "why is this run
+slow at the Rust level" case today.
+
+## Ops / production
+
+Tail sampling (keep only slow/errored traces, off the app host) and a ready-to-run
+Collector + Tempo + Grafana stack are covered in
+[observability-ops.md](observability-ops.md).
+
 ## Notes & limitations
 
 - The footer is a web-page artifact and auto-renders on web requests only; in
@@ -274,6 +306,6 @@ DB client (`db.system.name`, `db.query.text`, `db.operation.name`,
   it folds into Application time.
 - The remaining observability roadmap layer — a DAP step debugger — is designed
   and builds on the same hook bus, but is not yet shipped.
-- OTLP **metric** push (traces already push over OTLP) and `<cftransaction>`
-  spans are documented follow-ups; the `TxnEvent` hook is wired into the bus but
-  not yet emitted.
+- OTLP **metric** push (traces already push over OTLP), continuous native
+  profiling (Pyroscope), and `<cftransaction>` spans are documented follow-ups;
+  the `TxnEvent` hook is wired into the bus but not yet emitted.
