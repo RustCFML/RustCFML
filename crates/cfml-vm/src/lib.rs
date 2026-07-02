@@ -19736,7 +19736,37 @@ impl CfmlVirtualMachine {
                     // slash-path name yielded the whole path and broke m2m join
                     // relationship validation. Already-dotted names are unchanged
                     // (no slashes to replace). Verified vs Lucee 7.0.4.
-                    let dotted = Self::dotted_component_name(class_name);
+                    let mut dotted = Self::dotted_component_name(class_name);
+                    // Issue #229: an UNQUALIFIED `new X()` (no dots/slashes) made
+                    // from inside a component resolves relative to the DEFINING
+                    // component's own package, so its metadata.name is the fully
+                    // qualified "<caller-package>.X" on Lucee/ACF — not the bare
+                    // "X". The caller's own dotted __name (via `this` in scope)
+                    // gives that package prefix. We only qualify when the file was
+                    // found alongside the caller (source-relative resolution, i.e.
+                    // cfc_path sits in the caller source's directory), matching how
+                    // Lucee resolves the unqualified name against the defining
+                    // component's directory first. Same root-cause family as #206.
+                    if !class_name.contains(['.', '/', '\\']) {
+                        if let Some(caller_pkg) = locals.get("this").and_then(|t| match t {
+                            CfmlValue::Struct(cs) => cs.get("__name").map(|v| v.as_string()),
+                            _ => None,
+                        }).and_then(|n| {
+                            n.rfind('.').map(|i| n[..i].to_string()).filter(|p| !p.is_empty())
+                        }) {
+                            let resolved_in_caller_dir = self
+                                .source_file
+                                .as_deref()
+                                .and_then(|src| std::path::Path::new(src).parent())
+                                .map(|d| {
+                                    std::path::Path::new(&cfc_path).parent() == Some(d)
+                                })
+                                .unwrap_or(false);
+                            if resolved_in_caller_dir {
+                                dotted = format!("{}.{}", caller_pkg, dotted);
+                            }
+                        }
+                    }
                     s.insert("__name".to_string(), CfmlValue::string(dotted));
                 }
             }
