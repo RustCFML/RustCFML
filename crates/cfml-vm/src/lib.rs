@@ -814,6 +814,18 @@ pub struct ServerState {
     /// come from re-executing Application.cfc, which must run every request.)
     pub app_cfconfig_cache:
         Arc<parking_lot::RwLock<HashMap<std::path::PathBuf, Option<Arc<cfml_config::RustCfmlConfig>>>>>,
+    /// Production-mode cache of a component name → its resolved `.cfc` file path.
+    /// `resolve_component_template` finds a component by `stat()`-ing many
+    /// candidate paths (relative-to-caller, mappings, webroot); that probing is a
+    /// pure function of (class name, caller dir, base template) for an immutable
+    /// on-disk tree, which is exactly production mode's contract. Memoising it
+    /// lets repeated resolutions — WireBox rebuilding singletons, inheritance
+    /// chains re-resolved during boot — skip the filesystem entirely (the single
+    /// biggest slice of a Preside cold boot). Keyed
+    /// `"<class_lower>\x1f<source_file>\x1f<base_template>"`; only populated when
+    /// `production_mode` and only for paths that actually exist (negatives
+    /// re-probe). Never populated in dev mode (the tree may change).
+    pub component_path_cache: Arc<parking_lot::RwLock<HashMap<String, String>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -872,6 +884,7 @@ impl ServerState {
             production_mode,
             app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             app_cfconfig_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            component_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -19175,8 +19188,43 @@ impl CfmlVirtualMachine {
                 return Some(val);
             }
         }
-        // 4. Try loading .cfc file — first relative, then via mappings
-        let cfc_path = {
+        // 4. Try loading .cfc file — first relative, then via mappings.
+        //
+        // Production-mode resolution cache: the exists()-probing below is a pure
+        // function of (class name, caller dir, base template) for an immutable
+        // tree, so in production we memoise the winning path and skip the stat
+        // storm on repeat (the biggest slice of a Preside cold boot). Compute the
+        // key + look for a hit first, releasing the borrow before the probing
+        // block (which needs `&mut self`).
+        let cache_key: Option<String> = if self
+            .server_state
+            .as_ref()
+            .map_or(false, |s| s.production_mode)
+            // Ops/diagnostic escape hatch: RUSTCFML_NO_COMPONENT_CACHE=1 forces
+            // full path re-probing every time even in production.
+            && std::env::var("RUSTCFML_NO_COMPONENT_CACHE")
+                .map(|v| v.is_empty() || v == "0")
+                .unwrap_or(true)
+        {
+            Some(format!(
+                "{}\u{1f}{}\u{1f}{}",
+                class_name.to_ascii_lowercase(),
+                self.source_file.as_deref().unwrap_or(""),
+                self.base_template_path.as_deref().unwrap_or(""),
+            ))
+        } else {
+            None
+        };
+        let cached_path: Option<String> = cache_key.as_ref().and_then(|k| {
+            self.server_state
+                .as_ref()
+                .and_then(|s| s.component_path_cache.read().get(k).cloned())
+        });
+
+        let cfc_path = if let Some(hit) = cached_path {
+            hit
+        } else {
+            let resolved = {
             // If class_name is already an absolute path or has .cfc extension, use directly
             let as_path = std::path::Path::new(class_name);
             if class_name.starts_with('/') {
@@ -19306,6 +19354,21 @@ impl CfmlVirtualMachine {
                     relative_path // Fall back to relative (will fail at read_to_string below)
                 }
             }
+            };
+            // Cache the resolved path in production so repeat resolutions skip
+            // the probing above. Cached unconditionally (no verify-stat): an
+            // immutable production tree means a not-found stays not-found, and
+            // in-memory definitions (steps 1-3) are always checked before this
+            // cache, so a negative entry can never shadow a component defined
+            // later. Skipping the verify keeps the miss path a stat cheaper.
+            if let Some(key) = &cache_key {
+                if let Some(ss) = self.server_state.as_ref() {
+                    ss.component_path_cache
+                        .write()
+                        .insert(key.clone(), resolved.clone());
+                }
+            }
+            resolved
         };
 
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);

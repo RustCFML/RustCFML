@@ -55,10 +55,11 @@ To reproduce: clone [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfm
 
 ## Production mode caching
 
-By default the server re-validates files on each request (statting `Application.cfc` resolution and every cached bytecode entry) so edits are picked up live. Passing `--production` (or `RUSTCFML_PRODUCTION=1`) enables three persistent in-memory caches:
+By default the server re-validates files on each request (statting `Application.cfc` resolution and every cached bytecode entry) so edits are picked up live. Passing `--production` (or `RUSTCFML_PRODUCTION=1`) enables four persistent in-memory caches:
 
 - **Application.cfc path resolution** — the directory walk is done once, then memoized (including negative results).
 - **URL → file resolution** — routing `is_file` stats are memoized.
 - **Bytecode cache trust** — the per-hit `mtime` check on every compiled file is skipped.
+- **Component path resolution** — resolving a dotted/relative component name (`createObject`, `new`, `extends=`, WireBox lookups) normally `stat()`s many candidate paths (relative-to-caller, each mapping, the webroot). That probing is memoized per `(component, caller dir)`, so repeat resolutions skip the filesystem. This is the dominant filesystem cost on framework-heavy apps: profiling a Preside boot, it cut `RealFs::exists` CPU by roughly two-thirds. Overridable with `RUSTCFML_NO_COMPONENT_CACHE=1`.
 
 Once warm, requests pay zero filesystem IO. The typical speedup on an app with `Application.cfc` + cfincludes is 3–4× requests/sec. Files changed on disk are not picked up until restart. Self-contained binaries running in sandbox mode enable production caching automatically, since the embedded VFS is immutable. See **[Deployment](deployment.md)**.
