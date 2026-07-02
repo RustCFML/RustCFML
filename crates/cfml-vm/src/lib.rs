@@ -21,6 +21,11 @@ pub mod dump;
 pub mod observe;
 #[cfg(feature = "observability")]
 pub mod debug_footer;
+/// Threshold-gated cooperative sampling profiler (Phase 2 of the observability
+/// plan). Behind the `observability` feature; the watchdog thread lives in the
+/// CLI so nothing thread-related reaches wasm.
+#[cfg(feature = "observability")]
+pub mod profiler;
 mod java_shims;
 pub mod tz;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
@@ -837,6 +842,12 @@ pub struct ServerState {
     /// back null. Reading `server` returns this handle (a live clone), so the
     /// scope-pointer pattern writes through, exactly like `application`.
     pub server_scope: CfmlStruct,
+    /// Threshold-gated sampling profiler registry (Phase 2). `Some` only when
+    /// `observability.profiler.enabled` — the watchdog thread scans it and each
+    /// request registers itself on entry. `None` ⇒ the profiler is off and the
+    /// VM never installs a per-request handle.
+    #[cfg(feature = "observability")]
+    pub profiler: Option<Arc<profiler::ProfilerHub>>,
 }
 
 impl ServerState {
@@ -867,6 +878,8 @@ impl ServerState {
                 uuid::Uuid::new_v4().to_string(),
             )),
             server_scope: CfmlStruct::empty(),
+            #[cfg(feature = "observability")]
+            profiler: None,
         }
     }
 
@@ -1431,6 +1444,16 @@ pub struct CfmlVirtualMachine {
     /// the footer activation gates.
     #[cfg(feature = "observability")]
     pub debug_config: cfml_config::DebuggingCfg,
+    /// Per-request profiler handle (Phase 2). `Some` only when the profiler is
+    /// armed for this request (config on + registered in the hub). Its
+    /// `want_sample` flag is checked at the `LineInfo` hook — one relaxed atomic
+    /// load per source line, almost always `false`.
+    #[cfg(feature = "observability")]
+    profile: Option<profiler::RequestProfileHandle>,
+    /// Stack samples collected for this request, folded into a call tree on
+    /// demand (`getRequestProfile()`) and published to the hub at request end.
+    #[cfg(feature = "observability")]
+    profile_samples: profiler::RequestSamples,
 }
 
 /// Constructor signature for a Rust-backed class registered via
@@ -1710,6 +1733,10 @@ impl CfmlVirtualMachine {
             debug_collector: None,
             #[cfg(feature = "observability")]
             debug_config: cfml_config::DebuggingCfg::default(),
+            #[cfg(feature = "observability")]
+            profile: None,
+            #[cfg(feature = "observability")]
+            profile_samples: profiler::RequestSamples::default(),
         };
         // Register the root program's functions so stored references and
         // DefineFunction ops resolve by global_id from the first instruction.
@@ -2144,6 +2171,135 @@ impl CfmlVirtualMachine {
     #[cfg(feature = "observability")]
     pub fn is_debug_mode(&self) -> bool {
         self.debug_collector.is_some()
+    }
+
+    /// Register this request with the sampling profiler if it is enabled on the
+    /// server. Called once at request start. When the profiler is off (or there
+    /// is no server state, i.e. a CLI run) this is a cheap `None` check and no
+    /// handle is installed — so the `LineInfo` hook stays a `None` branch.
+    #[cfg(feature = "observability")]
+    pub fn maybe_arm_profiler(&mut self) {
+        if self.profile.is_some() {
+            return;
+        }
+        let hub = match self.server_state.as_ref().and_then(|s| s.profiler.clone()) {
+            Some(h) => h,
+            None => return,
+        };
+        let route = self
+            .scope_struct("cgi")
+            .and_then(|c| c.get_ci("script_name"))
+            .map(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.source_file.clone())
+            .unwrap_or_default();
+        self.profile = Some(hub.register(route));
+    }
+
+    /// The `LineInfo` hook's slow path: the watchdog asked for a sample. Clear
+    /// the flag and snapshot this VM's own call stack (root → leaf). Runs on the
+    /// request's own thread, so no cross-thread access to live scopes. Bounded by
+    /// the per-request cap so a pathological request can't grow unbounded.
+    #[cfg(feature = "observability")]
+    #[inline(never)]
+    fn capture_self_sample(&mut self) {
+        let cap = self.profile.as_ref().map(|p| p.max_samples).unwrap_or(0) as usize;
+        if let Some(p) = &self.profile {
+            p.want_sample
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if cap != 0 && self.profile_samples.len() >= cap {
+            return;
+        }
+        let mut frames: Vec<profiler::SampleFrame> =
+            Vec::with_capacity(self.call_stack.len() + 1);
+        for f in &self.call_stack {
+            frames.push(profiler::SampleFrame {
+                function: f.function_name.clone(),
+                template: f.template.clone(),
+                line: f.line,
+            });
+        }
+        if frames.is_empty() {
+            // Top-level page code between/before any function call.
+            frames.push(profiler::SampleFrame {
+                function: "(template)".to_string(),
+                template: self.source_file.clone().unwrap_or_default(),
+                line: self.current_line,
+            });
+        }
+        self.profile_samples.push(frames);
+    }
+
+    /// Finish profiling this request: publish the folded call tree to the hub
+    /// (for the admin endpoint) and deregister. Idempotent. Called at request end.
+    #[cfg(feature = "observability")]
+    pub fn finish_profiler(&mut self) {
+        if let (Some(p), Some(hub)) = (
+            self.profile.take(),
+            self.server_state.as_ref().and_then(|s| s.profiler.clone()),
+        ) {
+            hub.finish(p.id, &self.profile_samples);
+        }
+    }
+
+    /// Project the current request's profile (folded call tree) into a CFML
+    /// struct for `getRequestProfile()`. Empty struct when nothing was sampled.
+    #[cfg(feature = "observability")]
+    pub fn request_profile_cfml(&self) -> CfmlValue {
+        if self.profile_samples.is_empty() {
+            return CfmlValue::Struct(CfmlStruct::empty());
+        }
+        let tree = self.profile_samples.build_tree();
+        let total = tree.total_count.max(1) as f64;
+        let root = CfmlStruct::empty();
+        root.insert("sampleCount".to_string(), CfmlValue::Int(tree.total_count as i64));
+        root.insert(
+            "root".to_string(),
+            Self::profile_node_cfml(&tree, total),
+        );
+        CfmlValue::Struct(root)
+    }
+
+    /// Recursively render one call-tree node as a CFML struct.
+    #[cfg(feature = "observability")]
+    fn profile_node_cfml(node: &profiler::CallNode, total: f64) -> CfmlValue {
+        let s = CfmlStruct::empty();
+        s.insert("function".to_string(), CfmlValue::string(node.function.clone()));
+        s.insert("template".to_string(), CfmlValue::string(node.template.clone()));
+        s.insert("line".to_string(), CfmlValue::Int(node.line as i64));
+        s.insert("self".to_string(), CfmlValue::Int(node.self_count as i64));
+        s.insert("total".to_string(), CfmlValue::Int(node.total_count as i64));
+        s.insert(
+            "selfPercent".to_string(),
+            CfmlValue::Double((node.self_count as f64 / total) * 100.0),
+        );
+        s.insert(
+            "totalPercent".to_string(),
+            CfmlValue::Double((node.total_count as f64 / total) * 100.0),
+        );
+        let children: Vec<CfmlValue> = node
+            .children
+            .iter()
+            .map(|c| Self::profile_node_cfml(c, total))
+            .collect();
+        s.insert("children".to_string(), CfmlValue::array(children));
+        CfmlValue::Struct(s)
+    }
+
+    /// Force-start profiling the current request even if it hasn't crossed the
+    /// threshold (FusionReactor's "Profile now"). Arms the handle (if the
+    /// profiler is enabled) and immediately captures one sample. Returns whether
+    /// profiling is now active.
+    #[cfg(feature = "observability")]
+    pub fn profile_now(&mut self) -> bool {
+        self.maybe_arm_profiler();
+        if self.profile.is_some() {
+            self.capture_self_sample();
+            true
+        } else {
+            false
+        }
     }
 
     /// Gather the configured scope snapshots for the footer's scope dump. Never
@@ -8259,6 +8415,21 @@ impl CfmlVirtualMachine {
                     if let Some(frame) = self.call_stack.last_mut() {
                         frame.line = *line;
                     }
+                    // Sampling profiler (Phase 2): the whole block vanishes
+                    // without the feature. When on but the profiler is off for
+                    // this request, `self.profile` is `None` and this is a single
+                    // `is_none` branch. When armed, it is one relaxed atomic load
+                    // that is almost always `false`; only a watchdog-requested
+                    // sample takes the (out-of-line) snapshot.
+                    #[cfg(feature = "observability")]
+                    {
+                        let want = self.profile.as_ref().map_or(false, |p| {
+                            p.want_sample.load(std::sync::atomic::Ordering::Relaxed)
+                        });
+                        if want {
+                            self.capture_self_sample();
+                        }
+                    }
                 }
 
                 BytecodeOp::CallRustSuperCtor(arg_count) => {
@@ -9229,7 +9400,8 @@ impl CfmlVirtualMachine {
                 // `observability` feature is off they fall through to the no-op
                 // stub builtins registered in cfml-stdlib.
                 #[cfg(feature = "observability")]
-                "getdebugdata" | "isdebugmode" | "debugadd" | "writelog" | "trace" => {
+                "getdebugdata" | "isdebugmode" | "debugadd" | "writelog" | "trace"
+                | "getrequestprofile" | "profilenow" => {
                     // Will be handled at the end of this function (needs VM access)
                 }
                 _ => {
@@ -12620,6 +12792,19 @@ impl CfmlVirtualMachine {
                 #[cfg(feature = "observability")]
                 "isdebugmode" => {
                     return Ok(CfmlValue::Bool(self.is_debug_mode()));
+                }
+                #[cfg(feature = "observability")]
+                "getrequestprofile" => {
+                    // The sampling profiler's call tree for the current request
+                    // (Phase 2). Empty struct when nothing was sampled.
+                    return Ok(self.request_profile_cfml());
+                }
+                #[cfg(feature = "observability")]
+                "profilenow" => {
+                    // FusionReactor's "Profile now" — force-start sampling this
+                    // request. Returns true when the profiler is enabled and now
+                    // active, false when the profiler is off server-wide.
+                    return Ok(CfmlValue::Bool(self.profile_now()));
                 }
                 #[cfg(feature = "observability")]
                 "writelog" => {

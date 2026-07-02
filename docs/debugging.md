@@ -153,13 +153,69 @@ ignored):
 }
 ```
 
+## Sampling profiler (FusionReactor-style)
+
+The second observability layer is a **threshold-gated cooperative sampling
+profiler**. When a request runs longer than a threshold (default 3s), a watchdog
+thread asks that request's own VM to snapshot its CFML call stack on an interval
+(default 200ms). The snapshots fold into an inverted call tree with self/total
+sample counts, so you can see which functions a slow request actually spent its
+time in — without instrumenting every call.
+
+It is **off by default** and, like the footer, costs nothing when off. When
+armed but a request stays *under* the threshold, the only cost is one relaxed
+atomic load per executed source line (almost always false). Only a request that
+crosses the threshold pays for stack snapshots, and that cost is constant
+(one snapshot per interval) regardless of how much code the request runs.
+
+Enable it under the `observability` block:
+
+```jsonc
+{
+  "observability": {
+    "enabled": true,
+    "profiler": {
+      "enabled": true,
+      "thresholdMs": 3000,     // only requests slower than this start sampling
+      "intervalMs": 200,       // sampling cadence once armed
+      "maxSamples": 500,       // hard per-request cap
+      "watchdogTickMs": 50     // how often the watchdog scans in-flight requests
+    }
+  }
+}
+```
+
+**CFML surface:**
+
+- `profileNow()` — force-start profiling the current request immediately
+  (FusionReactor's "Profile now"). Takes one sample synchronously and returns
+  `true` when the profiler is enabled, `false` when it is off server-wide.
+- `getRequestProfile()` — the folded call tree for the current request as a
+  struct: `{ sampleCount, root }`, where each node has `function`, `template`,
+  `line`, `self`, `total`, `selfPercent`, `totalPercent`, and `children`.
+
+**Admin endpoint:** in serve mode, `GET /__rustcfml/profiler` returns the most
+recent profiled (slow) requests as JSON — route, sample count, and the call
+tree. It 404s when the profiler is off.
+
+### Limitation — JIT-compiled numeric leaves
+
+RustCFML's JIT compiles small hot numeric functions straight to native code,
+bypassing the interpreter loop (and therefore the per-line sampling hook and the
+call-frame push). Time spent inside a JIT-compiled numeric leaf is therefore
+attributed to its **caller's** self-time rather than showing as its own frame.
+This is acceptable in practice — such functions are tiny and fast by definition
+(that is why they were JIT'd) — but a profile will not break them out
+separately. Interpreted functions (the overwhelming majority of a real request,
+and everything in serve mode where the per-request JIT rarely warms up) are
+attributed correctly.
+
 ## Notes & limitations
 
 - The footer is a web-page artifact and auto-renders on web requests only; in
   CLI runs the data is still collected and reachable via `getDebugData()`.
 - Per-template **Load** (compile/startup) time is not yet broken out separately —
   it folds into Application time.
-- This footer is the first layer of a larger observability roadmap (a
-  threshold-gated sampling profiler, OpenTelemetry traces + metrics, and a DAP
-  step debugger) built on the same hook bus. Those layers are designed but not
-  yet shipped.
+- The remaining observability roadmap layers — OpenTelemetry traces + metrics
+  and a DAP step debugger — are designed and build on the same hook bus, but are
+  not yet shipped.

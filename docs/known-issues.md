@@ -433,6 +433,22 @@ order (bucket index + resize thresholds) plus its attribute-name case preservati
 **won't-fix divergence**. (FK *rule* reporting via `dbinfo type="foreignkeys"` — the
 JDBC numeric `UPDATE_RULE`/`DELETE_RULE` codes — *is* matched; see §10.)
 
+## 16. Sampling profiler — JIT-compiled numeric leaves not attributed 🏗
+
+The threshold-gated sampling profiler (`observability.profiler`, `profileNow()` /
+`getRequestProfile()` — see [debugging.md](debugging.md)) samples the CFML call
+stack at the interpreter's per-line hook. Small hot **numeric functions the JIT
+compiles to native code bypass the interpreter loop**, so they neither push a
+call frame nor fire the sampling hook. Time spent inside such a function is
+therefore folded into its **caller's** self-time instead of appearing as its own
+node in the call tree.
+
+This is a deliberate trade-off, not a silent drop: JIT'd numeric leaves are tiny
+and fast by definition, and in serve mode the per-request JIT rarely warms up at
+all (see the JIT-in-serve-mode notes), so interpreted frames — the overwhelming
+majority of a real request — are attributed correctly. Breaking JIT'd leaves out
+separately would require the JIT to push frames it currently elides for speed.
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*

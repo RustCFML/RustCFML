@@ -500,7 +500,18 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json: cfconfig.security.secure_json,
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
-    let server_state = ServerState::with_config(false, cfconfig);
+    let mut server_state = ServerState::with_config(false, cfconfig.clone());
+    // Sampling profiler in CLI runs: no watchdog thread, so threshold-based
+    // auto-sampling never fires, but `profileNow()` still captures synchronously
+    // and `getRequestProfile()` reports it. Armed only when config enables it.
+    if cfconfig.observability.enabled && cfconfig.observability.profiler.enabled {
+        let p = &cfconfig.observability.profiler;
+        server_state.profiler = Some(Arc::new(cfml_vm::profiler::ProfilerHub::new(
+            p.threshold_ms,
+            p.interval_ms,
+            p.max_samples,
+        )));
+    }
     let cli_vfs: Arc<dyn vfs::Vfs> =
         Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs()));
     match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, false) {
@@ -803,6 +814,11 @@ fn compile_and_run(
     // when they pass. A request that won't show debug output collects nothing.
     vm.maybe_install_debug_collector();
 
+    // Sampling profiler (Phase 2): register this request with the profiler hub
+    // (a no-op when the profiler is off). A watchdog thread will ask it to
+    // sample its own call stack if it runs past the threshold.
+    vm.maybe_arm_profiler();
+
     // Start logging this request's container allocations so the request-boundary
     // cycle collector can reclaim any reference cycles it built (the serve-mode
     // leak fix). Armed only in serve mode; a no-op otherwise. See cfml_common::cycle_gc.
@@ -846,6 +862,11 @@ fn compile_and_run(
     // renderable HTML response not suppressed by <cfsetting showDebugOutput>).
     // Appends to the output buffer, so it flows into the response body below.
     vm.maybe_render_debug_footer();
+
+    // Sampling profiler (Phase 2): fold this request's samples into a call tree,
+    // publish it to the hub for the /__rustcfml/profiler admin endpoint, and
+    // deregister. A no-op when nothing was sampled.
+    vm.finish_profiler();
 
     // Catch redirect errors as success
     let result = match result {
@@ -1424,6 +1445,35 @@ async fn async_run_server(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
     );
 
+    // Sampling profiler (Phase 2 of the observability plan). When
+    // `observability.profiler.enabled`, build the shared registry and spawn a
+    // single watchdog thread that asks slow in-flight requests to sample their
+    // own call stacks. Off by default — the field stays `None` and the VM never
+    // installs a per-request handle, so the LineInfo hook remains a `None` branch.
+    {
+        let pcfg = &cfconfig.observability.profiler;
+        if cfconfig.observability.enabled && pcfg.enabled {
+            let hub = Arc::new(cfml_vm::profiler::ProfilerHub::new(
+                pcfg.threshold_ms,
+                pcfg.interval_ms,
+                pcfg.max_samples,
+            ));
+            server_state.profiler = Some(hub.clone());
+            let tick = std::time::Duration::from_millis(pcfg.watchdog_tick_ms.max(1));
+            std::thread::Builder::new()
+                .name("rustcfml-profiler-watchdog".into())
+                .spawn(move || loop {
+                    std::thread::sleep(tick);
+                    hub.tick();
+                })
+                .expect("spawn profiler watchdog thread");
+            println!(
+                "Sampling profiler armed (threshold {}ms, interval {}ms, max {} samples)",
+                pcfg.threshold_ms, pcfg.interval_ms, pcfg.max_samples
+            );
+        }
+    }
+
     // Populate the global datasource registry from cfconfig so cfquery /
     // queryExecute can resolve `datasource="myDSN"` lookups. Done once per
     // process; replaying with new values is idempotent for tests.
@@ -1608,6 +1658,50 @@ async fn async_run_server(
     }
 }
 
+/// Render one call-tree node (and its children) as JSON for the profiler
+/// admin endpoint.
+fn profiler_node_json(node: &cfml_vm::profiler::CallNode, total: f64) -> serde_json::Value {
+    serde_json::json!({
+        "function": node.function,
+        "template": node.template,
+        "line": node.line,
+        "self": node.self_count,
+        "total": node.total_count,
+        "selfPercent": (node.self_count as f64 / total) * 100.0,
+        "totalPercent": (node.total_count as f64 / total) * 100.0,
+        "children": node.children.iter().map(|c| profiler_node_json(c, total)).collect::<Vec<_>>(),
+    })
+}
+
+/// The `/__rustcfml/profiler` admin endpoint. Returns `None` when the profiler
+/// is off (so the request falls through to the normal 404 path); otherwise a
+/// JSON document of the recent profiled requests, newest first.
+fn profiler_endpoint(state: &Arc<AppState>) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let hub = state.server_state.profiler.as_ref()?;
+    let profiles: Vec<serde_json::Value> = hub
+        .recent_profiles()
+        .iter()
+        .map(|p| {
+            let total = p.tree.total_count.max(1) as f64;
+            serde_json::json!({
+                "id": p.id,
+                "route": p.route,
+                "sampleCount": p.sample_count,
+                "tree": profiler_node_json(&p.tree, total),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "profiles": profiles });
+    Some(
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+    )
+}
+
 async fn handle_request(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -1640,6 +1734,16 @@ async fn handle_request(
         Some(pos) => (&url[..pos], &url[pos + 1..]),
         None => (url.as_str(), ""),
     };
+
+    // Sampling-profiler admin endpoint (Phase 2). Returns the recent profiled
+    // requests (slow requests the watchdog sampled) as JSON. Only served when
+    // the profiler is actually armed, so it 404s exactly like any other unknown
+    // path when the feature is off.
+    if raw_path == "/__rustcfml/profiler" {
+        if let Some(resp) = profiler_endpoint(&state) {
+            return resp;
+        }
+    }
 
     // Block direct access to config and meta files. 404 (not 403) so the
     // existence of the file is not confirmed to a probing client. Always

@@ -781,5 +781,6 @@ include "harness.cfm";
 <!--- Observability: classic CF debug-footer BIFs. Footer activation/render --->
 <!--- (serve-only) is covered by Rust gate tests in cfml-vm/src/lib.rs. --->
 <cf_runtest file="observe/test_debug_footer.cfm">
+<cf_runtest file="observe/test_profiler.cfm">
 
 <cfscript> printSummary(); </cfscript>

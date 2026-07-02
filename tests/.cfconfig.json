@@ -29,5 +29,14 @@
   "debugging": {
     "enabled": true,
     "errorStatusCode": false
+  },
+  "observability": {
+    "enabled": true,
+    "profiler": {
+      "enabled": true,
+      "thresholdMs": 3000,
+      "intervalMs": 200,
+      "maxSamples": 500
+    }
   }
 }

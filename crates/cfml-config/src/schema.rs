@@ -39,6 +39,10 @@ pub struct RustCfmlConfig {
     pub session: SessionCfg,
     pub logging: LoggingCfg,
     pub debugging: DebuggingCfg,
+    /// RustCFML-native observability subsystems (sampling profiler, OpenTelemetry,
+    /// DAP debugger). Distinct from `debugging`, which is the Lucee-compatible
+    /// classic footer. See `docs/observability-*.md`.
+    pub observability: ObservabilityCfg,
     pub security: SecurityCfg,
     #[serde(rename = "urlRewriting")]
     pub url_rewriting: UrlRewritingCfg,
@@ -660,6 +664,67 @@ impl Default for DebugFieldsCfg {
             query_usage: false,
             dump: true,
             scopes: vec!["cgi".into(), "url".into(), "form".into()],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// Observability (profiler / OTel / DAP) — RustCFML-native
+// ─────────────────────────────────────────────
+
+/// The RustCFML-native observability subsystems. `enabled` is the master switch;
+/// each subsystem also has its own `enabled` flag so they can be armed
+/// independently. All default off — zero cost until explicitly turned on.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct ObservabilityCfg {
+    /// Master switch for the observability subsystems (default off).
+    pub enabled: bool,
+    /// Threshold-gated cooperative sampling profiler (Phase 2).
+    pub profiler: ProfilerCfg,
+}
+
+impl Default for ObservabilityCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profiler: ProfilerCfg::default(),
+        }
+    }
+}
+
+/// Threshold-gated cooperative sampling profiler. When a request runs longer
+/// than `thresholdMs`, a watchdog thread asks the request's own VM to snapshot
+/// its CFML call stack every `intervalMs`, up to `maxSamples`. Fast requests
+/// pay nothing (one relaxed atomic load per source line, always false).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct ProfilerCfg {
+    /// Arm the profiler (default off). When off, the VM never installs a profile
+    /// handle and the per-line check compiles to a `None` branch.
+    pub enabled: bool,
+    /// Only requests slower than this begin sampling (ms).
+    #[serde(rename = "thresholdMs")]
+    pub threshold_ms: u64,
+    /// Sampling cadence once armed (ms).
+    #[serde(rename = "intervalMs")]
+    pub interval_ms: u64,
+    /// Hard cap on samples per request (bounds memory on a runaway request).
+    #[serde(rename = "maxSamples")]
+    pub max_samples: u32,
+    /// How often the watchdog scans in-flight requests (ms).
+    #[serde(rename = "watchdogTickMs")]
+    pub watchdog_tick_ms: u64,
+}
+
+impl Default for ProfilerCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_ms: 3000,
+            interval_ms: 200,
+            max_samples: 500,
+            watchdog_tick_ms: 50,
         }
     }
 }

@@ -756,6 +756,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getDebugData".into(), fn_get_debug_data_stub);
     f.insert("isDebugMode".into(), fn_is_debug_mode_stub);
     f.insert("debugAdd".into(), fn_debug_add_stub);
+    // Sampling-profiler BIFs (Phase 2) — VM-intercepted when observability is on;
+    // these stubs keep pages portable on feature-off / wasm builds.
+    f.insert("getRequestProfile".into(), fn_get_request_profile_stub);
+    f.insert("profileNow".into(), fn_profile_now_stub);
 
     // ---- File I/O functions ----
     f.insert("fileRead".into(), fn_file_read);
@@ -13573,6 +13577,16 @@ fn fn_is_debug_mode_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 /// Fallback `debugAdd()` for feature-off builds — no-op.
 fn fn_debug_add_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Null)
+}
+
+/// Fallback `getRequestProfile()` for feature-off builds — empty struct.
+fn fn_get_request_profile_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::strukt(ValueMap::default()))
+}
+
+/// Fallback `profileNow()` for feature-off builds — profiler unavailable.
+fn fn_profile_now_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::Bool(false))
 }
 
 // ---- File functions ----
