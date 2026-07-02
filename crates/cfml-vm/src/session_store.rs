@@ -48,6 +48,18 @@ pub trait SessionStore: Send + Sync + 'static {
     fn next_expiry(&self, _now_secs: u64) -> Option<u64> {
         None
     }
+
+    /// Whether this store persists session data by SERIALIZING it (an external
+    /// store: memcached, datasource, KV, cluster). Serializing stores can only
+    /// hold plain data — a live CFC / closure / native object cannot survive the
+    /// round trip — so the data-only session rule (issue #88) is enforced for
+    /// them. The default in-process `MemoryStore` keeps live object references,
+    /// so it returns `false`: CFCs/closures in `session` are allowed there,
+    /// matching Lucee/ACF in-memory sessions (issue #236). Serializing stores
+    /// override this to `true`.
+    fn persists_by_serialization(&self) -> bool {
+        false
+    }
 }
 
 // ─────────────────────────────────────────────

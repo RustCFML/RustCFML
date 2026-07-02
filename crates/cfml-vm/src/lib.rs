@@ -19054,6 +19054,17 @@ impl CfmlVirtualMachine {
     /// Persist the live session scope back to the session store. Called at the
     /// end of the request (after user code) so scope-pointer writes that bypass
     /// `set_session_*` (e.g. `var p = session; p[k]=v`) are committed.
+    /// Whether the active session store persists by SERIALIZING data, which
+    /// forbids live CFCs/closures/native objects in `session` (issue #88). The
+    /// default in-process store keeps live references, so it returns false and
+    /// CFCs in `session` are allowed there, matching Lucee/ACF (issue #236).
+    fn session_store_serializes(&self) -> bool {
+        self.server_state
+            .as_ref()
+            .map(|s| s.sessions.persists_by_serialization())
+            .unwrap_or(false)
+    }
+
     fn sync_session_scope_to_store(&mut self) -> Result<(), CfmlError> {
         let snap = match &self.session_scope {
             Some(ss) => ss.snapshot(),
@@ -19061,8 +19072,11 @@ impl CfmlVirtualMachine {
         };
         // Airtight data-only gate: catches values smuggled in via reference
         // mutation (`local.x = {}; session.cart = local.x; local.x.p = new C()`),
-        // which no assignment-time check can see.
-        validate_session_data_only(&snap)?;
+        // which no assignment-time check can see. Only for SERIALIZING stores —
+        // an in-memory session legitimately holds live objects (issue #236).
+        if self.session_store_serializes() {
+            validate_session_data_only(&snap)?;
+        }
         if let (Some(state), Some(sid)) = (self.server_state.clone(), self.session_id.clone()) {
             let now = now_epoch_secs();
             let app = self.current_application_name.clone().unwrap_or_default();
@@ -19113,9 +19127,12 @@ impl CfmlVirtualMachine {
     /// Set the session scope for the current request (mutates the live scope).
     fn set_session_scope(&mut self, vars: ValueMap) -> Result<(), CfmlError> {
         // Data-only gate at the write site (ergonomics): the common direct
-        // case `session.x = new C()` fails here rather than at request end.
-        // Validate BEFORE lazy-init so a rejected write mints no session.
-        validate_session_data_only(&vars)?;
+        // case `session.x = new C()` fails here rather than at request end —
+        // but only for a SERIALIZING store (issue #236). Validate BEFORE
+        // lazy-init so a rejected write mints no session.
+        if self.session_store_serializes() {
+            validate_session_data_only(&vars)?;
+        }
         // If lazy-init fires here, `onSessionStart` ran AFTER the user
         // code loaded the (then-empty) session scope. Their `vars`
         // snapshot doesn't contain any keys onSessionStart set, so we
@@ -19140,14 +19157,17 @@ impl CfmlVirtualMachine {
 
     /// Update a single key in the session scope (mutates the live scope).
     fn set_session_variable(&mut self, key: &str, value: CfmlValue) -> Result<(), CfmlError> {
-        // Data-only gate at the write site (ergonomics).
-        validate_session_value(&format!("session.{}", key), &value).map_err(|p| {
-            CfmlError::runtime(format!(
-                "{}; the session scope only persists data values \
-                 (no components, closures, functions, or native objects)",
-                p
-            ))
-        })?;
+        // Data-only gate at the write site (ergonomics) — SERIALIZING stores
+        // only; an in-memory session may hold a live CFC (issue #236).
+        if self.session_store_serializes() {
+            validate_session_value(&format!("session.{}", key), &value).map_err(|p| {
+                CfmlError::runtime(format!(
+                    "{}; the session scope only persists data values \
+                     (no components, closures, functions, or native objects)",
+                    p
+                ))
+            })?;
+        }
         self.lazy_init_session_if_pending();
         self.attach_session_scope();
         if let Some(ref ss) = self.session_scope {

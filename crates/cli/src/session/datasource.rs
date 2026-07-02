@@ -211,6 +211,11 @@ fn affected_rows(result: &CfmlResult) -> i64 {
 }
 
 impl SessionStore for DatasourceStore {
+    // Serializes session data to a JDBC datasource — data values only (issue #236).
+    fn persists_by_serialization(&self) -> bool {
+        true
+    }
+
     fn get(&self, app: &str, id: &str) -> Option<SessionData> {
         self.ensure_schema();
         let part = self.part(app);

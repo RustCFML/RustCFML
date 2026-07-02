@@ -640,6 +640,7 @@ include "harness.cfm";
 <!--- IDeclCreature), for both `new X()` and createObject("component", ...). --->
 <cf_runtest file="core/test_isinstanceof_interface_chain.cfm">
 <cf_runtest file="core/test_isinstanceof_native_types.cfm">
+<cf_runtest file="core/test_session_holds_component.cfm">
 <!--- - dotted_param_type: a function/method parameter may carry a dotted FQN --->
 <!--- type (function f( wheels.system.TestResult x )). RustCFML used to reject --->
 <!--- the first `.` ("Expected RParen, found Dot"). Parse-only (Lucee enforces --->

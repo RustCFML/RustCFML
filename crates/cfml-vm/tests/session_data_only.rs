@@ -1,24 +1,54 @@
-//! Data-only session enforcement (issue #88).
+//! Data-only session enforcement (issues #88, #236).
 //!
-//! The session scope persists data values only. Writing a closure, function,
-//! component, or native object must fail loudly — on every store, memory
-//! included — instead of silently serialising to null on an external store.
+//! A SERIALIZING session store (memcached / datasource / KV / cluster) persists
+//! data values only: writing a closure, function, component, or native object
+//! must fail loudly instead of silently serialising to null. The default
+//! in-process store keeps live object references, so it accepts CFCs/closures in
+//! `session`, matching Lucee/ACF in-memory sessions (issue #236).
 
 use cfml_codegen::compiler::CfmlCompiler;
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::{EmbeddedFs, Vfs};
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
-use cfml_vm::{CfmlVirtualMachine, MemoryStore, ServerState, SessionStore};
-use indexmap::IndexMap;
+use cfml_vm::{CfmlVirtualMachine, MemoryStore, ServerState, SessionData, SessionStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const VROOT: &str = "/app";
 
-/// Run a request and return the lifecycle result so the test can assert on
-/// whether the session write was rejected.
-fn run(page_cfm: &str) -> Result<CfmlValue, cfml_common::vm::CfmlError> {
+/// A session store that reports it persists by SERIALIZATION (so the data-only
+/// rule applies), delegating storage to an in-process map. Mirrors what a real
+/// memcached/datasource store does for the purpose of this test.
+#[derive(Default)]
+struct SerializingStore {
+    inner: MemoryStore,
+}
+
+impl SessionStore for SerializingStore {
+    fn persists_by_serialization(&self) -> bool {
+        true
+    }
+    fn get(&self, app: &str, id: &str) -> Option<SessionData> {
+        self.inner.get(app, id)
+    }
+    fn set(&self, app: &str, id: &str, data: SessionData) {
+        self.inner.set(app, id, data)
+    }
+    fn remove(&self, app: &str, id: &str) {
+        self.inner.remove(app, id)
+    }
+    fn rotate(&self, app: &str, old_id: &str, new_id: &str) {
+        self.inner.rotate(app, old_id, new_id)
+    }
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, ValueMap)> {
+        self.inner.take_expired(now_secs)
+    }
+}
+
+/// Run a request and return the lifecycle result. `serializing` selects a
+/// serializing store (data-only enforced) vs the default in-memory store.
+fn run_with(page_cfm: &str, serializing: bool) -> Result<CfmlValue, cfml_common::vm::CfmlError> {
     let app_cfc = r##"
 component {
     this.name              = "data-only-test";
@@ -42,9 +72,12 @@ component {
     let ast = Parser::new(processed).parse().unwrap();
     let program = CfmlCompiler::new().compile(ast);
 
-    let store = Arc::new(MemoryStore::new());
     let mut server_state = ServerState::with_production(false);
-    server_state.sessions = store.clone() as Arc<dyn SessionStore>;
+    server_state.sessions = if serializing {
+        Arc::new(SerializingStore::default()) as Arc<dyn SessionStore>
+    } else {
+        Arc::new(MemoryStore::new()) as Arc<dyn SessionStore>
+    };
 
     let mut vm = CfmlVirtualMachine::new(program);
     vm.vfs = vfs;
@@ -68,15 +101,29 @@ component {
 }
 
 #[test]
-fn plain_data_is_allowed() {
-    let r = run(r#"<cfscript> session.cart = ["a", "b"]; session.count = 2; </cfscript>"#);
+fn plain_data_is_allowed_on_memory() {
+    let r = run_with(r#"<cfscript> session.cart = ["a", "b"]; session.count = 2; </cfscript>"#, false);
     assert!(r.is_ok(), "plain data values must persist without error: {:?}", r.err());
 }
 
 #[test]
-fn closure_in_session_is_rejected() {
-    let r = run(r#"<cfscript> session.handler = function() { return 1; }; </cfscript>"#);
-    let err = r.expect_err("a closure in session must be rejected");
+fn plain_data_is_allowed_on_serializing() {
+    let r = run_with(r#"<cfscript> session.cart = ["a", "b"]; session.count = 2; </cfscript>"#, true);
+    assert!(r.is_ok(), "plain data values must persist without error: {:?}", r.err());
+}
+
+#[test]
+fn closure_in_memory_session_is_allowed() {
+    // In-memory keeps live references, so a closure in session is fine (Lucee
+    // parity, issue #236) — no serialization to null.
+    let r = run_with(r#"<cfscript> session.handler = function() { return 1; }; </cfscript>"#, false);
+    assert!(r.is_ok(), "an in-memory session may hold a closure: {:?}", r.err());
+}
+
+#[test]
+fn closure_in_serializing_session_is_rejected() {
+    let r = run_with(r#"<cfscript> session.handler = function() { return 1; }; </cfscript>"#, true);
+    let err = r.expect_err("a closure in a serializing session must be rejected");
     assert!(
         err.message.to_lowercase().contains("session.handler")
             && err.message.to_lowercase().contains("data values"),
@@ -86,9 +133,9 @@ fn closure_in_session_is_rejected() {
 }
 
 #[test]
-fn nested_closure_is_rejected_with_path() {
-    let r = run(r#"<cfscript> session.cfg = { cb: function(){ return 1; } }; </cfscript>"#);
-    let err = r.expect_err("a nested closure in session must be rejected");
+fn nested_closure_in_serializing_session_is_rejected_with_path() {
+    let r = run_with(r#"<cfscript> session.cfg = { cb: function(){ return 1; } }; </cfscript>"#, true);
+    let err = r.expect_err("a nested closure in a serializing session must be rejected");
     assert!(
         err.message.contains("session.cfg.cb"),
         "error should name the nested key path: {}",
@@ -97,15 +144,16 @@ fn nested_closure_is_rejected_with_path() {
 }
 
 #[test]
-fn reference_smuggled_closure_is_caught_at_persist() {
+fn reference_smuggled_closure_is_caught_at_persist_on_serializing() {
     // The shallow assignment check can't see this — the persist-time deep walk
-    // is the airtight gate.
-    let r = run(
+    // is the airtight gate for serializing stores.
+    let r = run_with(
         r#"<cfscript>
             local.holder = {};
             session.box = local.holder;   // plain struct at write time
             local.holder.fn = function(){ return 1; };  // mutated through the alias
         </cfscript>"#,
+        true,
     );
     let err = r.expect_err("a reference-smuggled closure must be caught at persist");
     assert!(

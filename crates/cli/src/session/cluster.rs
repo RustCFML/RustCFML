@@ -661,6 +661,12 @@ mod inner {
     }
 
     impl SessionStore for ClusterStore {
+        // Serializes session data across the cluster (Automerge) — data values
+        // only (issue #236).
+        fn persists_by_serialization(&self) -> bool {
+            true
+        }
+
         fn get(&self, app: &str, id: &str) -> Option<SessionData> {
             let key = composite_key(app, id);
             let docs = self.shared.docs.lock().ok()?;

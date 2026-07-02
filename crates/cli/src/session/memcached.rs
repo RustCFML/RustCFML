@@ -55,6 +55,11 @@ mod inner {
     }
 
     impl SessionStore for MemcachedStore {
+        // Serializes session data to memcached — data values only (issue #236).
+        fn persists_by_serialization(&self) -> bool {
+            true
+        }
+
         fn get(&self, app: &str, id: &str) -> Option<SessionData> {
             let raw: Option<String> = self.client.get(&self.key(app, id)).ok().flatten();
             raw.and_then(|s| serde_json::from_str(&s).ok())

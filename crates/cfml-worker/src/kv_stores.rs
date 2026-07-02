@@ -161,6 +161,11 @@ impl KvBackedSessionStore {
 // multi-app stores (memory/datasource/cluster/memcached) do the real
 // namespacing.
 impl SessionStore for KvBackedSessionStore {
+    // Serializes session data to Cloudflare KV — data values only (issue #236).
+    fn persists_by_serialization(&self) -> bool {
+        true
+    }
+
     fn get(&self, _app: &str, id: &str) -> Option<SessionData> {
         self.memory.get(MEM_APP, id)
     }
