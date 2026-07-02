@@ -288,9 +288,21 @@ On exit it writes two files in the working directory:
 - **`rustcfml-profile.pb`** — a pprof protobuf, loadable in `go tool pprof`,
   [speedscope](https://www.speedscope.app/), or Grafana Pyroscope.
 
-Continuous profiling in serve mode (the Grafana Pyroscope SDK, route-tagged) is a
-documented follow-up; the ad-hoc `--profile` path covers the "why is this run
-slow at the Rust level" case today.
+`--profile` also works with **`--serve`**:
+
+```bash
+./target/release/rustcfml --serve ./www --profile
+# drive load, then Ctrl+C — the flamegraph is written on graceful shutdown
+```
+
+In serve mode the sampler is **process-wide** (a `SIGPROF` timer over all worker
+threads), so the flamegraph is an **aggregate** of CPU across every request
+served during the window — the standard "profile the server under load" view, not
+a single request. Idle runtime/park frames appear too (filter them out when
+reading, or lean on the blocklist). Because sampling has a small always-on cost,
+this is an ad-hoc "profile for a few minutes, then Ctrl+C" tool; **continuous**
+serve-mode profiling (the Grafana Pyroscope SDK, route-tagged, at lower rates) is
+a documented follow-up.
 
 ## Ops / production
 

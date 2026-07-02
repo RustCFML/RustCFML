@@ -211,10 +211,12 @@ struct Args {
     jit_coverage: bool,
 
     /// Native CPU/wall-clock sampling profiler (observability Phase 6). Samples
-    /// the Rust call stack at ~100 Hz for the duration of a one-shot run and, on
-    /// exit, writes `rustcfml-profile.svg` (flamegraph) + `rustcfml-profile.pb`
-    /// (pprof protobuf, loadable in `go tool pprof` / speedscope / Pyroscope).
-    /// Requires a build with `--features obs-pprof`; Unix-only.
+    /// the Rust call stack at ~100 Hz and, on exit, writes `rustcfml-profile.svg`
+    /// (flamegraph) + `rustcfml-profile.pb` (pprof protobuf, loadable in
+    /// `go tool pprof` / speedscope / Pyroscope). Works for a one-shot run
+    /// (profiles that run) and with `--serve` (process-wide aggregate over all
+    /// requests; written on graceful Ctrl+C shutdown). Requires a build with
+    /// `--features obs-pprof`; Unix-only.
     #[arg(long)]
     profile: bool,
 }
@@ -442,6 +444,7 @@ fn real_main() {
             false,
             production,
             Arc::new(cfconfig),
+            args.profile,
         );
         return;
     }
@@ -1042,6 +1045,7 @@ struct AppState {
     cfconfig: Arc<RustCfmlConfig>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server(
     doc_root: &Path,
     port: u16,
@@ -1052,7 +1056,25 @@ fn run_server(
     sandbox: bool,
     production: bool,
     cfconfig: Arc<RustCfmlConfig>,
+    profile: bool,
 ) {
+    // Native sampling profiler (Phase 6) in serve mode. Sampling is process-wide
+    // (a SIGPROF timer over all worker threads), so it captures aggregate CPU
+    // across every request served — profile under load, then Ctrl+C to write the
+    // flamegraph. The guard is a plain local held across `block_on` (a blocking
+    // call, not an await), so there's no Send/await concern; the report is
+    // written after the server shuts down gracefully, below.
+    #[cfg(all(feature = "obs-pprof", unix))]
+    let profiler = if profile {
+        pprof_profile::start("rustcfml-profile")
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "obs-pprof", unix)))]
+    if profile {
+        eprintln!("--profile requires a build with `--features obs-pprof` (Unix only)");
+    }
+
     // Arm the request-boundary cycle collector so a long-lived serve process
     // reclaims reference cycles instead of leaking them on every request. Opt
     // out with RUSTCFML_NO_CYCLE_GC=1.
@@ -1075,6 +1097,12 @@ fn run_server(
             .unwrap()
     };
     rt.block_on(async_run_server(doc_root, port, socket, debug, single_threaded, vfs, sandbox, production, cfconfig));
+
+    // Server has shut down gracefully (Ctrl+C) — write the flamegraph + pprof.
+    #[cfg(all(feature = "obs-pprof", unix))]
+    if let Some(session) = profiler {
+        session.finish();
+    }
 }
 
 /// Known Lucee Memcached extension Java class names (both the old and new bundle).
@@ -3388,7 +3416,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false);
         }
         _ => {
             // Foreground mode (default: just run)
@@ -3413,7 +3441,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false);
         }
     }
 }
