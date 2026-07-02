@@ -1,0 +1,13 @@
+{
+    "app":{
+        "cfengine":"lucee@7"
+    },
+    "name":"rcfml-lucee",
+    "quiet":true,
+    "web":{
+        "http":{
+            "port":"8586"
+        }
+    },
+    "webroot":"/Users/alexskinner/Repos/opensource/CFMLs/RustCFML"
+}

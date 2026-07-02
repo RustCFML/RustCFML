@@ -5906,6 +5906,56 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
         }
     }
 
+    // Fallback for non-component values: match against the value's native Java
+    // identity, mirroring getClass().getName() (see cfml-vm/src/lib.rs). Lucee/ACF
+    // treat CFML arrays as java.util.List, structs as java.util.Map, etc., so
+    // isInstanceOf(arr, "java.util.List") and isInstanceOf(arr, "Array") are true.
+    // A component Struct (one carrying __name / __java_class) is NOT eligible here:
+    // if its metadata above didn't match, the answer is genuinely false.
+    let native_aliases: &[&str] = match obj {
+        CfmlValue::Array(_) => &[
+            "array",
+            "lucee.runtime.type.arrayimpl",
+            "lucee.runtime.type.array",
+            "java.util.list",
+            "java.util.collection",
+            "java.lang.iterable",
+        ],
+        CfmlValue::Struct(s)
+            if !s.contains_key("__name") && !s.contains_key("__java_class") =>
+        {
+            &[
+                "struct",
+                "lucee.runtime.type.structimpl",
+                "lucee.runtime.type.struct",
+                "java.util.map",
+            ]
+        }
+        CfmlValue::Query(_) => &[
+            "query",
+            "lucee.runtime.type.queryimpl",
+            "lucee.runtime.type.query",
+        ],
+        CfmlValue::String(_) => &["string", "java.lang.string", "java.lang.charsequence"],
+        CfmlValue::Bool(_) => &["boolean", "java.lang.boolean"],
+        CfmlValue::Int(_) => &[
+            "numeric",
+            "java.lang.integer",
+            "java.lang.number",
+            "java.lang.long",
+        ],
+        CfmlValue::Double(_) => &[
+            "numeric",
+            "java.lang.double",
+            "java.lang.number",
+        ],
+        CfmlValue::Binary(_) => &["binary", "[b", "byte[]"],
+        _ => &[],
+    };
+    if native_aliases.iter().any(|a| *a == type_lower) {
+        return Ok(CfmlValue::Bool(true));
+    }
+
     Ok(CfmlValue::Bool(false))
 }
 
