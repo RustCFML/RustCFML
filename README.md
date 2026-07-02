@@ -108,7 +108,8 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 
 | Topic | Description |
 |---|---|
-| **[Debugging](docs/debugging.md)** | The classic debug-output footer — queries (with params), template times, exceptions, scopes; activation gates, `getDebugData()`/`isDebugMode()`/`debugAdd()` |
+| **[Debugging & observability](docs/debugging.md)** | Classic debug-output footer (queries, template times, exceptions, scopes; `getDebugData()`/`isDebugMode()`/`debugAdd()`), threshold-gated **sampling profiler** (`profileNow()`/`getRequestProfile()`), **OpenTelemetry** OTLP traces + Prometheus RED metrics, and the native **`--profile`** CPU flamegraph/pprof profiler |
+| **[Observability ops](docs/observability-ops.md)** | Tail sampling at an OTel Collector (keep slow/errored traces off the app host) + a one-command Collector → Tempo → Grafana stack |
 | **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
 | **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
 
@@ -165,6 +166,7 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 - **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; in-memory **Query-of-Queries** (`dbtype="query"`) on a pure-Rust SQL engine — see the perf table below; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
 - **Real concurrency** — `cfthread` runs bodies on real OS threads with shared `application`/`request`/`session` scopes and `cflock`. See **[Threading](docs/threads.md)**.
 - **Native WebSockets** — realtime channels on the same port as HTTP: one CFC per channel with convention lifecycle methods, rooms, presence, auth, `lastEventId` resumability, multi-node fan-out, ack-by-return, and emit-from-anywhere (`wsPublish`/`io()`) — reachable over both **raw WebSocket** and the **socket.io** transport, plus an imperative **socket.io-lucee-compatible** API (`new SocketIoServer()`). See **[WebSockets](docs/websockets.md)**.
+- **Debugging & observability** — a Lucee-style debug-output footer, a FusionReactor-class threshold-gated **sampling profiler**, **OpenTelemetry** distributed traces (OTLP) + Prometheus RED metrics, and a native CPU **flamegraph profiler** (`--profile`) — all off by default and zero-cost when off. See **[Debugging & observability](docs/debugging.md)** and **[Observability ops](docs/observability-ops.md)**.
 - **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
 - **Extensible** — drop in first-class built-ins and classes written in Rust ([native modules](docs/native-modules.md)).
 
