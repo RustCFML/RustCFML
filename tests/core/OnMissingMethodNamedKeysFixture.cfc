@@ -34,7 +34,15 @@ component {
 			statusVal = structKeyExists(mma, "status") ? mma.status : "(absent)",
 			// Control: numeric key presence (the positional shape).
 			has1      = structKeyExists(mma, "1"),
-			val1      = structKeyExists(mma, "1") ? mma["1"] : "(absent)"
+			val1      = structKeyExists(mma, "1") ? mma["1"] : "(absent)",
+			// POSITIONAL INDEX ACCESS: on Lucee/ACF the missingMethodArguments
+			// collection is array-addressable — `mma[1]` returns the FIRST
+			// argument by order even when it was passed BY NAME (and
+			// structKeyExists(mma,"1") is still false for that named call).
+			// Wheels' dynamic finders rely on this: findAllByZipcode(zipCode="x")
+			// reads `missingMethodArguments[1]`.
+			idx1      = mma[1],
+			idx2      = structCount(mma) ge 2 ? mma[2] : "(none)"
 		};
 	}
 

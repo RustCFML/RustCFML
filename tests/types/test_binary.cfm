@@ -32,5 +32,19 @@ emptyBin = toBinary(toBase64(""));
 assertTrue("empty binary is binary", isBinary(emptyBin));
 assert("empty binary length", len(emptyBin), 0);
 
+// --- toBase64 of a BINARY value encodes its RAW bytes (not the "<Binary>"
+// display string). Previously toBase64(binary) returned base64("<Binary>") for
+// EVERY binary input, so any two binaries encoded identically — Wheels crudSpec
+// hasChanged (SQLite base64-encodes blobs) saw no change between a PNG and a TXT.
+b1 = toBinary(toBase64("Hello World"));
+assert("toBase64(binary) encodes raw bytes, matches string form",
+	toBase64(b1), toBase64("Hello World"));
+assert("toBase64(binary) round-trips via toBinary",
+	toString(toBinary(toBase64(b1))), "Hello World");
+// Two DIFFERENT binaries must produce DIFFERENT base64 (the hasChanged bug).
+bA = toBinary(toBase64("aaaa"));
+bB = toBinary(toBase64("bbbb"));
+assertFalse("distinct binaries produce distinct base64", toBase64(bA) eq toBase64(bB));
+
 suiteEnd();
 </cfscript>

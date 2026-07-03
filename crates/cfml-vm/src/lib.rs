@@ -18026,6 +18026,23 @@ impl CfmlVirtualMachine {
                         missing_args.insert(name.to_string(), a);
                     }
                 }
+                // Stamp missingMethodArguments as an arguments-scope collection so
+                // it matches Lucee/ACF: `missingMethodArguments[N]` is positionally
+                // addressable — it returns the N-th argument by order even when the
+                // arg was passed BY NAME — while StructCount/StructKeyList/
+                // StructKeyExists still see only the real arg keys (the markers are
+                // filtered from struct introspection, and hidden from StructAppend /
+                // argumentCollection spread too — verified). Wheels' dynamic finders
+                // read `missingMethodArguments[1]` for a value passed under the
+                // property name, e.g. `findAllByZipcode(zipCode="11111")`; without
+                // this that read returned empty and the finder queried `zipcode=''`
+                // → 0 rows. Empty `__arguments_params` → the GetIndex positional
+                // fallback resolves `[N]` to the N-th non-marker entry in order.
+                missing_args.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
+                missing_args.insert(
+                    "__arguments_params".to_string(),
+                    CfmlValue::array(Vec::new()),
+                );
                 let mut method_locals = ValueMap::default();
                 if let CfmlValue::Struct(ref s2) = object {
                     if let Some(vars) = s2.get("__variables") {
@@ -18216,6 +18233,20 @@ impl CfmlVirtualMachine {
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case(&root))
                         .map(|(_, v)| v.clone())
+                })
+                // Check the component `variables` scope. An unscoped var assigned
+                // inside a CFC method (or a closure defined in one) lands in
+                // `__variables`, not the function-local frame — so without this
+                // `isDefined("x")` / `isDefined("x.col")` wrongly returned false
+                // for it (only `isDefined("variables.x")` worked). Mirrors the
+                // variable READ path (lookup_name_in_scopes), which checks
+                // __variables right after locals. Wheels crudSpec's calc-property
+                // test does `isDefined("posts.titleAlias")` on an unscoped query.
+                .or_else(|| {
+                    locals
+                        .get("__variables")
+                        .and_then(|v| v.as_cfml_struct())
+                        .and_then(|s| s.get_ci(&root))
                 })
                 // Check request scope
                 .or_else(|| self.request_scope.get_ci(&root))

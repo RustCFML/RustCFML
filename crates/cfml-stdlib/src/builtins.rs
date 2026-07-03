@@ -1714,9 +1714,22 @@ fn fn_strip_cr(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_to_base64(args: Vec<CfmlValue>) -> CfmlResult {
-    // Simple base64 encoding
-    let input = get_str(&args, 0);
-    let bytes = input.as_bytes();
+    // Simple base64 encoding. A Binary value must be encoded from its RAW bytes,
+    // not its display string — `get_str` renders Binary as the literal "<Binary>",
+    // so `toBase64(FileReadBinary(x))` was producing base64("<Binary>") for EVERY
+    // binary input (identical output regardless of content). That silently broke
+    // any binary round-trip and made two different files compare equal — Wheels
+    // crudSpec's `hasChanged` binary test (SQLite adapter base64-encodes blobs)
+    // saw no change between a PNG and a TXT because both encoded to the same
+    // "<Binary>" string.
+    let input_string;
+    let bytes: &[u8] = match args.first() {
+        Some(CfmlValue::Binary(b)) => b.as_slice(),
+        _ => {
+            input_string = get_str(&args, 0);
+            input_string.as_bytes()
+        }
+    };
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
     for chunk in bytes.chunks(3) {

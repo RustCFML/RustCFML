@@ -103,5 +103,19 @@ assert("CONTROL: positional call -> missingMethodArguments['1'] == 'world'",
 assertFalse("CONTROL: positional call has no 'label' key",
 	ommnk_pos.hasLabel);
 
+// ---- (4) POSITIONAL INDEX access to NAMED args (Lucee/ACF collection) ----
+// missingMethodArguments[N] reads the N-th argument BY ORDER, even for named
+// calls, while structKeyExists(mma,"1") stays false. Wheels findAllByXXX +
+// dynamic association setters read mma[1] for a value passed under the
+// property name; without this they queried `col=''` / errored on `key`.
+assert("named arg: mma[1] positional read returns first value",
+	ommnk_one.idx1, "world");
+assertFalse("named arg: structKeyExists(mma,'1') still false (name-keyed)",
+	ommnk_one.has1);
+assert("two named args: mma[1] == first value by order", ommnk_two.idx1, "a");
+assert("two named args: mma[2] == second value by order", ommnk_two.idx2, "b");
+// Positional call: mma[1] agrees with the numeric key.
+assert("positional call: mma[1] positional read", ommnk_pos.idx1, "world");
+
 suiteEnd();
 </cfscript>
