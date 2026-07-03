@@ -69,6 +69,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_scoped_loop_index_and_argcoll.cfm">
 <cf_runtest file="core/test_closure_loopvar_in_cfc.cfm">
 <cf_runtest file="core/test_isdefined_component_scope.cfm">
+<cf_runtest file="core/test_returnvar_local_leak.cfm">
 <cf_runtest file="core/test_error_handling.cfm">
 <cf_runtest file="core/test_catchable_undefined.cfm">
 <cf_runtest file="core/test_builtin_shadowing.cfm">

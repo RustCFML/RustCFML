@@ -5422,7 +5422,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
                                 // Reconcile any nested-closure writeback that reached
                                 // the shared env behind an intermediate frame (see the
                                 // CallMethod arm / reconcile_closure_env_into_locals).
@@ -5595,6 +5595,7 @@ impl CfmlVirtualMachine {
                                             self.apply_pending_result_writeback(
                                                 &mut locals,
                                                 &mut inherited_or_param_keys,
+                                                &mut declared_locals,
                                                 effective_local_mode_modern,
                                             );
                                         }
@@ -5825,7 +5826,7 @@ impl CfmlVirtualMachine {
                                             locals.insert(var, result.clone());
                                         }
                                     }
-                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
+                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
                                     stack.push(result);
                                 }
                                 Err(e) => {
@@ -6029,7 +6030,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
                                 Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                                 stack.push(result);
                             }
@@ -15514,6 +15515,7 @@ impl CfmlVirtualMachine {
         &mut self,
         locals: &mut ValueMap,
         inherited_or_param_keys: &mut std::collections::HashSet<String>,
+        declared_locals: &mut std::collections::HashSet<String>,
         local_mode_modern: bool,
     ) {
         if let Some(sets) = self.pending_result_writeback.take() {
@@ -15522,6 +15524,20 @@ impl CfmlVirtualMachine {
                 let parts: Vec<&str> = path.split('.').collect();
                 if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("local") {
                     inherited_or_param_keys.remove(parts[1]);
+                    // Register the target as a declared local so the method-return
+                    // closure-writeback builder EXCLUDES it. A `returnVariable=
+                    // "local.rv"` (cfinvoke / Wheels `$invoke`) must stay
+                    // frame-private, exactly like a source-level `var rv` /
+                    // `local.rv = …` (both of which emit DeclareLocal). Without
+                    // this, `rv` was an UNDECLARED bareword local and leaked into
+                    // the CALLER's frame, clobbering a same-named `local.rv`:
+                    // Wheels nested-save `$saveAssociations` calls each child
+                    // `save()` via `$invoke` (returnVariable="local.rv"); a child's
+                    // successful save leaked local.rv=true over the parent loop's
+                    // running `local.rv=false`, so a FAILED child validation no
+                    // longer rolled the parent/child PKs back (nestedpropertiesSpec).
+                    declared_locals.insert(parts[1].to_string());
+                    declared_locals.insert(parts[1].to_lowercase());
                 } else if parts.len() == 1 && locals.contains_key(parts[0]) {
                     inherited_or_param_keys.remove(parts[0]);
                 }
