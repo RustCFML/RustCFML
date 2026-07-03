@@ -547,7 +547,9 @@ impl Backend {
                         str_literal_at.insert(ip, self.intern_literal(s));
                     }
                     BytecodeOp::LoadLocalProperty(_, prop)
-                    | BytecodeOp::GetProperty(prop) => {
+                    | BytecodeOp::TryLoadLocalProperty(_, prop)
+                    | BytecodeOp::GetProperty(prop)
+                    | BytecodeOp::TryGetProperty(prop) => {
                         let ic_ptr = self.alloc_member_ic_slot();
                         let (name_ptr, name_len) = self.intern_member_name(prop);
                         member_get_at.insert(ip, (ic_ptr, name_ptr, name_len));
@@ -734,7 +736,8 @@ impl Backend {
                         // the IC shim with the pre-allocated slot pointer
                         // and interned property name. Bail wires same as
                         // any bailable shim.
-                        BytecodeOp::LoadLocalProperty(name, _prop) => {
+                        BytecodeOp::LoadLocalProperty(name, _prop)
+                        | BytecodeOp::TryLoadLocalProperty(name, _prop) => {
                             let slot = plan.slot_of(name).ok_or("jit: unknown local")?;
                             let obj = b.use_var(vars[slot]);
                             let (ic_ptr, name_ptr, name_len) = *member_get_at
@@ -760,7 +763,9 @@ impl Backend {
                         }
                         // v0.99.5 — `obj.prop` where obj is on the stack
                         // (Boxed). Same IC shape as LoadLocalProperty.
-                        BytecodeOp::GetProperty(_prop) => {
+                        // TryGetProperty shares the codegen — the miss/throw
+                        // distinction is resolved by the shim's bail path.
+                        BytecodeOp::GetProperty(_prop) | BytecodeOp::TryGetProperty(_prop) => {
                             let (obj, ok) = stack.pop().ok_or("jit: stack underflow")?;
                             if ok != Kind::Boxed {
                                 return Err("jit: GetProperty receiver not Boxed".into());

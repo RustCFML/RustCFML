@@ -103,9 +103,18 @@ pub extern "C" fn cfml_jit_member_get_boxed(
         }
         return encode_member_result(val, kind_code, ic_slot);
     }
-    // Missing key — interp returns `Null`. Cache as "other" so next hit
-    // still finds it consistently if shape stays unchanged.
-    arena::box_into_active(CfmlValue::Null) as i64
+    // Missing key on the top-level struct → BAIL to the interpreter. The fast
+    // IC only inspects the struct's own keys; the interpreter's GetProperty does
+    // the full resolution the shim can't: the `__variables`/native-parent
+    // fallbacks, the `cgi`-style empty-default scope, AND the miss decision
+    // itself — a genuine miss THROWS "Variable is undefined" for the throwing
+    // read ops (GetProperty/LoadLocalProperty/LoadLocalKey) but reads as Null for
+    // the Try* twins. Deferring here keeps JIT and interpreter semantics
+    // identical regardless of which op drove this call.
+    unsafe {
+        *bail = 1;
+    }
+    0
 }
 
 /// v0.100.0 — JIT inline-cache write for `obj.prop = value` on a

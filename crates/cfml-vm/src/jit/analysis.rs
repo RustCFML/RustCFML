@@ -556,7 +556,8 @@ pub fn analyze(
                 // simulate_block enforces that the local's slot is Boxed
                 // (the shim takes a tagged ptr; Int/Float slots can't
                 // carry a struct).
-                BytecodeOp::LoadLocalProperty(name, _prop) => {
+                BytecodeOp::LoadLocalProperty(name, _prop)
+                | BytecodeOp::TryLoadLocalProperty(name, _prop) => {
                     if is_reserved_scope(name) {
                         return None;
                     }
@@ -568,12 +569,12 @@ pub fn analyze(
                 // on LoadLocal, so bailing keeps JIT admission identical — any
                 // function reading the per-call `local` scope by name stays an
                 // interpreter function.
-                BytecodeOp::LoadLocalKey(_) => {
+                BytecodeOp::LoadLocalKey(_) | BytecodeOp::TryLoadLocalKey(_) => {
                     return None;
                 }
                 // v0.99.5 — `obj.prop` where obj is on the stack. Operand
                 // tracking happens in simulate_block; Pass 1 just admits.
-                BytecodeOp::GetProperty(_) => {}
+                BytecodeOp::GetProperty(_) | BytecodeOp::TryGetProperty(_) => {}
                 // v0.100.0 — `obj.prop = value`. Operand tracking happens
                 // in simulate_block; Pass 1 just admits.
                 BytecodeOp::SetProperty(_) => {}
@@ -926,7 +927,8 @@ fn simulate_block(
             // In Infer mode that means: don't upgrade — if the slot is
             // still Int, the final consistency pass will reject. Check
             // mode rejects directly.
-            BytecodeOp::LoadLocalProperty(name, _prop) => {
+            BytecodeOp::LoadLocalProperty(name, _prop)
+            | BytecodeOp::TryLoadLocalProperty(name, _prop) => {
                 let s = slot_index(name)?;
                 if slot_kind[s] != Kind::Boxed {
                     if let Mode::Check { .. } = &mode {
@@ -942,8 +944,10 @@ fn simulate_block(
                 }
                 stack.push(Kind::Boxed);
             }
-            // v0.99.5 — GetProperty pops Boxed, pushes Boxed.
-            BytecodeOp::GetProperty(_) => {
+            // v0.99.5 — GetProperty pops Boxed, pushes Boxed. TryGetProperty
+            // shares the exact stack shape (differs only on the miss path,
+            // which the shim bails on).
+            BytecodeOp::GetProperty(_) | BytecodeOp::TryGetProperty(_) => {
                 let v = pop!();
                 if v != Kind::Boxed {
                     return None;

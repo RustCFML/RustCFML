@@ -83,8 +83,8 @@ pub fn classify(op: &BytecodeOp) -> OpClass {
         => OpClass::BoxedPromising,
 
         // Member access — primary target of v0.91.0 (member ICs).
-        GetProperty(_) | SetProperty(_)
-        | LoadLocalProperty(..) | StoreLocalProperty(..)
+        GetProperty(_) | TryGetProperty(_) | SetProperty(_)
+        | LoadLocalProperty(..) | TryLoadLocalProperty(..) | StoreLocalProperty(..)
         => OpClass::BoxedPromising,
 
         // String / array / struct construction & indexing — eventually

@@ -867,22 +867,26 @@ fn member_get_case_insensitive_matches_interpreter() {
 }
 
 #[test]
-fn member_get_missing_key_returns_null_matches_interpreter() {
-    // v0.99.5 — `obj.missing` returns Null (interpreter semantics for
-    // GetProperty on a Struct without the key). The shim's cold path
-    // returns Null without updating the IC. Concat with " " stringifies
-    // Null to empty so output is comparable.
+fn member_get_missing_key_throws_matches_interpreter() {
+    // A bare `obj.missing` read now THROWS "Variable 'absent' is undefined"
+    // (Lucee/ACF parity), replacing the old silent Null. The JIT member-IC shim
+    // bails to the interpreter on a struct miss, so the throw fires identically
+    // whether the caller is JIT-compiled or interpreted. A CFML try/catch
+    // confirms both modes reach the same catch every iteration.
     let src = r##"
-        function maybe(p) { return "<" & p.absent & ">"; }
+        function maybe(p) {
+            try { return "<" & p.absent & ">"; }
+            catch (any e) { return "MISS"; }
+        }
         out = "";
         rec = {hello: "world"};
         for (k = 1; k <= 60; k++) { out = out & maybe(rec) & ";"; }
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert_eq!(out, oracle, "missing-key member IC path must match interpreter");
-    assert!(compiled >= 1, "expected maybe() to be JIT-compiled, got {compiled}");
+    let (out, _compiled) = run(src);
+    assert_eq!(out, oracle, "missing-key read must throw identically under JIT and interpreter");
+    assert_eq!(out, "MISS;".repeat(60), "each call must reach the catch");
 }
 
 #[test]

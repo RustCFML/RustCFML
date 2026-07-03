@@ -3159,6 +3159,40 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Miss-signalling variant of `lookup_property` for the THROWING fused reads
+    /// (`LoadLocalProperty`/`LoadLocalKey`). Returns `None` only for a genuine
+    /// struct/component member miss (so the caller can throw "Variable is
+    /// undefined"); a `cgi`-style empty-default scope still yields `Some("")`, and
+    /// non-struct receivers keep their existing Null-or-member behaviour (never a
+    /// miss-throw — arrays/strings/queries are out of scope for this fix).
+    fn lookup_property_opt(obj: &CfmlValue, name: &str) -> Option<CfmlValue> {
+        if let CfmlValue::Struct(s) = obj {
+            let val = s.get_ci(name).or_else(|| {
+                if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                    vars.get_ci(name)
+                } else {
+                    None
+                }
+            });
+            if let Some(v) = val {
+                return Some(v);
+            }
+            if let Some(CfmlValue::NativeObject(parent)) = s.get("__super") {
+                if let Ok(guard) = parent.read() {
+                    if let Some(v) = guard.get_property(name) {
+                        return Some(v);
+                    }
+                }
+            }
+            if s.contains_key(cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER) {
+                return Some(CfmlValue::string(String::new()));
+            }
+            None
+        } else {
+            Some(Self::lookup_property(obj, name))
+        }
+    }
+
     pub fn execute(&mut self) -> CfmlResult {
         let main_idx = self
             .program
@@ -3292,6 +3326,41 @@ impl CfmlVirtualMachine {
         }
         if self.custom_tag_stack.len() > handler.custom_tag_depth {
             self.custom_tag_stack.truncate(handler.custom_tag_depth);
+        }
+    }
+
+    /// Raise a catchable "Variable '<name>' is undefined" for a genuine member/key
+    /// miss on a struct-or-scope read (`GetProperty`/`LoadLocalProperty`/
+    /// `LoadLocalKey`). If a `try` handler is active, unwind the stack into it and
+    /// return `Ok(catch_ip)` (caller sets `ip` and `continue`s); otherwise return
+    /// the error to abort the request. Mirrors the undefined-name routing used by
+    /// bare-identifier reads so the standard CFML lazy-init `try/catch` idiom works.
+    fn raise_undefined_member(
+        &mut self,
+        name: &str,
+        stack: &mut Vec<CfmlValue>,
+    ) -> Result<usize, CfmlError> {
+        if let Some(handler) = self.try_stack.pop() {
+            let mut exception = ValueMap::default();
+            exception.insert(
+                "message".to_string(),
+                CfmlValue::string(format!("Variable '{}' is undefined", name)),
+            );
+            exception.insert("type".to_string(), CfmlValue::string("expression".to_string()));
+            exception.insert("detail".to_string(), CfmlValue::string(String::new()));
+            exception.insert("tagcontext".to_string(), self.build_tag_context());
+            stack.truncate(handler.stack_depth);
+            self.restore_capture_state(&handler);
+            Self::add_root_cause(&mut exception);
+            let exc = CfmlValue::strukt(exception);
+            self.last_exception = Some(exc.clone());
+            stack.push(exc);
+            Ok(handler.catch_ip)
+        } else {
+            Err(self.wrap_error(CfmlError::runtime(format!(
+                "Variable '{}' is undefined",
+                name
+            ))))
         }
     }
 
@@ -6466,7 +6535,8 @@ impl CfmlVirtualMachine {
                     stack.push(collection);
                 }
 
-                BytecodeOp::LoadLocalProperty(local_name, prop_name) => {
+                BytecodeOp::LoadLocalProperty(local_name, prop_name)
+                | BytecodeOp::TryLoadLocalProperty(local_name, prop_name) => {
                     // Fused LoadLocal + GetProperty. Avoids the intermediate
                     // dispatch and the stack push/pop of the struct itself.
                     // Only emitted when the receiver is a plain identifier
@@ -6495,12 +6565,28 @@ impl CfmlVirtualMachine {
                                 &locals,
                             )
                         });
-                    let val = receiver
-                        .map(|obj| Self::lookup_property(&obj, prop_name))
-                        .unwrap_or(CfmlValue::Null);
-                    stack.push(val);
+                    let throw_on_miss = matches!(op, BytecodeOp::LoadLocalProperty(_, _));
+                    match receiver {
+                        // Undefined receiver variable: same as the unfused
+                        // `LoadLocal(root)` — throw on the root name.
+                        None if throw_on_miss => {
+                            let cip = self.raise_undefined_member(local_name, &mut stack)?;
+                            ip = cip;
+                            continue;
+                        }
+                        None => stack.push(CfmlValue::Null),
+                        Some(obj) => match Self::lookup_property_opt(&obj, prop_name) {
+                            Some(v) => stack.push(v),
+                            None if throw_on_miss => {
+                                let cip = self.raise_undefined_member(prop_name, &mut stack)?;
+                                ip = cip;
+                                continue;
+                            }
+                            None => stack.push(CfmlValue::Null),
+                        },
+                    }
                 }
-                BytecodeOp::LoadLocalKey(prop_name) => {
+                BytecodeOp::LoadLocalKey(prop_name) | BytecodeOp::TryLoadLocalKey(prop_name) => {
                     // Fused LoadLocal("local") + GetProperty for an explicit
                     // `local.foo` read. Reads the single member directly from
                     // `locals` rather than materializing the whole per-call
@@ -6535,9 +6621,18 @@ impl CfmlVirtualMachine {
                                     k.eq_ignore_ascii_case(name_lower) && is_visible(k)
                                 })
                         })
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(CfmlValue::Null);
-                    stack.push(val);
+                        .map(|(_, v)| v.clone());
+                    match val {
+                        Some(v) => stack.push(v),
+                        None if matches!(op, BytecodeOp::LoadLocalKey(_)) => {
+                            // `local.foo` read where foo isn't in this frame's local
+                            // scope → throw (Lucee/ACF parity).
+                            let cip = self.raise_undefined_member(prop_name, &mut stack)?;
+                            ip = cip;
+                            continue;
+                        }
+                        None => stack.push(CfmlValue::Null),
+                    }
                 }
                 BytecodeOp::StoreLocalProperty(local_name, prop_name) => {
                     // Fused StoreLocal + SetProperty. Pops value from stack,
@@ -6677,7 +6772,11 @@ impl CfmlVirtualMachine {
                         stack.push(CfmlValue::Null);
                     }
                 }
-                BytecodeOp::GetProperty(name) => {
+                BytecodeOp::GetProperty(name) | BytecodeOp::TryGetProperty(name) => {
+                    // GetProperty throws "Variable '<name>' is undefined" on a
+                    // genuine struct/component member miss (Lucee/ACF parity);
+                    // TryGetProperty reads the miss as Null (tolerant contexts).
+                    let throw_on_miss = matches!(op, BytecodeOp::GetProperty(_));
                     if let Some(obj) = stack.pop() {
                         match &obj {
                             CfmlValue::Struct(s) => {
@@ -6763,6 +6862,13 @@ impl CfmlVirtualMachine {
                                         ) {
                                             // Magic scope (cgi): unset key reads as "".
                                             CfmlValue::string(String::new())
+                                        } else if throw_on_miss {
+                                            // Genuine member miss on a struct/component:
+                                            // throw a catchable "Variable is undefined".
+                                            let cip =
+                                                self.raise_undefined_member(name, &mut stack)?;
+                                            ip = cip;
+                                            continue;
                                         } else {
                                             CfmlValue::Null
                                         }
@@ -23074,6 +23180,23 @@ impl CfmlVirtualMachine {
         // before Application.cfc `this.*` settings so those still win on conflict.
         self.discover_app_cfconfig(&app_cfc_path);
 
+        // 1c. Seed a TRANSIENT, writable application scope for the Application.cfc
+        // pseudo-constructor. The PC (e.g. Preside's `super.setupApplication(...)`)
+        // runs inside `load_application_cfc` below — BEFORE `this.name` is known
+        // and the real named scope is bound in step 4. Lucee runs the PC against a
+        // live, writable working `application` scope: writes succeed and immediate
+        // read-backs return the value (verified cross-engine), but those writes are
+        // DISCARDED once the named scope binds — a guard-set-then-return idiom like
+        // Preside's `_getDefaultStatelessUrlPatterns` relies on the read-back
+        // working. Without this, `application.x = v` in the PC is a silent no-op and
+        // `return application.x` throws "Variable is undefined". Step 4 overwrites
+        // `application_scope` with the real named scope (a fresh clone of the
+        // persisted snapshot), so these PC-local writes are dropped exactly as on
+        // Lucee. (CLI / no-Application.cfc paths seed their own scope elsewhere.)
+        if self.application_scope.is_none() {
+            self.application_scope = Some(CfmlStruct::empty());
+        }
+
         // 2. Load Application.cfc. A pseudo-constructor throw (or compile error)
         // aborts the request — Lucee does not fall through to the target page
         // when Application.cfc fails to load.
@@ -24018,10 +24141,13 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::GetIndex => (1, 2),       // obj + key → value
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value
+        BytecodeOp::TryGetProperty(_) => (1, 1), // obj → value (Null-tolerant twin)
         BytecodeOp::LoadStaticHolder(_) => (0, 1), // → holder
         BytecodeOp::GetStaticProperty(_) => (1, 1), // holder → value
         BytecodeOp::LoadLocalProperty(_, _) => (1, 0), // pushes value, reads nothing
+        BytecodeOp::TryLoadLocalProperty(_, _) => (1, 0), // Null-tolerant twin
         BytecodeOp::LoadLocalKey(_) => (1, 0), // pushes value, reads nothing
+        BytecodeOp::TryLoadLocalKey(_) => (1, 0), // Null-tolerant twin
         BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value

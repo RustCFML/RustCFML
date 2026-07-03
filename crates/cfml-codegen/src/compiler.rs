@@ -312,7 +312,12 @@ pub enum BytecodeOp {
     BuildStruct(usize),  // Build struct from top N key-value pairs
     GetIndex,            // Get array[index] or struct[key]
     SetIndex,            // Set array[index] = value or struct[key] = value
-    GetProperty(String), // Get object.property
+    GetProperty(String), // Get object.property — THROWS "Variable '<name>' is undefined" on a genuine miss (Lucee/ACF parity)
+    /// Null-tolerant twin of GetProperty: a missing struct/component member reads
+    /// as Null instead of throwing. Emitted only in contexts that must tolerate a
+    /// missing member — the `?:` (Elvis) left operand, `isNull()`, null-safe `?.`,
+    /// and nested-write auto-vivification bases (`q["a"]["b"] = v` with `q` unset).
+    TryGetProperty(String),
     /// Push the `super` receiver for the CURRENTLY EXECUTING method, resolved
     /// relative to that method's defining class (not the leaf instance). Reads
     /// `this.__super_map[<defining source>]` keyed by the active `source_file`,
@@ -344,6 +349,10 @@ pub enum BytecodeOp {
     /// `__`-prefixed bridge keys are invisible; a miss yields Null (matching
     /// GetProperty on the materialized view).
     LoadLocalKey(String),
+    /// Null-tolerant twins of the fused read ops (see TryGetProperty). A missing
+    /// receiver variable OR a missing member reads as Null instead of throwing.
+    TryLoadLocalProperty(String, String),
+    TryLoadLocalKey(String),
     SetProperty(String), // Set object.property = value
     /// Dynamic/quoted-string LHS assignment: `"#scope#.#prop#" = v` or
     /// `"variables.x" = v`. Stack: [pathString, value]. The path is resolved at
@@ -1017,7 +1026,9 @@ impl CfmlCompiler {
             }
             Expression::MemberAccess(access) => {
                 self.compile_index_assign_base(&access.object, instructions);
-                instructions.push(BytecodeOp::GetProperty(access.member.clone()));
+                // Auto-viv base: a not-yet-existing link must read as Null so the
+                // leaf SetIndex can build the chain — Try* twin, not throwing.
+                instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
             }
             _ => self.compile_expression(base, instructions),
         }
@@ -1033,14 +1044,65 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::LoadLocal(name.clone()));
             }
             AssignTarget::StructAccess(obj, member) => {
+                // Compound assign (`s.x += 1`) reads the current value; preserve the
+                // pre-existing Null-on-miss behaviour (treated as 0/"") rather than
+                // throwing when the target member doesn't exist yet.
                 self.compile_expression(obj, instructions);
-                instructions.push(BytecodeOp::GetProperty(member.clone()));
+                instructions.push(BytecodeOp::TryGetProperty(member.clone()));
             }
             AssignTarget::ArrayAccess(arr, idx) => {
                 self.compile_expression(arr, instructions);
                 self.compile_expression(idx, instructions);
                 instructions.push(BytecodeOp::GetIndex);
             }
+        }
+    }
+
+    /// Compile a member/array-access chain in a NULL-TOLERANT way: a missing
+    /// receiver variable, a missing struct member, or a missing key reads as Null
+    /// instead of throwing. This mirrors the normal read path (`compile_expression`
+    /// for MemberAccess) but swaps every throwing member op for its Try* twin, so
+    /// it can be used for the `?:` left operand, `isNull(...)`, and null-safe reads
+    /// without a genuine miss aborting the whole expression. Non-access leaves fall
+    /// back to the normal compiler.
+    fn compile_member_read_tolerant(&mut self, expr: &Expression, instructions: &mut Vec<BytecodeOp>) {
+        match expr {
+            Expression::Identifier(ident) if !Self::is_reserved_scope_name(&ident.name) => {
+                // A bare variable root that may be undefined → Null, not a throw.
+                instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+            }
+            Expression::MemberAccess(access) if !access.null_safe => {
+                // Mirror the normal read path's fusion peepholes so the JIT sees
+                // the same op shapes it already specialises — just the Null-
+                // tolerant twins (`local.foo` → TryLoadLocalKey, `<ident>.foo` →
+                // TryLoadLocalProperty). Reserved-scope and nested roots recurse
+                // then TryGetProperty.
+                if let Expression::Identifier(ref ident) = *access.object {
+                    if ident.name.eq_ignore_ascii_case("local") {
+                        instructions.push(BytecodeOp::TryLoadLocalKey(access.member.clone()));
+                        return;
+                    }
+                    if !is_reserved_scope_name(&ident.name) {
+                        instructions.push(BytecodeOp::TryLoadLocalProperty(
+                            ident.name.clone(),
+                            access.member.clone(),
+                        ));
+                        return;
+                    }
+                }
+                self.compile_member_read_tolerant(&access.object, instructions);
+                instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
+            }
+            Expression::ArrayAccess(access) => {
+                // GetIndex already reads a missing key / Null receiver as Null.
+                self.compile_member_read_tolerant(&access.array, instructions);
+                self.compile_expression(&access.index, instructions);
+                instructions.push(BytecodeOp::GetIndex);
+            }
+            // Reserved scopes (variables/local/this/…) always resolve to a live
+            // scope struct; null-safe accesses and everything else keep their
+            // normal (already Null-tolerant) compilation.
+            _ => self.compile_expression(expr, instructions),
         }
     }
 
@@ -1120,9 +1182,12 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::LoadLocal("this".to_string()));
             }
             Expression::MemberAccess(access) => {
-                // For nested access like loading "s.a", we load s then get property a
+                // For nested access like loading "s.a", we load s then get property a.
+                // Write-back reads a not-yet-existing link as Null (auto-viv), so the
+                // Try* twin — a throwing GetProperty would abort `s.a.b = v` when
+                // `s.a` doesn't exist yet.
                 self.emit_load_for_writeback(&access.object, instructions);
-                instructions.push(BytecodeOp::GetProperty(access.member.clone()));
+                instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
             }
             Expression::ArrayAccess(access) => {
                 // For nested access like loading "s.a[0]", we load s.a then get index 0.
@@ -2253,7 +2318,7 @@ impl CfmlCompiler {
                 // Load deepest parent: root[.intermediate[0]...intermediate[n]]
                 instructions.push(BytecodeOp::LoadLocal(root.clone()));
                 for seg in intermediate {
-                    instructions.push(BytecodeOp::GetProperty(seg.clone()));
+                    instructions.push(BytecodeOp::TryGetProperty(seg.clone()));
                 }
                 // Stack: [element_value, deepest_parent]
                 instructions.push(BytecodeOp::Swap);
@@ -2264,7 +2329,7 @@ impl CfmlCompiler {
                 for i in (0..intermediate.len()).rev() {
                     instructions.push(BytecodeOp::LoadLocal(root.clone()));
                     for seg in &intermediate[..i] {
-                        instructions.push(BytecodeOp::GetProperty(seg.clone()));
+                        instructions.push(BytecodeOp::TryGetProperty(seg.clone()));
                     }
                     instructions.push(BytecodeOp::Swap);
                     instructions.push(BytecodeOp::SetProperty(intermediate[i].clone()));
@@ -2957,7 +3022,7 @@ impl CfmlCompiler {
                     has_default: Vec::new(),
                     instructions: vec![
                         BytecodeOp::LoadLocal("variables".to_string()),
-                        BytecodeOp::GetProperty(prop.name.clone()),
+                        BytecodeOp::TryGetProperty(prop.name.clone()),
                         BytecodeOp::Return,
                     ],
                     source_file: self.source_file.clone(),
@@ -3002,7 +3067,7 @@ impl CfmlCompiler {
                         BytecodeOp::StoreLocal("this".to_string()),
                         // Set on __variables: this.__variables.name = value
                         BytecodeOp::LoadLocal("this".to_string()),
-                        BytecodeOp::GetProperty("__variables".to_string()),
+                        BytecodeOp::TryGetProperty("__variables".to_string()),
                         BytecodeOp::LoadLocal(prop.name.clone()),
                         BytecodeOp::SetProperty(prop.name.clone()),
                         BytecodeOp::StoreLocal("__variables".to_string()),
@@ -3693,10 +3758,17 @@ impl CfmlCompiler {
                         }
                     }
                 }
-                // For null-safe access, use TryLoadLocal for simple identifiers
+                // For null-safe access, the prefix must also read tolerantly — the
+                // whole point of `?.` is that a missing/undefined link yields Null
+                // rather than throwing (`s.deep?.x` with `deep` absent → Null).
                 if access.null_safe {
                     if let Expression::Identifier(ref ident) = *access.object {
                         instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                    } else if matches!(
+                        *access.object,
+                        Expression::MemberAccess(_) | Expression::ArrayAccess(_)
+                    ) {
+                        self.compile_member_read_tolerant(&access.object, instructions);
                     } else {
                         self.compile_expression(&access.object, instructions);
                     }
@@ -3711,9 +3783,11 @@ impl CfmlCompiler {
                     // Object is null - it's on the stack, skip the GetProperty
                     let jump_end = instructions.len();
                     instructions.push(BytecodeOp::Jump(0)); // placeholder
-                    // Object is not null - do the property access
+                    // Object is not null - do the property access. Null-safe reads
+                    // stay Null-tolerant on a missing member (the `?.` contract),
+                    // so use the Try* twin rather than the throwing GetProperty.
                     instructions[jump_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
-                    instructions.push(BytecodeOp::GetProperty(access.member.clone()));
+                    instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
                     instructions[jump_end] = BytecodeOp::Jump(instructions.len());
                 } else {
                     instructions.push(BytecodeOp::GetProperty(access.member.clone()));
@@ -3751,6 +3825,21 @@ impl CfmlCompiler {
                         if let Expression::Identifier(ref arg_ident) = call.arguments[0] {
                             instructions.push(BytecodeOp::TryLoadLocal(arg_ident.name.clone()));
                             instructions.push(BytecodeOp::IsNull);
+                            return;
+                        }
+                        // `isNull(a.b.c)` must not throw on a missing member. Keep
+                        // isNull on the builtin-call path (which the JIT specialises
+                        // via the isnull shim) but read the member argument
+                        // null-tolerantly so a missing link is `true`, not a throw.
+                        // (Emitting the `IsNull` bytecode op here would work but is
+                        // not JIT-admissible, needlessly demoting the caller.)
+                        if matches!(
+                            call.arguments[0],
+                            Expression::MemberAccess(_) | Expression::ArrayAccess(_)
+                        ) {
+                            instructions.push(BytecodeOp::LoadGlobal(ident.name.clone()));
+                            self.compile_member_read_tolerant(&call.arguments[0], instructions);
+                            instructions.push(BytecodeOp::Call(1));
                             return;
                         }
                     }
@@ -4232,6 +4321,13 @@ impl CfmlCompiler {
                 // Use TryLoadLocal for simple identifiers (undefined vars → Null, not error)
                 if let Expression::Identifier(ref ident) = *elvis.left {
                     instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                } else if matches!(
+                    *elvis.left,
+                    Expression::MemberAccess(_) | Expression::ArrayAccess(_)
+                ) {
+                    // `a.b.c ?: d` must read a missing member/link as Null (so the
+                    // default applies) rather than throwing on the genuine miss.
+                    self.compile_member_read_tolerant(&elvis.left, instructions);
                 } else {
                     self.compile_expression(&elvis.left, instructions);
                 }

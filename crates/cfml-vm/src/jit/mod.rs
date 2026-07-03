@@ -807,7 +807,8 @@ fn build_caller_kinds(
             // v0.99.8 — the fused `local.prop` op names a local receiver
             // that's never written elsewhere in the loop body but must be
             // seeded as Boxed so analyze_loop accepts the member read.
-            | BytecodeOp::LoadLocalProperty(n, _) => n,
+            | BytecodeOp::LoadLocalProperty(n, _)
+            | BytecodeOp::TryLoadLocalProperty(n, _) => n,
             _ => continue,
         };
         let lower = name.to_ascii_lowercase();

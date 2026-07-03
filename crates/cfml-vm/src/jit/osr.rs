@@ -433,7 +433,8 @@ pub fn analyze_loop(
                 // analyser also needs the receiver local interned for
                 // LoadLocalProperty so its slot kind (must be Boxed) is
                 // tracked through caller_kinds.
-                BytecodeOp::LoadLocalProperty(name, _prop) => {
+                BytecodeOp::LoadLocalProperty(name, _prop)
+                | BytecodeOp::TryLoadLocalProperty(name, _prop) => {
                     if is_reserved_scope(name) {
                         return None;
                     }
@@ -446,7 +447,7 @@ pub fn analyze_loop(
                     )?;
                     useful_ops += 1;
                 }
-                BytecodeOp::GetProperty(_) => {
+                BytecodeOp::GetProperty(_) | BytecodeOp::TryGetProperty(_) => {
                     useful_ops += 1;
                 }
 
@@ -810,7 +811,8 @@ fn simulate_block(
             // v0.99.8 — `local.prop` member read (fused). Local slot must be
             // Boxed (the IC shim takes a tagged ptr to a CfmlValue::Struct).
             // Mirrors analysis.rs:823-838.
-            BytecodeOp::LoadLocalProperty(name, _prop) => {
+            BytecodeOp::LoadLocalProperty(name, _prop)
+            | BytecodeOp::TryLoadLocalProperty(name, _prop) => {
                 let s = slot_of(name)?;
                 if slot_kinds[s] != Kind::Boxed {
                     return None;
@@ -819,7 +821,7 @@ fn simulate_block(
             }
             // v0.99.8 — `obj.prop` member read. Receiver on the stack must be
             // Boxed; result is Boxed. Mirrors analysis.rs:840-846.
-            BytecodeOp::GetProperty(_) => {
+            BytecodeOp::GetProperty(_) | BytecodeOp::TryGetProperty(_) => {
                 let v = pop!();
                 if v != Kind::Boxed {
                     return None;
@@ -997,7 +999,9 @@ pub fn compile_loop(
                     str_literal_at.insert(ip, backend.intern_literal(s));
                 }
                 BytecodeOp::LoadLocalProperty(_, prop)
-                | BytecodeOp::GetProperty(prop) => {
+                | BytecodeOp::TryLoadLocalProperty(_, prop)
+                | BytecodeOp::GetProperty(prop)
+                | BytecodeOp::TryGetProperty(prop) => {
                     let ic_ptr = backend.alloc_member_ic_slot();
                     let (name_ptr, name_len) = backend.intern_member_name(prop);
                     member_get_at.insert(ip, (ic_ptr, name_ptr, name_len));
@@ -1169,7 +1173,8 @@ pub fn compile_loop(
                     // The local slot is Boxed by simulate_block's contract; call
                     // the IC shim with the pre-allocated slot pointer + interned
                     // name; check bail; push the result as Boxed.
-                    BytecodeOp::LoadLocalProperty(name, _prop) => {
+                    BytecodeOp::LoadLocalProperty(name, _prop)
+                    | BytecodeOp::TryLoadLocalProperty(name, _prop) => {
                         let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
                         let obj = b.use_var(vars[slot]);
                         let (ic_ptr, name_ptr, name_len) = *member_get_at
@@ -1194,7 +1199,7 @@ pub fn compile_loop(
                     // v0.99.8 — `obj.prop` where receiver is on the stack
                     // (Boxed). Same IC shape as LoadLocalProperty. Mirrors
                     // translate.rs:679-702.
-                    BytecodeOp::GetProperty(_prop) => {
+                    BytecodeOp::GetProperty(_prop) | BytecodeOp::TryGetProperty(_prop) => {
                         let (obj, ok) = stack.pop().ok_or("osr: stack underflow")?;
                         if ok != Kind::Boxed {
                             return Err("osr: GetProperty receiver not Boxed".into());
