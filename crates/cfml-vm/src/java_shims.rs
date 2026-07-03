@@ -512,6 +512,52 @@ fn parse_url_parts(spec: &str) -> ValueMap {
     m
 }
 
+/// Value-equality for two `java.net.URL` shims, matching `java.net.URL.equals()`
+/// semantics: same protocol (case-insensitive), same host (case-insensitive),
+/// same effective port (a `-1` resolves to the scheme default), same file
+/// (path+query) and same ref (anchor). Used by both the `equals()` method and
+/// the CFML `eq` operator so two URLs built from the same spec compare equal and
+/// two different URLs do not (GH #238). Non-URL operands compare unequal.
+pub fn url_shim_equals(a: &CfmlValue, b: &CfmlValue) -> bool {
+    let is_url = |v: &CfmlValue| -> bool {
+        matches!(v, CfmlValue::Struct(s)
+            if s.get("__java_class")
+                .map(|c| c.as_string().eq_ignore_ascii_case("java.net.url"))
+                .unwrap_or(false))
+    };
+    if !is_url(a) || !is_url(b) {
+        return false;
+    }
+    let get = |v: &CfmlValue, k: &str| -> String {
+        if let CfmlValue::Struct(s) = v {
+            s.get(k).map(|x| x.as_string()).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    let port = |v: &CfmlValue| -> i64 {
+        let raw = if let CfmlValue::Struct(s) = v {
+            match s.get("__port") {
+                Some(CfmlValue::Int(i)) => i,
+                Some(o) => o.as_string().trim().parse().unwrap_or(-1),
+                None => -1,
+            }
+        } else {
+            -1
+        };
+        if raw == -1 {
+            url_default_port(&get(v, "__protocol"))
+        } else {
+            raw
+        }
+    };
+    get(a, "__protocol").eq_ignore_ascii_case(&get(b, "__protocol"))
+        && get(a, "__host").eq_ignore_ascii_case(&get(b, "__host"))
+        && port(a) == port(b)
+        && get(a, "__file") == get(b, "__file")
+        && get(a, "__ref") == get(b, "__ref")
+}
+
 /// `java.net.URL` shim (no JVM). Covers the parse/accessor surface; network I/O
 /// (openConnection/openStream/getContent) throws — there is no JVM behind it.
 /// See GH #231.
@@ -595,6 +641,13 @@ pub fn handle_java_url(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -
             v => Ok(v),
         },
         "tostring" | "toexternalform" => Ok(get("__spec")),
+        // java.net.URL.equals() — value equality, not identity. TestBox's
+        // equalize() falls here once isStruct() reports false for the shim
+        // (GH #238).
+        "equals" => {
+            let other = args.into_iter().next().unwrap_or(CfmlValue::Null);
+            Ok(CfmlValue::Bool(url_shim_equals(object, &other)))
+        }
         "openconnection" | "openstream" | "getcontent" | "getinputstream" => {
             Err(CfmlError::runtime(format!(
                 "java.net.URL.{}() requires network I/O, which RustCFML has no JVM \

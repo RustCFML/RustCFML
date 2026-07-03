@@ -16669,6 +16669,15 @@ impl CfmlVirtualMachine {
 
                 let all_args: Vec<CfmlValue> = std::mem::take(extra_args);
                 let m = method_lower.clone();
+                // Keep a copy so a fall-through (the shim handler returns Null =
+                // "method not mine") can hand the args back to the generic
+                // struct/property dispatch below. The handlers consume all_args
+                // by value, so without this the callback was swallowed here and
+                // never seen downstream — e.g. `.each()/.map()/.reduce()` on a
+                // java.util.Map shim (LinkedHashMap/TreeMap/ConcurrentHashMap),
+                // whose entries the generic struct HOFs iterate correctly, ran
+                // with an empty arg list and silently no-opped (GH #239).
+                let fallthrough_args = all_args.clone();
                 let result = match java_class.as_str() {
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
@@ -16810,7 +16819,10 @@ impl CfmlVirtualMachine {
                     Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the
                         // regular dispatch below so property access (e.g.
-                        // system.out) still works.
+                        // system.out) still works. Restore the consumed args so
+                        // the generic handler (struct HOFs, get(key), etc.) can
+                        // see them (GH #239).
+                        *extra_args = fallthrough_args;
                     }
                     Ok(val) => return Ok(val),
                     Err(e) => return Err(e),
@@ -17388,6 +17400,8 @@ impl CfmlVirtualMachine {
                     // struct.each(callback) - callback(key, value, struct)
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
+                            // Skip a Map shim's internal markers (GH #239).
+                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -17406,6 +17420,7 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         let mut result = ValueMap::default();
                         for (k, v) in s.iter() {
+                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -17427,6 +17442,7 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         let mut result = ValueMap::default();
                         for (k, v) in s.iter() {
+                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -17447,6 +17463,7 @@ impl CfmlVirtualMachine {
                 "some" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
+                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -17468,6 +17485,7 @@ impl CfmlVirtualMachine {
                 "every" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
+                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -17495,6 +17513,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::Null
                         };
                         for (k, v) in s.iter() {
+                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
                             cb_args.push(CfmlValue::string(k.clone()));
@@ -19897,23 +19916,81 @@ impl CfmlVirtualMachine {
                     // relationship validation. Already-dotted names are unchanged
                     // (no slashes to replace). Verified vs Lucee 7.0.4.
                     let mut dotted = Self::dotted_component_name(class_name);
-                    // Issue #229: an UNQUALIFIED `new X()` (no dots/slashes) made
-                    // from inside a component resolves relative to the DEFINING
-                    // component's own package, so its metadata.name is the fully
-                    // qualified "<caller-package>.X" on Lucee/ACF — not the bare
-                    // "X". The caller's own dotted __name (via `this` in scope)
-                    // gives that package prefix. We only qualify when the file was
-                    // found alongside the caller (source-relative resolution, i.e.
-                    // cfc_path sits in the caller source's directory), matching how
-                    // Lucee resolves the unqualified name against the defining
-                    // component's directory first. Same root-cause family as #206.
+                    // Issue #229/#237: an UNQUALIFIED `new X()` (no dots/slashes)
+                    // made from inside a component resolves relative to the
+                    // package of the file that LEXICALLY CONTAINS the `new`
+                    // expression, so its metadata.name is the fully qualified
+                    // "<defining-package>.X" on Lucee/ACF — not the bare "X".
+                    //
+                    // #229 first qualified using the runtime `this` package, but
+                    // for an INHERITED method (`new X()` written in a parent file
+                    // but reached via a subclass instance) `this` is the SUBCLASS,
+                    // whose package is wrong (#237: `tests.specs.Expectation` vs
+                    // the correct `testbox.system.Expectation`). The file itself
+                    // was already resolved correctly against the defining source
+                    // dir (self.source_file is swapped to the method's defining
+                    // component during dispatch), so the RIGHT package is simply
+                    // the package of dirname(cfc_path) — where the .cfc was found.
+                    //
+                    // To turn that directory into a dotted package we need the
+                    // webroot. Anchor it to the outermost instance (`this`), whose
+                    // dotted __name and __source_file are both known and mutually
+                    // consistent: the instance lives at <webroot>/<pkg-path>/<Class>.cfc,
+                    // so popping its package-segment count off dirname(__source_file)
+                    // yields the webroot. dirname(cfc_path) relative to that
+                    // webroot, dotted, is the defining package — correct for both
+                    // same-package (#229) and inherited-across-packages (#237).
                     if !class_name.contains(['.', '/', '\\']) {
-                        if let Some(caller_pkg) = locals.get("this").and_then(|t| match t {
-                            CfmlValue::Struct(cs) => cs.get("__name").map(|v| v.as_string()),
+                        let anchor = locals.get("this").and_then(|t| match t {
+                            CfmlValue::Struct(cs) => {
+                                let name = cs.get("__name").map(|v| v.as_string())?;
+                                let src = cs.get("__source_file").map(|v| v.as_string())?;
+                                Some((name, src))
+                            }
                             _ => None,
-                        }).and_then(|n| {
-                            n.rfind('.').map(|i| n[..i].to_string()).filter(|p| !p.is_empty())
-                        }) {
+                        });
+                        let defining_pkg: Option<String> =
+                            anchor.as_ref().and_then(|(name, src)| {
+                                let anchor_dir = std::path::Path::new(src).parent()?;
+                                // Package segments in the instance's own dotted
+                                // name (all but the trailing class segment).
+                                let seg_count = name.matches('.').count();
+                                let mut webroot = anchor_dir;
+                                for _ in 0..seg_count {
+                                    webroot = webroot.parent()?;
+                                }
+                                let defining_dir =
+                                    std::path::Path::new(&cfc_path).parent()?;
+                                let rel = defining_dir.strip_prefix(webroot).ok()?;
+                                let parts: Vec<String> = rel
+                                    .components()
+                                    .filter_map(|c| match c {
+                                        std::path::Component::Normal(seg) => {
+                                            Some(seg.to_string_lossy().to_string())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if parts.is_empty() {
+                                    None
+                                } else {
+                                    Some(parts.join("."))
+                                }
+                            });
+                        if let Some(pkg) = defining_pkg {
+                            dotted = format!("{}.{}", pkg, dotted);
+                        } else if let Some(caller_pkg) =
+                            anchor.as_ref().and_then(|(name, _)| {
+                                name.rfind('.')
+                                    .map(|i| name[..i].to_string())
+                                    .filter(|p| !p.is_empty())
+                            })
+                        {
+                            // Fallback (webroot not derivable, e.g. a mapping-based
+                            // cross-tree resolve where dirname(cfc_path) is not
+                            // under the anchor webroot): keep the pre-#237 behavior
+                            // of qualifying with the instance package, gated on the
+                            // file being found in the defining source's own dir.
                             let resolved_in_caller_dir = self
                                 .source_file
                                 .as_deref()
@@ -23779,6 +23856,16 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
                     }
                 }
             }
+        }
+        // Java URL value-shims compare by their underlying value (JDK
+        // `.equals()`), not by struct identity — two URLs built from the same
+        // spec are equal (GH #238). The guard only matches url↔url pairs; any
+        // other struct pair (or two different URLs) falls to `_ => false`,
+        // preserving loose-eq's pre-existing identity-only behavior.
+        (CfmlValue::Struct(_), CfmlValue::Struct(_))
+            if java_shims::url_shim_equals(a, b) =>
+        {
+            true
         }
         _ => false,
     }

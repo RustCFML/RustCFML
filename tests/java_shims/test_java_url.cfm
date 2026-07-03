@@ -35,5 +35,24 @@ assert("4-arg path", u3.getPath(), "/api/v1");
 // is no JVM — not asserted here since real Lucee/ACF would attempt live I/O, so
 // the behaviour is intentionally engine-specific and outside the parity bar.
 
+// GH #238: URL equality. Two URLs built from the same spec are equal; different
+// specs are not. Previously `eq` compared struct identity (always false) and
+// TestBox's equalize() saw all URL shims as interchangeable empty structs
+// (isStruct was true but the value lived in hidden __keys).
+urlA = createObject("java","java.net.URL").init("http://www.luismajano.com");
+urlB = createObject("java","java.net.URL").init("http://www.luismajano.com");
+urlC = createObject("java","java.net.URL").init("http://www.ortussolutions.com");
+assertTrue("same-spec URLs are eq", urlA eq urlB);
+assertFalse("different-spec URLs are not eq", urlA eq urlC);
+assertTrue("same-spec URLs .equals()", urlA.equals(urlB));
+assertFalse("different-spec URLs .equals()", urlA.equals(urlC));
+// A URL is an object, not a struct (Lucee parity) — this is what lets TestBox's
+// equalize() reach .equals() instead of an empty-struct key walk.
+assertFalse("isStruct(URL) is false", isStruct(urlA));
+// default-port equivalence: explicit :80 equals the implied http default
+uP1 = createObject("java","java.net.URL").init("http://h.com/a");
+uP2 = createObject("java","java.net.URL").init("http://h.com:80/a");
+assertTrue("explicit default port equals implied", uP1 eq uP2);
+
 suiteEnd();
 </cfscript>

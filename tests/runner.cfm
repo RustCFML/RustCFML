@@ -276,6 +276,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_implements_unqualified_sibling.cfm">
 <cf_runtest file="oop/test_unqualified_new_package_relative.cfm">
+<cf_runtest file="oop/test_unqualified_new_inherited_package.cfm">
 <cf_runtest file="oop/test_runtime_added_method_via_structappend.cfm">
 <cf_runtest file="oop/test_injected_method_instance_isolation.cfm">
 <cf_runtest file="oop/test_metadata.cfm">
@@ -468,6 +469,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_stringbuilder.cfm">
 <cf_runtest file="java_shims/test_system.cfm">
 <cf_runtest file="java_shims/test_concurrent_map.cfm">
+<cf_runtest file="java_shims/test_map_higher_order.cfm">
 <cf_runtest file="java_shims/test_soft_reference.cfm">
 <cf_runtest file="java_shims/test_java_url.cfm">
 <cf_runtest file="java_shims/test_property_bundle.cfm">

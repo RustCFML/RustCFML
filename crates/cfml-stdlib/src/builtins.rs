@@ -3185,7 +3185,33 @@ fn fn_struct_map(args: Vec<CfmlValue>) -> CfmlResult { Ok(args.into_iter().next(
 fn fn_struct_filter(args: Vec<CfmlValue>) -> CfmlResult { Ok(args.into_iter().next().unwrap_or(CfmlValue::Null)) }
 
 fn fn_is_struct(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Bool(matches!(args.first(), Some(CfmlValue::Struct(_)))))
+    let is = match args.first() {
+        Some(CfmlValue::Struct(s)) => {
+            // A java shim is only a struct to CFML code if it's a Map
+            // implementation (java.util.Map family) — Lucee treats those as
+            // struct-compatible (structKeyList/each/etc. all work). Every other
+            // shim (java.net.URL, StringBuilder, File, ...) is an object, not a
+            // struct, so isStruct() is false. This lets TestBox's equalize(),
+            // which short-circuits its generic struct-key walk on isStruct(),
+            // fall through to the shim's own .equals() instead of treating all
+            // instances as interchangeable empty structs (GH #238).
+            if s.contains_key("__java_shim") {
+                s.get("__java_class")
+                    .map(|v| {
+                        let c = v.as_string().to_lowercase();
+                        (c.contains("map") && !c.ends_with("map.entry"))
+                            || c.contains("hashtable")
+                            || c.contains("dictionary")
+                            || c == "java.util.properties"
+                    })
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        }
+        _ => false,
+    };
+    Ok(CfmlValue::Bool(is))
 }
 
 fn fn_struct_get(args: Vec<CfmlValue>) -> CfmlResult {
