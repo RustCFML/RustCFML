@@ -19,6 +19,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_access_identifiers.cfm">
 <cf_runtest file="core/test_reserved_word_param_names.cfm">
 <cf_runtest file="core/test_preside_boot_lang_fixes.cfm">
+<cf_runtest file="core/test_gcm_leading_dot_path.cfm">
 <cf_runtest file="core/test_function_scope_capture.cfm">
 <cf_runtest file="core/test_bare_call_caller_stack_leak.cfm">
 <cf_runtest file="core/test_boolean_literal_equality.cfm">

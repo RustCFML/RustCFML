@@ -19555,6 +19555,26 @@ impl CfmlVirtualMachine {
         // Reset any stashed compile error so a `None` return reflects THIS
         // resolution (a parse error in the target file, or a genuine not-found).
         self.last_component_compile_error = None;
+        // A leading dot on a dotted component path (".preside.system.handlers.Tasks")
+        // arises when a leading-slash mapping path is dot-encoded, e.g. Preside's
+        // TaskManagerConfigurationWrapper does `Replace( "/preside/system/handlers/
+        // Tasks.cfc", "/", ".", "all" )`. Lucee ignores the leading dot and resolves
+        // the remainder as an ordinary dotted path (getComponentMetaData(".gcmdir.T")
+        // == getComponentMetaData("gcmdir.T")); without this the leading dot desynced
+        // every lookup below, resolution returned an empty struct, and Preside's
+        // `meta.functions` threw "Variable 'functions' is undefined". Only strip for a
+        // pure dotted path (no slashes) so relative "./x" / "../x" are untouched.
+        let normalized_class_name: String;
+        let class_name: &str = if class_name.starts_with('.')
+            && !class_name.starts_with("./")
+            && !class_name.starts_with("../")
+            && !class_name.contains('/')
+        {
+            normalized_class_name = class_name.trim_start_matches('.').to_string();
+            normalized_class_name.as_str()
+        } else {
+            class_name
+        };
         // 1. Try locals
         if let Some(val) = locals.get(class_name) {
             if matches!(val, CfmlValue::Struct(_)) {
