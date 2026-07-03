@@ -3147,9 +3147,23 @@ impl CfmlCompiler {
                 let mut attr_count = 1; // always have "name"
                 instructions.push(BytecodeOp::String("name".to_string()));
                 instructions.push(BytecodeOp::String(prop.name.clone()));
+                // `type` ALWAYS appears in property metadata — Lucee/ACF default an
+                // undeclared property's type to "any" (verified: getMetaData shows
+                // `type=any`). Preside's PresideObjectReader reads `prop.type`
+                // directly (`if ( prop.type == "any" )`), which threw
+                // "Variable 'type' is undefined" (post-v0.408) when the key was
+                // absent. Skip only if a custom `type` attribute already provides it.
+                let has_type_attr = prop
+                    .attributes
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("type"));
                 if let Some(ref pt) = prop.prop_type {
                     instructions.push(BytecodeOp::String("type".to_string()));
                     instructions.push(BytecodeOp::String(pt.clone()));
+                    attr_count += 1;
+                } else if !has_type_attr {
+                    instructions.push(BytecodeOp::String("type".to_string()));
+                    instructions.push(BytecodeOp::String("any".to_string()));
                     attr_count += 1;
                 }
                 if prop.required {

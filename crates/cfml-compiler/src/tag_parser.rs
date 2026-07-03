@@ -846,14 +846,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (script, tag_end - start)
         }
         "cfcomponent" => {
-            let name = attrs.get("name").cloned();
             let extends = attrs.get("extends").cloned();
             let implements = attrs.get("implements").cloned();
-            let mut decl = if let Some(ref n) = name {
-                format!("component {} ", n)
-            } else {
-                "component ".to_string()
-            };
+            // Do NOT emit the `name` attribute. Lucee/ACF derive a component's name
+            // from its FILENAME and ignore any `<cfcomponent name="…">` attribute
+            // (verified: `getMetaData().name` returns the filename, not the attr).
+            // Emitting it as a bareword (`component i18n …`) stranded the name
+            // before the `{` when a keyword attribute like `output="false"`
+            // followed (Preside cbi18n `<cfcomponent name="i18n" … singleton>` →
+            // "Expected LBrace"); emitting it as `name="…"` wrongly overrode the
+            // filename-derived __name and broke path resolution. Dropping it is the
+            // Lucee-faithful behaviour — the `name` key is skipped in the
+            // pass-through loop below too.
+            let mut decl = "component ".to_string();
             if let Some(ext) = extends {
                 decl.push_str(&format!("extends=\"{}\" ", ext));
             }
@@ -870,13 +875,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (decl, tag_end - start)
         }
         "cfinterface" => {
-            let name = attrs.get("name").cloned();
             let extends = attrs.get("extends").cloned();
-            let mut decl = if let Some(ref n) = name {
-                format!("interface {} ", n)
-            } else {
-                "interface ".to_string()
-            };
+            // Drop the `name` attribute — name is filename-derived; see cfcomponent.
+            let mut decl = "interface ".to_string();
             if let Some(ext) = extends {
                 decl.push_str(&format!("extends=\"{}\" ", ext));
             }

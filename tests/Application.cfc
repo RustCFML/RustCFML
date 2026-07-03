@@ -10,6 +10,12 @@ component {
     // Map "oop" to the tests/oop/ directory so createObject("component", "oop.Greeter") resolves
     this.mappings["/oop"] = getDirectoryFromPath(getCurrentTemplatePath()) & "oop/";
 
+    // Map "core" to tests/core/ so createObject("component", "core.X") /
+    // getComponentMetaData("core.X") resolve on Lucee too (RustCFML resolves the
+    // unmapped package relatively; Lucee needs the explicit mapping — otherwise
+    // core.* fixture tests ERROR cross-engine).
+    this.mappings["/core"] = getDirectoryFromPath(getCurrentTemplatePath()) & "core/";
+
     // Map "tags" for any tag-based test includes
     this.mappings["/tags"] = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/";
 

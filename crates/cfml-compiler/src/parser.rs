@@ -389,6 +389,18 @@ impl Parser {
             return self.parse_script_loop(stmt_loc);
         }
 
+        // `cfloop( … ){ … }` — the cf-prefixed paren-call body form (equivalent to
+        // the `loop …` script statement above). `cfloop` is never a user function,
+        // so the `(`/`{`/`attr=` lookahead is unambiguous. The lucee-spreadsheet
+        // library (Preside asset manager) writes `cfloop( array=…, item=… ){ … }`.
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("cfloop"))
+            && (matches!(self.peek(1), Token::LParen | Token::LBrace)
+                || (self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal)))
+        {
+            self.advance(); // consume `cfloop`
+            return self.parse_script_loop(stmt_loc);
+        }
+
         if self.match_token(&Token::Include) {
             // Script include has two forms:
             //   include "path";                          (bare expression)
@@ -469,8 +481,31 @@ impl Parser {
             let mut params: Vec<Expression> = Vec::new();
             if self.check(&Token::LBrace) {
                 self.advance(); // consume {
-                while !self.check(&Token::RBrace) && !self.is_at_end() {
-                    // Expect httpparam statements
+                // Track nested-block depth so the body does NOT terminate at a
+                // nested `}` — e.g. `http … { if (…) { httpparam …; } }` (Preside
+                // elasticsearch ElasticSearchApiWrapper). httpparam statements are
+                // still collected flat regardless of nesting (issue #55 limitation:
+                // control flow around them isn't honoured), but the block bounds
+                // must be matched correctly or the parser desyncs past the tag.
+                let mut depth = 0i32;
+                loop {
+                    if self.is_at_end() {
+                        break;
+                    }
+                    if self.check(&Token::RBrace) {
+                        if depth == 0 {
+                            break; // closes the http body
+                        }
+                        depth -= 1;
+                        self.advance();
+                        continue;
+                    }
+                    if self.check(&Token::LBrace) {
+                        depth += 1;
+                        self.advance();
+                        continue;
+                    }
+                    // Expect httpparam statements (at any depth)
                     if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "httpparam") {
                         self.advance(); // consume 'httpparam'
                         let mut param_pairs: Vec<(Expression, Expression)> = Vec::new();
@@ -1452,10 +1487,15 @@ impl Parser {
 
     fn parse_var(&mut self) -> Result<Var, ParseError> {
         let loc = self.current_location();
-        let mut name = self.extract_identifier()?;
+        // `var` was already consumed, so the next token is unambiguously the
+        // variable name. Lucee/ACF/BoxLang accept ANY keyword there (`var catch`,
+        // `var type`, `var switch`, …); Preside's ErrorLogService uses
+        // `var catch = arguments.error`. Use the permissive property-name
+        // extractor (identifiers + soft keywords + all reserved words).
+        let mut name = self.extract_property_name()?;
         // CFML allows dotted var declarations like: var local.x = 1
         while self.match_token(&Token::Dot) {
-            let part = self.extract_identifier()?;
+            let part = self.extract_property_name()?;
             name.push('.');
             name.push_str(&part);
         }
@@ -1495,81 +1535,44 @@ impl Parser {
         let mut else_if = Vec::new();
         let mut else_branch = None;
 
-        // Handle else if / elseif chains
-        while self.match_token(&Token::Else) {
-            if self.match_token(&Token::If) || self.match_token(&Token::ElseIf) {
-                // else if
-                self.consume(&Token::LParen)?;
-                let cond = self.parse_expression()?;
-                self.consume(&Token::RParen)?;
-                let body = if self.check(&Token::LBrace) {
-                    self.parse_block()?
-                } else {
-                    let stmt = self.parse_statement()?;
-                    if let CfmlNode::Statement(s) = stmt {
-                        vec![s]
-                    } else {
-                        Vec::new()
-                    }
-                };
-                else_if.push(ElseIf {
-                    condition: cond,
-                    body,
-                });
-            } else if self.match_token(&Token::ElseIf) {
-                // elseif (single keyword)
-                self.consume(&Token::LParen)?;
-                let cond = self.parse_expression()?;
-                self.consume(&Token::RParen)?;
-                let body = if self.check(&Token::LBrace) {
-                    self.parse_block()?
-                } else {
-                    let stmt = self.parse_statement()?;
-                    if let CfmlNode::Statement(s) = stmt {
-                        vec![s]
-                    } else {
-                        Vec::new()
-                    }
-                };
-                else_if.push(ElseIf {
-                    condition: cond,
-                    body,
-                });
+        // Handle any interleaving of `else if`, `else elseif`, standalone
+        // `elseif` (one keyword, no leading `else`), and a terminal `else`.
+        // A single unified loop is needed because a standalone `elseif` may be
+        // FOLLOWED by an `else` (Lucee accepts `if{} elseif{} else{}`); two
+        // separate loops (one for `else…`, one for `elseif`) stranded that
+        // trailing `else` → "Expected RBrace" (Preside emailCenter/Layouts.cfc).
+        let parse_branch_body = |p: &mut Self| -> Result<Vec<Statement>, ParseError> {
+            if p.check(&Token::LBrace) {
+                p.parse_block()
             } else {
-                // else
-                else_branch = Some(if self.check(&Token::LBrace) {
-                    self.parse_block()?
+                let stmt = p.parse_statement()?;
+                Ok(if let CfmlNode::Statement(s) = stmt { vec![s] } else { Vec::new() })
+            }
+        };
+        loop {
+            if self.match_token(&Token::ElseIf) {
+                // standalone `elseif (…) {…}`
+                self.consume(&Token::LParen)?;
+                let cond = self.parse_expression()?;
+                self.consume(&Token::RParen)?;
+                let body = parse_branch_body(self)?;
+                else_if.push(ElseIf { condition: cond, body });
+            } else if self.match_token(&Token::Else) {
+                if self.match_token(&Token::If) || self.match_token(&Token::ElseIf) {
+                    // `else if (…)` / `else elseif (…)`
+                    self.consume(&Token::LParen)?;
+                    let cond = self.parse_expression()?;
+                    self.consume(&Token::RParen)?;
+                    let body = parse_branch_body(self)?;
+                    else_if.push(ElseIf { condition: cond, body });
                 } else {
-                    let stmt = self.parse_statement()?;
-                    if let CfmlNode::Statement(s) = stmt {
-                        vec![s]
-                    } else {
-                        Vec::new()
-                    }
-                });
+                    // terminal `else`
+                    else_branch = Some(parse_branch_body(self)?);
+                    break;
+                }
+            } else {
                 break;
             }
-        }
-
-        // Handle standalone elseif (without else keyword prefix)
-        while self.match_token(&Token::ElseIf) {
-            self.consume(&Token::LParen)?;
-            let cond = self.parse_expression()?;
-            self.consume(&Token::RParen)?;
-            let body = if self.check(&Token::LBrace) {
-                self.parse_block()?
-            } else {
-                let stmt = self.parse_statement()?;
-                if let CfmlNode::Statement(s) = stmt {
-                    vec![s]
-                } else {
-                    Vec::new()
-                }
-            };
-            else_if.push(ElseIf {
-                condition: cond,
-                body,
-            });
         }
 
         Ok(If {
@@ -1736,10 +1739,11 @@ impl Parser {
 
     fn parse_var_no_semicolon(&mut self) -> Result<Var, ParseError> {
         let loc = self.current_location();
-        let mut name = self.extract_identifier()?;
+        // See parse_var: the name after `var` may be any keyword (Lucee parity).
+        let mut name = self.extract_property_name()?;
         // CFML allows dotted var declarations like: var local.i = 1
         while self.match_token(&Token::Dot) {
-            let part = self.extract_identifier()?;
+            let part = self.extract_property_name()?;
             name.push('.');
             name.push_str(&part);
         }
@@ -1761,16 +1765,27 @@ impl Parser {
     /// lowers to the equivalent `for`/`for-in`/`while` AST — mirroring the
     /// `<cfloop>` tag preprocessor in tag_parser.rs. (Issue #183.)
     fn parse_script_loop(&mut self, loc: SourceLocation) -> Result<CfmlNode, ParseError> {
-        // Collect attributes until the body block (or a stray `;`).
+        // Collect attributes until the body block (or a stray `;`). Two syntaxes:
+        //   loop array=x item="i" { … }          (space-separated attrs)
+        //   cfloop( array=x, item="i" ) { … }    (paren-wrapped, comma-separated)
+        // The lucee-spreadsheet lib (Preside asset manager) uses the paren form.
         let mut attrs: Vec<(String, Expression)> = Vec::new();
-        while !self.check(&Token::LBrace) && !self.check(&Token::Semicolon) && !self.is_at_end() {
-            if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
-                let key = self.extract_identifier()?;
-                self.advance(); // consume =
-                let value = self.parse_expression()?;
-                attrs.push((key.to_lowercase(), value));
-            } else {
-                break;
+        if self.check(&Token::LParen) {
+            self.advance(); // consume `(`
+            for (k, v) in self.parse_tag_call_attrs()? {
+                attrs.push((k.to_lowercase(), v));
+            }
+            self.consume(&Token::RParen)?;
+        } else {
+            while !self.check(&Token::LBrace) && !self.check(&Token::Semicolon) && !self.is_at_end() {
+                if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                    let key = self.extract_identifier()?;
+                    self.advance(); // consume =
+                    let value = self.parse_expression()?;
+                    attrs.push((key.to_lowercase(), value));
+                } else {
+                    break;
+                }
             }
         }
 
@@ -1793,7 +1808,33 @@ impl Parser {
         };
 
         // --- expression constructors ----------------------------------------
-        let ident = |name: &str| Expression::Identifier(Identifier { name: name.to_string(), location: loc });
+        // A loop variable named with an explicit scope (`item="local.v"`,
+        // `index="local.i"` — the lucee-spreadsheet lib does this) must lower to
+        // a scoped MemberAccess READ, not an `Identifier` whose name literally
+        // contains a dot (codegen can't resolve `local.i` as one opaque name and
+        // throws "Variable 'local.i' is undefined"). A dot-free name stays a
+        // plain identifier (temps like `__cfloop_array_N`, bare `i`).
+        let ident = |name: &str| -> Expression {
+            match name.find('.') {
+                None => Expression::Identifier(Identifier { name: name.to_string(), location: loc }),
+                Some(pos) => {
+                    let root = &name[..pos];
+                    let mut expr = Expression::Identifier(Identifier {
+                        name: root.to_string(),
+                        location: loc,
+                    });
+                    for part in name[pos + 1..].split('.') {
+                        expr = Expression::MemberAccess(Box::new(MemberAccess {
+                            object: Box::new(expr),
+                            member: part.to_string(),
+                            null_safe: false,
+                            location: loc,
+                        }));
+                    }
+                    expr
+                }
+            }
+        };
         let int = |n: i64| Expression::Literal(Literal { value: LiteralValue::Int(n), location: loc });
         let bin = |l: Expression, op: BinaryOpType, r: Expression| {
             Expression::BinaryOp(Box::new(BinaryOp {
@@ -1810,10 +1851,12 @@ impl Parser {
                 location: loc,
             }))
         };
-        // `name = value;` as an assignment statement.
+        // `name = value;` as an assignment statement. A scoped/dotted name
+        // (`local.v`) becomes a StructAccess target, not a Variable named
+        // "local.v" — see `ident` above and `assign_target_from_dotted`.
         let assign = |name: String, value: Expression| {
             Statement::Assignment(Assignment {
-                target: AssignTarget::Variable(name),
+                target: self.assign_target_from_dotted(&name, loc),
                 value,
                 operator: AssignOp::Equal,
                 location: loc,
@@ -5689,6 +5732,41 @@ impl Parser {
             })),
             Token::ImpKeyword => Ok(Expression::Identifier(Identifier {
                 name: "imp".to_string(),
+                location: self.current_location(),
+            })),
+            // Error-handling / switch keywords used as ordinary identifiers in
+            // EXPRESSION position (Lucee/ACF accept any keyword as a variable
+            // name). parse_primary is only reached where a value is expected, so
+            // these can't shadow their statement forms. Preside's ErrorLogService
+            // does `var catch = arguments.error;` and errorTemplate.cfm reads
+            // `catch.message` / `catch.type`. (The `var`-declaration side is
+            // handled by parse_var's permissive name extraction.)
+            Token::Catch => Ok(Expression::Identifier(Identifier {
+                name: "catch".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Try => Ok(Expression::Identifier(Identifier {
+                name: "try".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Finally => Ok(Expression::Identifier(Identifier {
+                name: "finally".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Rethrow => Ok(Expression::Identifier(Identifier {
+                name: "rethrow".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Switch => Ok(Expression::Identifier(Identifier {
+                name: "switch".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Case => Ok(Expression::Identifier(Identifier {
+                name: "case".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Do => Ok(Expression::Identifier(Identifier {
+                name: "do".to_string(),
                 location: self.current_location(),
             })),
             Token::This => Ok(Expression::This(This {

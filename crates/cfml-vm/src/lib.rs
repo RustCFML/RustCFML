@@ -3329,6 +3329,28 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Lucee/ACF parity for the `arguments` scope: reading a declared-but-unpassed
+    /// optional parameter (`arguments.foo` where `foo` is a parameter of the
+    /// current function but was omitted and has no default) yields Null rather
+    /// than throwing "Variable is undefined" — only a truly UNDECLARED key throws.
+    /// The arguments scope carries `__arguments_params` (the full declared param
+    /// name list), so a member miss whose name matches a declared param is a
+    /// legitimate null read (Preside's `FeatureService.isFeatureEnabled` recurses
+    /// with `arguments.siteTemplate`, an optional arg it never passes). Returns
+    /// true only for the arguments scope; a plain struct/component miss still throws.
+    fn is_declared_arg_param(obj: &CfmlValue, name: &str) -> bool {
+        if let CfmlValue::Struct(s) = obj {
+            if s.get("__arguments_scope").is_some() {
+                if let Some(CfmlValue::Array(params)) = s.get("__arguments_params") {
+                    return params.iter().any(|p| {
+                        matches!(p, CfmlValue::String(pn) if pn.eq_ignore_ascii_case(name))
+                    });
+                }
+            }
+        }
+        false
+    }
+
     /// Raise a catchable "Variable '<name>' is undefined" for a genuine member/key
     /// miss on a struct-or-scope read (`GetProperty`/`LoadLocalProperty`/
     /// `LoadLocalKey`). If a `try` handler is active, unwind the stack into it and
@@ -6577,7 +6599,11 @@ impl CfmlVirtualMachine {
                         None => stack.push(CfmlValue::Null),
                         Some(obj) => match Self::lookup_property_opt(&obj, prop_name) {
                             Some(v) => stack.push(v),
-                            None if throw_on_miss => {
+                            // A declared-but-unpassed `arguments` param reads as
+                            // Null (Lucee/ACF), not an undefined-variable throw.
+                            None if throw_on_miss
+                                && !Self::is_declared_arg_param(&obj, prop_name) =>
+                            {
                                 let cip = self.raise_undefined_member(prop_name, &mut stack)?;
                                 ip = cip;
                                 continue;
@@ -6862,9 +6888,13 @@ impl CfmlVirtualMachine {
                                         ) {
                                             // Magic scope (cgi): unset key reads as "".
                                             CfmlValue::string(String::new())
-                                        } else if throw_on_miss {
+                                        } else if throw_on_miss
+                                            && !Self::is_declared_arg_param(&obj, name)
+                                        {
                                             // Genuine member miss on a struct/component:
                                             // throw a catchable "Variable is undefined".
+                                            // A declared-but-unpassed `arguments` param
+                                            // is exempt — it reads as Null (Lucee/ACF).
                                             let cip =
                                                 self.raise_undefined_member(name, &mut stack)?;
                                             ip = cip;
@@ -11683,6 +11713,16 @@ impl CfmlVirtualMachine {
                         meta.insert("name".to_string(), name_val.clone());
                         // fullname mirrors getMetadata(): the dotted component path.
                         meta.insert("fullname".to_string(), name_val);
+                        // `type` = "component" — Lucee/ACF include it in EVERY
+                        // component metadata struct. getMetadata()'s leaf builder
+                        // already does; getComponentMetadata() omitted it, so
+                        // ColdBox `Util.getInheritedMetaData` (Preside boot) read
+                        // `md.type` on a component with no parent and threw
+                        // "Variable 'type' is undefined" (post-v0.408 miss-throws).
+                        meta.insert(
+                            "type".to_string(),
+                            CfmlValue::string("component".to_string()),
+                        );
                         // `path` = the absolute filesystem path to the .cfc, which
                         // Lucee/ACF include in component metadata. Preside's
                         // PresideObjectReader reads `meta.path` to locate the source
@@ -11831,6 +11871,42 @@ impl CfmlVirtualMachine {
                                     &mut visited,
                                 ));
                             }
+                            // Inheriting component instance: build the RICH metadata
+                            // from the raw class templates (same as getMetadata),
+                            // so `.extends` is a recursive struct carrying each
+                            // parent's `name`/`type`/`functions` — NOT a bare parent
+                            // name string. ColdBox `Util.getInheritedMetaData`
+                            // (Preside boot) walks `md.extends.name` and recurses
+                            // through `md.extends.extends`; the flat
+                            // extract_component_meta form (extends = first chain
+                            // string) made `md.extends.name` throw "Variable 'name'
+                            // is undefined".
+                            let inherits = snap.contains_key("__extends_chain");
+                            if inherits {
+                                let name = snap
+                                    .get("__name")
+                                    .map(|v| v.as_string())
+                                    .unwrap_or_default();
+                                let src = match snap.get("__source_file") {
+                                    Some(CfmlValue::String(p)) => Some((**p).to_string()),
+                                    _ => None,
+                                };
+                                let chain = snap.get("__extends_chain").cloned();
+                                if !name.is_empty() {
+                                    let mut visited = std::collections::HashSet::new();
+                                    if let Some(mut meta) = self.build_inheritance_metadata(
+                                        &name,
+                                        src,
+                                        parent_locals,
+                                        &mut visited,
+                                    ) {
+                                        if let Some(chain @ CfmlValue::Array(_)) = chain {
+                                            meta.insert("fullExtends".to_string(), chain);
+                                        }
+                                        return Ok(CfmlValue::strukt(meta));
+                                    }
+                                }
+                            }
                             return Ok(extract_component_meta(&snap, ""));
                         }
                         // Otherwise treat as a component name/path to look up
@@ -11852,6 +11928,36 @@ impl CfmlVirtualMachine {
                                         parent_locals,
                                         &mut visited,
                                     ));
+                                }
+                                // Inheriting component (looked up by path): build the
+                                // RICH recursive metadata so `.extends` is a struct
+                                // (name/type/functions), not a bare parent name — see
+                                // the component-instance branch above. This is the
+                                // form ColdBox `Util.getInheritedMetaData` walks
+                                // during Preside boot.
+                                if snap.contains_key("__extends_chain") {
+                                    let name = snap
+                                        .get("__name")
+                                        .map(|v| v.as_string())
+                                        .filter(|n| !n.is_empty())
+                                        .unwrap_or_else(|| comp_name.clone());
+                                    let src = match snap.get("__source_file") {
+                                        Some(CfmlValue::String(p)) => Some((**p).to_string()),
+                                        _ => None,
+                                    };
+                                    let chain = snap.get("__extends_chain").cloned();
+                                    let mut visited = std::collections::HashSet::new();
+                                    if let Some(mut meta) = self.build_inheritance_metadata(
+                                        &name,
+                                        src,
+                                        parent_locals,
+                                        &mut visited,
+                                    ) {
+                                        if let Some(chain @ CfmlValue::Array(_)) = chain {
+                                            meta.insert("fullExtends".to_string(), chain);
+                                        }
+                                        return Ok(CfmlValue::strukt(meta));
+                                    }
                                 }
                                 return Ok(extract_component_meta(&snap, &comp_name));
                             }
@@ -20427,6 +20533,7 @@ impl CfmlVirtualMachine {
                     let _ = rust;
                     let mut e = ValueMap::default();
                     e.insert("name".to_string(), CfmlValue::string(parent.clone()));
+                    e.insert("type".to_string(), CfmlValue::string("component".to_string()));
                     meta.insert("extends".to_string(), CfmlValue::strukt(e));
                 } else {
                     let parent_src = match snap.get("__source_file") {
@@ -20442,6 +20549,7 @@ impl CfmlVirtualMachine {
                             // by name so introspection sees the chain exists.
                             let mut e = ValueMap::default();
                             e.insert("name".to_string(), CfmlValue::string(parent.clone()));
+                            e.insert("type".to_string(), CfmlValue::string("component".to_string()));
                             meta.insert("extends".to_string(), CfmlValue::strukt(e));
                         }
                     }
