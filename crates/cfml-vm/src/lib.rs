@@ -7911,7 +7911,25 @@ impl CfmlVirtualMachine {
                             // which is exactly how MockBox's `this.mockBox`
                             // back-reference got wiped (#204). Bail instead — the
                             // method's mutations already applied in place.
+                            // Scope-prefixed receiver reached via a trim
+                            // (`this.child.m()`, `variables.obj.m()`,
+                            // `arguments.o.m()` → load_path trimmed to just the
+                            // scope root): the real receiver is a nested property
+                            // held behind a shared Arc, so the method's `variables`
+                            // mutations already applied in place — there is nothing
+                            // to write back. Merging vars_wb into the trimmed scope
+                            // ROOT is a harmless no-op for data scopes (they carry
+                            // no `__name`), but it CORRUPTS `this`/`super`, whose
+                            // root IS a live CFC: e.g. a nested `this.mockBox.getGen()`
+                            // inside an INJECTED method (MockBox's `$` copied onto
+                            // the target) would splice the callee's own
+                            // `variables.instance` onto the receiver, wiping the
+                            // target's private state (MockBox `$`-mock clobber of
+                            // WireBox's Binder, GH #235). Skip the merge entirely
+                            // in this case — the in-place mutation is authoritative.
+                            let scope_prefixed_trim = path0_is_scope && path.len() > 1;
                             let mut nav_ok = true;
+                            if !scope_prefixed_trim {
                             if let Some(mut comp_obj) =
                                 self.scope_aware_load(&load_path[0], &locals)
                             {
@@ -7951,6 +7969,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 }
+                            }
                             }
                         }
                         }
