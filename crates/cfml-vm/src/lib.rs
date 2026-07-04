@@ -8315,6 +8315,12 @@ impl CfmlVirtualMachine {
                                             _ => true,
                                         }
                                     })
+                                    // Lucee parity: "a NULL value is the same as not existing"
+                                    // — for-in skips null-valued keys (as does structKeyExists).
+                                    // Preside's `for( field in record ){ var v = record[field] }`
+                                    // over a query row with a NULL column would otherwise assign
+                                    // null then throw on the next read of `v`.
+                                    .filter(|k| !matches!(s.get(k.as_str()), Some(CfmlValue::Null)))
                                     .map(CfmlValue::string)
                                     .collect();
                                 if is_treemap {
@@ -13549,6 +13555,19 @@ impl CfmlVirtualMachine {
                         }
                         self.response_headers
                             .push(("Set-Cookie".to_string(), cookie));
+
+                        // Lucee/ACF parity: cfcookie also updates the in-request readable
+                        // `cookie` scope, so a cookie set earlier in the request can be read
+                        // back later in the SAME request (e.g. cbi18n's getFwLocale sets
+                        // `DefaultLocale` via cfcookie then reads `cookie.DefaultLocale`).
+                        let cookie_val = CfmlValue::string(value.clone());
+                        if let Some(CfmlValue::Struct(cs)) = self.globals.get("cookie") {
+                            cs.insert(name.clone(), cookie_val);
+                        } else {
+                            let mut cs = ValueMap::default();
+                            cs.insert(name.clone(), cookie_val);
+                            self.globals.insert("cookie".to_string(), CfmlValue::strukt(cs));
+                        }
                     }
                     return Ok(CfmlValue::Null);
                 }
