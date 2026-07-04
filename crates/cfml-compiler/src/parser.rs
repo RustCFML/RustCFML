@@ -824,6 +824,16 @@ impl Parser {
                     "htmlhead" => Some(TagStmt::StructArg("__cfhtmlhead")),
                     "htmlbody" => Some(TagStmt::StructArg("__cfhtmlbody")),
                     "dbinfo" => Some(TagStmt::StructArg("cfdbinfo")),
+                    // Script-form `module template="x" …;` / `module
+                    // attributeCollection=args;` — the CFScript equivalent of
+                    // <cfmodule>. Lowers to __cfmodule({attrs}); the VM extracts
+                    // template/name (possibly from attributeCollection) at runtime
+                    // and runs it through the same custom-tag machinery as the tag
+                    // form. Without this the statement silently parsed as a bare
+                    // `module` identifier + `template=…` assignment and rendered
+                    // nothing — Preside renders every view via
+                    // `module attributeCollection=…`, so every view came out empty.
+                    "module" => Some(TagStmt::StructArg("__cfmodule")),
                     "directory" => Some(TagStmt::NamedCall("cfdirectory")),
                     "file" => Some(TagStmt::NamedCall("cffile")),
                     "zip" => Some(TagStmt::NamedCall("cfzip")),

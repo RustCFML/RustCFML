@@ -357,6 +357,7 @@ include "harness.cfm";
 
 <!--- --- Tags --- --->
 <cf_runtest file="tags/test_cfdump_tag.cfm">
+<cf_runtest file="tags/test_cfmodule_script_form.cfm">
 <cf_runtest file="tags/test_tags_basic.cfm">
 <cf_runtest file="tags/test_tags_control.cfm">
 <cf_runtest file="tags/test_tags_include.cfm">

@@ -4776,6 +4776,7 @@ impl CfmlVirtualMachine {
                     } else if matches!(
                         name_lower,
                         "__cfcustomtag"
+                            | "__cfmodule"
                             | "__cfcustomtag_start"
                             | "__cfcustomtag_end"
                             | "callstackget"
@@ -9667,6 +9668,7 @@ impl CfmlVirtualMachine {
                 | "getvariable"
                 | "throw"
                 | "__cfcustomtag"
+                | "__cfmodule"
                 | "__cfcustomtag_start"
                 | "__cfcustomtag_end"
                 | "cacheput"
@@ -14805,15 +14807,30 @@ impl CfmlVirtualMachine {
                     return Ok(java_shims::build_page_context_shim(cgi.as_ref()));
                 }
 
-                "__cfcustomtag" => {
-                    // Self-closing custom tag: __cfcustomtag(path_spec, attrs_struct)
-                    let path_spec = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let attrs_val = Self::merge_attribute_collection(
-                        args.get(1)
-                            .cloned()
-                            .unwrap_or(CfmlValue::strukt(ValueMap::default())),
-                    );
-                    let run_end_phase = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+                "__cfcustomtag" | "__cfmodule" => {
+                    // Self-closing custom tag: __cfcustomtag(path_spec, attrs_struct, run_end).
+                    // Script-form `module attr=…;` lowers to __cfmodule({attrs}):
+                    // the template/name lives inside the attrs (possibly via
+                    // attributeCollection) and is extracted at runtime. Both share
+                    // the identical start/end-phase custom-tag machinery below.
+                    let (path_spec, attrs_val, run_end_phase) = if name_lower == "__cfmodule" {
+                        let merged = Self::merge_attribute_collection(
+                            args.get(0)
+                                .cloned()
+                                .unwrap_or(CfmlValue::strukt(ValueMap::default())),
+                        );
+                        let (ps, attrs) = Self::split_module_path(merged);
+                        (ps, attrs, false)
+                    } else {
+                        let path_spec = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                        let attrs_val = Self::merge_attribute_collection(
+                            args.get(1)
+                                .cloned()
+                                .unwrap_or(CfmlValue::strukt(ValueMap::default())),
+                        );
+                        let run_end_phase = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+                        (path_spec, attrs_val, run_end_phase)
+                    };
 
                     let resolved = self.resolve_custom_tag_path(&path_spec)?;
                     let mut this_tag = ValueMap::default();
@@ -19019,6 +19036,31 @@ impl CfmlVirtualMachine {
             merged.insert(k, v);
         }
         CfmlValue::strukt(merged)
+    }
+
+    /// Split a script-form `module` attribute struct into (path_spec, attrs).
+    /// `template="x"` → path_spec `x`; `name="dot.path"` → `__name:dot.path`
+    /// (the sentinel `resolve_custom_tag_path` understands). The template/name
+    /// key is removed from the returned attrs so it doesn't pollute the tag's
+    /// `attributes` scope (mirrors how the `<cfmodule>` tag form reserves them).
+    /// The struct has already been through `merge_attribute_collection`, so a
+    /// template supplied via `attributeCollection` is a top-level key here.
+    fn split_module_path(attrs: CfmlValue) -> (String, CfmlValue) {
+        let mut map: ValueMap = match attrs {
+            CfmlValue::Struct(s) => s.snapshot(),
+            other => return (String::new(), other),
+        };
+        if let Some(k) = map.keys().find(|k| k.eq_ignore_ascii_case("template")).cloned() {
+            let path = map.get(&k).map(|v| v.as_string()).unwrap_or_default();
+            map.shift_remove(&k);
+            return (path, CfmlValue::strukt(map));
+        }
+        if let Some(k) = map.keys().find(|k| k.eq_ignore_ascii_case("name")).cloned() {
+            let name = map.get(&k).map(|v| v.as_string()).unwrap_or_default();
+            map.shift_remove(&k);
+            return (format!("__name:{}", name), CfmlValue::strukt(map));
+        }
+        (String::new(), CfmlValue::strukt(map))
     }
 
     /// Resolve a custom tag path specification to an actual filesystem path.
