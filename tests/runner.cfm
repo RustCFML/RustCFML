@@ -705,6 +705,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_switch_fallthrough.cfm">
 <cf_runtest file="core/test_switch_continue_in_loop.cfm">
 <cf_runtest file="core/test_application_scope_persist.cfm">
+<cf_runtest file="core/test_application_name_implicit.cfm">
 <cf_runtest file="core/test_session_scope_persist.cfm">
 <cf_runtest file="core/test_session_commit.cfm">
 <cf_runtest file="core/test_application_metadata.cfm">

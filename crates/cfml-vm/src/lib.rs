@@ -16713,6 +16713,82 @@ impl CfmlVirtualMachine {
         self.call_member_function_impl(object, method, extra_args, arg_names)
     }
 
+    /// Recover a component method whose stored `Function` references a
+    /// `global_id` that is no longer present in this request's `fn_registry`.
+    ///
+    /// This is the failure mode of an application-scope-cached CFC (a WireBox
+    /// singleton, factory bean, or any component stashed in `application`) whose
+    /// method `global_id`s were minted in a context that never fed them into the
+    /// per-application carried function table — e.g. a *prior* request whose
+    /// re-homing walk did not reach the instance, a request whose template cache
+    /// was cleared under it (`fwreinit`), or a detached `runAsync`/`cfthread`
+    /// child VM (its `fn_registry` is private and is discarded on completion).
+    /// On a later request the instance survives but `resolve_fn(gid)` returns
+    /// `None`, so dispatch would fall through to the "function not defined"
+    /// error even though the method plainly exists on the receiver.
+    ///
+    /// Recovery: recompile the receiver's OWN defining source (cache-first, so a
+    /// still-cached program restores the *same* gids and the original ref just
+    /// works) and register its functions this request; then re-resolve the
+    /// method BY NAME and return a healed `Function` ref carrying a fresh,
+    /// registered gid (name + `captured_scope` preserved) that dispatches
+    /// against the live instance's scope. Returns `None` when nothing needs
+    /// healing (gid already resolves) or recovery isn't possible (no source, no
+    /// matching function) so the caller proceeds unchanged.
+    fn heal_stale_component_method(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        func: &CfmlValue,
+    ) -> Option<CfmlValue> {
+        let CfmlValue::Function(f) = func else {
+            return None;
+        };
+        let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body else {
+            return None;
+        };
+        let CfmlValue::Int(gid) = body.as_ref() else {
+            return None;
+        };
+        // Fast path: already resolvable — nothing to heal.
+        if self.resolve_fn(*gid).is_some() {
+            return None;
+        }
+        // Recover the receiver's defining source path.
+        let src = match object {
+            CfmlValue::Struct(s) => match s.get("__source_file") {
+                Some(CfmlValue::String(p)) => p.to_string(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // Recompile (cache-first) and register the source's functions into this
+        // request's registry. The borrow of `server_state`/`vfs` ends with the
+        // call, before the `&mut self` register below.
+        let program = {
+            let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
+            compile_file_cached(&src, cache, self.vfs.as_ref()).ok()?
+        };
+        self.register_program_fns(&program);
+        // If the original gid now resolves (same cached program restored), the
+        // stored ref is valid as-is.
+        if self.resolve_fn(*gid).is_some() {
+            return Some(func.clone());
+        }
+        // Otherwise substitute the freshly-compiled, same-named method, keeping
+        // the original binding fields (name, params, captured_scope, access).
+        let fresh_gid = program
+            .functions
+            .iter()
+            .find(|bf| bf.name.eq_ignore_ascii_case(method))
+            .map(|bf| bf.global_id as i64)?;
+        let mut inner = (**f).clone();
+        inner.body = cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+            CfmlValue::Int(fresh_gid),
+        ));
+        Some(CfmlValue::Function(Arc::new(inner)))
+    }
+
     fn call_member_function_impl(
         &mut self,
         object: &CfmlValue,
@@ -18059,9 +18135,16 @@ impl CfmlVirtualMachine {
         };
         if let CfmlValue::Function(ref _fdata) = &prop {
             let mut func_ref = prop.clone();
+            // Heal a method whose stored gid is stale (a cross-request-cached
+            // CFC whose defining source wasn't reloaded / was minted in a child
+            // VM). Recompiles the receiver's own source and re-binds by name so
+            // dispatch resolves instead of erroring "function not defined".
+            if let Some(healed) = self.heal_stale_component_method(object, method, &func_ref) {
+                func_ref = healed;
+            }
             let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
             let (args, extras) =
-                Self::reorder_named_args_with_extras(&prop, arg_names, raw_args);
+                Self::reorder_named_args_with_extras(&func_ref, arg_names, raw_args);
             self.pending_extra_named_args =
                 if extras.is_empty() { None } else { Some(extras) };
             // Bind 'this' / __variables ONLY when the receiver is an actual CFC.
@@ -23577,6 +23660,18 @@ impl CfmlVirtualMachine {
             let app_snapshot = server_state.applications.get(&app_name).unwrap();
             self.current_application_name = Some(app_name.clone());
             self.application_scope = Some(CfmlStruct::new(app_snapshot.variables.clone()));
+            // Expose the implicit `application.applicationName` key that Lucee/ACF
+            // auto-populate from the app name. Frameworks (Wheels) build lock names
+            // like `"controllerLock" & application.applicationName`, so a missing
+            // key throws. Seed it if the app hasn't already written one.
+            if let Some(ref app_scope) = self.application_scope {
+                if !app_scope.contains_key_ci("applicationname") {
+                    app_scope.insert(
+                        "applicationName".to_string(),
+                        CfmlValue::string(app_name.clone()),
+                    );
+                }
+            }
             // Carry the app-reachable function Arcs forward and register them
             // into `fn_registry` by global_id, so an application-scope function
             // whose source file isn't (re)loaded this request still resolves.
@@ -23622,7 +23717,13 @@ impl CfmlVirtualMachine {
             }
         } else {
             // CLI mode: fresh application scope each time
-            self.application_scope = Some(CfmlStruct::empty());
+            let scope = CfmlStruct::empty();
+            // Implicit `application.applicationName` (see serve branch above).
+            scope.insert(
+                "applicationName".to_string(),
+                CfmlValue::string(app_name.clone()),
+            );
+            self.application_scope = Some(scope);
 
             // Still call onApplicationStart in CLI mode
             let _ = self.call_lifecycle_method(&mut template, "onApplicationStart", vec![]);
