@@ -603,8 +603,59 @@ fn esc(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
+            // Tab / newline / carriage return are legitimate formatting in a
+            // `white-space:pre-wrap` cell — keep them.
+            '\t' | '\n' | '\r' => out.push(c),
+            // Any other control character (C0 0x00–0x1F, DEL 0x7F, C1
+            // 0x80–0x9F) must NOT reach the HTML raw: browsers render them as
+            // garbage/invisible bytes, which is exactly the "leaked bytes"
+            // corruption when dumping scopes (application/session) that hold
+            // strings with embedded binary — session tokens, CSRF secrets,
+            // cached blobs, encryption artifacts. Show a visible, unambiguous
+            // escape instead. (Only the dump display is sanitized;
+            // writeOutput() of the same string is unaffected.)
+            _ if c.is_control() => {
+                let cp = c as u32;
+                if cp <= 0xFF {
+                    out.push_str(&format!("\\x{:02X}", cp));
+                } else {
+                    out.push_str(&format!("\\u{{{:04X}}}", cp));
+                }
+            }
             _ => out.push(c),
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cfml_common::dynamic::CfmlValue;
+
+    // Control/non-printable bytes must never reach the HTML raw — they render as
+    // invisible garbage in the browser and (worse) can break HTML nesting. They
+    // are shown as visible \xNN / \u{XXXX} escapes instead. Tab/newline/CR are
+    // legitimate formatting and pass through.
+    #[test]
+    fn esc_escapes_control_chars_but_keeps_whitespace() {
+        let s = format!("abc{}{}{}def{}", '\u{7}', '\u{8}', '\u{1b}', '\u{0}');
+        let out = esc(&s);
+        assert_eq!(out, "abc\\x07\\x08\\x1Bdef\\x00");
+        // HTML metachars still escaped
+        assert_eq!(esc("<a>&\"'"), "&lt;a&gt;&amp;&quot;&#39;");
+        // Legitimate whitespace preserved
+        assert_eq!(esc("a\tb\nc\rd"), "a\tb\nc\rd");
+        // C1 control (0x80–0x9F) escaped too
+        assert_eq!(esc("x\u{85}y"), "x\\x85y");
+    }
+
+    #[test]
+    fn scalar_html_string_with_control_bytes_has_no_raw_controls() {
+        let v = CfmlValue::string(format!("tok{}{}", '\u{1}', '\u{7f}'));
+        let html = scalar_html(&v);
+        assert!(!html.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')),
+            "rendered dump HTML must contain no raw control bytes: {:?}", html);
+        assert!(html.contains("\\x01") && html.contains("\\x7F"));
+    }
 }
