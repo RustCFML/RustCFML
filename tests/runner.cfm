@@ -242,6 +242,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_gettagdata.cfm">
 <cf_runtest file="stdlib/test_ini_functions.cfm">
 <cf_runtest file="stdlib/test_directorylist.cfm">
+<cf_runtest file="stdlib/test_objectsave.cfm">
 <cf_runtest file="stdlib/test_writedump.cfm">
 <cf_runtest file="stdlib/test_cfdirectory_type_filter.cfm">
 <cf_runtest file="stdlib/test_cfhttp.cfm">

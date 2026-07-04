@@ -656,6 +656,13 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // `evaluate()` reads back. Distinct from JSON — strings escape `"` by
     // doubling it (`""`) CFML-literal style, not with backslashes.
     f.insert("serialize".into(), fn_serialize);
+    // Binary object serialization (ACF/Lucee). RustCFML uses an INTERNAL,
+    // self-describing format (magic header + JSON body) that round-trips with
+    // itself — it is NOT wire-compatible with JVM object serialization, but
+    // objectSave/objectLoad are only ever paired on the same engine (e.g.
+    // ColdBox's cache DiskStore marshaller saves then loads).
+    f.insert("objectSave".into(), fn_object_save);
+    f.insert("objectLoad".into(), fn_object_load);
 
     // ---- Query functions ----
     f.insert("queryNew".into(), fn_query_new);
@@ -1764,6 +1771,61 @@ fn fn_to_binary(args: Vec<CfmlValue>) -> CfmlResult {
         i += 4;
     }
     Ok(CfmlValue::Binary(bytes))
+}
+
+/// Magic header prefixing an `objectSave()` blob. Lets `objectLoad()` recognise
+/// its own output and produce a clear error (rather than a cryptic JSON parse
+/// failure) if handed something that isn't RustCFML-serialized.
+const OBJECT_SAVE_MAGIC: &[u8] = b"RCFMLOBJ\x01";
+
+/// `objectSave(value)` — serialize any CFML value to a binary blob.
+///
+/// ACF/Lucee implement this via Java object serialization; RustCFML has no JVM,
+/// so we use our own self-describing format: the `OBJECT_SAVE_MAGIC` header
+/// followed by the value serialized as JSON via `CfmlValue`'s serde impl (which
+/// tags Binary/Query with `_cftype` markers so `objectLoad` can reconstruct
+/// them). The blob only needs to round-trip with `objectLoad` on the same
+/// engine, which is exactly how ColdBox's cache DiskStore marshaller uses it.
+///
+/// Limitation: Components/Closures/Functions serialize to null (they cannot be
+/// reconstituted without their defining program); documented in known-issues.
+fn fn_object_save(args: Vec<CfmlValue>) -> CfmlResult {
+    let value = args.first().unwrap_or(&CfmlValue::Null);
+    let body = serde_json::to_vec(value)
+        .map_err(|e| CfmlError::runtime(format!("objectSave: failed to serialize value: {e}")))?;
+    let mut out = Vec::with_capacity(OBJECT_SAVE_MAGIC.len() + body.len());
+    out.extend_from_slice(OBJECT_SAVE_MAGIC);
+    out.extend_from_slice(&body);
+    Ok(CfmlValue::Binary(out))
+}
+
+/// `objectLoad(binary)` — inflate a blob produced by `objectSave()`.
+///
+/// Accepts a Binary value (the normal case; ColdBox calls `toBinary()` on a
+/// base64 string first) or a String (treated as raw UTF-8 bytes) for leniency.
+fn fn_object_load(args: Vec<CfmlValue>) -> CfmlResult {
+    let bytes: Vec<u8> = match args.first() {
+        Some(CfmlValue::Binary(b)) => b.clone(),
+        Some(CfmlValue::String(s)) => s.as_bytes().to_vec(),
+        Some(other) => other.as_string().into_bytes(),
+        None => {
+            return Err(CfmlError::runtime(
+                "objectLoad: requires a binary argument".to_string(),
+            ))
+        }
+    };
+    let body = if bytes.starts_with(OBJECT_SAVE_MAGIC) {
+        &bytes[OBJECT_SAVE_MAGIC.len()..]
+    } else {
+        // Not our header — could be a JVM-serialized blob from another engine.
+        return Err(CfmlError::runtime(
+            "objectLoad: input was not produced by RustCFML's objectSave \
+             (JVM object serialization is not supported)"
+                .to_string(),
+        ));
+    };
+    serde_json::from_slice::<CfmlValue>(body)
+        .map_err(|e| CfmlError::runtime(format!("objectLoad: failed to deserialize value: {e}")))
 }
 
 fn fn_binary_encode(args: Vec<CfmlValue>) -> CfmlResult {

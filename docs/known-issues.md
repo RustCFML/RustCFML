@@ -459,6 +459,27 @@ all (see the JIT-in-serve-mode notes), so interpreted frames — the overwhelmin
 majority of a real request — are attributed correctly. Breaking JIT'd leaves out
 separately would require the JIT to push frames it currently elides for speed.
 
+## 17. `objectSave()` / `objectLoad()` — internal binary format, not JVM-compatible 🌟 *(divergence)*
+
+ACF/Lucee implement `objectSave()` / `objectLoad()` via **Java object serialization**
+(a JVM-native binary blob). RustCFML has no JVM, so it uses its own **self-describing
+internal format**: a magic header (`RCFMLOBJ\x01`) followed by the value serialized
+as JSON via `CfmlValue`'s serde impl (Binary/Query are tagged with `_cftype` markers
+so they reconstruct exactly). Consequences:
+
+- **Not wire-compatible with the JVM engines.** A blob produced by ACF/Lucee cannot
+  be `objectLoad()`ed here, and vice-versa. This is fine for the common use case —
+  the pair is only ever round-tripped on the same engine (e.g. ColdBox's cache
+  `DiskStore` marshaller saves then loads). `objectLoad()` on a foreign/JVM blob
+  throws a clear error rather than corrupting silently.
+- **Components / closures / functions serialize to `null`.** They cannot be
+  reconstituted without their defining program. Scalars, structs, arrays, and
+  queries round-trip with full fidelity. (Lucee can serialize a live CFC instance's
+  state; RustCFML does not.)
+- Struct key **insertion order** is preserved (see also §15), and whole-number
+  doubles collapse to `Int` on load — the same normalisation the JSON path applies
+  everywhere else.
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*
