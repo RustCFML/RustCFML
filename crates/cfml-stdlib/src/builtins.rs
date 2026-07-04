@@ -6572,15 +6572,37 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
     fn matches_filter(filename: &str, filter: &str) -> bool {
         if filter.is_empty() { return true; }
-        // Support glob patterns like "*.cfc", "*.cfm"
-        if filter.starts_with("*.") {
-            let ext = &filter[1..]; // ".cfc"
-            filename.to_lowercase().ends_with(&ext.to_lowercase())
-        } else if filter.contains('*') || filter.contains('?') {
-            // Simple glob: convert to check
-            filename.to_lowercase().contains(&filter.replace("*", "").to_lowercase())
-        } else {
-            filename.to_lowercase().contains(&filter.to_lowercase())
+        // Lucee/ACF allow a pipe-delimited list of glob patterns, e.g. "*.cfm|*.cfc".
+        // Match if ANY sub-pattern matches.
+        filter.split('|').any(|pat| glob_matches(filename, pat))
+    }
+
+    // Convert a shell-style glob (`*` = any run, `?` = one char) to an anchored,
+    // case-insensitive regex and test the whole filename against it. This correctly
+    // handles wildcards anywhere in the pattern (e.g. "jquery-2*.min.js"), not just
+    // at the start/end. A pattern with no wildcards is an exact (case-insensitive)
+    // name match, matching Lucee's DirectoryList filter semantics.
+    fn glob_matches(filename: &str, pattern: &str) -> bool {
+        if pattern.is_empty() { return true; }
+        let mut re = String::with_capacity(pattern.len() + 8);
+        re.push_str("(?i)^");
+        for ch in pattern.chars() {
+            match ch {
+                '*' => re.push_str(".*"),
+                '?' => re.push('.'),
+                // escape regex metacharacters so they match literally
+                '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' | '|' => {
+                    re.push('\\');
+                    re.push(ch);
+                }
+                _ => re.push(ch),
+            }
+        }
+        re.push('$');
+        match Regex::new(&re) {
+            Ok(r) => r.is_match(filename),
+            // Malformed pattern: fall back to a case-insensitive substring test.
+            Err(_) => filename.to_lowercase().contains(&pattern.replace('*', "").to_lowercase()),
         }
     }
 

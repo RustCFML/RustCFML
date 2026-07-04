@@ -42,4 +42,29 @@ child.config( "beta" );
 assert( "child method config() callable", child.getConfig().lastKey, "beta" );
 
 suiteEnd();
+
+// ---------------------------------------------------------------------------
+suiteBegin("Property / method collision — generated setter must not clobber method");
+
+// Regression (Preside/Sticker util/Asset.cfc). A CFC with `property name="after"`
+// AND a method `after()`; the value is written via the AUTO-GENERATED `setAfter()`
+// at runtime. The generated setter used to write `this.after = value`, clobbering
+// the same-named method so `this.after()` / bare `after()` / external `obj.after()`
+// all threw "Component has no function with name [after]". Fix: the generated
+// setter writes ONLY the `variables` backing when a same-named method exists; the
+// method stays callable, getAfter() returns the value. (Lucee parity.)
+
+a = new PropMethodSetterCollision();  // init() calls setAfter([]) (runtime setter)
+
+// external method call still works after the runtime setter ran
+a.after( "x" );
+assertTrue( "getAfter() returns an array (value, not the method)", isArray( a.getAfter() ) );
+assert(     "external after('x') mutated backing", a.getAfter()[ 1 ], "x" );
+
+// internal this.method() call (Asset.dependsOn shape)
+a.callInternal( "y" );
+assert( "this.after('y') callable internally", a.getAfter()[ 2 ], "y" );
+assert( "getAfter() length after two appends", arrayLen( a.getAfter() ), 2 );
+
+suiteEnd();
 </cfscript>

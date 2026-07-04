@@ -3054,12 +3054,31 @@ impl CfmlCompiler {
                 // Generate setter: setPropertyName(value)
                 // Set the property directly on this struct and __variables
                 let setter_name = format!("set{}", capitalize_first(&prop.name));
-                let setter_func = BytecodeFunction {
-                    name: setter_name.clone(),
-                    params: vec![prop.name.clone()],
-                    required_params: vec![true],
-                    has_default: vec![false],
-                    instructions: vec![
+                // Collision: a CFC may declare both `property name="x"` and a method
+                // `x()`. The method occupies the top-level `this.x` key; writing the
+                // property value to `this.x` would clobber it, making x() uncallable.
+                // Lucee/ACF keep the method callable (getX/setX operate on the
+                // `variables` backing). So when a same-named method exists, the setter
+                // writes ONLY the `__variables` backing and leaves `this.x` (the method)
+                // untouched. The getter already reads from `variables` (see above).
+                let collides_with_method = component
+                    .functions
+                    .iter()
+                    .any(|f| f.name.eq_ignore_ascii_case(&prop.name));
+                let setter_instructions = if collides_with_method {
+                    vec![
+                        // Set on __variables only: this.__variables.name = value
+                        BytecodeOp::LoadLocal("this".to_string()),
+                        BytecodeOp::TryGetProperty("__variables".to_string()),
+                        BytecodeOp::LoadLocal(prop.name.clone()),
+                        BytecodeOp::SetProperty(prop.name.clone()),
+                        BytecodeOp::StoreLocal("__variables".to_string()),
+                        // Return this (unmodified — method preserved on this.name)
+                        BytecodeOp::LoadLocal("this".to_string()),
+                        BytecodeOp::Return,
+                    ]
+                } else {
+                    vec![
                         // Set on this: this.name = value; store modified this back
                         BytecodeOp::LoadLocal("this".to_string()),
                         BytecodeOp::LoadLocal(prop.name.clone()),
@@ -3074,7 +3093,14 @@ impl CfmlCompiler {
                         // Return this
                         BytecodeOp::LoadLocal("this".to_string()),
                         BytecodeOp::Return,
-                    ],
+                    ]
+                };
+                let setter_func = BytecodeFunction {
+                    name: setter_name.clone(),
+                    params: vec![prop.name.clone()],
+                    required_params: vec![true],
+                    has_default: vec![false],
+                    instructions: setter_instructions,
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,

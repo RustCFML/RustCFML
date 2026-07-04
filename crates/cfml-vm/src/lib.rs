@@ -18184,6 +18184,18 @@ impl CfmlVirtualMachine {
                         .find(|(k, _)| k.eq_ignore_ascii_case(&prop_name))
                         .map(|(_, v)| v.clone());
                     if let Some(v) = val {
+                        // Collision: `this.<prop>` holds a same-named METHOD — a CFC may
+                        // declare both `property name="x"` and a method `x()`. The property
+                        // VALUE lives in the `__variables` backing (see the setter below);
+                        // return that so getX() yields the value while x() stays callable.
+                        // (Lucee parity; matches apply_implicit_accessor_ctor.)
+                        if matches!(v, CfmlValue::Function(_)) {
+                            let backing = match s.get("__variables") {
+                                Some(CfmlValue::Struct(vars)) => vars.get_ci(prop_name),
+                                _ => None,
+                            };
+                            return Ok(backing.unwrap_or(CfmlValue::string("")));
+                        }
                         return Ok(v);
                     }
                 }
@@ -18210,9 +18222,23 @@ impl CfmlVirtualMachine {
                             let actual_key = ms
                                 .keys().into_iter()
                                 .find(|k| k.eq_ignore_ascii_case(&prop_name))
-                                
+
                                 .unwrap_or_else(|| prop_name.to_string());
-                            ms.insert(actual_key, value.clone());
+                            // Collision guard: a CFC may declare both `property name="x"`
+                            // and a method `x()`. Never clobber the method held in the
+                            // `this` scope — route the property VALUE to the `__variables`
+                            // backing (which getX reads). Lucee keeps x() callable while
+                            // getX/setX operate on the value. (Matches the ctor path in
+                            // apply_implicit_accessor_ctor.)
+                            let collides_with_method =
+                                matches!(ms.get_ci(&actual_key), Some(CfmlValue::Function(_)));
+                            if collides_with_method {
+                                if let Some(CfmlValue::Struct(vars)) = ms.get("__variables") {
+                                    vars.insert(actual_key, value.clone());
+                                }
+                            } else {
+                                ms.insert(actual_key, value.clone());
+                            }
                         }
                         return Ok(modified);
                     }

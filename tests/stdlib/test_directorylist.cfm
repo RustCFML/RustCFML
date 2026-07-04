@@ -61,6 +61,35 @@ for (item in recTargets) {
     assert("only Target.cfc entries returned", item, "Target.cfc");
 }
 
+// Glob patterns with a wildcard in the MIDDLE (not just start/end). Regression:
+// matches_filter used a naive contains(replace(*,"")) that failed for mid-pattern
+// stars, e.g. "jquery-2*.min.js" would not match "jquery-2.2.5-sec.min.js" (broke
+// Preside/Sticker wildcard asset resolution). Lucee matches these.
+fileWrite(tmpDir & "/jquery-2.2.5-sec.min.js", "x");
+fileWrite(tmpDir & "/jquery-ui-1.11.4.min.js", "x");
+
+midStar = directoryList(tmpDir, false, "name", "jquery-2*.min.js");
+assert("mid-pattern star matches one file", arrayLen(midStar), 1);
+assert("mid-pattern star matches correct file", midStar[1], "jquery-2.2.5-sec.min.js");
+
+midStar2 = directoryList(tmpDir, false, "name", "jquery-*.min.js");
+assert("mid-pattern star matches both jquery libs", arrayLen(midStar2), 2);
+
+// Trailing/leading star still work
+trailStar = directoryList(tmpDir, false, "name", "jquery-2*");
+assert("trailing star matches", arrayLen(trailStar), 1);
+
+// Single '?' wildcard matches exactly one character
+fileWrite(tmpDir & "/ab1.log", "x");
+fileWrite(tmpDir & "/ab12.log", "x");
+qmark = directoryList(tmpDir, false, "name", "ab?.log");
+assert("? matches exactly one char", arrayLen(qmark), 1);
+assert("? matched correct file", qmark[1], "ab1.log");
+
+// Pipe-delimited multi-filter (Lucee/ACF): match if ANY sub-pattern matches
+multi = directoryList(tmpDir, false, "name", "*.min.js|ab?.log");
+assert("pipe-delimited filter matches union", arrayLen(multi), 3);
+
 // Cleanup
 directoryDelete(tmpDir, true);
 
