@@ -85,6 +85,61 @@ where
         .collect())
 }
 
+/// Lenient boolean deserializer. Lucee/CommandBox `.cfconfig.json` exports write
+/// booleans as *strings* ("true"/"false"/"yes"/"no"/"1"/"0") throughout, so a
+/// strict `bool` field would reject an otherwise-valid Lucee config. Accepts a
+/// real JSON boolean, a numeric 0/1, or any of the common string spellings
+/// (case-insensitive). Anything else falls back to `false`.
+fn de_lenient_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolLike {
+        Bool(bool),
+        Int(i64),
+        Str(String),
+    }
+    Ok(match BoolLike::deserialize(d)? {
+        BoolLike::Bool(b) => b,
+        BoolLike::Int(n) => n != 0,
+        BoolLike::Str(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        ),
+    })
+}
+
+/// Lenient numeric deserializer. Like [`de_lenient_bool`], Lucee/CommandBox
+/// `.cfconfig.json` exports write numbers as *strings* (`"100"`, `"3306"`), so
+/// a strict integer field would reject an otherwise-valid Lucee config. Accepts
+/// a native JSON number or a numeric string; an empty/blank string yields the
+/// type's default (e.g. `0`).
+fn de_lenient_num<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr + serde::Deserialize<'de> + Default,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumLike<U> {
+        Native(U),
+        Str(String),
+    }
+    match NumLike::<T>::deserialize(d)? {
+        NumLike::Native(n) => Ok(n),
+        NumLike::Str(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(T::default());
+            }
+            t.parse::<T>().map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 // ─────────────────────────────────────────────
 // Server
 // ─────────────────────────────────────────────
@@ -103,13 +158,17 @@ pub struct ServerCfg {
     #[serde(rename = "cfmlExtensions")]
     pub cfml_extensions: Vec<String>,
     #[serde(rename = "maxConcurrentRequests")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub max_concurrent_requests: u32,
     /// Bytes. `0` = unlimited.
     #[serde(rename = "maxRequestBodySize")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub max_request_body_size: u64,
     /// Seconds. `0` = no timeout.
     #[serde(rename = "requestTimeout")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub request_timeout: u32,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub http2: bool,
     /// Front-controller fallback: run a configured template for URLs that
     /// resolve to no file, instead of returning 404.
@@ -163,14 +222,18 @@ impl Default for FallbackCfg {
 #[serde(default)]
 pub struct RuntimeCfg {
     #[serde(rename = "nullSupport")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub null_support: bool,
     #[serde(rename = "dotNotationUpperCase")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub dot_notation_upper_case: bool,
     pub locale: String,
     pub timezone: String,
     #[serde(rename = "whitespaceCompressionEnabled")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub whitespace_compression_enabled: bool,
     #[serde(rename = "trustedCache")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub trusted_cache: bool,
     /// When true, `server.coldfusion.productname` reports `"Lucee"` instead of
     /// `"RustCFML"`. RustCFML targets the Lucee dialect and already advertises
@@ -180,6 +243,7 @@ pub struct RuntimeCfg {
     /// needs that. `server.lucee.versionName` stays `"RustCFML"` regardless, so
     /// engine self-identification is unaffected.
     #[serde(rename = "reportAsLucee")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub report_as_lucee: bool,
     /// `"days,hours,minutes,seconds"`.
     #[serde(rename = "applicationTimeout")]
@@ -235,17 +299,20 @@ pub struct SessionCfg {
     /// Reaper tick in seconds. `0` disables the background reaper entirely
     /// (read-path exactness + native store TTL still apply).
     #[serde(rename = "reapIntervalSecs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub reap_interval_secs: u64,
     /// When true, sleep until the next session's expiry instant (capped at
     /// `reapIntervalSecs`) instead of waking on the fixed interval. Only stores
     /// that can compute the next expiry cheaply benefit; others fall back to
     /// the fixed tick.
     #[serde(rename = "reapAdaptive")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub reap_adaptive: bool,
     /// Maximum number of pending `onSessionEnd` deliveries buffered per
     /// application between requests. Beyond this the oldest are dropped (with a
     /// log line) so a never-revisited application cannot leak memory.
     #[serde(rename = "reapBatchMax")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub reap_batch_max: usize,
 }
 
@@ -284,12 +351,16 @@ pub struct DatasourceCfg {
     #[serde(rename = "connectionString")]
     pub connection_string: String,
     #[serde(rename = "connectionLimit")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub connection_limit: i32,
     #[serde(rename = "connectionTimeout")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub connection_timeout: u32,
     #[serde(rename = "idleTimeout")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub idle_timeout: u32,
     pub timezone: String,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub default: bool,
 }
 
@@ -367,11 +438,15 @@ impl DatasourceCfg {
 #[serde(default)]
 pub struct MailServerCfg {
     pub smtp: String,
+    #[serde(deserialize_with = "de_lenient_num")]
     pub port: u16,
     pub username: String,
     pub password: String,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub tls: bool,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub ssl: bool,
+    #[serde(deserialize_with = "de_lenient_num")]
     pub timeout: u32,
 }
 
@@ -390,6 +465,7 @@ pub struct CacheCfg {
     /// Must be `true` for the cache to be eligible for session/client storage.
     /// Lucee requires this flag explicitly; RustCFML emits a warning when it is
     /// absent but does not refuse to use the cache.
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub storage: bool,
     /// Lucee-style flat property map (all values are strings). Used when a
     /// `.cfconfig.json` was exported from Lucee — the Memcached extension stores
@@ -403,8 +479,10 @@ pub struct CacheCfg {
 pub struct CacheProperties {
     // Generic cache settings
     #[serde(rename = "maxObjects")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub max_objects: u64,
     #[serde(rename = "defaultTimeout")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub default_timeout: u64,
     #[serde(rename = "evictionPolicy")]
     pub eviction_policy: String,
@@ -464,6 +542,7 @@ pub struct Discovery {
     pub name: String,
     /// Port to attach to addresses returned by DNS resolution.
     /// Defaults to the cluster listen port.
+    #[serde(deserialize_with = "de_lenient_num")]
     pub port: u16,
     /// Optional explicit seed list (overrides parent `seeds` when set).
     pub seeds: Vec<String>,
@@ -475,6 +554,7 @@ pub struct Discovery {
     // shared
     /// Refresh interval in seconds. Default 10s for dns, 5s for multicast.
     #[serde(rename = "intervalSecs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub interval_secs: u64,
 }
 
@@ -560,6 +640,7 @@ pub struct LoggerCfg {
 pub struct DebuggingCfg {
     /// Master switch (Lucee `debuggingEnabled`). Set `true` and restrict
     /// `showFromIPs` to run live in production with no leakage to other visitors.
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
     /// The security gate: only these client IPs (and the URL trigger) see the
     /// footer. Honoured in production too. Exact-match for stage 1; CIDR ranges
@@ -570,6 +651,7 @@ pub struct DebuggingCfg {
     /// peer; `true` trusts `X-Forwarded-For` / `X-Real-IP` (the documented
     /// foot-gun — only safe when your edge overwrites the header on ingress).
     #[serde(rename = "trustForwardedFor")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub trust_forwarded_for: bool,
     /// RustCFML enhancement — a configurable URL trigger (Lucee core matches by
     /// IP only). Both the param NAME and required value are configurable, so a
@@ -580,9 +662,11 @@ pub struct DebuggingCfg {
     pub template: String,
     /// Slow-row red-highlight threshold in ms (Adobe/Lucee universal default 250).
     #[serde(rename = "highlightMs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub highlight_ms: u64,
     /// Rolling per-section row cap (≈ Lucee `debugMaxRecordsLogged`).
     #[serde(rename = "maxRecords")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub max_records: usize,
     /// The seven Lucee section toggles + the scope-dump selection.
     pub fields: DebugFieldsCfg,
@@ -591,8 +675,10 @@ pub struct DebuggingCfg {
     #[serde(rename = "errorTemplate")]
     pub error_template: String,
     #[serde(rename = "errorStatusCode")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub error_status_code: bool,
     #[serde(rename = "showExecutionTime")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub show_execution_time: bool,
 }
 
@@ -618,6 +704,7 @@ impl Default for DebuggingCfg {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct UrlTriggerCfg {
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
     /// The URL/form variable NAME (default `debug`). Rename for obscurity.
     pub param: String,
@@ -640,14 +727,21 @@ impl Default for UrlTriggerCfg {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct DebugFieldsCfg {
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub database: bool,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub exception: bool,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub tracing: bool,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub timer: bool,
     #[serde(rename = "implicitAccess")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub implicit_access: bool,
     #[serde(rename = "queryUsage")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub query_usage: bool,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub dump: bool,
     /// Which scopes the scope-dump renders. Never `variables`/`local`.
     pub scopes: Vec<String>,
@@ -679,6 +773,7 @@ impl Default for DebugFieldsCfg {
 #[serde(default)]
 pub struct ObservabilityCfg {
     /// Master switch for the observability subsystems (default off).
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
     /// Threshold-gated cooperative sampling profiler (Phase 2).
     pub profiler: ProfilerCfg,
@@ -703,6 +798,7 @@ impl Default for ObservabilityCfg {
 #[serde(default)]
 pub struct OtelCfg {
     /// Arm OpenTelemetry (default off).
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
     /// OTLP collector base endpoint (HTTP). The signal path (`/v1/traces`) is
     /// appended by the exporter. Default the OTLP/HTTP port 4318 on localhost.
@@ -715,16 +811,19 @@ pub struct OtelCfg {
     /// Head sampling ratio (0.0–1.0). Applied as `ParentBased(TraceIdRatioBased)`
     /// so a sampled inbound `traceparent` is always continued.
     #[serde(rename = "sampleRatio")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub sample_ratio: f64,
     /// Only user functions at or below this call depth get a span (bounds
     /// spans-per-request). Queries and the request root are always spanned.
     #[serde(rename = "spanDepthCap")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub span_depth_cap: usize,
     /// Component/method name globs that may be spanned (`*` = all within the cap).
     #[serde(rename = "spanAllowList")]
     pub span_allow_list: Vec<String>,
     /// OTLP export timeout (ms).
     #[serde(rename = "timeoutMs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub timeout_ms: u64,
     /// RED metrics settings.
     pub metrics: OtelMetricsCfg,
@@ -753,6 +852,7 @@ impl Default for OtelCfg {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct OtelMetricsCfg {
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
     /// Path Prometheus scrapes for the RED metrics text exposition.
     #[serde(rename = "prometheusPath")]
@@ -777,18 +877,23 @@ impl Default for OtelMetricsCfg {
 pub struct ProfilerCfg {
     /// Arm the profiler (default off). When off, the VM never installs a profile
     /// handle and the per-line check compiles to a `None` branch.
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
     /// Only requests slower than this begin sampling (ms).
     #[serde(rename = "thresholdMs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub threshold_ms: u64,
     /// Sampling cadence once armed (ms).
     #[serde(rename = "intervalMs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub interval_ms: u64,
     /// Hard cap on samples per request (bounds memory on a runaway request).
     #[serde(rename = "maxSamples")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub max_samples: u32,
     /// How often the watchdog scans in-flight requests (ms).
     #[serde(rename = "watchdogTickMs")]
+    #[serde(deserialize_with = "de_lenient_num")]
     pub watchdog_tick_ms: u64,
 }
 
@@ -811,6 +916,7 @@ impl Default for ProfilerCfg {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct SecurityCfg {
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub sandbox: bool,
     #[serde(rename = "disallowedFunctions")]
     pub disallowed_functions: Vec<String>,
@@ -819,8 +925,10 @@ pub struct SecurityCfg {
     #[serde(rename = "blockedPaths")]
     pub blocked_paths: Vec<String>,
     #[serde(rename = "csrfEnabled")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub csrf_enabled: bool,
     #[serde(rename = "secureJSON")]
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub secure_json: bool,
     #[serde(rename = "secureJSONPrefix")]
     pub secure_json_prefix: String,
@@ -854,6 +962,7 @@ impl Default for SecurityCfg {
 pub struct UrlRewritingCfg {
     #[serde(rename = "configFile")]
     pub config_file: String,
+    #[serde(deserialize_with = "de_lenient_bool")]
     pub enabled: bool,
 }
 
@@ -993,6 +1102,50 @@ mod tests {
         // `port` is intentionally not a schema field — it is silently ignored,
         // like any other unknown key.
         assert_eq!(cfg.server.host, "0.0.0.0"); // known key still parses
+    }
+
+    #[test]
+    fn lucee_string_booleans_are_accepted() {
+        // Lucee/CommandBox `.cfconfig.json` exports write booleans as strings.
+        // A ColdBox HMVC template ships a cache block with `"storage":"true"` /
+        // `"readOnly":"false"` — the strict `bool` field used to reject the file.
+        let json = r#"{
+            "caches": {
+                "coldbox": { "storage": "true", "class": "lucee.runtime.cache.ram.RamCache" }
+            },
+            "security": { "csrfEnabled": "false" },
+            "urlRewriting": { "enabled": "yes" }
+        }"#;
+        let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.caches.get("coldbox").expect("cache").storage);
+        assert!(!cfg.security.csrf_enabled);
+        assert!(cfg.url_rewriting.enabled);
+    }
+
+    #[test]
+    fn lucee_string_numbers_are_accepted() {
+        // Same export quirk for numeric fields: a datasource block written the
+        // Lucee way carries `"connectionLimit":"100"` / `"port":"3306"` etc.
+        let json = r#"{
+            "datasources": {
+                "myDSN": {
+                    "driver": "mysql",
+                    "port": "3306",
+                    "connectionLimit": "100",
+                    "connectionTimeout": "1",
+                    "database": "mydb"
+                }
+            }
+        }"#;
+        let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
+        let ds = cfg.datasources.get("myDSN").expect("missing dsn");
+        assert_eq!(ds.port, "3306");
+        assert_eq!(ds.connection_limit, 100);
+        assert_eq!(ds.connection_timeout, 1);
+        // An empty numeric string falls back to the type default rather than erroring.
+        let json2 = r#"{ "datasources": { "d": { "connectionTimeout": "" } } }"#;
+        let cfg2: RustCfmlConfig = serde_json::from_str(json2).unwrap();
+        assert_eq!(cfg2.datasources.get("d").unwrap().connection_timeout, 0);
     }
 
     #[test]
