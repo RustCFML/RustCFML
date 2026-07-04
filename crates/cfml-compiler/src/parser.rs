@@ -190,7 +190,7 @@ impl Parser {
         }
 
         if self.match_token(&Token::Var) {
-            return Ok(CfmlNode::Statement(Statement::Var(self.parse_var()?)));
+            return Ok(CfmlNode::Statement(self.parse_var()?));
         }
 
         if self.match_token(&Token::If) {
@@ -1495,7 +1495,7 @@ impl Parser {
         }
     }
 
-    fn parse_var(&mut self) -> Result<Var, ParseError> {
+    fn parse_var(&mut self) -> Result<Statement, ParseError> {
         let loc = self.current_location();
         // `var` was already consumed, so the next token is unambiguously the
         // variable name. Lucee/ACF/BoxLang accept ANY keyword there (`var catch`,
@@ -1509,6 +1509,20 @@ impl Parser {
             name.push('.');
             name.push_str(&part);
         }
+
+        // `var m[ key ] = value` — a subscripted (or further member-chained)
+        // target, NOT a bare declaration. Preside's Renderer builds its
+        // view-mapping struct with exactly this idiom (`var mappings[ mapping ] =
+        // …` inside a loop). It must write into the EXISTING local struct via an
+        // indexed assignment; treating it as `var m` (declaration) re-declared and
+        // wiped `m` every iteration, leaving the map empty — the cause of every
+        // Preside front-end view resolving to /app/views and 404ing. Lower to an
+        // indexed assignment on `local.<name>` (var semantics: force local, don't
+        // clobber). Lucee accepts and honours this form.
+        if self.check(&Token::LBracket) {
+            return self.parse_var_indexed_assignment(name, loc);
+        }
+
         let value = if self.match_token(&Token::Equal) {
             Some(self.parse_expression()?)
         } else {
@@ -1517,11 +1531,79 @@ impl Parser {
 
         self.match_token(&Token::Semicolon);
 
-        Ok(Var {
+        Ok(Statement::Var(Var {
             name,
             value,
             location: loc,
-        })
+        }))
+    }
+
+    /// Lower `var <name>[ idx ]… = value` to an indexed assignment on
+    /// `local.<name>` (a bare name is scoped local per `var` semantics; an
+    /// explicitly-scoped/dotted name keeps its own path). See `parse_var`.
+    fn parse_var_indexed_assignment(
+        &mut self,
+        name: String,
+        loc: SourceLocation,
+    ) -> Result<Statement, ParseError> {
+        let full = if name.contains('.') { name } else { format!("local.{}", name) };
+        let mut parts = full.split('.');
+        let root = parts.next().unwrap_or("").to_string();
+        let mut expr = Expression::Identifier(Identifier { name: root, location: loc.clone() });
+        for part in parts {
+            expr = Expression::MemberAccess(Box::new(MemberAccess {
+                object: Box::new(expr),
+                member: part.to_string(),
+                null_safe: false,
+                location: loc.clone(),
+            }));
+        }
+        // Consume the postfix subscript / member chain: `[ expr ]` and `.member`.
+        loop {
+            if self.match_token(&Token::LBracket) {
+                let index = self.parse_expression()?;
+                self.consume(&Token::RBracket)?;
+                expr = Expression::ArrayAccess(Box::new(ArrayAccess {
+                    array: Box::new(expr),
+                    index: Box::new(index),
+                    location: loc.clone(),
+                }));
+            } else if self.match_token(&Token::Dot) {
+                let member = self.extract_property_name()?;
+                expr = Expression::MemberAccess(Box::new(MemberAccess {
+                    object: Box::new(expr),
+                    member,
+                    null_safe: false,
+                    location: loc.clone(),
+                }));
+            } else {
+                break;
+            }
+        }
+        // Assignment: plain `=` or a compound op. A bare `var m[k];` (no `=`) is
+        // degenerate — emit the access as an expression statement so it doesn't error.
+        let op = if self.check(&Token::Equal) {
+            self.advance();
+            Some(AssignOp::Equal)
+        } else if let Some(o) = self.check_assignment_op() {
+            self.advance();
+            Some(o)
+        } else {
+            None
+        };
+        if let Some(operator) = op {
+            let value = self.parse_expression()?;
+            self.match_token(&Token::Semicolon);
+            let target = self.expression_to_assign_target(&expr)?;
+            return Ok(Statement::Assignment(Assignment {
+                target,
+                value,
+                operator,
+                location: loc,
+            }));
+        }
+        self.match_token(&Token::Semicolon);
+        Ok(Statement::Expression(ExpressionStatement { expr, location: loc }))
     }
 
     fn parse_if(&mut self) -> Result<If, ParseError> {
@@ -4005,7 +4087,7 @@ impl Parser {
                 self.apply_doc_to_function(member_start, &mut func);
                 functions.push(func);
             } else if self.match_token(&Token::Var) {
-                body.push(Statement::Var(self.parse_var()?));
+                body.push(self.parse_var()?);
             } else {
                 let node = self.parse_statement()?;
                 if let CfmlNode::Statement(s) = node {
