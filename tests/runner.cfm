@@ -213,9 +213,11 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_json_query_roundtrip.cfm">
 <cf_runtest file="stdlib/test_arraysort_callback_reverse.cfm">
 <cf_runtest file="stdlib/test_file_io.cfm">
-<!--- Relative file-BIF paths resolve against the calling template's dir --->
-<!--- (ExpandPath parity), not the entry template / cwd — GitHub #171. --->
+<!--- Relative file-BIF paths resolve against the BASE TEMPLATE dir (ExpandPath --->
+<!--- parity), verified on Lucee 7 — supersedes the CFC-dir behaviour of #171. --->
 <cf_runtest file="stdlib/test_file_relative_path.cfm">
+<!--- java.util.concurrent shim + createDynamicProxy (ColdBox/Preside async). --->
+<cf_runtest file="stdlib/test_java_concurrent.cfm">
 <cf_runtest file="stdlib/test_security.cfm">
 <cf_runtest file="stdlib/test_password_hashing.cfm">
 <cf_runtest file="stdlib/test_xml.cfm">

@@ -883,6 +883,9 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // ---- async kernel: runAsync + _schedule (VM-intercepted) ----
     f.insert("runAsync".into(), fn_async_stub);
     f.insert("_schedule".into(), fn_async_stub);
+    // createDynamicProxy: wraps a CFC as a Java SAM (Callable/Runnable/…) so the
+    // java.util.concurrent shim can invoke it. VM-intercepted. See lib.rs.
+    f.insert("createDynamicProxy".into(), fn_async_stub);
 
     // ---- Cache functions (VM-intercepted) ----
     f.insert("cachePut".into(), fn_cache_stub);

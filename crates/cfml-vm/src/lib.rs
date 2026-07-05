@@ -2632,7 +2632,26 @@ impl CfmlVirtualMachine {
         let start_time = cfml_common::clock::Monotonic::now();
         // Mark thread context so isInThread() reports true inside the body.
         self.in_thread_body = self.in_thread_body.saturating_add(1);
-        let result = self.call_function(closure, vec![], parent_locals);
+        // The async body is normally a closure (`function(){…}`), but the
+        // java.util.concurrent shim submits a *component method* — an
+        // ExecutorService received a `createDynamicProxy(callable, …)` whose
+        // `.call()`/`.run()` must run on this thread. That arrives as a sentinel
+        // struct carrying the receiver + method name (see the `submit`/`execute`
+        // intercept and `createDynamicProxy`). Invoke it via member dispatch
+        // rather than as a plain closure.
+        let result = match closure {
+            CfmlValue::Struct(s) if s.contains_key("__async_invoke_target") => {
+                let target = s.get("__async_invoke_target").unwrap_or(CfmlValue::Null);
+                let method = s
+                    .get("__async_invoke_method")
+                    .map(|v| v.as_string())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| "run".to_string());
+                let mut args: Vec<CfmlValue> = vec![];
+                self.call_member_function(&target, &method, &mut args, None)
+            }
+            _ => self.call_function(closure, vec![], parent_locals),
+        };
         self.in_thread_body = self.in_thread_body.saturating_sub(1);
         let elapsed = start_time.elapsed().as_millis() as i64;
         let output = std::mem::take(&mut self.output_buffer);
@@ -9689,6 +9708,7 @@ impl CfmlVirtualMachine {
                 | "threadterminate"
                 | "runasync"
                 | "_schedule"
+                | "createdynamicproxy"
                 | "callstackget"
                 | "callstackdump"
                 | "isinthread"
@@ -11233,9 +11253,20 @@ impl CfmlVirtualMachine {
                     } else {
                         raw.clone()
                     };
+                    // CFML `expandPath` resolves a relative path against the
+                    // BASE TEMPLATE (the request-level page), NOT the currently-
+                    // executing component/include. Verified on Lucee 7: a CFC deep
+                    // in a subdirectory calling `expandPath("x")` resolves against
+                    // the request page's directory, not the CFC's own. This is
+                    // load-bearing for frameworks — e.g. ColdBox's
+                    // `Util.getAbsolutePath()` (deep in coldbox/system/core/util)
+                    // expands the app's relative `config/Coldbox.cfc`. Fall back to
+                    // `source_file` only when there is no base template (never in
+                    // serve/CLI request context).
                     let base_dir = self
-                        .source_file
+                        .base_template_path
                         .as_ref()
+                        .or(self.source_file.as_ref())
                         .and_then(|s| std::path::Path::new(s).parent())
                         .unwrap_or_else(|| std::path::Path::new("."));
 
@@ -12082,6 +12113,49 @@ impl CfmlVirtualMachine {
                                         empty_args,
                                         &CfmlValue::Null,
                                     )
+                                }
+                                // ---- java.util.concurrent executor family ----
+                                // No JVM thread pool: these present the executor
+                                // surface and route executing methods through the
+                                // native async kernel. See java_shims + the
+                                // dispatch arms in call_member_function_impl.
+                                "java.util.concurrent.executors" => {
+                                    Ok(java_shims::make_executors_static())
+                                }
+                                "java.util.concurrent.threadpoolexecutor" => {
+                                    Ok(java_shims::make_executor_service("fixed"))
+                                }
+                                "java.util.concurrent.scheduledthreadpoolexecutor" => {
+                                    Ok(java_shims::make_scheduled_executor())
+                                }
+                                "java.util.concurrent.timeunit" => {
+                                    Ok(java_shims::make_timeunit())
+                                }
+                                "java.util.concurrent.threadfactory" => {
+                                    Ok(java_shims::make_threadfactory())
+                                }
+                                // Work queue (Preside builds one explicitly). Reuse
+                                // the ConcurrentLinkedQueue shim (offer/poll/size).
+                                "java.util.concurrent.linkedblockingqueue"
+                                | "java.util.concurrent.arrayblockingqueue" => {
+                                    handle_java_concurrentlinkedqueue(
+                                        "init",
+                                        empty_args,
+                                        &CfmlValue::Null,
+                                    )
+                                }
+                                "java.util.concurrent.executorcompletionservice" => {
+                                    // Carry the wrapped executor so submit() can
+                                    // delegate; poll() drains completed futures.
+                                    Ok(java_shims::make_completion_service(
+                                        args.get(2).cloned().unwrap_or(CfmlValue::Null),
+                                    ))
+                                }
+                                // Rejected-execution policies ($DiscardPolicy etc.)
+                                // are only passed to a pool ctor we ignore — an
+                                // opaque marker is enough.
+                                s if s.starts_with("java.util.concurrent.threadpoolexecutor$") => {
+                                    Ok(java_shims::make_executors_static())
                                 }
                                 "java.util.collections" => {
                                     handle_java_collections(
@@ -14549,6 +14623,32 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
 
+                // createDynamicProxy(cfc, interfaces): in a real JVM this builds
+                // a Java proxy implementing the given SAM interface(s) that
+                // bridges back to the CFC. RustCFML has no JVM, and the only
+                // consumers are the java.util.concurrent shim's submit/execute/
+                // schedule (they invoke the proxy's SAM method on a worker
+                // thread). So the "proxy" is just an opaque wrapper recording the
+                // target CFC + which method to invoke; the shim unwraps it. Not a
+                // general Java dynamic proxy.
+                "createdynamicproxy" => {
+                    let target = args.first().cloned().unwrap_or(CfmlValue::Null);
+                    // Derive the SAM method name from the interface list (2nd arg,
+                    // an array of fully-qualified interface names). Default "run".
+                    let sam = args
+                        .get(1)
+                        .and_then(|v| match v {
+                            CfmlValue::Array(a) => a.snapshot().into_iter().next(),
+                            other => Some(other.clone()),
+                        })
+                        .map(|v| java_shims::sam_method_for_interface(&v.as_string()))
+                        .unwrap_or_else(|| "run".to_string());
+                    let mut w = ValueMap::default();
+                    w.insert("__dynamic_proxy".to_string(), CfmlValue::Bool(true));
+                    w.insert("__proxy_target".to_string(), target);
+                    w.insert("__proxy_method".to_string(), CfmlValue::string(sam));
+                    return Ok(CfmlValue::strukt(w));
+                }
                 // ---- async kernel: runAsync + _schedule ----
                 "runasync" => {
                     let callback = match args.get(0) {
@@ -16684,6 +16784,189 @@ impl CfmlVirtualMachine {
     /// file (Lucee's Templates/pages section aggregates per file, so every CFC
     /// method call — including `Application.cfc` lifecycle methods reached this
     /// way — contributes to that file's row). Otherwise it's a direct passthrough.
+    /// Turn a `submit()`/`execute()`/`schedule()` argument into a body the async
+    /// thread kernel can run: a `createDynamicProxy` wrapper becomes a
+    /// member-invoke sentinel (`run_thread_body` calls its SAM method); a plain
+    /// closure is used as-is; any other object is treated as a Runnable and
+    /// invoked via `run()`.
+    fn to_async_body(arg: CfmlValue) -> CfmlValue {
+        match &arg {
+            CfmlValue::Struct(s) if s.contains_key("__dynamic_proxy") => {
+                let target = s.get("__proxy_target").unwrap_or(CfmlValue::Null);
+                let method = s
+                    .get("__proxy_method")
+                    .map(|v| v.as_string())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| "run".to_string());
+                let mut m = ValueMap::default();
+                m.insert("__async_invoke_target".to_string(), target);
+                m.insert("__async_invoke_method".to_string(), CfmlValue::string(method));
+                CfmlValue::strukt(m)
+            }
+            CfmlValue::Function(_) => arg,
+            _ => {
+                let mut m = ValueMap::default();
+                m.insert("__async_invoke_target".to_string(), arg);
+                m.insert(
+                    "__async_invoke_method".to_string(),
+                    CfmlValue::string("run".to_string()),
+                );
+                CfmlValue::strukt(m)
+            }
+        }
+    }
+
+    /// Spawn an async task (executor submit/execute/schedule) on a detached
+    /// background thread via the native async kernel, returning a `FutureNative`
+    /// (get/isDone/isCancelled/cancel). Inline fallback on wasm / real-threads
+    /// off. This is the bridge that lets ColdBox/Preside executor shims run CFML.
+    fn spawn_async_body(&mut self, arg: CfmlValue) -> CfmlResult {
+        let body = Self::to_async_body(arg);
+        #[cfg(feature = "real-threads")]
+        let spawn = self.thread_spawn_fn;
+        #[cfg(not(feature = "real-threads"))]
+        let spawn: Option<ThreadSpawnFn> = None;
+
+        #[cfg(feature = "real-threads")]
+        if let Some(spawn_fn) = spawn {
+            let seed = self.build_thread_seed(body, None);
+            let handle = spawn_fn(seed);
+            let fut = async_kernel::FutureNative::from_handle(handle);
+            return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+        }
+
+        let _ = spawn;
+        let r = self.run_thread_body(&body, None, &ValueMap::default());
+        let fut = async_kernel::FutureNative::resolved(r);
+        Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))))
+    }
+
+    /// `java.util.concurrent.Executors` static factory methods. Each returns an
+    /// executor-service shim; the pool sizing arg is accepted but ignored (tasks
+    /// run on the OS scheduler via detached threads, not a fixed pool).
+    fn handle_java_executors_method(&mut self, method: &str, _args: Vec<CfmlValue>) -> CfmlResult {
+        Ok(match method {
+            "newfixedthreadpool" => java_shims::make_executor_service("fixed"),
+            "newcachedthreadpool" => java_shims::make_executor_service("cached"),
+            "newsinglethreadexecutor" => java_shims::make_executor_service("single"),
+            "newworkstealingpool" => java_shims::make_executor_service("workstealing"),
+            "newscheduledthreadpool" | "newsinglethreadscheduledexecutor" => {
+                java_shims::make_scheduled_executor()
+            }
+            "defaultthreadfactory" => java_shims::make_threadfactory(),
+            _ => CfmlValue::Null,
+        })
+    }
+
+    /// ExecutorService / ScheduledExecutorService method dispatch. Executing
+    /// methods (submit/execute/schedule/invoke*) route through the async kernel;
+    /// lifecycle/stat methods go to the pure handler (which may request a
+    /// `__shutdown`-flag writeback).
+    fn handle_java_executor_method(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        mut args: Vec<CfmlValue>,
+    ) -> CfmlResult {
+        match method {
+            "submit" | "execute" | "schedule" | "scheduleatfixedrate"
+            | "schedulewithfixeddelay" => {
+                // NOTE: periodic scheduling (scheduleAtFixedRate/WithFixedDelay)
+                // currently fires the task once (detached). True recurring
+                // scheduling is a follow-up (needs a cross-request driver).
+                let task = if args.is_empty() {
+                    CfmlValue::Null
+                } else {
+                    args.remove(0)
+                };
+                self.spawn_async_body(task)
+            }
+            "invokeall" => {
+                let tasks = match args.into_iter().next() {
+                    Some(CfmlValue::Array(a)) => a.snapshot(),
+                    _ => vec![],
+                };
+                let mut futs = Vec::with_capacity(tasks.len());
+                for t in tasks {
+                    futs.push(self.spawn_async_body(t)?);
+                }
+                Ok(CfmlValue::array(futs))
+            }
+            "invokeany" => {
+                // Run the first task inline and return its value (best-effort).
+                match args.into_iter().next() {
+                    Some(CfmlValue::Array(a)) => {
+                        if let Some(first) = a.snapshot().into_iter().next() {
+                            let body = Self::to_async_body(first);
+                            let r = self.run_thread_body(&body, None, &ValueMap::default());
+                            return Ok(r.return_value.unwrap_or(CfmlValue::Null));
+                        }
+                        Ok(CfmlValue::Null)
+                    }
+                    _ => Ok(CfmlValue::Null),
+                }
+            }
+            _ => {
+                let (res, writeback) =
+                    java_shims::handle_java_executor_service_pure(method, object);
+                if let Some(new_self) = writeback {
+                    self.method_this_writeback = Some(new_self);
+                }
+                res
+            }
+        }
+    }
+
+    /// `ExecutorCompletionService` — submit runs the task and queues its Future;
+    /// poll()/take() returns the next completed Future (FIFO). Mutations to the
+    /// completed queue are written back to the shim variable.
+    fn handle_java_completion_service(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        mut args: Vec<CfmlValue>,
+    ) -> CfmlResult {
+        match method {
+            "submit" => {
+                let task = if args.is_empty() {
+                    CfmlValue::Null
+                } else {
+                    args.remove(0)
+                };
+                let fut = self.spawn_async_body(task)?;
+                if let CfmlValue::Struct(s) = object {
+                    let mut ns = s.snapshot();
+                    let mut completed = match ns.get("__cs_completed") {
+                        Some(CfmlValue::Array(a)) => a.snapshot(),
+                        _ => vec![],
+                    };
+                    completed.push(fut.clone());
+                    ns.insert("__cs_completed".to_string(), CfmlValue::array(completed));
+                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
+                }
+                Ok(fut)
+            }
+            "poll" | "take" => {
+                if let CfmlValue::Struct(s) = object {
+                    let mut completed = match s.get("__cs_completed") {
+                        Some(CfmlValue::Array(a)) => a.snapshot(),
+                        _ => vec![],
+                    };
+                    if completed.is_empty() {
+                        return Ok(CfmlValue::Null);
+                    }
+                    let head = completed.remove(0);
+                    let mut ns = s.snapshot();
+                    ns.insert("__cs_completed".to_string(), CfmlValue::array(completed));
+                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
+                    return Ok(head);
+                }
+                Ok(CfmlValue::Null)
+            }
+            _ => Ok(CfmlValue::Null),
+        }
+    }
+
     fn call_member_function(
         &mut self,
         object: &CfmlValue,
@@ -17020,6 +17303,9 @@ impl CfmlVirtualMachine {
                     "java.net.url" => java_shims::handle_java_url(&m, all_args, object),
                     "java.io.file" => handle_java_file(&m, all_args, object),
                     "java.lang.system" => handle_java_system(&m, all_args, object),
+                    "java.lang.system.out" | "java.lang.system.err" => {
+                        java_shims::handle_java_printstream(&m, all_args, object)
+                    }
                     "java.lang.stringbuilder" | "java.lang.stringbuffer" => {
                         handle_java_stringbuilder(&m, all_args, object)
                     }
@@ -17033,6 +17319,24 @@ impl CfmlVirtualMachine {
                     }
                     "java.util.concurrent.concurrenthashmap" => {
                         handle_java_concurrenthashmap(&m, all_args, object)
+                    }
+                    // ---- executor family ----
+                    "java.util.concurrent.executors" => {
+                        self.handle_java_executors_method(&m, all_args)
+                    }
+                    "java.util.concurrent.threadpoolexecutor"
+                    | "java.util.concurrent.scheduledthreadpoolexecutor"
+                    | "java.util.concurrent.abstractexecutorservice" => {
+                        self.handle_java_executor_method(object, &m, all_args)
+                    }
+                    "java.util.concurrent.executorcompletionservice" => {
+                        self.handle_java_completion_service(object, &m, all_args)
+                    }
+                    "java.util.concurrent.timeunit" => {
+                        java_shims::handle_java_timeunit(&m, all_args, object)
+                    }
+                    "java.util.concurrent.threadfactory" => {
+                        java_shims::handle_java_threadfactory(&m, all_args, object)
                     }
                     "java.util.collections" => {
                         handle_java_collections(&m, all_args, object)
@@ -21444,9 +21748,15 @@ impl CfmlVirtualMachine {
         if is_absolute {
             return raw.to_string();
         }
+        // Resolve against the BASE TEMPLATE dir (the request-level page), not the
+        // currently-executing component — matching CFML `expandPath` and Lucee's
+        // file-BIF behaviour (verified on Lucee 7: `fileRead("./x")` from a CFC in
+        // a subdirectory reads the *webroot* sibling, not the CFC's). Falls back
+        // to `source_file` only when there is no base template.
         match self
-            .source_file
+            .base_template_path
             .as_ref()
+            .or(self.source_file.as_ref())
             .and_then(|s| std::path::Path::new(s).parent())
             .filter(|d| !d.as_os_str().is_empty())
         {

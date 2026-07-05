@@ -1,39 +1,51 @@
 <cfscript>
-suiteBegin("File BIFs: relative paths resolve against the calling template (GitHub 171)");
+suiteBegin("File BIFs: relative paths resolve against the BASE TEMPLATE (Lucee parity)");
 
-// A relative path passed to FileRead/FileExists from inside a CFC must resolve
-// against the directory of THAT CFC — the same base ExpandPath already uses —
-// not the entry template / process cwd. Before the fix, FileRead("./x") from a
-// component in a subdirectory threw "No such file or directory" while
-// ExpandPath("./x") from the same component pointed at the sibling correctly.
-// The test runner's cwd is the repo root, so the fixture lives in a subdir
-// (tests/stdlib/relpath/) where cwd != the component's directory.
+// Verified on Lucee 7: a relative path passed to FileRead/FileExists (and
+// ExpandPath) from inside a CFC resolves against the request's BASE TEMPLATE
+// directory — the page that started the request — NOT the CFC's own directory.
+// A component in tests/stdlib/relpath/ reading "./x" therefore reads the file
+// next to the base template (the test runner), not a sibling of the CFC.
+// (Supersedes GitHub #171, whose fix resolved against the CFC dir and diverged
+// from Lucee — the reference engine.)
 
-reader = new relpath.Reader();
+// Write the fixture next to the base template via ExpandPath (base-relative),
+// then read it back through bare/dot-relative paths from a CFC in a subdir.
+marker = '{"who":"base-template"}';
+target = expandPath( "rel_bif_probe.json" );
+fileWrite( target, marker );
 
-assert(
-	"FileRead('./x') resolves against the CFC's own directory",
-	reader.readDotRelative(),
-	'{"who":"sibling"}'
-);
+try {
+	reader = new relpath.Reader();
 
-assert(
-	"FileRead('x') (bare relative) resolves against the CFC's own directory",
-	reader.readBareRelative(),
-	'{"who":"sibling"}'
-);
+	assert(
+		"FileRead('x') (bare relative) resolves against the base template",
+		reader.readBareRelative(),
+		marker
+	);
 
-assertTrue(
-	"FileExists('./x') uses the same base as FileRead",
-	reader.existsRelative()
-);
+	assert(
+		"FileRead('./x') resolves against the base template",
+		reader.readDotRelative(),
+		marker
+	);
 
-// The relative read must agree with the ExpandPath-wrapped workaround.
-assert(
-	"FileRead('./x') agrees with FileRead(ExpandPath('./x'))",
-	reader.readDotRelative(),
-	reader.readViaExpandPath()
-);
+	assertTrue(
+		"FileExists('./x') uses the same base as FileRead",
+		reader.existsRelative()
+	);
+
+	// The relative read must agree with the ExpandPath-wrapped read.
+	assert(
+		"FileRead('./x') agrees with FileRead(ExpandPath('./x'))",
+		reader.readDotRelative(),
+		reader.readViaExpandPath()
+	);
+} finally {
+	if ( fileExists( target ) ) {
+		fileDelete( target );
+	}
+}
 
 suiteEnd();
 </cfscript>

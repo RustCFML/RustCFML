@@ -4,6 +4,237 @@ use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
+/// Build a bare java-shim marker map for `class`.
+fn java_shim_map(class: &str) -> ValueMap {
+    let mut m = ValueMap::default();
+    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
+    m
+}
+
+// ─────────────────────────────────────────────
+// java.util.concurrent — executor family
+//
+// RustCFML has no JVM thread pool. These shims present the ExecutorService /
+// ScheduledExecutorService / Executors / TimeUnit surface that ColdBox
+// (`coldbox/system/async/*`) and Preside (`system/externals/cfconcurrent/*`)
+// build on, and route the *executing* methods (submit/execute/schedule) through
+// the engine's native async kernel (`runAsync`/`_schedule`) — those live VM-side
+// (they need `&mut VM`); the pure lifecycle/stat methods live here.
+// ─────────────────────────────────────────────
+
+pub const EXECUTORS_CLASS: &str = "java.util.concurrent.executors";
+pub const EXECUTOR_SERVICE_CLASS: &str = "java.util.concurrent.threadpoolexecutor";
+pub const SCHEDULED_EXECUTOR_CLASS: &str = "java.util.concurrent.scheduledthreadpoolexecutor";
+pub const TIMEUNIT_CLASS: &str = "java.util.concurrent.timeunit";
+pub const THREADFACTORY_CLASS: &str = "java.util.concurrent.threadfactory";
+pub const COMPLETION_SERVICE_CLASS: &str = "java.util.concurrent.executorcompletionservice";
+
+/// `java.util.concurrent.Executors` — a static factory holder. Method calls
+/// (newFixedThreadPool/newScheduledThreadPool/…) are handled VM-side.
+pub fn make_executors_static() -> CfmlValue {
+    CfmlValue::strukt(java_shim_map(EXECUTORS_CLASS))
+}
+
+/// An ExecutorService / ThreadPoolExecutor shim. `kind` is informational
+/// ("fixed"/"cached"/"single"). Carries a `__shutdown` flag toggled by
+/// shutdown()/shutdownNow() (via method writeback).
+pub fn make_executor_service(kind: &str) -> CfmlValue {
+    let mut m = java_shim_map(EXECUTOR_SERVICE_CLASS);
+    m.insert("__executor_kind".to_string(), CfmlValue::string(kind.to_string()));
+    m.insert("__shutdown".to_string(), CfmlValue::Bool(false));
+    CfmlValue::strukt(m)
+}
+
+/// A ScheduledExecutorService / ScheduledThreadPoolExecutor shim.
+pub fn make_scheduled_executor() -> CfmlValue {
+    let mut m = java_shim_map(SCHEDULED_EXECUTOR_CLASS);
+    m.insert("__executor_kind".to_string(), CfmlValue::string("scheduled".to_string()));
+    m.insert("__shutdown".to_string(), CfmlValue::Bool(false));
+    CfmlValue::strukt(m)
+}
+
+/// `java.util.concurrent.TimeUnit` — an enum holder. Reads of `.SECONDS` etc.
+/// (property access) return the token string; `.toString()` on a token is the
+/// token itself. RustCFML never feeds these to a live executor, so opaque
+/// string tokens are sufficient (matches Preside's own RustCFML branch).
+pub fn make_timeunit() -> CfmlValue {
+    let mut m = java_shim_map(TIMEUNIT_CLASS);
+    for u in [
+        "NANOSECONDS",
+        "MICROSECONDS",
+        "MILLISECONDS",
+        "SECONDS",
+        "MINUTES",
+        "HOURS",
+        "DAYS",
+    ] {
+        m.insert(u.to_string(), CfmlValue::string(u.to_string()));
+    }
+    CfmlValue::strukt(m)
+}
+
+/// `java.util.concurrent.ThreadFactory` (or Executors.defaultThreadFactory()).
+pub fn make_threadfactory() -> CfmlValue {
+    CfmlValue::strukt(java_shim_map(THREADFACTORY_CLASS))
+}
+
+/// `java.util.concurrent.ExecutorCompletionService(executor[, queue])`. Wraps a
+/// backing executor; submit() runs the task and stashes the Future so poll()/
+/// take() can return it in completion order. The completed-future queue lives on
+/// the shim struct and is mutated via method writeback.
+pub fn make_completion_service(executor: CfmlValue) -> CfmlValue {
+    let mut m = java_shim_map(COMPLETION_SERVICE_CLASS);
+    m.insert("__cs_executor".to_string(), executor);
+    m.insert("__cs_completed".to_string(), CfmlValue::array(vec![]));
+    CfmlValue::strukt(m)
+}
+
+/// `System.out` / `System.err` PrintStream methods. `println`/`print` write to
+/// the process stdout/stderr (Java semantics — console, NOT the HTTP output
+/// buffer); `flush`/`close`/`write`/`append` are accepted. Used by ColdBox's
+/// ConsoleAppender.
+pub fn handle_java_printstream(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let is_err = matches!(object, CfmlValue::Struct(s)
+        if s.get("__java_class")
+            .map(|v| v.as_string())
+            .unwrap_or_default()
+            .ends_with(".err"));
+    let text: String = args.iter().map(|a| a.as_string()).collect::<Vec<_>>().join("");
+    match method {
+        "println" => {
+            if is_err {
+                eprintln!("{}", text);
+            } else {
+                println!("{}", text);
+            }
+        }
+        "print" | "write" | "append" | "printf" | "format" => {
+            if is_err {
+                eprint!("{}", text);
+            } else {
+                print!("{}", text);
+            }
+        }
+        _ => {} // flush/close/checkError/etc — no-op
+    }
+    // Return the stream object so a `.append(x).append(y)` chain still resolves,
+    // and so the caller treats this as authoritatively handled (not a miss).
+    Ok(object.clone())
+}
+
+/// TimeUnit method dispatch — only `toString()`/`name()` are ever called; both
+/// return the token. Property reads (`.SECONDS`) are handled by generic struct
+/// member access, not here.
+pub fn handle_java_timeunit(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    let m = method.to_ascii_lowercase();
+    if m == "tostring" || m == "name" {
+        // The token is stored per-constant, not on the class object; a bare
+        // TimeUnit class .toString() has no single value, so return "TimeUnit".
+        if let CfmlValue::Struct(s) = object {
+            if let Some(t) = s.get("__timeunit_token") {
+                return Ok(CfmlValue::string(t.as_string()));
+            }
+        }
+        return Ok(CfmlValue::string("TimeUnit".to_string()));
+    }
+    Ok(CfmlValue::Null)
+}
+
+/// ThreadFactory.newThread(runnable) → a lightweight Thread shim carrying the
+/// runnable. RustCFML never starts it via the factory (the executor shim runs
+/// tasks directly), so this only needs getName/setName to satisfy Preside's
+/// `ThreadFactory.cfc` naming logic.
+pub fn handle_java_threadfactory(
+    method: &str,
+    args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    if method.eq_ignore_ascii_case("newThread") {
+        let mut m = java_shim_map("java.lang.thread");
+        if let Some(r) = args.into_iter().next() {
+            m.insert("__runnable".to_string(), r);
+        }
+        m.insert("__thread_name".to_string(), CfmlValue::string("rustcfml-worker".to_string()));
+        return Ok(CfmlValue::strukt(m));
+    }
+    Ok(CfmlValue::Null)
+}
+
+/// Pure ExecutorService methods: lifecycle flags + pool statistics. The
+/// executing methods (submit/execute/schedule/invokeAll) are VM-side. Returns
+/// `Ok(Null)` for anything unrecognised so the caller can fall through.
+/// `shutdown`/`shutdownNow` mutate the `__shutdown` flag; the VM caller writes
+/// the returned struct back (via `method_this_writeback`) — signalled by the
+/// second tuple element being `Some(new_self)`.
+pub fn handle_java_executor_service_pure(
+    method: &str,
+    object: &CfmlValue,
+) -> (CfmlResult, Option<CfmlValue>) {
+    let m = method.to_ascii_lowercase();
+    let is_shut = matches!(object, CfmlValue::Struct(s)
+        if s.get("__shutdown").map(|v| v.is_true()).unwrap_or(false));
+    match m.as_str() {
+        "shutdown" => {
+            let mut ns = match object {
+                CfmlValue::Struct(s) => s.snapshot(),
+                _ => ValueMap::default(),
+            };
+            ns.insert("__shutdown".to_string(), CfmlValue::Bool(true));
+            (Ok(CfmlValue::Null), Some(CfmlValue::strukt(ns)))
+        }
+        "shutdownnow" => {
+            let mut ns = match object {
+                CfmlValue::Struct(s) => s.snapshot(),
+                _ => ValueMap::default(),
+            };
+            ns.insert("__shutdown".to_string(), CfmlValue::Bool(true));
+            // Returns the list of never-started tasks — always empty for us.
+            (Ok(CfmlValue::array(vec![])), Some(CfmlValue::strukt(ns)))
+        }
+        "isshutdown" | "isterminated" => (Ok(CfmlValue::Bool(is_shut)), None),
+        "isterminating" => (Ok(CfmlValue::Bool(false)), None),
+        // awaitTermination(timeout, unit) → true (nothing is still running that
+        // we track; tasks are detached real threads).
+        "awaittermination" => (Ok(CfmlValue::Bool(true)), None),
+        "purge" => (Ok(CfmlValue::Null), None),
+        // Pool statistics — no real pool, so report benign zeros.
+        "getactivecount" | "gettaskcount" | "getcompletedtaskcount" | "getpoolsize"
+        | "getlargestpoolsize" => (Ok(CfmlValue::Int(0)), None),
+        "getcorepoolsize" | "getmaximumpoolsize" => (Ok(CfmlValue::Int(0)), None),
+        "getqueue" => (Ok(CfmlValue::array(vec![])), None),
+        _ => (Ok(CfmlValue::Null), None),
+    }
+}
+
+/// Map a Java single-abstract-method (SAM) interface name to the CFML method
+/// name a `createDynamicProxy` target is expected to expose. Used by the
+/// java.util.concurrent shim to invoke a proxied CFC. Matches the functional
+/// interfaces ColdBox/Preside proxy: Callable→call, Runnable→run,
+/// ThreadFactory→newThread, Function/BiFunction→apply, Consumer/BiConsumer→
+/// accept, Supplier→get. Unknown interfaces default to `run`.
+pub fn sam_method_for_interface(iface: &str) -> String {
+    let last = iface
+        .rsplit(['.', '$'])
+        .next()
+        .unwrap_or(iface)
+        .to_ascii_lowercase();
+    match last.as_str() {
+        "callable" => "call",
+        "runnable" => "run",
+        "threadfactory" => "newThread",
+        "supplier" => "get",
+        "function" | "bifunction" | "futurefunction" => "apply",
+        "consumer" | "biconsumer" => "accept",
+        _ => "run",
+    }
+    .to_string()
+}
+
 /// `org.mindrot.jbcrypt.BCrypt` construction. Returns a marker shim; the actual
 /// gensalt/hashpw/checkpw method calls are routed (VM-side) to the pure-Rust
 /// bcrypt builtins (the crypto crate lives in cfml-stdlib, not cfml-vm). This
@@ -1029,6 +1260,15 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
             );
             out.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("out".to_string(), CfmlValue::strukt(out));
+            // Expose `err` too, so `System.err.println(...)` works (ColdBox's
+            // ConsoleAppender writes error-level output to stderr).
+            let mut err = ValueMap::default();
+            err.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.system.err".to_string()),
+            );
+            err.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("err".to_string(), CfmlValue::strukt(err));
             Ok(CfmlValue::strukt(shim))
         }
         "currenttimemillis" => {

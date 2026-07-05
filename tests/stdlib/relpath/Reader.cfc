@@ -1,7 +1,13 @@
 /**
- * Fixture for GitHub #171: a relative file path passed to a file BIF must
- * resolve against THIS component's directory (matching ExpandPath), not the
- * entry template / process cwd. `reldata.json` sits next to this CFC.
+ * Fixture for relative file-BIF resolution (Lucee parity).
+ *
+ * Verified on Lucee 7: a relative file path passed to a file BIF from inside a
+ * component resolves against the request's BASE TEMPLATE directory (the page
+ * that started the request), NOT this component's own directory — the same base
+ * ExpandPath uses. This CFC lives in a subdirectory, so a relative read here
+ * must NOT find a sibling file; it must find the file next to the base template.
+ * (Supersedes the earlier GitHub #171 behaviour, which resolved against the
+ * CFC's own directory and diverged from Lucee.)
  */
 component {
 
@@ -11,21 +17,21 @@ component {
 
 	// dot-relative
 	public string function readDotRelative(){
-		return fileRead( "./reldata.json" );
+		return fileRead( "./rel_bif_probe.json" );
 	}
 
 	// bare relative (no ./)
 	public string function readBareRelative(){
-		return fileRead( "reldata.json" );
+		return fileRead( "rel_bif_probe.json" );
 	}
 
 	// fileExists must use the same base
 	public boolean function existsRelative(){
-		return fileExists( "./reldata.json" );
+		return fileExists( "./rel_bif_probe.json" );
 	}
 
-	// the documented workaround must agree with the bare relative result
+	// the ExpandPath-wrapped read must agree with the bare relative read
 	public string function readViaExpandPath(){
-		return fileRead( expandPath( "./reldata.json" ) );
+		return fileRead( expandPath( "./rel_bif_probe.json" ) );
 	}
 }

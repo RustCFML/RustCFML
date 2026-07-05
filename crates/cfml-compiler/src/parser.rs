@@ -5915,8 +5915,16 @@ impl Parser {
                         location: self.current_location(),
                     }))
                 } else {
-                    // Fallback for non-identifier new (e.g. new "#path#"())
-                    let class = Box::new(self.parse_call()?);
+                    // Fallback for non-identifier new (e.g. `new "#path#"()`).
+                    // Parse ONLY the class-name expression as a primary — NOT a
+                    // full call — then consume the constructor `(args)` here. If
+                    // we used parse_call, its postfix loop would swallow the
+                    // constructor parens (calling the class-name string as a
+                    // function) and any following `.method()` chain, so
+                    // `new "#path#"().setX()` mis-compiled to "(call the string)".
+                    // Leaving the chain unconsumed lets the outer postfix loop
+                    // apply it to the New result, exactly like `new Ident().m()`.
+                    let class = Box::new(self.parse_primary()?);
                     let args = if self.match_token(&Token::LParen) {
                         let a = self.parse_arguments()?;
                         self.consume(&Token::RParen)?;
