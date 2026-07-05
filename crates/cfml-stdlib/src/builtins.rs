@@ -1246,7 +1246,15 @@ fn write_dump(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_len(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::String(s)) => Ok(CfmlValue::Int(s.len() as i64)),
+        // CFML len() is a CHARACTER count, not a byte count. `mid`/`left`/`right`
+        // and the java.util.regex Matcher shim (start/end/group) are all
+        // char-indexed, so a byte-based len() here desyncs any code that mixes
+        // len() with those (e.g. Preside's DynamicFindAndReplaceService slices
+        // `Right(source, Len(source) - charPos)`, which over-read by the UTF-8
+        // byte gap of every multibyte char — the `▾` twisties in a writeDump —
+        // and re-appended the tail of the delayed-Sticker `<!--ds:…:ds-->` marker
+        // into the response).
+        Some(CfmlValue::String(s)) => Ok(CfmlValue::Int(s.chars().count() as i64)),
         Some(CfmlValue::Bool(_)) | Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(
             CfmlValue::Int(args.first().unwrap().as_string().chars().count() as i64),
         ),

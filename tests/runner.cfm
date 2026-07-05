@@ -242,6 +242,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_xml_dom_functions.cfm">
 <cf_runtest file="stdlib/test_misc_functions.cfm">
 <cf_runtest file="stdlib/test_len_scalar_coercion.cfm">
+<cf_runtest file="stdlib/test_len_multibyte_and_output_buffer.cfm">
 <cf_runtest file="stdlib/test_create_unique_id.cfm">
 <cf_runtest file="stdlib/test_preserve_single_quotes.cfm">
 <cf_runtest file="stdlib/test_valuelist_functions.cfm">
