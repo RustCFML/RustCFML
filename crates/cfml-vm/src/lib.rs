@@ -12579,6 +12579,22 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.to_lowercase() == "type")
                             .map(|(_, v)| v.as_string())
                         {
+                            // `cfcontent type=` is the authoritative response
+                            // content-type (Lucee/ACF). Write it into BOTH channels:
+                            // response_content_type (read by resolve_response_headers)
+                            // AND the response_headers Content-Type entry — because
+                            // Preside's getPageContext().getResponse().getContentType()
+                            // shim reads the *header*, not response_content_type. Its
+                            // _resetHttpResponseWithoutCookies() does getContentType()
+                            // → reset() → setContentType(saved) during flush; if the
+                            // cfcontent type lived only in response_content_type,
+                            // getContentType() missed it, returned the hardcoded
+                            // text/html default, and re-applied that — so a served
+                            // static asset (image/png) came back as text/html.
+                            self.response_headers
+                                .retain(|(n, _)| !n.eq_ignore_ascii_case("content-type"));
+                            self.response_headers
+                                .push(("Content-Type".to_string(), ct.clone()));
                             self.response_content_type = Some(ct);
                         }
                         if let Some(var_val) = opts
@@ -12593,8 +12609,25 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.to_lowercase() == "file")
                             .map(|(_, v)| v.as_string())
                         {
-                            if let Ok(contents) = std::fs::read_to_string(&file_path) {
-                                self.response_body = Some(CfmlValue::string(contents));
+                            // Read the file as raw BYTES, not UTF-8 text: `cfcontent
+                            // file=…` streams the file verbatim as the response body,
+                            // and most such payloads are binary (images, fonts, PDFs
+                            // — Preside serves every /preside/system/assets/* image
+                            // through `content file=… type=image/png`). `read_to_string`
+                            // errored on any non-UTF-8 file, silently dropping the body
+                            // so the response fell back to template whitespace. `Binary`
+                            // is streamed verbatim by the serve response builder and is
+                            // equally correct for text payloads (bytes are bytes).
+                            match self.vfs.read(&file_path) {
+                                Ok(bytes) => {
+                                    self.response_body = Some(CfmlValue::Binary(bytes));
+                                }
+                                Err(e) => {
+                                    return Err(CfmlError::runtime(format!(
+                                        "cfcontent: could not read file '{}': {}",
+                                        file_path, e
+                                    )));
+                                }
                             }
                         }
                     }
@@ -16928,6 +16961,7 @@ impl CfmlVirtualMachine {
                 receiver.clone()
             }
             "getcontenttype" => header_get("Content-Type")
+                .or_else(|| self.response_content_type.clone())
                 .map(CfmlValue::string)
                 .unwrap_or_else(|| CfmlValue::string("text/html;charset=UTF-8".to_string())),
             "setcontenttype" => {
