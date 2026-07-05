@@ -3546,6 +3546,7 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let call_depth_before = self.call_stack.len();
         let try_depth_before = self.try_stack.len();
+        let saved_buffers_before = self.saved_output_buffers.len();
 
         // Function enter/exit hook (Phase 3 — OTel spans). Fired from the call
         // WRAPPER, not the body: the body has many early-return paths (`?` on
@@ -3576,6 +3577,29 @@ impl CfmlVirtualMachine {
         // (len < before) are both untouched; only a leaked frame is reclaimed.
         self.call_stack.truncate(call_depth_before);
         self.try_stack.truncate(try_depth_before);
+        // Reclaim output-capture buffers orphaned by an early `return` out of a
+        // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
+        // `<cfsilent><cfreturn …></cfsilent>` helpers — booleanUtils `isTrue`,
+        // presideProxies). Such a `return` jumps over the block's matching
+        // `__cfsavecontent_end`, leaving its buffer on `saved_output_buffers` and
+        // `output_buffer` pointing at the abandoned inner buffer; every later
+        // `__cfsavecontent_end` then pops the WRONG (shifted) buffer, so page
+        // assembly desyncs and viewlets/form fields drop out.
+        //
+        // ONLY on a NORMAL return (`is_ok`). On an *error* unwind the buffers are
+        // owned by `restore_capture_state`, which pops to each catching try's
+        // recorded depth — ColdBox/Preside aborts a full-page-cache HIT (and the
+        // CFML-routed static-asset render) by THROWING to short-circuit, leaving
+        // the top-level request-capture buffer (opened in Bootstrap.cfc) open for
+        // the exception handler to consume. Popping it here on the error path
+        // discarded that captured response — the v0.419.0 regression that emptied
+        // cache hits and `/preside/system/assets/*`. Restricting to `is_ok` closes
+        // the `silent{return}` orphans without touching exception-managed captures.
+        if result.is_ok() {
+            while self.saved_output_buffers.len() > saved_buffers_before {
+                self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
+            }
+        }
 
         #[cfg(feature = "observability")]
         if fn_hook {

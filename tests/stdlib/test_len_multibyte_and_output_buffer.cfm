@@ -1,5 +1,5 @@
 <cfscript>
-suiteBegin("len() char-count (multibyte)");
+suiteBegin("len() char-count + silent-return buffer restore");
 
 // ── len() is a CHARACTER count, not a byte count ────────────────────────────
 // Regression: len() used String::len() (UTF-8 bytes), disagreeing with the
@@ -38,6 +38,34 @@ assert(
 	, spliceAfterMarker( tw & tw & " MARK tail" )
 	, tw & tw & " [R] tail"
 );
+
+// ── An early `return` out of a cfsilent/cfsavecontent block must not orphan its
+// output buffer ────────────────────────────────────────────────────────────
+// Preside's `<cfsilent><cfreturn …></cfsilent>` helpers (booleanUtils isTrue,
+// presideProxies) `return` over the block's matching end op. Without cleanup the
+// pushed buffer is orphaned, so every later __cfsavecontent_end pops the WRONG
+// (shifted) buffer and page assembly desyncs — viewlets/form fields drop out. A
+// NORMAL function return now restores the capture stack to its entry depth.
+// (Reclamation is gated to normal returns only: exception unwinds stay owned by
+// the try/catch capture-restore, which is how ColdBox aborts a cached response.)
+function isTrue( v ) { silent { return v; } }
+
+savecontent variable="cap" {
+	writeOutput( "A" );
+	isTrue( true );
+	isTrue( false );
+	writeOutput( "B" );
+}
+assert( "output survives silent{return} helper calls", cap, "AB" );
+
+// Nested savecontent with a silent{return} in the inner block — the LIFO-shift
+// scenario that dropped Preside viewlets.
+savecontent variable="outer" {
+	writeOutput( "<" );
+	savecontent variable="inner" { writeOutput( "i" ); isTrue( true ); writeOutput( "j" ); }
+	writeOutput( inner & ">" );
+}
+assert( "nested savecontent stays aligned across silent{return}", outer, "<ij>" );
 
 suiteEnd();
 </cfscript>
