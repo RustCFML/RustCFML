@@ -3546,7 +3546,6 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let call_depth_before = self.call_stack.len();
         let try_depth_before = self.try_stack.len();
-        let saved_buffers_before = self.saved_output_buffers.len();
 
         // Function enter/exit hook (Phase 3 — OTel spans). Fired from the call
         // WRAPPER, not the body: the body has many early-return paths (`?` on
@@ -3577,21 +3576,6 @@ impl CfmlVirtualMachine {
         // (len < before) are both untouched; only a leaked frame is reclaimed.
         self.call_stack.truncate(call_depth_before);
         self.try_stack.truncate(try_depth_before);
-        // A `cfsilent`/`cfsavecontent` block opened *inside* this function whose
-        // body then `return`ed (or `break`/`continue`/`cfexit`'d out) never reached
-        // its matching `__cfsavecontent_end`, orphaning the pushed outer buffer on
-        // `saved_output_buffers` and leaving `output_buffer` pointing at the
-        // abandoned inner (silent/capture) buffer. Restore to the entry depth so
-        // the caller's output stream is intact and the stack can't grow across
-        // calls. Preside's `silent { return … }` helpers (booleanUtils `isTrue`/
-        // `isFalse`, presideProxies) are invoked thousands of times per request; the
-        // unbounded stack growth desynced page assembly and leaked raw `renderIncludes`
-        // markers into responses. `while`+overwrite discards the inner buffer (silent
-        // output is meant to be dropped; a returned savecontent's var assignment was
-        // skipped) and restores `output_buffer` to the buffer active at entry.
-        while self.saved_output_buffers.len() > saved_buffers_before {
-            self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
-        }
 
         #[cfg(feature = "observability")]
         if fn_hook {
