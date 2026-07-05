@@ -3214,7 +3214,25 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
         if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (&args[0], &args[1]) {
             // Mutate the first struct's shared handle in place (Lucee semantics).
             let overwrite = if args.len() >= 3 { args[2].is_true() } else { true };
+            // When the SOURCE is a component (ColdBox does
+            // `structAppend(settings, new Settings(), true)` to fold a config
+            // CFC's public settings into a plain struct), copy only its public
+            // data keys — NOT the engine-internal markers (`__variables`,
+            // `__name`, `__is_component`, …) or the `this`/`super` self-refs.
+            // Copying those turned the destination into a pseudo-component
+            // (`isObject()` true), so a later `settings.keyExists(...)` dispatched
+            // as a component method and threw "has no function with name".
+            let src_is_component = b.contains_key("__variables")
+                || b.contains_key("__name")
+                || b.contains_key("__is_component");
             for (k, v) in b.iter() {
+                if src_is_component
+                    && (k.starts_with("__")
+                        || k.eq_ignore_ascii_case("this")
+                        || k.eq_ignore_ascii_case("super"))
+                {
+                    continue;
+                }
                 if overwrite || struct_find_key_ci(a, &k).is_none() {
                     a.insert(k, v);
                 }

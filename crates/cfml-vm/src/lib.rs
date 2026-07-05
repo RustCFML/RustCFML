@@ -27,6 +27,7 @@ pub mod debug_footer;
 #[cfg(feature = "observability")]
 pub mod profiler;
 mod java_shims;
+mod java_time;
 pub mod tz;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
 /// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
@@ -1572,6 +1573,28 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<ThreadSeed>();
 };
+
+/// Case-insensitive insert into a raw local/page scope map (`ValueMap`), matching
+/// CFML semantics — and `CfmlStruct::insert` for component scopes: when a key
+/// already exists under a different casing, update it in place and preserve the
+/// first-written casing rather than forking a second physical entry. CFML
+/// identifiers are case-insensitive, so `foo = ""; FOO = "bar"` must leave a
+/// single variable equal to "bar" (ColdBox's RequestService relies on this: it
+/// declares `var flashPath` then assigns `flashpath` inside a switch). The
+/// exact-match fast path keeps hot loops O(1); the CI scan runs only when the
+/// exact key is absent (a genuinely new key or a case mismatch).
+#[inline]
+fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
+    if map.contains_key(name) {
+        map.insert(name.to_string(), val);
+        return;
+    }
+    if let Some(existing) = map.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() {
+        map.insert(existing, val);
+    } else {
+        map.insert(name.to_string(), val);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CallFrame {
@@ -4200,8 +4223,17 @@ impl CfmlVirtualMachine {
                     stack.push(val);
                 }
                 BytecodeOp::DeclareLocal(name) => {
-                    // Mark this variable as function-local (var keyword)
+                    // Mark this variable as function-local (var keyword). Record
+                    // BOTH the original casing and the lowercased form (mirrors the
+                    // param path in `apply_pending_result_writeback`): CFML
+                    // identifiers are case-insensitive, so a `var flashPath` must
+                    // be recognised as declared-local when a later `flashpath = …`
+                    // (different casing) is assigned — otherwise the write leaks to
+                    // the `variables` scope (ColdBox's Router.buildFlashScope). The
+                    // original-case entry keeps the `local`-view visibility filter
+                    // (which checks `contains(k)` with the key's own casing) intact.
                     declared_locals.insert(name.clone());
+                    declared_locals.insert(name.to_lowercase());
                     // PR #93: a `var x` / `local.x` declaration RECLAIMS the
                     // name into THIS frame's `local` scope, shadowing any
                     // same-named key inherited from the caller. Removing it
@@ -4399,7 +4431,7 @@ impl CfmlVirtualMachine {
                                 vars.insert(name.clone(), val);
                             }
                         } else {
-                            locals.insert(name.clone(), val.clone());
+                            scope_insert_ci(&mut locals, name, val.clone());
                             // PR #93: in modern localmode, a bare assignment IS a
                             // local-scope assignment — it claims the key for this
                             // frame's `local` view, shadowing any inherited
@@ -11533,6 +11565,23 @@ impl CfmlVirtualMachine {
                         let nm = self.current_application_name.clone().unwrap_or_default();
                         meta.insert("name".to_string(), CfmlValue::string(nm));
                     }
+                    // Lucee/ACF always surface the standard application flags in
+                    // getApplicationMetadata(), defaulted even when the app didn't
+                    // set them. A CFML `getApplicationMetadata().clientManagement`
+                    // read must not throw "undefined" (ColdBox's RequestService
+                    // reads both sessionManagement and clientManagement). Only add
+                    // a default when the Application.cfc didn't declare it.
+                    for (key, default) in [
+                        ("sessionManagement", CfmlValue::Bool(false)),
+                        ("clientManagement", CfmlValue::Bool(false)),
+                        ("setClientCookies", CfmlValue::Bool(true)),
+                        ("setDomainCookies", CfmlValue::Bool(false)),
+                        ("scriptProtect", CfmlValue::string("none".to_string())),
+                    ] {
+                        if !meta.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+                            meta.insert(key.to_string(), default);
+                        }
+                    }
                     // Reflect the *effective* runtime mappings (cfconfig + this.mappings
                     // + any registered via `application action="update"`), not just the
                     // Application.cfc literal `this.mappings`. ColdBox's
@@ -12255,6 +12304,17 @@ impl CfmlVirtualMachine {
                                 // handle_jsonvalidator_method).
                                 "ca.vanmulligen.json.schema.validator" => {
                                     java_shims::handle_java_jsonvalidator("init", empty_args, &CfmlValue::Null)
+                                }
+                                // java.time.* (JSR-310) — ColdBox scheduler date
+                                // library. Constructible shims backed by chrono.
+                                other if other.starts_with("java.time.") => {
+                                    match java_time::construct(other) {
+                                        Some(v) => Ok(v),
+                                        None => Err(CfmlError::runtime(format!(
+                                            "createObject: Java class [{}] is not supported.",
+                                            args[1].as_string()
+                                        ))),
+                                    }
                                 }
                                 _ => Err(CfmlError::runtime(format!(
                                     "createObject: Java class [{}] is not supported. \
@@ -17335,6 +17395,10 @@ impl CfmlVirtualMachine {
                     "java.util.concurrent.timeunit" => {
                         java_shims::handle_java_timeunit(&m, all_args, object)
                     }
+                    // java.time.* (JSR-310) date library.
+                    jt if jt.starts_with("java.time.") => {
+                        java_time::dispatch(jt, &m, all_args, object)
+                    }
                     "java.util.concurrent.threadfactory" => {
                         java_shims::handle_java_threadfactory(&m, all_args, object)
                     }
@@ -18786,6 +18850,29 @@ impl CfmlVirtualMachine {
         // keep the lenient Null return; tightening those is a separate concern.)
         if let CfmlValue::Struct(ref s) = object {
             if s.contains_key("__variables") || s.contains_key("__name") {
+                // Lucee parity: every component inherits java.lang.Object, so
+                // hashCode()/equals()/identityHashCode() resolve even when the CFC
+                // declares no such method. ColdBox's async BaseProxy calls
+                // `hashCode()` on the proxied component to key thread/context maps;
+                // without this it threw "has no function with name [hashCode]" and
+                // aborted executor scheduling. Identity hash = the shared struct
+                // backing pointer (same instance -> same value), matching
+                // System.identityHashCode.
+                match method_lower.as_str() {
+                    "hashcode" => {
+                        let raw = s.backing_ptr() as u64;
+                        let folded = (raw ^ (raw >> 32)) & 0x7fff_ffff;
+                        return Ok(CfmlValue::Int(folded as i64));
+                    }
+                    "equals" => {
+                        let same = matches!(
+                            extra_args.first(),
+                            Some(CfmlValue::Struct(o)) if o.backing_ptr() == s.backing_ptr()
+                        );
+                        return Ok(CfmlValue::Bool(same));
+                    }
+                    _ => {}
+                }
                 let comp_name = s
                     .get("__name")
                     .map(|v| v.as_string())
@@ -18881,6 +18968,32 @@ impl CfmlVirtualMachine {
                     chrono::Local.from_local_datetime(&dt)
                 {
                     return Ok(CfmlValue::Double(local_dt.timestamp_millis() as f64));
+                }
+            }
+        }
+
+        // Lucee parity: `dateValue.toInstant()` (java.util.Date.toInstant) yields
+        // a java.time.Instant. RustCFML dates are formatted strings; parse the
+        // receiver as a date and hand back an Instant shim so ColdBox's
+        // ChronoUnit (`cfDate.toInstant().atZone(zone)`) can bridge a CF date into
+        // the java.time world. Only fires when the receiver parses as a date.
+        if method_lower == "toinstant" {
+            let raw = object.as_string();
+            let s = raw.trim().trim_start_matches("{ts '").trim_end_matches("'}").trim();
+            let parsed = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+                .ok()
+                .or_else(|| {
+                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .ok()
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                });
+            if let Some(dt) = parsed {
+                use chrono::TimeZone;
+                if let chrono::LocalResult::Single(local_dt) =
+                    chrono::Local.from_local_datetime(&dt)
+                {
+                    return Ok(java_time::instant_from_millis(local_dt.timestamp_millis()));
                 }
             }
         }
@@ -23991,6 +24104,15 @@ impl CfmlVirtualMachine {
                 self.register_fn(f);
             }
 
+            // Publish the loaded Application.cfc `this` scope BEFORE running
+            // onApplicationStart, so `getApplicationMetadata()`/`getApplicationSettings()`
+            // called from within the startup handler see the app's `this.*`
+            // settings (sessionManagement, name, mappings, …). Without this the
+            // metadata was empty during startup — ColdBox's RequestService reads
+            // `getApplicationMetadata().sessionManagement` in onConfigurationLoad.
+            // The post-start reassignment below refreshes it with any writes.
+            self.app_cfc_template = Some(template.clone());
+
             // 5. onApplicationStart (if not yet started)
             let already_started = app_snapshot.started;
             if !already_started {
@@ -24035,6 +24157,8 @@ impl CfmlVirtualMachine {
             );
             self.application_scope = Some(scope);
 
+            // Publish the this-scope before startup (see serve branch note).
+            self.app_cfc_template = Some(template.clone());
             // Still call onApplicationStart in CLI mode
             let _ = self.call_lifecycle_method(&mut template, "onApplicationStart", vec![]);
         }

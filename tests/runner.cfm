@@ -218,6 +218,9 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_file_relative_path.cfm">
 <!--- java.util.concurrent shim + createDynamicProxy (ColdBox/Preside async). --->
 <cf_runtest file="stdlib/test_java_concurrent.cfm">
+<!--- Engine fixes surfaced by booting ColdBox (case-insensitive locals, --->
+<!--- structAppend-from-component, component hashCode, java.time shim). --->
+<cf_runtest file="stdlib/test_coldbox_engine_fixes.cfm">
 <cf_runtest file="stdlib/test_security.cfm">
 <cf_runtest file="stdlib/test_password_hashing.cfm">
 <cf_runtest file="stdlib/test_xml.cfm">
