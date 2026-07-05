@@ -221,6 +221,10 @@ include "harness.cfm";
 <!--- Engine fixes surfaced by booting ColdBox (case-insensitive locals, --->
 <!--- structAppend-from-component, component hashCode, java.time shim). --->
 <cf_runtest file="stdlib/test_coldbox_engine_fixes.cfm">
+<!--- More ColdBox/Preside boot fixes: comma-less dates, stackTrace key, array --->
+<!--- argumentCollection, list-HOF member forms, injected-method receiver --->
+<!--- binding, runtime mapping via application action="update". --->
+<cf_runtest file="stdlib/test_coldbox_preside_boot_fixes.cfm">
 <cf_runtest file="stdlib/test_security.cfm">
 <cf_runtest file="stdlib/test_password_hashing.cfm">
 <cf_runtest file="stdlib/test_xml.cfm">

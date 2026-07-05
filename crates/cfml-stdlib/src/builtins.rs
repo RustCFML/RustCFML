@@ -4058,6 +4058,12 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         "%b %d, %Y %H:%M:%S",
         "%B %d, %Y %H:%M:%S",
         "%d-%b-%Y %H:%M:%S",
+        // Month-name forms without a comma (Lucee/ACF accept these) — e.g.
+        // "January 1 1970 00:00", used by cbsecurity's JwtService epoch base.
+        "%B %d %Y %H:%M:%S",
+        "%b %d %Y %H:%M:%S",
+        "%B %d %Y %H:%M",
+        "%b %d %Y %H:%M",
     ] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
             return Some(dt);
@@ -4073,6 +4079,8 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         "%b %d, %Y",
         "%B %d, %Y",
         "%d-%b-%Y",
+        "%B %d %Y",
+        "%b %d %Y",
     ] {
         if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
             return d.and_hms_opt(0, 0, 0);
@@ -6668,40 +6676,63 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // loader uses directoryList(..., "dir") to enumerate only sub-directories.
     let type_filter = if args.len() >= 6 { get_str(&args, 5).to_lowercase() } else { "all".to_string() };
 
-    fn matches_filter(filename: &str, filter: &str) -> bool {
-        if filter.is_empty() { return true; }
-        // Lucee/ACF allow a pipe-delimited list of glob patterns, e.g. "*.cfm|*.cfc".
-        // Match if ANY sub-pattern matches.
-        filter.split('|').any(|pat| glob_matches(filename, pat))
+    // A filter is a pipe-delimited list of glob patterns (e.g. "*.cfm|*.cfc") —
+    // match if ANY sub-pattern matches. Each sub-pattern is compiled ONCE here
+    // (not per directory entry): a wildcard-free pattern (Sticker's asset lookups
+    // pass an exact filename like "user.svg") becomes a cheap case-insensitive
+    // string compare with no regex at all; a glob compiles to a single anchored,
+    // case-insensitive regex reused across every entry. Compiling per-entry made
+    // a filtered scan of a 1000-file dir do ~1000 regex compilations — Preside's
+    // Sticker re-scans a FontAwesome icon dir hundreds of times per request, so
+    // the old code cost ~500K compilations and pinned /admin at ~100s of CPU.
+    enum PatMatcher {
+        Exact(String),   // lowercased literal — case-insensitive equality
+        Rx(Regex),       // compiled glob
+        Contains(String),// lowercased fallback for a malformed glob
     }
-
-    // Convert a shell-style glob (`*` = any run, `?` = one char) to an anchored,
-    // case-insensitive regex and test the whole filename against it. This correctly
-    // handles wildcards anywhere in the pattern (e.g. "jquery-2*.min.js"), not just
-    // at the start/end. A pattern with no wildcards is an exact (case-insensitive)
-    // name match, matching Lucee's DirectoryList filter semantics.
-    fn glob_matches(filename: &str, pattern: &str) -> bool {
-        if pattern.is_empty() { return true; }
-        let mut re = String::with_capacity(pattern.len() + 8);
-        re.push_str("(?i)^");
-        for ch in pattern.chars() {
-            match ch {
-                '*' => re.push_str(".*"),
-                '?' => re.push('.'),
-                // escape regex metacharacters so they match literally
-                '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' | '|' => {
-                    re.push('\\');
-                    re.push(ch);
+    fn compile_filter(filter: &str) -> Vec<PatMatcher> {
+        if filter.is_empty() {
+            return Vec::new();
+        }
+        filter
+            .split('|')
+            .filter(|p| !p.is_empty())
+            .map(|pattern| {
+                if !pattern.contains('*') && !pattern.contains('?') {
+                    return PatMatcher::Exact(pattern.to_lowercase());
                 }
-                _ => re.push(ch),
-            }
+                let mut re = String::with_capacity(pattern.len() + 8);
+                re.push_str("(?i)^");
+                for ch in pattern.chars() {
+                    match ch {
+                        '*' => re.push_str(".*"),
+                        '?' => re.push('.'),
+                        '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' | '|' => {
+                            re.push('\\');
+                            re.push(ch);
+                        }
+                        _ => re.push(ch),
+                    }
+                }
+                re.push('$');
+                match Regex::new(&re) {
+                    Ok(r) => PatMatcher::Rx(r),
+                    Err(_) => PatMatcher::Contains(pattern.replace('*', "").to_lowercase()),
+                }
+            })
+            .collect()
+    }
+    fn matches_filter(filename: &str, matchers: &[PatMatcher]) -> bool {
+        if matchers.is_empty() {
+            return true;
         }
-        re.push('$');
-        match Regex::new(&re) {
-            Ok(r) => r.is_match(filename),
-            // Malformed pattern: fall back to a case-insensitive substring test.
-            Err(_) => filename.to_lowercase().contains(&pattern.replace('*', "").to_lowercase()),
-        }
+        // Only lowercase once, and only if a case-insensitive matcher needs it.
+        let lower = filename.to_lowercase();
+        matchers.iter().any(|m| match m {
+            PatMatcher::Exact(p) => lower == *p,
+            PatMatcher::Rx(r) => r.is_match(filename),
+            PatMatcher::Contains(p) => lower.contains(p),
+        })
     }
 
     enum Entry {
@@ -6709,7 +6740,14 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
         Row { name: String, directory: String, size: u64, is_dir: bool },
     }
 
-    fn list_dir(path: &str, recurse: bool, filter: &str, list_info: &str, type_filter: &str) -> Result<Vec<Entry>, std::io::Error> {
+    fn list_dir(
+        path: &str,
+        recurse: bool,
+        filter: &[PatMatcher],
+        list_info: &str,
+        type_filter: &str,
+        visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> Result<Vec<Entry>, std::io::Error> {
         let mut results = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
@@ -6717,8 +6755,23 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
             let full_path = entry_path.to_string_lossy().to_string();
             let file_name = entry.file_name().to_string_lossy().to_string();
 
-            let is_dir = entry_path.is_dir();
-            let is_file = entry_path.is_file();
+            // Determine dir/file WITHOUT a stat syscall for the common case:
+            // `read_dir` already yields the entry's type (via `d_type`), so a
+            // regular file or directory costs zero extra syscalls. Only a symlink
+            // needs a follow-the-target `stat` to classify it — preserving the
+            // previous `is_dir()`/`is_file()` (symlink-following) semantics while
+            // dropping two stat calls per entry. Preside's admin re-scans a
+            // ~1000-file FontAwesome icon dir hundreds of times per request; the
+            // old double-stat made that ~1M syscalls and pinned a cold /admin boot
+            // at ~100s of CPU.
+            let (is_dir, is_file) = match entry.file_type() {
+                Ok(ft) if ft.is_symlink() => match entry_path.metadata() {
+                    Ok(m) => (m.is_dir(), m.is_file()),
+                    Err(_) => (false, false),
+                },
+                Ok(ft) => (ft.is_dir(), ft.is_file()),
+                Err(_) => (false, false),
+            };
 
             // The name filter applies to BOTH files and directories (Lucee/ACF
             // behavior); directories are still always recursed into below
@@ -6744,7 +6797,14 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 };
             }
             if recurse && is_dir {
-                results.extend(list_dir(&full_path, true, filter, list_info, type_filter)?);
+                // Guard against symlink cycles: canonicalize the target and skip a
+                // directory already on the current recursion's visited set, so a
+                // looping symlink can never spin forever (a real hang, not a
+                // divergence — no engine should follow a directory cycle).
+                let canon = std::fs::canonicalize(&entry_path).unwrap_or_else(|_| entry_path.clone());
+                if visited.insert(canon) {
+                    results.extend(list_dir(&full_path, true, filter, list_info, type_filter, visited)?);
+                }
             }
         }
         Ok(results)
@@ -6754,7 +6814,9 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // than throwing (ColdBox/Preside scan optional module locations like
     // `/app/extensions_app` that may not exist). Only a genuine I/O failure
     // (permissions, etc.) still surfaces as an error.
-    let listing = match list_dir(&path, recurse, &filter, &list_info, &type_filter) {
+    let compiled_filter = compile_filter(&filter);
+    let mut visited = std::collections::HashSet::new();
+    let listing = match list_dir(&path, recurse, &compiled_filter, &list_info, &type_filter, &mut visited) {
         Ok(entries) => Ok(entries),
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         // A path that exists but is a FILE yields ENOTDIR (os error 20). Lucee

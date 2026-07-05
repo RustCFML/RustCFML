@@ -330,12 +330,20 @@ fn parse_cookie_expiry_date(s: &str) -> Option<chrono::NaiveDateTime> {
         "%d-%b-%Y %H:%M:%S",
         "%a, %d-%b-%Y %H:%M:%S GMT",
         "%a, %d %b %Y %H:%M:%S GMT",
+        // Month-name forms (comma-less too) — dateConvert reuses this parser and
+        // cbsecurity's JwtService passes "January 1 1970 00:00".
+        "%B %d %Y %H:%M:%S",
+        "%b %d %Y %H:%M:%S",
+        "%B %d %Y %H:%M",
+        "%b %d %Y %H:%M",
+        "%B %d, %Y %H:%M:%S",
+        "%B %d, %Y %H:%M",
     ] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
             return Some(dt);
         }
     }
-    for fmt in &["%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d-%b-%Y"] {
+    for fmt in &["%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d-%b-%Y", "%B %d %Y", "%b %d %Y", "%B %d, %Y"] {
         if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
             return d.and_hms_opt(0, 0, 0);
         }
@@ -2976,6 +2984,26 @@ impl CfmlVirtualMachine {
             CfmlValue::string(format!("{}", e.error_type)),
         );
         err_struct.insert("detail".to_string(), CfmlValue::string(String::new()));
+        // `stackTrace` (Lucee/ACF parity): a multiline "message @ template:line"
+        // string synthesised from the tag context. Frameworks read it directly
+        // (ColdBox's ModuleService logs `e.stackTrace`; a missing member would
+        // throw "Variable 'stackTrace' is undefined").
+        let stack_trace = {
+            let mut s = e.message.clone();
+            if let CfmlValue::Array(frames) = &tag_context {
+                for f in frames.snapshot() {
+                    if let CfmlValue::Struct(fr) = f {
+                        let tmpl = fr.get("template").map(|v| v.as_string()).unwrap_or_default();
+                        let line = fr.get("line").map(|v| v.as_string()).unwrap_or_default();
+                        if !tmpl.is_empty() {
+                            s.push_str(&format!("\n  at {}:{}", tmpl, line));
+                        }
+                    }
+                }
+            }
+            s
+        };
+        err_struct.insert("stackTrace".to_string(), CfmlValue::string(stack_trace));
         err_struct.insert("tagcontext".to_string(), tag_context);
         Self::add_root_cause(&mut err_struct);
         CfmlValue::strukt(err_struct)
@@ -2989,6 +3017,33 @@ impl CfmlVirtualMachine {
     /// exception never recurse. A pre-existing `rootCause` (e.g. carried by an
     /// object re-thrown via `throw(object=…)`) is left untouched.
     fn add_root_cause(exc: &mut ValueMap) {
+        // Ensure a `stackTrace` key (Lucee/ACF parity): every cfcatch/exception
+        // exposes one, and frameworks read it directly (ColdBox's RestHandler logs
+        // `arguments.exception.stacktrace`). Synthesised from message + tagContext
+        // when a builder didn't set one. Centralised here so every exception
+        // struct that gets a rootCause also gets a stackTrace.
+        if !exc.keys().any(|k| k.eq_ignore_ascii_case("stacktrace")) {
+            let msg = exc
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("message"))
+                .map(|(_, v)| v.as_string())
+                .unwrap_or_default();
+            let mut st = msg;
+            if let Some((_, CfmlValue::Array(frames))) =
+                exc.iter().find(|(k, _)| k.eq_ignore_ascii_case("tagcontext"))
+            {
+                for f in frames.snapshot() {
+                    if let CfmlValue::Struct(fr) = f {
+                        let tmpl = fr.get("template").map(|v| v.as_string()).unwrap_or_default();
+                        let line = fr.get("line").map(|v| v.as_string()).unwrap_or_default();
+                        if !tmpl.is_empty() {
+                            st.push_str(&format!("\n  at {}:{}", tmpl, line));
+                        }
+                    }
+                }
+            }
+            exc.insert("stackTrace".to_string(), CfmlValue::string(st));
+        }
         if exc.keys().any(|k| k.eq_ignore_ascii_case("rootcause")) {
             return;
         }
@@ -3412,7 +3467,12 @@ impl CfmlVirtualMachine {
             );
             exception.insert("type".to_string(), CfmlValue::string("expression".to_string()));
             exception.insert("detail".to_string(), CfmlValue::string(String::new()));
-            exception.insert("tagcontext".to_string(), self.build_tag_context());
+            let tc = self.build_tag_context();
+            exception.insert(
+                "stackTrace".to_string(),
+                CfmlValue::string(format!("Variable '{}' is undefined", name)),
+            );
+            exception.insert("tagcontext".to_string(), tc);
             stack.truncate(handler.stack_depth);
             self.restore_capture_state(&handler);
             Self::add_root_cause(&mut exception);
@@ -4080,20 +4140,62 @@ impl CfmlVirtualMachine {
                         // a `.each(...)` call site that previously dropped
                         // `this` will now see it via the function's binding.
                         if let CfmlValue::Function(ref f) = val {
-                            if f.captured_scope.is_none()
-                                && (locals.contains_key("this")
-                                    || locals.contains_key("__variables"))
+                            // Only bind a genuine component method retrieved by
+                            // BARE NAME (e.g. `.each( processPropertyMetadata )`) —
+                            // i.e. the name is a member of this component's
+                            // `variables`/`this` scope. A Function held in a plain
+                            // LOCAL or PARAM (e.g. a `propertyValue` argument that
+                            // carries a *foreign* method) must NOT be rebound to
+                            // the current component: WireBox's virtual inheritance
+                            // iterates a base CFC's methods and passes each through
+                            // a Builder-method closure to inject into the target —
+                            // rebinding those to the Builder made ColdBox's mixed-in
+                            // Router.initRouteDefinition see the Builder's
+                            // `variables` (no `onGroup`) instead of the Router's.
+                            let is_own_component_member = |scope_key: &str| -> bool {
+                                matches!(
+                                    locals.get(scope_key),
+                                    Some(CfmlValue::Struct(cv)) if cv.contains_key_ci(name)
+                                )
+                            };
+                            if (locals.contains_key("this")
+                                || locals.contains_key("__variables"))
+                                && !locals.contains_key(name.as_str())
+                                && !locals.contains_key(name_lower)
+                                && (is_own_component_member("__variables")
+                                    || is_own_component_member("this"))
                             {
-                                let mut bound: ValueMap =
-                                    ValueMap::default();
+                                // Start from any existing captured (closure) scope,
+                                // then let the CURRENT component's this/variables WIN.
+                                // A method injected into this component (e.g. WireBox's
+                                // buildProviderMixer, member-extracted from the
+                                // objectBuilder so carrying ITS this/variables) must,
+                                // when called as a member of THIS component (bare
+                                // `new()` inside a method), bind to THIS component —
+                                // otherwise `this.$wbScopeStorage` resolved against the
+                                // objectBuilder and was undefined. Overriding only the
+                                // scope-bridge keys preserves genuine closure captures.
+                                let mut bound: ValueMap = match &f.captured_scope {
+                                    Some(cap) => {
+                                        cap.read().map(|g| g.clone()).unwrap_or_default()
+                                    }
+                                    None => ValueMap::default(),
+                                };
                                 for key in [
                                     "this",
                                     "__variables",
                                     "variables",
                                     "super",
                                 ] {
-                                    if let Some(v) = locals.get(key) {
-                                        bound.insert(key.to_string(), v.clone());
+                                    match locals.get(key) {
+                                        Some(v) => {
+                                            bound.insert(key.to_string(), v.clone());
+                                        }
+                                        None => {
+                                            // Don't inherit a foreign bridge key when
+                                            // the current frame has none.
+                                            bound.shift_remove(key);
+                                        }
                                     }
                                 }
                                 let mut bound_fn = (**f).clone();
@@ -4694,6 +4796,70 @@ impl CfmlVirtualMachine {
                             None
                         }
                     }) {
+                        // A component method resolved from `__variables` for a bare
+                        // call. If it carries a FOREIGN component binding in its
+                        // captured_scope (an INJECTED method member-extracted from
+                        // another component — e.g. WireBox's buildProviderMixer,
+                        // extracted off the objectBuilder and injected as the
+                        // `new()` provider), rebind its this/variables to THIS
+                        // component so `this.$wbScopeStorage` resolves against the
+                        // receiver, not the extraction origin. Plain component
+                        // methods (captured_scope None) and genuine closures (no
+                        // this/__variables captured) are left untouched.
+                        let val = match &val {
+                            CfmlValue::Function(f) => {
+                                // Attribute a bare call of a component method to the
+                                // name it was invoked under (the __variables key),
+                                // so getFunctionCalledName() returns e.g. "new" for
+                                // an injected provider whose source method is named
+                                // "buildProviderMixer". Drained by the next call.
+                                if !f.name.eq_ignore_ascii_case(name.as_str()) {
+                                    self.pending_called_name = Some(name.clone());
+                                }
+                                let foreign_bind = f
+                                    .captured_scope
+                                    .as_ref()
+                                    .and_then(|c| c.read().ok().map(|g| {
+                                        g.contains_key("this") || g.contains_key("__variables")
+                                    }))
+                                    .unwrap_or(false);
+                                if foreign_bind
+                                    && (locals.contains_key("this")
+                                        || locals.contains_key("__variables"))
+                                {
+                                    let mut bound: ValueMap = f
+                                        .captured_scope
+                                        .as_ref()
+                                        .and_then(|c| c.read().ok().map(|g| g.clone()))
+                                        .unwrap_or_default();
+                                    for key in ["this", "__variables", "variables", "super"] {
+                                        match locals.get(key) {
+                                            Some(v) => {
+                                                bound.insert(key.to_string(), v.clone());
+                                            }
+                                            None => {
+                                                bound.shift_remove(key);
+                                            }
+                                        }
+                                    }
+                                    let mut bf = (**f).clone();
+                                    bf.captured_scope =
+                                        Some(cfml_common::cycle_gc::tracked_scope(bound));
+                                    // Record the call-site alias so
+                                    // getFunctionCalledName() returns the injected
+                                    // name (e.g. "new"), not the source method's
+                                    // name — WireBox's buildProviderMixer keys
+                                    // `this.$wbProviders[getFunctionCalledName()]`.
+                                    if !bf.name.eq_ignore_ascii_case(name.as_str()) {
+                                        bf.name = name.clone();
+                                    }
+                                    CfmlValue::Function(Arc::new(bf))
+                                } else {
+                                    val
+                                }
+                            }
+                            _ => val,
+                        };
                         stack.push(val);
                     // 2. Check globals (exact, then CI)
                     } else if let Some(val) = self.globals.get(name.as_str()) {
@@ -11311,6 +11477,13 @@ impl CfmlVirtualMachine {
                         let mut found = None;
                         for mapping in &self.mappings {
                             let prefix = mapping.name.trim_end_matches('/');
+                            // Skip the "/" root mapping (empty prefix matches every
+                            // path): it must NOT shadow a more specific runtime
+                            // mapping. The webroot/base fallback below handles the
+                            // genuine root case identically.
+                            if prefix.is_empty() {
+                                continue;
+                            }
                             if rel.to_lowercase().starts_with(&prefix.to_lowercase()) {
                                 let remainder = &rel[prefix.len()..];
                                 let remainder = remainder.trim_start_matches('/');
@@ -11582,15 +11755,18 @@ impl CfmlVirtualMachine {
                             meta.insert(key.to_string(), default);
                         }
                     }
-                    // Reflect the *effective* runtime mappings (cfconfig + this.mappings
-                    // + any registered via `application action="update"`), not just the
-                    // Application.cfc literal `this.mappings`. ColdBox's
-                    // CFMappingHelper/LuceeMappingHelper read this to append new module
-                    // cfmappings, so it must mirror the live mapping table.
+                    // Reflect the *effective* runtime mappings (cfconfig +
+                    // this.mappings + any registered via `application
+                    // action="update"`) as a fresh COPY — matching Lucee, where
+                    // mutating the returned `mappings` struct (e.g. ColdBox's ACF
+                    // CFMappingHelper doing `getApplicationMetadata().mappings[x]=y`)
+                    // does NOT register a live mapping. Runtime registration is done
+                    // via `application action="update" mappings={...}` (the
+                    // LuceeMappingHelper path), which writes the real `self.mappings`
+                    // table. Names use the Lucee "/HTMLHelper" form (no trailing
+                    // slash); "/" stays as-is.
                     let mut map_struct = ValueMap::default();
                     for mp in &self.mappings {
-                        // Present names without the normalized trailing slash (Lucee
-                        // surfaces "/HTMLHelper", not "/HTMLHelper/"); keep "/" as-is.
                         let key = if mp.name == "/" {
                             "/".to_string()
                         } else {
@@ -16562,6 +16738,17 @@ impl CfmlVirtualMachine {
         let CfmlValue::Struct(arg_map) = invoke_args else {
             return match invoke_args {
                 CfmlValue::Null => (Vec::new(), Vec::new()),
+                // An ARRAY argument-collection is positional (Lucee/ACF): each
+                // element becomes a positional argument. ColdBox's BeanPopulator
+                // sets accessors via `invoke(bean, "setX", [value])`; without this
+                // the whole array was passed as one arg, so `setEmail(["x"])` stored
+                // an array and later `getEmail()` returned `["x"]` (login password
+                // compare then failed).
+                CfmlValue::Array(a) => {
+                    let vals = a.snapshot();
+                    let names = vec![String::new(); vals.len()];
+                    (vals, names)
+                }
                 other => (vec![other], vec![String::new()]),
             };
         };
@@ -17022,6 +17209,106 @@ impl CfmlVirtualMachine {
                     return Ok(head);
                 }
                 Ok(CfmlValue::Null)
+            }
+            _ => Ok(CfmlValue::Null),
+        }
+    }
+
+    /// Closure-taking list higher-order member methods on a string
+    /// (`list.listFilter(cb)`, `.listMap`, `.listReduce`, `.listEach`,
+    /// `.listEvery`, `.listSome`). These are VM-intercepted in `call_function`
+    /// for the standalone form, but member dispatch maps to builtins directly
+    /// (which can't run a closure), so the member form must be handled here.
+    /// Callback signature: (item, index, list).
+    fn dispatch_string_list_hof(
+        &mut self,
+        hof: &str,
+        list: &str,
+        callback: &CfmlValue,
+        delimiter: &str,
+        init: Option<CfmlValue>,
+    ) -> CfmlResult {
+        let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
+        let items: Vec<String> = list
+            .split(|c: char| delimiter.contains(c))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let pl = ValueMap::default();
+        let call = |vm: &mut Self, item: &str, idx: usize| -> CfmlResult {
+            vm.closure_parent_writeback = None;
+            let r = vm.call_function(
+                callback,
+                vec![
+                    CfmlValue::string(item.to_string()),
+                    CfmlValue::Int((idx + 1) as i64),
+                    CfmlValue::string(list.to_string()),
+                ],
+                &pl,
+            );
+            if let Some(ref wb) = vm.closure_parent_writeback {
+                Self::write_back_to_captured_scope(callback, wb);
+            }
+            r
+        };
+        match hof {
+            "filter" => {
+                let mut out = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    if call(self, item, i)?.is_true() {
+                        out.push(item.clone());
+                    }
+                }
+                Ok(CfmlValue::string(out.join(&first_delim)))
+            }
+            "map" => {
+                let mut out = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    out.push(call(self, item, i)?.as_string());
+                }
+                Ok(CfmlValue::string(out.join(&first_delim)))
+            }
+            "each" => {
+                for (i, item) in items.iter().enumerate() {
+                    call(self, item, i)?;
+                }
+                Ok(CfmlValue::Null)
+            }
+            "every" => {
+                for (i, item) in items.iter().enumerate() {
+                    if !call(self, item, i)?.is_true() {
+                        return Ok(CfmlValue::Bool(false));
+                    }
+                }
+                Ok(CfmlValue::Bool(true))
+            }
+            "some" => {
+                for (i, item) in items.iter().enumerate() {
+                    if call(self, item, i)?.is_true() {
+                        return Ok(CfmlValue::Bool(true));
+                    }
+                }
+                Ok(CfmlValue::Bool(false))
+            }
+            "reduce" => {
+                let mut acc = init.unwrap_or(CfmlValue::Null);
+                for (i, item) in items.iter().enumerate() {
+                    self.closure_parent_writeback = None;
+                    acc = self.call_function(
+                        callback,
+                        vec![
+                            acc,
+                            CfmlValue::string(item.clone()),
+                            CfmlValue::Int((i + 1) as i64),
+                            CfmlValue::string(list.to_string()),
+                        ],
+                        &pl,
+                    )?;
+                    if let Some(ref wb) = self.closure_parent_writeback {
+                        Self::write_back_to_captured_scope(callback, wb);
+                    }
+                }
+                Ok(acc)
             }
             _ => Ok(CfmlValue::Null),
         }
@@ -17548,6 +17835,27 @@ impl CfmlVirtualMachine {
                         .map(|c| CfmlValue::string(c.to_string()))
                         .collect();
                     return Ok(CfmlValue::array(chars));
+                }
+                // Closure-taking list HOFs: `list.listFilter(cb[, delim])` etc.
+                // Member dispatch can't route these through the standalone VM
+                // intercept, so handle them inline (ColdBox's RoutingService does
+                // `router.getValidExtensions().listFilter(cb).listFirst()`).
+                "listfilter" | "listmap" | "listeach" | "listevery" | "listsome"
+                | "listreduce" => {
+                    let cb = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
+                    let (init, delim) = if method_lower == "listreduce" {
+                        (
+                            extra_args.get(1).cloned(),
+                            extra_args.get(2).map(|v| v.as_string()).unwrap_or_else(|| ",".to_string()),
+                        )
+                    } else {
+                        (
+                            None,
+                            extra_args.get(1).map(|v| v.as_string()).unwrap_or_else(|| ",".to_string()),
+                        )
+                    };
+                    let hof = method_lower.trim_start_matches("list");
+                    return self.dispatch_string_list_hof(hof, &object.as_string(), &cb, &delim, init);
                 }
                 "ucase" | "touppercase" => Some("ucase"),
                 "lcase" | "tolowercase" => Some("lcase"),
@@ -19413,27 +19721,41 @@ impl CfmlVirtualMachine {
     /// Resolve a dot-path class name to a .cfc file path using component mappings.
     /// Mappings are sorted longest-prefix-first for correct precedence.
     fn resolve_path_with_mappings(&self, class_name: &str) -> Option<String> {
-        if self.mappings.is_empty() {
-            return None;
-        }
         // Convert dot-path to slash-path: "taffy.core.api" → "/taffy/core/api"
         let slash_path = format!("/{}", class_name.replace('.', "/"));
         let slash_lower = slash_path.to_lowercase();
 
+        // Iterate the effective `mappings` table (cfconfig + this.mappings + any
+        // registered via `application action="update"` — e.g. a ColdBox module's
+        // cfmapping like "/mementifier"). action=update writes this table directly,
+        // so a `createObject`/`getComponentMetadata("mementifier.interceptors.X")`
+        // resolves the module component.
         for mapping in &self.mappings {
-            let prefix_lower = mapping.name.to_lowercase();
-            if slash_lower.starts_with(&prefix_lower)
-                || (mapping.name == "/" && slash_lower.starts_with('/'))
-            {
-                let remainder = if mapping.name == "/" {
-                    &slash_path[1..] // Strip leading /
+            let name = mapping.name.as_str();
+            let path = mapping.path.as_str();
+            // Normalise the prefix to "/name/" (names may or may not carry a
+            // trailing slash depending on how they were registered).
+            let prefix = if name == "/" {
+                "/".to_string()
+            } else {
+                format!("/{}/", name.trim_start_matches('/').trim_end_matches('/'))
+            };
+            let prefix_lower = prefix.to_lowercase();
+            let matches = if prefix == "/" {
+                slash_lower.starts_with('/')
+            } else {
+                slash_lower.starts_with(&prefix_lower)
+            };
+            if matches {
+                let remainder = if prefix == "/" {
+                    &slash_path[1..]
                 } else {
-                    &slash_path[mapping.name.len()..]
+                    &slash_path[prefix.len() - 1..] // keep matching-boundary slash off
                 };
                 let remainder = remainder.trim_start_matches('/');
                 let cfc_path = format!(
                     "{}/{}.cfc",
-                    mapping.path.trim_end_matches('/'),
+                    path.trim_end_matches('/'),
                     remainder.replace('/', std::path::MAIN_SEPARATOR_STR)
                 );
                 if self.vfs.exists(&cfc_path) {
@@ -21837,7 +22159,7 @@ impl CfmlVirtualMachine {
         tz::system_tz_id()
     }
 
-    fn resolve_template_relative(&self, raw: &str) -> String {
+    fn resolve_template_relative(&self, raw: &str, allow_current_template_fallback: bool) -> String {
         if raw.is_empty() {
             return raw.to_string();
         }
@@ -21861,12 +22183,10 @@ impl CfmlVirtualMachine {
         if is_absolute {
             return raw.to_string();
         }
-        // Resolve against the BASE TEMPLATE dir (the request-level page), not the
-        // currently-executing component — matching CFML `expandPath` and Lucee's
-        // file-BIF behaviour (verified on Lucee 7: `fileRead("./x")` from a CFC in
-        // a subdirectory reads the *webroot* sibling, not the CFC's). Falls back
-        // to `source_file` only when there is no base template.
-        match self
+        // Resolve against the BASE TEMPLATE dir (the request-level page) first —
+        // matching CFML `expandPath` and Lucee (verified on Lucee 7: `fileRead("./x")`
+        // from a CFC in a subdirectory reads the *webroot* sibling when one exists).
+        let base_resolved = match self
             .base_template_path
             .as_ref()
             .or(self.source_file.as_ref())
@@ -21875,7 +22195,30 @@ impl CfmlVirtualMachine {
         {
             Some(dir) => dir.join(raw).to_string_lossy().into_owned(),
             None => raw.to_string(),
+        };
+        // Lucee FALLS BACK to the currently-executing template's OWN directory when
+        // the file is absent at the base template (verified on Lucee 7). Preside's
+        // PasswordStrengthAnalyzer reads `./symbolClasses.json` sitting next to the
+        // CFC exactly this way. Existence-gated so a genuinely-missing read keeps
+        // the base-template path (and its error message); only applied for
+        // read/existing-file BIFs so a brand-new write is never silently
+        // redirected into a component's directory.
+        if allow_current_template_fallback && !self.vfs.exists(&base_resolved) {
+            if let Some(cur_dir) = self
+                .call_stack
+                .last()
+                .map(|f| f.template.as_str())
+                .filter(|t| !t.is_empty())
+                .and_then(|t| std::path::Path::new(t).parent())
+                .filter(|d| !d.as_os_str().is_empty())
+            {
+                let cur_resolved = cur_dir.join(raw).to_string_lossy().into_owned();
+                if self.vfs.exists(&cur_resolved) {
+                    return cur_resolved;
+                }
+            }
         }
+        base_resolved
     }
 
     /// If a leading-slash virtual path matches an application mapping
@@ -21947,7 +22290,18 @@ impl CfmlVirtualMachine {
         for &i in indices {
             if let Some(CfmlValue::String(s)) = args.get(i) {
                 let cur = s.as_str();
-                let resolved = self.resolve_template_relative(cur);
+                // Allow the current-template (CFC dir) fallback for every op that
+                // references an EXISTING path, but not for a brand-new write/create
+                // target — there the file is expected not to exist yet, so the
+                // existence-gated fallback must not divert it into a component's
+                // directory. For copy/move, index 0 is the (existing) source and
+                // index 1 is the (possibly-new) destination.
+                let allow_fallback = match name_lower {
+                    "filewrite" | "filewriteline" | "directorycreate" => false,
+                    "filecopy" | "filemove" | "directorycopy" | "directoryrename" => i == 0,
+                    _ => true,
+                };
+                let resolved = self.resolve_template_relative(cur, allow_fallback);
                 if resolved.as_str() != cur {
                     args[i] = CfmlValue::string(resolved);
                 }

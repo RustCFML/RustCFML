@@ -1233,6 +1233,27 @@ impl CfmlCompiler {
         }
     }
 
+    /// Emit the code for a `break`/`continue` that has no enclosing loop in the
+    /// current function/closure. Lucee treats this as ending the current
+    /// invocation (an `.each`/`map`/`filter` callback keeps iterating with the
+    /// next element), so it compiles to a null `return` — running any enclosing
+    /// finallys first, exactly like a bare `return;`. Emitting an unpatched
+    /// `Jump(0)` instead (the old behavior) looped back to the closure's first
+    /// instruction and spun the CPU forever.
+    fn emit_break_out_of_closure(&mut self, instructions: &mut Vec<BytecodeOp>) {
+        if !self.finally_stack.is_empty() {
+            let saved = std::mem::take(&mut self.finally_stack);
+            for fb in saved.iter().rev() {
+                for s in fb {
+                    self.compile_statement(s, instructions);
+                }
+            }
+            self.finally_stack = saved;
+        }
+        instructions.push(BytecodeOp::Null);
+        instructions.push(BytecodeOp::Return);
+    }
+
     fn compile_statement(&mut self, stmt: &Statement, instructions: &mut Vec<BytecodeOp>) {
         if let Some(line) = Self::stmt_line(stmt) {
             instructions.push(BytecodeOp::LineInfo(line, 0));
@@ -1566,20 +1587,32 @@ impl CfmlCompiler {
                 self.compile_switch(switch_stmt, instructions);
             }
             Statement::Break(_) => {
-                // Push a placeholder jump that will be patched later
-                let idx = instructions.len();
-                instructions.push(BytecodeOp::Jump(0)); // placeholder
                 if let Some(loop_ctx) = self.loop_stack.last_mut() {
+                    // Push a placeholder jump that will be patched to the loop exit.
+                    let idx = instructions.len();
+                    instructions.push(BytecodeOp::Jump(0)); // placeholder
                     loop_ctx.0.push(idx); // break indices
+                } else {
+                    // `break` with NO enclosing loop — e.g. inside an `.each()` /
+                    // closure callback. Lucee ends the current closure invocation
+                    // (iteration continues), so this is a null return, NOT an
+                    // unpatched `Jump(0)` that loops back to the closure start and
+                    // spins forever (Preside admin Layout.localePicker did exactly
+                    // this: `locales.each(function(l){ if(...) { ...; break; } })`).
+                    self.emit_break_out_of_closure(instructions);
                 }
             }
             Statement::Continue(_) => {
-                let idx = instructions.len();
-                instructions.push(BytecodeOp::Jump(0)); // placeholder
                 // `continue` targets the enclosing LOOP, not a `switch` it sits
                 // inside (a switch has no loop semantics). Skip switch frames.
                 if let Some(loop_ctx) = self.loop_stack.iter_mut().rev().find(|c| c.2) {
+                    let idx = instructions.len();
+                    instructions.push(BytecodeOp::Jump(0)); // placeholder
                     loop_ctx.1.push(idx); // continue indices
+                } else {
+                    // `continue` with no enclosing loop behaves like `break` here:
+                    // end the current closure invocation rather than jump-to-0.
+                    self.emit_break_out_of_closure(instructions);
                 }
             }
             Statement::Try(try_stmt) => {

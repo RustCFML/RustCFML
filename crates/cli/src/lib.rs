@@ -1819,7 +1819,7 @@ async fn handle_request(
     let url = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
 
     // Extract headers as Vec<(String, String)>
-    let headers: Vec<(String, String)> = parts.headers.iter()
+    let mut headers: Vec<(String, String)> = parts.headers.iter()
         .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or("").to_string()))
         .collect();
 
@@ -1880,6 +1880,15 @@ async fn handle_request(
     // Apply URL rewrite rules before file resolution
     let mut path = raw_path.to_string();
     let mut query_string = original_qs.to_string();
+    // When a Forward rewrite maps the request onto a front controller (e.g.
+    // Preside/ColdBox `/admin/` → `/index.cfm`), the original URI must still be
+    // discoverable by the app's SES router. On Lucee behind Tuckey that arrives
+    // via the servlet forward attributes / `X-Original-URL`; RustCFML has no
+    // servlet layer, so we surface the original URI as an `X-Original-URL`
+    // request header (Preside's `pathInfoProvider` reads it first). Without this
+    // the forwarded path is lost — `cgi.path_info` becomes "/" — and every deep
+    // URL (the whole admin) mis-routes to the site homepage.
+    let mut forward_original_uri: Option<String> = None;
     if !state.rewrite_rules.is_empty() {
         let mut header_map = HashMap::new();
         for (name, value) in &headers {
@@ -1921,9 +1930,28 @@ async fn handle_request(
                     } else {
                         path = result.new_path;
                     }
+                    // A forward that changed the executed path onto a front
+                    // controller: remember the original request URI (path +
+                    // original query string) so the app's SES router can recover
+                    // it. Only when the path actually changed — a no-op forward
+                    // (path unchanged) leaves normal path_info handling intact.
+                    if path != raw_path {
+                        forward_original_uri = Some(if original_qs.is_empty() {
+                            raw_path.to_string()
+                        } else {
+                            format!("{}?{}", raw_path, original_qs)
+                        });
+                    }
                 }
             }
         }
+    }
+
+    // Surface the pre-rewrite URI as `X-Original-URL` (see note above). Replace
+    // any client-supplied value so it cannot spoof the router's view of the URL.
+    if let Some(ref original_uri) = forward_original_uri {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-original-url"));
+        headers.push(("X-Original-URL".to_string(), original_uri.clone()));
     }
 
     // Resolve file path from URL (memoized in production mode)
