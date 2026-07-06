@@ -3841,13 +3841,14 @@ impl CfmlVirtualMachine {
                     arguments_map.insert(param_name.clone(), value);
                 }
                 None => {
-                    // Omitted. Pre-seed Null only so the default preamble's
-                    // LoadLocal/IsNull check works; it then fills the real
-                    // default into both the local and the arguments key. A param
-                    // with no default stays absent from `arguments` entirely.
-                    if has_default {
-                        locals.insert(param_name.clone(), CfmlValue::Null);
-                    }
+                    // Omitted. Do NOT pre-seed the local: the default preamble
+                    // detects omission via JumpIfArgPresent (the `arguments`
+                    // scope lacks this key) and then fills the real default into
+                    // both the local and the arguments key. Pre-seeding a Null
+                    // here used to clobber an inherited same-named enclosing
+                    // variable, so a `function f(x = x)` default read its own
+                    // empty slot as Null instead of the outer `x` (GitHub #240).
+                    let _ = has_default;
                 }
             }
         }
@@ -8624,6 +8625,22 @@ impl CfmlVirtualMachine {
                         if !matches!(val, CfmlValue::Null) {
                             ip = *target;
                         }
+                    }
+                }
+
+                BytecodeOp::JumpIfArgPresent(name, target) => {
+                    // Default-argument preamble: skip the default when the caller
+                    // actually supplied this param — i.e. its key already lives in
+                    // this frame's `arguments` scope. Consults ONLY the arguments
+                    // scope, never the enclosing scope, so an omitted param whose
+                    // default reads a same-named outer variable is not shadowed by
+                    // its own (absent) slot (GitHub #240). No stack traffic.
+                    let supplied = matches!(
+                        locals.get(ARGUMENTS_SCOPE_KEY),
+                        Some(CfmlValue::Struct(a)) if a.contains_key_ci(name)
+                    );
+                    if supplied {
+                        ip = *target;
                     }
                 }
 
@@ -25345,6 +25362,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         // Null
         BytecodeOp::IsNull => (1, 1),
         BytecodeOp::JumpIfNotNull(_) => (1, 1), // pops, pushes back if not null
+        BytecodeOp::JumpIfArgPresent(_, _) => (0, 0), // pure control flow, no stack traffic
         // Output
         BytecodeOp::Print => (0, 1),
         BytecodeOp::Halt => (0, 0),

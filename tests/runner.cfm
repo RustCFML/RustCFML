@@ -89,6 +89,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_arrow_functions.cfm">
 <cf_runtest file="core/test_comma_less_params.cfm">
 <cf_runtest file="core/test_required_param_with_default.cfm">
+<cf_runtest file="core/test_self_named_default_arg.cfm">
 <cf_runtest file="core/test_member_index_incdec.cfm">
 <cf_runtest file="core/test_member_tostring.cfm">
 <cf_runtest file="core/test_getclass_and_image.cfm">

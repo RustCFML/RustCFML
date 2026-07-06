@@ -453,6 +453,14 @@ pub enum BytecodeOp {
     IsNull,                // Pop value, push bool (true if Null)
     JumpIfNotNull(usize),  // Pop value, jump if not null (pushes value back)
 
+    // Default-argument preamble: jump to `target` (skip the default) when the
+    // named param WAS supplied by the caller — i.e. the current frame's
+    // `arguments` scope already contains that key. Unlike `LoadLocal + IsNull`,
+    // this never consults the enclosing scope, so an omitted param whose default
+    // expression reads a same-named outer variable (`function f(x = x)`) is not
+    // shadowed by its own not-yet-initialized slot (GitHub #240). No stack traffic.
+    JumpIfArgPresent(String, usize),
+
     // Output
     Print,
     Halt,
@@ -2763,14 +2771,16 @@ impl CfmlCompiler {
         let saved_loops = std::mem::take(&mut self.loop_stack);
 
         // Emit default parameter value preamble:
-        // For each param with a default, if the arg is null, assign the default
-        // and also update the arguments scope
+        // For each param the caller did NOT supply, evaluate its default and seed
+        // both the local and the `arguments` key. Presence is tested against the
+        // `arguments` scope (JumpIfArgPresent) rather than `LoadLocal + IsNull`:
+        // the VM no longer pre-seeds an omitted param as Null, so a default that
+        // references a same-named outer variable (`function f(x = x)`) resolves to
+        // that outer variable instead of the param's own empty slot (GitHub #240).
         for param in &func.params {
             if let Some(ref default_expr) = param.default {
-                func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
-                func_instructions.push(BytecodeOp::IsNull);
                 let jump_idx = func_instructions.len();
-                func_instructions.push(BytecodeOp::JumpIfFalse(0)); // placeholder
+                func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0)); // placeholder
                 // Set the local variable
                 self.compile_expression(default_expr, &mut func_instructions);
                 func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
@@ -2779,7 +2789,8 @@ impl CfmlCompiler {
                 func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
                 func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                 func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
-                func_instructions[jump_idx] = BytecodeOp::JumpIfFalse(func_instructions.len());
+                func_instructions[jump_idx] =
+                    BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
             }
         }
 
