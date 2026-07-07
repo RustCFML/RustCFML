@@ -9501,11 +9501,26 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         _ => "query".to_string(),
     };
 
+    // `maxrows` caps the returned resultset (Lucee/ACF). A negative value is
+    // Lucee's "no limit" sentinel. Applied post-execution so it works uniformly
+    // across every driver (GitHub #251 — was QoQ-only before).
+    let max_rows: Option<usize> = match &options_arg {
+        CfmlValue::Struct(opts) => opts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("maxrows"))
+            .and_then(|(_, v)| {
+                let n = v.as_string().trim().parse::<i64>().ok()?;
+                if n >= 0 { Some(n as usize) } else { None }
+            }),
+        _ => None,
+    };
+
     if let Some(driver) = dynamic_driver {
-        return driver.execute(&sql, &params_arg, &return_type);
+        let r = driver.execute(&sql, &params_arg, &return_type)?;
+        return Ok(apply_query_maxrows(r, max_rows));
     }
 
-    match parse_datasource(&datasource) {
+    let result = match parse_datasource(&datasource) {
         #[cfg(feature = "sqlite")]
         DbDriver::Sqlite(path) => execute_sqlite(&path, &sql, &params_arg, &return_type),
         #[cfg(feature = "mysql_db")]
@@ -9519,6 +9534,31 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
             "queryExecute: database driver not available for datasource '{}'. Enable the appropriate feature (sqlite, mysql_db, postgres_db, mssql_db).",
             datasource
         ))),
+    }?;
+    Ok(apply_query_maxrows(result, max_rows))
+}
+
+/// Cap a query result to `max_rows` (Lucee `maxrows`), applied after execution
+/// so it is driver-independent. Handles the query and array return shapes; the
+/// struct (keyColumn) shape is left as-is (row order there is not meaningful).
+fn apply_query_maxrows(result: CfmlValue, max_rows: Option<usize>) -> CfmlValue {
+    let Some(n) = max_rows else { return result; };
+    match result {
+        CfmlValue::Query(q) => {
+            q.with_write(|data| {
+                if data.row_count() > n {
+                    for col in data.data.iter_mut() {
+                        std::sync::Arc::make_mut(col).truncate(n);
+                    }
+                }
+            });
+            CfmlValue::Query(q)
+        }
+        CfmlValue::Array(a) => {
+            a.with_write(|v| v.truncate(n));
+            CfmlValue::Array(a)
+        }
+        other => other,
     }
 }
 
@@ -9641,6 +9681,54 @@ fn rewrite_mysql_system_vars(sql: &str) -> String {
 /// mismatch errored at bind time ("Wrong number of parameters passed to query.
 /// Got 4, needed 3", hit by Wheels' DataChannel lastEventId poll). Rewriting to
 /// `?` makes each occurrence its own positional slot bound to the same value.
+/// Expand a named cfqueryparam-style value into the bind values it produces,
+/// honouring `list=true` (split on `separator`, default `,`). A `null=true`
+/// param yields a single NULL; a non-list param yields exactly one value.
+/// Mirrors the MySQL path's expand_cfqueryparam_values; SQLite is dynamically
+/// typed so no cfsqltype coercion is applied to the elements (GitHub #251).
+#[cfg(feature = "sqlite")]
+fn expand_sqlite_param_values(v: &CfmlValue) -> Vec<CfmlValue> {
+    if let CfmlValue::Struct(s) = v {
+        let has_value_key = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+        if has_value_key {
+            let flag = |name: &str| {
+                s.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, val)| match val {
+                        CfmlValue::Bool(b) => b,
+                        CfmlValue::String(st) => {
+                            st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes")
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            };
+            if flag("null") {
+                return vec![CfmlValue::Null];
+            }
+            let value = s
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("value"))
+                .map(|(_, val)| val.clone())
+                .unwrap_or(CfmlValue::Null);
+            if flag("list") {
+                let separator = s
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
+                    .map(|(_, val)| val.as_string())
+                    .unwrap_or_else(|| ",".to_string());
+                return value
+                    .as_string()
+                    .split(&*separator)
+                    .map(|part| CfmlValue::string(part.trim().to_string()))
+                    .collect();
+            }
+            return vec![value];
+        }
+    }
+    vec![cfqueryparam_unwrap(v)]
+}
+
 #[cfg(feature = "sqlite")]
 fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec<rusqlite::types::Value>), CfmlError> {
     match params_arg {
@@ -9669,16 +9757,31 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec
                             .map(|(_, v)| v)
                             .unwrap_or(CfmlValue::Null);
                         // Named params may carry a cfqueryparam-style struct
-                        // ({value, cfsqltype, null, ...}). Unwrap to the bind
-                        // value (or NULL when null=true) before driver binding,
-                        // matching Lucee. Positional arrays are already
+                        // ({value, cfsqltype, null, list, ...}). Expand honouring
+                        // `list=true` (split on `separator`, default `,`) so
+                        // `IN (:ids)` becomes `IN (?,?,…)` — a list param was
+                        // otherwise bound as ONE comma-joined literal and matched
+                        // nothing (GitHub #251). Non-list params yield one value
+                        // (NULL when null=true). Positional arrays are already
                         // normalized by normalize_query_params() upstream.
-                        let val = cfqueryparam_unwrap(&raw);
-                        result.push(cfml_to_sqlite(&val));
-                        // Flush literal text before the placeholder, then emit `?`.
+                        let expanded = expand_sqlite_param_values(&raw);
+                        // Flush literal text before the placeholder(s).
                         // (Slice boundaries are ASCII positions → UTF-8 safe.)
                         out_sql.push_str(&sql[seg_start..i]);
-                        out_sql.push('?');
+                        if expanded.is_empty() {
+                            // An empty list still needs a placeholder so `IN (?)`
+                            // stays valid SQL; bind NULL (matches nothing).
+                            out_sql.push('?');
+                            result.push(rusqlite::types::Value::Null);
+                        } else {
+                            for (j, val) in expanded.iter().enumerate() {
+                                if j > 0 {
+                                    out_sql.push(',');
+                                }
+                                out_sql.push('?');
+                                result.push(cfml_to_sqlite(val));
+                            }
+                        }
                         i = end;
                         seg_start = end;
                         continue;
