@@ -3044,6 +3044,20 @@ impl CfmlVirtualMachine {
             }
             exc.insert("stackTrace".to_string(), CfmlValue::string(st));
         }
+        // Guaranteed standard cfcatch members (Lucee/ACF/BoxLang): every catch
+        // object carries `errorCode` and `extendedInfo` — empty string when unset,
+        // never absent. throw()-created exceptions already set them (guarded below,
+        // so their values are preserved); engine-raised errors previously omitted
+        // both, so a handler reading `e.extendedInfo`/`e.errorCode` unguarded threw
+        // a secondary "Variable X is undefined" (post-v0.408), masking the real
+        // error and aborting sibling TestBox specs (GitHub #250). Centralised here
+        // alongside stackTrace so every exception struct carries the full set.
+        if !exc.keys().any(|k| k.eq_ignore_ascii_case("errorcode")) {
+            exc.insert("errorCode".to_string(), CfmlValue::string(String::new()));
+        }
+        if !exc.keys().any(|k| k.eq_ignore_ascii_case("extendedinfo")) {
+            exc.insert("extendedInfo".to_string(), CfmlValue::string(String::new()));
+        }
         if exc.keys().any(|k| k.eq_ignore_ascii_case("rootcause")) {
             return;
         }

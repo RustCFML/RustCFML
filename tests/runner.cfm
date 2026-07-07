@@ -26,6 +26,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_boolean_literal_equality.cfm">
 <cf_runtest file="core/test_null_return_no_key.cfm">
 <cf_runtest file="core/test_undefined_member_throws.cfm">
+<cf_runtest file="core/test_cfcatch_standard_members.cfm">
 <cf_runtest file="core/test_bare_call_shadowing_semantics.cfm">
 <cf_runtest file="core/test_closure_env_leak.cfm">
 <!--- - closure_captures_local_function (PR #198): a closure captures its --->
