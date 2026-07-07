@@ -19,7 +19,7 @@ default = ["http", "database", "xml", "security", "smtp", "html", "zip_support",
 # native. Default features of `image` are all pure-Rust codecs (png/jpeg/gif/
 # bmp/tiff/webp/ico/...); AVIF/HEIC (which need C libs) stay OFF so the wasm
 # and demo builds keep working.
-image_support = ["dep:image"]
+image_support = ["dep:image", "dep:imageproc", "dep:ab_glyph", "dep:kamadak-exif"]
 security = ["rand", "bcrypt", "scrypt", "argon2", "pbkdf2"]
 yaml = ["dep:serde_yaml"]
 jsonschema = ["dep:jsonschema"]
@@ -87,6 +87,15 @@ quick-xml = { version = "0.36", optional = true }
 # left ON — all default codecs are pure-Rust and build for wasm32. Do NOT enable
 # `avif`/`avif-native`/`hdr`-via-C: those pull C deps and break the wasm build.
 image = { version = "0.25", optional = true }
+# Tier 2/3 drawing, filters and geometric transforms. `default-features = false`
+# drops imageproc's `rayon` feature (threads → not wasm32-safe); we only need the
+# single-threaded drawing/filter/transform routines, which are pure-Rust.
+imageproc = { version = "0.27", optional = true, default-features = false, features = ["text"] }
+# Font rasterization for imageDrawText / cfimage captcha. Pure-Rust, wasm-safe.
+ab_glyph = { version = "0.2", optional = true }
+# EXIF metadata reader (imageGetEXIFMetadata/Tag). Pure-Rust, wasm-safe. IPTC is
+# hand-parsed from the JPEG APP13 segment (no maintained pure-Rust IPTC crate).
+kamadak-exif = { version = "0.6", optional = true }
 scraper = { version = "0.22", optional = true }
 ego-tree = { version = "0.10", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }

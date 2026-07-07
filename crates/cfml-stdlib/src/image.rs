@@ -20,9 +20,71 @@
 use crate::builtins::{base64_decode_bytes, base64_encode_bytes};
 use cfml_common::dynamic::{CfmlNative, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use std::io::Cursor;
 use std::sync::{Arc, RwLock};
+
+// Tier 2/3 drawing / transform / filter helpers, all from the pure-Rust
+// `imageproc` crate.
+use imageproc::drawing::{
+    draw_antialiased_line_segment_mut, draw_cubic_bezier_curve_mut, draw_filled_ellipse_mut,
+    draw_filled_rect_mut, draw_hollow_ellipse_mut, draw_hollow_rect_mut, draw_line_segment_mut,
+    draw_polygon_mut, draw_text_mut, Blend, Canvas,
+};
+use imageproc::filter::gaussian_blur_f32;
+use imageproc::pixelops::interpolate;
+use imageproc::geometric_transformations::{
+    rotate_about_center_no_crop, warp, Border, Interpolation, Projection,
+};
+use imageproc::point::Point;
+use imageproc::rect::Rect;
+
+/// The bundled default font used by `imageDrawText` / captcha when the caller
+/// doesn't (can't) supply one. DejaVu Sans — public-domain-derived Bitstream
+/// Vera license (see assets/fonts/LICENSE.DejaVu.txt), permits redistribution.
+const DEFAULT_FONT: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+
+/// Persistent drawing context — the stateful "graphics" that CFML's
+/// `imageSetDrawing*` functions configure and the `imageDraw*` primitives
+/// consume. Mirrors the Java2D `Graphics2D` state Lucee/ACF keep on the image.
+#[derive(Debug, Clone)]
+pub struct DrawingState {
+    /// Foreground colour used by the draw primitives (RGB; alpha comes from
+    /// `alpha` below so `imageSetDrawingTransparency` composes with it).
+    color: [u8; 3],
+    /// Background colour used by `imageClearRect` / bevel highlight.
+    background: [u8; 3],
+    /// Alpha applied to every drawn pixel (255 = opaque). Set via
+    /// `imageSetDrawingTransparency(percent)` where percent 0 = opaque.
+    alpha: u8,
+    /// Stroke width in pixels for the outline primitives.
+    stroke_width: f32,
+    /// Antialias line/curve primitives when true.
+    antialias: bool,
+    /// Java2D XOR paint mode (approximated — see docs/known-issues.md §18).
+    xor_mode: bool,
+}
+
+impl Default for DrawingState {
+    fn default() -> Self {
+        DrawingState {
+            color: [0, 0, 0],
+            background: [255, 255, 255],
+            alpha: 255,
+            stroke_width: 1.0,
+            antialias: false,
+            xor_mode: false,
+        }
+    }
+}
+
+impl DrawingState {
+    /// The current drawing colour as an RGBA pixel, folding in the alpha set by
+    /// `imageSetDrawingTransparency`.
+    fn rgba(&self) -> image::Rgba<u8> {
+        image::Rgba([self.color[0], self.color[1], self.color[2], self.alpha])
+    }
+}
 
 /// A live, mutable CFML image object.
 #[derive(Debug, Clone)]
@@ -35,11 +97,24 @@ pub struct CfmlImage {
     /// The format the image was read as (drives the default `getBlob`/`write`
     /// encoding when no explicit format/extension is given).
     format: ImageFormat,
+    /// Persistent drawing context (Tier 2). Reset to defaults on construction.
+    draw: DrawingState,
+    /// Original encoded bytes, when known. EXIF/IPTC metadata lives in the
+    /// container (JPEG/TIFF), not the decoded pixels, so `imageGetEXIFMetadata`
+    /// re-parses these. `None` for in-memory (`imageNew`-created) images; disk
+    /// reads fall back to re-reading `source`.
+    raw: Option<Vec<u8>>,
 }
 
 impl CfmlImage {
     fn new(img: DynamicImage, source: String, format: ImageFormat) -> Self {
-        CfmlImage { img, source, format }
+        CfmlImage { img, source, format, draw: DrawingState::default(), raw: None }
+    }
+
+    /// Attach the original encoded bytes (for later EXIF/IPTC parsing).
+    fn with_raw(mut self, bytes: Vec<u8>) -> Self {
+        self.raw = Some(bytes);
+        self
     }
 
     /// Wrap in the shared `NativeObject` handle used everywhere images flow
@@ -84,6 +159,59 @@ impl CfmlNative for CfmlImage {
                 self.flip(&arg_str(a, 0, "vertical"))?;
                 Ok(CfmlValue::Null)
             }
+
+            // ---- Tier 3: filters -------------------------------------------
+            "blur" => { self.blur(a)?; Ok(CfmlValue::Null) }
+            "sharpen" => { self.sharpen(a)?; Ok(CfmlValue::Null) }
+            "negative" => { self.negative(); Ok(CfmlValue::Null) }
+            "grayscale" => { self.grayscale(); Ok(CfmlValue::Null) }
+            "makecolortransparent" => { self.make_color_transparent(a)?; Ok(CfmlValue::Null) }
+            "maketranslucent" => { self.make_translucent(a)?; Ok(CfmlValue::Null) }
+
+            // ---- Tier 3: geometric transforms ------------------------------
+            "translate" | "translatedrawingaxis" => { self.translate(a)?; Ok(CfmlValue::Null) }
+            "shear" | "sheardrawingaxis" => { self.shear(a)?; Ok(CfmlValue::Null) }
+            "rotatedrawingaxis" => { self.rotate(a)?; Ok(CfmlValue::Null) }
+
+            // ---- Tier 2: drawing state -------------------------------------
+            "setdrawingcolor" => { self.draw.color = arg_color(a, 0)?; Ok(CfmlValue::Null) }
+            "setbackgroundcolor" => { self.draw.background = arg_color(a, 0)?; Ok(CfmlValue::Null) }
+            "setdrawingstroke" => { self.set_stroke(a); Ok(CfmlValue::Null) }
+            "setantialiasing" => { self.draw.antialias = arg_on(a, 0, true); Ok(CfmlValue::Null) }
+            "setdrawingtransparency" => { self.set_transparency(a); Ok(CfmlValue::Null) }
+            "xordrawingmode" => { self.draw.xor_mode = arg_on(a, 0, true); Ok(CfmlValue::Null) }
+
+            // ---- Tier 2: drawing primitives --------------------------------
+            "drawline" => { self.draw_line(a)?; Ok(CfmlValue::Null) }
+            "drawlines" => { self.draw_lines(a)?; Ok(CfmlValue::Null) }
+            "drawpoint" => { self.draw_point(a)?; Ok(CfmlValue::Null) }
+            "drawrect" => { self.draw_rect(a)?; Ok(CfmlValue::Null) }
+            "drawroundrect" => { self.draw_round_rect(a)?; Ok(CfmlValue::Null) }
+            "drawbeveledrect" => { self.draw_beveled_rect(a)?; Ok(CfmlValue::Null) }
+            "drawoval" => { self.draw_oval(a)?; Ok(CfmlValue::Null) }
+            "drawarc" => { self.draw_arc(a)?; Ok(CfmlValue::Null) }
+            "drawcubiccurve" => { self.draw_cubic_curve(a)?; Ok(CfmlValue::Null) }
+            "drawquadraticcurve" => { self.draw_quadratic_curve(a)?; Ok(CfmlValue::Null) }
+            "drawtext" => { self.draw_text(a)?; Ok(CfmlValue::Null) }
+            "clearrect" => { self.clear_rect(a)?; Ok(CfmlValue::Null) }
+
+            // ---- Tier 2: compositing ---------------------------------------
+            "drawimage" | "paste" => { self.paste(a)?; Ok(CfmlValue::Null) }
+            "overlay" => { self.overlay(a)?; Ok(CfmlValue::Null) }
+            "copy" => { self.copy_region(a)?; Ok(CfmlValue::Null) }
+            "addborder" => { self.add_border(a)?; Ok(CfmlValue::Null) }
+
+            // ---- Tier 3: metadata ------------------------------------------
+            "getexifmetadata" => self.exif_metadata(),
+            "getexiftag" => self.exif_tag(&arg_str(a, 0, "")),
+            "getiptcmetadata" => self.iptc_metadata(),
+            "getiptctag" => self.iptc_tag(&arg_str(a, 0, "")),
+            "getbufferedimage" => Err(CfmlError::runtime(
+                "imageGetBufferedImage returns a java.awt.BufferedImage, which has no equivalent \
+                 in this engine (see docs/known-issues.md §18)"
+                    .to_string(),
+            )),
+
             "getblob" => self.get_blob(a.first()),
             "write" => self.write(a),
             "writebase64" => self.write_base64(a),
@@ -148,14 +276,15 @@ pub fn coerce_to_image(v: &CfmlValue) -> CfmlResult {
         }
         CfmlValue::Binary(b) => {
             let (img, format) = decode_bytes(b)?;
-            Ok(CfmlImage::new(img, String::new(), format).into_value())
+            Ok(CfmlImage::new(img, String::new(), format).with_raw(b.clone()).into_value())
         }
         CfmlValue::String(s) => {
             let s = s.as_str();
             // data: URI or something that looks like base64 (no path separators)
             if s.starts_with("data:") {
-                let (img, format) = decode_bytes(&decode_base64_source(s))?;
-                return Ok(CfmlImage::new(img, String::new(), format).into_value());
+                let bytes = decode_base64_source(s);
+                let (img, format) = decode_bytes(&bytes)?;
+                return Ok(CfmlImage::new(img, String::new(), format).with_raw(bytes).into_value());
             }
             read_source_path(s)
         }
@@ -181,7 +310,7 @@ fn read_source_path(path: &str) -> CfmlResult {
     let source = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| path.to_string());
-    Ok(CfmlImage::new(img, source, format).into_value())
+    Ok(CfmlImage::new(img, source, format).with_raw(bytes).into_value())
 }
 
 #[cfg(feature = "http")]
@@ -228,13 +357,14 @@ pub fn fn_image_read(args: Vec<CfmlValue>) -> CfmlResult {
         }
         Some(CfmlValue::Binary(b)) => {
             let (img, format) = decode_bytes(b)?;
-            Ok(CfmlImage::new(img, String::new(), format).into_value())
+            Ok(CfmlImage::new(img, String::new(), format).with_raw(b.clone()).into_value())
         }
         Some(CfmlValue::String(s)) => {
             let s = s.as_str();
             if s.starts_with("data:") {
-                let (img, format) = decode_bytes(&decode_base64_source(s))?;
-                Ok(CfmlImage::new(img, String::new(), format).into_value())
+                let bytes = decode_base64_source(s);
+                let (img, format) = decode_bytes(&bytes)?;
+                Ok(CfmlImage::new(img, String::new(), format).with_raw(bytes).into_value())
             } else {
                 read_source_path(s)
             }
@@ -249,8 +379,9 @@ pub fn fn_image_read(args: Vec<CfmlValue>) -> CfmlResult {
 /// string into an image object.
 pub fn fn_image_read_base64(args: Vec<CfmlValue>) -> CfmlResult {
     let s = args.first().map(|v| v.as_string()).unwrap_or_default();
-    let (img, format) = decode_bytes(&decode_base64_source(&s))?;
-    Ok(CfmlImage::new(img, String::new(), format).into_value())
+    let bytes = decode_base64_source(&s);
+    let (img, format) = decode_bytes(&bytes)?;
+    Ok(CfmlImage::new(img, String::new(), format).with_raw(bytes).into_value())
 }
 
 /// `imageNew([source] [, width] [, height] [, imageType="rgb"] [, canvasColor])`
@@ -413,10 +544,64 @@ pub fn fn_cfimage(args: Vec<CfmlValue>) -> CfmlResult {
                 Ok(CfmlValue::Null)
             }
         }
-        "border" | "captcha" => Err(CfmlError::runtime(format!(
-            "cfimage action=[{}] is not implemented in this build (Tier 2 image support pending)",
-            action
-        ))),
+        "border" => {
+            let handle = coerce_to_image(&source)?;
+            let thickness = get("thickness").unwrap_or(CfmlValue::Int(1));
+            let color = get("color").unwrap_or_else(|| CfmlValue::string("black"));
+            dispatch(&handle, "addborder", vec![thickness, color])?;
+            if !destination.is_empty() {
+                dispatch(&handle, "write", vec![CfmlValue::string(destination), CfmlValue::Bool(true)])?;
+            }
+            Ok(handle)
+        }
+        "captcha" => {
+            let text = get_s("text");
+            if text.is_empty() {
+                return Err(CfmlError::runtime(
+                    "cfimage action=captcha requires a text attribute".to_string(),
+                ));
+            }
+            let width: u32 = get("width").map(|v| v.as_string()).and_then(|s| s.trim().parse().ok()).unwrap_or(200);
+            let height: u32 = get("height").map(|v| v.as_string()).and_then(|s| s.trim().parse().ok()).unwrap_or(50);
+            let handle = make_blank(width, height, "rgb", "white")?.into_value();
+            // Black text, sized to the canvas height.
+            dispatch(&handle, "setdrawingcolor", vec![CfmlValue::string("black")])?;
+            let size = ((height as f32) * 0.6).max(8.0);
+            let mut attrs = ValueMap::default();
+            attrs.insert("size".into(), CfmlValue::Double(size as f64));
+            let tx = 6i64;
+            let ty = ((height as f32 - size) / 2.0).max(0.0) as i64;
+            dispatch(
+                &handle,
+                "drawtext",
+                vec![
+                    CfmlValue::string(text.clone()),
+                    CfmlValue::Int(tx),
+                    CfmlValue::Int(ty),
+                    CfmlValue::strukt(attrs),
+                ],
+            )?;
+            // A few deterministic noise lines (no RNG dependency), seeded off the
+            // text so different captchas differ.
+            dispatch(&handle, "setdrawingcolor", vec![CfmlValue::string("gray")])?;
+            let seed: u32 = text.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+            for k in 0..4u32 {
+                let s = seed.wrapping_add(k.wrapping_mul(2654435761));
+                let x1 = (s % width) as i64;
+                let y1 = ((s >> 8) % height) as i64;
+                let x2 = ((s >> 16) % width) as i64;
+                let y2 = ((s >> 24) % height) as i64;
+                dispatch(
+                    &handle,
+                    "drawline",
+                    vec![CfmlValue::Int(x1), CfmlValue::Int(y1), CfmlValue::Int(x2), CfmlValue::Int(y2)],
+                )?;
+            }
+            if !destination.is_empty() {
+                dispatch(&handle, "write", vec![CfmlValue::string(destination), CfmlValue::Bool(true)])?;
+            }
+            Ok(handle)
+        }
         other => Err(CfmlError::runtime(format!(
             "cfimage: unknown action [{}]",
             other
@@ -529,9 +714,10 @@ impl CfmlImage {
 
     /// rotate([x, y,] angle [, interpolation]).
     ///
-    /// Only quarter-turn angles (multiples of 90°) are supported without the
-    /// drawing tier; arbitrary angles need `imageproc`, which is not built in
-    /// this tier. A clear error beats a silently-wrong result.
+    /// Quarter-turns (multiples of 90°) use the lossless `image` fast paths;
+    /// any other angle is rendered with `imageproc`'s projective rotation about
+    /// the centre, growing the canvas to fit (matching Lucee/ACF, which enlarge
+    /// the drawing surface rather than clipping the corners).
     fn rotate(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
         // Lucee's signature is rotate(x, y, angle, interpolation) but the common
         // form is rotate(angle). Detect: if exactly one numeric arg, it's angle.
@@ -543,15 +729,23 @@ impl CfmlImage {
         };
         let norm = ((angle % 360.0) + 360.0) % 360.0;
         self.img = match norm as i64 {
-            0 => return Ok(()),
-            90 => self.img.rotate90(),
-            180 => self.img.rotate180(),
-            270 => self.img.rotate270(),
+            _ if norm == 0.0 => return Ok(()),
+            90 if norm == 90.0 => self.img.rotate90(),
+            180 if norm == 180.0 => self.img.rotate180(),
+            270 if norm == 270.0 => self.img.rotate270(),
             _ => {
-                return Err(CfmlError::runtime(format!(
-                    "imageRotate currently supports only multiples of 90 degrees (got {}); arbitrary-angle rotation requires the drawing feature",
-                    angle
-                )));
+                // Clockwise about centre; theta in radians. Uncovered corners
+                // become fully-transparent pixels.
+                let rgba = self.img.to_rgba8();
+                let theta = norm.to_radians() as f32;
+                let interp = interp_kind(&arg_str(a, if a.len() == 1 { 1 } else { 3 }, "bilinear"));
+                let out = rotate_about_center_no_crop(
+                    &rgba,
+                    theta,
+                    interp,
+                    Border::Constant(Rgba([0, 0, 0, 0])),
+                );
+                DynamicImage::ImageRgba8(out)
             }
         };
         Ok(())
@@ -576,6 +770,652 @@ impl CfmlImage {
             }
         };
         Ok(())
+    }
+
+    // =======================================================================
+    // Tier 2/3 — filters, transforms, drawing, compositing, metadata.
+    //
+    // Drawing runs against an RGBA canvas wrapped in imageproc's `Blend`, so a
+    // drawn colour's alpha (from `imageSetDrawingTransparency`) composites over
+    // the existing pixels. Outline stroke width is approximated by stamping the
+    // primitive over a small disc of offsets. Pixel-exact parity with Lucee's
+    // Java2D renderer is not attempted; region/colour parity is (see
+    // docs/known-issues.md §18).
+    // =======================================================================
+
+    /// Draw against an alpha-blending RGBA canvas, then store the result back.
+    fn with_canvas<F: FnOnce(&mut Blend<RgbaImage>)>(&mut self, f: F) {
+        let mut canvas = Blend(self.img.to_rgba8());
+        f(&mut canvas);
+        self.img = DynamicImage::ImageRgba8(canvas.0);
+    }
+
+    /// Offsets used to thicken an outline to the current stroke width.
+    fn stroke_offsets(&self) -> Vec<(f32, f32)> {
+        let r = ((self.draw.stroke_width.max(1.0) - 1.0) / 2.0).round() as i32;
+        if r <= 0 {
+            return vec![(0.0, 0.0)];
+        }
+        let mut v = Vec::new();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy <= r * r {
+                    v.push((dx as f32, dy as f32));
+                }
+            }
+        }
+        v
+    }
+
+    // ---- filters ----------------------------------------------------------
+
+    /// blur(radius) — Gaussian blur; `radius` maps to the blur sigma.
+    fn blur(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let sigma = {
+            let s = arg_str(a, 0, "1");
+            s.trim().parse::<f32>().unwrap_or(1.0).max(0.1)
+        };
+        let rgba = self.img.to_rgba8();
+        self.img = DynamicImage::ImageRgba8(gaussian_blur_f32(&rgba, sigma));
+        Ok(())
+    }
+
+    /// sharpen(gain) — unsharp mask: out = orig + gain·(orig − blurred).
+    fn sharpen(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let gain = arg_str(a, 0, "1").trim().parse::<f32>().unwrap_or(1.0).max(0.0);
+        let orig = self.img.to_rgba8();
+        let blurred = gaussian_blur_f32(&orig, 1.0);
+        let mut out = orig.clone();
+        for (p_out, (p_o, p_b)) in out.pixels_mut().zip(orig.pixels().zip(blurred.pixels())) {
+            for c in 0..3 {
+                let v = p_o[c] as f32 + gain * (p_o[c] as f32 - p_b[c] as f32);
+                p_out[c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            p_out[3] = p_o[3];
+        }
+        self.img = DynamicImage::ImageRgba8(out);
+        Ok(())
+    }
+
+    /// negative() — invert RGB, preserving alpha.
+    fn negative(&mut self) {
+        let mut rgba = self.img.to_rgba8();
+        for p in rgba.pixels_mut() {
+            p[0] = 255 - p[0];
+            p[1] = 255 - p[1];
+            p[2] = 255 - p[2];
+        }
+        self.img = DynamicImage::ImageRgba8(rgba);
+    }
+
+    /// grayscale() — Rec. 601 luma, preserving alpha.
+    fn grayscale(&mut self) {
+        let mut rgba = self.img.to_rgba8();
+        for p in rgba.pixels_mut() {
+            let l = (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            p[0] = l;
+            p[1] = l;
+            p[2] = l;
+        }
+        self.img = DynamicImage::ImageRgba8(rgba);
+    }
+
+    /// makeColorTransparent(color [, tolerance]) — set alpha=0 on pixels whose
+    /// RGB is within `tolerance` (0–255 per channel) of `color`.
+    fn make_color_transparent(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let target = arg_color(a, 0)?;
+        let tol = arg_str(a, 1, "0").trim().parse::<i32>().unwrap_or(0).max(0);
+        let mut rgba = self.img.to_rgba8();
+        for p in rgba.pixels_mut() {
+            if (p[0] as i32 - target[0] as i32).abs() <= tol
+                && (p[1] as i32 - target[1] as i32).abs() <= tol
+                && (p[2] as i32 - target[2] as i32).abs() <= tol
+            {
+                p[3] = 0;
+            }
+        }
+        self.img = DynamicImage::ImageRgba8(rgba);
+        Ok(())
+    }
+
+    /// makeTranslucent(percent) — scale alpha by (1 − percent/100).
+    fn make_translucent(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let pct = arg_str(a, 0, "0").trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 100.0);
+        let factor = 1.0 - pct / 100.0;
+        let mut rgba = self.img.to_rgba8();
+        for p in rgba.pixels_mut() {
+            p[3] = (p[3] as f32 * factor).round().clamp(0.0, 255.0) as u8;
+        }
+        self.img = DynamicImage::ImageRgba8(rgba);
+        Ok(())
+    }
+
+    // ---- geometric transforms --------------------------------------------
+
+    /// translate(x, y [, interpolation]) — shift the image; uncovered area is
+    /// transparent.
+    fn translate(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let tx = int_arg(a.first(), "x")? as i32;
+        let ty = int_arg(a.get(1), "y")? as i32;
+        let rgba = self.img.to_rgba8();
+        let out = imageproc::geometric_transformations::translate(
+            &rgba,
+            (tx, ty),
+            Border::Constant(Rgba([0, 0, 0, 0])),
+        );
+        self.img = DynamicImage::ImageRgba8(out);
+        Ok(())
+    }
+
+    /// shear(shear, direction="horizontal") — affine shear about the origin.
+    fn shear(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let sh = arg_str(a, 0, "0").trim().parse::<f32>().unwrap_or(0.0);
+        let dir = arg_str(a, 1, "horizontal").to_lowercase();
+        let proj = if dir.starts_with('v') {
+            // vertical shear
+            Projection::from_matrix([1.0, 0.0, 0.0, sh, 1.0, 0.0, 0.0, 0.0, 1.0])
+        } else {
+            // horizontal shear
+            Projection::from_matrix([1.0, sh, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+        }
+        .ok_or_else(|| CfmlError::runtime("invalid shear transform".to_string()))?;
+        let rgba = self.img.to_rgba8();
+        let out = warp(&rgba, proj, Interpolation::Bilinear, Border::Constant(Rgba([0, 0, 0, 0])));
+        self.img = DynamicImage::ImageRgba8(out);
+        Ok(())
+    }
+
+    // ---- drawing state ----------------------------------------------------
+
+    /// setDrawingStroke(struct|width) — only the line `width` is honoured.
+    fn set_stroke(&mut self, a: &[CfmlValue]) {
+        let w = match a.first() {
+            Some(CfmlValue::Struct(s)) => s.with_read(|m| {
+                m.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("width"))
+                    .and_then(|(_, v)| v.as_string().trim().parse::<f32>().ok())
+            }),
+            Some(v) => v.as_string().trim().parse::<f32>().ok(),
+            None => None,
+        };
+        self.draw.stroke_width = w.unwrap_or(1.0).max(1.0);
+    }
+
+    /// setDrawingTransparency(percent) — 0 = opaque, 100 = fully transparent.
+    fn set_transparency(&mut self, a: &[CfmlValue]) {
+        let pct = arg_str(a, 0, "0").trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 100.0);
+        self.draw.alpha = ((1.0 - pct / 100.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+
+    // ---- drawing primitives ----------------------------------------------
+
+    fn draw_line(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x1, y1) = (f32_at(a, 0), f32_at(a, 1));
+        let (x2, y2) = (f32_at(a, 2), f32_at(a, 3));
+        let color = self.draw.rgba();
+        let aa = self.draw.antialias;
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            for (dx, dy) in &offs {
+                stamp_line(c, (x1 + dx, y1 + dy), (x2 + dx, y2 + dy), color, aa);
+            }
+        });
+        Ok(())
+    }
+
+    /// drawLines(xcoords, ycoords [, isPolygon=false] [, filled=false]).
+    fn draw_lines(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let xs = coord_list(a.first())?;
+        let ys = coord_list(a.get(1))?;
+        let n = xs.len().min(ys.len());
+        if n < 2 {
+            return Err(CfmlError::runtime(
+                "imageDrawLines requires at least two coordinate pairs".to_string(),
+            ));
+        }
+        let is_polygon = a.get(2).map(|v| v.is_true()).unwrap_or(false);
+        let filled = a.get(3).map(|v| v.is_true()).unwrap_or(false);
+        let pts: Vec<(f32, f32)> = (0..n).map(|i| (xs[i], ys[i])).collect();
+        let color = self.draw.rgba();
+        let aa = self.draw.antialias;
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            if filled && is_polygon {
+                let poly: Vec<Point<i32>> =
+                    pts.iter().map(|(x, y)| Point::new(*x as i32, *y as i32)).collect();
+                // imageproc requires an open polygon (first != last).
+                let poly = dedup_closing(poly);
+                if poly.len() >= 3 {
+                    draw_polygon_mut(c, &poly, color);
+                }
+                return;
+            }
+            for (dx, dy) in &offs {
+                for w in pts.windows(2) {
+                    stamp_line(c, (w[0].0 + dx, w[0].1 + dy), (w[1].0 + dx, w[1].1 + dy), color, aa);
+                }
+                if is_polygon {
+                    let (a0, b0) = (pts[n - 1], pts[0]);
+                    stamp_line(c, (a0.0 + dx, a0.1 + dy), (b0.0 + dx, b0.1 + dy), color, aa);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn draw_point(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (int_arg(a.first(), "x")? as i32, int_arg(a.get(1), "y")? as i32);
+        let color = self.draw.rgba();
+        let r = ((self.draw.stroke_width.max(1.0)) / 2.0).round() as i32;
+        let (w, h) = (self.img.width() as i32, self.img.height() as i32);
+        self.with_canvas(|c| {
+            if r <= 0 {
+                if x >= 0 && y >= 0 && x < w && y < h {
+                    c.draw_pixel(x as u32, y as u32, color);
+                }
+            } else {
+                draw_filled_ellipse_mut(c, (x, y), r, r, color);
+            }
+        });
+        Ok(())
+    }
+
+    fn draw_rect(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (int_arg(a.first(), "x")? as i32, int_arg(a.get(1), "y")? as i32);
+        let (w, h) = (int_arg(a.get(2), "width")? as u32, int_arg(a.get(3), "height")? as u32);
+        let filled = a.get(4).map(|v| v.is_true()).unwrap_or(false);
+        let color = self.draw.rgba();
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            let rect = Rect::at(x, y).of_size(w.max(1), h.max(1));
+            if filled {
+                draw_filled_rect_mut(c, rect, color);
+            } else {
+                for (dx, dy) in &offs {
+                    draw_hollow_rect_mut(
+                        c,
+                        Rect::at(x + *dx as i32, y + *dy as i32).of_size(w.max(1), h.max(1)),
+                        color,
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// drawRoundRect(x, y, width, height, arcWidth, arcHeight [, filled=false]).
+    fn draw_round_rect(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (f32_at(a, 0), f32_at(a, 1));
+        let (w, h) = (f32_at(a, 2).max(1.0), f32_at(a, 3).max(1.0));
+        let rx = (f32_at(a, 4) / 2.0).clamp(0.0, w / 2.0);
+        let ry = (f32_at(a, 5) / 2.0).clamp(0.0, h / 2.0);
+        let filled = a.get(6).map(|v| v.is_true()).unwrap_or(false);
+        let color = self.draw.rgba();
+        let aa = self.draw.antialias;
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            if filled {
+                // Central cross of two rects + four filled corner ellipses.
+                draw_filled_rect_mut(
+                    c,
+                    Rect::at((x + rx) as i32, y as i32).of_size((w - 2.0 * rx).max(1.0) as u32, h as u32),
+                    color,
+                );
+                draw_filled_rect_mut(
+                    c,
+                    Rect::at(x as i32, (y + ry) as i32).of_size(w as u32, (h - 2.0 * ry).max(1.0) as u32),
+                    color,
+                );
+                let corners = [
+                    (x + rx, y + ry),
+                    (x + w - rx, y + ry),
+                    (x + rx, y + h - ry),
+                    (x + w - rx, y + h - ry),
+                ];
+                for (cx, cy) in corners {
+                    draw_filled_ellipse_mut(c, (cx as i32, cy as i32), rx.max(1.0) as i32, ry.max(1.0) as i32, color);
+                }
+            } else {
+                for (dx, dy) in &offs {
+                    let (ox, oy) = (x + dx, y + dy);
+                    // straight edges (inset by the corner radius)
+                    stamp_line(c, (ox + rx, oy), (ox + w - rx, oy), color, aa);
+                    stamp_line(c, (ox + rx, oy + h), (ox + w - rx, oy + h), color, aa);
+                    stamp_line(c, (ox, oy + ry), (ox, oy + h - ry), color, aa);
+                    stamp_line(c, (ox + w, oy + ry), (ox + w, oy + h - ry), color, aa);
+                    // corner quarter-arcs
+                    stamp_arc(c, ox + rx, oy + ry, rx, ry, 180.0, 90.0, color, aa);
+                    stamp_arc(c, ox + w - rx, oy + ry, rx, ry, 270.0, 90.0, color, aa);
+                    stamp_arc(c, ox + w - rx, oy + h - ry, rx, ry, 0.0, 90.0, color, aa);
+                    stamp_arc(c, ox + rx, oy + h - ry, rx, ry, 90.0, 90.0, color, aa);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// drawBeveledRect(x, y, width, height [, raised=true] [, filled=false]).
+    /// Approximates Java2D's 3D bevel: lit top/left, shaded bottom/right.
+    fn draw_beveled_rect(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (int_arg(a.first(), "x")? as i32, int_arg(a.get(1), "y")? as i32);
+        let (w, h) = (int_arg(a.get(2), "width")? as i32, int_arg(a.get(3), "height")? as i32);
+        let raised = a.get(4).map(|v| v.is_true()).unwrap_or(true);
+        let filled = a.get(5).map(|v| v.is_true()).unwrap_or(false);
+        let base = self.draw.color;
+        let a8 = self.draw.alpha;
+        let lighter = Rgba([
+            (base[0] as u16 + 96).min(255) as u8,
+            (base[1] as u16 + 96).min(255) as u8,
+            (base[2] as u16 + 96).min(255) as u8,
+            a8,
+        ]);
+        let darker = Rgba([
+            (base[0] / 2),
+            (base[1] / 2),
+            (base[2] / 2),
+            a8,
+        ]);
+        let (top_left, bottom_right) = if raised { (lighter, darker) } else { (darker, lighter) };
+        let fill = self.draw.rgba();
+        self.with_canvas(|c| {
+            if filled {
+                draw_filled_rect_mut(c, Rect::at(x, y).of_size(w.max(1) as u32, h.max(1) as u32), fill);
+            }
+            // top & left edges
+            stamp_line(c, (x as f32, y as f32), ((x + w) as f32, y as f32), top_left, false);
+            stamp_line(c, (x as f32, y as f32), (x as f32, (y + h) as f32), top_left, false);
+            // bottom & right edges
+            stamp_line(c, (x as f32, (y + h) as f32), ((x + w) as f32, (y + h) as f32), bottom_right, false);
+            stamp_line(c, ((x + w) as f32, y as f32), ((x + w) as f32, (y + h) as f32), bottom_right, false);
+        });
+        Ok(())
+    }
+
+    fn draw_oval(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (f32_at(a, 0), f32_at(a, 1));
+        let (w, h) = (f32_at(a, 2).max(1.0), f32_at(a, 3).max(1.0));
+        let filled = a.get(4).map(|v| v.is_true()).unwrap_or(false);
+        let color = self.draw.rgba();
+        let (cx, cy) = ((x + w / 2.0) as i32, (y + h / 2.0) as i32);
+        let (rw, rh) = ((w / 2.0).max(1.0) as i32, (h / 2.0).max(1.0) as i32);
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            if filled {
+                draw_filled_ellipse_mut(c, (cx, cy), rw, rh, color);
+            } else {
+                for (dx, dy) in &offs {
+                    draw_hollow_ellipse_mut(c, (cx + *dx as i32, cy + *dy as i32), rw, rh, color);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// drawArc(x, y, width, height, startAngle, arcAngle [, filled=false]).
+    fn draw_arc(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (f32_at(a, 0), f32_at(a, 1));
+        let (w, h) = (f32_at(a, 2).max(1.0), f32_at(a, 3).max(1.0));
+        let start = f32_at(a, 4);
+        let sweep = f32_at(a, 5);
+        let filled = a.get(6).map(|v| v.is_true()).unwrap_or(false);
+        let color = self.draw.rgba();
+        let aa = self.draw.antialias;
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        let (rx, ry) = (w / 2.0, h / 2.0);
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            if filled {
+                // pie slice: arc samples + centre, as a filled polygon
+                let mut poly: Vec<Point<i32>> = arc_points(cx, cy, rx, ry, start, sweep)
+                    .into_iter()
+                    .map(|(px, py)| Point::new(px as i32, py as i32))
+                    .collect();
+                poly.push(Point::new(cx as i32, cy as i32));
+                let poly = dedup_closing(poly);
+                if poly.len() >= 3 {
+                    draw_polygon_mut(c, &poly, color);
+                }
+            } else {
+                for (dx, dy) in &offs {
+                    stamp_arc(c, cx + dx, cy + dy, rx, ry, start, sweep, color, aa);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// drawCubicCurve(x1, y1, ctrlx1, ctrly1, ctrlx2, ctrly2, x2, y2).
+    fn draw_cubic_curve(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let start = (f32_at(a, 0), f32_at(a, 1));
+        let ca = (f32_at(a, 2), f32_at(a, 3));
+        let cb = (f32_at(a, 4), f32_at(a, 5));
+        let end = (f32_at(a, 6), f32_at(a, 7));
+        let color = self.draw.rgba();
+        let offs = self.stroke_offsets();
+        self.with_canvas(|c| {
+            for (dx, dy) in &offs {
+                draw_cubic_bezier_curve_mut(
+                    c,
+                    (start.0 + dx, start.1 + dy),
+                    (end.0 + dx, end.1 + dy),
+                    (ca.0 + dx, ca.1 + dy),
+                    (cb.0 + dx, cb.1 + dy),
+                    color,
+                );
+            }
+        });
+        Ok(())
+    }
+
+    /// drawQuadraticCurve(x1, y1, ctrlx, ctrly, x2, y2) — elevated to a cubic.
+    fn draw_quadratic_curve(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x1, y1) = (f32_at(a, 0), f32_at(a, 1));
+        let (cx, cy) = (f32_at(a, 2), f32_at(a, 3));
+        let (x2, y2) = (f32_at(a, 4), f32_at(a, 5));
+        // Quadratic → cubic control points.
+        let ca = (x1 + 2.0 / 3.0 * (cx - x1), y1 + 2.0 / 3.0 * (cy - y1));
+        let cb = (x2 + 2.0 / 3.0 * (cx - x2), y2 + 2.0 / 3.0 * (cy - y2));
+        self.draw_cubic_curve(&[
+            CfmlValue::Double(x1 as f64), CfmlValue::Double(y1 as f64),
+            CfmlValue::Double(ca.0 as f64), CfmlValue::Double(ca.1 as f64),
+            CfmlValue::Double(cb.0 as f64), CfmlValue::Double(cb.1 as f64),
+            CfmlValue::Double(x2 as f64), CfmlValue::Double(y2 as f64),
+        ])
+    }
+
+    /// drawText(string, x, y [, attributeCollection{font,size,style}]).
+    fn draw_text(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        use ab_glyph::{FontRef, PxScale};
+        let text = a.first().map(|v| v.as_string()).unwrap_or_default();
+        let x = int_arg(a.get(1), "x")? as i32;
+        let y = int_arg(a.get(2), "y")? as i32;
+        // Optional attributeCollection: honour `size` (point size). `font`/`style`
+        // fall back to the bundled DejaVu Sans (see docs/known-issues.md §18).
+        let size = match a.get(3) {
+            Some(CfmlValue::Struct(s)) => s.with_read(|m| {
+                m.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("size"))
+                    .and_then(|(_, v)| v.as_string().trim().parse::<f32>().ok())
+            }),
+            _ => None,
+        }
+        .unwrap_or(12.0)
+        .max(1.0);
+        let font = FontRef::try_from_slice(DEFAULT_FONT)
+            .map_err(|e| CfmlError::runtime(format!("bundled font failed to load: {}", e)))?;
+        let scale = PxScale::from(size);
+        let color = self.draw.rgba();
+        self.with_canvas(|c| {
+            draw_text_mut(c, color, x, y, scale, &font, &text);
+        });
+        Ok(())
+    }
+
+    /// clearRect(x, y, width, height) — fill with the background colour.
+    fn clear_rect(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let (x, y) = (int_arg(a.first(), "x")? as i32, int_arg(a.get(1), "y")? as i32);
+        let (w, h) = (int_arg(a.get(2), "width")? as u32, int_arg(a.get(3), "height")? as u32);
+        let bg = self.draw.background;
+        let color = Rgba([bg[0], bg[1], bg[2], 255]);
+        self.with_canvas(|c| {
+            draw_filled_rect_mut(c, Rect::at(x, y).of_size(w.max(1), h.max(1)), color);
+        });
+        Ok(())
+    }
+
+    // ---- compositing ------------------------------------------------------
+
+    /// paste / drawImage(source, x, y) — overlay another image at (x, y).
+    fn paste(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let src = a.first().ok_or_else(|| CfmlError::runtime("imagePaste requires a source image".to_string()))?;
+        let src_rgba = image_rgba_of(src)?;
+        let x = int_arg(a.get(1), "x").unwrap_or(0);
+        let y = int_arg(a.get(2), "y").unwrap_or(0);
+        let mut base = self.img.to_rgba8();
+        image::imageops::overlay(&mut base, &src_rgba, x, y);
+        self.img = DynamicImage::ImageRgba8(base);
+        Ok(())
+    }
+
+    /// overlay(image2 [, rule] [, alpha]) — composite image2 over this image.
+    /// Only the "over" rule is implemented; `alpha` (0–1) scales image2's alpha.
+    fn overlay(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let top = a.first().ok_or_else(|| CfmlError::runtime("imageOverlay requires a second image".to_string()))?;
+        let mut top_rgba = image_rgba_of(top)?;
+        let alpha = arg_str(a, 2, "1").trim().parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
+        if alpha < 1.0 {
+            for p in top_rgba.pixels_mut() {
+                p[3] = (p[3] as f32 * alpha).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let mut base = self.img.to_rgba8();
+        image::imageops::overlay(&mut base, &top_rgba, 0, 0);
+        self.img = DynamicImage::ImageRgba8(base);
+        Ok(())
+    }
+
+    /// copy(x, y, width, height [, dx, dy]) — copy a region to (dx, dy).
+    fn copy_region(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let x = int_arg(a.first(), "x")? as u32;
+        let y = int_arg(a.get(1), "y")? as u32;
+        let w = int_arg(a.get(2), "width")? as u32;
+        let h = int_arg(a.get(3), "height")? as u32;
+        let dx = a.get(4).map(|v| int_arg(Some(v), "dx")).transpose()?.unwrap_or(x as i64);
+        let dy = a.get(5).map(|v| int_arg(Some(v), "dy")).transpose()?.unwrap_or(y as i64);
+        let mut base = self.img.to_rgba8();
+        let region = image::imageops::crop_imm(&base, x, y, w, h).to_image();
+        image::imageops::overlay(&mut base, &region, dx, dy);
+        self.img = DynamicImage::ImageRgba8(base);
+        Ok(())
+    }
+
+    /// addBorder(thickness [, color] [, borderType]) — grow the canvas by
+    /// `thickness` px on every side, filled with `color` (default the drawing
+    /// colour).
+    fn add_border(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
+        let t = int_arg(a.first(), "thickness").unwrap_or(1).max(0) as u32;
+        let color = match a.get(1) {
+            Some(v) if !v.as_string().is_empty() => {
+                let c = parse_color(&v.as_string())?;
+                Rgba(c)
+            }
+            _ => self.draw.rgba(),
+        };
+        let src = self.img.to_rgba8();
+        let (w, h) = (src.width(), src.height());
+        let mut out = RgbaImage::from_pixel(w + 2 * t, h + 2 * t, color);
+        image::imageops::overlay(&mut out, &src, t as i64, t as i64);
+        self.img = DynamicImage::ImageRgba8(out);
+        Ok(())
+    }
+
+    // ---- metadata (Tier 3) ------------------------------------------------
+
+    /// The original encoded bytes: cached `raw`, else a re-read of `source`.
+    fn container_bytes(&self) -> Option<Vec<u8>> {
+        if let Some(b) = &self.raw {
+            return Some(b.clone());
+        }
+        if !self.source.is_empty() {
+            return std::fs::read(&self.source).ok();
+        }
+        None
+    }
+
+    /// getEXIFMetadata() — struct of EXIF tag→value pairs (empty if none).
+    fn exif_metadata(&self) -> CfmlResult {
+        let mut out = ValueMap::default();
+        if let Some(bytes) = self.container_bytes() {
+            let reader = exif::Reader::new();
+            if let Ok(exif) = reader.read_from_container(&mut Cursor::new(&bytes)) {
+                for f in exif.fields() {
+                    out.insert(
+                        f.tag.to_string(),
+                        CfmlValue::string(f.display_value().with_unit(&exif).to_string()),
+                    );
+                }
+            }
+        }
+        Ok(CfmlValue::strukt(out))
+    }
+
+    /// getEXIFTag(name) — a single EXIF tag value, "" if absent.
+    fn exif_tag(&self, name: &str) -> CfmlResult {
+        if let Some(bytes) = self.container_bytes() {
+            let reader = exif::Reader::new();
+            if let Ok(exif) = reader.read_from_container(&mut Cursor::new(&bytes)) {
+                for f in exif.fields() {
+                    if f.tag.to_string().eq_ignore_ascii_case(name) {
+                        return Ok(CfmlValue::string(
+                            f.display_value().with_unit(&exif).to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(CfmlValue::string(""))
+    }
+
+    /// getIPTCMetadata() — struct of IPTC dataset→value pairs, parsed from the
+    /// JPEG APP13 (Photoshop 8BIM / IPTC-NAA) segment. Empty if none.
+    fn iptc_metadata(&self) -> CfmlResult {
+        let mut out = ValueMap::default();
+        if let Some(bytes) = self.container_bytes() {
+            // Group repeated datasets (e.g. keywords) into a comma list, in the
+            // order first seen — mirroring Lucee.
+            let mut order: Vec<String> = Vec::new();
+            let mut acc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+            for (name, value) in parse_iptc(&bytes) {
+                if !acc.contains_key(&name) {
+                    order.push(name.clone());
+                }
+                acc.entry(name).or_default().push(value);
+            }
+            for name in order {
+                if let Some(vals) = acc.get(&name) {
+                    out.insert(name, CfmlValue::string(vals.join(",")));
+                }
+            }
+        }
+        Ok(CfmlValue::strukt(out))
+    }
+
+    /// getIPTCTag(name) — a single IPTC value, "" if absent.
+    fn iptc_tag(&self, name: &str) -> CfmlResult {
+        if let Some(bytes) = self.container_bytes() {
+            let mut collected: Vec<String> = Vec::new();
+            for (k, v) in parse_iptc(&bytes) {
+                if k.eq_ignore_ascii_case(name) {
+                    collected.push(v);
+                }
+            }
+            if !collected.is_empty() {
+                return Ok(CfmlValue::string(collected.join(",")));
+            }
+        }
+        Ok(CfmlValue::string(""))
     }
 
     /// getBlob([format]) — raw encoded bytes.
@@ -854,6 +1694,16 @@ fn interpolation(name: &str) -> image::imageops::FilterType {
     }
 }
 
+/// Map a CFML interpolation name to imageproc's projective `Interpolation`
+/// (used by arbitrary-angle rotate / shear / translate).
+fn interp_kind(name: &str) -> Interpolation {
+    match name.to_lowercase().as_str() {
+        "nearest" | "highestperformance" | "highperformance" | "speed" => Interpolation::Nearest,
+        "bicubic" | "cubic" | "highestquality" | "highquality" => Interpolation::Bicubic,
+        _ => Interpolation::Bilinear,
+    }
+}
+
 fn format_from_name(name: &str) -> Result<ImageFormat, CfmlError> {
     match name.trim().trim_start_matches('.').to_lowercase().as_str() {
         "png" => Ok(ImageFormat::Png),
@@ -899,7 +1749,7 @@ pub fn parse_color(spec: &str) -> Result<[u8; 4], CfmlError> {
         let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
         return Ok([r, g, b, 255]);
     }
-    // Named
+    // Named (extended below with the AWT set used by the drawing tier)
     let named = match s.to_lowercase().as_str() {
         "black" => [0, 0, 0],
         "white" => [255, 255, 255],
@@ -923,3 +1773,319 @@ pub fn parse_color(spec: &str) -> Result<[u8; 4], CfmlError> {
     };
     Ok([named[0], named[1], named[2], 255])
 }
+
+// ===========================================================================
+// Tier 2/3 free helpers
+// ===========================================================================
+
+/// Parse the numeric argument at `idx`, defaulting to 0.
+fn f32_at(a: &[CfmlValue], idx: usize) -> f32 {
+    a.get(idx)
+        .map(|v| v.as_string().trim().parse::<f32>().unwrap_or(0.0))
+        .unwrap_or(0.0)
+}
+
+/// Parse a colour argument (hex / r,g,b / named) at `idx`, dropping alpha.
+fn arg_color(a: &[CfmlValue], idx: usize) -> Result<[u8; 3], CfmlError> {
+    let s = a.get(idx).map(|v| v.as_string()).unwrap_or_default();
+    let c = parse_color(&s)?;
+    Ok([c[0], c[1], c[2]])
+}
+
+/// Parse an on/off flag ("on"/"off"/"yes"/"no"/true/false/1/0).
+fn arg_on(a: &[CfmlValue], idx: usize, default: bool) -> bool {
+    match a.get(idx) {
+        Some(CfmlValue::Bool(b)) => *b,
+        Some(v) => match v.as_string().trim().to_lowercase().as_str() {
+            "on" | "yes" | "true" | "1" => true,
+            "off" | "no" | "false" | "0" => false,
+            "" => default,
+            _ => default,
+        },
+        None => default,
+    }
+}
+
+/// Read a coordinate list — a CFML array of numbers or a comma-delimited string.
+fn coord_list(v: Option<&CfmlValue>) -> Result<Vec<f32>, CfmlError> {
+    match v {
+        Some(CfmlValue::Array(items)) => Ok(items
+            .iter()
+            .map(|x| x.as_string().trim().parse::<f32>().unwrap_or(0.0))
+            .collect()),
+        Some(other) => {
+            let s = other.as_string();
+            if s.trim().is_empty() {
+                return Ok(vec![]);
+            }
+            Ok(s.split(',')
+                .map(|p| p.trim().parse::<f32>().unwrap_or(0.0))
+                .collect())
+        }
+        None => Ok(vec![]),
+    }
+}
+
+/// Drop a trailing point equal to the first (imageproc polygons must be open).
+fn dedup_closing(mut poly: Vec<Point<i32>>) -> Vec<Point<i32>> {
+    while poly.len() >= 2 && poly.first() == poly.last() {
+        poly.pop();
+    }
+    poly
+}
+
+/// Draw one line segment on the blend canvas, antialiased when requested.
+fn stamp_line(
+    c: &mut Blend<RgbaImage>,
+    start: (f32, f32),
+    end: (f32, f32),
+    color: Rgba<u8>,
+    aa: bool,
+) {
+    if aa {
+        // The antialiased routine needs a raw `GenericImage`, not the Blend
+        // canvas wrapper — draw straight onto the inner buffer.
+        draw_antialiased_line_segment_mut(
+            &mut c.0,
+            (start.0.round() as i32, start.1.round() as i32),
+            (end.0.round() as i32, end.1.round() as i32),
+            color,
+            interpolate,
+        );
+    } else {
+        draw_line_segment_mut(c, start, end, color);
+    }
+}
+
+/// Sample an elliptical arc (Java `drawArc` convention: degrees, 0° at 3
+/// o'clock, positive angles counter-clockwise) into a polyline.
+fn arc_points(cx: f32, cy: f32, rx: f32, ry: f32, start_deg: f32, sweep_deg: f32) -> Vec<(f32, f32)> {
+    let steps = ((sweep_deg.abs() / 4.0).ceil() as usize).max(2);
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = start_deg + sweep_deg * (i as f32 / steps as f32);
+        let rad = t.to_radians();
+        // screen y grows downward, so counter-clockwise ⇒ subtract the sine term
+        pts.push((cx + rx * rad.cos(), cy - ry * rad.sin()));
+    }
+    pts
+}
+
+/// Draw an elliptical arc as connected segments.
+fn stamp_arc(
+    c: &mut Blend<RgbaImage>,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    start_deg: f32,
+    sweep_deg: f32,
+    color: Rgba<u8>,
+    aa: bool,
+) {
+    let pts = arc_points(cx, cy, rx, ry, start_deg, sweep_deg);
+    for w in pts.windows(2) {
+        stamp_line(c, w[0], w[1], color, aa);
+    }
+}
+
+/// Coerce any image-ish value (handle / path / binary / base64) to an owned
+/// RGBA buffer, via the shared `getBlob` round-trip (avoids a downcast).
+fn image_rgba_of(v: &CfmlValue) -> Result<RgbaImage, CfmlError> {
+    let blob = dispatch(v, "getblob", vec![CfmlValue::string("png")])?;
+    if let CfmlValue::Binary(bytes) = blob {
+        let (img, _) = decode_bytes(&bytes)?;
+        Ok(img.to_rgba8())
+    } else {
+        Err(CfmlError::runtime(
+            "unable to read the source image for compositing".to_string(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal IPTC (IIM) reader — walks the JPEG APP13 "Photoshop 3.0" 8BIM blocks
+// to the IPTC-NAA (0x0404) resource, then decodes the 0x1C dataset records.
+// Only the common editorial datasets are named; everything else is skipped.
+// ---------------------------------------------------------------------------
+
+/// Map an IPTC record:dataset pair to a Lucee-style human key.
+fn iptc_key(record: u8, dataset: u8) -> Option<&'static str> {
+    match (record, dataset) {
+        (2, 5) => Some("object_name"),      // title
+        (2, 25) => Some("keywords"),
+        (2, 40) => Some("special_instructions"),
+        (2, 55) => Some("date_created"),
+        (2, 80) => Some("by_line"),         // author/creator
+        (2, 85) => Some("by_line_title"),
+        (2, 90) => Some("city"),
+        (2, 95) => Some("province_state"),
+        (2, 101) => Some("country_name"),
+        (2, 105) => Some("headline"),
+        (2, 110) => Some("credit"),
+        (2, 115) => Some("source"),
+        (2, 116) => Some("copyright_notice"),
+        (2, 120) => Some("caption"),        // description
+        (2, 122) => Some("caption_writer"),
+        _ => None,
+    }
+}
+
+/// Parse IPTC datasets from JPEG bytes. Returns (key, value) pairs in file
+/// order. Non-JPEG input, or JPEG without an APP13/IPTC segment, yields none.
+fn parse_iptc(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // JPEG SOI
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return out;
+    }
+    let mut i = 2usize;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            break;
+        }
+        let marker = bytes[i + 1];
+        // Standalone markers (RSTn, SOI/EOI) have no length.
+        if marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        let seg_len = ((bytes[i + 2] as usize) << 8) | bytes[i + 3] as usize;
+        if seg_len < 2 || i + 2 + seg_len > bytes.len() {
+            break;
+        }
+        let payload = &bytes[i + 4..i + 2 + seg_len];
+        if marker == 0xED {
+            // APP13 — look for "Photoshop 3.0\0" then walk 8BIM resources.
+            if let Some(iptc) = extract_iptc_from_app13(payload) {
+                out.extend(parse_iim(iptc));
+            }
+        }
+        // Stop once we reach compressed scan data.
+        if marker == 0xDA {
+            break;
+        }
+        i += 2 + seg_len;
+    }
+    out
+}
+
+/// Locate the IPTC-NAA (0x0404) 8BIM resource inside an APP13 payload.
+fn extract_iptc_from_app13(payload: &[u8]) -> Option<&[u8]> {
+    let sig = b"Photoshop 3.0\0";
+    let start = payload.windows(sig.len()).position(|w| w == sig)? + sig.len();
+    let mut p = start;
+    while p + 12 <= payload.len() {
+        if &payload[p..p + 4] != b"8BIM" {
+            break;
+        }
+        let id = ((payload[p + 4] as u16) << 8) | payload[p + 5] as u16;
+        // Pascal-style name, padded to an even length.
+        let name_len = payload[p + 6] as usize;
+        let mut q = p + 7 + name_len;
+        if (name_len + 1) % 2 != 0 {
+            q += 1; // pad byte
+        }
+        if q + 4 > payload.len() {
+            break;
+        }
+        let size = ((payload[q] as usize) << 24)
+            | ((payload[q + 1] as usize) << 16)
+            | ((payload[q + 2] as usize) << 8)
+            | payload[q + 3] as usize;
+        q += 4;
+        let end = (q + size).min(payload.len());
+        if id == 0x0404 {
+            return Some(&payload[q..end]);
+        }
+        // Data is padded to an even length.
+        p = end + (size % 2);
+    }
+    None
+}
+
+/// Decode IPTC IIM 0x1C dataset records into (key, value) pairs.
+fn parse_iim(data: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 5 <= data.len() {
+        if data[i] != 0x1C {
+            i += 1;
+            continue;
+        }
+        let record = data[i + 1];
+        let dataset = data[i + 2];
+        let len = ((data[i + 3] as usize) << 8) | data[i + 4] as usize;
+        let vstart = i + 5;
+        let vend = (vstart + len).min(data.len());
+        if vstart > data.len() {
+            break;
+        }
+        if let Some(key) = iptc_key(record, dataset) {
+            let value = String::from_utf8_lossy(&data[vstart..vend]).trim().to_string();
+            out.push((key.to_string(), value));
+        }
+        i = vend;
+    }
+    out
+}
+
+// ===========================================================================
+// Function-form wrappers (Tier 2/3). Each locks the shared handle and forwards
+// to `call_method`, so member form and function form share one implementation.
+// ===========================================================================
+
+macro_rules! image_fn {
+    ($name:ident, $method:literal) => {
+        pub fn $name(args: Vec<CfmlValue>) -> CfmlResult {
+            let (first, rest) = split_first(&args)?;
+            dispatch(first, $method, rest)
+        }
+    };
+}
+
+// filters
+image_fn!(fn_image_blur, "blur");
+image_fn!(fn_image_sharpen, "sharpen");
+image_fn!(fn_image_negative, "negative");
+image_fn!(fn_image_grayscale, "grayscale");
+image_fn!(fn_image_make_color_transparent, "makecolortransparent");
+image_fn!(fn_image_make_translucent, "maketranslucent");
+// transforms
+image_fn!(fn_image_translate, "translate");
+image_fn!(fn_image_translate_drawing_axis, "translatedrawingaxis");
+image_fn!(fn_image_shear, "shear");
+image_fn!(fn_image_shear_drawing_axis, "sheardrawingaxis");
+image_fn!(fn_image_rotate_drawing_axis, "rotatedrawingaxis");
+// drawing state
+image_fn!(fn_image_set_drawing_color, "setdrawingcolor");
+image_fn!(fn_image_set_background_color, "setbackgroundcolor");
+image_fn!(fn_image_set_drawing_stroke, "setdrawingstroke");
+image_fn!(fn_image_set_antialiasing, "setantialiasing");
+image_fn!(fn_image_set_drawing_transparency, "setdrawingtransparency");
+image_fn!(fn_image_xor_drawing_mode, "xordrawingmode");
+// primitives
+image_fn!(fn_image_draw_line, "drawline");
+image_fn!(fn_image_draw_lines, "drawlines");
+image_fn!(fn_image_draw_point, "drawpoint");
+image_fn!(fn_image_draw_rect, "drawrect");
+image_fn!(fn_image_draw_round_rect, "drawroundrect");
+image_fn!(fn_image_draw_beveled_rect, "drawbeveledrect");
+image_fn!(fn_image_draw_oval, "drawoval");
+image_fn!(fn_image_draw_arc, "drawarc");
+image_fn!(fn_image_draw_cubic_curve, "drawcubiccurve");
+image_fn!(fn_image_draw_quadratic_curve, "drawquadraticcurve");
+image_fn!(fn_image_draw_text, "drawtext");
+image_fn!(fn_image_clear_rect, "clearrect");
+// compositing
+image_fn!(fn_image_draw_image, "drawimage");
+image_fn!(fn_image_paste, "paste");
+image_fn!(fn_image_overlay, "overlay");
+image_fn!(fn_image_copy, "copy");
+image_fn!(fn_image_add_border, "addborder");
+// metadata
+image_fn!(fn_image_get_exif_metadata, "getexifmetadata");
+image_fn!(fn_image_get_exif_tag, "getexiftag");
+image_fn!(fn_image_get_iptc_metadata, "getiptcmetadata");
+image_fn!(fn_image_get_iptc_tag, "getiptctag");
+image_fn!(fn_image_get_buffered_image, "getbufferedimage");

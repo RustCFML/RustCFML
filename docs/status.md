@@ -101,11 +101,14 @@ RustCFML supports those as a BoxLang-faithful superset — see `docs/known-issue
   names are not provided.
 
 ### Partially Supported
-- **Image functions** — Tier 1 implemented (read/write/resize/scaleToFit/crop/quarter-turn
-  rotate/flip/info/blob/base64 + `<cfimage>` read/write/resize/info/convert/writeToBrowser),
-  backed by the pure-Rust `image` crate (native + wasm). Drawing primitives, filters,
-  free-angle rotation, and EXIF/IPTC metadata are not yet implemented (they throw a clear
-  error). See [known-issues.md §18](known-issues.md).
+- **Image functions** — Tiers 1–3 implemented (read/write/resize/scaleToFit/crop/
+  any-angle rotate/flip/info/blob/base64; the full `imageDraw*`/`imageSetDrawing*`
+  drawing surface with text + compositing; blur/sharpen/negative/grayscale/translucent
+  filters; translate/shear transforms; EXIF + IPTC metadata; and `<cfimage>`
+  read/write/resize/info/convert/writeToBrowser/border/captcha). Backed by pure-Rust
+  `image`/`imageproc`/`ab_glyph`/`kamadak-exif` (native + wasm). Rasterisation is
+  visually equivalent to, but not pixel-identical with, Lucee's Java2D renderer, and
+  text uses a bundled DejaVu Sans font. See [known-issues.md §18](known-issues.md).
 
 ### Explicitly Unsupported
 - Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway

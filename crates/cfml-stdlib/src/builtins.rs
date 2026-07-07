@@ -3554,9 +3554,11 @@ fn fn_get_readable_image_formats(_args: Vec<CfmlValue>) -> CfmlResult {
     ))
 }
 
-/// Tier 2 (drawing) and Tier 3 (filters/transforms/metadata) image functions.
-/// The surface is recognised so calls fail with a clear message instead of an
-/// "undefined function" — they are not implemented in this build.
+/// Tier 2 (drawing) and Tier 3 (filters/transforms/metadata) image function
+/// names. When `image_support` is OFF these are registered as disabled stubs so
+/// calls fail with a clear message rather than "undefined function"; when it is
+/// ON they are wired to real implementations in `register_image_functions`.
+#[cfg(not(feature = "image_support"))]
 const IMAGE_TIER23_STUBS: &[&str] = &[
     // drawing state
     "imageSetDrawingColor", "imageSetBackgroundColor", "imageSetDrawingStroke",
@@ -3607,9 +3609,52 @@ fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     f.insert("imageFlip".into(), img::fn_image_flip);
     f.insert("isImage".into(), img::fn_is_image);
     f.insert("cfimage".into(), img::fn_cfimage);
-    for name in IMAGE_TIER23_STUBS {
-        f.insert((*name).into(), fn_image_not_implemented);
-    }
+
+    // Tier 2 — drawing state
+    f.insert("imageSetDrawingColor".into(), img::fn_image_set_drawing_color);
+    f.insert("imageSetBackgroundColor".into(), img::fn_image_set_background_color);
+    f.insert("imageSetDrawingStroke".into(), img::fn_image_set_drawing_stroke);
+    f.insert("imageSetAntialiasing".into(), img::fn_image_set_antialiasing);
+    f.insert("imageSetDrawingTransparency".into(), img::fn_image_set_drawing_transparency);
+    f.insert("imageXORDrawingMode".into(), img::fn_image_xor_drawing_mode);
+    // Tier 2 — drawing primitives
+    f.insert("imageDrawLine".into(), img::fn_image_draw_line);
+    f.insert("imageDrawLines".into(), img::fn_image_draw_lines);
+    f.insert("imageDrawPoint".into(), img::fn_image_draw_point);
+    f.insert("imageDrawRect".into(), img::fn_image_draw_rect);
+    f.insert("imageDrawRoundRect".into(), img::fn_image_draw_round_rect);
+    f.insert("imageDrawBeveledRect".into(), img::fn_image_draw_beveled_rect);
+    f.insert("imageDrawOval".into(), img::fn_image_draw_oval);
+    f.insert("imageDrawArc".into(), img::fn_image_draw_arc);
+    f.insert("imageDrawCubicCurve".into(), img::fn_image_draw_cubic_curve);
+    f.insert("imageDrawQuadraticCurve".into(), img::fn_image_draw_quadratic_curve);
+    f.insert("imageDrawText".into(), img::fn_image_draw_text);
+    f.insert("imageClearRect".into(), img::fn_image_clear_rect);
+    // Tier 2 — compositing
+    f.insert("imageDrawImage".into(), img::fn_image_draw_image);
+    f.insert("imagePaste".into(), img::fn_image_paste);
+    f.insert("imageOverlay".into(), img::fn_image_overlay);
+    f.insert("imageCopy".into(), img::fn_image_copy);
+    f.insert("imageAddBorder".into(), img::fn_image_add_border);
+    // Tier 3 — filters / effects
+    f.insert("imageBlur".into(), img::fn_image_blur);
+    f.insert("imageSharpen".into(), img::fn_image_sharpen);
+    f.insert("imageNegative".into(), img::fn_image_negative);
+    f.insert("imageGrayscale".into(), img::fn_image_grayscale);
+    f.insert("imageMakeColorTransparent".into(), img::fn_image_make_color_transparent);
+    f.insert("imageMakeTranslucent".into(), img::fn_image_make_translucent);
+    // Tier 3 — coordinate transforms
+    f.insert("imageTranslate".into(), img::fn_image_translate);
+    f.insert("imageTranslateDrawingAxis".into(), img::fn_image_translate_drawing_axis);
+    f.insert("imageShear".into(), img::fn_image_shear);
+    f.insert("imageShearDrawingAxis".into(), img::fn_image_shear_drawing_axis);
+    f.insert("imageRotateDrawingAxis".into(), img::fn_image_rotate_drawing_axis);
+    // Tier 3 — metadata / interop
+    f.insert("imageGetEXIFMetadata".into(), img::fn_image_get_exif_metadata);
+    f.insert("imageGetEXIFTag".into(), img::fn_image_get_exif_tag);
+    f.insert("imageGetIPTCMetadata".into(), img::fn_image_get_iptc_metadata);
+    f.insert("imageGetIPTCTag".into(), img::fn_image_get_iptc_tag);
+    f.insert("imageGetBufferedImage".into(), img::fn_image_get_buffered_image);
 }
 
 #[cfg(not(feature = "image_support"))]
@@ -3620,16 +3665,6 @@ fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     for name in IMAGE_TIER1_NAMES.iter().chain(IMAGE_TIER23_STUBS) {
         f.insert((*name).into(), fn_image_disabled);
     }
-}
-
-/// Tier 2/3 image function called in a build that has `image_support` but not
-/// (yet) that function.
-#[cfg(feature = "image_support")]
-fn fn_image_not_implemented(_args: Vec<CfmlValue>) -> CfmlResult {
-    Err(CfmlError::runtime(
-        "This image function is not implemented in this build (Tier 2/3 image support pending)"
-            .to_string(),
-    ))
 }
 
 /// Any image function called in a build compiled WITHOUT `image_support`.

@@ -480,36 +480,52 @@ so they reconstruct exactly). Consequences:
   doubles collapse to `Int` on load — the same normalisation the JSON path applies
   everywhere else.
 
-## 18. Image functions — Tier 1 implemented; drawing/filters/metadata pending 🏗
+## 18. Image functions — Tiers 1–3 implemented; rasterisation is not pixel-identical to Java2D 🏗
 
-Image support is backed by the pure-Rust `image` crate (so it builds natively **and**
-for the wasm32 targets), behind the `image_support` feature (on by default). An image
-is a first-class mutable object — `imageNew`/`imageRead` return it, and both the
-function form (`imageResize(img, w, h)`) and the member form (`img.resize(w, h)`)
-mutate it in place, matching Lucee.
+Image support is backed by pure-Rust crates (`image`, `imageproc`, `ab_glyph`,
+`kamadak-exif`), so it builds natively **and** for the wasm32 targets, behind the
+`image_support` feature (on by default). An image is a first-class mutable object —
+`imageNew`/`imageRead` return it, and both the function form (`imageResize(img, w, h)`)
+and the member form (`img.resize(w, h)`) mutate it in place, matching Lucee.
 
-**Implemented (Tier 1):** `imageNew`, `imageRead`, `imageReadBase64`, `imageWrite`,
-`imageWriteBase64`, `imageGetBlob`, `imageResize`, `imageScaleToFit`, `imageGetWidth`,
-`imageGetHeight`, `imageInfo`, `imageCrop`, `imageRotate`, `imageFlip`, `isImage`,
-`isImageFile`, `getReadableImageFormats`/`getWriteableImageFormats`, and the
-`<cfimage>` actions `read`/`write`/`resize`/`info`/`convert`/`writeToBrowser`. Read
-formats: PNG, JPEG, GIF, BMP, TIFF, WebP, ICO (detected by **content**, not filename,
-matching Lucee's misnamed-file behaviour). `imageInfo()` reproduces Lucee's `colormodel`
-struct keys and colorspace/transparency strings.
+**Tier 1 — read / write / geometry:** `imageNew`, `imageRead`, `imageReadBase64`,
+`imageWrite`, `imageWriteBase64`, `imageGetBlob`, `imageResize`, `imageScaleToFit`,
+`imageGetWidth`, `imageGetHeight`, `imageInfo`, `imageCrop`, `imageRotate` (now **any**
+angle), `imageFlip`, `isImage`, `isImageFile`, `getReadableImageFormats`/
+`getWriteableImageFormats`, and `<cfimage>` `read`/`write`/`resize`/`info`/`convert`/
+`writeToBrowser`. Read formats: PNG, JPEG, GIF, BMP, TIFF, WebP, ICO (detected by
+**content**, not filename). `imageInfo()` reproduces Lucee's `colormodel` struct.
 
-**Not yet implemented 🛑 (call → clear error, never a silent no-op):**
-- **Arbitrary-angle `imageRotate`** — only quarter turns (0/90/180/270) are supported;
-  other angles throw. Free-angle rotation needs `imageproc` (a Tier 2 dependency).
-- **Tier 2 (drawing):** `imageDraw*`, `imageSetDrawing*`, `imagePaste`, `imageOverlay`,
-  `imageCopy`, `imageAddBorder`, `<cfimage action="border"/"captcha">`.
-- **Tier 3 (filters/transforms/metadata):** `imageBlur`, `imageSharpen`,
-  `imageNegative`, `imageGrayscale`, `imageShear`, `imageTranslate`,
-  `imageGet{EXIF,IPTC}Metadata`, etc.
+**Tier 2 — drawing:** `imageSetDrawingColor`/`BackgroundColor`/`DrawingStroke`/
+`Antialiasing`/`DrawingTransparency`, `imageXORDrawingMode`; `imageDrawLine`/`Lines`/
+`Point`/`Rect`/`RoundRect`/`BeveledRect`/`Oval`/`Arc`/`CubicCurve`/`QuadraticCurve`/
+`Text`, `imageClearRect`; `imageDrawImage`/`imagePaste`/`imageOverlay`/`imageCopy`/
+`imageAddBorder`; `<cfimage action="border"/"captcha">`.
 
-The Tier 2/3 names are registered so calls fail with an explicit
-"not implemented in this build" message instead of "undefined function". HEIC/AVIF/JXL
-are intentionally unsupported (their codecs need C libraries that don't build for wasm);
-Lucee treats those as optional codecs too.
+**Tier 3 — filters / transforms / metadata:** `imageBlur`, `imageSharpen`,
+`imageNegative`, `imageGrayscale`, `imageMakeColorTransparent`, `imageMakeTranslucent`;
+`imageTranslate`, `imageShear`, `imageRotateDrawingAxis` (+ the `*DrawingAxis` aliases);
+`imageGetEXIFMetadata`/`Tag`, `imageGetIPTCMetadata`/`Tag`.
+
+**Documented behaviour differences vs Lucee's Java2D renderer 🌟:**
+- **Not pixel-identical.** Antialiasing, curve/arc rasterisation and text hinting use
+  `imageproc`/`ab_glyph`, not `java.awt`. Output is visually equivalent but not
+  byte-for-byte; assert on dimensions/regions, not exact pixels.
+- **Stroke width** on outline primitives is approximated by stamping the shape over a
+  small disc of offsets (round joins), rather than Java2D's `BasicStroke` geometry.
+- **`imageDrawText`** always renders with the **bundled DejaVu Sans** font; the `font`
+  and `style` keys of an `attributeCollection` are ignored (only `size` is honoured).
+  There is no system-font enumeration.
+- **`imageXORDrawingMode`** is accepted and its flag stored, but drawing proceeds in
+  normal paint mode (true Java2D XOR paint is not emulated).
+- **`imageGetIPTCMetadata`** parses the JPEG APP13 / IPTC-NAA (8BIM 0x0404) segment for
+  the common editorial datasets (title, keywords, caption, by-line, city, credit, …);
+  uncommon datasets and non-JPEG IPTC containers are skipped. Dataset **key names** are
+  RustCFML's own (`object_name`, `by_line`, …) and may differ from Lucee/ACF.
+- **`imageGetBufferedImage`** has no engine equivalent (it returns a
+  `java.awt.BufferedImage`) and throws a clear error 🛑.
+- **HEIC/AVIF/JXL** decode is intentionally unsupported (their codecs need C libraries
+  that don't build for wasm); Lucee treats those as optional codecs too.
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /

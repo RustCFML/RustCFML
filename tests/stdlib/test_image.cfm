@@ -234,6 +234,126 @@ assertTrue("cfimage script-call form defines structName target", isDefined("scri
 assert("cfimage script-call form info width", scriptRv.width, 12);
 if (fileExists(tmpDir & "/rustcfml_probe.png")) { fileDelete(tmpDir & "/rustcfml_probe.png"); }
 
+// ============================================================
+// Tier 2 — drawing (state + primitives + text + compositing).
+//
+// There is no CFML pixel-accessor, and Java2D-vs-imageproc rasterisation is not
+// pixel-identical, so these assert structural invariants: the ops don't throw,
+// dimensions are preserved (or change as specified), and the result stays a
+// valid, encodable image. See docs/known-issues.md §18.
+// ============================================================
+canvas = imageNew("", 100, 60, "rgb", "white");
+imageSetDrawingColor(canvas, "blue");
+imageSetBackgroundColor(canvas, "white");
+imageSetDrawingStroke(canvas, {width: 3});
+imageSetDrawingTransparency(canvas, 0);
+imageDrawLine(canvas, 0, 0, 100, 60);
+imageDrawRect(canvas, 5, 5, 30, 20, false);
+imageDrawRect(canvas, 40, 5, 30, 20, true);
+imageDrawOval(canvas, 60, 30, 20, 20, false);
+imageDrawRoundRect(canvas, 5, 30, 30, 20, 8, 8, false);
+imageDrawBeveledRect(canvas, 40, 30, 30, 20, true, true);
+imageDrawArc(canvas, 75, 5, 20, 20, 0, 90, false);
+imageDrawPoint(canvas, 50, 50);
+imageDrawCubicCurve(canvas, 0, 0, 20, 60, 80, 0, 100, 60);
+imageDrawQuadraticCurve(canvas, 0, 30, 50, 0, 100, 30);
+imageDrawLines(canvas, [0, 50, 100], [0, 30, 0], true, false);
+imageSetAntialiasing(canvas, "on");
+imageDrawLine(canvas, 0, 60, 100, 0);
+imageDrawText(canvas, "Test", 10, 40, {size: 12});
+imageClearRect(canvas, 90, 50, 10, 10);
+assertTrue("drawing kept a valid image", isImage(canvas));
+assert("drawing preserved width", imageGetWidth(canvas), 100);
+assert("drawing preserved height", imageGetHeight(canvas), 60);
+assertTrue("drawn image still encodes", len(imageWriteBase64(canvas, "", "png")) GT 0);
+
+// filled polygon via drawLines(isPolygon, filled)
+poly = imageNew("", 40, 40, "rgb", "white");
+imageSetDrawingColor(poly, "green");
+imageDrawLines(poly, [5, 35, 20], [35, 35, 5], true, true);
+assertTrue("filled polygon is image", isImage(poly));
+
+// ---- compositing --------------------------------------------------------
+base = imageNew("", 50, 50, "rgb", "black");
+imagePaste(base, imageNew("", 20, 20, "rgb", "red"), 5, 5);
+assert("paste preserves base width", imageGetWidth(base), 50);
+imageDrawImage(base, imageNew("", 10, 10, "rgb", "blue"), 30, 30);
+assert("drawImage preserves base height", imageGetHeight(base), 50);
+imageOverlay(base, imageNew("", 50, 50, "argb"), "over", 0.5);
+assert("overlay preserves dimensions", imageGetWidth(base), 50);
+imageCopy(base, 0, 0, 10, 10, 20, 20);
+assert("copy preserves dimensions", imageGetHeight(base), 50);
+
+bordered = imageNew("", 30, 30, "rgb", "white");
+imageAddBorder(bordered, 4, "black");
+assert("addBorder grows width by 2*thickness", imageGetWidth(bordered), 38);
+assert("addBorder grows height by 2*thickness", imageGetHeight(bordered), 38);
+
+// <cfimage action="border"> writes back through name=
+cfimage(action = "border", source = imageNew("", 20, 20, "rgb", "white"), thickness = 3, color = "black", name = "cfBordered");
+assert("cfimage border grows width", imageGetWidth(cfBordered), 26);
+
+// <cfimage action="captcha">
+cfimage(action = "captcha", text = "RustCFML", width = 180, height = 44, name = "captchaImg");
+assertTrue("captcha produced an image", isImage(captchaImg));
+assert("captcha honours width", imageGetWidth(captchaImg), 180);
+assert("captcha honours height", imageGetHeight(captchaImg), 44);
+
+// ============================================================
+// Tier 3 — filters + transforms + metadata.
+// ============================================================
+fx = imageNew("", 40, 40, "rgb", "128,64,200");
+imageBlur(fx, 2);
+assert("blur preserves width", imageGetWidth(fx), 40);
+imageSharpen(fx, 1);
+assert("sharpen preserves height", imageGetHeight(fx), 40);
+imageNegative(fx);
+assertTrue("negative kept an image", isImage(fx));
+imageGrayscale(fx);
+assertTrue("grayscale kept an image", isImage(fx));
+
+// makeTranslucent / makeColorTransparent flip on the alpha channel
+translucent = imageNew("", 30, 30, "rgb", "red");
+imageMakeTranslucent(translucent, 50);
+assertTrue("makeTranslucent introduces an alpha channel",
+    imageInfo(translucent).colormodel.alpha_channel_support);
+keyed = imageNew("", 30, 30, "rgb", "red");
+imageMakeColorTransparent(keyed, "red");
+assertTrue("makeColorTransparent introduces an alpha channel",
+    imageInfo(keyed).colormodel.alpha_channel_support);
+
+// translate / shear keep the canvas size; arbitrary-angle rotate grows it
+moved = imageNew("", 30, 30, "rgb", "red");
+imageTranslate(moved, 5, 5);
+assert("translate preserves width", imageGetWidth(moved), 30);
+sheared = imageNew("", 30, 30, "rgb", "red");
+imageShear(sheared, 0.3, "horizontal");
+assert("shear preserves width", imageGetWidth(sheared), 30);
+spun = imageNew("", 40, 40, "rgb", "red");
+imageRotate(spun, 45);
+assertTrue("45° rotate grows the canvas to fit", imageGetWidth(spun) GT 40);
+
+// ---- EXIF / IPTC metadata ----------------------------------------------
+// A hand-built JPEG carrying a Photoshop APP13 / IPTC-NAA segment (title,
+// two keywords, caption, by-line). Values are asserted key-agnostically
+// because Lucee/ACF and RustCFML name the datasets differently.
+iptcJpegB64 = "/9j/7QBcUGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAEAcAgUACE15IFRpdGxlHAIZAAVhbHBoYRwCGQAEYmV0YRwCeAAOQSBjYXB0aW9uIGhlcmUcAlAACEphbmUgRG9l/+AAEEpGSUYAAQIAAAEAAQAA/8AAEQgACAAIAwERAAIRAQMRAf/bAEMACAYGBwYFCAcHBwkJCAoMFA0MCwsMGRITDxQdGh8eHRocHCAkLicgIiwjHBwoNyksMDE0NDQfJzk9ODI8LjM0Mv/bAEMBCQkJDAsMGA0NGDIhHCEyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMv/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/aAAwDAQACEQMRAD8A4uvmT9xP/9k=";
+iptcImg = imageReadBase64(iptcJpegB64);
+iptc = imageGetIPTCMetadata(iptcImg);
+assertTrue("imageGetIPTCMetadata returns a struct", isStruct(iptc));
+assertTrue("IPTC struct has entries", structCount(iptc) GT 0);
+iptcVals = "";
+for (k in iptc) { iptcVals &= iptc[k] & "|"; }
+assertTrue("IPTC keyword value parsed", findNoCase("alpha", iptcVals) GT 0);
+assertTrue("IPTC caption value parsed", findNoCase("A caption here", iptcVals) GT 0);
+assertTrue("IPTC by-line value parsed", findNoCase("Jane Doe", iptcVals) GT 0);
+// EXIF path is graceful (this fixture carries no EXIF): a struct, never a throw
+assertTrue("imageGetEXIFMetadata returns a struct", isStruct(imageGetEXIFMetadata(iptcImg)));
+// getBufferedImage has no engine equivalent
+assertThrows("imageGetBufferedImage is unsupported", function() {
+    imageGetBufferedImage(iptcImg);
+});
+
 // cleanup
 for (p in [pngPath, jpgPath, misnamed, tmpDir & "/rustcfml_cfimage_write.png"]) {
     if (fileExists(p)) { fileDelete(p); }
