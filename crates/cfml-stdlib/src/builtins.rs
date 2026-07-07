@@ -7240,11 +7240,94 @@ fn fn_canonicalize(args: Vec<CfmlValue>) -> CfmlResult {
         // `+` as a space (that's x-www-form-urlencoded, for urlDecode). A literal
         // `+` (e.g. a Google Fonts "Istok+Web" URL) must survive.
         s = url_decode_string_opt(&s, false);
+        // ESAPI DefaultEncoder.canonicalize() runs a third default codec:
+        // JavaScriptCodec. It decodes JS backslash escapes — `a\"b`->`a"b`,
+        // `\x41`->`A`, `A`->`A` (GitHub #252). Without it, Canonicalize
+        // over-preserved backslash escapes, so EncodeForHTMLAttribute(Canonicalize(v))
+        // produced `&#x5c;&quot;` where the JVM engines produce `&quot;`.
+        s = decode_javascript(&s);
         if s == prev {
             break;
         }
     }
     Ok(CfmlValue::string(s))
+}
+
+/// Decode JavaScript backslash escapes, mirroring
+/// `org.owasp.esapi.codecs.JavaScriptCodec.decodeCharacter`: the single-char
+/// escapes (`\b \t \n \v \f \r \" \' \\ \/ \0`), hex `\xHH`, and unicode
+/// `\uHHHH`. An unrecognized or truncated escape drops the backslash and keeps
+/// the following characters verbatim (ESAPI behaviour).
+fn decode_javascript(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    // Read up to `n` hex digits from the iterator, consuming only valid ones.
+    fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars>, n: usize) -> String {
+        let mut hex = String::new();
+        for _ in 0..n {
+            match chars.peek() {
+                Some(h) if h.is_ascii_hexdigit() => {
+                    hex.push(*h);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        hex
+    }
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // Trailing backslash: keep it verbatim.
+            None => out.push('\\'),
+            Some('b') => out.push('\u{0008}'),
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('v') => out.push('\u{000B}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('0') => out.push('\u{0000}'),
+            Some('x') => {
+                let hex = take_hex(&mut chars, 2);
+                match (hex.len() == 2)
+                    .then(|| u32::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .and_then(char::from_u32)
+                {
+                    Some(ch) => out.push(ch),
+                    // Truncated/invalid: drop the backslash, keep `x` + digits.
+                    None => {
+                        out.push('x');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some('u') => {
+                let hex = take_hex(&mut chars, 4);
+                match (hex.len() == 4)
+                    .then(|| u32::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .and_then(char::from_u32)
+                {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push('u');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            // Unrecognized escape: ESAPI drops the backslash, keeps the char.
+            Some(other) => out.push(other),
+        }
+    }
+    out
 }
 
 fn url_decode_string_opt(s: &str, plus_as_space: bool) -> String {

@@ -145,5 +145,20 @@ assert("canonicalize plain text unchanged", canon3, "hello");
 canon4 = canonicalize("%26lt%3B", false, false);
 assert("canonicalize double-encoded", canon4, "<");
 
+// GitHub #252: ESAPI JavaScriptCodec decode pass (backslash escapes). Built
+// with chr() so the CFML source carries no ambiguous escape sequences.
+jsBS = chr(92);   // backslash
+jsQ  = chr(34);   // double quote
+assert("canonicalize JS escaped quote",   canonicalize("a" & jsBS & jsQ & "b", false, false), "a" & jsQ & "b");
+assert("canonicalize JS hex escape",      canonicalize(jsBS & "x41", false, false), "A");
+assert("canonicalize JS unicode escape",  canonicalize(jsBS & "u0041", false, false), "A");
+assert("canonicalize JS backslash-backslash", canonicalize(jsBS & jsBS, false, false), jsBS);
+// HTML-entity + percent passes still match (regression guard).
+assert("canonicalize html+percent still works", canonicalize("a&##x20;b %41", false, false), "a b A");
+// The Wheels attribute pipeline shape: JVM engines produce &quot; (the un-decoded
+// backslash was previously entity-encoded to &##x5c;&quot;).
+assert("attr pipeline EncodeForHTMLAttribute(Canonicalize())",
+       encodeForHTMLAttribute(canonicalize("btn" & jsBS & jsQ & "x", false, false)), "btn&quot;x");
+
 suiteEnd();
 </cfscript>
