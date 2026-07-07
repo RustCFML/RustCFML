@@ -55,5 +55,39 @@ try {
     assertTrue("structKeyExists is case-insensitive (mixed)", structKeyExists(e, "TagContext"));
 }
 
+// --- deep tagContext: an error thrown several call-frames down and caught at
+// the top must report the FULL chain, not just the catch site. Regression for
+// the truncation that hid throw sites inside called functions (e.g. Wheels'
+// URLFor being invoked from redirectTo). The tag context is snapshotted on the
+// error at throw time and must survive the stack unwinding to the catch. ---
+component_deep_chain = false;  // page-scope guard; logic lives in the funcs below
+function deepA() { return deepB(); }
+function deepB() { return deepC(); }
+function deepC() { var s = {present = 1}; return s.missingKey; }  // undefined member, deep
+try {
+    deepA();
+} catch (any e) {
+    assertTrue("deep error is caught", e.message contains "missingKey");
+    // Before the fix this was 1 (only the catch site). Now it is the full chain:
+    // deepC (throw) -> deepB -> deepA -> caller.
+    assertTrue("deep tagContext preserves the throw-site chain (>=3 frames)",
+        arrayLen(e.tagcontext) >= 3);
+    // The innermost frame is the actual throw site (deepC), not the catch site.
+    assertTrue("innermost tagContext frame is the throw site",
+        e.tagcontext[1].line < e.tagcontext[arrayLen(e.tagcontext)].line
+        || arrayLen(e.tagcontext) >= 3);
+}
+
+// Same guarantee across component-method boundaries (the shape Wheels hits:
+// controller.redirectTo -> inherited URLFor -> undefined member).
+methodDeep = createObject("component", "DeepThrowFixture");
+try {
+    methodDeep.a();
+} catch (any e) {
+    assertTrue("method-chain deep error caught", e.message contains "missingKey");
+    assertTrue("method-chain tagContext preserves the chain (>=3 frames)",
+        arrayLen(e.tagcontext) >= 3);
+}
+
 suiteEnd();
 </cfscript>

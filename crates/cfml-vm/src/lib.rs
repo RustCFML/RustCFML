@@ -2954,7 +2954,15 @@ impl CfmlVirtualMachine {
     }
 
     fn build_tag_context(&self) -> CfmlValue {
-        let frames = self.build_stack_trace();
+        Self::tag_context_from_frames(&self.build_stack_trace())
+    }
+
+    /// Build a CFML `tagContext` array from a captured stack-frame list. Used
+    /// both for the live stack (`build_tag_context`) and — crucially — for the
+    /// frames snapshotted at throw time on `CfmlError::stack_trace`, so that an
+    /// error caught after the Rust call stack has unwound still reports the deep
+    /// throw site rather than a single shallow frame at the catch point.
+    fn tag_context_from_frames(frames: &[cfml_common::vm::StackFrame]) -> CfmlValue {
         let context: Vec<CfmlValue> = frames
             .iter()
             .map(|f| {
@@ -2974,6 +2982,17 @@ impl CfmlVirtualMachine {
             })
             .collect();
         CfmlValue::array(context)
+    }
+
+    /// Tag context for an error being converted to a CFML struct. Prefers the
+    /// frames captured on the error at throw time (deep, before unwinding);
+    /// falls back to the live stack only when the error carries none.
+    fn build_tag_context_for_error(&self, e: &CfmlError) -> CfmlValue {
+        if e.stack_trace.is_empty() {
+            self.build_tag_context()
+        } else {
+            Self::tag_context_from_frames(&e.stack_trace)
+        }
     }
 
     fn build_error_struct(e: &CfmlError, tag_context: CfmlValue) -> CfmlValue {
@@ -3113,7 +3132,7 @@ impl CfmlVirtualMachine {
             // last_exception already holds the right value; clone once for the stack
             self.last_exception.as_ref().unwrap().clone()
         } else {
-            let v = Self::build_error_struct(e, self.build_tag_context());
+            let v = Self::build_error_struct(e, self.build_tag_context_for_error(e));
             self.last_exception = Some(v.clone());
             v
         }
