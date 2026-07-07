@@ -33,7 +33,10 @@ assert("var-scoped receiver not nulled inside function", insideFn(), false);
 fresh = createObject("java", "java.lang.System");
 assert("value persists across System instances", fresh.getProperty("probe.key.249"), "hello");
 
-// setProperty returns the PREVIOUS value (or null if none).
+// setProperty returns the PREVIOUS value (or null if none). Clear first so this
+// holds even in serve mode, where the process-global store persists across
+// requests (a fixed key set on a prior request would otherwise have a prior).
+createObject("java", "java.lang.System").clearProperty("brand.new.249");
 assert("setProperty returns null when no prior value",
        isNull(createObject("java", "java.lang.System").setProperty("brand.new.249", "x")), true);
 assert("setProperty returns prior value",
