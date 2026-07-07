@@ -16395,6 +16395,7 @@ impl CfmlVirtualMachine {
                 | "__cfdirectory"
                 | "cffile"
                 | "cfzip"
+                | "cfimage"
                 | "cfhttp"
                 | "cfmail"
                 | "__cfmail"
@@ -16437,6 +16438,12 @@ impl CfmlVirtualMachine {
         let tag = tag.trim_start_matches("__");
         match tag.to_lowercase().as_str() {
             "cfhttp" => &["result"],
+            // cfimage writes its result to `name` (read/resize/rotate → image)
+            // or `structName` (action="info" → metadata struct). Mirrors the
+            // tag form's `name = cfimage({...})` rewrite so the script-call
+            // form `cfimage(attributeCollection={action:"info",…,structName:"rv"})`
+            // populates the target too (GitHub #253, Wheels imageTag probe).
+            "cfimage" => &["name", "structname"],
             // Response/control tags have no return-value write-back: their
             // `name` attribute is a real option (header/cookie name), not a
             // caller-scope target.

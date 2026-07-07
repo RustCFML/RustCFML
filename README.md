@@ -172,9 +172,13 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 
 See **[Compatibility & Status](docs/status.md)** for implementation status.
 
+### Partially Supported
+
+- **Image functions** — core surface shipped: `imageNew`/`imageRead`/`imageResize`/`imageScaleToFit`/`imageCrop`/`imageRotate`/`imageFlip`/`imageInfo`/`imageGetWidth`/`imageGetHeight`/`imageWrite`/`imageWriteBase64`/`imageGetBlob` plus `<cfimage>` (`read`/`write`/`resize`/`info`/`convert`/`writeToBrowser`), backed by the pure-Rust `image` crate (native **and** wasm). Drawing primitives, filters, free-angle rotation, and EXIF/IPTC metadata are not yet implemented. See **[Known Issues §18](docs/known-issues.md)**.
+
 ### Not Supported
 
-- Image functions, Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
+- Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
 - `cfschedule`, `cfwddx`
 
 For documented gaps, silent no-ops, and Lucee/BoxLang divergences, see **[Known Issues](docs/known-issues.md)**.

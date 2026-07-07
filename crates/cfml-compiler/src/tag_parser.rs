@@ -1424,6 +1424,48 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         "cffile" => {
             parse_cffile_tag(&attrs, &quoted, tag_end - start)
         }
+        "cfimage" => {
+            // <cfimage action="resize" source="in.png" name="img" width="100">
+            // → img = cfimage({ action:"resize", source:in.png, name:"img", ... });
+            // The `writeToBrowser` action needs the output buffer, so it is
+            // lowered directly to a writeOutput() of the base64 <img> markup.
+            let action = attrs.get("action").map(|s| s.to_lowercase()).unwrap_or_else(|| "read".to_string());
+            let name = attrs.get("name").cloned();
+            let struct_name = attrs.get("structname").cloned();
+
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                let raw = v.trim();
+                let lower = raw.to_lowercase();
+                if lower == "true" || lower == "yes" {
+                    parts.push(format!("{}: true", k));
+                } else if lower == "false" || lower == "no" {
+                    parts.push(format!("{}: false", k));
+                } else if raw.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, raw));
+                } else {
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+                }
+            }
+            let call = format!("cfimage({{ {} }})", parts.join(", "));
+
+            if action == "writetobrowser" {
+                // source may be an image var (#img#) or a quoted path.
+                let src = attrs.get("source").cloned().unwrap_or_default();
+                let src_expr = format_attr_value(&src, quoted.contains("source"));
+                let fmt = attrs.get("format").cloned().unwrap_or_else(|| "png".to_string()).to_lowercase();
+                (format!(
+                    "writeOutput('<img src=\"data:image/{f};base64,' & toBase64(imageGetBlob({src}, \"{f}\")) & '\" />');\n",
+                    f = fmt, src = src_expr
+                ), tag_end - start)
+            } else if let Some(sn) = struct_name.filter(|_| action == "info") {
+                (format!("{} = {};\n", sn, call), tag_end - start)
+            } else if let Some(n) = name {
+                (format!("{} = {};\n", n, call), tag_end - start)
+            } else {
+                (format!("{};\n", call), tag_end - start)
+            }
+        }
         "cflock" => {
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cflock") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();

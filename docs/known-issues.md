@@ -480,6 +480,37 @@ so they reconstruct exactly). Consequences:
   doubles collapse to `Int` on load — the same normalisation the JSON path applies
   everywhere else.
 
+## 18. Image functions — Tier 1 implemented; drawing/filters/metadata pending 🏗
+
+Image support is backed by the pure-Rust `image` crate (so it builds natively **and**
+for the wasm32 targets), behind the `image_support` feature (on by default). An image
+is a first-class mutable object — `imageNew`/`imageRead` return it, and both the
+function form (`imageResize(img, w, h)`) and the member form (`img.resize(w, h)`)
+mutate it in place, matching Lucee.
+
+**Implemented (Tier 1):** `imageNew`, `imageRead`, `imageReadBase64`, `imageWrite`,
+`imageWriteBase64`, `imageGetBlob`, `imageResize`, `imageScaleToFit`, `imageGetWidth`,
+`imageGetHeight`, `imageInfo`, `imageCrop`, `imageRotate`, `imageFlip`, `isImage`,
+`isImageFile`, `getReadableImageFormats`/`getWriteableImageFormats`, and the
+`<cfimage>` actions `read`/`write`/`resize`/`info`/`convert`/`writeToBrowser`. Read
+formats: PNG, JPEG, GIF, BMP, TIFF, WebP, ICO (detected by **content**, not filename,
+matching Lucee's misnamed-file behaviour). `imageInfo()` reproduces Lucee's `colormodel`
+struct keys and colorspace/transparency strings.
+
+**Not yet implemented 🛑 (call → clear error, never a silent no-op):**
+- **Arbitrary-angle `imageRotate`** — only quarter turns (0/90/180/270) are supported;
+  other angles throw. Free-angle rotation needs `imageproc` (a Tier 2 dependency).
+- **Tier 2 (drawing):** `imageDraw*`, `imageSetDrawing*`, `imagePaste`, `imageOverlay`,
+  `imageCopy`, `imageAddBorder`, `<cfimage action="border"/"captcha">`.
+- **Tier 3 (filters/transforms/metadata):** `imageBlur`, `imageSharpen`,
+  `imageNegative`, `imageGrayscale`, `imageShear`, `imageTranslate`,
+  `imageGet{EXIF,IPTC}Metadata`, etc.
+
+The Tier 2/3 names are registered so calls fail with an explicit
+"not implemented in this build" message instead of "undefined function". HEIC/AVIF/JXL
+are intentionally unsupported (their codecs need C libraries that don't build for wasm);
+Lucee treats those as optional codecs too.
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*

@@ -183,6 +183,8 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_structdelete_return_and_gettime.cfm">
 <cf_runtest file="stdlib/test_numberformat_mask_padding.cfm">
 <cf_runtest file="stdlib/test_jwt.cfm">
+<cf_runtest file="stdlib/test_image.cfm">
+<cf_runtest file="stdlib/test_xmp.cfm">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
 <cf_runtest file="stdlib/test_encode_for_html_esapi.cfm">
 <cf_runtest file="stdlib/test_string_functions_encoding.cfm">

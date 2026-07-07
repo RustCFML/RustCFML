@@ -13,7 +13,13 @@ repository.workspace = true
 license.workspace = true
 
 [features]
-default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema"]
+default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support"]
+# Raster image manipulation (imageNew/imageRead/imageResize/... + <cfimage>).
+# Backed by the pure-Rust `image` crate, so it builds for wasm32 as well as
+# native. Default features of `image` are all pure-Rust codecs (png/jpeg/gif/
+# bmp/tiff/webp/ico/...); AVIF/HEIC (which need C libs) stay OFF so the wasm
+# and demo builds keep working.
+image_support = ["dep:image"]
 security = ["rand", "bcrypt", "scrypt", "argon2", "pbkdf2"]
 yaml = ["dep:serde_yaml"]
 jsonschema = ["dep:jsonschema"]
@@ -77,6 +83,10 @@ argon2 = { version = "0.5", optional = true }
 pbkdf2 = { version = "0.12", optional = true, features = ["simple"] }
 iana-time-zone = "0.1"
 quick-xml = { version = "0.36", optional = true }
+# Pure-Rust imaging (decode/encode/resize/rotate/crop/flip). `default-features`
+# left ON — all default codecs are pure-Rust and build for wasm32. Do NOT enable
+# `avif`/`avif-native`/`hdr`-via-C: those pull C deps and break the wasm build.
+image = { version = "0.25", optional = true }
 scraper = { version = "0.22", optional = true }
 ego-tree = { version = "0.10", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }

@@ -463,6 +463,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("isImageFile".into(), fn_is_image_file);
     f.insert("getReadableImageFormats".into(), fn_get_readable_image_formats);
     f.insert("getWriteableImageFormats".into(), fn_get_readable_image_formats);
+    register_image_functions(&mut f);
     f.insert("isBinary".into(), fn_is_binary);
     f.insert("isCustomFunction".into(), fn_is_custom_function);
     f.insert("isClosure".into(), fn_is_closure);
@@ -988,6 +989,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     #[cfg(feature = "xml")]
     {
         f.insert("xmlParse".into(), fn_xml_parse);
+        // XMP metadata (RDF/XML) flattener — replaces Preside's xmpcore.jar.
+        f.insert("xmpParse".into(), crate::xmp::fn_xmp_parse);
         f.insert("xmlSearch".into(), fn_xml_search);
         f.insert("isXML".into(), fn_is_xml);
         f.insert("xmlTransform".into(), fn_xml_transform_stub);
@@ -3548,6 +3551,93 @@ fn fn_is_image_file(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_get_readable_image_formats(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(
         "BMP,GIF,JPEG,JPG,PNG,PSD,TIF,TIFF,WBMP,WEBP".to_string(),
+    ))
+}
+
+/// Tier 2 (drawing) and Tier 3 (filters/transforms/metadata) image functions.
+/// The surface is recognised so calls fail with a clear message instead of an
+/// "undefined function" — they are not implemented in this build.
+const IMAGE_TIER23_STUBS: &[&str] = &[
+    // drawing state
+    "imageSetDrawingColor", "imageSetBackgroundColor", "imageSetDrawingStroke",
+    "imageSetAntialiasing", "imageSetDrawingTransparency", "imageXORDrawingMode",
+    // drawing primitives
+    "imageDrawLine", "imageDrawLines", "imageDrawPoint", "imageDrawRect",
+    "imageDrawRoundRect", "imageDrawBeveledRect", "imageDrawOval", "imageDrawArc",
+    "imageDrawCubicCurve", "imageDrawQuadraticCurve", "imageDrawText",
+    "imageClearRect", "imageDrawImage", "imageAddBorder",
+    // compositing
+    "imagePaste", "imageOverlay", "imageCopy",
+    // filters / effects
+    "imageBlur", "imageSharpen", "imageNegative", "imageGrayscale",
+    "imageMakeColorTransparent", "imageMakeTranslucent",
+    // coordinate transforms
+    "imageTranslate", "imageTranslateDrawingAxis", "imageShear",
+    "imageShearDrawingAxis", "imageRotateDrawingAxis",
+    // metadata / interop
+    "imageGetEXIFMetadata", "imageGetEXIFTag", "imageGetIPTCMetadata",
+    "imageGetIPTCTag", "imageGetBufferedImage",
+];
+
+/// Tier 1 (implemented when `image_support` is on) function names — used only to
+/// register disabled-build stubs when the feature is off.
+#[cfg(not(feature = "image_support"))]
+const IMAGE_TIER1_NAMES: &[&str] = &[
+    "imageNew", "imageRead", "imageReadBase64", "imageWrite", "imageWriteBase64",
+    "imageGetBlob", "imageResize", "imageScaleToFit", "imageGetWidth",
+    "imageGetHeight", "imageInfo", "imageCrop", "imageRotate", "imageFlip",
+];
+
+#[cfg(feature = "image_support")]
+fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
+    use crate::image as img;
+    f.insert("imageNew".into(), img::fn_image_new);
+    f.insert("imageRead".into(), img::fn_image_read);
+    f.insert("imageReadBase64".into(), img::fn_image_read_base64);
+    f.insert("imageWrite".into(), img::fn_image_write);
+    f.insert("imageWriteBase64".into(), img::fn_image_write_base64);
+    f.insert("imageGetBlob".into(), img::fn_image_get_blob);
+    f.insert("imageResize".into(), img::fn_image_resize);
+    f.insert("imageScaleToFit".into(), img::fn_image_scale_to_fit);
+    f.insert("imageGetWidth".into(), img::fn_image_get_width);
+    f.insert("imageGetHeight".into(), img::fn_image_get_height);
+    f.insert("imageInfo".into(), img::fn_image_info);
+    f.insert("imageCrop".into(), img::fn_image_crop);
+    f.insert("imageRotate".into(), img::fn_image_rotate);
+    f.insert("imageFlip".into(), img::fn_image_flip);
+    f.insert("isImage".into(), img::fn_is_image);
+    f.insert("cfimage".into(), img::fn_cfimage);
+    for name in IMAGE_TIER23_STUBS {
+        f.insert((*name).into(), fn_image_not_implemented);
+    }
+}
+
+#[cfg(not(feature = "image_support"))]
+fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
+    // isImage is a type predicate — always safe to answer "false".
+    f.insert("isImage".into(), |_args| Ok(CfmlValue::Bool(false)));
+    f.insert("cfimage".into(), fn_image_disabled);
+    for name in IMAGE_TIER1_NAMES.iter().chain(IMAGE_TIER23_STUBS) {
+        f.insert((*name).into(), fn_image_disabled);
+    }
+}
+
+/// Tier 2/3 image function called in a build that has `image_support` but not
+/// (yet) that function.
+#[cfg(feature = "image_support")]
+fn fn_image_not_implemented(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "This image function is not implemented in this build (Tier 2/3 image support pending)"
+            .to_string(),
+    ))
+}
+
+/// Any image function called in a build compiled WITHOUT `image_support`.
+#[cfg(not(feature = "image_support"))]
+fn fn_image_disabled(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "Image support was not compiled into this build (enable the 'image_support' feature)"
+            .to_string(),
     ))
 }
 
@@ -12084,7 +12174,7 @@ fn fn_cffile(_args: Vec<CfmlValue>) -> CfmlResult {
 
 // ==== ENCODING HELPERS ====
 
-fn base64_encode_bytes(data: &[u8]) -> String {
+pub(crate) fn base64_encode_bytes(data: &[u8]) -> String {
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
     for chunk in data.chunks(3) {
@@ -12108,7 +12198,7 @@ fn base64_encode_bytes(data: &[u8]) -> String {
     result
 }
 
-fn base64_decode_bytes(s: &str) -> Vec<u8> {
+pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut bytes = Vec::new();
     let chars: Vec<u8> = s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();

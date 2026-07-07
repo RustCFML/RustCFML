@@ -21,7 +21,7 @@ cfml-vm = { path = "../cfml-vm", default-features = false, features = ["std"] }
 # rationale). Native-only http/database/smtp stay OUT — the worker provides those
 # via JS bindings (fetch, D1). getrandom's `js` backend (Web Crypto) works in the
 # Workers runtime, satisfying `security`→rand.
-cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security"] }
+cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security", "image_support"] }
 cfml-config = { path = "../cfml-config" }
 indexmap = { workspace = true }
 serde = { version = "1", features = ["derive"] }

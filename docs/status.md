@@ -100,8 +100,15 @@ RustCFML supports those as a BoxLang-faithful superset — see `docs/known-issue
   `createSignedJWT` / `verifySignedJWT` / `createEncryptedJWT` / `verifyEncryptedJWT`
   names are not provided.
 
+### Partially Supported
+- **Image functions** — Tier 1 implemented (read/write/resize/scaleToFit/crop/quarter-turn
+  rotate/flip/info/blob/base64 + `<cfimage>` read/write/resize/info/convert/writeToBrowser),
+  backed by the pure-Rust `image` crate (native + wasm). Drawing primitives, filters,
+  free-angle rotation, and EXIF/IPTC metadata are not yet implemented (they throw a clear
+  error). See [known-issues.md §18](known-issues.md).
+
 ### Explicitly Unsupported
-- Image functions (80+), Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway
+- Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway
 - cfschedule, cfwddx
 
 ### Taffy Framework

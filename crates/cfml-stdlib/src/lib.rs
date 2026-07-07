@@ -1,6 +1,10 @@
 //! CFML Standard Library
 
 pub mod builtins;
+#[cfg(feature = "image_support")]
+pub mod image;
+#[cfg(feature = "xml")]
+pub mod xmp;
 pub mod db_driver;
 pub mod pg_sql;
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
