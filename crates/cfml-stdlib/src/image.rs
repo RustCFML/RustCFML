@@ -230,11 +230,15 @@ impl CfmlNative for CfmlImage {
 /// Decode raw bytes into a `DynamicImage`, detecting the format from content
 /// (NOT any filename). Lucee reads misnamed files correctly, so we must too.
 fn decode_bytes(bytes: &[u8]) -> Result<(DynamicImage, ImageFormat), CfmlError> {
+    // Decode failures surface as `java.io.IOException` for Lucee/ACF parity:
+    // their ImageIO.read throws IOException on non-image bytes, and CFML code
+    // (e.g. Preside's NativeImageService) catches that exact type to raise an
+    // informative "not an image" error.
     let format = image::guess_format(bytes)
-        .map_err(|e| CfmlError::runtime(format!("Unsupported or unrecognised image format: {}", e)))?;
+        .map_err(|e| CfmlError::io_exception(format!("Unsupported or unrecognised image format: {}", e)))?;
     let img = image::load_from_memory_with_format(bytes, format)
         .or_else(|_| image::load_from_memory(bytes))
-        .map_err(|e| CfmlError::runtime(format!("Unable to decode image: {}", e)))?;
+        .map_err(|e| CfmlError::io_exception(format!("Unable to decode image: {}", e)))?;
     Ok((img, format))
 }
 

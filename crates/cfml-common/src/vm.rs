@@ -69,6 +69,18 @@ impl CfmlError {
             CfmlErrorType::Custom("java.io.FileNotFoundException".to_string()),
         )
     }
+
+    /// An I/O exception whose `type` matches Java's `java.io.IOException`, the
+    /// way Lucee/ACF surface an unreadable/undecodable image from `imageNew`/
+    /// `imageRead` (their `ImageIO.read` throws `IOException`). CFML code
+    /// branches on it — e.g. Preside's `NativeImageService.resize` does
+    /// `try{ ImageNew(binary) }catch("java.io.IOException"){ throw notAnImage }`.
+    pub fn io_exception(message: String) -> Self {
+        Self::new(
+            message,
+            CfmlErrorType::Custom("java.io.IOException".to_string()),
+        )
+    }
 }
 
 impl std::fmt::Display for CfmlErrorType {

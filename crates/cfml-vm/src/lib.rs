@@ -4593,6 +4593,18 @@ impl CfmlVirtualMachine {
                             && name_lower != "arguments"
                             && name_lower != "cfcatch"
                             && !effective_local_mode_modern
+                            // A declared PARAMETER is inherently local (local/arguments),
+                            // NEVER the component `variables` scope — even in classic
+                            // localmode. This matters for the default-value preamble
+                            // (`function f(struct p={}) {}`): an omitted-with-default
+                            // param is not pre-seeded into `locals` (GH #240), so
+                            // without this guard its `StoreLocal(p)` fell into the
+                            // classic-mode variables-write below and clobbered a
+                            // same-named component method in `variables` — permanently.
+                            // That broke every bare `p()` call program-wide once such a
+                            // method ran (surfaced as the Wheels `$args` POST-redirect
+                            // 500s / the bare-call caller-stack leak suite).
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                         {
                             // CFC method, classic localmode (default): unscoped,
                             // non-local variables go to __variables (the component scope).
@@ -4759,6 +4771,9 @@ impl CfmlVirtualMachine {
                         && !declared_locals.contains(name_lower)
                         && !locals.contains_key(name.as_str())
                         && !effective_local_mode_modern
+                        // A declared parameter is local, never the component scope —
+                        // see the matching guard in StoreLocal above.
+                        && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                     {
                         // CFC method, classic localmode: component (variables) scope.
                         if let Some(vars) =

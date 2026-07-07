@@ -92,5 +92,28 @@ try {
 }
 assertTrue("SQL error is catchable as type='database'", caughtAsDatabase);
 
+// --- queryNew() with a flat scalar array chunks by column count into rows ---
+// Lucee: queryNew("width,height","int,int",[100,200]) is ONE row (not two
+// single-value rows). Preside's AssetManagerService.getAssetDimensions relies
+// on this — its mocks build dimension queries this way and read q.width/q.height
+// as scalars. A flat array whose length is a multiple of the column count is
+// chunked into rows of columns.len() values.
+qOneRow = queryNew("width,height", "int,int", [100, 200]);
+assert("flat array -> one row", qOneRow.recordCount, 1);
+assert("flat array row width scalar", qOneRow.width, 100);
+assert("flat array row height scalar", qOneRow.height, 200);
+assertTrue("flat array width isNumeric", isNumeric(qOneRow.width));
+qTwoRows = queryNew("a,b", "int,int", [1, 2, 3, 4]);
+assert("flat array -> two rows", qTwoRows.recordCount, 2);
+assert("row1 a", queryGetRow(qTwoRows, 1).a, 1);
+assert("row2 b", queryGetRow(qTwoRows, 2).b, 4);
+// Single-column shortcut still yields one row per scalar (unchanged behaviour).
+qSingleCol = queryNew("id", "int", [1, 2, 3]);
+assert("single-column flat array -> row per value", qSingleCol.recordCount, 3);
+// Array-of-arrays (explicit rows) and array-of-structs unaffected.
+qRows = queryNew("a,b", "int,int", [[10, 20], [30, 40]]);
+assert("array-of-arrays -> two rows", qRows.recordCount, 2);
+assert("array-of-arrays row2 a", queryGetRow(qRows, 2).a, 30);
+
 suiteEnd();
 </cfscript>

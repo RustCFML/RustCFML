@@ -5694,31 +5694,53 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
         _ => Vec::new(),
     };
     let mut rows: Vec<ValueMap> = Vec::new();
-    // 3rd arg: initial data as array of arrays or array of structs
+    // 3rd arg: initial data as array of arrays, array of structs, or a flat
+    // array of scalars.
     if args.len() >= 3 {
         if let CfmlValue::Array(data_rows) = &args[2] {
-            for row_data in data_rows.iter() {
-                match row_data {
-                    CfmlValue::Array(values) => {
-                        // Array of arrays: each inner array maps positionally to columns
-                        let mut row = ValueMap::default();
-                        for (i, val) in values.iter().enumerate() {
-                            if i < columns.len() {
-                                row.insert(columns[i].clone(), val.clone());
+            let data: Vec<CfmlValue> = data_rows.snapshot();
+            // A FLAT array of scalars (no inner arrays/structs) is chunked by
+            // column count into rows — Lucee semantics: queryNew("a,b","..",
+            // [1,2,3,4]) yields two rows {a:1,b:2},{a:3,b:4}, and the common
+            // single-column case ([1,2,3] over one column) still yields one row
+            // per value. A single leftover chunk fills the leading columns.
+            let flat_scalars = !data.is_empty()
+                && !columns.is_empty()
+                && data
+                    .iter()
+                    .all(|v| !matches!(v, CfmlValue::Array(_) | CfmlValue::Struct(_)));
+            if flat_scalars {
+                for chunk in data.chunks(columns.len()) {
+                    let mut row = ValueMap::default();
+                    for (i, val) in chunk.iter().enumerate() {
+                        row.insert(columns[i].clone(), val.clone());
+                    }
+                    rows.push(row);
+                }
+            } else {
+                for row_data in data.iter() {
+                    match row_data {
+                        CfmlValue::Array(values) => {
+                            // Array of arrays: each inner array maps positionally to columns
+                            let mut row = ValueMap::default();
+                            for (i, val) in values.iter().enumerate() {
+                                if i < columns.len() {
+                                    row.insert(columns[i].clone(), val.clone());
+                                }
                             }
+                            rows.push(row);
                         }
-                        rows.push(row);
-                    }
-                    CfmlValue::Struct(s) => {
-                        rows.push(s.snapshot());
-                    }
-                    _ => {
-                        // Single-column shortcut: wrap scalar in a row
-                        let mut row = ValueMap::default();
-                        if !columns.is_empty() {
-                            row.insert(columns[0].clone(), row_data.clone());
+                        CfmlValue::Struct(s) => {
+                            rows.push(s.snapshot());
                         }
-                        rows.push(row);
+                        _ => {
+                            // Single-column shortcut: wrap scalar in a row
+                            let mut row = ValueMap::default();
+                            if !columns.is_empty() {
+                                row.insert(columns[0].clone(), row_data.clone());
+                            }
+                            rows.push(row);
+                        }
                     }
                 }
             }

@@ -354,6 +354,22 @@ assertThrows("imageGetBufferedImage is unsupported", function() {
     imageGetBufferedImage(iptcImg);
 });
 
+// --- Decoding non-image bytes throws a java.io.IOException-typed error ---
+// Lucee/ACF's ImageIO.read throws IOException on undecodable bytes, and CFML
+// code catches that exact type (e.g. Preside's NativeImageService.resize does
+// `catch("java.io.IOException"){ throw notAnImage }`). A generic runtime type
+// would slip past that catch.
+notImageBytes = toBinary(toBase64("this is definitely not an image"));
+imgErrType = "";
+try {
+    imageNew(notImageBytes);
+} catch (java.io.IOException e) {
+    imgErrType = "io";
+} catch (any e) {
+    imgErrType = "other:" & e.type;
+}
+assert("imageNew on non-image throws java.io.IOException", imgErrType, "io");
+
 // cleanup
 for (p in [pngPath, jpgPath, misnamed, tmpDir & "/rustcfml_cfimage_write.png"]) {
     if (fileExists(p)) { fileDelete(p); }

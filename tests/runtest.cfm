@@ -17,6 +17,6 @@
     <cfinclude template="harness.cfm">
     <cftry>
         <cfinclude template="#attributes.file#">
-        <cfcatch type="any"><cfoutput>ERROR | #attributes.file# | #cfcatch.message##chr(10)#</cfoutput></cfcatch>
+        <cfcatch type="any"><cfset suiteAbort(attributes.file, cfcatch.message)></cfcatch>
     </cftry>
 </cfif>
