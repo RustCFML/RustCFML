@@ -4367,7 +4367,19 @@ impl CfmlVirtualMachine {
                     // same-named key inherited from the caller. Removing it
                     // from `inherited_or_param_keys` makes the subsequent
                     // `local.x` reads return this frame's value.
+                    //
+                    // GH #243: CFML is case-insensitive, so `var fileName` must
+                    // also reclaim an inherited key stored under a DIFFERENT
+                    // casing (`filename`, carried in from an ancestor's
+                    // `argumentCollection` overflow arg). Removing only the
+                    // exact-cased key left the CI variant flagged inherited, so
+                    // the subsequent `StoreLocal` (via scope_insert_ci) wrote into
+                    // that still-inherited key and `build_local_scope_view`
+                    // filtered the write straight back out — the local assignment
+                    // was silently lost. Drop every CI-matching entry.
                     inherited_or_param_keys.remove(name);
+                    let name_lower = name.to_lowercase();
+                    inherited_or_param_keys.retain(|k| !k.eq_ignore_ascii_case(&name_lower));
                 }
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
@@ -7750,6 +7762,20 @@ impl CfmlVirtualMachine {
                 BytecodeOp::RestoreException => {
                     if let Some(saved) = self.exception_save_stack.pop() {
                         self.last_exception = saved;
+                    }
+                }
+                BytecodeOp::SetLastExceptionFromLocal(name) => {
+                    // GH #244: re-point `last_exception` at the exception bound to
+                    // the enclosing catch clause's variable (the full cfcatch
+                    // struct) so the following Rethrow re-raises it, not an
+                    // already-handled inner exception left in the register by a
+                    // nested try/catch. A missing local (shouldn't happen for a
+                    // real catch var) leaves the register untouched.
+                    let name_lower = name.to_lowercase();
+                    if let Some(v) = self.lookup_name_in_scopes(name.as_str(), &name_lower, &locals) {
+                        if !matches!(v, CfmlValue::Null) {
+                            self.last_exception = Some(v);
+                        }
                     }
                 }
 
@@ -25347,6 +25373,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::TryStart(_) | BytecodeOp::TryEnd => (0, 0),
         // Operate only on the internal exception save-stack, not the operand stack.
         BytecodeOp::SaveException | BytecodeOp::RestoreException => (0, 0),
+        BytecodeOp::SetLastExceptionFromLocal(_) => (0, 0),
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
         BytecodeOp::CatchMatch(_) => (1, 0), // peeks exception, pushes match bool
         // Method call: pops obj + args, pushes 1

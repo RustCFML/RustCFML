@@ -97,6 +97,13 @@ pub struct CfmlCompiler {
     /// runtime Return op does not run finallys; a `rethrow` in a catch runs the
     /// innermost (its own try's) finally before propagating.
     finally_stack: Vec<Vec<Statement>>,
+    /// Names of the catch variables for the enclosing catch clauses currently
+    /// being compiled (innermost last). GH #244: `rethrow` re-raises the
+    /// exception caught by its enclosing catch clause; the runtime
+    /// `last_exception` register can have been clobbered by a nested try/catch
+    /// in the same catch body, so before emitting `Rethrow` we reset
+    /// `last_exception` from this variable (which holds the full cfcatch struct).
+    catch_var_stack: Vec<String>,
     /// Nesting depth of function-body compilation. 0 means page-scope; inside any
     /// UDF or CFC method this is > 0. Used to gate the `variables.x` peephole:
     /// at page scope `variables.x` is a read of globals (LoadGlobal semantics),
@@ -409,6 +416,13 @@ pub enum BytecodeOp {
     // actually caught.
     SaveException,
     RestoreException,
+    // GH #244: reset the engine's "last exception" register from a local
+    // variable (the enclosing catch clause's caught-exception variable). Emitted
+    // just before a `rethrow` inside a catch body so it re-raises the exception
+    // THAT clause caught, even when a nested try/catch in the same body has since
+    // overwritten `last_exception` with an already-handled inner error. A no-op
+    // if the named local is undefined.
+    SetLastExceptionFromLocal(String),
     // Peek the exception value on top of the stack (does NOT consume it) and
     // push a boolean: does its `type` match this catch clause's declared type?
     // "any"/empty matches everything; otherwise case-insensitive exact match or
@@ -516,6 +530,7 @@ impl CfmlCompiler {
             },
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
+            catch_var_stack: Vec::new(),
             function_depth: 0,
             current_fn_local_mode: None,
             in_component_method: false,
@@ -1660,6 +1675,15 @@ impl CfmlCompiler {
                         self.finally_stack.push(p);
                     }
                 }
+                // GH #244: re-raise the exception caught by the enclosing catch
+                // clause, not whatever `last_exception` currently holds — a nested
+                // try/catch in the same catch body (or an inline finally above)
+                // may have overwritten it. The catch variable still holds the full
+                // cfcatch struct (type/message/detail/tagcontext). Emitted AFTER
+                // any inline finally so it wins.
+                if let Some(catch_var) = self.catch_var_stack.last() {
+                    instructions.push(BytecodeOp::SetLastExceptionFromLocal(catch_var.clone()));
+                }
                 instructions.push(BytecodeOp::Rethrow);
             }
             Statement::FunctionDecl(func_decl) => {
@@ -2694,9 +2718,14 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::JumpIfFalse(0)); // -> next clause's test
             // Matched: bind the exception to the catch variable (consumes it).
             instructions.push(BytecodeOp::StoreLocal(catch.var_name.clone()));
+            // GH #244: track the caught-exception variable so a `rethrow` in this
+            // body re-raises THIS clause's exception even if a nested try/catch
+            // clobbered `last_exception`.
+            self.catch_var_stack.push(catch.var_name.clone());
             for s in &catch.body {
                 self.compile_statement(s, instructions);
             }
+            self.catch_var_stack.pop();
             // Skip the remaining clauses and land on the shared finally/end.
             let j = instructions.len();
             instructions.push(BytecodeOp::Jump(0));
@@ -2769,6 +2798,7 @@ impl CfmlCompiler {
         // `produceMetadataUDF` regression).
         let saved_finally = std::mem::take(&mut self.finally_stack);
         let saved_loops = std::mem::take(&mut self.loop_stack);
+        let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
 
         // Emit default parameter value preamble:
         // For each param the caller did NOT supply, evaluate its default and seed
@@ -2806,6 +2836,7 @@ impl CfmlCompiler {
         self.current_fn_local_mode = prev_fn_local_mode;
         self.finally_stack = saved_finally;
         self.loop_stack = saved_loops;
+        self.catch_var_stack = saved_catch_vars;
 
         let bc_func = BytecodeFunction {
             name: func.name.clone(),
@@ -4261,6 +4292,7 @@ impl CfmlCompiler {
                 // body (see compile_function_decl for why).
                 let saved_finally = std::mem::take(&mut self.finally_stack);
                 let saved_loops = std::mem::take(&mut self.loop_stack);
+        let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
 
                 let mut func_instructions = Vec::new();
                 // Emit default parameter value preamble for closures
@@ -4287,6 +4319,7 @@ impl CfmlCompiler {
                 func_instructions.push(BytecodeOp::Return);
                 self.finally_stack = saved_finally;
                 self.loop_stack = saved_loops;
+        self.catch_var_stack = saved_catch_vars;
 
                 let func_name = format!("__closure_{}", self.program.functions.len());
                 let bc_func = BytecodeFunction {
@@ -4320,6 +4353,7 @@ impl CfmlCompiler {
                 // Function boundary: isolate finally/loop stacks for the body.
                 let saved_finally = std::mem::take(&mut self.finally_stack);
                 let saved_loops = std::mem::take(&mut self.loop_stack);
+        let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
                 let mut func_instructions = Vec::new();
                 // Emit default parameter value preamble for arrow functions
                 for param in &arrow.params {
@@ -4342,6 +4376,7 @@ impl CfmlCompiler {
                 func_instructions.push(BytecodeOp::Return);
                 self.finally_stack = saved_finally;
                 self.loop_stack = saved_loops;
+        self.catch_var_stack = saved_catch_vars;
 
                 let func_name = format!("__arrow_{}", self.program.functions.len());
                 let bc_func = BytecodeFunction {
