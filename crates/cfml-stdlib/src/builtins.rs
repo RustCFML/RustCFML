@@ -1341,17 +1341,39 @@ fn fn_replace_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// Byte offset in `s` for the given 0-based CHARACTER index. Returns `s.len()`
+/// when the index is at or past the end (usable directly as a search start).
+fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or_else(|| s.len())
+}
+
+/// 0-based CHARACTER count preceding the given byte offset in `s`.
+fn byte_to_char_index(s: &str, byte_idx: usize) -> usize {
+    s[..byte_idx.min(s.len())].chars().count()
+}
+
+/// Char-based substring search. `start_char` is a 0-based character index.
+/// Returns a 1-based CHARACTER position, or 0 if not found. CFML positions are
+/// all character-based (Len/Mid/Left/Right are already char-based here), so
+/// Find must be too — a byte-based position desynced with Mid on any non-ASCII
+/// string (GitHub #248).
+fn find_substr_char(haystack: &str, needle: &str, start_char: usize) -> i64 {
+    if start_char > haystack.chars().count() {
+        return 0;
+    }
+    let byte_start = char_index_to_byte(haystack, start_char);
+    match haystack[byte_start..].find(needle) {
+        Some(bpos) => (byte_to_char_index(haystack, byte_start + bpos) + 1) as i64,
+        None => 0,
+    }
+}
+
 fn fn_find(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let substring = get_str(&args, 0);
         let string = get_str(&args, 1);
         let start = if args.len() >= 3 { get_int(&args, 2).max(1) as usize - 1 } else { 0 };
-        if start < string.len() {
-            if let Some(pos) = string[start..].find(&substring) {
-                return Ok(CfmlValue::Int((pos + start + 1) as i64));
-            }
-        }
-        Ok(CfmlValue::Int(0))
+        Ok(CfmlValue::Int(find_substr_char(&string, &substring, start)))
     } else {
         Ok(CfmlValue::Int(0))
     }
@@ -1362,12 +1384,7 @@ fn fn_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
         let substring = get_str(&args, 0).to_lowercase();
         let string = get_str(&args, 1).to_lowercase();
         let start = if args.len() >= 3 { get_int(&args, 2).max(1) as usize - 1 } else { 0 };
-        if start < string.len() {
-            if let Some(pos) = string[start..].find(&substring) {
-                return Ok(CfmlValue::Int((pos + start + 1) as i64));
-            }
-        }
-        Ok(CfmlValue::Int(0))
+        Ok(CfmlValue::Int(find_substr_char(&string, &substring, start)))
     } else {
         Ok(CfmlValue::Int(0))
     }
@@ -1442,10 +1459,15 @@ fn fn_insert(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         let substring = get_str(&args, 0);
         let string = get_str(&args, 1);
-        let pos = get_int(&args, 2).max(0) as usize;
+        // `pos` is a CHARACTER offset (insert AFTER this many chars). Byte-based
+        // insert_str desynced with the char-based Find/Mid family and could panic
+        // on a non-char-boundary offset for non-ASCII input (GitHub #248).
+        let pos_char = get_int(&args, 2).max(0) as usize;
+        let char_count = string.chars().count();
         let mut result = string.clone();
-        if pos <= result.len() {
-            result.insert_str(pos, &substring);
+        if pos_char <= char_count {
+            let byte_pos = char_index_to_byte(&string, pos_char);
+            result.insert_str(byte_pos, &substring);
         }
         Ok(CfmlValue::string(result))
     } else {
@@ -1527,7 +1549,11 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     }
     let pattern = get_str(&args, 0);
     let string = get_str(&args, 1);
-    let start = if args.len() >= 3 { (get_int(&args, 2).max(1) as usize).saturating_sub(1) } else { 0 };
+    // The `start` argument is a 1-based CHARACTER offset; convert to a byte
+    // offset for the regex engine. Returned match positions/lengths are mapped
+    // back to characters below so reFind stays consistent with Mid/Len/Find
+    // on non-ASCII input (GitHub #248).
+    let start_char = if args.len() >= 3 { (get_int(&args, 2).max(1) as usize).saturating_sub(1) } else { 0 };
     let return_sub = if args.len() >= 4 { args[3].is_true() } else { false };
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
@@ -1544,7 +1570,7 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     // `reFind("^a","xax",2)` wrongly returned 2 instead of 0. Returned match
     // offsets from these APIs are already absolute, so they are NOT re-adjusted.
     // Clamp to len so an out-of-range start can't panic.
-    let start = start.min(string.len());
+    let start = char_index_to_byte(&string, start_char).min(string.len());
 
     if return_sub {
         if let Some(caps) = re.captures_at_start(&string, start) {
@@ -1553,8 +1579,8 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
             let mut len_arr = Vec::new();
             for cap in &caps {
                 if let Some((m_start, m_str)) = cap {
-                    pos_arr.push(CfmlValue::Int((*m_start + 1) as i64));
-                    len_arr.push(CfmlValue::Int(m_str.len() as i64));
+                    pos_arr.push(CfmlValue::Int((byte_to_char_index(&string, *m_start) + 1) as i64));
+                    len_arr.push(CfmlValue::Int(m_str.chars().count() as i64));
                     match_arr.push(CfmlValue::string(m_str.clone()));
                 } else {
                     pos_arr.push(CfmlValue::Int(0));
@@ -1576,7 +1602,7 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
         }
     } else {
         match re.find_at_start(&string, start) {
-            Some(m_start) => Ok(CfmlValue::Int((m_start + 1) as i64)),
+            Some(m_start) => Ok(CfmlValue::Int((byte_to_char_index(&string, m_start) + 1) as i64)),
             None => Ok(CfmlValue::Int(0)),
         }
     }
