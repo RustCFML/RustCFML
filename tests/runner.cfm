@@ -277,6 +277,7 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_new_keyword_path.cfm">
 <!--- - component_internals_serialize_leak: iterating a component (for(k in obj)) --->
 <!--- or SerializeJSON(obj) must expose only data members, never engine --->
 <!--- internals. RustCFML leaks __name/__source_file/__variables into both, and --->

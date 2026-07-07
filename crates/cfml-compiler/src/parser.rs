@@ -4761,6 +4761,7 @@ impl Parser {
             Token::Implements => "implements", Token::Interface => "interface",
             Token::Public => "public", Token::Private => "private",
             Token::Remote => "remote", Token::Package => "package",
+            Token::Static => "static",
             Token::True => "true", Token::False => "false", Token::Null => "null",
             Token::Contains => "contains", Token::NotKeyword => "not",
             Token::AndKeyword => "and", Token::OrKeyword => "or", Token::XorKeyword => "xor",
@@ -5877,10 +5878,28 @@ impl Parser {
                         name_parts.push(first);
                     }
                     while self.check(&Token::Dot) {
-                        if let Token::Identifier(_) = self.peek(1) {
+                        // Accept reserved-word segments (public/private/remote/
+                        // package/static, …) as ordinary path parts. JVM engines
+                        // only reserve these words in modifier/statement position,
+                        // never inside a dotted component path after `new`, so
+                        // `new pkg.public.Inner()` and `new pkg.Public()` are
+                        // valid (GitHub #246). extract_property_name accepts the
+                        // full keyword set; guard the dot-consume with the same
+                        // set via is_identifier_like_at + the reserved words.
+                        let seg_ok = self.is_identifier_like_at(1)
+                            || matches!(
+                                self.peek(1),
+                                Token::Public
+                                    | Token::Private
+                                    | Token::Remote
+                                    | Token::Package
+                                    | Token::Static
+                            );
+                        if seg_ok {
                             self.advance(); // consume dot
-                            if let Token::Identifier(part) = self.advance().token.clone() {
-                                name_parts.push(part);
+                            match self.extract_property_name() {
+                                Ok(part) => name_parts.push(part),
+                                Err(_) => break,
                             }
                         } else {
                             break;

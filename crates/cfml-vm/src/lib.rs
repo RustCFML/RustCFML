@@ -7356,9 +7356,30 @@ impl CfmlVirtualMachine {
                                 Some(t) => t,
                                 // Unresolved component path: throw rather than
                                 // instantiate an empty struct (Lucee/ACF parity).
+                                // Route through the in-loop try/catch mechanism so
+                                // a surrounding try/catch(any) can contain it —
+                                // exactly like CreateObject's resolution failure
+                                // and init()'s exceptions already do. A bare
+                                // `return Err` unwound past the active try handler
+                                // and escaped the request (GitHub #246).
                                 None => {
                                     let err = self.component_load_error(&class_name);
-                                    return Err(self.wrap_error(err));
+                                    let err = self.wrap_error(err);
+                                    if Self::is_control_flow_error(&err) {
+                                        return Err(err);
+                                    }
+                                    if let Some(handler) = self.try_stack.pop() {
+                                        while stack.len() > handler.stack_depth {
+                                            stack.pop();
+                                        }
+                                        self.restore_capture_state(&handler);
+                                        let error_val = self.resolve_catch_error_val(&err);
+                                        stack.push(error_val);
+                                        ip = handler.catch_ip;
+                                        continue;
+                                    } else {
+                                        return Err(err);
+                                    }
                                 }
                             }
                         };
