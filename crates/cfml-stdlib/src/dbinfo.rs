@@ -360,6 +360,7 @@ const COLUMNS_COLUMNS: &[&str] = &[
 
 const COLUMNS_ENRICHMENT: &[&str] = &[
     "IS_PRIMARYKEY",
+    "IS_AUTOINCREMENT",
     "IS_FOREIGNKEY",
     "REFERENCED_PRIMARYKEY",
     "REFERENCED_PRIMARYKEY_TABLE",
@@ -378,6 +379,7 @@ struct ColInfo {
     default_value: Option<String>,
     ordinal: i64,
     is_pk: bool,
+    is_autoincrement: bool,
 }
 
 fn type_columns(
@@ -418,6 +420,11 @@ fn type_columns(
                     Some(CfmlValue::Null) | None => None,
                     Some(v) => Some(v.as_string()),
                 };
+                // SQLite auto-increment is the INTEGER PRIMARY KEY rowid alias
+                // (with or without the AUTOINCREMENT keyword). Computed before
+                // `type_name` is moved into the struct.
+                let is_autoincrement =
+                    cell_int(&row, "pk") > 0 && type_name.eq_ignore_ascii_case("INTEGER");
                 cols.push(ColInfo {
                     table_cat: "main".to_string(),
                     table_schem: String::new(),
@@ -430,6 +437,7 @@ fn type_columns(
                     default_value: dflt,
                     ordinal: cell_int(&row, "cid") + 1,
                     is_pk: cell_int(&row, "pk") > 0,
+                    is_autoincrement,
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -453,7 +461,7 @@ fn type_columns(
                 Some(sc) => (
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, \
                      CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY \
+                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA \
                      FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     vec![s(sc), s(&table)],
@@ -461,7 +469,7 @@ fn type_columns(
                 None => (
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, \
                      CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY \
+                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA \
                      FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     vec![s(&table)],
@@ -505,6 +513,13 @@ fn type_columns(
                     default_value: dflt,
                     ordinal: cell_int(&row, "ORDINAL_POSITION"),
                     is_pk: cell_str(&row, "COLUMN_KEY").eq_ignore_ascii_case("PRI"),
+                    // MySQL/MariaDB flags auto-increment in the EXTRA column
+                    // ("auto_increment"), mirroring JDBC's IS_AUTOINCREMENT.
+                    // Preside's schema synchronizer reads column.is_autoincrement
+                    // (GitHub #254).
+                    is_autoincrement: cell_str(&row, "EXTRA")
+                        .to_lowercase()
+                        .contains("auto_increment"),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -575,6 +590,12 @@ fn type_columns(
                     column_size: size,
                     decimal_digits: cell_int(&row, "numeric_scale"),
                     nullable: cell_str(&row, "is_nullable").eq_ignore_ascii_case("YES"),
+                    // Postgres serial/bigserial columns default to nextval(seq);
+                    // that (or an IDENTITY default) is the auto-increment marker.
+                    is_autoincrement: dflt
+                        .as_deref()
+                        .map(|d| d.to_lowercase().contains("nextval"))
+                        .unwrap_or(false),
                     default_value: dflt,
                     ordinal: cell_int(&row, "ordinal_position"),
                 });
@@ -660,6 +681,10 @@ fn type_columns(
                     nullable: cell_str(&row, "IS_NULLABLE").eq_ignore_ascii_case("YES"),
                     default_value: dflt,
                     ordinal: cell_int(&row, "ORDINAL_POSITION"),
+                    // SQL Server IDENTITY is not exposed via INFORMATION_SCHEMA
+                    // (it needs COLUMNPROPERTY(...,'IsIdentity')); left false as a
+                    // best-effort default (the reported case is MySQL, GitHub #254).
+                    is_autoincrement: false,
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -745,6 +770,10 @@ fn type_columns(
             row.insert(
                 "IS_PRIMARYKEY".to_string(),
                 s(if c.is_pk { "YES" } else { "NO" }),
+            );
+            row.insert(
+                "IS_AUTOINCREMENT".to_string(),
+                s(if c.is_autoincrement { "YES" } else { "NO" }),
             );
             match fk_map.get(&c.column_name.to_lowercase()) {
                 Some((pkcol, pktable)) => {

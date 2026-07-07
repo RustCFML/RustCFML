@@ -55,6 +55,14 @@ if (NOT dbiSkip) {
     assert("columns: type_name", cols.TYPE_NAME[2], "VARCHAR");
     assert("columns: column_size from decl", cols.COLUMN_SIZE[2], 40);
     assert("columns: is_primarykey", valueList(cols.IS_PRIMARYKEY), "YES,NO,NO");
+    // GitHub #254: IS_AUTOINCREMENT must be present (JDBC/Lucee parity) so
+    // Preside's schema synchronizer reading column.is_autoincrement doesn't
+    // throw. `id` is INTEGER PRIMARY KEY AUTOINCREMENT → YES; others NO.
+    assertTrue("columns: columnList has IS_AUTOINCREMENT",
+        listFindNoCase(cols.columnList, "IS_AUTOINCREMENT") GT 0);
+    assert("columns: is_autoincrement", valueList(cols.IS_AUTOINCREMENT), "YES,NO,NO");
+    // The read that regressed Preside on v0.408: column.is_autoincrement per row.
+    assert("columns: is_autoincrement member read on pk row", cols.IS_AUTOINCREMENT[1], "YES");
     assert("columns: is_foreignkey", valueList(cols.IS_FOREIGNKEY), "NO,NO,YES");
     assert("columns: referenced pk table", cols.REFERENCED_PRIMARYKEY_TABLE[3], "roles");
     assert("columns: referenced pk column", cols.REFERENCED_PRIMARYKEY[3], "role_id");
