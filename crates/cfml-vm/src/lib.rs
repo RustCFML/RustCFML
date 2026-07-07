@@ -8082,7 +8082,23 @@ impl CfmlVirtualMachine {
                                     (&cur_val, &result),
                                     (Some(CfmlValue::Struct(_)), CfmlValue::Bool(_))
                                 );
-                                if !clobbers_cfc && !bool_over_struct {
+                                // Java-shim guard: a shim method matched by the
+                                // `set*` implicit-setter rule (e.g.
+                                // System.setProperty, Map.put) returns a plain
+                                // value — the PRIOR value, or null when there was
+                                // none — NOT the new receiver. Writing that back
+                                // nulled/clobbered the variable holding the shim
+                                // (GitHub #249). Only skip when the result is not
+                                // itself a shim (chained `sb.append()` returns the
+                                // same shim and must still propagate).
+                                let shim_over_nonshim = matches!(
+                                    &cur_val,
+                                    Some(CfmlValue::Struct(cur)) if cur.contains_key("__java_shim")
+                                ) && !matches!(
+                                    &result,
+                                    CfmlValue::Struct(res) if res.contains_key("__java_shim")
+                                );
+                                if !clobbers_cfc && !bool_over_struct && !shim_over_nonshim {
                                     self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
                                 }
                             }
@@ -17967,7 +17983,17 @@ impl CfmlVirtualMachine {
                             "handlegetobject" | "getobject" | "getstring"
                         ))
                     || (java_class == "java.util.enumeration"
-                        && matches!(method_lower.as_str(), "nextelement" | "next"));
+                        && matches!(method_lower.as_str(), "nextelement" | "next"))
+                    // System.setProperty/getProperty/clearProperty/getenv return
+                    // null authoritatively (no prior value / unset key). Falling
+                    // through would let the generic implicit-setter treat
+                    // setProperty(k,v) as `set`+`Property` and write the (null)
+                    // result over the receiver variable (GitHub #249).
+                    || (java_class == "java.lang.system"
+                        && matches!(
+                            method_lower.as_str(),
+                            "setproperty" | "getproperty" | "clearproperty" | "getenv"
+                        ));
                 match result {
                     Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the

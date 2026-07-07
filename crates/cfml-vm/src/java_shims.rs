@@ -4,6 +4,18 @@ use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
+/// Process-global system-properties map, shared by every `java.lang.System`
+/// shim instance (mirrors the JVM's single process-wide property table). Written
+/// by `setProperty`, read by `getProperty` (GitHub #249). A plain string map —
+/// no JVM required.
+fn system_property_store(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static PROPS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    PROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Build a bare java-shim marker map for `class`.
 fn java_shim_map(class: &str) -> ValueMap {
     let mut m = ValueMap::default();
@@ -901,7 +913,80 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("__path".to_string(), CfmlValue::string(path));
+            // Static fields exposed as instance keys so both
+            // `File.separator` and `f.separator` resolve (GitHub #245). Reading
+            // an absent one used to throw `Variable 'separator' is undefined`.
+            let sep = std::path::MAIN_SEPARATOR.to_string();
+            let path_sep = if cfg!(unix) { ":" } else { ";" }.to_string();
+            shim.insert("separator".to_string(), CfmlValue::string(sep.clone()));
+            shim.insert("separatorChar".to_string(), CfmlValue::string(sep));
+            shim.insert("pathSeparator".to_string(), CfmlValue::string(path_sep.clone()));
+            shim.insert("pathSeparatorChar".to_string(), CfmlValue::string(path_sep));
             Ok(CfmlValue::strukt(shim))
+        }
+        "mkdirs" | "mkdir" => {
+            // mkdirs() creates the directory and all missing parents; mkdir()
+            // creates a single level (parent must exist). Both return boolean
+            // per the JDK contract: true if created, false on failure — no throw
+            // (GitHub #245). Wheels uses this as its cross-engine recursive-mkdir
+            // idiom because Adobe CF rejects DirectoryCreate's createPath flag.
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    let p = std::path::Path::new(path.as_str());
+                    // JDK returns false (not error) if the directory already exists.
+                    if p.is_dir() {
+                        return Ok(CfmlValue::Bool(false));
+                    }
+                    let res = if method == "mkdirs" {
+                        std::fs::create_dir_all(p)
+                    } else {
+                        std::fs::create_dir(p)
+                    };
+                    return Ok(CfmlValue::Bool(res.is_ok()));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "delete" => {
+            // File.delete(): remove a file or (empty) directory; boolean result,
+            // no throw — matches the JDK contract.
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    let p = std::path::Path::new(path.as_str());
+                    let res = if p.is_dir() {
+                        std::fs::remove_dir(p)
+                    } else {
+                        std::fs::remove_file(p)
+                    };
+                    return Ok(CfmlValue::Bool(res.is_ok()));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "createnewfile" => {
+            // Atomically create a new empty file; true if created, false if it
+            // already existed (JDK contract).
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    let p = std::path::Path::new(path.as_str());
+                    if p.exists() {
+                        return Ok(CfmlValue::Bool(false));
+                    }
+                    return Ok(CfmlValue::Bool(std::fs::File::create(p).is_ok()));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "getparent" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    return Ok(std::path::Path::new(path.as_str())
+                        .parent()
+                        .map(|p| CfmlValue::string(p.to_string_lossy().to_string()))
+                        .unwrap_or(CfmlValue::Null));
+                }
+            }
+            Ok(CfmlValue::Null)
         }
         "tostring" => {
             // java.io.File.toString() returns the original path as given.
@@ -1309,16 +1394,51 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
             let folded = (raw ^ (raw >> 32)) & 0x7fff_ffff;
             Ok(CfmlValue::Int(folded as i64))
         }
+        "setproperty" => {
+            // System.setProperty(key, value): store into the process-global map,
+            // return the PREVIOUS value (or null if none) — never touch the
+            // variable holding the receiver. The value persists process-wide and
+            // is visible through any System reference (GitHub #249).
+            // Member dispatch prepends the receiver shim; skip shim-struct args.
+            let reals: Vec<&CfmlValue> = args
+                .iter()
+                .filter(|a| !matches!(a, CfmlValue::Struct(s) if s.contains_key("__java_shim")))
+                .collect();
+            let key = reals.first().map(|v| v.as_string()).unwrap_or_default();
+            let value = reals.get(1).map(|v| v.as_string()).unwrap_or_default();
+            if key.is_empty() {
+                return Ok(CfmlValue::Null);
+            }
+            let prev = system_property_store().lock().unwrap().insert(key, value);
+            match prev {
+                Some(p) => Ok(CfmlValue::string(p)),
+                None => Ok(CfmlValue::Null),
+            }
+        }
+        "clearproperty" => {
+            let reals: Vec<&CfmlValue> = args
+                .iter()
+                .filter(|a| !matches!(a, CfmlValue::Struct(s) if s.contains_key("__java_shim")))
+                .collect();
+            let key = reals.first().map(|v| v.as_string()).unwrap_or_default();
+            let prev = system_property_store().lock().unwrap().remove(&key);
+            match prev {
+                Some(p) => Ok(CfmlValue::string(p)),
+                None => Ok(CfmlValue::Null),
+            }
+        }
         "getproperty" => {
             // Some callers pass the key as the first "real" arg, but member
             // dispatch prepends the object — skip leading shim structs.
-            let key = args
+            let reals: Vec<&CfmlValue> = args
                 .iter()
-                .find_map(|a| match a {
-                    CfmlValue::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+                .filter(|a| !matches!(a, CfmlValue::Struct(s) if s.contains_key("__java_shim")))
+                .collect();
+            let key = reals.first().map(|v| v.as_string()).unwrap_or_default();
+            // A previously set property wins over the built-in fallbacks.
+            if let Some(v) = system_property_store().lock().unwrap().get(&key) {
+                return Ok(CfmlValue::string(v.clone()));
+            }
             let val = match key.to_lowercase().as_str() {
                 "os.name" => std::env::consts::OS.to_string(),
                 "file.separator" => std::path::MAIN_SEPARATOR.to_string(),
@@ -1329,6 +1449,7 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                         ";".to_string()
                     }
                 }
+                "line.separator" => "\n".to_string(),
                 "user.dir" => std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default(),
@@ -1336,7 +1457,15 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                     .or_else(|_| std::env::var("USERPROFILE"))
                     .unwrap_or_default(),
                 "java.version" => "rustcfml".to_string(),
-                _ => String::new(),
+                // Unset key: the JVM returns null (isNull() true), NOT "" — a
+                // "" flipped portable isNull() save/restore guards (GitHub #249).
+                // A `getProperty(key, default)` 2-arg form returns the default.
+                _ => {
+                    return Ok(reals
+                        .get(1)
+                        .map(|v| CfmlValue::string(v.as_string()))
+                        .unwrap_or(CfmlValue::Null));
+                }
             };
             Ok(CfmlValue::string(val))
         }
@@ -1351,7 +1480,11 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 _ => None,
             });
             match key {
-                Some(k) => Ok(CfmlValue::string(std::env::var(k.as_str()).unwrap_or_default())),
+                // Unset env var → null (JVM parity), not "" — matching getProperty.
+                Some(k) => match std::env::var(k.as_str()) {
+                    Ok(v) => Ok(CfmlValue::string(v)),
+                    Err(_) => Ok(CfmlValue::Null),
+                },
                 None => {
                     let mut env = ValueMap::default();
                     env.insert(

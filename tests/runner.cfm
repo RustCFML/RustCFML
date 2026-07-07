@@ -493,6 +493,8 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_security.cfm">
 <cf_runtest file="java_shims/test_stringbuilder.cfm">
 <cf_runtest file="java_shims/test_system.cfm">
+<cf_runtest file="java_shims/test_system_properties.cfm">
+<cf_runtest file="java_shims/test_file_mkdirs_separator.cfm">
 <cf_runtest file="java_shims/test_concurrent_map.cfm">
 <cf_runtest file="java_shims/test_map_higher_order.cfm">
 <cf_runtest file="java_shims/test_soft_reference.cfm">
