@@ -13266,6 +13266,18 @@ impl CfmlVirtualMachine {
                     // handler applies the writeback in the caller's frame.
                     let mut deliveries: Vec<(String, CfmlValue)> = Vec::new();
                     if let Some(rn) = result_name {
+                        // `returnType` only reshapes the RETURNED value; the
+                        // `result` variable ALWAYS receives the standard query
+                        // metadata struct and is never the same object as the
+                        // return (Lucee/ACF/BoxLang). A returnType=struct/array
+                        // result is a plain Struct/Array of row data, so the
+                        // Struct arm must NOT treat it as mutation metadata —
+                        // that clobbered `result` with the data and lost `sql`
+                        // (GitHub #247). We synthesize the metadata from the
+                        // shaped value instead (recordCount + columnList from the
+                        // row keys), matching the array/struct branches.
+                        let rt = return_type_opt.as_deref().unwrap_or("query");
+                        let is_shaped = rt == "array" || rt.starts_with("struct");
                         let result_struct = match &ret {
                             CfmlValue::Query(q) => {
                                 let mut m = ValueMap::default();
@@ -13287,19 +13299,43 @@ impl CfmlVirtualMachine {
                                 m.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
                                 CfmlValue::strukt(m)
                             }
-                            // Mutation metadata struct from the driver — it IS
-                            // the result shape. Snapshot so the delivered
-                            // struct is independent of the returned one.
-                            CfmlValue::Struct(s) => CfmlValue::strukt(s.snapshot()),
+                            // Mutation metadata struct from the driver
+                            // (INSERT/UPDATE/DELETE) — it IS the result shape,
+                            // UNLESS returnType=struct made the returned struct a
+                            // data payload. Snapshot so the delivered struct is
+                            // independent of the returned one.
+                            CfmlValue::Struct(s) if !is_shaped => {
+                                CfmlValue::strukt(s.snapshot())
+                            }
                             other => {
+                                // returnType=array (Array of row structs) or
+                                // returnType=struct (Struct keyed by keyColumn,
+                                // values are row structs): derive metadata.
                                 let mut m = ValueMap::default();
-                                if let CfmlValue::Array(a) = other {
-                                    m.insert(
-                                        "recordCount".to_string(),
-                                        CfmlValue::Int(a.len() as i64),
-                                    );
-                                }
+                                let (record_count, first_row) = match other {
+                                    CfmlValue::Array(a) => {
+                                        (a.len(), a.snapshot().into_iter().next())
+                                    }
+                                    CfmlValue::Struct(s) => {
+                                        let snap = s.snapshot();
+                                        let n = snap.len();
+                                        (n, snap.into_iter().next().map(|(_, v)| v))
+                                    }
+                                    _ => (0, None),
+                                };
+                                let column_list = match first_row {
+                                    Some(CfmlValue::Struct(row)) => row.keys().join(","),
+                                    _ => String::new(),
+                                };
+                                m.insert(
+                                    "recordCount".to_string(),
+                                    CfmlValue::Int(record_count as i64),
+                                );
                                 m.insert("cached".to_string(), CfmlValue::Bool(false));
+                                m.insert(
+                                    "columnList".to_string(),
+                                    CfmlValue::string(column_list),
+                                );
                                 m.insert("sql".to_string(), CfmlValue::string(sql_text.clone()));
                                 m.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
                                 CfmlValue::strukt(m)

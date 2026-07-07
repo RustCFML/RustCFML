@@ -812,6 +812,7 @@ include "harness.cfm";
 <cf_runtest file="qoq/test_qoq_custom_functions.cfm">
 <cf_runtest file="qoq/test_qoq_rustcfml_ext.cfm">
 <cf_runtest file="qoq/test_queryexecute_maxrows_list.cfm">
+<cf_runtest file="qoq/test_queryexecute_returntype_result.cfm">
 
 <!--- WebSocket / realtime: connection-free harness coverage (live-socket --->
 <!--- behaviour is covered by crates/cli/tests/websocket_raw.rs). --->
