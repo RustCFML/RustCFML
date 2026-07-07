@@ -38,6 +38,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_recursive_closure_var.cfm">
 <cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
 <cf_runtest file="core/test_closure_unscoped_reset.cfm">
+<cf_runtest file="core/test_closure_param_defaults.cfm">
 <cf_runtest file="core/test_server_scope_write.cfm">
 <cf_runtest file="core/test_compound_assignment.cfm">
 <cf_runtest file="core/test_undeclared_named_args.cfm">

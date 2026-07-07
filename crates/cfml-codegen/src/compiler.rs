@@ -4295,13 +4295,17 @@ impl CfmlCompiler {
         let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
 
                 let mut func_instructions = Vec::new();
-                // Emit default parameter value preamble for closures
+                // Emit default parameter value preamble for closures.
+                // Presence is tested against the `arguments` scope
+                // (JumpIfArgPresent), NOT `LoadLocal + IsNull`: the VM no longer
+                // pre-seeds an omitted param as a Null local, so `LoadLocal` on an
+                // absent param now THROWS `Variable 'X' is undefined` (post-v0.408
+                // strict undefined reads). Named functions were switched to this
+                // pattern for GitHub #240; closures/arrows must match (GitHub #255).
                 for param in &closure.params {
                     if let Some(ref default_expr) = param.default {
-                        func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
-                        func_instructions.push(BytecodeOp::IsNull);
                         let jump_idx = func_instructions.len();
-                        func_instructions.push(BytecodeOp::JumpIfFalse(0));
+                        func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
                         self.compile_expression(default_expr, &mut func_instructions);
                         func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
                         // Also update the arguments scope
@@ -4309,7 +4313,8 @@ impl CfmlCompiler {
                         func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
                         func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                         func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
-                        func_instructions[jump_idx] = BytecodeOp::JumpIfFalse(func_instructions.len());
+                        func_instructions[jump_idx] =
+                            BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
                     }
                 }
                 for s in &closure.body {
@@ -4355,13 +4360,13 @@ impl CfmlCompiler {
                 let saved_loops = std::mem::take(&mut self.loop_stack);
         let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
                 let mut func_instructions = Vec::new();
-                // Emit default parameter value preamble for arrow functions
+                // Emit default parameter value preamble for arrow functions.
+                // Uses JumpIfArgPresent (arguments-scope presence) for the same
+                // reason as closures/named functions — see GitHub #255 / #240.
                 for param in &arrow.params {
                     if let Some(ref default_expr) = param.default {
-                        func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
-                        func_instructions.push(BytecodeOp::IsNull);
                         let jump_idx = func_instructions.len();
-                        func_instructions.push(BytecodeOp::JumpIfFalse(0));
+                        func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
                         self.compile_expression(default_expr, &mut func_instructions);
                         func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
                         // Also update the arguments scope
@@ -4369,7 +4374,8 @@ impl CfmlCompiler {
                         func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
                         func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                         func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
-                        func_instructions[jump_idx] = BytecodeOp::JumpIfFalse(func_instructions.len());
+                        func_instructions[jump_idx] =
+                            BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
                     }
                 }
                 self.compile_expression(&arrow.body, &mut func_instructions);
