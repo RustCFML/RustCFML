@@ -1519,7 +1519,19 @@ impl CfmlQueryData {
         }
         let mut m = ValueMap::with_capacity_and_hasher(self.columns.len(), Default::default());
         for (ci, col) in self.columns.iter().enumerate() {
-            m.insert(col.clone(), self.data[ci][row].clone());
+            // A SQL-NULL cell surfaces as an empty string, not `Null`. This is
+            // the CFML default (`nullSupport = false`): every column of a query
+            // row is a PRESENT key whose NULL value reads as "". A `Null` here
+            // would make the column vanish from the row struct — `structKeyExists`
+            // / `structKeyList` / `cfparam` treat a Null-valued key as absent —
+            // so `for row in q { row.nullCol }` and a `param name="args.nullCol"
+            // type="string"` (Preside sitetree `_node.cfm`) would wrongly see the
+            // column as missing. Lucee/ACF include it as "".
+            let cell = match &self.data[ci][row] {
+                CfmlValue::Null => CfmlValue::string(String::new()),
+                other => other.clone(),
+            };
+            m.insert(col.clone(), cell);
         }
         Some(m)
     }

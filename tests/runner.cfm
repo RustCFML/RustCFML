@@ -214,6 +214,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_list_rest_literal_remainder.cfm">
 <cf_runtest file="stdlib/test_list_higher_order.cfm">
 <cf_runtest file="stdlib/test_query_functions.cfm">
+<cf_runtest file="stdlib/test_query_null_column.cfm">
 <cf_runtest file="stdlib/test_echo_and_mysql_sysvars.cfm">
 <cf_runtest file="stdlib/test_query_higher_order.cfm">
 <cf_runtest file="stdlib/test_type_checking.cfm">
