@@ -8172,6 +8172,23 @@ impl CfmlVirtualMachine {
                                 );
                                 if !clobbers_cfc && !bool_over_struct && !shim_over_nonshim {
                                     self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
+                                } else if bool_over_struct
+                                    && !cur_is_cfc
+                                    && Self::is_builtin_scope_name(var_name)
+                                {
+                                    // An in-place struct mutator on a SCOPE receiver
+                                    // (e.g. `request.delete("x")`, `request.clear()`)
+                                    // returns a bool and mutated the RECEIVER value.
+                                    // Some scopes (`request`, `session`) are loaded as
+                                    // a snapshot COPY, so the in-place change never
+                                    // reached the live scope — write the mutated
+                                    // receiver back so the mutation persists (Lucee
+                                    // parity: scopes are references; Preside's admin
+                                    // login relies on `request.delete(...)` to clear a
+                                    // cached struct). Live-handle scopes (application/
+                                    // server) self-alias-skip inside scope_aware_store,
+                                    // so this is a harmless re-write for them.
+                                    self.scope_aware_store(var_name, object.clone(), &mut locals, effective_local_mode_modern);
                                 }
                             }
                         } else if path.len() >= 2 && Self::is_mutating_method(&method_name) {
@@ -15656,6 +15673,19 @@ impl CfmlVirtualMachine {
     /// where the object becomes the first argument.
     /// Returns true if the method name is a mutating array/struct operation.
     /// These methods modify the receiver in-place in CFML (pass-by-reference semantics).
+    /// The reserved CFML scope names that `scope_aware_store` commits back to a
+    /// live per-request/-application/-session backing (as opposed to an ordinary
+    /// variable). Used to decide whether an in-place struct mutator invoked as a
+    /// member call (`request.delete("x")`) needs its mutated receiver written
+    /// back to the scope. A user variable that merely shares one of these names
+    /// is not a concern: these names are reserved scopes in CFML.
+    fn is_builtin_scope_name(name: &str) -> bool {
+        matches!(
+            name.to_lowercase().as_str(),
+            "request" | "session" | "application" | "variables" | "server" | "thread"
+        )
+    }
+
     fn is_mutating_method(method: &str) -> bool {
         let lower = method.to_lowercase();
         // Implicit property setters (setXxx) are mutating
