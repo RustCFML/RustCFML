@@ -20,6 +20,10 @@ component {
 		return this;
 	}
 
+	// No-op fluent step — returns `this` unchanged. Used to reproduce GH ##261:
+	// a chain whose FIRST step mutates nothing, then injects a closure member.
+	function noop(){ return this; }
+
 	// Returns a DIFFERENT CFC — the case the identity guard MUST keep skipping.
 	function getDep(){
 		if ( isNull( variables.dep ) ) { variables.dep = new FluentReturnThis(); }

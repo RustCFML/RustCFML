@@ -8558,6 +8558,44 @@ impl CfmlVirtualMachine {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
+                    // Re-sync the receiver into the shared closure env (GH #261).
+                    // The this/variables write-back above may have rebuilt the
+                    // receiver on a FRESH Arc — since #260, `return this` yields a
+                    // copy, so a fluent chain (`b.stub("v",1).stub("m2", ()=>…)`)
+                    // merges each step onto a new instance. But the closure env
+                    // still holds the receiver SNAPSHOT captured when the arrow
+                    // literal was created (before the member was injected). Left
+                    // stale, the reconcile below — or a later sibling call that
+                    // takes the same var as an argument (e.g. `structKeyExists(b,
+                    // …)`, a bare Call whose own reconcile has no receiver notion)
+                    // — pulls that pre-call snapshot back over the just-updated
+                    // receiver, dropping a function/closure member installed via
+                    // `this[k]=fn`. Push the authoritative post-call receiver into
+                    // the env so env and locals agree everywhere. Only when the
+                    // var was actually captured (env holds the key) and both sides
+                    // are the SAME instance (equal `__instance_id`) — never
+                    // clobber a genuinely different value sharing the name.
+                    if let (Some(env), Some(recv)) =
+                        (&closure_env, write_back.as_ref().and_then(|p| p.first()))
+                    {
+                        if let Some(cur) = locals.get(recv.as_str()).cloned() {
+                            let mut w = env.write().unwrap();
+                            let key = w
+                                .keys()
+                                .find(|k| k.eq_ignore_ascii_case(recv))
+                                .cloned();
+                            if let Some(key) = key {
+                                let same_instance = matches!(
+                                    (w.get(&key), &cur),
+                                    (Some(CfmlValue::Struct(old)), CfmlValue::Struct(new))
+                                        if Self::same_cfc_instance(old, new)
+                                );
+                                if same_instance {
+                                    w.insert(key, cur);
+                                }
+                            }
+                        }
+                    }
                     // A closure invoked behind this method (e.g. the method called
                     // `arguments.someClosure()`) writes back into the shared
                     // closure env, not this frame's `closure_parent_writeback`
