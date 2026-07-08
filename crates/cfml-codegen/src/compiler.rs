@@ -1559,7 +1559,20 @@ impl CfmlCompiler {
             }
             Statement::Return(ret) => {
                 if let Some(value) = &ret.value {
+                    // A return value is a VALUE position, so `return x = expr`
+                    // must yield the assigned value (Lucee/ACF/BoxLang), exactly
+                    // like an assignment used as an RHS. Without setting
+                    // `need_assign_value`, the assignment stored but left nothing
+                    // on the stack, so the function returned null — e.g. Preside's
+                    // `return alerts = obj.selectData(...)` returned null and the
+                    // caller's `criticalAlerts.recordCount` threw "undefined"
+                    // (surfaced on the admin sitetree once GH #259 was fixed).
+                    if matches!(value, Expression::BinaryOp(b) if b.operator == BinaryOpType::Assign)
+                    {
+                        self.need_assign_value = true;
+                    }
                     self.compile_expression(value, instructions);
+                    self.need_assign_value = false;
                 } else {
                     instructions.push(BytecodeOp::Null);
                 }

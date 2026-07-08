@@ -15,6 +15,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_return_assignment_expression.cfm">
 <cf_runtest file="core/test_local_scope_name_locals.cfm">
 <cf_runtest file="core/test_access_identifiers.cfm">
 <cf_runtest file="core/test_reserved_word_param_names.cfm">

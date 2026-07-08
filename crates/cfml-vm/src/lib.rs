@@ -1004,6 +1004,18 @@ pub struct CfmlVirtualMachine {
     pub source_file: Option<String>,
     /// Call stack for tracking execution
     call_stack: Vec<CallFrame>,
+    /// Per-frame call context for `build_call_parent_scope`, pushed for EVERY
+    /// executing frame — including `__main__`/`__cfc_body__` template frames,
+    /// which `call_stack` deliberately omits (they're the stack-trace root).
+    /// Each entry is `(inherited_from_parent, is_template_frame)`. A bare call
+    /// must inherit-filter against its IMMEDIATE caller frame, not the nearest
+    /// *pushed* function frame — otherwise a bare call from inside an `include`d
+    /// template (whose `__main__` isn't on `call_stack`) wrongly adopts an outer
+    /// method's inherited set and drops legitimate page vars the template holds
+    /// (GH #259: `controller` dropped when a nested Preside view called the
+    /// mixed-in `renderViewlet()`). Maintained in lockstep with `call_stack` via
+    /// `execute_function_with_args`'s truncate-to-entry-depth epilogue.
+    frame_ctx: Vec<(std::sync::Arc<std::collections::HashSet<String>>, bool)>,
     /// Try-catch handler stack
     try_stack: Vec<TryHandler>,
     /// Current exception (if any)
@@ -1667,6 +1679,7 @@ impl CfmlVirtualMachine {
             user_functions: HashMap::new(),
             source_file: None,
             call_stack: Vec::new(),
+            frame_ctx: Vec::new(),
             try_stack: Vec::new(),
             current_exception: None,
             last_exception: None,
@@ -3587,6 +3600,7 @@ impl CfmlVirtualMachine {
         parent_scope: Option<&ValueMap>,
     ) -> CfmlResult {
         let call_depth_before = self.call_stack.len();
+        let frame_ctx_before = self.frame_ctx.len();
         let try_depth_before = self.try_stack.len();
         let saved_buffers_before = self.saved_output_buffers.len();
 
@@ -3618,6 +3632,7 @@ impl CfmlVirtualMachine {
         // balanced clean exit (len == before) and __main__'s unconditional pop
         // (len < before) are both untouched; only a leaked frame is reclaimed.
         self.call_stack.truncate(call_depth_before);
+        self.frame_ctx.truncate(frame_ctx_before);
         self.try_stack.truncate(try_depth_before);
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
@@ -3858,6 +3873,14 @@ impl CfmlVirtualMachine {
             }
         }
         let inherited_from_parent = std::sync::Arc::new(inherited_from_parent);
+
+        // Record this frame's call context for `build_call_parent_scope`. Pushed
+        // for EVERY frame (templates included, unlike `call_stack`) so a bare
+        // call resolves its inherited-key filter against its true immediate
+        // caller. Balanced by the truncate-to-entry-depth in
+        // `execute_function_with_args` (robust to `__main__`'s early pop). GH #259.
+        self.frame_ctx
+            .push((inherited_from_parent.clone(), is_template_frame));
 
         // Build CFML arguments scope.
         //
@@ -15995,19 +16018,28 @@ impl CfmlVirtualMachine {
         // mutated vars). So it inherits the caller's data wholesale.
         let is_closure_expr =
             func_ref.name.starts_with("__closure_") || func_ref.name.starts_with("__arrow_");
-        // The caller is whatever frame is currently executing this call. A real
-        // function is on `call_stack`; a page/template frame (`__main__`) is
-        // NOT pushed, so an empty top means "called from page scope" — there the
-        // caller's locals ARE the page `variables` scope and all carry. When the
-        // caller IS a real function, only the keys it itself inherited (lexical/
-        // page scope + structural + helpers) propagate — never its own `var`
-        // locals or params, which would be dynamic scoping (not CFML). This is
-        // what stops a callee's bare `x ?: default` from silently reading the
-        // caller's same-named local.
+        // The caller is whatever frame is currently executing this call, read
+        // from `frame_ctx` (which — unlike `call_stack` — includes `__main__`/
+        // template frames). Cases:
+        //   • no frame, or the immediate caller is a TEMPLATE/page frame → None:
+        //     the caller's locals ARE the page `variables` scope, so all carry.
+        //   • the immediate caller is a real function → only the keys it itself
+        //     inherited (lexical/page scope + structural + helpers) propagate —
+        //     never its own `var` locals or params (that would be dynamic
+        //     scoping, not CFML). This stops a callee's bare `x ?: default` from
+        //     silently reading the caller's same-named local.
+        // Reading `call_stack.last()` here was the GH #259 bug: a bare call from
+        // inside an `include`d template found the nearest *pushed* function frame
+        // (e.g. Preside's `renderViewComposite`) and applied ITS inherited set,
+        // dropping page vars (`controller`) the template legitimately held.
         let caller_inherited = if is_closure_expr {
             None // closures capture the full enclosing scope; skip the filter
         } else {
-            self.call_stack.last().map(|f| f.inherited_from_parent.clone())
+            match self.frame_ctx.last() {
+                None => None,
+                Some((_, true)) => None, // immediate caller is a template/page frame
+                Some((inh, false)) => Some(inh.clone()),
+            }
         };
         for (k, v) in parent_locals {
             let carry = match &caller_inherited {
