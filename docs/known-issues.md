@@ -527,6 +527,33 @@ angle), `imageFlip`, `isImage`, `isImageFile`, `getReadableImageFormats`/
 - **HEIC/AVIF/JXL** decode is intentionally unsupported (their codecs need C libraries
   that don't build for wasm); Lucee treats those as optional codecs too.
 
+## 19. Mixed-in view helper cannot resolve the host Renderer's implicit accessors 🛑 *(GH [#259](https://github.com/RustCFML/RustCFML/issues/259))*
+
+A ColdBox/Preside **view helper** that is *mixed into* the Renderer and then calls one
+of the Renderer's **implicit accessors** (e.g. `getController()`) gets `null` back,
+because the mixed-in helper runs with the Renderer's `variables` scope but **without
+`this`** — so the implicit accessor can't bind to the component instance and returns
+the property's empty default instead of `variables.controller`.
+
+Symptom (Preside admin dashboard, `admin.sitetree.index`):
+
+```
+cannot call method [renderViewlet] on a null value
+```
+
+from `system/helpers/presideProxies.cfm` (`getController().renderViewlet(...)`).
+Debug at the call site: `getController() isNull=true`, `variables.controller` exists,
+`this` absent.
+
+- Reproduces only for a **mixed-in helper invoked without `this`** calling a host
+  implicit accessor. Implicit accessors called from a normal sibling method, or from a
+  UDF injected as a member and invoked as a method (both have `this`), resolve
+  correctly.
+- Likely area: how the engine includes a ColdBox view and mixes in the helper library
+  — the mixed-in functions do not retain the Renderer's `this`.
+- Impact: blocks rendering ColdBox admin UIs whose view helpers call the Renderer's
+  implicit accessors. (Preside boot + admin login/session work as of v0.430–v0.433.)
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*
