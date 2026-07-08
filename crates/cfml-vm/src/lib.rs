@@ -2688,7 +2688,7 @@ impl CfmlVirtualMachine {
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| "run".to_string());
                 let mut args: Vec<CfmlValue> = vec![];
-                self.call_member_function(&target, &method, &mut args, None)
+                self.call_member_function(&target, &method, &mut args, None, parent_locals)
             }
             _ => self.call_function(closure, vec![], parent_locals),
         };
@@ -8094,6 +8094,7 @@ impl CfmlVirtualMachine {
                                         &method_name,
                                         &mut extra_args,
                                         method_arg_names,
+                                        &locals,
                                     )
                                 }
                             } else {
@@ -8102,6 +8103,7 @@ impl CfmlVirtualMachine {
                                     &method_name,
                                     &mut extra_args,
                                     method_arg_names,
+                                    &locals,
                                 )
                             }
                         } else {
@@ -8110,6 +8112,7 @@ impl CfmlVirtualMachine {
                                 &method_name,
                                 &mut extra_args,
                                 method_arg_names,
+                                &locals,
                             )
                         };
                     self.try_stack = saved_try_stack_method;
@@ -8651,6 +8654,7 @@ impl CfmlVirtualMachine {
                             &method_name,
                             &mut extra_args,
                             computed_arg_names,
+                            &locals,
                         )
                     } else {
                         // Legacy index-then-call fallback for non-method receivers.
@@ -13084,6 +13088,7 @@ impl CfmlVirtualMachine {
                             &method_name,
                             &mut values,
                             Some(&names),
+                            parent_locals,
                         );
                         // cfinvoke has no target variable to receive a value-type
                         // writeback; the component's mutations already persist via
@@ -13152,6 +13157,7 @@ impl CfmlVirtualMachine {
                             &method_name,
                             &mut values,
                             Some(&names),
+                            parent_locals,
                         );
                         self.method_this_writeback = None;
                         return r;
@@ -17701,6 +17707,7 @@ impl CfmlVirtualMachine {
         method: &str,
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
+        caller_locals: &ValueMap,
     ) -> CfmlResult {
         #[cfg(feature = "observability")]
         {
@@ -17715,13 +17722,19 @@ impl CfmlVirtualMachine {
                 if let Some(src) = src {
                     let start = std::time::Instant::now();
                     self.template_frame_begin();
-                    let r = self.call_member_function_impl(object, method, extra_args, arg_names);
+                    let r = self.call_member_function_impl(
+                        object,
+                        method,
+                        extra_args,
+                        arg_names,
+                        caller_locals,
+                    );
                     self.template_frame_end(&src, start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
         }
-        self.call_member_function_impl(object, method, extra_args, arg_names)
+        self.call_member_function_impl(object, method, extra_args, arg_names, caller_locals)
     }
 
     /// Recover a component method whose stored `Function` references a
@@ -17806,6 +17819,7 @@ impl CfmlVirtualMachine {
         method: &str,
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
+        caller_locals: &ValueMap,
     ) -> CfmlResult {
         let method_lower = method.to_lowercase();
         // Caller's `__variables` (set by the CallMethod op). Used as a fallback
@@ -19319,22 +19333,43 @@ impl CfmlVirtualMachine {
                 }
                 method_locals.insert("this".to_string(), object.clone());
             } else if matches!(&func_ref, CfmlValue::Function(ref f) if f.captured_scope.is_none()) {
-                // Plain-struct receiver holding an UNBOUND component method
-                // (extracted via `this[item.name]` into a plain struct, then
-                // invoked as `item.beforeEach()`). CFML runs it with the CALLING
-                // frame's component `this`/`variables` — the same context a bare
-                // `f()` call inherits (the bare Call op forwards the caller's
-                // locals). Inject them so the method body's `this`/`variables`
-                // resolve to the caller's component instead of running detached.
+                // Plain-struct receiver holding an UNBOUND function. Two cases:
+                //
+                // (a) The CALLER is a component method (`caller_this`/
+                //     `caller_variables` set): an extracted-then-restored method
+                //     (`this[item.name]` into a plain struct, invoked as
+                //     `item.beforeEach()`) runs with the CALLING frame's
+                //     component `this`/`variables` — the same context a bare
+                //     `f()` call inherits. The mixin-semantics fix for #220.
+                //
+                // (b) NO component context — the caller is a page/plain-UDF
+                //     frame. Lucee/BoxLang treat a non-component UDF as
+                //     "see-through": its `variables` scope resolves to the
+                //     CALLER's `variables` (Railo UDFImpl._call never swaps the
+                //     variables scope; BoxLang FunctionBoxContext defers to the
+                //     parent context when not `isInClass()`). A page frame has no
+                //     materialized `__variables` handle, so thread the caller's
+                //     page locals as the parent scope — mirroring the bare Call
+                //     op, which forwards the frame's own locals. Without this a
+                //     UDF invoked via a stored reference (`request.helperRef()`)
+                //     ran fully detached and read an empty `variables` instead of
+                //     the caller's (GH #259). build_call_parent_scope still
+                //     applies the inherited-key filter, so no caller `var` local
+                //     leaks in.
+                //
                 // Only for unbound functions: a struct-stored closure with its
                 // own captured scope (`enc = { string: fn }`) keeps that scope.
-                // This is the mixin-semantics fix for #220 — replacing the
-                // eager GetIndex binding that wrongly froze the source scope.
-                if let Some(ref ct) = caller_this {
-                    method_locals.insert("this".to_string(), ct.clone());
-                }
-                if let Some(ref cv) = caller_variables {
-                    method_locals.insert("__variables".to_string(), cv.clone());
+                if caller_this.is_some() || caller_variables.is_some() {
+                    if let Some(ref ct) = caller_this {
+                        method_locals.insert("this".to_string(), ct.clone());
+                    }
+                    if let Some(ref cv) = caller_variables {
+                        method_locals.insert("__variables".to_string(), cv.clone());
+                    }
+                } else {
+                    for (k, v) in caller_locals {
+                        method_locals.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
                 }
             }
             self.closure_parent_writeback = None;
