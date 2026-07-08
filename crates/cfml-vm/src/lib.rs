@@ -24997,17 +24997,26 @@ impl CfmlVirtualMachine {
             "onRequestStart",
             vec![CfmlValue::string(target_page.clone())],
         ) {
-            Err(e) if e.message == "__cfabort" => {
-                // A request aborted in onRequestStart still fires onAbort, then
-                // ends (onRequest/target page/onRequestEnd are skipped).
+            Err(e) if e.message == "__cfabort" || e.message == "__cflocation_redirect" => {
+                // A request aborted in onRequestStart — via `cfabort` OR
+                // `cflocation`/`location()` (both unwind the same way) — still
+                // fires `onAbort`, then ends (onRequest/target page/onRequestEnd
+                // are skipped). This matters for frameworks that run the whole
+                // request inside `onRequestStart` and defer teardown to
+                // `onAbort`: Preside's ColdBox bootstrap runs there and persists
+                // its DB-backed session (setting the session cookie) in onAbort,
+                // so a redirect during request processing — e.g. the post-login
+                // relocate — MUST fire onAbort or the session (and its cookie) is
+                // never saved and the user can't stay logged in. cflocation
+                // previously returned here without firing onAbort.
                 let _ = self.call_lifecycle_method(
                     &mut template,
                     "onAbort",
                     vec![CfmlValue::string(target_page.clone())],
                 );
-                return Ok(CfmlValue::Null);
-            }
-            Err(e) if e.message == "__cflocation_redirect" => {
+                if session_management {
+                    let _ = self.sync_session_scope_to_store();
+                }
                 return Ok(CfmlValue::Null);
             }
             // An uncaught exception in onRequestStart aborts the request and is
