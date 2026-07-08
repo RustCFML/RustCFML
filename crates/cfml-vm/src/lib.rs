@@ -4048,6 +4048,20 @@ impl CfmlVirtualMachine {
                     } else {
                         name.as_str()
                     };
+                    // A declared parameter — or a genuine frame-local (`var x`) —
+                    // named after a built-in scope SHADOWS that scope: the CFML
+                    // cascade resolves `local`/`arguments` before `variables`,
+                    // `cgi`, `url`, `form`, `cookie`, `request`, `application`,
+                    // `server`, `session`. Without this, the scope-name arms below
+                    // returned the live scope struct unconditionally, so
+                    // `function f(cookie="x")` read the request's cookie scope
+                    // instead of the argument value (GitHub #256). `url`/`form`/
+                    // `cgi` were already correct precisely because they have no
+                    // dedicated arm and fall through to lookup_name_in_scopes.
+                    let scope_shadowed_by_local = (is_inside_function
+                        && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
+                        || declared_locals.contains(name.as_str())
+                        || declared_locals.contains(name_lower);
                     let val = if name_lower == "local" {
                         // `local` is strictly per-call (PR #93): only keys
                         // established in THIS frame are visible — inherited
@@ -4057,7 +4071,7 @@ impl CfmlVirtualMachine {
                             &locals,
                             &inherited_or_param_keys,
                         ))
-                    } else if name_lower == "variables"
+                    } else if name_lower == "variables" && !scope_shadowed_by_local
                     {
                         // Return a struct representing the variables scope.
                         // A `__variables` key means we're running in a component
@@ -4103,7 +4117,7 @@ impl CfmlVirtualMachine {
                         } else {
                             CfmlValue::strukt(locals.clone())
                         }
-                    } else if name_lower == "request" {
+                    } else if name_lower == "request" && !scope_shadowed_by_local {
                         CfmlValue::strukt(self.request_scope.snapshot())
                     } else if name_lower == "static" {
                         // The shared per-type static scope (see find_static_scope).
@@ -4171,7 +4185,7 @@ impl CfmlVirtualMachine {
                         // inherited) still wins, so a custom tag's own body reads its
                         // own attributes normally (this arm is skipped for it).
                         self.globals.get("attributes").cloned().unwrap()
-                    } else if name_lower == "application" {
+                    } else if name_lower == "application" && !scope_shadowed_by_local {
                         if let Some(ref app_scope) = self.application_scope {
                             // Live handle clone, not a snapshot, so `var p =
                             // application; p.x = 1` writes through (Lucee semantics).
@@ -4179,7 +4193,7 @@ impl CfmlVirtualMachine {
                         } else {
                             CfmlValue::strukt(ValueMap::default())
                         }
-                    } else if name_lower == "session" {
+                    } else if name_lower == "session" && !scope_shadowed_by_local {
                         // Attach the live session scope before returning it, so a
                         // bare `session` READ hands back the same Arc-backed
                         // handle on every read (Lucee scope-reference semantics).
@@ -4188,12 +4202,12 @@ impl CfmlVirtualMachine {
                         // the read-first scope-pointer caching pattern.
                         self.attach_session_scope();
                         self.get_session_scope()
-                    } else if name_lower == "cookie" {
+                    } else if name_lower == "cookie" && !scope_shadowed_by_local {
                         self.globals
                             .get("cookie")
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(ValueMap::default()))
-                    } else if name_lower == "server" {
+                    } else if name_lower == "server" && !scope_shadowed_by_local {
                         CfmlValue::Struct(self.live_server_scope())
                     } else if let Some(val) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
@@ -4467,6 +4481,13 @@ impl CfmlVirtualMachine {
                         } else if name_lower == "variables"
                             && !declared_locals.contains(name.as_str())
                             && !declared_locals.contains(&name_lower)
+                            // A declared param named after a scope is inherently
+                            // local (see the twin guards in the __variables and
+                            // LoadLocal arms) — its default-value store must NOT
+                            // round-trip into the live scope, where a non-struct
+                            // default is silently dropped and the read then leaks
+                            // the scope struct (GitHub #256).
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Bare `variables = …` / `variables.x = …` round-trip into
                             // the component/page `variables` scope. A user
@@ -4493,6 +4514,7 @@ impl CfmlVirtualMachine {
                         } else if name_lower == "request"
                             && !declared_locals.contains(name.as_str())
                             && !declared_locals.contains(&name_lower)
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Same declared-local guard as `variables`: a user
                             // `local.request = …` stays a plain local, not a
@@ -4503,6 +4525,7 @@ impl CfmlVirtualMachine {
                         } else if name_lower == "application"
                             && !declared_locals.contains(name.as_str())
                             && !declared_locals.contains(&name_lower)
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
                                 if let Some(ref app_scope) = self.application_scope {
@@ -4516,6 +4539,7 @@ impl CfmlVirtualMachine {
                         } else if name_lower == "session"
                             && !declared_locals.contains(name.as_str())
                             && !declared_locals.contains(&name_lower)
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
                                 self.set_session_scope(s.snapshot())?;

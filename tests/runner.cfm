@@ -24,6 +24,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_function_scope_capture.cfm">
 <cf_runtest file="core/test_bare_call_caller_stack_leak.cfm">
 <cf_runtest file="core/test_defaulted_param_variables_clobber.cfm">
+<cf_runtest file="core/test_scope_named_default_param.cfm">
 <cf_runtest file="core/test_boolean_literal_equality.cfm">
 <cf_runtest file="core/test_null_return_no_key.cfm">
 <cf_runtest file="core/test_undefined_member_throws.cfm">
