@@ -1618,6 +1618,15 @@ struct CallFrame {
     line: usize,
     /// Line in the caller where this function was invoked
     caller_line: usize,
+    /// Keys that were inherited INTO this frame from its parent scope (page/
+    /// component `variables`, structural scope keys, helper functions) — i.e.
+    /// the keys present in the `parent_scope` this frame was seeded from, before
+    /// its own params and `var`-locals were added. Used by
+    /// `build_call_parent_scope` to decide what may propagate to a callee: a
+    /// bare call from THIS frame carries these forward (they are lexical/page
+    /// scope) but NOT this frame's own local data (which would be dynamic
+    /// scoping — not CFML). `Arc` so the push stays cheap.
+    inherited_from_parent: std::sync::Arc<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3818,6 +3827,11 @@ impl CfmlVirtualMachine {
         // and is part of `local`.
         let mut inherited_or_param_keys: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Exactly the keys seeded from the parent scope (no params added) —
+        // stored in the call frame so a bare call from this frame knows which
+        // of its keys are lexical/page scope (propagate) vs its own locals.
+        let mut inherited_from_parent: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if let Some(parent) = parent_scope {
             for (k, v) in parent {
                 // Function values are normally skipped here: a named function /
@@ -3839,9 +3853,11 @@ impl CfmlVirtualMachine {
                 if carry {
                     locals.insert(k.clone(), v.clone());
                     inherited_or_param_keys.insert(k.clone());
+                    inherited_from_parent.insert(k.clone());
                 }
             }
         }
+        let inherited_from_parent = std::sync::Arc::new(inherited_from_parent);
 
         // Build CFML arguments scope.
         //
@@ -3978,6 +3994,7 @@ impl CfmlVirtualMachine {
                     .unwrap_or_default(),
                 line: 0,
                 caller_line: self.current_line,
+                inherited_from_parent: inherited_from_parent.clone(),
             });
         }
 
@@ -7880,6 +7897,24 @@ impl CfmlVirtualMachine {
                     // Pop the object (receiver)
                     let object = stack.pop().unwrap_or(CfmlValue::Null);
 
+                    // A PLAIN struct key holding a function shadows the built-in
+                    // member function of the same name (dispatched as a closure in
+                    // call_member_function_impl — Lucee parity, TestBox relies on
+                    // it). Such a call is a plain closure invocation and does NOT
+                    // mutate the receiver, so the mutating-method value-writeback
+                    // below must be suppressed — otherwise a struct key named
+                    // `append`/`sort`/`insert`/… (all `is_mutating_method`) would
+                    // clobber the struct variable with the closure's return value.
+                    // Restricted to plain structs (no __variables/__name) so CFC
+                    // method dispatch and its `this`-writeback are unaffected.
+                    let plain_struct_fn_member_shadows = matches!(&object,
+                        CfmlValue::Struct(ref s)
+                            if !s.contains_key("__variables")
+                                && !s.contains_key("__name")
+                                && !s.contains_key("__java_shim")
+                                && !s.contains_key("__is_super")
+                                && matches!(s.get_ci(method_name.as_str()), Some(CfmlValue::Function(_))));
+
                     // Record this frame's `__variables` so a method dispatched on
                     // a still-being-constructed receiver (no `__variables` of its
                     // own yet) can fall back to the caller's hoisted method table.
@@ -8080,6 +8115,9 @@ impl CfmlVirtualMachine {
                     // The compiler encodes a path vec: ["var"], ["var", "prop"], ["a", "b", "c"], etc.
                     // Skipped for super.method() — see is_super_call.
                     let write_back = if is_super_call { &None } else { write_back };
+                    // A shadowed plain-struct closure member never mutates its
+                    // receiver — skip the value-writeback entirely (see above).
+                    let write_back = if plain_struct_fn_member_shadows { &None } else { write_back };
                     if let Some(ref path) = write_back {
                         if path.len() == 1 {
                             // Direct variable write-back: var.method(args)
@@ -9306,33 +9344,15 @@ impl CfmlVirtualMachine {
             if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = func.body {
                 if let CfmlValue::Int(idx) = body.as_ref() {
                     if let Some(user_func) = self.resolve_fn(*idx) {
-                        // Handle closure scope merging
-                        let effective_locals;
-                        let effective_parent = if let Some(ref shared_env) = func.captured_scope {
-                            let is_cfc_method = parent_locals.contains_key("this");
-                            effective_locals = if is_cfc_method {
-                                let mut merged = shared_env.read().unwrap().clone();
-                                for (k, v) in parent_locals {
-                                    if matches!(v, CfmlValue::Function(_))
-                                        || !merged.contains_key(k)
-                                    {
-                                        merged.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                merged
-                            } else {
-                                let mut merged = shared_env.read().unwrap().clone();
-                                for (k, v) in parent_locals {
-                                    if !merged.contains_key(k) {
-                                        merged.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                merged
-                            };
-                            &effective_locals
-                        } else {
-                            parent_locals
-                        };
+                        // Handle closure scope merging. A callee's DATA scope is
+                        // its lexical/defining scope (`captured_scope`) — for a
+                        // CFC method that already carries the component's `this`
+                        // /`variables`. The CALL SITE's local data vars must NOT
+                        // leak in (CFML is not dynamically scoped); only helper
+                        // functions are carried so bare-name sibling/var-scoped
+                        // helpers stay callable (PR #198). See
+                        // `build_call_parent_scope`.
+                        let effective_parent = self.build_call_parent_scope(func, parent_locals);
                         // Lexical relative-component resolution: while a user
                         // function runs, a bare createObject("component","X")/
                         // `new X()` inside it must resolve X relative to the
@@ -9361,7 +9381,7 @@ impl CfmlVirtualMachine {
                         let result = self.execute_function_with_args(
                             &user_func,
                             args,
-                            Some(effective_parent),
+                            Some(&effective_parent),
                         );
                         if let Some(prev) = saved_source_file {
                             self.source_file = prev;
@@ -10122,22 +10142,8 @@ impl CfmlVirtualMachine {
             // merge it with parent_locals so the function retains access to its
             // defining scope's variables when called from a different context.
             if let Some(user_func) = self.user_functions.get(&func.name).cloned() {
-                let effective_parent;
-                let parent = if let Some(ref shared_env) = func.captured_scope {
-                    effective_parent = {
-                        let mut merged = shared_env.read().unwrap().clone();
-                        for (k, v) in parent_locals {
-                            if matches!(v, CfmlValue::Function(_)) || !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        merged
-                    };
-                    &effective_parent
-                } else {
-                    parent_locals
-                };
-                return self.execute_function_with_args(&user_func, args, Some(parent));
+                let effective_parent = self.build_call_parent_scope(func, parent_locals);
+                return self.execute_function_with_args(&user_func, args, Some(&effective_parent));
             }
 
             // Case-insensitive user function lookup
@@ -10148,22 +10154,8 @@ impl CfmlVirtualMachine {
                 .map(|(_, v)| v.clone());
 
             if let Some(user_func) = user_match {
-                let effective_parent;
-                let parent = if let Some(ref shared_env) = func.captured_scope {
-                    effective_parent = {
-                        let mut merged = shared_env.read().unwrap().clone();
-                        for (k, v) in parent_locals {
-                            if matches!(v, CfmlValue::Function(_)) || !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        merged
-                    };
-                    &effective_parent
-                } else {
-                    parent_locals
-                };
-                return self.execute_function_with_args(&user_func, args, Some(parent));
+                let effective_parent = self.build_call_parent_scope(func, parent_locals);
+                return self.execute_function_with_args(&user_func, args, Some(&effective_parent));
             }
 
             // Higher-order standalone functions (arrayMap, arrayFilter, arrayReduce, etc.)
@@ -15877,6 +15869,71 @@ impl CfmlVirtualMachine {
     /// `name_lower` MUST be the lowercase form of `name`; the caller
     /// already computes it once for special-scope dispatch so we reuse it
     /// instead of re-allocating per scope.
+    /// Build the parent scope for a by-name user-function/method call.
+    ///
+    /// A CFML function's *data* scope is strictly its lexical/defining scope —
+    /// a closure carries that as `captured_scope`; a plain named function has
+    /// none. The CALL SITE's local data vars must NOT be visible to the callee
+    /// (that would be dynamic scoping, which CFML/Lucee does not do — a callee
+    /// reading an unqualified name that's undefined in its own scopes must
+    /// resolve to null/variables/globals, never the caller's locals). The one
+    /// legitimate cross-frame carry is helper FUNCTIONS: var-scoped function
+    /// expressions and sibling references stay callable by bare name (PR #198),
+    /// so those are copied from the call site while data values are dropped.
+    fn build_call_parent_scope(
+        &self,
+        func_ref: &cfml_common::dynamic::CfmlFunction,
+        parent_locals: &ValueMap,
+    ) -> ValueMap {
+        let mut parent: ValueMap = match func_ref.captured_scope {
+            Some(ref shared_env) => shared_env.read().unwrap().clone(),
+            None => ValueMap::default(),
+        };
+        // An anonymous function EXPRESSION / arrow is a true lexical closure: it
+        // captures the ENCLOSING function's locals (incl. mutable data like an
+        // accumulator), and in this VM that enclosing scope arrives as
+        // `parent_locals` (its `captured_scope` is seeded without late-bound and
+        // mutated vars). So it inherits the caller's data wholesale.
+        let is_closure_expr =
+            func_ref.name.starts_with("__closure_") || func_ref.name.starts_with("__arrow_");
+        // The caller is whatever frame is currently executing this call. A real
+        // function is on `call_stack`; a page/template frame (`__main__`) is
+        // NOT pushed, so an empty top means "called from page scope" — there the
+        // caller's locals ARE the page `variables` scope and all carry. When the
+        // caller IS a real function, only the keys it itself inherited (lexical/
+        // page scope + structural + helpers) propagate — never its own `var`
+        // locals or params, which would be dynamic scoping (not CFML). This is
+        // what stops a callee's bare `x ?: default` from silently reading the
+        // caller's same-named local.
+        let caller_inherited = if is_closure_expr {
+            None // closures capture the full enclosing scope; skip the filter
+        } else {
+            self.call_stack.last().map(|f| f.inherited_from_parent.clone())
+        };
+        for (k, v) in parent_locals {
+            let carry = match &caller_inherited {
+                None => true,
+                Some(inh) => {
+                    inh.contains(k.as_str())
+                        || matches!(v, CfmlValue::Function(_))
+                        || matches!(k.as_str(), "this" | "__variables" | "variables" | "super")
+                }
+            };
+            if !carry {
+                continue;
+            }
+            // Functions overwrite (call-site helper wins, preserving prior
+            // behaviour); scope/data keys only fill gaps so a callee's OWN
+            // captured page/component scope is never clobbered by the caller's.
+            if matches!(v, CfmlValue::Function(_)) {
+                parent.insert(k.clone(), v.clone());
+            } else {
+                parent.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        parent
+    }
+
     fn lookup_name_in_scopes(
         &self,
         name: &str,
@@ -18050,9 +18107,27 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // A user-defined struct/component key holding a function shadows any
+        // built-in member function of the same name (Lucee parity). TestBox
+        // stores closures like `directory.filter` and invokes them via
+        // `arguments.directory.filter(...)`; without this, the built-in struct
+        // `filter`/`map`/`each`/`sort`/`append`/... HOFs (which `return` early
+        // from the `match object` below) would intercept and mis-dispatch. When
+        // such a member exists, skip built-in dispatch entirely so control falls
+        // through to the property/closure dispatch below, which calls the stored
+        // function. Java shims and `super` structs handle their own dispatch.
+        let struct_fn_member_shadows = matches!(object,
+            CfmlValue::Struct(ref s)
+                if !s.contains_key("__java_shim")
+                    && !s.contains_key("__is_super")
+                    && matches!(s.get_ci(method), Some(CfmlValue::Function(_))));
+
         // Map member function names to standalone builtin names
         // The object becomes the first argument
-        let builtin_name = match object {
+        let builtin_name = if struct_fn_member_shadows {
+            None
+        } else {
+            match object {
             CfmlValue::String(_) => match method_lower.as_str() {
                 "tostring" => {
                     // java.lang.String.toString() / Lucee string member: returns
@@ -18953,6 +19028,7 @@ impl CfmlVirtualMachine {
                 _ => None,
             },
             _ => None,
+            }
         };
 
         if let Some(name) = builtin_name {
