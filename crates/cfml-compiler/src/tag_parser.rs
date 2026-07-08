@@ -2006,13 +2006,11 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
 fn find_tag_end(chars: &[char], start: usize, len: usize) -> usize {
     let mut i = start;
-    let mut in_string = false;
-    let mut string_char = '"';
     while i < len {
         // A CFML comment embedded in the tag (e.g. inside a multi-line cfset
         // expression body) may contain `>` in its `--->` terminator — skip the
         // whole comment so it doesn't prematurely end the tag.
-        if !in_string && i + 4 < len && chars[i] == '<' && chars[i + 1] == '!'
+        if i + 4 < len && chars[i] == '<' && chars[i + 1] == '!'
             && chars[i + 2] == '-' && chars[i + 3] == '-' && chars[i + 4] == '-'
         {
             let mut j = i + 5;
@@ -2022,13 +2020,65 @@ fn find_tag_end(chars: &[char], start: usize, len: usize) -> usize {
             i = if j + 2 < len { j + 3 } else { len };
             continue;
         }
-        if !in_string && (chars[i] == '"' || chars[i] == '\'') {
-            in_string = true;
-            string_char = chars[i];
-        } else if in_string && chars[i] == string_char {
-            in_string = false;
-        } else if !in_string && chars[i] == '>' {
+        let c = chars[i];
+        if c == '"' || c == '\'' {
+            // Skip the whole CFML string, honouring `""`/`''` escapes and
+            // `#...#` interpolations (which may themselves contain nested
+            // strings — e.g. `'"#replaceNoCase(v,'"','""','all')#"'`). A naive
+            // quote toggle mis-tokenises those and loses the tag's `>`.
+            i = skip_cfml_string(chars, i, len);
+            continue;
+        }
+        if c == '>' {
             return i + 1;
+        }
+        i += 1;
+    }
+    len
+}
+
+/// Advance past a CFML string literal. `start` must point at the opening quote.
+/// Returns the index just past the closing quote (or `len` if unterminated).
+/// Handles `""`/`''` doubled-quote escapes, `##` escaped hashes, and `#...#`
+/// interpolations whose expressions may contain their own nested strings.
+fn skip_cfml_string(chars: &[char], start: usize, len: usize) -> usize {
+    let quote = chars[start];
+    let mut i = start + 1;
+    while i < len {
+        let c = chars[i];
+        if c == quote {
+            if i + 1 < len && chars[i + 1] == quote {
+                i += 2; // escaped doubled quote — stays inside the string
+                continue;
+            }
+            return i + 1;
+        }
+        if c == '#' {
+            if i + 1 < len && chars[i + 1] == '#' {
+                i += 2; // escaped `##` — a literal hash
+                continue;
+            }
+            i = skip_interpolation(chars, i, len);
+            continue;
+        }
+        i += 1;
+    }
+    len
+}
+
+/// Advance past a `#...#` interpolation. `start` must point at the opening `#`.
+/// Returns the index just past the closing `#`. Nested strings inside the
+/// interpolated expression are skipped so their quotes don't leak out.
+fn skip_interpolation(chars: &[char], start: usize, len: usize) -> usize {
+    let mut i = start + 1;
+    while i < len {
+        let c = chars[i];
+        if c == '#' {
+            return i + 1;
+        }
+        if c == '"' || c == '\'' {
+            i = skip_cfml_string(chars, i, len);
+            continue;
         }
         i += 1;
     }

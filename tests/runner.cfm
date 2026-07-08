@@ -472,6 +472,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfhttpparam_interpolation.cfm">
 <cf_runtest file="tags/test_tag_string_interpolation.cfm">
 <cf_runtest file="tags/test_tag_attribute_interpolation.cfm">
+<cf_runtest file="tags/test_tag_return_nested_quote_interpolation.cfm">
 <cf_runtest file="tags/test_cffinally_tag_body.cfm">
 <cf_runtest file="tags/test_cflog_cfmail_attribute_interpolation.cfm">
 <cf_runtest file="tags/test_tags_cfzip.cfm">
