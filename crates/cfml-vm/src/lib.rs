@@ -8312,7 +8312,8 @@ impl CfmlVirtualMachine {
                                     && matches!(
                                         (&existing, &modified_this),
                                         (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap))
-                                            if cur.contains_key("__variables") && !cur.ptr_eq(snap)
+                                            if cur.contains_key("__variables")
+                                                && !Self::same_cfc_instance(cur, snap)
                                     );
                                 // Same-instance guard: when the snapshot IS the receiver
                                 // (same Arc), every `this.x =` in the callee already
@@ -8395,7 +8396,7 @@ impl CfmlVirtualMachine {
                                                 CfmlValue::Struct(snap),
                                             ) = (&node, &modified_this)
                                             {
-                                                if !cur.ptr_eq(snap)
+                                                if !Self::same_cfc_instance(cur, snap)
                                                     && cur.contains_key("__variables")
                                                 {
                                                     skip_for_identity = true;
@@ -20827,6 +20828,28 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Allocate the next stable per-instance component id. Process-global and
+    /// monotonic so ids stay unique across cfthreads. Starts at 1 so a `0`/absent
+    /// `__instance_id` is unambiguously "no identity" in the write-back guards.
+    fn next_component_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Whether two CFC instance structs are the *same logical instance*. Prefers
+    /// the stable `__instance_id` stamped at construction (survives the value-semantics
+    /// deep-copy / write-back rebuild that detaches the Arc); falls back to Arc
+    /// `ptr_eq` when either side carries no id (e.g. a hand-built shim struct or
+    /// a component created before this stamping existed). Used by the method-call
+    /// write-back's chained-CFC identity guards (GH #260).
+    fn same_cfc_instance(a: &CfmlStruct, b: &CfmlStruct) -> bool {
+        match (a.get("__instance_id"), b.get("__instance_id")) {
+            (Some(CfmlValue::Int(x)), Some(CfmlValue::Int(y))) => x == y,
+            _ => a.ptr_eq(b),
+        }
+    }
+
     fn resolve_component_template(
         &mut self,
         class_name: &str,
@@ -21409,6 +21432,20 @@ impl CfmlVirtualMachine {
                 s.insert(
                     "__source_file".to_string(),
                     CfmlValue::string(cfc_path.clone()),
+                );
+                // Stable per-instance identity. Components have value semantics
+                // here (deep-copied above), and `return this` yields a copy on a
+                // fresh Arc — so `ptr_eq` cannot tell "the same logical instance
+                // returned via `this`" (a fluent `obj.$(..).$(..)` chain) from "a
+                // getter that returned a *different* CFC" (`a.getDep().mutate()`).
+                // The method-call write-back's chained-CFC identity guard needs
+                // exactly that distinction. Stamp each freshly constructed instance
+                // with a monotonic id that survives clone/merge/snapshot as an
+                // ordinary hidden field; the guard compares `__instance_id` and only falls
+                // back to `ptr_eq` when it is absent (GH #260).
+                s.insert(
+                    "__instance_id".to_string(),
+                    CfmlValue::Int(Self::next_component_id() as i64),
                 );
                 // Anonymous `component { ... }` declarations get __name = "Anonymous"
                 // baked in by the parser. Override with the dotted path the caller

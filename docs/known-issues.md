@@ -554,6 +554,24 @@ Debug at the call site: `getController() isNull=true`, `variables.controller` ex
 - Impact: blocks rendering ColdBox admin UIs whose view helpers call the Renderer's
   implicit accessors. (Preside boot + admin login/session work as of v0.430–v0.433.)
 
+## 20. Assigning a *function* to a `this` key through a fluent chain is dropped 🔇 *(narrow, related to GH [#260](https://github.com/RustCFML/RustCFML/issues/260))*
+
+`this[ key ] = someClosure; return this;` **inside a method invoked as the 2nd-or-later
+step of a fluent chain** (`obj.a().b()`) does not persist the function member — the key
+survives but still holds the *original* value, so a call to it dispatches the original
+method rather than the injected closure. The equivalent **separate statement** works, and
+**scalar/struct** members installed the same way through a chain *do* persist (fixed in
+v0.437.0 — GH #260).
+
+Root cause: assigning a *function value* to a `this` key routes through a different path
+than scalar assignment and is not captured in the per-call `this` write-back snapshot that
+the chain's merge rebuilds from, so the merge keeps the pre-existing method.
+
+This does **not** affect TestBox MockBox, whose `$()` installs overrides via `$include`
+(which registers the method properly) — the reported #260 chain (`obj.$("m1",r).$("m2")…`)
+works. It only bites hand-rolled fluent builders that inject *closures* onto `this` and are
+chained. Use separate statements as a workaround.
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*
