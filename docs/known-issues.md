@@ -554,7 +554,7 @@ Debug at the call site: `getController() isNull=true`, `variables.controller` ex
 - Impact: blocks rendering ColdBox admin UIs whose view helpers call the Renderer's
   implicit accessors. (Preside boot + admin login/session work as of v0.430–v0.433.)
 
-## 20. Assigning a *function* to a `this` key through a fluent chain is dropped 🔇 *(narrow, related to GH [#260](https://github.com/RustCFML/RustCFML/issues/260))*
+## 20. Assigning a *function* to a `this` key through a fluent chain is dropped 🔇 *(GH [#261](https://github.com/RustCFML/RustCFML/issues/261); related to [#260](https://github.com/RustCFML/RustCFML/issues/260))*
 
 `this[ key ] = someClosure; return this;` **inside a method invoked as the 2nd-or-later
 step of a fluent chain** (`obj.a().b()`) does not persist the function member — the key
