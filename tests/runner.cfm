@@ -15,6 +15,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_arguments_scope_dispatch.cfm">
 <cf_runtest file="core/test_return_assignment_expression.cfm">
 <cf_runtest file="core/test_local_scope_name_locals.cfm">
 <cf_runtest file="core/test_access_identifiers.cfm">
@@ -206,6 +207,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_yaml.cfm">
 <cf_runtest file="stdlib/test_validatejson.cfm">
 <cf_runtest file="stdlib/test_struct_putall.cfm">
+<cf_runtest file="stdlib/test_struct_ci_index.cfm">
 <cf_runtest file="stdlib/test_array_higher_order.cfm">
 <cf_runtest file="stdlib/test_struct_functions.cfm">
 <cf_runtest file="stdlib/test_struct_higher_order.cfm">

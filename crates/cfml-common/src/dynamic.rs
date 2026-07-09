@@ -240,6 +240,17 @@ impl FromIterator<CfmlValue> for CfmlArray {
 /// uninitialised IC slot is always a miss.
 pub struct StructInner {
     pub map: ValueMap,
+    /// v0.442 (issue #262) — case-insensitive lookup index: maps each key's
+    /// ASCII-lowercased form to the ORIGINAL-cased key currently stored in
+    /// `map`. This turns every ci lookup / existence check / insert-dedup from
+    /// the old O(n) `keys().any(eq_ignore_ascii_case)` scan into an O(1) hash
+    /// probe (large per-request caches, session/URL scopes, and the pixl8/
+    /// sticker sort that motivated the fix all built and probed huge structs,
+    /// degrading to O(n²)–O(n⁴)). Invariant: for every key `K` in `map`,
+    /// `ci[fold(K)] == K` (first-written casing wins, matching `insert`). It is
+    /// rebuilt wholesale after any raw [`CfmlStruct::with_write`], whose closure
+    /// can restructure `map` arbitrarily.
+    pub ci: HashMap<String, String, ValueBuildHasher>,
     pub shape_id: u64,
     /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
     /// private `__variables` struct, a read of the `this` key resolves to the
@@ -257,6 +268,38 @@ static STRUCT_SHAPE_COUNTER: std::sync::atomic::AtomicU64 =
 #[inline]
 fn next_shape_id() -> u64 {
     STRUCT_SHAPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fold a key to its case-insensitive canonical form for the `ci` index.
+/// CFML case-insensitivity is ASCII-only (the whole codebase compares with
+/// `eq_ignore_ascii_case`), so we lower only ASCII — and, crucially, borrow
+/// the key unchanged when it is already lowercase (the overwhelmingly common
+/// case: `key_1`, `columnList`-style names, etc.), so a hot lookup loop pays
+/// zero allocations.
+#[inline]
+fn fold_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(key.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(key)
+    }
+}
+
+impl StructInner {
+    /// Rebuild the `ci` index from scratch to re-establish the
+    /// `ci[fold(K)] == K` invariant after `map` may have been mutated through
+    /// a channel that doesn't maintain it incrementally (raw `with_write`).
+    /// O(n); only called off the hot path. When two keys fold to the same form
+    /// (a pre-existing raw map with case-variant duplicates — normal inserts
+    /// dedup, so this is an edge), the LAST one iterated wins the ci slot,
+    /// matching `map`'s own last-writer-wins for equal keys.
+    fn ci_rebuild(&mut self) {
+        self.ci.clear();
+        self.ci.reserve(self.map.len());
+        for k in self.map.keys() {
+            self.ci.insert(k.to_ascii_lowercase(), k.clone());
+        }
+    }
 }
 
 /// Format an f64 the way Lucee/ACF stringify numbers, rather than Rust's
@@ -317,8 +360,14 @@ pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 impl CfmlStruct {
     #[inline]
     pub fn new(m: ValueMap) -> Self {
+        let mut ci =
+            HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
+        for k in m.keys() {
+            ci.insert(k.to_ascii_lowercase(), k.clone());
+        }
         let arc = Arc::new(PlRwLock::new(StructInner {
             map: m,
+            ci,
             shape_id: next_shape_id(),
             this_alias: None,
         }));
@@ -414,10 +463,13 @@ impl CfmlStruct {
         {
             let g = self.0.read();
             if let Some(v) = g.map.get(key) {
-                return Some(v.clone());
+                return Some(v.clone()); // exact-case fast path (no fold)
             }
-            if let Some((_, v)) = g.map.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
-                return Some(v.clone());
+            // v0.442 — O(1) ci resolution via the fold→original-key index.
+            if let Some(orig) = g.ci.get(fold_key(key).as_ref()) {
+                if let Some(v) = g.map.get(orig) {
+                    return Some(v.clone());
+                }
             }
         }
         // Live `variables.this` alias on a miss (see `get`).
@@ -438,11 +490,9 @@ impl CfmlStruct {
         if let Some((i, _, v)) = g.map.get_full(key) {
             return Some((i, v.clone()));
         }
-        g.map
-            .iter()
-            .enumerate()
-            .find(|(_, (k, _))| k.eq_ignore_ascii_case(key))
-            .map(|(i, (_, v))| (i, v.clone()))
+        // v0.442 — resolve the original casing in O(1), then one `get_full`.
+        let orig = g.ci.get(fold_key(key).as_ref())?;
+        g.map.get_full(orig).map(|(i, _, v)| (i, v.clone()))
     }
 
     /// v0.99.5 — read the value at a specific IndexMap entry index. Used
@@ -468,6 +518,19 @@ impl CfmlStruct {
             .map(|(_, slot)| std::mem::replace(slot, value))
     }
 
+    /// v0.442 — resolve `key` case-insensitively to the ORIGINAL-cased key as
+    /// stored in the map, in O(1) via the ci index. Returns `None` if no
+    /// case-variant is present. Used by `structKeyExists`/`structFindKey`-style
+    /// callers that need the real stored key, not just presence.
+    #[inline]
+    pub fn key_ci(&self, key: &str) -> Option<String> {
+        let g = self.0.read();
+        if g.map.contains_key(key) {
+            return Some(key.to_string()); // exact-case fast path
+        }
+        g.ci.get(fold_key(key).as_ref()).cloned()
+    }
+
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.read().map.contains_key(key)
@@ -477,7 +540,8 @@ impl CfmlStruct {
     /// Case-insensitive key presence check.
     pub fn contains_key_ci(&self, key: &str) -> bool {
         let g = self.0.read();
-        if g.map.contains_key(key) || g.map.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+        // v0.442 — O(1): exact hit, else the fold→original-key ci index.
+        if g.map.contains_key(key) || g.ci.contains_key(fold_key(key).as_ref()) {
             return true;
         }
         drop(g);
@@ -501,17 +565,20 @@ impl CfmlStruct {
     pub fn insert(&self, key: String, value: CfmlValue) -> Option<CfmlValue> {
         let mut g = self.0.write();
         if let Some(slot) = g.map.get_mut(&key) {
-            return Some(std::mem::replace(slot, value));
+            return Some(std::mem::replace(slot, value)); // exact hit, value-only
         }
-        let ci_idx = g
-            .map
-            .iter()
-            .position(|(k, _)| k.eq_ignore_ascii_case(&key));
-        if let Some(idx) = ci_idx {
-            let (_, slot) = g.map.get_index_mut(idx).expect("ci_idx in range");
-            return Some(std::mem::replace(slot, value));
+        // v0.442 — O(1) case-variant dedup via the ci index (was an O(n)
+        // `iter().position(eq_ignore_ascii_case)` scan on EVERY new-key insert,
+        // which made building a large struct O(n²)).
+        if let Some(orig) = g.ci.get(fold_key(&key).as_ref()).cloned() {
+            if let Some(slot) = g.map.get_mut(&orig) {
+                return Some(std::mem::replace(slot, value));
+            }
         }
-        let prev = g.map.insert(key, value);
+        // Genuinely new key: append to `map`, mirror into `ci`, bump shape.
+        let folded = key.to_ascii_lowercase();
+        let prev = g.map.insert(key.clone(), value);
+        g.ci.insert(folded, key);
         if prev.is_none() {
             g.shape_id = next_shape_id();
         }
@@ -545,6 +612,13 @@ impl CfmlStruct {
         let mut g = self.0.write();
         let prev = g.map.shift_remove(key);
         if prev.is_some() {
+            // Drop the ci entry only if it still points at the exact key we
+            // removed (a same-fold key under different casing is impossible
+            // given insert-time dedup, but stay defensive).
+            let f = fold_key(key).into_owned();
+            if g.ci.get(&f).map(|o| o == key).unwrap_or(false) {
+                g.ci.remove(&f);
+            }
             g.shape_id = next_shape_id();
         }
         prev
@@ -554,13 +628,17 @@ impl CfmlStruct {
     /// v0.99.4 — shape_id bumps iff a key was actually removed.
     pub fn remove_ci(&self, key: &str) -> Option<CfmlValue> {
         let mut g = self.0.write();
-        let prev = if g.map.contains_key(key) {
-            g.map.shift_remove(key)
+        let f = fold_key(key).into_owned();
+        // v0.442 — O(1): resolve the stored original casing via the ci index
+        // (was an O(n) `keys().find(eq_ignore_ascii_case)` scan).
+        let orig = if g.map.contains_key(key) {
+            Some(key.to_string())
         } else {
-            let found = g.map.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned();
-            found.and_then(|k| g.map.shift_remove(&k))
+            g.ci.get(&f).cloned()
         };
+        let prev = orig.and_then(|k| g.map.shift_remove(&k));
         if prev.is_some() {
+            g.ci.remove(&f);
             g.shape_id = next_shape_id();
         }
         prev
@@ -572,6 +650,7 @@ impl CfmlStruct {
         let mut g = self.0.write();
         if !g.map.is_empty() {
             g.map.clear();
+            g.ci.clear();
             g.shape_id = next_shape_id();
         }
     }
@@ -616,7 +695,12 @@ impl CfmlStruct {
     pub fn with_write<R>(&self, f: impl FnOnce(&mut ValueMap) -> R) -> R {
         let mut g = self.0.write();
         g.shape_id = next_shape_id();
-        f(&mut g.map)
+        let r = f(&mut g.map);
+        // v0.442 — the closure may have inserted / removed / renamed keys
+        // arbitrarily, so rebuild the ci index to restore the O(1) invariant.
+        // Off the hot path (hot inserts/probes use the dedicated methods).
+        g.ci_rebuild();
+        r
     }
 
     /// Run a closure with shared (read) access. Same re-entrancy caveat.
@@ -642,10 +726,13 @@ impl CfmlStruct {
         // a nested dotted assignment `settings.assetmanager.x = v` created a
         // parallel lowercase key, and a later `structAppend` then merged both
         // (the partial fork last-writer-wins), dropping most keys.
+        // v0.442 — O(1) ci locate via the index (was an O(n) `iter().position`).
         let existing_idx = if g.map.contains_key(key) {
             g.map.get_index_of(key)
         } else {
-            g.map.iter().position(|(k, _)| k.eq_ignore_ascii_case(key))
+            g.ci
+                .get(fold_key(key).as_ref())
+                .and_then(|orig| g.map.get_index_of(orig))
         };
         if let Some(idx) = existing_idx {
             let (_, entry) = g.map.get_index_mut(idx).expect("existing_idx in range");
@@ -661,6 +748,7 @@ impl CfmlStruct {
         }
         // Brand-new key.
         let s = CfmlStruct::empty();
+        g.ci.insert(fold_key(key).into_owned(), key.to_string());
         g.map.insert(key.to_string(), CfmlValue::Struct(s.clone()));
         g.shape_id = next_shape_id();
         s

@@ -1137,15 +1137,11 @@ fn get_delimiter(args: &[CfmlValue], idx: usize) -> String {
 /// case-insensitively. Returns an owned `String` because the backing map is
 /// behind a lock and can't be borrowed out.
 fn struct_find_key_ci(s: &CfmlStruct, key: &str) -> Option<String> {
-    let found = s.with_read(|m| {
-        if m.contains_key(key) {
-            return Some(key.to_string());
-        }
-        let key_lower = key.to_lowercase();
-        m.keys().find(|k| k.eq_ignore_ascii_case(&key_lower)).cloned()
-    });
-    if found.is_some() {
-        return found;
+    // v0.442 (issue #262) — O(1) resolution via the struct's ci index, instead
+    // of the old O(n) `keys().find(eq_ignore_ascii_case)` scan that made
+    // `StructKeyExists` on a large struct O(n) per call.
+    if let Some(found) = s.key_ci(key) {
+        return Some(found);
     }
     // Live `variables.this` alias (Lucee/ACF): `StructKeyExists(variables,
     // "this")` must be true on a CFC private scope so framework code can gate
@@ -3003,8 +2999,12 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
                 // not keys (Lucee/ACF parity). Defer to visible_struct_keys so
                 // StructKeyExists never disagrees with StructKeyList/for-in.
                 if found {
-                    let is_component = s.contains_key_ci("__variables")
-                        && (s.contains_key_ci("__name") || s.contains_key_ci("this"));
+                    // Engine-internal marker keys are always stored lowercase,
+                    // so probe them with the O(1) exact `contains_key` rather
+                    // than a ci lookup (issue #262). ("this" can be user-cased,
+                    // but the live-alias check needs contains_key_ci anyway.)
+                    let is_component = s.contains_key("__variables")
+                        && (s.contains_key("__name") || s.contains_key_ci("this"));
                     if is_component
                         && !visible_struct_keys(s)
                             .iter()

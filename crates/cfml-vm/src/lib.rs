@@ -1311,6 +1311,20 @@ pub struct CfmlVirtualMachine {
     /// to the max `global_id` seen, i.e. the app's distinct-function count (cached
     /// programs reuse ids), not per-request growth.
     fn_registry: Vec<Option<Arc<BytecodeFunction>>>,
+    /// v0.442 (call-dispatch Lever 2) — memoized `__arguments_params` marker
+    /// array per function (`global_id` → the immutable `CfmlValue::Array` of
+    /// declared param-name strings). Built once and Arc-cloned into each call's
+    /// `arguments` scope, replacing the per-call rebuild (a `Vec` + one
+    /// `String` clone per param + a fresh `CfmlArray`) that ran on EVERY call.
+    /// The marker is a read-only engine sentinel — filtered out of every struct
+    /// introspection path (`structKeyList`/for-in/`structKeyExists`/append/
+    /// delete/dump/serialize) and only ever *read* by the two positional-access
+    /// sites — so sharing one backing `Arc` across invocations is safe. Keyed
+    /// by the process-stable `global_id`, so a cached entry stays valid across
+    /// requests in serve mode (a function's declared param names never change).
+    /// Paramless functions store nothing (the marker is omitted entirely —
+    /// absent is indistinguishable from an empty array at both read sites).
+    arguments_params_cache: HashMap<u32, CfmlValue>,
     /// Set whenever a `DefineFunction` op runs during a request. A new
     /// `CfmlValue::Function` can ONLY be born via that op (closures, arrows,
     /// component methods, and function references all compile to it), so if it
@@ -1754,6 +1768,7 @@ impl CfmlVirtualMachine {
             html_body_buffer: String::new(),
             app_function_table: Vec::new(),
             fn_registry: Vec::new(),
+            arguments_params_cache: HashMap::new(),
             app_fn_table_dirty: false,
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
@@ -3805,7 +3820,14 @@ impl CfmlVirtualMachine {
             }
         }
 
-        let mut locals: ValueMap = ValueMap::default();
+        // v0.442 (call-dispatch Lever 4) — pre-size the per-call maps/sets to
+        // what we already know we'll insert (inherited parent keys + declared
+        // params + the `arguments` key), so the parent-copy and param-binding
+        // loops never trigger an incremental rehash-and-grow.
+        let parent_len = parent_scope.map(|p| p.len()).unwrap_or(0);
+        let seed_cap = parent_len + func.params.len();
+        let mut locals: ValueMap =
+            ValueMap::with_capacity_and_hasher(seed_cap + 1, Default::default());
         let mut stack: Vec<CfmlValue> = Vec::new();
         let mut ip = 0;
         // Track variables declared with `var` (function-local, not written back to parent)
@@ -3841,12 +3863,12 @@ impl CfmlVirtualMachine {
         // belong to `arguments`, not `local`) was established in this frame
         // and is part of `local`.
         let mut inherited_or_param_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+            std::collections::HashSet::with_capacity(seed_cap);
         // Exactly the keys seeded from the parent scope (no params added) —
         // stored in the call frame so a bare call from this frame knows which
         // of its keys are lexical/page scope (propagate) vs its own locals.
         let mut inherited_from_parent: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+            std::collections::HashSet::with_capacity(parent_len);
         if let Some(parent) = parent_scope {
             for (k, v) in parent {
                 // Function values are normally skipped here: a named function /
@@ -3889,7 +3911,12 @@ impl CfmlVirtualMachine {
         // seeds the local + the `arguments` key at runtime. An omitted param
         // with no default must stay ABSENT from both `locals` and `arguments`,
         // so `structKeyExists(arguments, "p")` is false — matching Lucee/ACF.
-        let mut arguments_map: ValueMap = ValueMap::default();
+        // Pre-size: one entry per bound/overflow arg (whichever is larger) plus
+        // the two `__arguments_*` markers.
+        let mut arguments_map: ValueMap = ValueMap::with_capacity_and_hasher(
+            args.len().max(func.params.len()) + 2,
+            Default::default(),
+        );
         // Lucee/ACF/BoxLang: a value bound to a declared parameter appears in
         // the `arguments` scope under its parameter NAME — never under its
         // 1-based positional index. Positional access (`arguments[1]`) still
@@ -3963,15 +3990,29 @@ impl CfmlVirtualMachine {
         // GetIndex site without having to thread the param list separately.
         // Both markers are filtered from user-visible struct introspection.
         arguments_map.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
-        let params_array: Vec<CfmlValue> = func
-            .params
-            .iter()
-            .map(|p| CfmlValue::string(p.clone()))
-            .collect();
-        arguments_map.insert(
-            "__arguments_params".to_string(),
-            CfmlValue::array(params_array),
-        );
+        // v0.442 (call-dispatch Lever 2) — the `__arguments_params` positional
+        // marker is only consulted for functions that declare params; for a
+        // paramless function an absent marker behaves identically to the empty
+        // array at both read sites (`is_declared_arg_param` and the `arguments[N]`
+        // GetIndex fallback), so skip the per-call allocation entirely. For
+        // declared params, reuse a memoized Arc-backed array (built once per
+        // function, keyed by global_id) rather than rebuilding a `Vec` + one
+        // `String` clone per param + a fresh `CfmlArray` on every single call.
+        if !func.params.is_empty() {
+            let params_marker = self
+                .arguments_params_cache
+                .entry(func.global_id)
+                .or_insert_with(|| {
+                    CfmlValue::array(
+                        func.params
+                            .iter()
+                            .map(|p| CfmlValue::string(p.clone()))
+                            .collect(),
+                    )
+                })
+                .clone();
+            arguments_map.insert("__arguments_params".to_string(), params_marker);
+        }
         // A `cfinclude`d template (the included file's `__main__`, run with the
         // caller's scope as parent) shares the CALLER's `arguments` scope in
         // CFML — e.g. Wheels renders error/view templates with
