@@ -22,4 +22,21 @@
 <cfoutput>Line2</cfoutput></cfsavecontent>
 <cfscript>assertTrue("savecontent multiline has Line1", find("Line1", multiLine) GT 0);</cfscript>
 
+<!--- cfsavecontent nested INSIDE cfoutput: body #expr# must interpolate       --->
+<!--- (Preside form.cfm builds the jQuery-validation script this way; RustCFML  --->
+<!--- reset the cfoutput context for the savecontent body and emitted literal   --->
+<!--- #formId#/#validationJs#). Escaped ## must still collapse to a literal #.   --->
+<cfset formId = "myForm">
+<cfset ref    = "presideJQuery">
+<cfoutput><cfsavecontent variable="nestedCapture">var v = $('###formId#').validate(); init( #ref# );</cfsavecontent></cfoutput>
+<cfscript>
+assert( "savecontent inside cfoutput interpolates body", trim( nestedCapture ), "var v = $('##myForm').validate(); init( presideJQuery );" );
+</cfscript>
+
+<!--- OUTSIDE cfoutput, tag text keeps a literal # (no interpolation). --->
+<cfsavecontent variable="literalHash">raw: #formId#</cfsavecontent>
+<cfscript>
+assert( "savecontent outside cfoutput keeps literal hash", trim( literalHash ), "raw: ##formId##" );
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>

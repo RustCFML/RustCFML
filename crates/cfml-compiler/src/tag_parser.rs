@@ -1200,8 +1200,13 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfsavecontent") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
-                // Process body through main loop (handles hash expressions, nested tags, text)
-                let body_script = tags_to_script_impl(&body, imports);
+                // Process body preserving the enclosing cfoutput context. When the
+                // <cfsavecontent> is nested inside <cfoutput>, its body's #expr#
+                // must still interpolate (Lucee/ACF). Using tags_to_script_impl
+                // here reset in_cfoutput to false, so Preside's form.cfm captured
+                // literal `#formId#`/`#validationJs#` inside the validation-JS
+                // savecontent. Same class as the v0.443.0 cfswitch/cfcase fix.
+                let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
                 (format!("__cfsavecontent_start();\n{}{} = __cfsavecontent_end();\n", body_script, variable), close_end - start)
             } else {
                 (format!("__cfsavecontent_start();\n"), tag_end - start)
