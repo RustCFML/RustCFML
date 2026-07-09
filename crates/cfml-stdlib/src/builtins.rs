@@ -3685,7 +3685,31 @@ fn fn_is_custom_function(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_closure(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Bool(matches!(args.first(), Some(CfmlValue::Closure(_)))))
+    // Lucee parity: `isClosure()` is true for a closure/arrow-function
+    // expression (`function(){}` / `()=>{}`) but false for a plain named UDF
+    // or component method. At runtime an anonymous function expression is a
+    // `CfmlValue::Function` (like every UDF) whose `captured_scope` is `Some`
+    // — but so is every named UDF's, so that flag can't distinguish them. The
+    // reliable signal is the compiler-synthesized name: closures compile to
+    // `__closure_N` and arrow functions to `__arrow_N` (see cfml-codegen
+    // `Expression::Closure`/`ArrowFunction`); named declarations keep their
+    // real name. `DefineFunction` already keys behavior off the same `__`
+    // prefix convention. (The legacy `CfmlValue::Closure` variant is also
+    // honored for completeness.)
+    //
+    // This being wrong (always false) silently broke Preside/Sticker's
+    // `Bundle.addAssets()`: its `if ( !isClosure(match) || match(path) )` guard
+    // short-circuited on `!false`, so the `match` closure was never applied and
+    // every file (and directory) got registered as an asset — clobbering the
+    // core admin CSS/JS bundles and leaving the admin unstyled.
+    let is = match args.first() {
+        Some(CfmlValue::Closure(_)) => true,
+        Some(CfmlValue::Function(f)) => {
+            f.name.starts_with("__closure_") || f.name.starts_with("__arrow_")
+        }
+        _ => false,
+    };
+    Ok(CfmlValue::Bool(is))
 }
 
 fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {

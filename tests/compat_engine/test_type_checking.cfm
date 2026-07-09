@@ -151,10 +151,18 @@ suiteEnd();
 // ============================================================
 suiteBegin("Lucee7: isClosure / isCustomFunction");
 myClosure = function(){ return 1; };
+myArrow   = () => 1;
+function myNamedUdf(){ return 1; }
 assertTrue("isCustomFunction on closure", isCustomFunction(myClosure));
 assertFalse("isCustomFunction on string", isCustomFunction("hello"));
 assertFalse("isCustomFunction on number", isCustomFunction(42));
 assertFalse("isCustomFunction on struct", isCustomFunction({}));
+// isClosure: TRUE for closure/arrow expressions, FALSE for named UDFs and
+// non-functions. Regression guard for Sticker's Bundle.addAssets() match
+// closure (Preside admin asset bundling depends on this).
+assertTrue("isClosure on closure", isClosure(myClosure));
+assertTrue("isClosure on arrow function", isClosure(myArrow));
+assertFalse("isClosure on named UDF", isClosure(myNamedUdf));
 assertFalse("isClosure on string", isClosure("hello"));
 assertFalse("isClosure on number", isClosure(42));
 suiteEnd();
