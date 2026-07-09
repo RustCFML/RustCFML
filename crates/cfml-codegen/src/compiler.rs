@@ -1374,7 +1374,20 @@ impl CfmlCompiler {
                 };
                 instructions.push(BytecodeOp::DeclareLocal(name.clone()));
                 if let Some(value) = &var.value {
+                    // `var x = y = expr` — the initialiser is itself an assignment
+                    // (value position), so it must LEAVE its assigned value on the
+                    // stack for the `StoreLocal(x)` below to consume. Without
+                    // `need_assign_value`, the inner assignment stored `y` but left
+                    // nothing, so `x` was never bound — "Variable 'x' is undefined"
+                    // (Preside's ObjectPicker.cfc:
+                    // `var labelRenderer = args.labelRenderer = args.labelRenderer ?: …`).
+                    // Same fix as the `return x = expr` arm below.
+                    if matches!(value, Expression::BinaryOp(b) if b.operator == BinaryOpType::Assign)
+                    {
+                        self.need_assign_value = true;
+                    }
                     self.compile_expression(value, instructions);
+                    self.need_assign_value = false;
                     // `var x = voidFn()` — a Null initialiser must NOT create the
                     // key (CFML null-assignment semantics), same as `local.x =`.
                     if Self::expr_may_be_null(value) {
