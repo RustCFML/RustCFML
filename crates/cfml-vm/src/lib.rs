@@ -8478,8 +8478,16 @@ impl CfmlVirtualMachine {
                                     self.scope_aware_load(var_name, &locals)
                                 {
                                     let props = &path[1..];
-                                    Self::deep_set(&mut root_obj, props, modified_this);
-                                    self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
+                                    // Never resurrect a receiver the call removed
+                                    // from its container (e.g.
+                                    // `application.cbBootstrap.onRequestStart()`
+                                    // whose body ran `application.clear()`). Only
+                                    // persist state back onto a still-present
+                                    // receiver — see `path_leaf_exists`.
+                                    if Self::path_leaf_exists(&root_obj, props) {
+                                        Self::deep_set(&mut root_obj, props, modified_this);
+                                        self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
+                                    }
                                 }
                             }
                         }
@@ -15837,6 +15845,28 @@ impl CfmlVirtualMachine {
             // Java shim mutators (Map.put, Map.putIfAbsent, Queue.offer)
             "put" | "putifabsent" | "offer"
         )
+    }
+
+    /// True when `path` resolves to an already-existing value inside `root`,
+    /// walking case-insensitively (source-text casing may differ from the
+    /// stored key). Gates the receiver `this`/variables write-back: a method
+    /// call persists the receiver's own state back into where it is ALREADY
+    /// stored — it must never CREATE the key. If the receiver was removed from
+    /// its container during the call (the classic case: a method that runs
+    /// `application.clear()`, invoked as `application.cbBootstrap.onRequestStart()`
+    /// — Preside's request dispatch), the key no longer resolves, and writing it
+    /// back would resurrect a single stale entry into an otherwise-cleared scope,
+    /// leaving it in an inconsistent partial state. When that happens we skip the
+    /// write-back, matching Lucee's reference semantics (the object is simply gone).
+    fn path_leaf_exists(root: &CfmlValue, path: &[String]) -> bool {
+        let mut node = root.clone();
+        for part in path {
+            match node.get_ci(part) {
+                Some(v) => node = v,
+                None => return false,
+            }
+        }
+        true
     }
 
     /// Set a value at an arbitrary depth in a nested struct.

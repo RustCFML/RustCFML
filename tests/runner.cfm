@@ -497,6 +497,7 @@ include "harness.cfm";
 <cf_runtest file="lifecycle/test_application_load_errors.cfm">
 <cf_runtest file="lifecycle/test_application_scope_custom_tag.cfm">
 <cf_runtest file="lifecycle/test_application_onerror_onabort.cfm">
+<cf_runtest file="lifecycle/test_appscope_receiver_no_resurrect.cfm">
 <cf_runtest file="server/test_front_controller_fallback.cfm">
 <cf_runtest file="server/test_location_redirect.cfm">
 
