@@ -10243,7 +10243,12 @@ fn cfml_to_mysql_value(val: &CfmlValue) -> mysql::Value {
 #[cfg(feature = "mysql_db")]
 fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
     match val {
-        mysql::Value::NULL => CfmlValue::Null,
+        // Lucee/ACF default (full null support OFF): a NULL column reads back as
+        // an empty string in query-land, so `q.col EQ ""`, Len(q.col)=0, and
+        // passing `q.col` to a required arg all behave. Matches sqlite_to_cfml.
+        // (Preside's homepage has parent_page=NULL; queryRowToStruct + a
+        // positional call to _isManagedPage(parentId,...) broke on `Null`.)
+        mysql::Value::NULL => CfmlValue::string(String::new()),
         mysql::Value::Int(i) => CfmlValue::Int(i),
         mysql::Value::UInt(u) => CfmlValue::Int(u as i64),
         mysql::Value::Float(f) => CfmlValue::Double(f as f64),
@@ -16222,6 +16227,21 @@ mod db_tls_tests {
             let (_, ssl) = mysql_extract_ssl("mysql://u:p@host/db?useSSL=true");
             let ssl = ssl.expect("ssl opts");
             assert!(ssl.accept_invalid_certs()); // required, no verify
+        }
+
+        // A NULL column must read back as an empty string (Lucee/ACF default,
+        // full null support OFF), matching sqlite_to_cfml. A raw `Null` here
+        // fails to bind to a positional required arg — this is exactly what
+        // broke Preside's sitetree editPage on the homepage (parent_page=NULL):
+        // `_isManagedPage( prc.page.parent_page, ... )` → "parentId undefined".
+        #[test]
+        fn null_column_reads_as_empty_string_not_null() {
+            use crate::builtins::mysql_value_to_cfml;
+            use cfml_common::dynamic::CfmlValue;
+            let v = mysql_value_to_cfml(mysql::Value::NULL);
+            assert!(matches!(&v, CfmlValue::String(s) if s.is_empty()),
+                "MySQL NULL should map to empty string, got {:?}", v);
+            assert!(!matches!(v, CfmlValue::Null), "must not be CfmlValue::Null");
         }
     }
 }
