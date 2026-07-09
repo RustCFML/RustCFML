@@ -7620,6 +7620,40 @@ fn cfhttp_get_as_binary_enabled(value: &CfmlValue) -> bool {
     }
 }
 
+/// Process-wide pooled HTTP agents so cfhttp reuses keep-alive connections
+/// instead of opening (and client-closing) a fresh TCP socket per call.
+///
+/// A `ureq::Agent` *is* the connection pool; building a new one on every cfhttp
+/// call — as the code used to — defeats keep-alive entirely. Every request then
+/// connects and closes, and each client-closed socket lingers in TIME_WAIT for
+/// ~2·MSL holding an ephemeral local port. Under a bursty caller (e.g. Preside
+/// reindexing to a local ElasticSearch, where trashing a page fires a cascade of
+/// index calls) that transiently exhausts the OS ephemeral-port range, so a run
+/// of connect() calls fails with a Transport error even though the server is
+/// perfectly healthy — surfacing as "made N attempts but none returned a
+/// response". Sharing one pooled agent keeps a small set of connections alive and
+/// reused, eliminating the churn. ureq safely retries a recycled connection on a
+/// fresh socket if the server has closed it (unit.rs `send_prelude` early-retry),
+/// so pooling introduces no spurious failures. Per-call timeouts are applied on
+/// the `Request` (see below), so a shared agent doesn't flatten them.
+#[cfg(feature = "http")]
+static HTTP_AGENT: Lazy<ureq::Agent> = Lazy::new(|| {
+    ureq::AgentBuilder::new()
+        .max_idle_connections(100)
+        .max_idle_connections_per_host(20)
+        .build()
+});
+
+/// Same pool but with redirect-following disabled, for `redirect="no"` callers.
+#[cfg(feature = "http")]
+static HTTP_AGENT_NO_REDIRECT: Lazy<ureq::Agent> = Lazy::new(|| {
+    ureq::AgentBuilder::new()
+        .max_idle_connections(100)
+        .max_idle_connections_per_host(20)
+        .redirects(0)
+        .build()
+});
+
 /// Read a response body either as decoded text or as raw bytes. Decoding bytes
 /// through `into_string()` would corrupt non-UTF-8 payloads (images, etc.).
 #[cfg(feature = "http")]
@@ -7948,15 +7982,20 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
         }
     }
 
-    let mut agent_builder = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(timeout_secs));
-
-    if !follow_redirects {
-        agent_builder = agent_builder.redirects(0);
-    }
-
-    if let Some(ref proxy_host) = proxy_server {
-        if !proxy_host.is_empty() {
+    // Reuse a process-wide pooled agent (keep-alive) for the common no-proxy
+    // case; only a proxy — which is per-call configuration — forces a one-off
+    // agent. This is what keeps cfhttp from churning a fresh TCP connection per
+    // call (see HTTP_AGENT above). The one-off agent is held in `owned_agent` so
+    // it outlives the borrow below.
+    let use_proxy = proxy_server.as_deref().map(|h| !h.is_empty()).unwrap_or(false);
+    let owned_agent;
+    let agent: &ureq::Agent = if use_proxy {
+        let mut agent_builder = ureq::AgentBuilder::new()
+            .max_idle_connections_per_host(20);
+        if !follow_redirects {
+            agent_builder = agent_builder.redirects(0);
+        }
+        if let Some(ref proxy_host) = proxy_server {
             let proxy_url = if let Some(pp) = proxy_port {
                 format!("http://{}:{}", proxy_host, pp)
             } else {
@@ -7966,9 +8005,13 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 agent_builder = agent_builder.proxy(proxy);
             }
         }
-    }
-
-    let agent = agent_builder.build();
+        owned_agent = agent_builder.build();
+        &owned_agent
+    } else if follow_redirects {
+        &HTTP_AGENT
+    } else {
+        &HTTP_AGENT_NO_REDIRECT
+    };
 
     let mut request = match method.as_str() {
         "GET" => agent.get(&url),
@@ -7980,6 +8023,10 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
         "OPTIONS" => agent.request("OPTIONS", &url),
         _ => agent.get(&url),
     };
+
+    // Per-call timeout lives on the Request now (the shared agent has none), so
+    // each cfhttp still honours its own `timeout` attribute.
+    request = request.timeout(std::time::Duration::from_secs(timeout_secs));
 
     for (k, v) in &headers {
         request = request.set(k, v);
@@ -16443,5 +16490,101 @@ mod sql_classifier_tests {
         assert!(!is_select_query("insert into t (a) values (1)"));
         assert!(!is_select_query("update t set a = 1"));
         assert!(!is_select_query("delete from t"));
+    }
+}
+
+/// cfhttp connection-reuse regression. Before this fix cfhttp built a fresh
+/// `ureq::Agent` per call, so every request opened and client-closed its own TCP
+/// connection — no keep-alive. Under a burst that churns ephemeral ports into
+/// TIME_WAIT and intermittently exhausts them, which is how a healthy local
+/// ElasticSearch would still report "made N attempts but none returned a
+/// response" (the Preside symptom that motivated this). With a shared pooled
+/// agent, sequential requests to the same host reuse one connection. We prove
+/// that by counting accepted TCP connections against a tiny keep-alive server:
+/// old behaviour == one accept per request; fixed == a single accept for many.
+#[cfg(all(test, feature = "http"))]
+mod cfhttp_connection_reuse_tests {
+    use super::fn_cfhttp;
+    use cfml_common::dynamic::{CfmlValue, ValueMap};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn sequential_requests_reuse_one_keepalive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = accepts.clone();
+
+        // Keep-alive HTTP/1.1 server: one accept can serve many requests. It
+        // never sends `Connection: close`, so ureq keeps the socket pooled.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let mut acc: Vec<u8> = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break, // client closed
+                        Ok(n) => {
+                            acc.extend_from_slice(&buf[..n]);
+                            // Serve every complete (header-only, GET) request.
+                            while let Some(pos) = find_double_crlf(&acc) {
+                                acc.drain(..pos + 4);
+                                let body = b"OK";
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                    body.len()
+                                );
+                                if stream.write_all(resp.as_bytes()).is_err()
+                                    || stream.write_all(body).is_err()
+                                {
+                                    return;
+                                }
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/", port);
+        let num_calls = 6;
+        for _ in 0..num_calls {
+            let mut opts = ValueMap::default();
+            opts.insert("url".to_string(), CfmlValue::string(url.clone()));
+            let result = fn_cfhttp(vec![CfmlValue::strukt(opts)]).expect("cfhttp ok");
+            let s = match &result {
+                CfmlValue::Struct(m) => m
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("fileContent"))
+                    .map(|(_, v)| v.as_string())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            assert_eq!(s, "OK", "each request round-trips a body");
+        }
+
+        let total = accepts.load(Ordering::SeqCst);
+        // With pooling, all sequential calls ride one connection. Allow a tiny
+        // margin for pool timing but it must be far below one-per-call.
+        assert!(
+            total < num_calls,
+            "expected connection reuse (< {} accepts) but the server accepted {} \
+             — cfhttp is opening a fresh connection per call",
+            num_calls,
+            total
+        );
+    }
+
+    fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
     }
 }
