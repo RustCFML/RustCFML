@@ -273,7 +273,7 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
             continue;
         }
         if i < len - 1 && chars[i] == '<' && is_cf_tag_start(&chars, i, len) {
-            let (script, consumed) = parse_cf_tag(&chars, i, len, imports);
+            let (script, consumed) = parse_cf_tag(&chars, i, len, imports, in_cfoutput);
             result.push_str(&script);
             i += consumed;
         } else if !imports.is_empty() && chars[i] == '<' && is_import_tag_start(&chars, i, len, imports) {
@@ -463,7 +463,7 @@ fn find_closing_hash(chars: &[char], start: usize, len: usize) -> Option<usize> 
     None
 }
 
-fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::collections::HashMap<String, String>) -> (String, usize) {
+fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::collections::HashMap<String, String>, in_cfoutput: bool) -> (String, usize) {
     // Determine if closing tag
     let is_closing = chars.get(start + 1) == Some(&'/');
 
@@ -1262,7 +1262,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfswitch") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
-                let switch_body = parse_cfswitch_body(&body, imports);
+                let switch_body = parse_cfswitch_body(&body, imports, in_cfoutput);
                 (format!("switch ({}) {{\n{}}}\n", expression, switch_body), close_end - start)
             } else {
                 (format!("switch ({}) {{\n", expression), tag_end - start)
@@ -2936,7 +2936,7 @@ fn parse_cfloop_tag(
 }
 
 /// Parse the body of a <cfswitch> tag, scanning for <cfcase> and <cfdefaultcase>
-fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<String, String>) -> String {
+fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<String, String>, in_cfoutput: bool) -> String {
     let mut result = String::new();
     let chars: Vec<char> = body.chars().collect();
     let len = chars.len();
@@ -2963,7 +2963,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 // Find closing </cfdefaultcase>
                 if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfdefaultcase") {
                     let case_body: String = chars[tag_end..close_pos].iter().collect();
-                    let case_script = tags_to_script_impl(&case_body, imports);
+                    let case_script = tags_to_script_inner(&case_body, imports, in_cfoutput);
                     result.push_str(&format!("default: \n{}", case_script));
                     let close_end = find_tag_end(&chars, close_pos, len);
                     i = close_end;
@@ -2980,7 +2980,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 // Find closing </cfcase>
                 if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfcase") {
                     let case_body: String = chars[tag_end..close_pos].iter().collect();
-                    let case_script = tags_to_script_impl(&case_body, imports);
+                    let case_script = tags_to_script_inner(&case_body, imports, in_cfoutput);
                     // Value can be comma-separated for multiple case values
                     let values: Vec<&str> = value.split(',').map(|v| v.trim()).filter(|v| !v.is_empty()).collect();
                     let quoted_values: Vec<String> = values.iter().map(|v| {

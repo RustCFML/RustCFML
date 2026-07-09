@@ -120,4 +120,17 @@
 </cfif>
 <cfscript>assert("cfelseif chain", grade, "C");</cfscript>
 
+<!--- cfswitch/cfcase bodies nested inside <cfoutput> must interpolate #expr#
+      just like <cfif> bodies do. Regression: Preside admin sitetree rendered
+      the literal `#translateResource(...)#` in a <cfdefaultcase> because the
+      case body lost the enclosing cfoutput context. --->
+<cffunction name="_ctrlEcho"><cfargument name="v"><cfreturn "T[" & arguments.v & "]"></cffunction>
+<cfset greenClass = "green">
+<cfset restriction = "none">
+<cfsavecontent variable="switchOut"><cfoutput><cfswitch expression="#restriction#"><cfcase value="full"><i class="#greenClass#"></i>#_ctrlEcho( "full" )#</cfcase><cfdefaultcase><i class="#greenClass#"></i>#_ctrlEcho( "none" )#</cfdefaultcase></cfswitch></cfoutput></cfsavecontent>
+<cfscript>assert("cfswitch defaultcase interpolates inside cfoutput", Trim( switchOut ), '<i class="green"></i>T[none]');</cfscript>
+<cfset restriction = "full">
+<cfsavecontent variable="switchOut2"><cfoutput><cfswitch expression="#restriction#"><cfcase value="full"><i class="#greenClass#"></i>#_ctrlEcho( "full" )#</cfcase><cfdefaultcase>#_ctrlEcho( "none" )#</cfdefaultcase></cfswitch></cfoutput></cfsavecontent>
+<cfscript>assert("cfswitch case interpolates inside cfoutput", Trim( switchOut2 ), '<i class="green"></i>T[full]');</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
