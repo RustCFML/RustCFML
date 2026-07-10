@@ -541,7 +541,13 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         "versionLevel".to_string(),
         CfmlValue::string("Stable".to_string()),
     );
-    info.insert("lucee".to_string(), CfmlValue::strukt(lucee));
+    info.insert("lucee".to_string(), CfmlValue::strukt(lucee.clone()));
+
+    // `server.railo` is Lucee's back-compat alias for `server.lucee` (Railo was
+    // Lucee's predecessor; the old key survives the rename). Preside's Lucee
+    // error template (system/services/errors/errorTemplate.cfm) reads
+    // `server.railo.version`, so mirror the struct here to match Lucee.
+    info.insert("railo".to_string(), CfmlValue::strukt(lucee));
 
     let mut os = ValueMap::default();
     os.insert(

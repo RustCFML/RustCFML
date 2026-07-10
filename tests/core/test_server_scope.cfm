@@ -12,6 +12,11 @@ assertTrue("server.lucee exists", structKeyExists(server, "lucee"));
 assertTrue("server.lucee.version is non-empty", len(server.lucee.version) GT 0);
 assertTrue("server.lucee.version major >= 5", listFirst(server.lucee.version, ".") GTE 5);
 
+// --- server.railo (Lucee's back-compat alias for server.lucee; Preside's
+// Lucee error template reads server.railo.version) ---
+assertTrue("server.railo exists", structKeyExists(server, "railo"));
+assert("server.railo.version mirrors server.lucee.version", server.railo.version, server.lucee.version);
+
 // --- server.os ---
 assertTrue("server.os.name is non-empty", len(server.os.name) GT 0);
 assertTrue("server.os.arch is non-empty", len(server.os.arch) GT 0);
