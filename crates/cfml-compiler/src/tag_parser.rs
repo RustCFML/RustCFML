@@ -452,6 +452,13 @@ fn find_closing_hash(chars: &[char], start: usize, len: usize) -> Option<usize> 
         if chars[i] == '#' && depth == 0 {
             return Some(i);
         }
+        // Skip nested string literals so that `#` characters living inside a
+        // quoted string (which are themselves nested interpolations, e.g.
+        // `#"line #tc.line#"#`) are not mistaken for the closing delimiter.
+        if chars[i] == '"' || chars[i] == '\'' {
+            i = skip_cfml_string(chars, i, len);
+            continue;
+        }
         if chars[i] == '(' {
             depth += 1;
         }
