@@ -5595,6 +5595,36 @@ impl Parser {
         Ok(expr)
     }
 
+    /// True when the tokens at the current position form a quoted or
+    /// interpolated string literal immediately followed by `=` or `:` — i.e. a
+    /// *dynamic* named argument whose name is computed at runtime, like
+    /// `func( "#property#" = value )`. Lucee supports these; RustCFML lowers the
+    /// whole call to `argumentCollection` (see `parse_arguments`) since a
+    /// runtime name cannot live in the static names array.
+    fn is_dynamic_named_arg(&self) -> bool {
+        match self.peek(0) {
+            Token::String(_) => matches!(self.peek(1), Token::Equal | Token::Colon),
+            Token::InterpolatedStringStart => {
+                let mut k = 1;
+                loop {
+                    match self.peek(k) {
+                        Token::InterpolatedStringEnd => {
+                            return matches!(self.peek(k + 1), Token::Equal | Token::Colon);
+                        }
+                        Token::Eof => return false,
+                        _ => {
+                            k += 1;
+                            if k > 4096 {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn parse_arguments(&mut self) -> Result<Vec<Expression>, ParseError> {
         let mut args = Vec::new();
 
@@ -5602,10 +5632,17 @@ impl Parser {
             return Ok(args);
         }
 
+        // Each collected entry is (name-key expression, value). A `None` name
+        // marks a positional argument. Identifier and literal-string names are
+        // stored as string literals; interpolated names keep their expression so
+        // they can be resolved at runtime.
+        let mut collected: Vec<(Option<Expression>, Expression)> = Vec::new();
+        let mut has_dynamic_name = false;
+
         loop {
             if self.match_token(&Token::DotDotDot) {
                 let expr = self.parse_expression()?;
-                args.push(Expression::Spread(Box::new(expr)));
+                collected.push((None, Expression::Spread(Box::new(expr))));
             } else {
                 // Check for named argument: identifier = value or identifier : value
                 // CFML supports foo(name = value, name2 = value2) and foo(name : value)
@@ -5614,24 +5651,81 @@ impl Parser {
                     && (matches!(self.peek(1), Token::Equal | Token::Colon));
                 if is_named_arg {
                     let name = self.extract_identifier()?;
+                    let loc = self.current_location();
                     // Consume either = or :
                     if !self.match_token(&Token::Equal) {
                         self.consume(&Token::Colon)?;
                     }
                     let value = self.parse_expression()?;
-                    // Encode named arg as a struct entry: argumentCollection-style
-                    // Use a NamedArgument expression node or encode as key:value
-                    args.push(Expression::NamedArgument(Box::new(NamedArgument {
-                        name,
-                        value: Box::new(value),
-                        location: self.current_location(),
-                    })));
+                    collected.push((
+                        Some(Expression::Literal(Literal {
+                            value: LiteralValue::String(name),
+                            location: loc,
+                        })),
+                        value,
+                    ));
+                } else if self.is_dynamic_named_arg() {
+                    // Dynamic named argument: a quoted/interpolated string as the
+                    // parameter name, e.g. `func( "#property#" = value )`.
+                    let name_expr = self.parse_primary()?;
+                    if !self.match_token(&Token::Equal) {
+                        self.consume(&Token::Colon)?;
+                    }
+                    let value = self.parse_expression()?;
+                    has_dynamic_name = true;
+                    collected.push((Some(name_expr), value));
                 } else {
-                    args.push(self.parse_expression()?);
+                    collected.push((None, self.parse_expression()?));
                 }
             }
             if !self.match_token(&Token::Comma) {
                 break;
+            }
+        }
+
+        let any_positional = collected.iter().any(|(name, _)| name.is_none());
+
+        if has_dynamic_name && !any_positional {
+            // Every argument is named and at least one name is runtime-computed.
+            // Fold them into a single `argumentCollection` struct literal so the
+            // computed names resolve at call time (struct literals already
+            // support dynamic/interpolated keys). Matches Lucee.
+            let loc = self.current_location();
+            let pairs: Vec<(Expression, Expression)> = collected
+                .into_iter()
+                .map(|(name, value)| (name.expect("all args named here"), value))
+                .collect();
+            let struct_expr = Expression::Struct(Struct {
+                pairs,
+                ordered: false,
+                location: loc.clone(),
+            });
+            args.push(Expression::NamedArgument(Box::new(NamedArgument {
+                name: "argumentCollection".to_string(),
+                value: Box::new(struct_expr),
+                location: loc,
+            })));
+        } else {
+            // Fast path (no runtime-computed names): reconstruct the original
+            // argument expressions exactly as before.
+            for (name, value) in collected {
+                match name {
+                    Some(Expression::Literal(Literal {
+                        value: LiteralValue::String(n),
+                        location,
+                    })) => {
+                        args.push(Expression::NamedArgument(Box::new(NamedArgument {
+                            name: n,
+                            value: Box::new(value),
+                            location,
+                        })));
+                    }
+                    // Interpolated name mixed with positional args (invalid CFML):
+                    // emit the value positionally so the runtime raises the
+                    // mixed named/positional-arguments error, as Lucee does.
+                    Some(_) => args.push(value),
+                    None => args.push(value),
+                }
             }
         }
 
