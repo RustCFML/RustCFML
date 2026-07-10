@@ -46,6 +46,10 @@ assertTrue("GET status_code is 200", getResult.status_code == 200);
 assertTrue("GET statusCode contains 200", find("200", getResult.statusCode) > 0);
 assertTrue("GET fileContent is not empty", len(getResult.fileContent) > 0);
 assertTrue("GET responseHeader is struct", isStruct(getResult.responseHeader));
+// ACF/Lucee expose the status inside responseHeader too (Preside's
+// ElasticSearchApiWrapper reads result.responseHeader.status_code).
+assertTrue("GET responseHeader.status_code is 200", getResult.responseHeader.status_code == 200);
+assertTrue("GET responseHeader.explanation present", len(getResult.responseHeader.explanation ?: "") > 0);
 assertTrue("GET mimeType is json", find("json", getResult.mimeType) > 0);
 
 // Parse the JSON response

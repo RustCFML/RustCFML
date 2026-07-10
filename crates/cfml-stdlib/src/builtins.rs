@@ -8053,6 +8053,13 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                     resp_headers.insert(name, CfmlValue::string(val.to_string()));
                 }
             }
+            // ACF/Lucee inject the status into responseHeader itself (numeric
+            // status_code + explanation), alongside the real HTTP headers. Lots
+            // of CFML reads result.responseHeader.status_code (e.g. Preside's
+            // ElasticSearchApiWrapper success check); without these keys that
+            // read is empty and the caller thinks the request failed.
+            resp_headers.insert("status_code".to_string(), CfmlValue::Int(status as i64));
+            resp_headers.insert("explanation".to_string(), CfmlValue::string(status_text.clone()));
 
             let file_content = cfhttp_file_content(resp, get_as_binary);
 
@@ -8089,6 +8096,10 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                     resp_headers.insert(name, CfmlValue::string(val.to_string()));
                 }
             }
+            // Match ACF/Lucee: status also lives inside responseHeader (see the
+            // success branch above).
+            resp_headers.insert("status_code".to_string(), CfmlValue::Int(code as i64));
+            resp_headers.insert("explanation".to_string(), CfmlValue::string(status_text.clone()));
 
             let file_content = cfhttp_file_content(resp, get_as_binary);
             let (mime, charset) = parse_content_type(&content_type);
