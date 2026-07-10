@@ -362,32 +362,33 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
         None => return form,
     };
 
-    let delimiter = format!("--{}", boundary);
-    let end_delimiter = format!("--{}--", boundary);
+    let delimiter = format!("--{}", boundary).into_bytes();
 
-    let body_str = String::from_utf8_lossy(body);
-    let parts: Vec<&str> = body_str.split(&delimiter).collect();
-
-    for part in parts {
-        let part = part.trim_start_matches("\r\n").trim_end_matches("\r\n");
-        if part.is_empty() || part == "--" || part.starts_with(&end_delimiter) {
+    // IMPORTANT: split on the RAW bytes, not on a lossy UTF-8 view of the body.
+    // File uploads are binary (a PNG starts with 0x89, which is not valid
+    // UTF-8), so `String::from_utf8_lossy` would replace every non-UTF-8 byte
+    // with U+FFFD and corrupt the uploaded file before it reaches disk —
+    // yielding "unrecognised image format" and the like downstream.
+    for raw_part in split_on_bytes(body, &delimiter) {
+        // Strip the single CRLF the delimiter left at the front and the single
+        // trailing CRLF that precedes the next delimiter. Only ONE each — the
+        // body may legitimately end in 0x0D 0x0A bytes.
+        let part = strip_one_trailing_crlf(strip_one_leading_crlf(raw_part));
+        // The closing delimiter leaves a "--" (optionally followed by CRLF) part.
+        if part.is_empty() || part == b"--" || part.starts_with(b"--") {
             continue;
         }
 
-        let header_end = if let Some(pos) = part.find("\r\n\r\n") {
-            pos
-        } else if let Some(pos) = part.find("\n\n") {
-            pos
+        let (header_end, body_start) = if let Some(pos) = find_subslice(part, b"\r\n\r\n") {
+            (pos, pos + 4)
+        } else if let Some(pos) = find_subslice(part, b"\n\n") {
+            (pos, pos + 2)
         } else {
             continue;
         };
 
-        let header_section = &part[..header_end];
-        let body_start = if part[header_end..].starts_with("\r\n\r\n") {
-            header_end + 4
-        } else {
-            header_end + 2
-        };
+        // Headers are ASCII; a lossy string view here is safe and convenient.
+        let header_section = String::from_utf8_lossy(&part[..header_end]);
         let part_body = &part[body_start..];
 
         let mut field_name = String::new();
@@ -419,7 +420,7 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
         }
 
         if let Some(fname) = file_name {
-            let (server_dir, temp_path) = write_multipart_file(&fname, part_body.as_bytes());
+            let (server_dir, temp_path) = write_multipart_file(&fname, part_body);
 
             let mut file_info = ValueMap::default();
             file_info.insert("serverFile".to_string(), CfmlValue::string(fname.clone()));
@@ -439,11 +440,65 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
 
             form.insert(field_name.to_lowercase(), CfmlValue::strukt(file_info));
         } else {
-            form.insert(field_name.to_lowercase(), CfmlValue::string(part_body.to_string()));
+            form.insert(
+                field_name.to_lowercase(),
+                CfmlValue::string(String::from_utf8_lossy(part_body).into_owned()),
+            );
         }
     }
 
     form
+}
+
+/// Find the first index of `needle` within `haystack` (byte-level `.find`).
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+/// Split `body` on every occurrence of `delimiter`, returning the byte slices
+/// between delimiters (mirrors `str::split` semantics for `&[u8]`).
+fn split_on_bytes<'a>(body: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start <= body.len() {
+        match find_subslice(&body[start..], delimiter) {
+            Some(rel) => {
+                let abs = start + rel;
+                parts.push(&body[start..abs]);
+                start = abs + delimiter.len();
+            }
+            None => {
+                parts.push(&body[start..]);
+                break;
+            }
+        }
+    }
+    parts
+}
+
+fn strip_one_leading_crlf(part: &[u8]) -> &[u8] {
+    if let Some(rest) = part.strip_prefix(b"\r\n") {
+        rest
+    } else if let Some(rest) = part.strip_prefix(b"\n") {
+        rest
+    } else {
+        part
+    }
+}
+
+fn strip_one_trailing_crlf(part: &[u8]) -> &[u8] {
+    if let Some(rest) = part.strip_suffix(b"\r\n") {
+        rest
+    } else if let Some(rest) = part.strip_suffix(b"\n") {
+        rest
+    } else {
+        part
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -531,6 +586,64 @@ mod tests {
             .collect();
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].1, "/b");
+    }
+
+    #[test]
+    fn multipart_preserves_binary_upload_bytes() {
+        // Regression: a PNG (or any binary) upload must survive multipart
+        // parsing byte-for-byte. The old lossy-UTF-8 path corrupted the very
+        // first byte (0x89) into U+FFFD, breaking image format detection.
+        let boundary = "----RustCFMLBoundary";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        // Bytes that are NOT valid UTF-8: PNG signature + a stray high byte.
+        let file_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xC0, 0x00, 0x0D,
+        ];
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"upload\"; filename=\"x.png\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
+        body.extend_from_slice(file_bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let form = parse_multipart_sync(&ct, &body);
+        let file = match form.get("upload") {
+            Some(CfmlValue::Struct(s)) => s,
+            other => panic!("expected file struct, got {:?}", other),
+        };
+        match file.get("fileSize") {
+            Some(CfmlValue::Int(n)) => assert_eq!(n, file_bytes.len() as i64),
+            other => panic!("expected fileSize Int, got {:?}", other),
+        }
+        let temp_path = match file.get("tempFilePath") {
+            Some(CfmlValue::String(p)) => p.to_string(),
+            other => panic!("expected tempFilePath, got {:?}", other),
+        };
+        let written = std::fs::read(&temp_path).expect("temp file should exist");
+        let _ = std::fs::remove_file(&temp_path);
+        assert_eq!(written, file_bytes, "uploaded bytes must be preserved exactly");
+    }
+
+    #[test]
+    fn multipart_parses_text_field() {
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"greeting\"\r\n\r\n");
+        body.extend_from_slice("héllo wörld".as_bytes());
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let form = parse_multipart_sync(&ct, &body);
+        match form.get("greeting") {
+            Some(CfmlValue::String(s)) => assert_eq!(s.as_str(), "héllo wörld"),
+            other => panic!("expected greeting String, got {:?}", other),
+        }
     }
 
     #[test]
