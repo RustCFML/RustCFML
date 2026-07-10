@@ -12789,6 +12789,13 @@ impl CfmlVirtualMachine {
                                 "ca.vanmulligen.json.schema.validator" => {
                                     java_shims::handle_java_jsonvalidator("init", empty_args, &CfmlValue::Null)
                                 }
+                                // Apache Commons Imaging — Preside's
+                                // JavaImageMetaReader reads image metadata with
+                                // Imaging.getImageInfo(file). Routes to the native
+                                // imageInfo builtin (see handle_commons_imaging_method).
+                                "org.apache.commons.imaging.imaging" => {
+                                    Ok(java_shims::make_commons_imaging_static())
+                                }
                                 // java.time.* (JSR-310) — ColdBox scheduler date
                                 // library. Constructible shims backed by chrono.
                                 other if other.starts_with("java.time.") => {
@@ -16877,6 +16884,76 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// `org.apache.commons.imaging.Imaging` static methods. `getImageInfo(src)`
+    /// (Preside's `JavaImageMetaReader.readMeta`) reads image metadata via the
+    /// native `imageInfo` builtin and returns an `ImageInfo` shim whose getters
+    /// (`getWidth`/`getHeight`/`getFormatName`/…) Preside then calls.
+    /// `getBufferedImage(src)` routes to `imageRead`. `src` may be a
+    /// `java.io.File` shim, a path String, or a `byte[]` (Binary).
+    fn handle_commons_imaging_method(&self, method: &str, mut args: Vec<CfmlValue>) -> CfmlResult {
+        let src = if args.is_empty() { CfmlValue::Null } else { args.remove(0) };
+        // Resolve the source into (value handed to the native builtin, raw bytes
+        // for magic-byte format sniffing).
+        let (builtin_source, sniff_bytes): (CfmlValue, Vec<u8>) = match &src {
+            CfmlValue::Struct(s)
+                if s.get("__java_class").map(|v| v.as_string()).as_deref()
+                    == Some("java.io.file") =>
+            {
+                let path = s.get("__path").map(|v| v.as_string()).unwrap_or_default();
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                (CfmlValue::string(path), bytes)
+            }
+            CfmlValue::Binary(b) => (CfmlValue::Binary(b.clone()), b.clone()),
+            other => {
+                let path = other.as_string();
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                (CfmlValue::string(path), bytes)
+            }
+        };
+
+        match method {
+            "getimageinfo" => {
+                // Propagates the imageInfo error on non-image bytes, exactly as
+                // Apache's getImageInfo throws — Preside's readMeta catches it.
+                let info = self.call_named_builtin("imageInfo", vec![builtin_source])?;
+                let info = match info {
+                    CfmlValue::Struct(s) => s,
+                    _ => return Err(CfmlError::runtime(
+                        "Imaging.getImageInfo: imageInfo returned no metadata".to_string(),
+                    )),
+                };
+                let get_int = |m: &cfml_common::dynamic::CfmlStruct, k: &str| {
+                    m.get(k).and_then(|v| match v {
+                        CfmlValue::Int(n) => Some(n),
+                        other => other.as_string().trim().parse::<i64>().ok(),
+                    })
+                };
+                let width = get_int(&info, "width").unwrap_or(0);
+                let height = get_int(&info, "height").unwrap_or(0);
+                let (mut bpp, mut transparent, mut grayscale) = (24_i64, false, false);
+                if let Some(CfmlValue::Struct(cm)) = info.get("colormodel") {
+                    if let Some(p) = get_int(&cm, "pixel_size") {
+                        bpp = p;
+                    }
+                    transparent = matches!(cm.get("alpha_channel_support"), Some(CfmlValue::Bool(true)));
+                    grayscale = cm
+                        .get("colorspace")
+                        .map(|v| v.as_string().to_uppercase().contains("GRAY"))
+                        .unwrap_or(false);
+                }
+                let format = java_shims::detect_image_format(&sniff_bytes);
+                Ok(java_shims::make_commons_imaging_info(
+                    width, height, format, bpp, transparent, grayscale,
+                ))
+            }
+            "getbufferedimage" => self.call_named_builtin("imageRead", vec![builtin_source]),
+            other => Err(CfmlError::runtime(format!(
+                "org.apache.commons.imaging.Imaging shim has no method [{}]",
+                other
+            ))),
+        }
+    }
+
     fn handle_jbcrypt_method(&self, method: &str, args: Vec<CfmlValue>) -> CfmlResult {
         let call =
             |vm: &Self, name: &str, a: Vec<CfmlValue>| -> CfmlResult { vm.call_named_builtin(name, a) };
@@ -18141,6 +18218,12 @@ impl CfmlVirtualMachine {
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
                     "ca.vanmulligen.json.schema.validator" => {
                         self.handle_jsonvalidator_method(&m, object, all_args)
+                    }
+                    "org.apache.commons.imaging.imaging" => {
+                        self.handle_commons_imaging_method(&m, all_args)
+                    }
+                    "org.apache.commons.imaging.imageinfo" => {
+                        java_shims::handle_java_commons_imaging_info(&m, all_args, object)
                     }
                     "java.security.messagedigest" => {
                         handle_java_messagedigest(&m, all_args, object)

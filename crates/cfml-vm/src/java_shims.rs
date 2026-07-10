@@ -303,6 +303,111 @@ pub fn handle_java_jsonvalidator(
     Ok(CfmlValue::strukt(shim))
 }
 
+pub const COMMONS_IMAGING_CLASS: &str = "org.apache.commons.imaging.imaging";
+pub const COMMONS_IMAGING_INFO_CLASS: &str = "org.apache.commons.imaging.imageinfo";
+
+/// `org.apache.commons.imaging.Imaging` construction — a static-method holder.
+/// Preside's `JavaImageMetaReader.readMeta()` does
+/// `Imaging.getImageInfo(file).getWidth()/getHeight()/getFormatName()/…` to
+/// validate uploaded images (`isValidImageFile`) and read dimensions. With no
+/// JVM this class was unsupported, so `readMeta` caught the error, returned an
+/// empty struct, and every image upload failed with "Unrecognized image
+/// format". The shim routes `getImageInfo` through the native `imageInfo`
+/// builtin (VM-side, see `handle_commons_imaging_method`).
+pub fn make_commons_imaging_static() -> CfmlValue {
+    CfmlValue::strukt(java_shim_map(COMMONS_IMAGING_CLASS))
+}
+
+/// Detect an image format from its magic bytes and return the name Apache
+/// Commons Imaging's `ImageInfo.getFormatName()` would report. Pure byte
+/// inspection — no image crate (cfml-vm doesn't depend on it).
+pub fn detect_image_format(bytes: &[u8]) -> &'static str {
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.starts_with(PNG) {
+        "PNG"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "JPEG"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "GIF"
+    } else if bytes.starts_with(b"BM") {
+        "BMP"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "WEBP"
+    } else if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+        "TIFF"
+    } else if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        "ICO"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+/// Build the `ImageInfo` result shim returned by `Imaging.getImageInfo(...)`.
+/// Carries the computed metadata as stored keys; the getter methods
+/// (`getWidth()` etc.) read them back in `handle_java_commons_imaging_info`.
+pub fn make_commons_imaging_info(
+    width: i64,
+    height: i64,
+    format: &str,
+    bits_per_pixel: i64,
+    transparent: bool,
+    grayscale: bool,
+) -> CfmlValue {
+    let mut m = java_shim_map(COMMONS_IMAGING_INFO_CLASS);
+    m.insert("__width".to_string(), CfmlValue::Int(width));
+    m.insert("__height".to_string(), CfmlValue::Int(height));
+    m.insert("__format".to_string(), CfmlValue::string(format.to_string()));
+    m.insert("__bitsperpixel".to_string(), CfmlValue::Int(bits_per_pixel));
+    m.insert("__transparent".to_string(), CfmlValue::Bool(transparent));
+    m.insert("__grayscale".to_string(), CfmlValue::Bool(grayscale));
+    CfmlValue::strukt(m)
+}
+
+/// Method dispatch for the `ImageInfo` shim — the getters Apache Commons
+/// Imaging's `org.apache.commons.imaging.ImageInfo` exposes. Pure reads off the
+/// stored keys, so no VM state is needed.
+pub fn handle_java_commons_imaging_info(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let s = match object {
+        CfmlValue::Struct(s) => s,
+        _ => return Ok(CfmlValue::Null),
+    };
+    let get_int = |k: &str| s.get(k).and_then(|v| match v {
+        CfmlValue::Int(n) => Some(n),
+        other => other.as_string().trim().parse::<i64>().ok(),
+    }).unwrap_or(0);
+    let get_bool = |k: &str| matches!(s.get(k), Some(CfmlValue::Bool(true)));
+    let format = s.get("__format").map(|v| v.as_string()).unwrap_or_else(|| "UNKNOWN".to_string());
+    let grayscale = get_bool("__grayscale");
+    match method {
+        "getwidth" => Ok(CfmlValue::Int(get_int("__width"))),
+        "getheight" => Ok(CfmlValue::Int(get_int("__height"))),
+        "getformatname" => Ok(CfmlValue::string(format)),
+        "getformatdetails" => Ok(CfmlValue::string(format!("{} image", format))),
+        "getbitsperpixel" => Ok(CfmlValue::Int(get_int("__bitsperpixel"))),
+        "isprogressive" => Ok(CfmlValue::Bool(false)),
+        "istransparent" => Ok(CfmlValue::Bool(get_bool("__transparent"))),
+        "getnumberofimages" => Ok(CfmlValue::Int(1)),
+        "getcompressionalgorithm" => Ok(CfmlValue::string("UNKNOWN".to_string())),
+        "getcolortype" | "getcolortypedescription" => Ok(CfmlValue::string(
+            if grayscale { "GRAYSCALE" } else { "RGB" }.to_string(),
+        )),
+        "tostring" => Ok(CfmlValue::string(format!(
+            "ImageInfo: {} {}x{}",
+            format,
+            get_int("__width"),
+            get_int("__height")
+        ))),
+        other => Err(CfmlError::runtime(format!(
+            "org.apache.commons.imaging.ImageInfo shim has no method [{}]",
+            other
+        ))),
+    }
+}
+
 pub fn handle_java_messagedigest(
     method: &str,
     args: Vec<CfmlValue>,

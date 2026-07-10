@@ -518,6 +518,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_java_url.cfm">
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
+<cf_runtest file="java_shims/test_commons_imaging.cfm">
 
 <!--- --- Engine Compatibility --- --->
 <cf_runtest file="compat_engine/test_math_functions.cfm">
