@@ -240,8 +240,17 @@ pub fn sam_method_for_interface(iface: &str) -> String {
         "runnable" => "run",
         "threadfactory" => "newThread",
         "supplier" => "get",
-        "function" | "bifunction" | "futurefunction" => "apply",
+        "function" | "bifunction" | "futurefunction" | "binaryoperator" | "unaryoperator" => {
+            "apply"
+        }
         "consumer" | "biconsumer" => "accept",
+        // Remaining java.util.function SAMs used by ColdBox's cbproxies
+        // (Predicate/Comparator + the primitive-returning To*Function set).
+        "predicate" | "bipredicate" => "test",
+        "comparator" => "compare",
+        "tointfunction" => "applyAsInt",
+        "tolongfunction" => "applyAsLong",
+        "todoublefunction" => "applyAsDouble",
         _ => "run",
     }
     .to_string()
@@ -2091,6 +2100,40 @@ pub fn handle_java_referencequeue(
         "poll" | "remove" => Ok(CfmlValue::Null),
         _ => Ok(CfmlValue::Null),
     }
+}
+
+// ─────────────────────────────────────────────
+// java.util.Optional — value container
+//
+// ColdBox's cbproxies `Optional.cfc` wraps a real `java.util.Optional`:
+// `createObject("java","java.util.Optional")` at pseudo-constructor time, then
+// `.empty()` / `.of(v)` to build instances and `isPresent()/get()/map()/…` to
+// query them. With no JVM we back it with a struct holding `__present` + a
+// single `__value`. The construction path (`createObject`) lands here; the
+// instance methods — several of which must invoke a `createDynamicProxy`
+// wrapping a CFML closure (map/filter/ifPresent) — are dispatched by the VM in
+// `Vm::handle_java_optional_method` (lib.rs), which has the `self` needed to
+// call the proxy. See `../coldbox-platform/system/async/cbproxies/models/Optional.cfc`.
+// ─────────────────────────────────────────────
+
+/// Build a `java.util.Optional` shim carrying its presence flag and value.
+pub fn make_java_optional(present: bool, value: CfmlValue) -> CfmlValue {
+    let mut m = java_shim_map("java.util.optional");
+    m.insert("__present".to_string(), CfmlValue::Bool(present));
+    m.insert("__value".to_string(), value);
+    CfmlValue::strukt(m)
+}
+
+/// `createObject("java","java.util.Optional")` → an empty optional. The CFC
+/// treats the class object and instances uniformly (it calls `.empty()`/`.of()`
+/// on whatever `createObject` returned), so an empty optional doubles as the
+/// factory. All instance methods are handled in the VM.
+pub fn handle_java_optional(
+    _method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    Ok(make_java_optional(false, CfmlValue::Null))
 }
 
 // ---- .properties-file reader chain: FileInputStream / InputStreamReader /

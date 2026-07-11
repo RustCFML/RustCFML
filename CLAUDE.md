@@ -173,6 +173,16 @@ Users can extend a self-contained binary with first-class Rust BIFs and classes.
 
 ## Important Conventions
 
+> 🚫 **NEVER solve a problem by making a function a no-op (or a stub / fake-empty
+> return) without first flagging it and getting the user's approval.** If a boot
+> blocker or failing call can be "fixed" by having a function return
+> `""`/`[]`/`{}`/`null`/do-nothing, STOP and ask before doing it. No-ops hide
+> missing behaviour, silently corrupt correctness, and can mask performance
+> problems (a real implementation that was never written). Prefer a faithful
+> implementation; if one is genuinely out of scope, surface that trade-off to the
+> user and let them decide — do not quietly ship the no-op. Any no-op that *is*
+> approved MUST be recorded in `docs/known-issues.md` (see below).
+
 - **Case-insensitive**: All CFML identifiers, function names, scope keys are case-insensitive. Use `.to_lowercase()` or `eq_ignore_ascii_case()` for comparisons.
 - **IndexMap, not HashMap**: Use `IndexMap<String, CfmlValue>` for ordered key-value structures (structs, scopes). `HashMap` only for internal lookups (builtins, user_functions).
 - **CfmlValue**: The core enum — `Null`, `Boolean(bool)`, `Int(i64)`, `Double(f64)`, `String(String)`, `Array(Vec<CfmlValue>)`, `Struct(IndexMap<String, CfmlValue>)`, `Function(CfmlFunction)`, `Query(...)`, `Binary(Vec<u8>)`, `Component(...)`.

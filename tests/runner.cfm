@@ -256,6 +256,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
+<cf_runtest file="stdlib/test_cache_properties.cfm">
 <cf_runtest file="stdlib/test_higher_order_functions.cfm">
 <cf_runtest file="stdlib/test_bitmask_functions.cfm">
 <cf_runtest file="stdlib/test_xml_dom_functions.cfm">
@@ -521,6 +522,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
+<cf_runtest file="java_shims/test_optional.cfm">
 
 <!--- --- Engine Compatibility --- --->
 <cf_runtest file="compat_engine/test_math_functions.cfm">

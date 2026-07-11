@@ -897,6 +897,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("cacheCount".into(), fn_cache_stub);
     f.insert("cacheGetAll".into(), fn_cache_stub);
     f.insert("cacheGetAllIds".into(), fn_cache_stub);
+    f.insert("cacheGetProperties".into(), fn_cache_stub);
 
     // ---- Session & Auth functions (VM-intercepted) ----
     f.insert("sessionInvalidate".into(), fn_session_stub);

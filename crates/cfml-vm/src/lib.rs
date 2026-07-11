@@ -1343,6 +1343,14 @@ pub struct CfmlVirtualMachine {
     app_fn_table_dirty: bool,
     /// In-memory cache: key -> (value, optional expiry instant)
     pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
+    /// Real runtime stats for the in-memory cache, surfaced by
+    /// `cacheGetProperties(name)` (Lucee returns `hit_count`/`miss_count`/
+    /// `outOfMemoryHandling` per cache). A `cacheGet`/`cacheKeyExists` that
+    /// resolves to a live entry counts as a hit; a miss (absent or expired) as a
+    /// miss. RustCFML backs `cache*` with one shared store, so these are
+    /// process/store-wide, not per-named-region.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
     pub enable_cfoutput_only: i32,
     /// cfsetting requesttimeout (seconds), stored as milliseconds. 0 = unset.
@@ -1777,6 +1785,8 @@ impl CfmlVirtualMachine {
             arguments_params_cache: HashMap::new(),
             app_fn_table_dirty: false,
             cache: HashMap::new(),
+            cache_hits: 0,
+            cache_misses: 0,
             enable_cfoutput_only: 0,
             request_timeout_ms: 0,
             #[cfg(feature = "observability")]
@@ -2750,6 +2760,149 @@ impl CfmlVirtualMachine {
             elapsed,
             thread_vars,
             return_value,
+        }
+    }
+
+    /// Dispatch an instance method on a `java.util.Optional` shim (see
+    /// `java_shims::make_java_optional`). Value-mapping methods (map/filter/
+    /// ifPresent) receive a `createDynamicProxy` wrapping a CFML closure, so
+    /// they need `self` to invoke it — hence this lives here rather than in the
+    /// free-function shim handlers. Every builder method returns a *new*
+    /// optional (matching Java's immutable Optional); the CFC assigns the result
+    /// back to `variables.jOptional`.
+    fn handle_java_optional_method(
+        &mut self,
+        method: &str,
+        args: Vec<CfmlValue>,
+        object: &CfmlValue,
+        caller_locals: &ValueMap,
+    ) -> CfmlResult {
+        let s = match object {
+            CfmlValue::Struct(s) => s,
+            _ => return Ok(CfmlValue::Null),
+        };
+        let present = matches!(s.get("__present"), Some(CfmlValue::Bool(true)));
+        let value = s.get("__value").unwrap_or(CfmlValue::Null);
+        let empty = || java_shims::make_java_optional(false, CfmlValue::Null);
+        match method {
+            "empty" => Ok(empty()),
+            // Optional.of(v): Java throws on null; the CFC only reaches here with
+            // a non-null value (ofNullable guards). ofNullable is pure CFML but
+            // harmless to accept here too.
+            "of" | "ofnullable" => {
+                let v = args.into_iter().next().unwrap_or(CfmlValue::Null);
+                let is_present = !matches!(v, CfmlValue::Null);
+                Ok(java_shims::make_java_optional(is_present, v))
+            }
+            "ispresent" => Ok(CfmlValue::Bool(present)),
+            "isempty" => Ok(CfmlValue::Bool(!present)),
+            // get()/getAsInt/... — the CFC's getValueFromOptional probes for the
+            // primitive Optional subclasses (which our single struct never is)
+            // and falls to plain get(). Empty → NoSuchElementException, as Java.
+            "get" | "getasint" | "getaslong" | "getasdouble" => {
+                if present {
+                    Ok(value)
+                } else {
+                    Err(self.wrap_error(CfmlError::runtime(
+                        "java.util.NoSuchElementException: No value present".to_string(),
+                    )))
+                }
+            }
+            "ifpresent" => {
+                if present {
+                    let proxy = args.into_iter().next().unwrap_or(CfmlValue::Null);
+                    self.invoke_functional_proxy(&proxy, vec![value], caller_locals)?;
+                }
+                Ok(CfmlValue::Null) // void
+            }
+            "map" => {
+                if !present {
+                    return Ok(empty());
+                }
+                let proxy = args.into_iter().next().unwrap_or(CfmlValue::Null);
+                let mapped = self.invoke_functional_proxy(&proxy, vec![value], caller_locals)?;
+                let is_present = !matches!(mapped, CfmlValue::Null);
+                Ok(java_shims::make_java_optional(is_present, mapped))
+            }
+            "filter" => {
+                if !present {
+                    return Ok(empty());
+                }
+                let proxy = args.into_iter().next().unwrap_or(CfmlValue::Null);
+                let keep = self
+                    .invoke_functional_proxy(&proxy, vec![value.clone()], caller_locals)?
+                    .is_true();
+                Ok(if keep {
+                    java_shims::make_java_optional(true, value)
+                } else {
+                    empty()
+                })
+            }
+            "equals" => {
+                // Java Optional.equals: both empty, or both present with equal
+                // values. The CFC's isEqual passes another cbOptional whose
+                // jOptional is our shim struct.
+                let other = args.into_iter().next().unwrap_or(CfmlValue::Null);
+                let eq = match &other {
+                    CfmlValue::Struct(o) if o.contains_key("__present") => {
+                        let o_present =
+                            matches!(o.get("__present"), Some(CfmlValue::Bool(true)));
+                        if present != o_present {
+                            false
+                        } else if !present {
+                            true
+                        } else {
+                            let ov = o.get("__value").unwrap_or(CfmlValue::Null);
+                            value.as_string() == ov.as_string()
+                        }
+                    }
+                    _ => false,
+                };
+                Ok(CfmlValue::Bool(eq))
+            }
+            "hashcode" => {
+                if present {
+                    let mut h: i64 = 1125899906842597; // prime seed
+                    for b in value.as_string().bytes() {
+                        h = h.wrapping_mul(31).wrapping_add(b as i64);
+                    }
+                    Ok(CfmlValue::Int(h & 0x7fff_ffff))
+                } else {
+                    Ok(CfmlValue::Int(0))
+                }
+            }
+            "tostring" => Ok(CfmlValue::string(if present {
+                format!("Optional[{}]", value.as_string())
+            } else {
+                "Optional.empty".to_string()
+            })),
+            _ => Ok(CfmlValue::Null),
+        }
+    }
+
+    /// Invoke a functional-interface argument synchronously and return its
+    /// result. Accepts either a `createDynamicProxy` wrapper (invoke its SAM
+    /// method on the wrapped target — e.g. Consumer.accept / Function.apply /
+    /// Predicate.test) or a plain CFML closure. Used by the Optional shim's
+    /// map/filter/ifPresent. Eager/synchronous, matching the executor shims.
+    fn invoke_functional_proxy(
+        &mut self,
+        proxy: &CfmlValue,
+        mut args: Vec<CfmlValue>,
+        caller_locals: &ValueMap,
+    ) -> CfmlResult {
+        match proxy {
+            CfmlValue::Struct(s) if s.contains_key("__dynamic_proxy") => {
+                let target = s.get("__proxy_target").unwrap_or(CfmlValue::Null);
+                let sam = s
+                    .get("__proxy_method")
+                    .map(|v| v.as_string())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| "run".to_string());
+                self.call_member_function(&target, &sam, &mut args, None, caller_locals)
+            }
+            CfmlValue::Function(_) => self.call_function(proxy, args, caller_locals),
+            _ => Ok(CfmlValue::Null),
         }
     }
 
@@ -10268,6 +10421,7 @@ impl CfmlVirtualMachine {
                 | "cachecount"
                 | "cachegetall"
                 | "cachegetallids"
+                | "cachegetproperties"
                 | "__cfcache"
                 | "__cfloop_file_lines"
                 | "__cfexecute"
@@ -12832,6 +12986,12 @@ impl CfmlVirtualMachine {
                                 "org.apache.commons.imaging.imaging" => {
                                     Ok(java_shims::make_commons_imaging_static())
                                 }
+                                // java.util.Optional — value container for
+                                // ColdBox's cbproxies Optional.cfc. Instance
+                                // methods dispatched via handle_java_optional_method.
+                                "java.util.optional" => {
+                                    java_shims::handle_java_optional("init", empty_args, &CfmlValue::Null)
+                                }
                                 // java.time.* (JSR-310) — ColdBox scheduler date
                                 // library. Constructible shims backed by chrono.
                                 other if other.starts_with("java.time.") => {
@@ -14983,11 +15143,14 @@ impl CfmlVirtualMachine {
                         if let Some(exp) = expiry {
                             if cfml_common::clock::Monotonic::now() > exp {
                                 self.cache.remove(&key);
+                                self.cache_misses = self.cache_misses.saturating_add(1);
                                 return Ok(CfmlValue::Null);
                             }
                         }
+                        self.cache_hits = self.cache_hits.saturating_add(1);
                         return Ok(val);
                     }
+                    self.cache_misses = self.cache_misses.saturating_add(1);
                     return Ok(CfmlValue::Null);
                 }
                 "cachedelete" => {
@@ -15035,11 +15198,14 @@ impl CfmlVirtualMachine {
                         if let Some(exp) = expiry {
                             if cfml_common::clock::Monotonic::now() > *exp {
                                 self.cache.remove(&key);
+                                self.cache_misses = self.cache_misses.saturating_add(1);
                                 return Ok(CfmlValue::Bool(false));
                             }
                         }
+                        self.cache_hits = self.cache_hits.saturating_add(1);
                         return Ok(CfmlValue::Bool(true));
                     }
+                    self.cache_misses = self.cache_misses.saturating_add(1);
                     return Ok(CfmlValue::Bool(false));
                 }
                 "cachecount" => {
@@ -15070,6 +15236,40 @@ impl CfmlVirtualMachine {
                         .map(|(k, _)| CfmlValue::string(k.clone()))
                         .collect();
                     return Ok(CfmlValue::array(ids));
+                }
+                // Lucee `cacheGetProperties([cacheName])`. Behaviour verified
+                // against a live Lucee 7:
+                //   * NO ARG  → always returns an empty array `[]` (Lucee's
+                //     no-arg form reports only Administrator-registered *default*
+                //     caches, which a CacheBox-managed app never has — so ColdBox's
+                //     CFProvider `if cacheName=="object" { props=cacheGetProperties() }`
+                //     path legitimately iterates nothing on Lucee too).
+                //   * WITH A NAME → returns a one-element array holding that
+                //     cache's live runtime stats:
+                //     `[{ hit_count, miss_count, outOfMemoryHandling }]`
+                //     (RamCache's exact shape — these are STATS, not config).
+                // RustCFML has one always-on in-memory store, so a named lookup
+                // returns that store's real hit/miss counters. `outOfMemoryHandling`
+                // is false (we never spill/evict on OOM).
+                "cachegetproperties" => {
+                    let name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    if name.is_empty() {
+                        return Ok(CfmlValue::array(vec![]));
+                    }
+                    let mut stats = ValueMap::default();
+                    stats.insert(
+                        "hit_count".to_string(),
+                        CfmlValue::Int(self.cache_hits as i64),
+                    );
+                    stats.insert(
+                        "miss_count".to_string(),
+                        CfmlValue::Int(self.cache_misses as i64),
+                    );
+                    stats.insert(
+                        "outOfMemoryHandling".to_string(),
+                        CfmlValue::Bool(false),
+                    );
+                    return Ok(CfmlValue::array(vec![CfmlValue::strukt(stats)]));
                 }
 
                 // ---- cfcache tag handler ----
@@ -18395,6 +18595,9 @@ impl CfmlVirtualMachine {
                     "java.lang.ref.referencequeue" => {
                         java_shims::handle_java_referencequeue(&m, all_args, object)
                     }
+                    "java.util.optional" => {
+                        self.handle_java_optional_method(&m, all_args, object, caller_locals)
+                    }
                     "java.net.urlclassloader"
                     | "java.lang.classloader"
                     | "coldfusion.runtime.java.javaproxy"
@@ -18467,7 +18670,12 @@ impl CfmlVirtualMachine {
                         && matches!(
                             method_lower.as_str(),
                             "setproperty" | "getproperty" | "clearproperty" | "getenv"
-                        ));
+                        ))
+                    // Optional.ifPresent is `void` — its legitimate null return
+                    // must not be mistaken for "method unhandled" and fall
+                    // through to generic dispatch.
+                    || (java_class == "java.util.optional"
+                        && method_lower == "ifpresent");
                 match result {
                     Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the
