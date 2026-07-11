@@ -438,6 +438,7 @@ include "harness.cfm";
 <!--- that returns rows must use the query path, else the rows are silently lost. --->
 <cf_runtest file="tags/test_mssql_dml_output.cfm">
 <cf_runtest file="tags/test_mysql_dml_returning.cfm">
+<cf_runtest file="tags/test_db_null_column_empty_string.cfm">
 <cf_runtest file="tags/test_pg_extended_param_binds.cfm">
 <cf_runtest file="tags/test_pg_pool_checkout_validation.cfm">
 <cf_runtest file="tags/test_pg_pool_stale_connection_retry.cfm">

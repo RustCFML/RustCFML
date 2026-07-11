@@ -10926,7 +10926,22 @@ fn format_pg_interval(iv: &PgInterval) -> String {
 }
 
 #[cfg(feature = "postgres_db")]
+// Public entry: normalize a NULL column to an empty string, matching CFML/Lucee/
+// ACF's default "full null support OFF" behavior (a NULL must read back as "" so
+// `q.col EQ ""`, `Len(q.col)=0`, and passing q.col positionally to a required
+// arg all behave). Mirrors the SQLite (`SqlValue::Null => ""`) and MySQL
+// (`mysql::Value::NULL => ""`) adapters. See GH #265. Genuine read-error/type-
+// mismatch fallbacks (Err arms) also collapse to "" here — indistinguishable
+// from a real NULL under null-support-off, and never panics the worker.
 fn postgres_row_to_cfml(row: &postgres::Row, col_idx: usize) -> CfmlValue {
+    match postgres_row_to_cfml_typed(row, col_idx) {
+        CfmlValue::Null => CfmlValue::string(String::new()),
+        v => v,
+    }
+}
+
+#[cfg(feature = "postgres_db")]
+fn postgres_row_to_cfml_typed(row: &postgres::Row, col_idx: usize) -> CfmlValue {
     use postgres::types::Type;
     let col_type = row.columns()[col_idx].type_();
 
@@ -11312,7 +11327,20 @@ fn mssql_txn_control(client: &mut MssqlClient, broken: &mut bool, sql: &str, lab
 }
 
 #[cfg(feature = "mssql_db")]
+// Public entry: normalize a NULL column to an empty string, matching CFML/Lucee/
+// ACF's default "full null support OFF" behavior (see GH #264). Mirrors the
+// SQLite/MySQL/Postgres adapters. The explicit `ColumnType::Null` arm and every
+// per-type `Ok(None)`/`Err` fallback in the typed converter collapse to "" here,
+// so `q.col EQ ""`, `Len(q.col)=0`, and positional binding to required args behave.
 fn mssql_column_to_cfml(row: &tiberius::Row, col_idx: usize) -> CfmlValue {
+    match mssql_column_to_cfml_typed(row, col_idx) {
+        CfmlValue::Null => CfmlValue::string(String::new()),
+        v => v,
+    }
+}
+
+#[cfg(feature = "mssql_db")]
+fn mssql_column_to_cfml_typed(row: &tiberius::Row, col_idx: usize) -> CfmlValue {
     use tiberius::ColumnType;
     use tiberius::numeric::Numeric;
     let col_type = row.columns()[col_idx].column_type();
