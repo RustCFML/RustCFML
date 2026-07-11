@@ -16252,6 +16252,23 @@ impl CfmlVirtualMachine {
         {
             return Some(v.clone());
         }
+        // CFML unscoped scope cascade: after local -> arguments -> variables, a
+        // bare name falls through to the request web scopes (Lucee "standard"
+        // cascading: cgi -> url -> form -> cookie). This is how Preside's
+        // DataManager.viewRecord resolves a bare `id` to `url.id`
+        // (DataManager.cfc:311 `recordId=id`). Only keys that ACTUALLY exist in
+        // a scope match: `get_ci` returns None for an absent key, so a genuinely
+        // undefined name still errors. The cgi empty-default "" magic applies
+        // only to explicit `cgi.x` member access (GetProperty), never to this
+        // raw struct lookup — so adding cgi here cannot mask undefined-variable
+        // errors for arbitrary bare names.
+        for scope_name in ["cgi", "url", "form", "cookie"] {
+            if let Some(CfmlValue::Struct(scope)) = self.globals.get(scope_name) {
+                if let Some(v) = scope.get_ci(name) {
+                    return Some(v);
+                }
+            }
+        }
         None
     }
 
