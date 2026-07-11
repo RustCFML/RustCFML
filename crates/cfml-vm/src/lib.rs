@@ -8402,8 +8402,44 @@ impl CfmlVirtualMachine {
                                     (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap))
                                         if cur.ptr_eq(snap)
                                 );
+                                // Same CFC instance (equal `__instance_id`) returned
+                                // on a DIFFERENT Arc — the value-copy that `return this`
+                                // produces since #260. The plain-merge branch below
+                                // rebuilds a FRESH struct and re-points `var_name` at
+                                // it, which orphans any OTHER reference already holding
+                                // the original shared Arc: a Holder that captured the
+                                // receiver BEFORE the chain (e.g.
+                                // `builder.init(mockInjector)`) keeps seeing the
+                                // pre-copy Arc, so every 2nd-and-later chained mutation
+                                // (`mock.$(a).$(b)` — the b stub) becomes invisible to
+                                // it and dispatch falls through to the real method
+                                // (GH #263, residual of #260/#261). Instead merge the
+                                // snapshot's public members INTO the original shared
+                                // Arc in place and DON'T re-store, so the variable and
+                                // every alias keep pointing at the one instance that
+                                // accumulates all chain steps.
+                                let same_cfc_diff_arc = is_cfc
+                                    && !same_instance
+                                    && matches!(
+                                        (&existing, &modified_this),
+                                        (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap))
+                                            if Self::same_cfc_instance(cur, snap)
+                                    );
                                 if skip_for_identity {
                                     self.method_variables_writeback = None;
+                                } else if same_cfc_diff_arc {
+                                    if let (
+                                        Some(CfmlValue::Struct(cur)),
+                                        CfmlValue::Struct(snap),
+                                    ) = (&existing, &modified_this)
+                                    {
+                                        for (k, v) in snap.iter() {
+                                            if k == "__variables" {
+                                                continue;
+                                            }
+                                            cur.insert(k, v);
+                                        }
+                                    }
                                 } else if !same_instance {
                                 let merged = if is_cfc {
                                     match (existing, modified_this) {

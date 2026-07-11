@@ -72,5 +72,39 @@ assert("chained struct member lands", g.cfg.a, 1);
 assertTrue("closure survives an intervening bare Call on the receiver",
 	structKeyExists( e, "m2" ) && e.m2("k") == "STUB-M2");
 
+// (I) GH ##263: a reference captured BEFORE a chained stub install must see
+//     EVERY chained step — not just the first. `return this` copies onto a
+//     fresh Arc since #260, and the write-back used to re-point the direct
+//     variable at that copy, orphaning any other reference that still held the
+//     original shared Arc (a Holder that captured the mock before stubbing).
+//     The 1st chained stub (mutated in place on the shared Arc) stayed visible
+//     to the alias, but every 2nd-and-later stub landed only on the copy and
+//     fell through to the real method through the alias. This is exactly how
+//     ColdBox BuilderTest's `mockInjector.$("getInstance",…).$("containsInstance")`
+//     lost `containsInstance` → real `Injector.containsInstance` → undefined
+//     `binder`. The write-back now merges same-instance return-this copies IN
+//     PLACE into the shared Arc, so the held alias sees all steps.
+//     The stubs must be FUNCTIONS (as MockBox's generator injects), so a call
+//     through the alias dispatches to the stub rather than the real method.
+i = new FluentReturnThis();
+hi = new FluentAliasHolder().init( i );        // alias captured BEFORE the chain
+i.stub( "m1", ()=>"STUB-M1" ).stub( "m2", ( key )=>"STUB-M2" );
+assert("alias sees 1st chained stub",  hi.callM1(), "STUB-M1");
+assert("alias sees 2nd chained stub",  hi.callM2("k"), "STUB-M2");   // was REAL-M2
+
+// (J) control: two stubs as SEPARATE statements were already visible to a
+//     pre-captured alias — lock that it stays so.
+j = new FluentReturnThis();
+hj = new FluentAliasHolder().init( j );
+j.stub( "m1", ()=>"STUB-M1" );
+j.stub( "m2", ( key )=>"STUB-M2" );
+assert("alias sees 2nd separate-statement stub", hj.callM2("k"), "STUB-M2");
+
+// (K) control: alias captured AFTER the chain must also see both.
+k = new FluentReturnThis();
+k.stub( "m1", ()=>"STUB-M1" ).stub( "m2", ( key )=>"STUB-M2" );
+hk = new FluentAliasHolder().init( k );
+assert("alias-after-chain sees 2nd stub", hk.callM2("k"), "STUB-M2");
+
 suiteEnd();
 </cfscript>
