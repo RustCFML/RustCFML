@@ -67,5 +67,47 @@ for ( i = 1; i <= 50; i++ ) {
 }
 assertTrue( "repeated calls keep per-call arg values (no shared-marker leak)", ok );
 
+// --- bare (unscoped) read of an UNDECLARED arg resolves via the arguments scope ---
+// An extra named arg — passed positionally-by-name or forwarded via
+// argumentCollection — that does not bind to a formal parameter lives only in the
+// arguments scope. A bare (unscoped) reference to it must still resolve, because
+// CFML searches local -> arguments -> variables. RustCFML previously copied only
+// declared params into the bare-name search space, so `bareUndeclared` below
+// silently read as missing.
+function bareUndeclared( declared ) {
+    return ( extra ?: "MISSING" );  // `extra` never declared as a param
+}
+assert( "bare read of undeclared named arg", bareUndeclared( declared="d", extra="hello" ), "hello" );
+
+// case-insensitive bare read of an undeclared arg
+function bareUndeclaredCI( declared ) {
+    return ( EXTRA ?: "MISSING" );
+}
+assert( "bare read of undeclared named arg (ci)", bareUndeclaredCI( declared="d", extra="world" ), "world" );
+
+// --- ColdBox preHandler pattern: extra args forwarded via argumentCollection to
+// a callee that doesn't declare them, then read as bare names. This is exactly
+// how Preside's DataManager preHandler passes rc/prc into _loadTopRightButtons,
+// whose bare `prc.objectName` fed hasWorkflow() (regression: "Object [] does not
+// exist" on admin.datamanager.viewRecord).
+function innerHelper( event, action ) {
+    return ( prc.objectName ?: "" );  // prc is undeclared here
+}
+function outerHandler( event, action ) {
+    return innerHelper( argumentCollection = arguments );  // forwards rc/prc too
+}
+assert(
+      "argumentCollection-forwarded undeclared arg readable as bare name in callee"
+    , outerHandler( event="e", action="viewRecord", rc={ object="x" }, prc={ objectName="content_library_content" } )
+    , "content_library_content"
+);
+
+// --- precedence: a real local shadows a same-named undeclared arg ---
+function localBeatsArg( declared ) {
+    var extra = "LOCAL_WINS";
+    return extra;  // must be the local, not the undeclared arg
+}
+assert( "local var outranks same-named undeclared arg", localBeatsArg( declared="d", extra="ARG" ), "LOCAL_WINS" );
+
 suiteEnd();
 </cfscript>

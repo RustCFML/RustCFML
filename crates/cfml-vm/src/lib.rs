@@ -16201,6 +16201,30 @@ impl CfmlVirtualMachine {
         if let Some(v) = locals.get(name) {
             return Some(v.clone());
         }
+        // The `arguments` scope is part of the bare-name search chain (CFML
+        // order: local -> arguments -> variables -> ...). Declared params are
+        // already copied into `locals` above, so this branch only matters for
+        // EXTRA args — values passed via `argumentCollection=` (or overflow
+        // named args) that never bound to a formal parameter and therefore
+        // live ONLY in the arguments struct. e.g. ColdBox's `preHandler`
+        // forwards `rc`/`prc` to private helpers (`_loadTopRightButtons`) that
+        // don't declare them; the helper then reads a bare `prc`. Without this
+        // lookup that bare `prc` resolves to nothing and `prc.x ?: ""` silently
+        // yields "" (Preside DataManager topRightButtons -> hasWorkflow("")
+        // -> "Object [] does not exist"). Placed before `__variables` so the
+        // arguments scope correctly outranks the variables scope.
+        if name_lower != "arguments" {
+            if let Some(CfmlValue::Struct(args)) = locals.get(ARGUMENTS_SCOPE_KEY) {
+                if let Some(v) = args.get(name) {
+                    return Some(v.clone());
+                }
+                if let Some((_, v)) = args.iter().find(|(k, _)| {
+                    !k.starts_with("__arguments_") && k.eq_ignore_ascii_case(name_lower)
+                }) {
+                    return Some(v.clone());
+                }
+            }
+        }
         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
             if let Some(v) = vars.get(name) {
                 return Some(v.clone());
