@@ -285,6 +285,21 @@ fn fold_key(key: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Structs at or below this size skip the case-insensitive `ci` index
+/// entirely: a linear `eq_ignore_ascii_case` scan over so few keys is cheaper
+/// than allocating, populating, and maintaining a hash index — and the
+/// overwhelmingly common structs (every function call's `arguments` scope,
+/// small option/config structs, per-row query structs) are all this small.
+/// Building that index eagerly in `CfmlStruct::new` for these tiny structs was
+/// ~25% of serve-mode CPU on the pixl8/sticker sort (millions of per-call
+/// arguments scopes). The index is built lazily only once a struct grows past
+/// this threshold — which is where O(1) ci ops actually matter (issue #262: big
+/// per-request caches, session/URL scopes, the sticker `comparisonCache`).
+///
+/// Invariant: `ci` is complete (`ci[fold(K)] == K` for every key `K`) iff
+/// `map.len() > CI_THRESHOLD`; otherwise `ci` is empty and ci resolution scans.
+const CI_THRESHOLD: usize = 16;
+
 impl StructInner {
     /// Rebuild the `ci` index from scratch to re-establish the
     /// `ci[fold(K)] == K` invariant after `map` may have been mutated through
@@ -298,6 +313,36 @@ impl StructInner {
         self.ci.reserve(self.map.len());
         for k in self.map.keys() {
             self.ci.insert(k.to_ascii_lowercase(), k.clone());
+        }
+    }
+
+    /// Resolve `key` case-insensitively to the ORIGINAL-cased key stored in
+    /// `map`, or `None`. O(1) via the `ci` index when the struct is large
+    /// enough to maintain one; otherwise a linear `eq_ignore_ascii_case` scan
+    /// (cheap at `<= CI_THRESHOLD` keys — see `CI_THRESHOLD`). This is the one
+    /// place the "indexed vs scan" decision lives; every ci read routes here.
+    #[inline]
+    fn resolve_ci_key(&self, key: &str) -> Option<&String> {
+        if self.map.len() > CI_THRESHOLD {
+            self.ci.get(fold_key(key).as_ref())
+        } else {
+            self.map.keys().find(|k| k.eq_ignore_ascii_case(key))
+        }
+    }
+
+    /// Maintain the `ci` index after a genuinely-new key was appended to `map`.
+    /// A no-op while the struct is small (index inactive); rebuilds wholesale on
+    /// the insert that crosses `CI_THRESHOLD` (or when a prior shrink left the
+    /// index cleared) and incrementally otherwise. `folded`/`key` are the new
+    /// key's fold form and original casing.
+    #[inline]
+    fn ci_note_new_key(&mut self, folded: String, key: String) {
+        if self.map.len() > CI_THRESHOLD {
+            if self.ci.len() == self.map.len() - 1 {
+                self.ci.insert(folded, key); // index was complete → incremental
+            } else {
+                self.ci_rebuild(); // crossing the threshold, or stale post-shrink
+            }
         }
     }
 }
@@ -360,11 +405,19 @@ pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 impl CfmlStruct {
     #[inline]
     pub fn new(m: ValueMap) -> Self {
-        let mut ci =
-            HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
-        for k in m.keys() {
-            ci.insert(k.to_ascii_lowercase(), k.clone());
-        }
+        // Build the case-insensitive index eagerly ONLY for large structs; small
+        // structs (the common per-call case) skip it and scan on the rare ci
+        // read. See `CI_THRESHOLD`. `HashMap::with_hasher` allocates nothing.
+        let ci = if m.len() > CI_THRESHOLD {
+            let mut ci =
+                HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
+            for k in m.keys() {
+                ci.insert(k.to_ascii_lowercase(), k.clone());
+            }
+            ci
+        } else {
+            HashMap::with_hasher(ValueBuildHasher::default())
+        };
         let arc = Arc::new(PlRwLock::new(StructInner {
             map: m,
             ci,
@@ -465,8 +518,8 @@ impl CfmlStruct {
             if let Some(v) = g.map.get(key) {
                 return Some(v.clone()); // exact-case fast path (no fold)
             }
-            // v0.442 — O(1) ci resolution via the fold→original-key index.
-            if let Some(orig) = g.ci.get(fold_key(key).as_ref()) {
+            // ci resolution: O(1) index for large structs, linear scan for small.
+            if let Some(orig) = g.resolve_ci_key(key) {
                 if let Some(v) = g.map.get(orig) {
                     return Some(v.clone());
                 }
@@ -490,8 +543,9 @@ impl CfmlStruct {
         if let Some((i, _, v)) = g.map.get_full(key) {
             return Some((i, v.clone()));
         }
-        // v0.442 — resolve the original casing in O(1), then one `get_full`.
-        let orig = g.ci.get(fold_key(key).as_ref())?;
+        // Resolve original casing (O(1) index for large, scan for small), then
+        // one `get_full`.
+        let orig = g.resolve_ci_key(key)?;
         g.map.get_full(orig).map(|(i, _, v)| (i, v.clone()))
     }
 
@@ -528,7 +582,7 @@ impl CfmlStruct {
         if g.map.contains_key(key) {
             return Some(key.to_string()); // exact-case fast path
         }
-        g.ci.get(fold_key(key).as_ref()).cloned()
+        g.resolve_ci_key(key).cloned()
     }
 
     #[inline]
@@ -540,8 +594,8 @@ impl CfmlStruct {
     /// Case-insensitive key presence check.
     pub fn contains_key_ci(&self, key: &str) -> bool {
         let g = self.0.read();
-        // v0.442 — O(1): exact hit, else the fold→original-key ci index.
-        if g.map.contains_key(key) || g.ci.contains_key(fold_key(key).as_ref()) {
+        // exact hit, else ci resolution (O(1) index for large, scan for small).
+        if g.map.contains_key(key) || g.resolve_ci_key(key).is_some() {
             return true;
         }
         drop(g);
@@ -567,21 +621,22 @@ impl CfmlStruct {
         if let Some(slot) = g.map.get_mut(&key) {
             return Some(std::mem::replace(slot, value)); // exact hit, value-only
         }
-        // v0.442 — O(1) case-variant dedup via the ci index (was an O(n)
-        // `iter().position(eq_ignore_ascii_case)` scan on EVERY new-key insert,
-        // which made building a large struct O(n²)).
-        if let Some(orig) = g.ci.get(fold_key(&key).as_ref()).cloned() {
+        // Case-variant dedup: O(1) via the ci index for large structs, a linear
+        // scan for small ones (see `CI_THRESHOLD`). Either way, an existing key
+        // under a different casing is updated in place (first-casing wins).
+        if let Some(orig) = g.resolve_ci_key(&key).cloned() {
             if let Some(slot) = g.map.get_mut(&orig) {
                 return Some(std::mem::replace(slot, value));
             }
         }
-        // Genuinely new key: append to `map`, mirror into `ci`, bump shape.
+        // Genuinely new key: append to `map`, bump shape, and maintain the ci
+        // index iff the struct is (or just became) large enough to keep one.
         let folded = key.to_ascii_lowercase();
         let prev = g.map.insert(key.clone(), value);
-        g.ci.insert(folded, key);
         if prev.is_none() {
             g.shape_id = next_shape_id();
         }
+        g.ci_note_new_key(folded, key);
         prev
     }
 
@@ -612,14 +667,20 @@ impl CfmlStruct {
         let mut g = self.0.write();
         let prev = g.map.shift_remove(key);
         if prev.is_some() {
-            // Drop the ci entry only if it still points at the exact key we
-            // removed (a same-fold key under different casing is impossible
-            // given insert-time dedup, but stay defensive).
-            let f = fold_key(key).into_owned();
-            if g.ci.get(&f).map(|o| o == key).unwrap_or(false) {
-                g.ci.remove(&f);
-            }
             g.shape_id = next_shape_id();
+            // Maintain the ci index only while one is active. If the removal
+            // drops the struct to/below the threshold, retire the index (clear)
+            // so later reads fall back to the scan and a regrow rebuilds cleanly.
+            if !g.ci.is_empty() {
+                if g.map.len() > CI_THRESHOLD {
+                    let f = fold_key(key).into_owned();
+                    if g.ci.get(&f).map(|o| o == key).unwrap_or(false) {
+                        g.ci.remove(&f);
+                    }
+                } else {
+                    g.ci.clear();
+                }
+            }
         }
         prev
     }
@@ -629,17 +690,23 @@ impl CfmlStruct {
     pub fn remove_ci(&self, key: &str) -> Option<CfmlValue> {
         let mut g = self.0.write();
         let f = fold_key(key).into_owned();
-        // v0.442 — O(1): resolve the stored original casing via the ci index
-        // (was an O(n) `keys().find(eq_ignore_ascii_case)` scan).
+        // Resolve the stored original casing (O(1) index for large, scan for
+        // small), then remove it.
         let orig = if g.map.contains_key(key) {
             Some(key.to_string())
         } else {
-            g.ci.get(&f).cloned()
+            g.resolve_ci_key(key).cloned()
         };
         let prev = orig.and_then(|k| g.map.shift_remove(&k));
         if prev.is_some() {
-            g.ci.remove(&f);
             g.shape_id = next_shape_id();
+            if !g.ci.is_empty() {
+                if g.map.len() > CI_THRESHOLD {
+                    g.ci.remove(&f);
+                } else {
+                    g.ci.clear();
+                }
+            }
         }
         prev
     }
@@ -696,10 +763,14 @@ impl CfmlStruct {
         let mut g = self.0.write();
         g.shape_id = next_shape_id();
         let r = f(&mut g.map);
-        // v0.442 — the closure may have inserted / removed / renamed keys
-        // arbitrarily, so rebuild the ci index to restore the O(1) invariant.
-        // Off the hot path (hot inserts/probes use the dedicated methods).
-        g.ci_rebuild();
+        // The closure may have inserted / removed / renamed keys arbitrarily.
+        // Restore the invariant: rebuild the index if the struct is large,
+        // otherwise retire it (small structs scan). Off the hot path.
+        if g.map.len() > CI_THRESHOLD {
+            g.ci_rebuild();
+        } else {
+            g.ci.clear();
+        }
         r
     }
 
@@ -726,13 +797,13 @@ impl CfmlStruct {
         // a nested dotted assignment `settings.assetmanager.x = v` created a
         // parallel lowercase key, and a later `structAppend` then merged both
         // (the partial fork last-writer-wins), dropping most keys.
-        // v0.442 — O(1) ci locate via the index (was an O(n) `iter().position`).
+        // Locate case-insensitively (O(1) index for large, scan for small).
         let existing_idx = if g.map.contains_key(key) {
             g.map.get_index_of(key)
+        } else if let Some(orig) = g.resolve_ci_key(key).cloned() {
+            g.map.get_index_of(&orig)
         } else {
-            g.ci
-                .get(fold_key(key).as_ref())
-                .and_then(|orig| g.map.get_index_of(orig))
+            None
         };
         if let Some(idx) = existing_idx {
             let (_, entry) = g.map.get_index_mut(idx).expect("existing_idx in range");
@@ -748,9 +819,9 @@ impl CfmlStruct {
         }
         // Brand-new key.
         let s = CfmlStruct::empty();
-        g.ci.insert(fold_key(key).into_owned(), key.to_string());
         g.map.insert(key.to_string(), CfmlValue::Struct(s.clone()));
         g.shape_id = next_shape_id();
+        g.ci_note_new_key(fold_key(key).into_owned(), key.to_string());
         s
     }
 }
