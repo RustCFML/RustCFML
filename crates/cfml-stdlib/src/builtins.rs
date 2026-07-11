@@ -1649,27 +1649,28 @@ fn expand_cfml_replacement<F: Fn(usize) -> Option<String>>(template: &str, group
         let c = chars[i];
         if c == '\\' && i + 1 < n {
             let next = chars[i + 1];
-            i += 2;
             match next {
                 '0'..='9' => {
                     let g = next as usize - '0' as usize;
                     let text = group(g).unwrap_or_default();
                     emit(&mut out, &text, ranged_upper, &mut oneshot_upper);
+                    i += 2;
                 }
-                'u' => oneshot_upper = Some(true),
-                'l' => oneshot_upper = Some(false),
-                'U' => ranged_upper = Some(true),
-                'L' => ranged_upper = Some(false),
-                'E' => ranged_upper = None,
-                // Any OTHER escape is NOT interpreted in a CFML reReplace
-                // replacement string — the backslash is kept verbatim (Lucee 7
-                // parity, verified): `\n`/`\t`/`\r` stay literal `\n`/`\t`/`\r`,
-                // `\\`→`\\`, `\d`→`\d`, `\/`→`\/`. Only `\0`-`\9` (backreferences)
-                // and `\u`/`\l`/`\U`/`\L`/`\E` (case modifiers) are special.
-                other => {
-                    let mut s = String::from('\\');
-                    s.push(other);
-                    emit(&mut out, &s, ranged_upper, &mut oneshot_upper);
+                'u' => { oneshot_upper = Some(true); i += 2; }
+                'l' => { oneshot_upper = Some(false); i += 2; }
+                'U' => { ranged_upper = Some(true); i += 2; }
+                'L' => { ranged_upper = Some(false); i += 2; }
+                'E' => { ranged_upper = None; i += 2; }
+                // A backslash before ANY other char is a LITERAL backslash, and
+                // we RE-SCAN the following char (advance by 1, not 2) — Lucee
+                // parses the replacement one char at a time. So `\\1` is a literal
+                // `\` followed by the backref `\1` (→ `\<group1>`), NOT the verbatim
+                // `\\1`; `\\`→`\\`, `\n`→`\n`, `\d`→`\d` are unchanged (advancing 1
+                // vs 2 yields the same output unless the trailing char is a
+                // backref/modifier digit-or-letter). Verified against Lucee.
+                _ => {
+                    emit(&mut out, "\\", ranged_upper, &mut oneshot_upper);
+                    i += 1;
                 }
             }
         } else {
@@ -2891,14 +2892,14 @@ fn fn_get_tag_data(args: Vec<CfmlValue>) -> CfmlResult {
 /// name (e.g. paramless fn called positionally) — DO remain visible: that's
 /// how Lucee surfaces them.
 fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
-    // Lucee parity: "a NULL value is the same as not existing in CFML" — a key whose
-    // value is null is invisible to StructKeyArray/StructKeyList/StructCount (and any
-    // other consumer of this helper), matching structKeyExists and struct for-in.
-    let keys: Vec<String> = s
-        .keys()
-        .into_iter()
-        .filter(|k| !matches!(s.get(k.as_str()), Some(CfmlValue::Null)))
-        .collect();
+    // Lucee ENUMERATES a null-valued key (StructKeyList/StructKeyArray/StructCount
+    // and struct for-in all include it — verified: `{a=1,x=nullValue(),b=2}` →
+    // "B,X,A"), even though `structKeyExists` reports it absent ("a NULL value is
+    // the same as not existing"). structKeyExists enforces its own null-absence
+    // check (fn_struct_key_exists), so listing null keys here does NOT make the two
+    // disagree. (Query rows store NULL columns as "" — a real value — so they are
+    // unaffected either way.)
+    let keys: Vec<String> = s.keys();
     // A Java-collection shim (e.g. createObject("java","java.util.LinkedHashMap"))
     // is a transparent map facade — its `__java_class`/`__java_shim` markers are
     // engine-internal and must never surface as struct keys (ColdBox's
@@ -2920,6 +2921,14 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
             .iter()
             .any(|k| k.eq_ignore_ascii_case("__name") || k.eq_ignore_ascii_case("this"));
     if is_component {
+        // Accessor-private property names (values written by the implicit accessor
+        // ctor or a generated setX) — Lucee keeps these in the private `variables`
+        // scope, so structKeyList/Count/Exists/for-in must not surface them (only
+        // getX()/serializeJSON do). See ACCESSOR_PRIVATE_MARKER.
+        let accessor_private = match s.get(cfml_common::dynamic::ACCESSOR_PRIVATE_MARKER) {
+            Some(CfmlValue::Struct(m)) => Some(m),
+            _ => None,
+        };
         return keys
             .into_iter()
             .filter(|k| {
@@ -2932,7 +2941,7 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
                         cfml_common::dynamic::CfmlAccess::Public
                             | cfml_common::dynamic::CfmlAccess::Remote
                     ),
-                    _ => true,
+                    _ => !accessor_private.as_ref().is_some_and(|m| m.contains_key_ci(k)),
                 }
             })
             .collect();
@@ -6327,6 +6336,19 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
     let type_lower = type_name.to_lowercase();
 
     if let CfmlValue::Struct(s) = obj {
+        // Lucee parity: every CFC is an instance of the base type "Component"
+        // (case-insensitive), and ONLY that exact name — NOT "Object", NOT
+        // "lucee.runtime.Component", and NOT a plain struct. Verified against a
+        // live Lucee server. MockBox's `normalizeArguments` depends on this to
+        // pick `serializeJSON(cfc)` over a member `cfc.toString()` call (line 510
+        // of MockBox.cfc) — the latter throws "has no function with name
+        // [toString]" on both engines, which is why component args failed to
+        // match and ~40 cfflow specs errored. A component carries `__name` or the
+        // `__variables` scope; a plain struct carries neither.
+        let is_component = s.get("__name").is_some() || s.get("__variables").is_some();
+        if is_component && type_lower == "component" {
+            return Ok(CfmlValue::Bool(true));
+        }
         // Check direct name match
         if let Some(CfmlValue::String(name)) = s.get("__name") {
             if name.to_lowercase() == type_lower {

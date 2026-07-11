@@ -188,8 +188,15 @@ impl Token {
             "interface" => Some(Token::Interface),
             "var" => Some(Token::Var),
             "local" => Some(Token::Local),
-            "true" | "yes" => Some(Token::True),
-            "false" | "no" => Some(Token::False),
+            // `yes`/`no` are NOT boolean literals in CFML script — Lucee/ACF treat
+            // a bare `yes`/`no` as an ordinary identifier (variable reference):
+            // `x = yes` throws "variable [YES] doesn't exist". Only `true`/`false`
+            // are literals. Lexing them as identifiers also keeps them usable as
+            // struct-literal KEYS (`{ yes=1, no=2 }` → keys "yes"/"no", not
+            // "true"/"false"). String coercion (`isBoolean("yes")`, boolean tag
+            // attributes) is handled at the value level, not the lexer.
+            "true" => Some(Token::True),
+            "false" => Some(Token::False),
             "null" => Some(Token::Null),
             "lock" => Some(Token::Lock),
             "include" => Some(Token::Include),

@@ -73,6 +73,19 @@ pub fn build_implements_meta(s: &ValueMap) -> Option<CfmlValue> {
 /// in struct introspection (`structKeyList`, `structCount`, for-in, JSON, …).
 pub const EMPTY_DEFAULT_SCOPE_MARKER: &str = "__cfml_empty_default_scope__";
 
+/// Reserved key on a component instance struct holding the set (a `Struct` used
+/// as a set: key = lowercased property name, value ignored) of accessor
+/// properties whose VALUE was written by the engine's accessor path — the
+/// implicit accessor constructor or a generated `setX()` setter. Lucee stores
+/// such values in the PRIVATE `variables` scope, so they are invisible to
+/// `structKeyList`/`structCount`/`structKeyExists`/for-in (only `getX()` and
+/// `serializeJSON` surface them). This engine materialises them at the struct
+/// top level (shared with the public `this` scope), so introspection must
+/// consult this marker to hide them and match Lucee. An explicit `this.x = …`
+/// write does NOT enter this set — it is a genuine public member (kept visible).
+/// `__`-prefixed, so it is itself already hidden from introspection and JSON.
+pub const ACCESSOR_PRIVATE_MARKER: &str = "__cfml_accessor_private__";
+
 /// Shared, interior-mutable backing for a CFML array — the basis of Lucee-style
 /// **reference semantics**. Cloning a `CfmlArray` bumps the `Arc` (it does NOT
 /// copy the elements), so `b = a` makes `a` and `b` two handles onto the *same*

@@ -100,6 +100,48 @@ assert("multiplier factory triple", triple(5), 15);
 suiteEnd();
 
 // ============================================================
+// Deferred nested closures capture a LIVE outer var (Lucee parity)
+// Mirrors the TestBox describe/beforeEach/it shape that broke cfflow:
+// closures are registered at increasing lexical depth, an outer variable
+// is reassigned AFTER registration, then the deferred readers run. Lucee
+// captures the variable (not a snapshot), so every depth sees the new
+// value. RustCFML previously saw it only at the sibling level (depth 0)
+// and read a stale copy at any deeper nesting.
+suiteBegin("Lucee7: Deferred nested closure live capture");
+deferredReaders = [];
+function buildDeferred(){
+    var v = "INITIAL";
+    var mutate = function(){ v = "WRITTEN"; };
+    deferredReaders.append( function(){ return v; } );                 // depth 0 (sibling)
+    var d1 = function(){
+        deferredReaders.append( function(){ return v; } );             // depth 1
+        var d2 = function(){
+            deferredReaders.append( function(){ return v; } );         // depth 2
+            var d3 = function(){
+                deferredReaders.append( function(){ return v; } );     // depth 3
+            }; d3();
+        }; d2();
+    }; d1();
+    mutate();   // reassign AFTER all readers were registered
+}
+buildDeferred();
+assert("deferred closure depth 0 sees live value", deferredReaders[1](), "WRITTEN");
+assert("deferred closure depth 1 sees live value", deferredReaders[2](), "WRITTEN");
+assert("deferred closure depth 2 sees live value", deferredReaders[3](), "WRITTEN");
+assert("deferred closure depth 3 sees live value", deferredReaders[4](), "WRITTEN");
+
+// A closure factory nested inside must STILL capture its own per-call arg,
+// even though the shared outer scope holds a same-named variable. Guards
+// against the live-capture chain leaking an ancestor value over a param.
+x = 999; // decoy same-named page var
+nestedFactory = function(x){ return function(){ return x; }; };
+capA = nestedFactory(5);
+capB = nestedFactory(10);
+assert("nested factory keeps own arg A", capA(), 5);
+assert("nested factory keeps own arg B", capB(), 10);
+suiteEnd();
+
+// ============================================================
 // IIf (from Lucee IIf.cfc)
 // ============================================================
 suiteBegin("Lucee7: IIf");

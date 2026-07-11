@@ -4688,6 +4688,26 @@ impl Parser {
         )
     }
 
+    /// Whether the token at `offset` can be consumed by `extract_property_name`
+    /// as a dotted path/member segment. CFML lets ANY keyword follow a dot —
+    /// including the operator words (`contains`, `eq`, `is`, `mod`, `and`, …) —
+    /// so `new pkg.string.Contains()` and `obj.Contains()` are valid (cfflow's
+    /// string-condition CFCs are literally named `Contains`/`Not`-style words).
+    /// Mirror the exact set `extract_property_name` accepts.
+    fn is_property_name_at(&self, offset: usize) -> bool {
+        self.is_identifier_like_at(offset)
+            || matches!(self.peek(offset),
+                Token::If | Token::Else | Token::ElseIf | Token::For | Token::In
+                | Token::While | Token::Do | Token::Break | Token::Continue
+                | Token::Return | Token::Switch | Token::Case | Token::Try
+                | Token::Catch | Token::Finally | Token::Rethrow | Token::New
+                | Token::This | Token::Super | Token::True | Token::False | Token::Null
+                | Token::Contains | Token::NotKeyword | Token::AndKeyword | Token::OrKeyword
+                | Token::XorKeyword | Token::EqKeyword | Token::NeqKeyword
+                | Token::GtKeyword | Token::GteKeyword | Token::LtKeyword
+                | Token::LteKeyword | Token::ModKeyword | Token::IsKeyword)
+    }
+
     fn extract_identifier(&mut self) -> Result<String, ParseError> {
         match self.peek(0) {
             Token::Identifier(_) => {
@@ -5980,15 +6000,7 @@ impl Parser {
                         // valid (GitHub #246). extract_property_name accepts the
                         // full keyword set; guard the dot-consume with the same
                         // set via is_identifier_like_at + the reserved words.
-                        let seg_ok = self.is_identifier_like_at(1)
-                            || matches!(
-                                self.peek(1),
-                                Token::Public
-                                    | Token::Private
-                                    | Token::Remote
-                                    | Token::Package
-                                    | Token::Static
-                            );
+                        let seg_ok = self.is_property_name_at(1);
                         if seg_ok {
                             self.advance(); // consume dot
                             match self.extract_property_name() {

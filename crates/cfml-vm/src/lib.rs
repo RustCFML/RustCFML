@@ -1382,6 +1382,17 @@ pub struct CfmlVirtualMachine {
     /// scope keeps the original names (matches Lucee/ACF/BoxLang: extras
     /// stay reachable as `arguments.<name>`).
     pending_extra_named_args: Option<Vec<(usize, String)>>,
+    /// The live shared closure environment of a lexical closure that is about to
+    /// be invoked. Set by `call_function` right before dispatch (only for
+    /// `__closure_`/`__arrow_` callees that carry a captured scope) and drained
+    /// by the next `execute_function_body` at frame entry, which adopts it as the
+    /// frame's OWN `closure_env` instead of lazily minting a fresh one. This
+    /// keeps closures defined *inside* a closure body (e.g. TestBox's
+    /// `describe(fn(){ it(fn(){…}); })` — a spec closure registered one level
+    /// deep) sharing the SAME live env Arc as their lexical ancestors, so a
+    /// sibling `beforeEach` reassignment is visible to the deferred `it`. Without
+    /// it the inner closure captured a point-in-time COPY that never re-synced.
+    pending_closure_env: Option<Arc<RwLock<ValueMap>>>,
     /// The name a member method was invoked under at its call site. Set by
     /// `call_member_function` just before dispatching, and drained by the next
     /// `execute_function_with_args` into the new frame's `called_name`. Lets
@@ -1795,6 +1806,7 @@ impl CfmlVirtualMachine {
             arg_ref_writeback: None,
             pending_result_writeback: None,
             pending_extra_named_args: None,
+            pending_closure_env: None,
             pending_called_name: None,
             native_classes: HashMap::new(),
             qoq_registry: QoQFunctionRegistry::new(),
@@ -3995,6 +4007,16 @@ impl CfmlVirtualMachine {
         // Shared closure environment: all closures defined within this function
         // invocation share one Rc<RefCell<HashMap>>. Lazily created on first DefineFunction.
         let mut closure_env: Option<Arc<RwLock<ValueMap>>> = None;
+        // If THIS frame is a lexical-closure invocation, `call_function` stashed the
+        // closure's live captured (defining) env in `pending_closure_env`. We do NOT
+        // adopt it as our own env — each invocation must own its scope so closure
+        // FACTORIES stay independent (`makeAdder(5)` vs `makeAdder(10)` capture
+        // different `x`). Instead we remember it here and record it as the PARENT of
+        // any fresh env this frame mints (see DefineFunction), building a live parent
+        // chain. That chain is what lets a deferred spec `it(fn(){…})` — registered
+        // one `describe` deeper than the `beforeEach` that reassigns an outer var —
+        // resolve the reassigned value from its authoritative ancestor at call time.
+        let inherited_parent_env: Option<Arc<RwLock<ValueMap>>> = self.pending_closure_env.take();
 
         // Effective Lucee localMode for this frame: function's declared attribute
         // wins; otherwise inherits the application default (`this.localMode` in
@@ -4095,6 +4117,22 @@ impl CfmlVirtualMachine {
             };
             match supplied {
                 Some(value) => {
+                    // Argument type validation for COMPONENT/INTERFACE-typed params
+                    // (Lucee parity): passing an object that isn't an instance of
+                    // the declared CFC/interface throws `expression`. Scoped to
+                    // non-primitive types — primitives stay leniently coerced as
+                    // before. cfflow's WorkflowImplementationFactory relies on this
+                    // (`registerScheduler(required IWorkflowScheduler impl)` etc.).
+                    if let Some(Some(ptype)) = func.param_types.get(i) {
+                        if Self::is_validatable_component_type(ptype)
+                            && !Self::value_satisfies_component_type(&value, ptype)
+                        {
+                            return Err(self.wrap_error(CfmlError::expression(format!(
+                                "The argument [{}] passed to function [{}] is not of type [{}].",
+                                param_name, func.name, ptype
+                            ))));
+                        }
+                    }
                     locals.insert(param_name.clone(), value.clone());
                     arguments_map.insert(param_name.clone(), value);
                 }
@@ -7549,6 +7587,16 @@ impl CfmlVirtualMachine {
                         .unwrap_or(CfmlValue::Null);
                     stack.push(val);
                 }
+                BytecodeOp::MarkAccessorPrivate(name) => {
+                    // Emitted at the tail of a generated `setX()` accessor. Record
+                    // the property on the frame's `this` so introspection/for-in
+                    // hide it (Lucee keeps accessor values private in `variables`);
+                    // getX()/serializeJSON still read the top-level value. Persists
+                    // to the receiver the same way the setter's value write does.
+                    if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
+                        Self::mark_accessor_private(this_s, name);
+                    }
+                }
                 BytecodeOp::SetProperty(name) => {
                     if let Some(value) = stack.pop() {
                         if let Some(mut obj) = stack.pop() {
@@ -7926,6 +7974,25 @@ impl CfmlVirtualMachine {
                                 {
                                     seed.insert(k.clone(), cv);
                                 }
+                            }
+                            // Record this frame's lexical parent (the env of the
+                            // closure whose body we are running) as a live link on
+                            // the fresh env. `refresh_env_from_parent_chain` walks it
+                            // at call time so a closure defined here later resolves an
+                            // outer var from the ancestor that OWNS it — even if a
+                            // sibling reassigned it after this env was seeded (the
+                            // deferred describe/it → beforeEach shape).
+                            if let Some(ref parent) = inherited_parent_env {
+                                // Own keys = this frame's params + `var`-declared
+                                // locals: frozen per-invocation, never refreshed.
+                                let own_keys: Vec<CfmlValue> = func
+                                    .params
+                                    .iter()
+                                    .cloned()
+                                    .chain(declared_locals.iter().cloned())
+                                    .map(CfmlValue::string)
+                                    .collect();
+                                Self::set_closure_parent_link(&mut seed, parent, own_keys);
                             }
                             closure_env.insert(cfml_common::cycle_gc::tracked_scope(seed))
                         }
@@ -9010,6 +9077,17 @@ impl CfmlVirtualMachine {
                                 // public-method enumeration to mix in a base
                                 // class's methods — `toVirtualInheritance`.)
                                 let is_cfc = is_component_struct(&s);
+                                // Accessor-private property names (set via implicit
+                                // ctor / generated setX) — hidden from for-in to
+                                // match Lucee's private `variables` storage.
+                                let accessor_private = if is_cfc {
+                                    match s.get(cfml_common::dynamic::ACCESSOR_PRIVATE_MARKER) {
+                                        Some(CfmlValue::Struct(m)) => Some(m.clone()),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
                                 // A Java-collection shim (LinkedHashMap etc.) is a
                                 // transparent map — hide its `__java_*` markers.
                                 let is_java_shim = s.contains_key("__java_shim");
@@ -9055,17 +9133,27 @@ impl CfmlVirtualMachine {
                                                 cfml_common::dynamic::CfmlAccess::Public
                                                     | cfml_common::dynamic::CfmlAccess::Remote
                                             ),
-                                            // Closures (e.g. `this.x = () => {}`)
-                                            // are public data assignments.
-                                            _ => true,
+                                            // Non-function data member: visible
+                                            // UNLESS it is an accessor-private
+                                            // property (Lucee stores it in the
+                                            // private `variables` scope). A genuine
+                                            // public `this.x = …` is never marked.
+                                            _ => !accessor_private
+                                                .as_ref()
+                                                .is_some_and(|m| m.contains_key_ci(k)),
                                         }
                                     })
-                                    // Lucee parity: "a NULL value is the same as not existing"
-                                    // — for-in skips null-valued keys (as does structKeyExists).
-                                    // Preside's `for( field in record ){ var v = record[field] }`
-                                    // over a query row with a NULL column would otherwise assign
-                                    // null then throw on the next read of `v`.
-                                    .filter(|k| !matches!(s.get(k.as_str()), Some(CfmlValue::Null)))
+                                    // Lucee ENUMERATES a null-valued key in struct
+                                    // for-in (e.g. `for(k in {x=nullValue()})`
+                                    // yields `x`), even though structKeyExists
+                                    // reports it absent. The loop body reads the
+                                    // value defensively (`?:` / structKeyExists), and
+                                    // RustCFML's null access is lenient ("" rather
+                                    // than a throw). Query rows store NULL columns as
+                                    // "" (a real value), so Preside's
+                                    // `for(field in record){ var v = record[field] }`
+                                    // is unaffected. (cfflow WorkflowStateSubstitution
+                                    // needs the null `$something` token enumerated.)
                                     .map(CfmlValue::string)
                                     .collect();
                                 if is_treemap {
@@ -9703,6 +9791,31 @@ impl CfmlVirtualMachine {
                         // functions are carried so bare-name sibling/var-scoped
                         // helpers stay callable (PR #198). See
                         // `build_call_parent_scope`.
+                        // Live lexical parent chain for deferred nested closures.
+                        // Gated to synthesized lexical closures (`__closure_`/
+                        // `__arrow_`) so named functions and CFC methods keep the
+                        // copy-and-writeback path untouched. Must run BEFORE
+                        // `build_call_parent_scope` copies the captured env into the
+                        // callee's locals — otherwise the refresh lands too late to
+                        // be seen by this invocation.
+                        if (func.name.starts_with("__closure_")
+                            || func.name.starts_with("__arrow_"))
+                            && func.captured_scope.is_some()
+                        {
+                            // (1) Refresh this closure's captured env from its
+                            // ancestors so an outer var reassigned by a sibling
+                            // (e.g. a TestBox `beforeEach`) is seen by this deferred
+                            // `it`, which was seeded with a now-stale copy.
+                            if let Some(ref env) = func.captured_scope {
+                                Self::refresh_env_from_parent_chain(env);
+                            }
+                            // (2) Hand our captured (defining) env down so any env
+                            // this invocation mints links back to it as its parent —
+                            // building the chain (1) walks. Each invocation still owns
+                            // its scope (closure factories stay independent), unlike
+                            // adopting the parent env outright.
+                            self.pending_closure_env = func.captured_scope.clone();
+                        }
                         let effective_parent = self.build_call_parent_scope(func, parent_locals);
                         // Lexical relative-component resolution: while a user
                         // function runs, a bare createObject("component","X")/
@@ -17267,6 +17380,95 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Whether a declared parameter/return type is a COMPONENT/INTERFACE type
+    /// worth argument-type-validating (vs a primitive/builtin RustCFML coerces or
+    /// ignores). Returns false for the primitive/loose set (Lucee coerces those;
+    /// RustCFML stays lenient) and true for anything else — a CFC or interface
+    /// name (`IWorkflowScheduler`, `pkg.Widget`, …). Case-insensitive.
+    fn is_validatable_component_type(type_name: &str) -> bool {
+        let t = type_name.trim().to_lowercase();
+        if t.is_empty() {
+            return false;
+        }
+        // An array-of / typed-collection annotation (`Widget[]`) is a collection,
+        // not a single-instance check.
+        if t.ends_with("[]") {
+            return false;
+        }
+        !matches!(
+            t.as_str(),
+            "any" | "string" | "numeric" | "number" | "boolean" | "bool" | "struct"
+                | "array" | "query" | "date" | "datetime" | "time" | "binary"
+                | "uuid" | "guid" | "function" | "closure" | "udf" | "void"
+                | "xml" | "component" | "object" | "node" | "variablename"
+                | "range" | "regex" | "regular_expression" | "email" | "url"
+                | "creditcard" | "ssn" | "social_security_number" | "telephone"
+                | "phone" | "zipcode" | "float" | "double" | "int" | "integer"
+                | "long" | "short" | "bigdecimal" | "biginteger" | "char"
+                | "byte" | "void" | "null" | "usdate" | "eurodate" | "boolean_"
+                | "hex" | "base64" | "path" | "string_" | "lambda"
+        )
+    }
+
+    /// isInstanceOf-style check: does `value` satisfy a COMPONENT/INTERFACE type
+    /// `type_name`? Mirrors `fn_is_instance_of`'s component metadata walk (direct
+    /// name, `__extends_chain`, `__implements`/`__implements_chain`/
+    /// `__implements_fqns`), matching either the full name or last dotted segment.
+    /// A NativeObject (rust class) is accepted leniently. A non-component value
+    /// (string/number/plain struct/…) never satisfies a component/interface type.
+    fn value_satisfies_component_type(value: &CfmlValue, type_name: &str) -> bool {
+        let want = type_name.trim().to_lowercase();
+        let matches_name = |candidate: &str| -> bool {
+            let c = candidate.to_lowercase();
+            c == want || c.rsplit('.').next().map(|s| s == want).unwrap_or(false)
+        };
+        match value {
+            // Rust/native parents can't carry CFC metadata — accept leniently.
+            CfmlValue::NativeObject(_) => true,
+            CfmlValue::Struct(s) => {
+                if !(s.contains_key("__variables")
+                    || s.contains_key("__name")
+                    || s.contains_key("__properties"))
+                {
+                    // A plain struct is not a component instance.
+                    return false;
+                }
+                if let Some(CfmlValue::String(n)) = s.get("__name") {
+                    if matches_name(n.as_str()) {
+                        return true;
+                    }
+                }
+                for key in ["__extends_chain", "__implements", "__implements_chain", "__implements_fqns"] {
+                    if let Some(CfmlValue::Array(arr)) = s.get(key) {
+                        if arr.iter().any(|item| matches_name(&item.as_string())) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Record `prop` on `s` as accessor-private: its value was written by the
+    /// implicit accessor constructor or a generated `setX()`, so Lucee would keep
+    /// it in the private `variables` scope. See `ACCESSOR_PRIVATE_MARKER`. The
+    /// marker is a nested `Struct` used as a case-insensitive set (key = lowercased
+    /// property name). Iteration/introspection consults it to hide the key; the
+    /// value stays readable via `getX()`/`serializeJSON` (top-level, unchanged).
+    fn mark_accessor_private(s: &cfml_common::dynamic::CfmlStruct, prop: &str) {
+        let key = cfml_common::dynamic::ACCESSOR_PRIVATE_MARKER;
+        let plc = prop.to_lowercase();
+        if let Some(CfmlValue::Struct(m)) = s.get(key) {
+            m.insert(plc, CfmlValue::Bool(true));
+        } else {
+            let mut m = ValueMap::default();
+            m.insert(plc, CfmlValue::Bool(true));
+            s.insert(key.to_string(), CfmlValue::strukt(m));
+        }
+    }
+
     /// Lucee/ACF implicit accessor constructor. A component declared with
     /// `accessors=true` and NO explicit `init()` gets a generated constructor
     /// that maps NAMED constructor arguments (and an `argumentCollection`
@@ -17349,6 +17551,11 @@ impl CfmlVirtualMachine {
                     matches!(s.get_ci(actual), Some(CfmlValue::Function(_)));
                 if !collides_with_method {
                     s.insert(actual.clone(), pval);
+                    // Accessor-set value: private in Lucee's `variables` scope,
+                    // so hide it from introspection/for-in (kept readable via
+                    // getX()/serializeJSON). Matches Lucee; breaks the TestBox
+                    // `equalize` cycle through cfflow mock instances.
+                    Self::mark_accessor_private(s, actual);
                 }
             }
         }
@@ -19954,7 +20161,11 @@ impl CfmlVirtualMachine {
                                     vars.insert(actual_key, value.clone());
                                 }
                             } else {
-                                ms.insert(actual_key, value.clone());
+                                ms.insert(actual_key.clone(), value.clone());
+                                // Generated setter write → accessor-private (Lucee
+                                // keeps it in `variables`). Hide from introspection/
+                                // for-in; getX()/serializeJSON still see it.
+                                Self::mark_accessor_private(ms, &actual_key);
                             }
                         }
                         return Ok(modified);
@@ -20553,6 +20764,120 @@ impl CfmlVirtualMachine {
                 Some(CfmlValue::Function(Arc::new(nf)))
             }
             _ => Some(value.clone()),
+        }
+    }
+
+    /// Reserved key under which a closure env stores a live link to its lexical
+    /// PARENT env. The link is a throwaway `Function` value — the only `CfmlValue`
+    /// that can carry an `Arc<RwLock<ValueMap>>` (its `captured_scope`) — so the
+    /// parent stays reachable exactly as long as the child env does, with no
+    /// side-table to leak or dangle. `__`-prefixed and Function-typed, so every
+    /// existing env guard (closure_env_capture_value, write_back_to_captured_scope,
+    /// reconcile_closure_env_into_locals, scope views) already skips it.
+    const CLOSURE_PARENT_KEY: &'static str = "__closure_parent_env__";
+    /// Reserved key holding an `Array` of THIS env's OWN key names — the frame's
+    /// params and `var`-declared locals. `refresh_env_from_parent_chain` never
+    /// overwrites an own key from an ancestor, so a closure factory's captured
+    /// argument (`makeAdder(x)` → `x`) stays frozen even when the shared page
+    /// scope happens to hold an unrelated variable of the same name.
+    const CLOSURE_OWN_KEYS: &'static str = "__closure_own_keys__";
+
+    /// Attach `parent` as `map`'s lexical-parent link plus its own-key set (see
+    /// `CLOSURE_PARENT_KEY` / `CLOSURE_OWN_KEYS`).
+    fn set_closure_parent_link(
+        map: &mut ValueMap,
+        parent: &Arc<RwLock<ValueMap>>,
+        own_keys: Vec<CfmlValue>,
+    ) {
+        map.insert(
+            Self::CLOSURE_PARENT_KEY.to_string(),
+            CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+                name: String::new(),
+                params: Vec::new(),
+                body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
+                return_type: None,
+                access: cfml_common::dynamic::CfmlAccess::Public,
+                captured_scope: Some(Arc::clone(parent)),
+            })),
+        );
+        map.insert(Self::CLOSURE_OWN_KEYS.to_string(), CfmlValue::array(own_keys));
+    }
+
+    /// Read `map`'s lexical-parent env link, if any.
+    fn closure_parent_link(map: &ValueMap) -> Option<Arc<RwLock<ValueMap>>> {
+        match map.get(Self::CLOSURE_PARENT_KEY) {
+            Some(CfmlValue::Function(f)) => f.captured_scope.clone(),
+            _ => None,
+        }
+    }
+
+    /// Refresh `env`'s inherited data keys from its lexical parent chain so a
+    /// deferred closure sees the CURRENT value of an outer variable that a sibling
+    /// closure reassigned after `env` was seeded (the TestBox
+    /// `describe(fn(){ beforeEach(...); describe(fn(){ it(...) }) })` shape).
+    ///
+    /// For each non-reserved, non-Function key already present in `env`, take the
+    /// value from the FARTHEST ancestor that also holds it — i.e. the scope that
+    /// actually OWNS the variable (where `beforeEach`'s write-back lands), not an
+    /// intermediate frame's stale copy. A key that no ancestor holds (a param /
+    /// `var`-local, e.g. a closure factory's captured argument) is left untouched,
+    /// preserving per-invocation independence.
+    fn refresh_env_from_parent_chain(env: &Arc<RwLock<ValueMap>>) {
+        // Collect the ancestor chain (nearest → farthest), guarding against a
+        // pathological cycle with a depth cap.
+        let mut chain: Vec<Arc<RwLock<ValueMap>>> = Vec::new();
+        {
+            let mut cur = Self::closure_parent_link(&env.read().unwrap());
+            let mut depth = 0;
+            while let Some(p) = cur {
+                if chain.iter().any(|c| Arc::ptr_eq(c, &p)) || depth > 64 {
+                    break;
+                }
+                let next = Self::closure_parent_link(&p.read().unwrap());
+                chain.push(p);
+                cur = next;
+                depth += 1;
+            }
+        }
+        if chain.is_empty() {
+            return;
+        }
+        // Keys to refresh: this env's inherited data keys — everything except the
+        // reserved links, Function values, and the frame's OWN params/var-locals
+        // (those are frozen per-invocation; see CLOSURE_OWN_KEYS).
+        let keys: Vec<String> = {
+            let e = env.read().unwrap();
+            let own: std::collections::HashSet<String> = match e.get(Self::CLOSURE_OWN_KEYS) {
+                Some(CfmlValue::Array(a)) => a.snapshot().iter().map(|v| v.as_string()).collect(),
+                _ => std::collections::HashSet::new(),
+            };
+            e.keys()
+                .filter(|k| {
+                    k.as_str() != Self::CLOSURE_PARENT_KEY && k.as_str() != Self::CLOSURE_OWN_KEYS
+                })
+                .filter(|k| !own.contains(k.as_str()))
+                .filter(|k| !matches!(e.get(k.as_str()), Some(CfmlValue::Function(_))))
+                .cloned()
+                .collect()
+        };
+        let mut updates: Vec<(String, CfmlValue)> = Vec::new();
+        for k in keys {
+            // Farthest ancestor that owns the key = authoritative home.
+            for anc in chain.iter().rev() {
+                let a = anc.read().unwrap();
+                if let Some(v) = a.get(k.as_str()) {
+                    if !matches!(v, CfmlValue::Function(_)) {
+                        updates.push((k.clone(), v.clone()));
+                    }
+                    break;
+                }
+            }
+        }
+        if !updates.is_empty() {
+            let mut e = env.write().unwrap();
+            for (k, v) in updates {
+                e.insert(k, v);
+            }
         }
     }
 
@@ -26221,6 +26546,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::TryLoadLocalKey(_) => (1, 0), // Null-tolerant twin
         BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
+        BytecodeOp::MarkAccessorPrivate(_) => (0, 0), // no stack effect
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
         BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value

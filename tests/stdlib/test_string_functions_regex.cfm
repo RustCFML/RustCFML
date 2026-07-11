@@ -22,6 +22,13 @@ assert("reReplace backref all", reReplace("a1b2c3", "([a-z])([0-9])", "\2\1", "a
 assert("reReplace backref upper-first", reReplace("hello", "(h)(ello)", "\u\1\2"), "Hello");
 assert("reReplace backref title-case all", reReplace("route-tester", "(^|-)([a-z])", "\u\2", "all"), "RouteTester");
 assert("reReplace backref upper-rest", reReplace("abc", "(.*)", "\U\1"), "ABC");
+// A backslash before a NON-special char is a literal backslash and scanning
+// RE-SCANS the next char (Lucee parses one char at a time). So "\\1" is a
+// literal `\` followed by the backref `\1` -> `\<group1>`, NOT verbatim "\\1".
+// cfflow's WorkflowArgSubstitutor escapes tokens with reReplace(t,"([\$\-\.])","\\1","all").
+assert("reReplace literal-backslash then backref", reReplace("$test", "([\$\-\.])", "\\1", "all"), "\$test");
+assert("reReplace lone double-backslash", reReplace("X", "(X)", "\\", "all"), "\\");
+assert("reReplace backslash-nondigit stays literal", reReplace("X", "(X)", "\n", "all"), "\n");
 
 // --- reReplaceNoCase ---
 assert("reReplaceNoCase all", reReplaceNoCase("Hello World", "[a-z]+", "X", "all"), "X X");

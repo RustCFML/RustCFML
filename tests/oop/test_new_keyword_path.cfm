@@ -27,6 +27,13 @@ assert("new ...static.Inner()",  (new newkw.static.Inner()).hello(),  "stat-inne
 // Trailing keyword-named class.
 assert("new ...Public() (trailing keyword class)", (new newkw.Public()).hello(), "public-cfc-ok");
 
+// Operator-keyword segments/classes: `contains`/`eq`/`is`/… are binary
+// operators in CFML, but after a dot they are ordinary path/member words. cfflow
+// ships condition CFCs literally named `Contains` under a `.../conditions/string`
+// package; `new ...string.Contains()` was mis-parsed at the `.Contains` segment.
+assert("new ...Contains() (trailing operator-keyword class)", (new newkw.Contains()).hello(), "contains-cfc-ok");
+assert("new ...eq.Inner() (operator-keyword segment)", (new newkw.eq.Inner()).hello(), "eq-inner-ok");
+
 // Controls: non-keyword segments must still work.
 assert("control new ...sub.Inner()", (new newkw.sub.Inner()).hello(), "sub-inner-ok");
 assert("control new ...Thing()",     (new newkw.Thing()).hello(),     "thing-ok");

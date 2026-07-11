@@ -158,6 +158,7 @@ include "harness.cfm";
 <cf_runtest file="types/test_array_append_grow.cfm">
 <cf_runtest file="types/test_array_reference_semantics.cfm">
 <cf_runtest file="types/test_struct.cfm">
+<cf_runtest file="types/test_struct_literal_yesno_null_enum.cfm">
 <cf_runtest file="types/test_struct_reference_semantics.cfm">
 <cf_runtest file="types/test_ordered_struct_literals.cfm">
 <cf_runtest file="types/test_dotted_key_struct_literals.cfm">
@@ -291,6 +292,8 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_accessor_private_iteration.cfm">
+<cf_runtest file="oop/test_arg_type_validation.cfm">
 <cf_runtest file="oop/test_new_keyword_path.cfm">
 <!--- - component_internals_serialize_leak: iterating a component (for(k in obj)) --->
 <!--- or SerializeJSON(obj) must expose only data members, never engine --->
@@ -694,6 +697,7 @@ include "harness.cfm";
 <!--- IDeclCreature), for both `new X()` and createObject("component", ...). --->
 <cf_runtest file="core/test_isinstanceof_interface_chain.cfm">
 <cf_runtest file="core/test_isinstanceof_native_types.cfm">
+<cf_runtest file="core/test_isinstanceof_component_base.cfm">
 <cf_runtest file="core/test_session_holds_component.cfm">
 <!--- - dotted_param_type: a function/method parameter may carry a dotted FQN --->
 <!--- type (function f( wheels.system.TestResult x )). RustCFML used to reject --->

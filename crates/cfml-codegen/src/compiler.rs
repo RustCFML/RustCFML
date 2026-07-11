@@ -361,6 +361,14 @@ pub enum BytecodeOp {
     TryLoadLocalProperty(String, String),
     TryLoadLocalKey(String),
     SetProperty(String), // Set object.property = value
+    /// Mark a property name as accessor-private on the current frame's `this`
+    /// component: its value was written by a generated `setX()` accessor, so
+    /// Lucee keeps it in the private `variables` scope and it must be hidden from
+    /// `structKeyList`/`structCount`/`structKeyExists`/for-in (but stays readable
+    /// via `getX()`/`serializeJSON`). Records into the `ACCESSOR_PRIVATE_MARKER`
+    /// set on `this`. No stack effect. The implicit accessor constructor does the
+    /// equivalent from Rust (`mark_accessor_private`).
+    MarkAccessorPrivate(String),
     /// Dynamic/quoted-string LHS assignment: `"#scope#.#prop#" = v` or
     /// `"variables.x" = v`. Stack: [pathString, value]. The path is resolved at
     /// runtime and the value stored scope-aware into the current frame (so
@@ -3191,6 +3199,11 @@ impl CfmlCompiler {
                         BytecodeOp::LoadLocal(prop.name.clone()),
                         BytecodeOp::SetProperty(prop.name.clone()),
                         BytecodeOp::StoreLocal("__variables".to_string()),
+                        // The value now sits on the top-level `this` scope (public),
+                        // but Lucee keeps an accessor property PRIVATE (variables
+                        // only). Mark it so introspection/for-in hide it while
+                        // getX()/serializeJSON still surface it.
+                        BytecodeOp::MarkAccessorPrivate(prop.name.clone()),
                         // Return this
                         BytecodeOp::LoadLocal("this".to_string()),
                         BytecodeOp::Return,
