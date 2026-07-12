@@ -5601,9 +5601,261 @@ pub fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     // When false, a {COLUMNS, DATA} object is reconstructed into a native Query
     // (the inverse of serializeJSON(query, …)) — matching Lucee/ACF. GH #232.
     let strict = args.get(1).map(|v| v.is_true()).unwrap_or(true);
-    match serde_json::from_str::<serde_json::Value>(&json) {
-        Ok(value) => Ok(serde_json_to_cfml_strict(value, strict)),
-        Err(e) => Err(CfmlError::runtime(format!("Invalid JSON: {}", e))),
+    let value = match serde_json::from_str::<serde_json::Value>(&json) {
+        Ok(value) => value,
+        // Strict RFC-8259 parsing failed. Lucee/ACF `deserializeJSON` is lenient —
+        // it accepts unquoted object keys, single-quoted strings/keys, trailing
+        // commas, and `//` / `/* */` comments. Fall back to a lenient parse so we
+        // match the reference engine instead of rejecting valid-per-CFML input.
+        // On lenient failure, surface the original strict error text (Lucee still
+        // rejects genuinely malformed JSON such as `{a:1 b:2}`).
+        Err(strict_err) => parse_lenient_json(&json)
+            .map_err(|_| CfmlError::runtime(format!("Invalid JSON: {}", strict_err)))?,
+    };
+    Ok(serde_json_to_cfml_strict(value, strict))
+}
+
+/// Lenient (Lucee/ACF-compatible) JSON parser used only as a fallback when strict
+/// `serde_json` parsing fails. Matches Lucee 7's `deserializeJSON` leniency set:
+/// unquoted object keys, single-quoted strings/keys, trailing commas, and `//`
+/// line + `/* */` block comments. Commas between members are still required
+/// (Lucee rejects `{a:1 b:2}`), so it is not arbitrarily permissive.
+fn parse_lenient_json(input: &str) -> Result<serde_json::Value, String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut pos = 0usize;
+    let value = parse_lenient_value(&chars, &mut pos)?;
+    skip_ws_comments(&chars, &mut pos);
+    if pos != chars.len() {
+        return Err(format!("unexpected trailing characters at column {}", pos + 1));
+    }
+    Ok(value)
+}
+
+fn skip_ws_comments(chars: &[char], pos: &mut usize) {
+    loop {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+        if *pos + 1 < chars.len() && chars[*pos] == '/' && chars[*pos + 1] == '/' {
+            *pos += 2;
+            while *pos < chars.len() && chars[*pos] != '\n' {
+                *pos += 1;
+            }
+        } else if *pos + 1 < chars.len() && chars[*pos] == '/' && chars[*pos + 1] == '*' {
+            *pos += 2;
+            while *pos + 1 < chars.len() && !(chars[*pos] == '*' && chars[*pos + 1] == '/') {
+                *pos += 1;
+            }
+            *pos = (*pos + 2).min(chars.len());
+        } else {
+            break;
+        }
+    }
+}
+
+fn parse_lenient_value(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+    skip_ws_comments(chars, pos);
+    if *pos >= chars.len() {
+        return Err("unexpected end of JSON input".to_string());
+    }
+    match chars[*pos] {
+        '{' => parse_lenient_object(chars, pos),
+        '[' => parse_lenient_array(chars, pos),
+        '"' | '\'' => Ok(serde_json::Value::String(parse_lenient_string(chars, pos)?)),
+        _ => parse_lenient_literal(chars, pos),
+    }
+}
+
+fn parse_lenient_object(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+    *pos += 1; // consume '{'
+    let mut map = serde_json::Map::new();
+    loop {
+        skip_ws_comments(chars, pos);
+        if *pos >= chars.len() {
+            return Err("unterminated object".to_string());
+        }
+        if chars[*pos] == '}' {
+            *pos += 1;
+            break;
+        }
+        let key = if chars[*pos] == '"' || chars[*pos] == '\'' {
+            parse_lenient_string(chars, pos)?
+        } else {
+            parse_lenient_bare_key(chars, pos)?
+        };
+        skip_ws_comments(chars, pos);
+        if *pos >= chars.len() || chars[*pos] != ':' {
+            return Err(format!("expected ':' after key at column {}", *pos + 1));
+        }
+        *pos += 1; // consume ':'
+        let val = parse_lenient_value(chars, pos)?;
+        map.insert(key, val);
+        skip_ws_comments(chars, pos);
+        if *pos >= chars.len() {
+            return Err("unterminated object".to_string());
+        }
+        match chars[*pos] {
+            ',' => {
+                *pos += 1;
+            }
+            '}' => {
+                *pos += 1;
+                break;
+            }
+            _ => return Err(format!("expected ',' or '}}' at column {}", *pos + 1)),
+        }
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+fn parse_lenient_array(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+    *pos += 1; // consume '['
+    let mut arr = Vec::new();
+    loop {
+        skip_ws_comments(chars, pos);
+        if *pos >= chars.len() {
+            return Err("unterminated array".to_string());
+        }
+        if chars[*pos] == ']' {
+            *pos += 1;
+            break;
+        }
+        arr.push(parse_lenient_value(chars, pos)?);
+        skip_ws_comments(chars, pos);
+        if *pos >= chars.len() {
+            return Err("unterminated array".to_string());
+        }
+        match chars[*pos] {
+            ',' => {
+                *pos += 1;
+            }
+            ']' => {
+                *pos += 1;
+                break;
+            }
+            _ => return Err(format!("expected ',' or ']' at column {}", *pos + 1)),
+        }
+    }
+    Ok(serde_json::Value::Array(arr))
+}
+
+fn parse_lenient_string(chars: &[char], pos: &mut usize) -> Result<String, String> {
+    let quote = chars[*pos];
+    *pos += 1; // consume opening quote
+    let mut s = String::new();
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        if c == quote {
+            *pos += 1;
+            return Ok(s);
+        }
+        if c == '\\' {
+            *pos += 1;
+            if *pos >= chars.len() {
+                break;
+            }
+            match chars[*pos] {
+                '"' => s.push('"'),
+                '\'' => s.push('\''),
+                '\\' => s.push('\\'),
+                '/' => s.push('/'),
+                'n' => s.push('\n'),
+                'r' => s.push('\r'),
+                't' => s.push('\t'),
+                'b' => s.push('\u{0008}'),
+                'f' => s.push('\u{000C}'),
+                'u' => {
+                    let code = parse_lenient_hex4(chars, pos)?;
+                    // Combine a UTF-16 surrogate pair when present.
+                    if (0xD800..=0xDBFF).contains(&code)
+                        && *pos + 2 < chars.len()
+                        && chars[*pos + 1] == '\\'
+                        && chars[*pos + 2] == 'u'
+                    {
+                        *pos += 2; // move onto the second '\uXXXX'
+                        let low = parse_lenient_hex4(chars, pos)?;
+                        let combined =
+                            0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                        if let Some(ch) = char::from_u32(combined) {
+                            s.push(ch);
+                        }
+                    } else if let Some(ch) = char::from_u32(code) {
+                        s.push(ch);
+                    }
+                }
+                other => s.push(other),
+            }
+            *pos += 1;
+        } else {
+            s.push(c);
+            *pos += 1;
+        }
+    }
+    Err("unterminated string".to_string())
+}
+
+/// Reads the four hex digits of a `\uXXXX` escape. `*pos` points at the `u`;
+/// on success it points at the last hex digit consumed.
+fn parse_lenient_hex4(chars: &[char], pos: &mut usize) -> Result<u32, String> {
+    let mut code = 0u32;
+    for _ in 0..4 {
+        *pos += 1;
+        if *pos >= chars.len() {
+            return Err("invalid \\u escape".to_string());
+        }
+        let h = chars[*pos]
+            .to_digit(16)
+            .ok_or_else(|| "invalid \\u escape".to_string())?;
+        code = code * 16 + h;
+    }
+    Ok(code)
+}
+
+fn parse_lenient_bare_key(chars: &[char], pos: &mut usize) -> Result<String, String> {
+    let start = *pos;
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        if c.is_alphanumeric() || c == '_' || c == '$' {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    if *pos == start {
+        return Err(format!("expected object key at column {}", start + 1));
+    }
+    Ok(chars[start..*pos].iter().collect())
+}
+
+fn parse_lenient_literal(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+    let start = *pos;
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        if c.is_whitespace() || matches!(c, ',' | '}' | ']' | ':') {
+            break;
+        }
+        if c == '/' && *pos + 1 < chars.len() && (chars[*pos + 1] == '/' || chars[*pos + 1] == '*')
+        {
+            break;
+        }
+        *pos += 1;
+    }
+    let token: String = chars[start..*pos].iter().collect();
+    match token.as_str() {
+        "true" => Ok(serde_json::Value::Bool(true)),
+        "false" => Ok(serde_json::Value::Bool(false)),
+        "null" => Ok(serde_json::Value::Null),
+        _ => {
+            if let Ok(i) = token.parse::<i64>() {
+                Ok(serde_json::Value::Number(i.into()))
+            } else if let Ok(f) = token.parse::<f64>() {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| format!("invalid number '{}'", token))
+            } else {
+                Err(format!("unexpected token '{}' at column {}", token, start + 1))
+            }
+        }
     }
 }
 
@@ -5705,7 +5957,11 @@ fn serde_json_to_cfml_strict(value: serde_json::Value, strict: bool) -> CfmlValu
 
 fn fn_is_json(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    Ok(CfmlValue::Bool(serde_json::from_str::<serde_json::Value>(&s).is_ok()))
+    // Match deserializeJSON's leniency: Lucee's isJSON also accepts unquoted
+    // keys, single quotes, trailing commas and comments.
+    let valid = serde_json::from_str::<serde_json::Value>(&s).is_ok()
+        || parse_lenient_json(&s).is_ok();
+    Ok(CfmlValue::Bool(valid))
 }
 
 // ===============================================

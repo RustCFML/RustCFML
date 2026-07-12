@@ -53,5 +53,51 @@ circArr = []; arrayAppend(circArr, "x"); arrayAppend(circArr, circArr);
 circArrJson = serializeJSON(circArr);
 assertTrue("circular array serializes without crashing", len(circArrJson) > 0);
 
+// --- lenient (Lucee/ACF-compatible) deserializeJSON ---
+// Lucee's deserializeJSON accepts unquoted keys, single-quoted strings/keys,
+// trailing commas, and // and /* */ comments. Strict serde_json rejected these,
+// which broke Preside's AdHocTaskManagerService.getProgress() (a DB `result`
+// column of "{ test:'this' }"). Verified against Lucee 7.0.4.
+lenientUnquotedKey = deserializeJSON("{ test:'this' }");
+assert("lenient: unquoted key + single-quote value", lenientUnquotedKey.test, "this");
+
+lenientSingleKey = deserializeJSON("{'a':1}");
+assert("lenient: single-quoted key", lenientSingleKey.a, 1);
+
+lenientTrailingObj = deserializeJSON("{a:1,}");
+assert("lenient: trailing comma in object", lenientTrailingObj.a, 1);
+
+lenientTrailingArr = deserializeJSON("[1,2,]");
+assert("lenient: trailing comma in array", arrayLen(lenientTrailingArr), 2);
+
+assert("lenient: top-level single-quoted string", deserializeJSON("'single'"), "single");
+
+lenientBlockComment = deserializeJSON("{a:/*c*/1}");
+assert("lenient: block comment", lenientBlockComment.a, 1);
+
+lenientLineComment = deserializeJSON("//line#chr(10)#{a:1}");
+assert("lenient: line comment", lenientLineComment.a, 1);
+
+lenientEscQuote = deserializeJSON("{a:'he\'llo'}");
+assert("lenient: escaped single-quote in single-quoted string", lenientEscQuote.a, "he'llo");
+
+// Still strict where Lucee is strict: a missing comma between members must throw.
+assertThrows("lenient parser still rejects missing comma", function() {
+	deserializeJSON("{a:1 b:2}");
+});
+
+// Strict, valid JSON continues to parse (fast path unchanged).
+strictStill = deserializeJSON('{"x":1,"y":[true,null,2.5]}');
+assert("strict path: object key", strictStill.x, 1);
+assertTrue("strict path: nested array", isArray(strictStill.y));
+
+// isJSON is lenient in Lucee too — true for the lenient forms, false only for
+// genuinely-malformed JSON. Verified against Lucee 7.0.4.
+assertTrue("isJSON lenient: unquoted key", isJSON("{ test:'this' }"));
+assertTrue("isJSON lenient: single-quoted key", isJSON("{'a':1}"));
+assertTrue("isJSON lenient: trailing comma", isJSON("[1,2,]"));
+assertTrue("isJSON lenient: top-level single-quoted string", isJSON("'single'"));
+assertFalse("isJSON still false on missing comma", isJSON("{a:1 b:2}"));
+
 suiteEnd();
 </cfscript>
