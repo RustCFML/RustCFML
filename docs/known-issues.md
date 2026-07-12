@@ -420,12 +420,16 @@ Edges:
 | Non-literal `type` | A `type` given as an expression (not a string literal) is not validated. |
 | "required" semantics | A typed param with no default whose value is absent is defaulted to `""` then type-checked, so the error names the type rather than "parameter required". |
 
-## 15. `serializeJSON` struct key order — insertion order, not Lucee's HashMap order 🌟 *(divergence)*
+## 15. Struct iteration order — insertion order, not Lucee's HashMap order 🌟 *(divergence)*
 
-RustCFML structs are insertion-ordered (`IndexMap`), so `serializeJSON()` emits keys
-in the order they were added. Lucee/ACF back component metadata (and many internal
-structs) with a Java `HashMap`, whose iteration order is hash-bucket order — neither
-insertion nor alphabetical, but deterministic for a given JVM.
+RustCFML structs are insertion-ordered (`IndexMap`), so `serializeJSON()`, `for( k in
+struct )`, `structKeyList()`, `structKeyArray()` and friends all visit keys in the order
+they were added — i.e. RustCFML's default `{}` behaves like Lucee's `structNew("ordered")`.
+Lucee/ACF's **default** `{}` (and component metadata + many internal structs) is instead
+backed by a Java `HashMap`, whose iteration order is hash-bucket order — neither insertion
+nor alphabetical, but deterministic for a given key set (Java `String.hashCode()` is
+spec-defined). RustCFML's `structNew("ordered")` and Lucee's `structNew("ordered")` agree;
+it is only the *default* struct where Lucee is unordered and RustCFML is ordered.
 
 This is normally invisible and arguably an improvement (stable, predictable output).
 It only bites code that **hashes a serialized struct as an identity key** and expects

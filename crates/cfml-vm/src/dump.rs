@@ -126,6 +126,7 @@ fn render_html(
         | CfmlValue::Bool(_)
         | CfmlValue::Int(_)
         | CfmlValue::Double(_)
+        | CfmlValue::TimeSpan(_)
         | CfmlValue::String(_)
         | CfmlValue::Binary(_) => {
             out.push_str("<div class=\"rcf-dump\"><table><tr><td>");
@@ -579,6 +580,7 @@ fn value_string(value: &CfmlValue) -> String {
         CfmlValue::Bool(b) => b.to_string(),
         CfmlValue::Int(i) => i.to_string(),
         CfmlValue::Double(d) => fmt_double(*d),
+        CfmlValue::TimeSpan(d) => fmt_double(*d),
         CfmlValue::String(s) => {
             if s.is_empty() { "[empty string]".to_string() } else { s.to_string() }
         }

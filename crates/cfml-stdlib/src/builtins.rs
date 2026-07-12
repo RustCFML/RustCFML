@@ -3452,7 +3452,13 @@ fn fn_is_simple_value(args: Vec<CfmlValue>) -> CfmlResult {
     // value on Lucee/ACF/BoxLang, so unwrap the proxy before the type test.
     Ok(CfmlValue::Bool(matches!(
         args.first().map(|v| v.query_column_scalar()),
-        Some(CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::String(_))
+        Some(
+            CfmlValue::Bool(_)
+                | CfmlValue::Int(_)
+                | CfmlValue::Double(_)
+                | CfmlValue::TimeSpan(_)
+                | CfmlValue::String(_)
+        )
     )))
 }
 
@@ -3488,6 +3494,11 @@ fn fn_is_date(args: Vec<CfmlValue>) -> CfmlResult {
     // Lucee: a bare number (or numeric string) is NOT a date — only date/datetime
     // STRINGS parse. parse_cfml_date intentionally accepts an OLE date serial for
     // ParseDateTime/CreateDate, so IsDate must reject numerics up front.
+    // A timespan IS a date in Lucee (isDate(createTimeSpan(...)) is true) — it is
+    // a duration on the date/time axis. Report true before the numeric guard.
+    if matches!(args.first().map(|v| v.query_column_scalar()), Some(CfmlValue::TimeSpan(_))) {
+        return Ok(CfmlValue::Bool(true));
+    }
     match args.first().map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) | Some(CfmlValue::Bool(_)) => {
             return Ok(CfmlValue::Bool(false));
@@ -5374,6 +5385,8 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
         CfmlValue::Bool(b) => b.to_string(),
         CfmlValue::Int(i) => i.to_string(),
         CfmlValue::Double(d) => d.to_string(),
+        // A timespan serializes as its numeric (fractional-day) value, like Lucee.
+        CfmlValue::TimeSpan(d) => d.to_string(),
         CfmlValue::String(s) => format!("\"{}\"", json_escape_str(s)),
         CfmlValue::Array(arr) => {
             let ptr = arr.backing_ptr();
@@ -5526,6 +5539,8 @@ fn serialize_cfml_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
         CfmlValue::Bool(b) => b.to_string(),
         CfmlValue::Int(i) => i.to_string(),
         CfmlValue::Double(d) => d.to_string(),
+        // A timespan serializes as its numeric (fractional-day) value, like Lucee.
+        CfmlValue::TimeSpan(d) => d.to_string(),
         CfmlValue::String(s) => cfml_literal_string(s),
         CfmlValue::Array(arr) => {
             let ptr = arr.backing_ptr();
@@ -14335,7 +14350,10 @@ fn fn_create_time_span(args: Vec<CfmlValue>) -> CfmlResult {
     let minutes = get_float(&args, 2);
     let seconds = get_float(&args, 3);
     let total_days = days + hours / 24.0 + minutes / 1440.0 + seconds / 86400.0;
-    Ok(CfmlValue::Double(total_days))
+    // A distinct TimeSpan value (numerically the fractional-day Double) so
+    // `getClass().getName()` and the `timespan` type-check can recognise it,
+    // while it still behaves as a Double in every arithmetic/coercion context.
+    Ok(CfmlValue::TimeSpan(total_days))
 }
 
 fn fn_yes_no_format(args: Vec<CfmlValue>) -> CfmlResult {

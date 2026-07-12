@@ -15228,7 +15228,7 @@ impl CfmlVirtualMachine {
                         // Timespan: value < 1 treated as fractional days (×86400→secs)
                         let secs = match v {
                             CfmlValue::Int(i) => *i as f64,
-                            CfmlValue::Double(d) => {
+                            CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => {
                                 if *d < 1.0 {
                                     *d * 86400.0
                                 } else {
@@ -17398,7 +17398,7 @@ impl CfmlVirtualMachine {
         !matches!(
             t.as_str(),
             "any" | "string" | "numeric" | "number" | "boolean" | "bool" | "struct"
-                | "array" | "query" | "date" | "datetime" | "time" | "binary"
+                | "array" | "query" | "date" | "datetime" | "time" | "timespan" | "binary"
                 | "uuid" | "guid" | "function" | "closure" | "udf" | "void"
                 | "xml" | "component" | "object" | "node" | "variablename"
                 | "range" | "regex" | "regular_expression" | "email" | "url"
@@ -19818,6 +19818,28 @@ impl CfmlVirtualMachine {
                 "round" => Some("round"),
                 _ => None,
             },
+            // Lucee's TimeSpan exposes accessor methods on the value itself.
+            // `getSeconds()` returns the TOTAL seconds of the span; `getSecond()`
+            // returns just the seconds component (0-59). (getDays/getHours/
+            // getMinutes do NOT exist on Lucee's TimeSpan — they throw — so we
+            // don't add them.) Unknown methods fall through to the shared
+            // getClass()/toString() handling below. Verified vs Lucee 7.0.4.
+            CfmlValue::TimeSpan(d) => match method_lower.as_str() {
+                "getseconds" => {
+                    return Ok(CfmlValue::Int((*d * 86_400.0).round() as i64));
+                }
+                "getsecond" => {
+                    return Ok(CfmlValue::Int(((*d * 86_400.0).round() as i64) % 60));
+                }
+                "tostring" => {
+                    return Ok(CfmlValue::string(object.as_string()));
+                }
+                "abs" => Some("abs"),
+                "ceiling" | "ceil" => Some("ceiling"),
+                "floor" => Some("floor"),
+                "round" => Some("round"),
+                _ => None,
+            },
             _ => None,
             }
         };
@@ -20342,6 +20364,10 @@ impl CfmlVirtualMachine {
                 CfmlValue::Bool(_) => "java.lang.Boolean",
                 CfmlValue::Int(_) => "java.lang.Integer",
                 CfmlValue::Double(_) => "java.lang.Double",
+                // A timespan reports Lucee's dedicated TimeSpan class so code that
+                // sniffs `x.getClass().getName()` for "timespan" (e.g. Preside's
+                // AdHocTaskManagerService._isTimespan) recognises it.
+                CfmlValue::TimeSpan(_) => "lucee.runtime.type.dt.TimeSpanImpl",
                 CfmlValue::String(_) => "java.lang.String",
                 CfmlValue::Array(_) => "lucee.runtime.type.ArrayImpl",
                 CfmlValue::Struct(_) => "lucee.runtime.type.StructImpl",
@@ -24879,7 +24905,7 @@ impl CfmlVirtualMachine {
                 // truncated every sub-day timeout to 0, which yielded an
                 // invalid KV `expiration_ttl(0)` and made sessions instantly
                 // expirable (the root of "sessions never persist").
-                CfmlValue::Double(d) => Some((d * 86_400.0).round() as u64),
+                CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Some((d * 86_400.0).round() as u64),
                 // A bare integer/string is taken as a literal seconds count.
                 CfmlValue::Int(i) => Some(i as u64),
                 CfmlValue::String(s) => s.parse::<u64>().ok(),
@@ -26295,7 +26321,9 @@ fn to_number(val: &CfmlValue) -> Option<f64> {
     let val = val.query_column_scalar();
     match val {
         CfmlValue::Int(i) => Some(*i as f64),
-        CfmlValue::Double(d) => Some(*d),
+        // A timespan is numerically its fractional-day Double value, so it
+        // participates in all arithmetic/comparison exactly like a Double.
+        CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Some(*d),
         CfmlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         CfmlValue::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
@@ -26343,6 +26371,22 @@ fn bool_literal_to_num(s: &str) -> Option<f64> {
 fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
     let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
+    // A timespan compares as its fractional-day Double value.
+    let (ta, tb);
+    let a = match a {
+        CfmlValue::TimeSpan(d) => {
+            ta = CfmlValue::Double(*d);
+            &ta
+        }
+        _ => a,
+    };
+    let b = match b {
+        CfmlValue::TimeSpan(d) => {
+            tb = CfmlValue::Double(*d);
+            &tb
+        }
+        _ => b,
+    };
     match (a, b) {
         (CfmlValue::Null, CfmlValue::Null) => true,
         (CfmlValue::Null, _) | (_, CfmlValue::Null) => false,
@@ -26464,6 +26508,22 @@ fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
 fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
     let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
+    // A timespan compares as its fractional-day Double value.
+    let (ta, tb);
+    let a = match a {
+        CfmlValue::TimeSpan(d) => {
+            ta = CfmlValue::Double(*d);
+            &ta
+        }
+        _ => a,
+    };
+    let b = match b {
+        CfmlValue::TimeSpan(d) => {
+            tb = CfmlValue::Double(*d);
+            &tb
+        }
+        _ => b,
+    };
     match (a, b) {
         (CfmlValue::Int(x), CfmlValue::Int(y)) => x.cmp(y) as i32,
         (CfmlValue::Double(x), CfmlValue::Double(y)) => x.partial_cmp(y).map_or(0, |o| o as i32),

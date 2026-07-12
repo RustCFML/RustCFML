@@ -892,6 +892,19 @@ pub enum CfmlValue {
     Bool(bool),
     Int(i64),
     Double(f64),
+    /// A CFML timespan (the value produced by `createTimeSpan`/`createTimespan`).
+    /// Numerically it IS a `Double` — the count of fractional days (Lucee/ACF
+    /// semantics: `createTimeSpan(1,0,0,0)` == 1.0), and it behaves exactly like
+    /// `Double` in every arithmetic, comparison, coercion and stringification
+    /// context. It is a distinct variant ONLY so the engine can answer the two
+    /// type-introspection questions Lucee answers via its dedicated `TimeSpan`
+    /// class: `x.getClass().getName()` (→ a name containing "timespan") and the
+    /// `timespan` argument-type / `isValid("timespan", x)` check. Without a
+    /// distinct type a timespan is indistinguishable from a plain number, which
+    /// broke Preside's `AdHocTaskManagerService._isTimespan()` (a `getClass()`
+    /// class-name sniff) and `timespan`-typed params. Treat it as `Double`
+    /// everywhere except those introspection sites.
+    TimeSpan(f64),
     /// CFML string value. Wrapped in `Arc<String>` (v0.87.0) so cloning a
     /// `CfmlValue::String` is an `Arc::clone` (refcount bump) instead of a
     /// heap allocation + copy. Mutating string ops (rare in CFML — strings
@@ -955,6 +968,7 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             CfmlValue::Int(i) => f.debug_tuple("Int").field(i).finish(),
             CfmlValue::Double(d) => f.debug_tuple("Double").field(d).finish(),
+            CfmlValue::TimeSpan(d) => f.debug_tuple("TimeSpan").field(d).finish(),
             CfmlValue::String(s) => f.debug_tuple("String").field(s).finish(),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
@@ -1000,6 +1014,11 @@ impl CfmlValue {
             CfmlValue::Bool(_) => "Boolean",
             CfmlValue::Int(_) => "Integer",
             CfmlValue::Double(_) => "Double",
+            // A timespan is numerically a Double; report it as such so any
+            // type-name-based numeric handling treats it identically. Its
+            // distinct identity is surfaced only via getClass()/the timespan
+            // type-check, which match the variant directly.
+            CfmlValue::TimeSpan(_) => "Double",
             CfmlValue::String(_) => "String",
             CfmlValue::Array(_) => "Array",
             // Lucee@7: `isArray(q.col)` is false — QueryColumn is a string proxy
@@ -1022,6 +1041,7 @@ impl CfmlValue {
             CfmlValue::Bool(b) => *b,
             CfmlValue::Int(i) => *i != 0,
             CfmlValue::Double(d) => *d != 0.0,
+            CfmlValue::TimeSpan(d) => *d != 0.0,
             CfmlValue::String(s) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
@@ -1129,6 +1149,9 @@ impl CfmlValue {
             CfmlValue::Bool(b) => b.to_string(),
             CfmlValue::Int(i) => i.to_string(),
             CfmlValue::Double(d) => format_double(*d),
+            // Stringifies exactly like its fractional-day Double value, so string
+            // concatenation and number-via-string coercion are unchanged.
+            CfmlValue::TimeSpan(d) => format_double(*d),
             CfmlValue::String(s) => (**s).clone(),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
@@ -1423,6 +1446,15 @@ impl CfmlValue {
     }
 
     pub fn eq(&self, other: &CfmlValue) -> bool {
+        // A timespan compares as its fractional-day Double value. Rewrite either
+        // operand to Double up-front so all the numeric arms below apply without
+        // duplicating every Int/Double combination for TimeSpan.
+        if let CfmlValue::TimeSpan(d) = self {
+            return CfmlValue::Double(*d).eq(other);
+        }
+        if let CfmlValue::TimeSpan(d) = other {
+            return self.eq(&CfmlValue::Double(*d));
+        }
         match (self, other) {
             (CfmlValue::Null, CfmlValue::Null) => true,
             // NativeObjects compare by identity: two CFML references that
@@ -2106,6 +2138,8 @@ impl serde::Serialize for CfmlValue {
             CfmlValue::Bool(b) => s.serialize_bool(*b),
             CfmlValue::Int(i) => s.serialize_i64(*i),
             CfmlValue::Double(d) => s.serialize_f64(*d),
+            // serializeJSON emits a timespan as its numeric (fractional-day) value.
+            CfmlValue::TimeSpan(d) => s.serialize_f64(*d),
             CfmlValue::String(st) => s.serialize_str(st),
             CfmlValue::Array(a) => {
                 let snap = a.snapshot();
