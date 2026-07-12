@@ -7071,8 +7071,15 @@ fn fn_file_write(args: Vec<CfmlValue>) -> CfmlResult {
         return Err(CfmlError::runtime("fileWrite requires path and data".to_string()));
     }
     let path = get_str(&args, 0);
-    let data = get_str(&args, 1);
-    match std::fs::write(&path, &data) {
+    // Binary data must be written as raw bytes; only stringify simple values.
+    // Otherwise a CfmlValue::Binary would serialize to the placeholder
+    // "<Binary>" (as_string), corrupting every file written from a binary
+    // (Preside's FileSystemStorageProvider.putObject → FileWrite(path, binary)).
+    let result = match args.get(1) {
+        Some(CfmlValue::Binary(bytes)) => std::fs::write(&path, bytes),
+        _ => std::fs::write(&path, get_str(&args, 1).as_bytes()),
+    };
+    match result {
         Ok(_) => Ok(CfmlValue::Null),
         Err(e) => Err(CfmlError::runtime(format!("fileWrite: {}", e))),
     }
@@ -7083,15 +7090,18 @@ fn fn_file_append(args: Vec<CfmlValue>) -> CfmlResult {
         return Err(CfmlError::runtime("fileAppend requires path and data".to_string()));
     }
     let path = get_str(&args, 0);
-    let data = get_str(&args, 1);
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|e| CfmlError::runtime(format!("fileAppend: {}", e)))?;
-    file.write_all(data.as_bytes())
-        .map_err(|e| CfmlError::runtime(format!("fileAppend: {}", e)))?;
+    // Append raw bytes for binary data; stringify simple values (see fileWrite).
+    let write_result = match args.get(1) {
+        Some(CfmlValue::Binary(bytes)) => file.write_all(bytes),
+        _ => file.write_all(get_str(&args, 1).as_bytes()),
+    };
+    write_result.map_err(|e| CfmlError::runtime(format!("fileAppend: {}", e)))?;
     Ok(CfmlValue::Null)
 }
 
@@ -12603,18 +12613,31 @@ fn fn_cffile(args: Vec<CfmlValue>) -> CfmlResult {
     match action.as_str() {
         "read" => fn_file_read(vec![CfmlValue::string(str_attr("file"))]),
         "readbinary" => fn_file_read_binary(vec![CfmlValue::string(str_attr("file"))]),
-        "write" => fn_file_write(vec![
-            CfmlValue::string(str_attr("file")),
-            CfmlValue::string(str_attr("output")),
-        ]),
+        "write" => {
+            // Preserve a binary `output` as raw bytes rather than stringifying
+            // it to the "<Binary>" placeholder (see fn_file_write).
+            let output = get_ci("output").unwrap_or_else(|| CfmlValue::string(""));
+            fn_file_write(vec![CfmlValue::string(str_attr("file")), output])
+        }
         "append" => {
-            let mut data = str_attr("output");
             // addNewLine appends a trailing newline; defaults off to match the
-            // fileAppend() BIF. The tag form is delivery-equivalent.
-            if bool_attr("addnewline") {
-                data.push('\n');
+            // fileAppend() BIF. The tag form is delivery-equivalent. Binary
+            // output is passed through untouched (no newline coercion).
+            match get_ci("output") {
+                Some(binary @ CfmlValue::Binary(_)) if !bool_attr("addnewline") => {
+                    fn_file_append(vec![CfmlValue::string(str_attr("file")), binary])
+                }
+                _ => {
+                    let mut data = str_attr("output");
+                    if bool_attr("addnewline") {
+                        data.push('\n');
+                    }
+                    fn_file_append(vec![
+                        CfmlValue::string(str_attr("file")),
+                        CfmlValue::string(data),
+                    ])
+                }
             }
-            fn_file_append(vec![CfmlValue::string(str_attr("file")), CfmlValue::string(data)])
         }
         "copy" => fn_file_copy(vec![
             CfmlValue::string(str_attr("source")),

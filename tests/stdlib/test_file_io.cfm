@@ -57,5 +57,25 @@ fileDelete(moveTo);
 expanded = expandPath(".");
 assertTrue("expandPath returns something", len(expanded) > 0);
 
+// --- fileWrite of BINARY must round-trip (regression: was writing the
+//     "<Binary>" placeholder string, corrupting Preside FileSystemStorageProvider) ---
+binFile = tempDir & "rustcfml_bin_" & createUUID() & ".bin";
+origBin = toBinary(toBase64("bytes-with-nulls-#chr(0)##chr(1)##chr(2)#-end"));
+fileWrite(binFile, origBin);
+readBin = fileReadBinary(binFile);
+assertTrue("fileWrite binary: readback isBinary", isBinary(readBin));
+assert("fileWrite binary round-trips", toBase64(readBin), toBase64(origBin));
+
+// fileAppend of binary must also append raw bytes, not the placeholder
+appendBin = toBinary(toBase64("-more-#chr(3)##chr(4)#"));
+origLen = len(origBin);
+appendLen = len(appendBin);
+fileAppend(binFile, appendBin);
+combined = fileReadBinary(binFile);
+assertTrue("fileAppend binary: readback isBinary", isBinary(combined));
+assert("fileAppend binary grows by appended byte count",
+       len(combined), origLen + appendLen);
+fileDelete(binFile);
+
 suiteEnd();
 </cfscript>
