@@ -22375,6 +22375,39 @@ impl CfmlVirtualMachine {
                         });
                         let defining_pkg: Option<String> =
                             anchor.as_ref().and_then(|(name, src)| {
+                                // Common (non-inherited) case: the `new X()` is
+                                // lexically in the instance's OWN component file
+                                // (self.source_file — swapped to the defining
+                                // method's file during dispatch, restored above —
+                                // equals the instance's __source_file). The
+                                // defining package is then simply the instance's
+                                // own dotted-name package, which PRESERVES the
+                                // mapping prefix the instance was loaded under
+                                // (e.g. `preside.system.services.database.adapters`).
+                                // The filesystem derivation below reconstructs the
+                                // package from the on-disk layout under an inferred
+                                // webroot and is WRONG whenever a mapping makes the
+                                // logical name differ from the physical directory
+                                // (mapping `/dotdotprobe` -> dir `oop` yielded
+                                // `oop.pkg.X` instead of `dotdotprobe.pkg.X`).
+                                // Verified vs Lucee 7.0.4.
+                                let defined_in_own_file = self
+                                    .source_file
+                                    .as_deref()
+                                    .map(|cur| {
+                                        std::path::Path::new(cur)
+                                            == std::path::Path::new(src.as_str())
+                                    })
+                                    .unwrap_or(false);
+                                if defined_in_own_file {
+                                    if let Some(pkg) = name
+                                        .rfind('.')
+                                        .map(|i| name[..i].to_string())
+                                        .filter(|p| !p.is_empty())
+                                    {
+                                        return Some(pkg);
+                                    }
+                                }
                                 let anchor_dir = std::path::Path::new(src).parent()?;
                                 // Package segments in the instance's own dotted
                                 // name (all but the trailing class segment).
