@@ -3,6 +3,8 @@
 pub mod builtins;
 #[cfg(feature = "image_support")]
 pub mod image;
+#[cfg(feature = "spreadsheet")]
+pub mod spreadsheet;
 #[cfg(feature = "xml")]
 pub mod xmp;
 pub mod db_driver;

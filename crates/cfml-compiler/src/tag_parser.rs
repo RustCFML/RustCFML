@@ -919,6 +919,71 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             prop_str.push_str(";\n");
             (prop_str, tag_end - start)
         }
+        "cfspreadsheet" => {
+            // Action-dispatched spreadsheet tag → the Spreadsheet* BIFs.
+            //   read   → NAME = spreadsheetRead(src)[.setActiveSheet…][.toQuery()/.toCsv()]
+            //   write  → spreadsheetWrite( <workbook | query→workbook>, filename, overwrite )
+            //   update → treated as write (writes the file; POI-style in-place
+            //            merge into an existing file is not yet modelled).
+            let action = attrs
+                .get("action")
+                .map(|s| s.to_lowercase())
+                .unwrap_or_else(|| "read".to_string());
+            let overwrite = attrs
+                .get("overwrite")
+                .map(|v| strip_hashes(v))
+                .unwrap_or_else(|| "false".to_string());
+            let code = match action.as_str() {
+                "write" | "update" => {
+                    let filename = attrs
+                        .get("filename")
+                        .or_else(|| attrs.get("src"))
+                        .map(|v| format_attr_value(v, quoted.contains("filename") || quoted.contains("src")))
+                        .unwrap_or_else(|| "\"\"".to_string());
+                    if let Some(qv) = attrs.get("query") {
+                        format!(
+                            "spreadsheetWrite( spreadsheet(\"xlsx\").addRows({}, 1, 1, true), {}, {} );\n",
+                            strip_hashes(qv), filename, overwrite
+                        )
+                    } else if let Some(nm) = attrs.get("name") {
+                        format!("spreadsheetWrite({}, {}, {});\n", strip_hashes(nm), filename, overwrite)
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => {
+                    // read
+                    let src = attrs
+                        .get("src")
+                        .or_else(|| attrs.get("filename"))
+                        .map(|v| format_attr_value(v, quoted.contains("src") || quoted.contains("filename")))
+                        .unwrap_or_else(|| "\"\"".to_string());
+                    let mut expr = format!("spreadsheetRead({})", src);
+                    if let Some(sheet) = attrs.get("sheet") {
+                        expr = format!("{}.setActiveSheetNumber({})", expr, strip_hashes(sheet));
+                    } else if let Some(sn) = attrs.get("sheetname") {
+                        expr = format!("{}.setActiveSheet({})", expr, format_attr_value(sn, quoted.contains("sheetname")));
+                    }
+                    // A `query` attribute → return a query; `name` → object (or a
+                    // CSV/HTML string when format says so).
+                    let (target, suffix) = if let Some(qv) = attrs.get("query") {
+                        (strip_hashes(qv), ".toQuery()".to_string())
+                    } else {
+                        let nm = attrs
+                            .get("name")
+                            .map(|v| strip_hashes(v))
+                            .unwrap_or_else(|| "cfspreadsheet".to_string());
+                        let suf = match attrs.get("format").map(|f| f.to_lowercase()).as_deref() {
+                            Some("csv") => ".toCsv()".to_string(),
+                            _ => String::new(),
+                        };
+                        (nm, suf)
+                    };
+                    format!("{} = {}{};\n", target, expr, suffix)
+                }
+            };
+            (code, tag_end - start)
+        }
         "cfhttp" => {
             let result_var = attrs.get("result").cloned().unwrap_or("cfhttp".to_string());
 

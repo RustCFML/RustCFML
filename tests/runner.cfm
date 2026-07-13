@@ -280,6 +280,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_cfdirectory_type_filter.cfm">
 <cf_runtest file="stdlib/test_cfhttp.cfm">
 <cf_runtest file="stdlib/test_cfhttp_binary_response.cfm">
+<cf_runtest file="stdlib/test_spreadsheet.cfm">
 
 <!--- --- Function References --- --->
 <cf_runtest file="functions/test_function_references.cfm">
@@ -834,6 +835,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfloop_list_literal.cfm">
 <cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
+<cf_runtest file="tags/test_cfspreadsheet.cfm">
 
 <!--- --- Query of Queries --- --->
 <cf_runtest file="qoq/test_qoq_select.cfm">

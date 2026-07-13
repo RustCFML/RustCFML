@@ -175,10 +175,11 @@ See **[Compatibility & Status](docs/status.md)** for implementation status.
 ### Partially Supported
 
 - **Image functions** — core surface shipped: `imageNew`/`imageRead`/`imageResize`/`imageScaleToFit`/`imageCrop`/`imageRotate`/`imageFlip`/`imageInfo`/`imageGetWidth`/`imageGetHeight`/`imageWrite`/`imageWriteBase64`/`imageGetBlob` plus `<cfimage>` (`read`/`write`/`resize`/`info`/`convert`/`writeToBrowser`), backed by the pure-Rust `image` crate (native **and** wasm). Drawing primitives, filters, free-angle rotation, and EXIF/IPTC metadata are not yet implemented. See **[Known Issues §18](docs/known-issues.md)**.
+- **Spreadsheets** — native, JVM-free `.xlsx` read/create/edit/write: the full `Spreadsheet*` function family, a fluent `Spreadsheet()` builder, and the `<cfspreadsheet>` tag. Cell values, formulas, struct-based styling, merged cells, freeze/split panes, charts, images, comments, hyperlinks, autofilter, data validation, conditional formatting, delete/shift rows/columns, headers/footers & print setup, password-protected write, query/array/CSV interchange, and full read→modify→write round-tripping (styling/charts/images preserved). Reads `.xlsx` (full round-trip) plus legacy `.xls`/`.xlsb`/`.ods` (data-only, via `calamine`). Backed by the pure-Rust `umya-spreadsheet` crate (native/server builds; not in the wasm target). See **[Spreadsheets](docs/spreadsheets.md)**.
 
 ### Not Supported
 
-- Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
+- ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
 - `cfschedule`, `cfwddx`
 
 For documented gaps, silent no-ops, and Lucee/BoxLang divergences, see **[Known Issues](docs/known-issues.md)**.

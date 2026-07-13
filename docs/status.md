@@ -110,8 +110,36 @@ RustCFML supports those as a BoxLang-faithful superset — see `docs/known-issue
   visually equivalent to, but not pixel-identical with, Lucee's Java2D renderer, and
   text uses a bundled DejaVu Sans font. See [known-issues.md §18](known-issues.md).
 
+- **Spreadsheet functions** — native, JVM-free `.xlsx` support via the pure-Rust
+  `umya-spreadsheet` crate (POI-model read→mutate→write round-trip). Implemented:
+  `SpreadsheetNew`/`Spreadsheet` (fluent builder)/`SpreadsheetRead`/
+  `SpreadsheetReadBinary`/`SpreadsheetWrite`/`SpreadsheetInfo`/`IsSpreadsheetObject`,
+  `SpreadsheetSetCellValue`/`GetCellValue`, `SpreadsheetAddRow`/`AddRows`(query or
+  array)/`AddColumn`, `SpreadsheetFormatCell`/`FormatRow`/`FormatColumn`/
+  `FormatCellRange` (struct styling: bold/italic/underline/font/size/colour/fill/
+  alignment/number-format/wrap), `SpreadsheetMergeCells`, `SpreadsheetAddFreezePane`,
+  `SpreadsheetSetColumnWidth`/`SetRowHeight`, `SpreadsheetCreateSheet`/`RenameSheet`/
+  `SetActiveSheet`/`SetActiveSheetNumber`, `GetColumnCount`, delete/shift rows &
+  columns, `SetCellFormula`/`GetCellFormula`/`GetCellType`, `ClearCell`(`Range`),
+  `SetCellRangeValue`, `SetCellComment`, `SetCellHyperlink`, `AddAutofilter`,
+  `AddImage`, `AddChart` (line/bar/pie/doughnut/area), `AddInfo`, hidden rows/
+  columns, `ToQuery`/`ToArray`/`ToCsv`/`WriteToCsv`/`ReadCsv`, `IsSpreadsheetFile`,
+  the **`<cfspreadsheet>` tag** (read/write/update), comment/hyperlink getters,
+  split panes, header/footer & print orientation/fit, password-protected write,
+  data validation, conditional formatting, and legacy `.xls`/`.xlsb`/`.ods`
+  reading (via `calamine`, data-only), plus fluent `autoSize`/`freezeRows`/
+  `freezeCols`/`sheet`/`selectSheet`/`headerRow`/`fromQuery`/`fromCsv`, plus
+  getColumnWidth/getCellFormat introspection, setActiveCell/addPageBreaks/
+  setRepeatingRows/Columns, colour-scale conditional formatting, JSON interchange
+  (toJson/fromJson), binary `addImage`, and fluent `load`. Native/server builds
+  only (behind the `spreadsheet` feature; excluded from wasm). Remaining gaps are
+  backing-crate limits, not wiring: `.ods` *writing*, chart types beyond
+  line/bar/pie/doughnut/area, reading styles from legacy `.xls`, row/column
+  grouping, and formula *evaluation* (formula cells have no value until an app
+  recalculates). See [spreadsheets.md](spreadsheets.md).
+
 ### Explicitly Unsupported
-- Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway
+- ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway
 - cfschedule, cfwddx
 
 ### Taffy Framework

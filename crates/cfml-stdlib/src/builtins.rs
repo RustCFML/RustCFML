@@ -464,6 +464,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getReadableImageFormats".into(), fn_get_readable_image_formats);
     f.insert("getWriteableImageFormats".into(), fn_get_readable_image_formats);
     register_image_functions(&mut f);
+    register_spreadsheet_functions(&mut f);
     f.insert("isBinary".into(), fn_is_binary);
     f.insert("isCustomFunction".into(), fn_is_custom_function);
     f.insert("isClosure".into(), fn_is_closure);
@@ -3686,6 +3687,124 @@ fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     for name in IMAGE_TIER1_NAMES.iter().chain(IMAGE_TIER23_STUBS) {
         f.insert((*name).into(), fn_image_disabled);
     }
+}
+
+/// Every Spreadsheet* BIF name — used to register disabled-build stubs when the
+/// `spreadsheet` feature is off (native/server-only capability; kept out of wasm).
+#[cfg(not(feature = "spreadsheet"))]
+const SPREADSHEET_FN_NAMES: &[&str] = &[
+    "spreadsheetNew", "spreadsheet", "spreadsheetRead", "spreadsheetReadBinary",
+    "spreadsheetSetCellValue", "spreadsheetGetCellValue", "spreadsheetCreateSheet",
+    "spreadsheetRenameSheet", "spreadsheetWrite", "spreadsheetInfo", "spreadsheetGetColumnCount",
+    "spreadsheetSetActiveSheet", "spreadsheetSetActiveSheetNumber", "spreadsheetAddRow",
+    "spreadsheetAddRows", "spreadsheetAddColumn", "spreadsheetFormatCell", "spreadsheetFormatRow",
+    "spreadsheetFormatColumn", "spreadsheetFormatCellRange", "spreadsheetMergeCells",
+    "spreadsheetAddFreezePane", "spreadsheetSetColumnWidth", "spreadsheetSetRowHeight",
+    "spreadsheetDeleteRow", "spreadsheetDeleteRows", "spreadsheetDeleteColumn",
+    "spreadsheetDeleteColumns", "spreadsheetShiftRows", "spreadsheetShiftColumns",
+    "spreadsheetSetCellFormula", "spreadsheetGetCellFormula", "spreadsheetGetCellType",
+    "spreadsheetClearCell", "spreadsheetClearCellRange", "spreadsheetSetCellRangeValue",
+    "spreadsheetSetCellComment", "spreadsheetSetCellHyperlink", "spreadsheetAddAutofilter",
+    "spreadsheetAddInfo", "spreadsheetAddImage", "spreadsheetAddChart", "spreadsheetToQuery",
+    "spreadsheetToArray", "spreadsheetToCsv", "spreadsheetWriteToCsv", "spreadsheetReadCsv",
+    "isSpreadsheetFile", "spreadsheetGetCellComment", "spreadsheetGetCellHyperlink",
+    "spreadsheetAddSplitPane", "spreadsheetSetPrintOrientation", "spreadsheetSetFitToPage",
+    "spreadsheetSetHeader", "spreadsheetSetFooter", "spreadsheetSetColumnHidden",
+    "spreadsheetSetRowHidden", "spreadsheetAddDataValidation", "spreadsheetAddConditionalFormatting",
+    "spreadsheetGetColumnWidth", "spreadsheetGetCellFormat", "spreadsheetSetActiveCell",
+    "spreadsheetAddPageBreaks", "spreadsheetSetRepeatingRows", "spreadsheetSetRepeatingColumns",
+    "spreadsheetToJson", "spreadsheetFromJson",
+];
+
+#[cfg(feature = "spreadsheet")]
+fn register_spreadsheet_functions(f: &mut HashMap<String, BuiltinFunction>) {
+    use crate::spreadsheet as ss;
+    f.insert("spreadsheetNew".into(), ss::fn_spreadsheet_new);
+    f.insert("spreadsheet".into(), ss::fn_spreadsheet);
+    f.insert("spreadsheetRead".into(), ss::fn_spreadsheet_read);
+    f.insert("spreadsheetReadBinary".into(), ss::fn_spreadsheet_read_binary);
+    f.insert("isSpreadsheetObject".into(), ss::fn_is_spreadsheet_object);
+    f.insert("spreadsheetSetCellValue".into(), ss::fn_spreadsheet_set_cell_value);
+    f.insert("spreadsheetGetCellValue".into(), ss::fn_spreadsheet_get_cell_value);
+    f.insert("spreadsheetCreateSheet".into(), ss::fn_spreadsheet_create_sheet);
+    f.insert("spreadsheetRenameSheet".into(), ss::fn_spreadsheet_rename_sheet);
+    f.insert("spreadsheetWrite".into(), ss::fn_spreadsheet_write);
+    f.insert("spreadsheetInfo".into(), ss::fn_spreadsheet_info);
+    f.insert("spreadsheetGetColumnCount".into(), ss::fn_spreadsheet_get_column_count);
+    f.insert("spreadsheetSetActiveSheet".into(), ss::fn_spreadsheet_set_active_sheet);
+    f.insert("spreadsheetSetActiveSheetNumber".into(), ss::fn_spreadsheet_set_active_sheet_number);
+    f.insert("spreadsheetAddRow".into(), ss::fn_spreadsheet_add_row);
+    f.insert("spreadsheetAddRows".into(), ss::fn_spreadsheet_add_rows);
+    f.insert("spreadsheetAddColumn".into(), ss::fn_spreadsheet_add_column);
+    f.insert("spreadsheetFormatCell".into(), ss::fn_spreadsheet_format_cell);
+    f.insert("spreadsheetFormatRow".into(), ss::fn_spreadsheet_format_row);
+    f.insert("spreadsheetFormatColumn".into(), ss::fn_spreadsheet_format_column);
+    f.insert("spreadsheetFormatCellRange".into(), ss::fn_spreadsheet_format_cell_range);
+    f.insert("spreadsheetMergeCells".into(), ss::fn_spreadsheet_merge_cells);
+    f.insert("spreadsheetAddFreezePane".into(), ss::fn_spreadsheet_add_freeze_pane);
+    f.insert("spreadsheetSetColumnWidth".into(), ss::fn_spreadsheet_set_column_width);
+    f.insert("spreadsheetSetRowHeight".into(), ss::fn_spreadsheet_set_row_height);
+    f.insert("spreadsheetDeleteRow".into(), ss::fn_spreadsheet_delete_row);
+    f.insert("spreadsheetDeleteRows".into(), ss::fn_spreadsheet_delete_rows);
+    f.insert("spreadsheetDeleteColumn".into(), ss::fn_spreadsheet_delete_column);
+    f.insert("spreadsheetDeleteColumns".into(), ss::fn_spreadsheet_delete_columns);
+    f.insert("spreadsheetShiftRows".into(), ss::fn_spreadsheet_shift_rows);
+    f.insert("spreadsheetShiftColumns".into(), ss::fn_spreadsheet_shift_columns);
+    f.insert("spreadsheetSetCellFormula".into(), ss::fn_spreadsheet_set_cell_formula);
+    f.insert("spreadsheetGetCellFormula".into(), ss::fn_spreadsheet_get_cell_formula);
+    f.insert("spreadsheetGetCellType".into(), ss::fn_spreadsheet_get_cell_type);
+    f.insert("spreadsheetClearCell".into(), ss::fn_spreadsheet_clear_cell);
+    f.insert("spreadsheetClearCellRange".into(), ss::fn_spreadsheet_clear_cell_range);
+    f.insert("spreadsheetSetCellRangeValue".into(), ss::fn_spreadsheet_set_cell_range_value);
+    f.insert("spreadsheetSetCellComment".into(), ss::fn_spreadsheet_set_cell_comment);
+    f.insert("spreadsheetSetCellHyperlink".into(), ss::fn_spreadsheet_set_cell_hyperlink);
+    f.insert("spreadsheetAddAutofilter".into(), ss::fn_spreadsheet_add_autofilter);
+    f.insert("spreadsheetAddInfo".into(), ss::fn_spreadsheet_add_info);
+    f.insert("spreadsheetAddImage".into(), ss::fn_spreadsheet_add_image);
+    f.insert("spreadsheetAddChart".into(), ss::fn_spreadsheet_add_chart);
+    f.insert("spreadsheetToQuery".into(), ss::fn_spreadsheet_to_query);
+    f.insert("spreadsheetToArray".into(), ss::fn_spreadsheet_to_array);
+    f.insert("spreadsheetToCsv".into(), ss::fn_spreadsheet_to_csv);
+    f.insert("spreadsheetWriteToCsv".into(), ss::fn_spreadsheet_write_to_csv);
+    f.insert("spreadsheetReadCsv".into(), ss::fn_spreadsheet_read_csv);
+    f.insert("isSpreadsheetFile".into(), ss::fn_is_spreadsheet_file);
+    f.insert("spreadsheetGetCellComment".into(), ss::fn_spreadsheet_get_cell_comment);
+    f.insert("spreadsheetGetCellHyperlink".into(), ss::fn_spreadsheet_get_cell_hyperlink);
+    f.insert("spreadsheetAddSplitPane".into(), ss::fn_spreadsheet_add_split_pane);
+    f.insert("spreadsheetSetPrintOrientation".into(), ss::fn_spreadsheet_set_print_orientation);
+    f.insert("spreadsheetSetFitToPage".into(), ss::fn_spreadsheet_set_fit_to_page);
+    f.insert("spreadsheetSetHeader".into(), ss::fn_spreadsheet_set_header);
+    f.insert("spreadsheetSetFooter".into(), ss::fn_spreadsheet_set_footer);
+    f.insert("spreadsheetSetColumnHidden".into(), ss::fn_spreadsheet_set_column_hidden);
+    f.insert("spreadsheetSetRowHidden".into(), ss::fn_spreadsheet_set_row_hidden);
+    f.insert("spreadsheetAddDataValidation".into(), ss::fn_spreadsheet_add_data_validation);
+    f.insert("spreadsheetAddConditionalFormatting".into(), ss::fn_spreadsheet_add_conditional_formatting);
+    f.insert("spreadsheetGetColumnWidth".into(), ss::fn_spreadsheet_get_column_width);
+    f.insert("spreadsheetGetCellFormat".into(), ss::fn_spreadsheet_get_cell_format);
+    f.insert("spreadsheetSetActiveCell".into(), ss::fn_spreadsheet_set_active_cell);
+    f.insert("spreadsheetAddPageBreaks".into(), ss::fn_spreadsheet_add_page_breaks);
+    f.insert("spreadsheetSetRepeatingRows".into(), ss::fn_spreadsheet_set_repeating_rows);
+    f.insert("spreadsheetSetRepeatingColumns".into(), ss::fn_spreadsheet_set_repeating_columns);
+    f.insert("spreadsheetToJson".into(), ss::fn_spreadsheet_to_json);
+    f.insert("spreadsheetFromJson".into(), ss::fn_spreadsheet_from_json);
+}
+
+#[cfg(not(feature = "spreadsheet"))]
+fn register_spreadsheet_functions(f: &mut HashMap<String, BuiltinFunction>) {
+    // isSpreadsheetObject is a type predicate — always safe to answer "false".
+    f.insert("isSpreadsheetObject".into(), |_args| Ok(CfmlValue::Bool(false)));
+    for name in SPREADSHEET_FN_NAMES {
+        f.insert((*name).into(), fn_spreadsheet_disabled);
+    }
+}
+
+/// Any spreadsheet function called in a build compiled WITHOUT `spreadsheet`
+/// (e.g. the wasm targets).
+#[cfg(not(feature = "spreadsheet"))]
+fn fn_spreadsheet_disabled(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "Spreadsheet support is not available in this build (native/server only)".to_string(),
+    ))
 }
 
 /// Any image function called in a build compiled WITHOUT `image_support`.

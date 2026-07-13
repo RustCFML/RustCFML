@@ -13,7 +13,15 @@ repository.workspace = true
 license.workspace = true
 
 [features]
-default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support"]
+default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet"]
+# Native spreadsheet support — Spreadsheet* BIFs, the fluent Spreadsheet()
+# builder, and <cfspreadsheet>. Read+edit+write .xlsx via the pure-Rust
+# `umya-spreadsheet` (POI-style open→mutate→save with styles/charts/images
+# preserved); legacy .xls/.xlsb reads via `calamine`. Both pure Rust, but this
+# whole capability is NATIVE/SERVER-ONLY and is deliberately kept OUT of the
+# wasm builds (the worker/demo don't enumerate it), so umya's unverified wasm
+# story never touches the wasm targets.
+spreadsheet = ["dep:umya-spreadsheet", "dep:calamine", "dep:imagesize"]
 # Raster image manipulation (imageNew/imageRead/imageResize/... + <cfimage>).
 # Backed by the pure-Rust `image` crate, so it builds for wasm32 as well as
 # native. Default features of `image` are all pure-Rust codecs (png/jpeg/gif/
@@ -98,6 +106,15 @@ ab_glyph = { version = "0.2", optional = true }
 kamadak-exif = { version = "0.6", optional = true }
 scraper = { version = "0.22", optional = true }
 ego-tree = { version = "0.10", optional = true }
+# Pure-Rust xlsx read+edit+write (POI-model round-trip: styles/charts/images
+# preserved). Primary spreadsheet engine. Native-only (see `spreadsheet` feature).
+umya-spreadsheet = { version = "3", optional = true }
+# Pure-Rust reader for legacy .xls (BIFF), .xlsb and .ods that umya can't open.
+# Data-only (styles dropped) — used for SpreadsheetRead of legacy formats.
+calamine = { version = "0.36", optional = true }
+# Pure-Rust image-dimension probe (already in umya's tree) — lets addImage accept
+# raw bytes by supplying width/height to umya's new_image_with_dimensions.
+imagesize = { version = "0.14", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"], optional = true }
 # Use the modern HTTPS connector (aws-lc-rs + rustls 0.23) rather than the
