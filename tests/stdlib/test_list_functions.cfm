@@ -70,5 +70,19 @@ assert("listCompact removes empties", listLen(compacted), 3);
 trimmed = listItemTrim(" a , b , c ");
 assert("listItemTrim trims items", listFirst(trimmed), "a");
 
+// --- listToArray with EMPTY delimiter (Lucee splits into characters) ---
+// This is specific to listToArray; listLen/listFirst/listGetAt instead treat
+// an empty delimiter as "no delimiter" (whole string = one element).
+assert("listToArray empty-delim splits chars", serializeJson(listToArray("weak", "")), '["w","e","a","k"]');
+assert("listToArray empty-delim single char", arrayLen(listToArray("x", "")), 1);
+assert("listToArray empty-delim empty string", arrayLen(listToArray("", "")), 0);
+assert("listToArray empty-delim keeps unicode", serializeJson(listToArray("a-b", "")), '["a","-","b"]');
+// includeEmptyFields=true brackets the chars with a leading + trailing empty
+assert("listToArray empty-delim includeEmpty", serializeJson(listToArray("ab", "", true)), '["","a","b",""]');
+assert("listToArray empty-delim includeEmpty empty string", serializeJson(listToArray("", "", true)), '[""]');
+// empty delimiter stays a no-op for the other list functions
+assert("listLen empty-delim is 1", listLen("weak", ""), 1);
+assert("listFirst empty-delim whole string", listFirst("weak", ""), "weak");
+
 suiteEnd();
 </cfscript>

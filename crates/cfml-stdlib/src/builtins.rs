@@ -5297,6 +5297,30 @@ fn fn_list_to_array(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
     let delimiter = get_delimiter(&args, 1);
     let include_empty = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+    // Lucee parity: an EMPTY delimiter splits the list into its individual
+    // characters (this is specific to ListToArray — ListLen/ListFirst/ListGetAt
+    // instead treat an empty delimiter as "no delimiter" = one element). With
+    // includeEmptyFields=true, Lucee brackets the characters with a leading and
+    // trailing empty element: "ab" -> ["","a","b",""], "" -> [""].
+    if delimiter.is_empty() {
+        let mut items: Vec<CfmlValue> = Vec::new();
+        if include_empty {
+            // "" -> [""] (a single empty element, not two).
+            if list.is_empty() {
+                return Ok(CfmlValue::array(vec![CfmlValue::string(String::new())]));
+            }
+            items.push(CfmlValue::string(String::new()));
+            for ch in list.chars() {
+                items.push(CfmlValue::string(ch.to_string()));
+            }
+            items.push(CfmlValue::string(String::new()));
+        } else {
+            for ch in list.chars() {
+                items.push(CfmlValue::string(ch.to_string()));
+            }
+        }
+        return Ok(CfmlValue::array(items));
+    }
     if list.is_empty() {
         return Ok(CfmlValue::array(Vec::new()));
     }
