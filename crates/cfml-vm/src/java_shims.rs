@@ -3048,6 +3048,70 @@ fn rand_u128() -> u128 {
 /// `java_matcher_step`) because they mutate matcher state that must be written
 /// back to the variable. `group(n)`/`groupCount()` read that stashed state and
 /// stay here (pure reads).
+/// Translate the small subset of Java regex syntax that Rust's `regex` crate
+/// does not accept natively into an equivalent it does. Currently: Java's bare
+/// `\uXXXX` (exactly 4 hex digits) unicode escape → `\x{XXXX}`. Everything else
+/// (including other escape pairs like `\\`, `\d`, `\.`) is preserved verbatim.
+/// Used so `String.matches("[-ÿ]")`-style patterns from JVM-oriented
+/// CFML (e.g. Preside's PasswordStrengthAnalyzer symbol classes) compile.
+pub fn java_regex_to_rust(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let n = chars[i + 1];
+            if n == 'u'
+                && i + 6 <= chars.len()
+                && chars[i + 2..i + 6].iter().all(|h| h.is_ascii_hexdigit())
+            {
+                out.push_str("\\x{");
+                out.extend(&chars[i + 2..i + 6]);
+                out.push('}');
+                i += 6;
+                continue;
+            }
+            // Preserve any other escaped pair (\\, \d, \., escaped-separator…).
+            out.push(c);
+            out.push(n);
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// True if a (Rust-translated) regex references a UTF-16 surrogate code point
+/// (`\x{D800}`..`\x{DFFF}`). Java regexes match on code units so these are
+/// legal, but Rust strings hold only scalar values — such a class can never
+/// match a real char, so `String.matches` should yield false rather than throw
+/// on the (unavoidable) compile error.
+pub fn regex_references_surrogate(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if &bytes[i..i + 3] == b"\\x{" {
+            let mut j = i + 3;
+            let mut hex = String::new();
+            while j < bytes.len() && bytes[j] != b'}' {
+                hex.push(bytes[j] as char);
+                j += 1;
+            }
+            if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                if (0xD800..=0xDFFF).contains(&v) {
+                    return true;
+                }
+            }
+            i = j;
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     use regex::Regex;
 

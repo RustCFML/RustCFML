@@ -3730,6 +3730,36 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Raise a catchable CFML runtime exception from an inline VM op. If a `try`
+    /// handler is active, unwind the operand stack into it and return
+    /// `Ok(catch_ip)` (the caller sets `ip = catch_ip; continue;`); otherwise
+    /// return the error to abort the request. Generic sibling of
+    /// `raise_undefined_member` for ops that need their own message/type.
+    fn raise_catchable(
+        &mut self,
+        stack: &mut Vec<CfmlValue>,
+        message: &str,
+        err_type: &str,
+    ) -> Result<usize, CfmlError> {
+        if let Some(handler) = self.try_stack.pop() {
+            let mut exception = ValueMap::default();
+            exception.insert("message".to_string(), CfmlValue::string(message.to_string()));
+            exception.insert("type".to_string(), CfmlValue::string(err_type.to_string()));
+            exception.insert("detail".to_string(), CfmlValue::string(String::new()));
+            exception.insert("stackTrace".to_string(), CfmlValue::string(message.to_string()));
+            exception.insert("tagcontext".to_string(), self.build_tag_context());
+            stack.truncate(handler.stack_depth);
+            self.restore_capture_state(&handler);
+            Self::add_root_cause(&mut exception);
+            let exc = CfmlValue::strukt(exception);
+            self.last_exception = Some(exc.clone());
+            stack.push(exc);
+            Ok(handler.catch_ip)
+        } else {
+            Err(self.wrap_error(CfmlError::runtime(message.to_string())))
+        }
+    }
+
     /// Apply an in-place numeric mutation (`x++`, `x--`, `x += k`, `x *= k`) to a
     /// bare variable, resolving it the SAME way `LoadLocal`/`StoreLocal` do. The
     /// fast path is a value held directly in this frame's `locals`. The fallback
@@ -7052,6 +7082,44 @@ impl CfmlVirtualMachine {
                             // method onto another component, breaking every Wheels
                             // boot (#220).
                             stack.push(val);
+                        }
+                        // Lucee/ACF/BoxLang: `str[n]` is 1-based CHARACTER access
+                        // (equivalent to Mid(str, n, 1)). An out-of-range, zero or
+                        // non-numeric subscript throws — matching Lucee's
+                        // "there is no property with name [n] found in [string]".
+                        // (Preside EmailService validates `sendArgs.to[1]` where
+                        // `to` is a single-recipient string.)
+                        CfmlValue::String(s) => {
+                            let n = match &index {
+                                CfmlValue::Int(i) => Some(*i),
+                                CfmlValue::Double(d) => Some(*d as i64),
+                                CfmlValue::String(is) => is.trim().parse::<i64>().ok(),
+                                _ => None,
+                            };
+                            let ch = match n {
+                                Some(n) if n >= 1 => s.chars().nth((n - 1) as usize),
+                                _ => None,
+                            };
+                            match ch {
+                                Some(ch) => stack.push(CfmlValue::string(ch.to_string())),
+                                None => {
+                                    // Out-of-range / zero / non-numeric subscript —
+                                    // catchable, matching Lucee's message + type.
+                                    // Two spaces before "found" mirrors Lucee's
+                                    // exact message verbatim.
+                                    let msg = format!(
+                                        "there is no property with name [{}]  found in [string]",
+                                        index.as_string()
+                                    );
+                                    match self.raise_catchable(&mut stack, &msg, "expression") {
+                                        Ok(catch_ip) => {
+                                            ip = catch_ip;
+                                            continue;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
                         }
                         _ => stack.push(CfmlValue::Null),
                     }
@@ -19003,6 +19071,36 @@ impl CfmlVirtualMachine {
                         return Ok(CfmlValue::Bool(
                             object.as_string().ends_with(suffix.as_string().as_str()),
                         ));
+                    }
+                    return Ok(CfmlValue::Bool(false));
+                }
+                "matches" => {
+                    // Java String.matches(regex): true iff the ENTIRE string
+                    // matches the regex (implicitly anchored). Preside's
+                    // PasswordStrengthAnalyzer classifies characters with
+                    // JavaCast('String', ch).matches('[a-z]') etc. Translate the
+                    // Java `\uXXXX` escapes the symbol-class patterns use into
+                    // the regex crate's `\x{XXXX}` form first.
+                    if let Some(pat) = extra_args.first() {
+                        let src = object.as_string();
+                        let pattern =
+                            java_shims::java_regex_to_rust(&pat.as_string());
+                        let anchored = format!("^(?:{})$", pattern);
+                        match regex::Regex::new(&anchored) {
+                            Ok(re) => return Ok(CfmlValue::Bool(re.is_match(&src))),
+                            Err(e) => {
+                                // A pattern referencing UTF-16 surrogate code
+                                // points is valid Java but can't compile against
+                                // Rust's scalar-only strings; it can never match
+                                // a real char, so the result is simply false.
+                                if java_shims::regex_references_surrogate(&pattern) {
+                                    return Ok(CfmlValue::Bool(false));
+                                }
+                                return Err(self.wrap_error(CfmlError::runtime(
+                                    format!("String.matches: invalid regex [{}]: {}", pattern, e),
+                                )));
+                            }
+                        }
                     }
                     return Ok(CfmlValue::Bool(false));
                 }

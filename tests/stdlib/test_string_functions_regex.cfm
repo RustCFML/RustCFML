@@ -91,5 +91,21 @@ assert("reFind non-anchored from start pos", reFind("a", "xax", 2), 2);
 reAnchorMatch = reFindNoCase("(^|\s|,)([a-z_]+)", "object.email", 2, true);
 assert("reFindNoCase leading-delim idiom no spurious mid-token match", reAnchorMatch.match[1], "");
 
+// --- Java String.matches() member method: full-string (anchored) match ---
+assertTrue("matches lowercase class", "w".matches("[a-z]"));
+assertTrue("matches uppercase class", "A".matches("[A-Z]"));
+assertTrue("matches digit class", "5".matches("[0-9]"));
+assertFalse("matches is anchored (whole string)", "abc".matches("[a-z]"));
+assertTrue("matches whole lowercase string", "abc".matches("[a-z]+"));
+assertFalse("matches wrong class", "w".matches("[A-Z]"));
+// Java \uXXXX escapes are translated to the regex crate's \x{XXXX} form.
+// Pattern is a literal backslash-u string; input built via chr() so this file stays ASCII.
+assertTrue("matches java unicode escape range", chr(233).matches("[\u0080-\u00FF]"));
+assertFalse("matches ascii not in unicode range", "a".matches("[\u0080-\u00FF]"));
+// A surrogate-code-point class is valid Java but can never match a scalar char → false (no throw)
+assertFalse("matches surrogate range yields false", "a".matches("[\uD800-\uDB7F]"));
+// works on a JavaCast'd string too
+assertTrue("matches on JavaCast String", JavaCast("String", "z").matches("[a-z]"));
+
 suiteEnd();
 </cfscript>
