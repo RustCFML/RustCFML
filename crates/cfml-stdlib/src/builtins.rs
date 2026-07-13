@@ -10182,6 +10182,22 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         _ => "query".to_string(),
     };
 
+    // `timeout` (seconds) aborts a query that overruns, mirroring JDBC
+    // Statement.setQueryTimeout (what Lucee's `timeout` option maps to). 0 / <=0
+    // means "no timeout". Currently enforced for the MySQL/MariaDB driver via a
+    // server-side KILL QUERY watchdog (see execute_mysql); other drivers accept
+    // the option but do not yet enforce it (docs/known-issues.md).
+    let query_timeout: Option<u32> = match &options_arg {
+        CfmlValue::Struct(opts) => opts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("timeout"))
+            .and_then(|(_, v)| {
+                let n = v.as_string().trim().parse::<i64>().ok()?;
+                if n > 0 { Some(n as u32) } else { None }
+            }),
+        _ => None,
+    };
+
     // `maxrows` caps the returned resultset (Lucee/ACF). A negative value is
     // Lucee's "no limit" sentinel. Applied post-execution so it works uniformly
     // across every driver (GitHub #251 — was QoQ-only before).
@@ -10205,7 +10221,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         #[cfg(feature = "sqlite")]
         DbDriver::Sqlite(path) => execute_sqlite(&path, &sql, &params_arg, &return_type),
         #[cfg(feature = "mysql_db")]
-        DbDriver::Mysql(url) => execute_mysql(&url, &sql, &params_arg, &return_type),
+        DbDriver::Mysql(url) => execute_mysql(&url, &sql, &params_arg, &return_type, query_timeout),
         #[cfg(feature = "postgres_db")]
         DbDriver::Postgres(url) => execute_postgres(&url, &sql, &params_arg, &return_type),
         #[cfg(feature = "mssql_db")]
@@ -10667,7 +10683,71 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
 }
 
 #[cfg(feature = "mysql_db")]
-fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
+/// Query-timeout watchdog for MySQL/MariaDB, mirroring JDBC
+/// Statement.setQueryTimeout. On construction it starts a thread that waits
+/// `secs`; if the guarded query has not finished by then it opens a fresh
+/// pooled connection and issues `KILL QUERY <conn_id>`, which aborts just the
+/// running statement (the connection itself stays usable, so returning it to
+/// the pool is safe). Dropping the guard signals the query finished and joins
+/// the thread. `fired()` reports whether the KILL was actually sent, so the
+/// caller can translate the resulting "query interrupted" error into a
+/// timeout error.
+struct MysqlQueryTimeout {
+    done_tx: std::sync::mpsc::Sender<()>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "mysql_db")]
+impl MysqlQueryTimeout {
+    fn start(url: String, conn_id: u32, secs: u32) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let (done_tx, rx) = channel::<()>();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_thread = fired.clone();
+        let handle = std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(secs as u64)) {
+                // Query finished (or guard dropped) before the deadline — stand down.
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                // Deadline elapsed while the query was still running — KILL it.
+                Err(RecvTimeoutError::Timeout) => {
+                    fired_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(pool) = get_mysql_pool(&url) {
+                        if let Ok(mut kc) = pool.get_conn() {
+                            use mysql::prelude::Queryable;
+                            let _ = kc.query_drop(format!("KILL QUERY {}", conn_id));
+                        }
+                    }
+                }
+            }
+        });
+        MysqlQueryTimeout { done_tx, fired, handle: Some(handle) }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "mysql_db")]
+impl Drop for MysqlQueryTimeout {
+    fn drop(&mut self) {
+        let _ = self.done_tx.send(());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(feature = "mysql_db")]
+fn execute_mysql(
+    url: &str,
+    sql: &str,
+    params_arg: &CfmlValue,
+    return_type: &str,
+    timeout_secs: Option<u32>,
+) -> CfmlResult {
     use mysql::*;
     use mysql::prelude::*;
 
@@ -10702,9 +10782,31 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
     };
     let sql: &str = &final_sql;
 
+    // Arm the query-timeout watchdog (JDBC setQueryTimeout equivalent) if a
+    // positive timeout was requested. It KILLs this connection's running query
+    // server-side once the deadline passes; we then translate the resulting
+    // "query interrupted" error into a timeout error the caller can detect.
+    let watchdog = timeout_secs.map(|secs| {
+        let conn_id = conn.connection_id();
+        MysqlQueryTimeout::start(url.to_string(), conn_id, secs)
+    });
+    // Map a query error to a timeout error when the watchdog fired (so callers
+    // catching `database` errors see "timeout" in the message), else pass through.
+    let map_err = |e: mysql::Error, ctx: &str| -> CfmlError {
+        if let (Some(w), Some(secs)) = (watchdog.as_ref(), timeout_secs) {
+            if w.fired() {
+                return CfmlError::database(format!(
+                    "queryExecute: MySQL query exceeded timeout of {} second(s) and was cancelled: {}",
+                    secs, e
+                ));
+            }
+        }
+        CfmlError::database(format!("queryExecute: MySQL {}: {}", ctx, e))
+    };
+
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
-            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL query error: {}", e)))?;
+            .map_err(|e| map_err(e, "query error"))?;
 
         // Extract column names from result set
         let columns: Vec<String> = if let Some(first_row) = result.first() {
@@ -10729,7 +10831,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         build_query_result(columns, rows, sql, return_type)
     } else {
         conn.exec_drop(sql, &params)
-            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL error: {}", e)))?;
+            .map_err(|e| map_err(e, "error"))?;
 
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;

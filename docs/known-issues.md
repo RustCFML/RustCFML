@@ -132,6 +132,7 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `setTimeZone(tz)` | `tz` | No-op: the argument is ignored (only cfconfig `runtime.timezone` is honoured — see §1). |
 | `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
 | `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
+| `queryExecute(…, {timeout=N})` / `<cfquery timeout>` | `timeout` (partial) | Enforced for the **MySQL/MariaDB** driver only (a `KILL QUERY` watchdog aborts an overrunning statement server-side, the JDBC `setQueryTimeout` equivalent). The Postgres, MSSQL and SQLite drivers currently accept the option but do not enforce it. |
 | `s3Write` / `s3Upload` / `s3Copy` / `s3Move` | `acl`, `location` | Accepted but not sent to the backend. |
 | `s3Read` / `s3Download` | `charset` | Accepted but ignored. |
 | `writeDump(output=…)` | a filename path | `output="console"` (→ server stdout) and `output="browser"`/default (→ page) are honoured; a filename value (Lucee writes the dump to that file) is not — it falls back to page output. |
