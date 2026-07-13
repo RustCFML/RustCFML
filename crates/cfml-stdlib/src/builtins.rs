@@ -3477,7 +3477,12 @@ fn fn_is_numeric(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_boolean(args: Vec<CfmlValue>) -> CfmlResult {
-    match args.first() {
+    // A bare query-column access (q.col) yields a QueryColumn proxy standing in
+    // for its first-row scalar; unwrap it before the type test, matching
+    // isNumeric/isDate/isSimpleValue. (Preside FormBuilderService.isFormActive
+    // guards on IsBoolean(formRecord.active) where `active` is a boolean query
+    // column.)
+    match args.first().map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Bool(_)) => Ok(CfmlValue::Bool(true)),
         Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(CfmlValue::Bool(true)),
         Some(CfmlValue::String(s)) => {

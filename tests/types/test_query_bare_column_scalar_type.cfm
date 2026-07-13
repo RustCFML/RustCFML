@@ -45,5 +45,13 @@ assert("bare COUNT participates in arithmetic", qbcC.cnt + 0, 2);
 assertTrue("CONTROL: row-indexed q.col[1] IsNumeric", isNumeric(qbcQ.n[1]));
 assert("CONTROL: row-indexed arithmetic", qbcQ.n[1] + 1, 6);
 
+// --- IsBoolean must also unwrap the proxy to its first-row scalar ---
+// (Preside FormBuilderService.isFormActive guards on IsBoolean(formRecord.active)
+// where `active` is a boolean query column; a non-unwrapped proxy read false.)
+qbcB = queryNew("active,active_from", "boolean,date", [[true, ""]]);
+assertTrue("bare q.col on a boolean column IsBoolean", isBoolean(qbcB.active));
+assertTrue("bare q['col'] on a boolean column IsBoolean", isBoolean(qbcB["active"]));
+assertTrue("boolean column proxy is truthy in a condition", qbcB.active ? true : false);
+
 suiteEnd();
 </cfscript>
