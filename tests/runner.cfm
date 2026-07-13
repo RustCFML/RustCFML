@@ -505,6 +505,7 @@ include "harness.cfm";
 <cf_runtest file="lifecycle/test_session_app_namespace.cfm">
 <cf_runtest file="lifecycle/test_application_mapping_coverage.cfm">
 <cf_runtest file="lifecycle/test_application_pseudo_include.cfm">
+<cf_runtest file="lifecycle/test_application_shared_variables.cfm">
 <cf_runtest file="lifecycle/test_application_lifecycle_case_override.cfm">
 <cf_runtest file="lifecycle/test_application_load_errors.cfm">
 <cf_runtest file="lifecycle/test_application_scope_custom_tag.cfm">

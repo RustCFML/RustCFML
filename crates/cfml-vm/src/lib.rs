@@ -9437,7 +9437,49 @@ impl CfmlVirtualMachine {
                             }
                         }
                         Err(e) => {
-                            return Err(e);
+                            // A missing/unreadable include file is a CATCHABLE
+                            // error in CFML (Lucee/ACF surface it with type
+                            // `missingInclude`), not a hard abort. Masa CMS relies
+                            // on this: `try{ include "plugins/mappings.cfm" }
+                            // catch(any e){ if(e.type eq 'missingInclude') ... }`
+                            // to detect a fresh install. Route it through the
+                            // try-stack instead of returning past every handler.
+                            let is_missing = e.message.starts_with("Cannot read '");
+                            let err = if is_missing {
+                                CfmlError::new(
+                                    e.message.clone(),
+                                    CfmlErrorType::Custom("missingInclude".to_string()),
+                                )
+                            } else {
+                                e
+                            };
+                            if Self::is_control_flow_error(&err) {
+                                return Err(err);
+                            }
+                            if let Some(handler) = self.try_stack.pop() {
+                                while stack.len() > handler.stack_depth {
+                                    stack.pop();
+                                }
+                                self.restore_capture_state(&handler);
+                                let mut err_struct = ValueMap::default();
+                                err_struct.insert(
+                                    "message".to_string(),
+                                    CfmlValue::string(err.message.clone()),
+                                );
+                                err_struct.insert(
+                                    "type".to_string(),
+                                    CfmlValue::string(format!("{}", err.error_type)),
+                                );
+                                err_struct
+                                    .insert("detail".to_string(), CfmlValue::string(String::new()));
+                                err_struct
+                                    .insert("tagcontext".to_string(), self.build_tag_context());
+                                let error_val = CfmlValue::strukt(err_struct);
+                                stack.push(error_val);
+                                ip = handler.catch_ip;
+                            } else {
+                                return Err(err);
+                            }
                         }
                     }
                 }
@@ -9551,7 +9593,47 @@ impl CfmlVirtualMachine {
                             }
                         }
                         Err(e) => {
-                            return Err(e);
+                            // Missing/unreadable dynamic include → catchable
+                            // `missingInclude` error, routed through the try-stack
+                            // (Masa CMS: `try{ include "#context#/plugins/mappings.cfm" }
+                            // catch(any e){ hasPluginMappings=false }`). See the
+                            // matching handling on the static Include op above.
+                            let is_missing = e.message.starts_with("Cannot read '");
+                            let err = if is_missing {
+                                CfmlError::new(
+                                    e.message.clone(),
+                                    CfmlErrorType::Custom("missingInclude".to_string()),
+                                )
+                            } else {
+                                e
+                            };
+                            if Self::is_control_flow_error(&err) {
+                                return Err(err);
+                            }
+                            if let Some(handler) = self.try_stack.pop() {
+                                while stack.len() > handler.stack_depth {
+                                    stack.pop();
+                                }
+                                self.restore_capture_state(&handler);
+                                let mut err_struct = ValueMap::default();
+                                err_struct.insert(
+                                    "message".to_string(),
+                                    CfmlValue::string(err.message.clone()),
+                                );
+                                err_struct.insert(
+                                    "type".to_string(),
+                                    CfmlValue::string(format!("{}", err.error_type)),
+                                );
+                                err_struct
+                                    .insert("detail".to_string(), CfmlValue::string(String::new()));
+                                err_struct
+                                    .insert("tagcontext".to_string(), self.build_tag_context());
+                                let error_val = CfmlValue::strukt(err_struct);
+                                stack.push(error_val);
+                                ip = handler.catch_ip;
+                            } else {
+                                return Err(err);
+                            }
                         }
                     }
                 }
@@ -24773,6 +24855,10 @@ impl CfmlVirtualMachine {
             });
         let empty_locals = ValueMap::default();
         let mut pushed_super = false;
+        // Inherited methods (+ inherited property/data defaults) from a resolved
+        // framework-Bootstrap parent, used to seed the shared `__variables`
+        // method table below so unqualified inherited calls in the body resolve.
+        let mut parent_vars: Option<ValueMap> = None;
         if let Some(ref pname) = parent_name {
             if let Some(parent_template) =
                 self.resolve_component_template(pname, &empty_locals)
@@ -24780,10 +24866,30 @@ impl CfmlVirtualMachine {
                 let resolved_parent = self.resolve_inheritance(parent_template, &empty_locals);
                 if let CfmlValue::Struct(ref ps) = resolved_parent {
                     let mut super_methods = ValueMap::default();
+                    let mut pvars = ValueMap::default();
                     for (k, v) in ps.iter() {
-                        if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
-                            super_methods.insert(k.clone(), v.clone());
+                        if k.starts_with("__") {
+                            // Fold the parent's own resolved `variables` (property
+                            // defaults + inherited data) into the seed so the body
+                            // can read inherited state during construction.
+                            if k == "__variables" {
+                                if let CfmlValue::Struct(ref pv) = v {
+                                    for (dk, dv) in pv.iter() {
+                                        if !dk.starts_with("__") {
+                                            pvars.insert(dk.clone(), dv.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
                         }
+                        if matches!(v, CfmlValue::Function(_)) {
+                            super_methods.insert(k.clone(), v.clone());
+                            pvars.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if !pvars.is_empty() {
+                        parent_vars = Some(pvars);
                     }
                     if !super_methods.is_empty() {
                         super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
@@ -24793,6 +24899,60 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        // Construction-ordering fix (mirrors the normal component path): hoist
+        // the method table into a SHARED, Arc-backed `__variables` handle BEFORE
+        // running the pseudo-constructor. Without this, a method that writes
+        // `variables.x` during Application.cfc construction and then calls a
+        // sibling method that reads `variables.x` would fail — each call gets its
+        // own scope and the write is lost. Masa CMS hits exactly this: `initINI()`
+        // sets `variables.ini` then calls `setINISection()` which reads it.
+        // The handle is shared into every sub-call via parent-scope propagation,
+        // so `variables.x` writes accumulate into it in place and become the app
+        // component's `variables` scope (folded back into `component_variables`
+        // after the body returns).
+        let body_vars = {
+            let mut method_table: ValueMap = parent_vars.unwrap_or_default();
+            for bf in self.program.functions.iter() {
+                if !bf.is_component_method || bf.name.starts_with("__") {
+                    continue;
+                }
+                let cf = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+                    name: bf.name.clone(),
+                    params: bf
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| cfml_common::dynamic::CfmlParam {
+                            name: name.clone(),
+                            param_type: bf.param_types.get(i).cloned().flatten(),
+                            default: None,
+                            required: bf.required_params.get(i).copied().unwrap_or(false),
+                            annotations: bf
+                                .param_annotations
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_default(),
+                        })
+                        .collect(),
+                    body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+                        CfmlValue::Int(bf.global_id as i64),
+                    )),
+                    return_type: bf.return_type.clone(),
+                    access: bf.access.clone(),
+                    captured_scope: None,
+                }));
+                method_table.insert(bf.name.clone(), cf);
+            }
+            CfmlStruct::new(method_table)
+        };
+        let app_body_scope = {
+            let mut s = ValueMap::default();
+            s.insert(
+                "__variables".to_string(),
+                CfmlValue::Struct(body_vars.clone()),
+            );
+            s
+        };
         // Resolve relative includes/file-BIFs in the pseudo-constructor against
         // the Application.cfc's own directory, not the request target page.
         // CFML engines run an Application.cfc body in its own location; e.g.
@@ -24802,14 +24962,25 @@ impl CfmlVirtualMachine {
         // resolves against the target page's dir and escapes to the wrong place.
         let saved_source_file = self.source_file.replace(path.to_string());
         let exec_result =
-            self.execute_function_with_args(&cfc_body, Vec::new(), Some(&empty_locals));
+            self.execute_function_with_args(&cfc_body, Vec::new(), Some(&app_body_scope));
         self.source_file = saved_source_file;
         if pushed_super {
             self.pseudo_ctor_super.pop();
         }
 
         // Capture component body locals as the variables scope
-        let component_variables = self.captured_locals.take().unwrap_or_default();
+        let mut component_variables = self.captured_locals.take().unwrap_or_default();
+        // Fold the shared `__variables` handle's accumulated writes (any
+        // `variables.x = ...` done inside methods called during construction, or
+        // in the body itself) back into the flat capture so they persist onto the
+        // app component's `variables` scope. Functions and `__`-prefixed keys are
+        // filtered downstream; the handle values are authoritative for data keys.
+        for (k, v) in body_vars.snapshot() {
+            if matches!(v, CfmlValue::Function(_)) || k.starts_with("__") {
+                continue;
+            }
+            component_variables.insert(k, v);
+        }
 
         // Merge sub-program functions into main program
         let sub_funcs = self.program.functions.clone();
