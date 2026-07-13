@@ -116,7 +116,12 @@ pub fn build_web_scopes(
 
     let mut cgi = ValueMap::default();
     cgi.insert("request_method".to_string(), CfmlValue::string(method.to_string()));
-    let path_info = if path_info.is_empty() { "/" } else { path_info };
+    // `cgi.path_info` is the extra path *after* the resolved script — empty when
+    // the URL maps straight to a file with nothing trailing (`/index.cfm?x=1`),
+    // matching Lucee/ACF. Do NOT coerce empty to "/": frameworks distinguish the
+    // two (Taffy's `parseRequest` only falls back to its `?endpoint=` param when
+    // `len(cgi.path_info) == 0`; Wheels' `$cgiScope` branches on `!Len(path_info)`).
+    // Verified against Lucee 7.0.4: `/x.cfm?q=1` → "", `/x.cfm/a/b` → "/a/b".
     cgi.insert("path_info".to_string(), CfmlValue::string(path_info.to_string()));
     cgi.insert("script_name".to_string(), CfmlValue::string(script_name.to_string()));
     cgi.insert("query_string".to_string(), CfmlValue::string(query_string.to_string()));

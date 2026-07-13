@@ -265,6 +265,30 @@ impl Parser {
             return Ok(CfmlNode::Statement(Statement::Throw(self.parse_throw()?)));
         }
 
+        // `cfthrow(...)` — the cfXXX() script alias for the <cfthrow> tag (Lucee
+        // exposes every tag as a `cfName()` function). Route it through the very
+        // same lowering as `throw(...)` above so named attrs AND
+        // `attributeCollection=` both work. Taffy's Factory throws bean-not-found
+        // via `cfthrow(attributecollection=arguments)`; without this `cfthrow`
+        // resolved as an undefined variable.
+        if matches!(self.peek(0), Token::Identifier(n) if n.eq_ignore_ascii_case("cfthrow"))
+            && matches!(self.peek(1), Token::LParen)
+        {
+            self.advance(); // consume `cfthrow`
+            self.consume(&Token::LParen)?;
+            let is_named = matches!(self.peek(0), Token::Identifier(_))
+                && matches!(self.peek(1), Token::Equal | Token::Colon);
+            let arguments = if is_named {
+                let named = self.parse_throw_named_attrs(true)?;
+                self.throw_named_to_positional(named, stmt_loc)
+            } else {
+                self.parse_arguments()?
+            };
+            self.consume(&Token::RParen)?;
+            self.match_token(&Token::Semicolon);
+            return Ok(self.build_throw_call(arguments, stmt_loc));
+        }
+
         if self.match_token(&Token::Rethrow) {
             self.match_token(&Token::Semicolon);
             return Ok(CfmlNode::Statement(Statement::Rethrow(stmt_loc)));
@@ -3561,6 +3585,11 @@ impl Parser {
             get_arg("errorcode"),
             get_arg("extendedinfo"),
             get_arg("object"),
+            // Index 6: `attributeCollection` — a runtime struct can't be expanded
+            // at parse time, so it rides through as a 7th positional arg and the
+            // VM throw intercept seeds the exception from its keys (explicit
+            // positional attrs still win). Empty string when absent.
+            get_arg("attributecollection"),
         ]
     }
 

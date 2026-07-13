@@ -559,6 +559,25 @@ Debug at the call site: `getController() isNull=true`, `variables.controller` ex
 - Impact: blocks rendering ColdBox admin UIs whose view helpers call the Renderer's
   implicit accessors. (Preside boot + admin login/session work as of v0.430–v0.433.)
 
+## 20. `binary.equals(other)` compares by value, not Java reference identity 🌟 *(divergence)*
+
+On Lucee/ACF a binary value is a Java `byte[]`, so `.equals()` is `java.lang.Object`
+**reference identity**: two independently-created binaries with identical bytes compare
+`false`, and only the *same* array object compares `true`. Consumers rely on this
+transitively — a CFC that stores a binary and returns it later hands back the *same*
+reference, so `stored.equals(returned)` is `true`.
+
+RustCFML has no JVM and clones `CfmlValue`s freely, so a binary cannot preserve a stable
+"reference" through a set/get round-trip. `binary.equals(other)` therefore compares **by
+value** (byte-for-byte). This produces the same answer as Lucee for the case consumers
+actually depend on (`stored.equals(returned)` → `true`), and only diverges for two
+separately-constructed-but-equal binaries: Lucee returns `false`, RustCFML returns `true`
+(the intuitive answer). TestBox's `Assertion.equalize()` falls through to `.equals()` for
+binary values, so this is what lets binary `expect().toBe()` assertions pass (e.g. Taffy's
+`BaseSerializerSpec` / `ResponseHandlingSpec`). The bare `eq` operator on two binaries
+still differs too — Lucee throws "can't compare complex object types"; RustCFML currently
+returns `false` — but no exercised consumer depends on that edge.
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*

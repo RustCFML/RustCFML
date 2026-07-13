@@ -15200,6 +15200,22 @@ impl CfmlVirtualMachine {
                     };
                     let object_supplied = matches!(args.get(5), Some(CfmlValue::Struct(_)));
 
+                    // `attributeCollection` (positional slot 6, from
+                    // `throw(attributecollection=s)` / `cfthrow(...)`): seed the
+                    // exception from the struct's keys BEFORE the positional attrs
+                    // below, so an explicitly-supplied positional attr still wins
+                    // (Lucee's "explicit attribute overrides the collection").
+                    // Taffy's Factory raises `cfthrow(attributecollection={type,
+                    // message})` — without this the type/message were dropped and
+                    // the throw surfaced as a bare "Application" error.
+                    if let Some(CfmlValue::Struct(coll)) = args.get(6) {
+                        for (k, v) in coll.snapshot().into_iter() {
+                            if !exception.keys().any(|ek| ek.eq_ignore_ascii_case(&k)) {
+                                exception.insert(k, v);
+                            }
+                        }
+                    }
+
                     // Helper: set `key` from the positional arg when it was supplied,
                     // otherwise keep whatever the object already had (or the default).
                     let apply = |exc: &mut ValueMap, key: &str, arg: Option<&CfmlValue>, default: &str| {
@@ -19745,6 +19761,23 @@ impl CfmlVirtualMachine {
                     // Uppercase column names, matching Lucee/ACF columnList.
                     return Ok(CfmlValue::string(q.column_list()));
                 }
+                "getcolumnlist" => {
+                    // Lucee query member `getColumnList(boolean upperCase)`:
+                    //   getColumnList(true)  → "ID,NAME,EMAIL" (upper, == columnList)
+                    //   getColumnList(false) → "id,Name,Email" (original case)
+                    // Lucee's no-arg form throws; we default leniently to upper
+                    // (a harmless superset). Taffy's `qToArray`/`qToStruct` call
+                    // `getColumnList(false)` on the Lucee branch — without this it
+                    // returned "", so every query→struct/array conversion produced
+                    // empty structs (ResourceSpec `row.id`/`row.name` undefined).
+                    let upper = extra_args.first().map(|v| v.is_true()).unwrap_or(true);
+                    let list = if upper {
+                        q.column_list()
+                    } else {
+                        q.columns().join(",")
+                    };
+                    return Ok(CfmlValue::string(list));
+                }
                 "addrow" => Some("queryAddRow"),
                 "getrow" => Some("queryGetRow"),
                 "each" => {
@@ -19914,6 +19947,26 @@ impl CfmlVirtualMachine {
                 "ceiling" | "ceil" => Some("ceiling"),
                 "floor" => Some("floor"),
                 "round" => Some("round"),
+                _ => None,
+            },
+            // `binary.equals(other)` — Lucee exposes java.lang.Object.equals on a
+            // byte[]. On Lucee that is REFERENCE identity (two separate toBinary()
+            // of the same bytes compare false); RustCFML clones CfmlValues, so
+            // reference identity can't be preserved through a set/get round-trip —
+            // we compare by VALUE instead. That still passes every consumer that
+            // relies on Lucee's `getFileData().equals(stored)` returning true
+            // (TestBox's `equalize` falls through to `.equals()` for binary — see
+            // Taffy BaseSerializerSpec/ResponseHandlingSpec), and only diverges for
+            // the separate-but-equal case, where value equality is the intuitive
+            // answer. Documented in docs/known-issues.md.
+            CfmlValue::Binary(bytes) => match method_lower.as_str() {
+                "equals" => {
+                    let eq = matches!(
+                        extra_args.first(),
+                        Some(CfmlValue::Binary(other)) if other == bytes
+                    );
+                    return Ok(CfmlValue::Bool(eq));
+                }
                 _ => None,
             },
             // Lucee's TimeSpan exposes accessor methods on the value itself.
