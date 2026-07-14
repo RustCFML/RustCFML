@@ -655,6 +655,7 @@ include "harness.cfm";
 <!--- bare `component = x` (and the `component` attribute of cfinvoke) failed to --->
 <!--- PARSE. Now soft; genuine declarations still parse. --->
 <cf_runtest file="core/test_component_soft_keyword.cfm">
+<cf_runtest file="core/test_abort_soft_keyword.cfm">
 <!--- - cfinvoke_statement: `invoke` as a CFScript statement (attributes + optional --->
 <!--- invokeargument block) is now compiled to __cfinvoke(...). RustCFML previously --->
 <!--- only supported the <cfinvoke> tag and the invoke(...) call forms. (RustCFML --->

@@ -1380,8 +1380,29 @@ impl Parser {
             }
         }
 
-        // Handle 'abort' keyword as __cfabort() call
-        if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "abort") {
+        // Handle 'abort' keyword as __cfabort() call.
+        // `abort` is a SOFT keyword: it may also be used as an ordinary
+        // identifier (variable name, member/index target, or function call).
+        // Only treat it as the abort statement when the following token does
+        // NOT make it an identifier usage — otherwise `abort = "x"`,
+        // `abort.y`, `abort[1]`, `abort(...)` would be silently swallowed as
+        // an abort. (Masa CMS's setup cleanIni() uses a local `var abort`.)
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "abort")
+            && !matches!(
+                self.peek(1),
+                Token::Equal
+                    | Token::PlusEqual
+                    | Token::MinusEqual
+                    | Token::StarEqual
+                    | Token::SlashEqual
+                    | Token::AmpEqual
+                    | Token::PercentEqual
+                    | Token::Dot
+                    | Token::QuestionDot
+                    | Token::LBracket
+                    | Token::LParen
+            )
+        {
             self.advance(); // consume 'abort'
             self.match_token(&Token::Semicolon);
             // Build a function call expression to __cfabort()
