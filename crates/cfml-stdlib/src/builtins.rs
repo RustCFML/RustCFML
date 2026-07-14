@@ -3914,6 +3914,20 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 let s = value.as_string();
                 Ok(CfmlValue::Bool(GUID_REGEX.is_match(&s)))
             }
+            "variablename" => {
+                // A legal CFML variable identifier: a letter/underscore start
+                // followed by letters/digits/underscores. Mura/Masa's
+                // onApplicationStart setup-detection gates on
+                // `isValid('variableName', application.setupSubmitButton)`; without
+                // this the type fell through to `false`, flipping setupComplete to
+                // true on a fresh DB and skipping the setup wizard (which Lucee
+                // shows) — booting straight into an unbuilt schema instead.
+                let s = value.as_string();
+                let mut chars = s.chars();
+                let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                Ok(CfmlValue::Bool(ok))
+            }
             "range" => {
                 // isValid("range", value, min, max)
                 if args.len() >= 4 {

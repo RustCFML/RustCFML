@@ -249,5 +249,17 @@ assertTrue("isValid json object", isValid("json", '{"a":1}'));
 assertTrue("isValid json array", isValid("json", '[1,2,3]'));
 assertFalse("isValid json bad", isValid("json", "{a:}"));
 
+// variableName — a legal CFML identifier. Mura/Masa's onApplicationStart
+// setup-detection gates on isValid('variableName', <hash-derived name>); the
+// type was unhandled (always false), which flipped setupComplete=true on a
+// fresh DB and skipped the install/setup wizard.
+assertTrue("isValid variableName letter+digits", isValid("variableName", "A1BEC879A4355A121A18091572D0245E9"));
+assertTrue("isValid variableName simple", isValid("variableName", "abc"));
+assertTrue("isValid variableName underscore", isValid("variableName", "my_var2"));
+assertTrue("isValid variableName leading underscore", isValid("variableName", "_x"));
+assertFalse("isValid variableName leading digit", isValid("variableName", "1abc"));
+assertFalse("isValid variableName dotted", isValid("variableName", "a.b"));
+assertFalse("isValid variableName empty", isValid("variableName", ""));
+
 suiteEnd();
 </cfscript>
