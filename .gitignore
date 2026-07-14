@@ -39,6 +39,11 @@ whitebackground.png
 /PERFORMANCE_TUNING.md
 /REFERENCE_SEMANTICS_PLAN.md
 /moopareview.md
+# Preside working/handoff notes — keep untracked (kept re-appearing in the repo)
+/PRESIDE_BOOT_NEXT_STEPS.md
+/PresideTestCompatibility.md
+/PRESIDE_BOOT_JAVA_NOOPS.md
+/PRESIDE_CFCONCURRENT_PLAN.md
 # WebSocket plan/design are working docs (user-facing docs/websockets.md IS tracked)
 /docs/websocket-design.md
 /docs/websocket-implementation-plan.md
