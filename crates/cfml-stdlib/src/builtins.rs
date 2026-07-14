@@ -748,6 +748,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("setLocale".into(), fn_set_locale);
     f.insert("getLocale".into(), fn_get_locale);
     f.insert("setTimeZone".into(), fn_set_time_zone);
+    f.insert("setEncoding".into(), fn_set_encoding);
 
     // ---- Locale (ls*) functions ----
     f.insert("lsDateFormat".into(), fn_ls_date_format);
@@ -15033,6 +15034,12 @@ fn fn_set_time_zone(_args: Vec<CfmlValue>) -> CfmlResult {
     // VM-intercepted (needs VM state to set the request timezone). This stub is
     // only reached if the intercept is bypassed.
     Err(CfmlError::runtime("setTimeZone() requires VM context".to_string()))
+}
+
+fn fn_set_encoding(_args: Vec<CfmlValue>) -> CfmlResult {
+    // VM-intercepted (mutates the url/form scope structs in globals). This stub
+    // is only reached if the intercept is bypassed — return void like the BIF.
+    Ok(CfmlValue::Null)
 }
 
 fn fn_get_time_zone_info(_args: Vec<CfmlValue>) -> CfmlResult {

@@ -10648,6 +10648,7 @@ impl CfmlVirtualMachine {
                 | "dateconvert"
                 | "expandpath"
                 | "isdefined"
+                | "setencoding"
                 | "__cfparam"
                 | "queryexecute"
                 | "cfdbinfo"
@@ -12312,6 +12313,41 @@ impl CfmlVirtualMachine {
                     let var_name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     let defined = self.is_variable_defined(&var_name, parent_locals);
                     return Ok(CfmlValue::Bool(defined));
+                }
+                "setencoding" => {
+                    // setEncoding(scopeName, charset) — Lucee/ACF: set the charset
+                    // used to read the URL or FORM scope. RustCFML decodes request
+                    // data as UTF-8, so the scope values are already UTF-8 strings.
+                    // Re-decode each value FAITHFULLY: reinterpret its bytes under
+                    // the requested charset (identity for utf-8; byte→codepoint for
+                    // latin1/windows-1252). Mura/Masa call
+                    // setEncoding("url","utf-8")/setEncoding("form","utf-8") in
+                    // onRequestStart. Void return, like the BIF.
+                    let scope = args.get(0).map(|v| v.as_string()).unwrap_or_default().to_lowercase();
+                    let charset = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                    // Normalise charset id (strip separators/case): utf-8 → utf8.
+                    let cs: String = charset
+                        .to_lowercase()
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect();
+                    // Only URL and FORM are settable per the BIF contract.
+                    if scope == "url" || scope == "form" {
+                        // The scope is a nested struct in globals (web scopes live
+                        // there). Re-decode its string leaves in place.
+                        if let Some(CfmlValue::Struct(s)) = self.globals.get(&scope).cloned() {
+                            let keys: Vec<String> = s.with_read(|m| m.keys().cloned().collect());
+                            for k in keys {
+                                if let Some(CfmlValue::String(v)) = s.get_ci(&k) {
+                                    let redecoded = Self::redecode_charset(v.as_str(), &cs);
+                                    if redecoded.as_str() != v.as_str() {
+                                        s.insert(k, CfmlValue::string(redecoded));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(CfmlValue::Null);
                 }
                 "__cfparam" => {
                     // Runtime fallback for `param name="<dynamic>" default=<v>`
@@ -24687,6 +24723,25 @@ impl CfmlVirtualMachine {
     /// definition is synthesised straight to a connection URL. A plain string
     /// (name or connection string) passes through. Without this a struct value
     /// was stringified — `{name: masa, …}` — and no datasource ever matched.
+    /// Re-decode a UTF-8 string's bytes under another charset, for `setEncoding`.
+    /// `cs` is the charset id already normalised to lowercase-alphanumerics
+    /// (e.g. "utf-8" → "utf8"). RustCFML decodes request data as UTF-8, so the
+    /// scope values are UTF-8 strings; this reinterprets their bytes under the
+    /// requested charset. UTF-8 is identity; single-byte Latin charsets map each
+    /// byte to a codepoint (the standard re-decode); unknown charsets pass through.
+    fn redecode_charset(s: &str, cs: &str) -> String {
+        match cs {
+            "utf8" | "utf" | "" => s.to_string(),
+            "iso88591" | "latin1" | "88591" | "l1" | "cp1252" | "windows1252" | "8859"
+            | "iso885915" | "latin9" => s.bytes().map(|b| b as char).collect(),
+            "usascii" | "ascii" | "usascii7" => s
+                .bytes()
+                .map(|b| if b < 128 { b as char } else { '?' })
+                .collect(),
+            _ => s.to_string(),
+        }
+    }
+
     fn datasource_arg_to_name(val: &CfmlValue) -> String {
         match val {
             CfmlValue::Struct(s) => {
