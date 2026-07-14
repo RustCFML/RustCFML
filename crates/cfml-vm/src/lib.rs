@@ -25300,6 +25300,50 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // The component's methods must ALSO be visible in its `variables` scope,
+        // not only as keys on `this`/the component struct. In a normal component
+        // a method's own `variables` scope contains its sibling methods, so
+        // `isDefined("someMethod")` and `variables.someMethod` resolve. The
+        // Application.cfc load path above builds `__variables` from data
+        // variables only (functions are filtered out), so include-attached
+        // lifecycle handlers like onApplicationStart were reachable via lifecycle
+        // dispatch (a key on the struct) but INVISIBLE to
+        // `isDefined("onApplicationStart")` — the exact guard Mura/Masa use in
+        // onRequestStart to decide whether to run onApplicationStart / render the
+        // setup wizard. Lucee returns true there; without this RustCFML returned
+        // false and silently skipped the whole init+setup block, falling through
+        // to the un-built managers. Copy every function on the component struct
+        // into __variables (component methods carry no captured_scope, so no Arc
+        // cycle), creating __variables if the data-variable pass didn't.
+        if let Some(app_struct) = template.as_cfml_struct() {
+            let methods: Vec<(String, CfmlValue)> = app_struct.with_read(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+                            Some((k.clone(), v.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            if !methods.is_empty() {
+                if app_struct.get("__variables").is_none() {
+                    app_struct
+                        .insert("__variables".to_string(), CfmlValue::strukt(ValueMap::default()));
+                }
+                if let Some(vars_val) = app_struct.get("__variables") {
+                    if let Some(vars) = vars_val.as_cfml_struct() {
+                        for (k, v) in methods {
+                            if vars.get_ci(&k).is_none() {
+                                vars.insert(k, v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Extract and install mappings early so resolve_inheritance can find parent classes
         let (_, _, mut early_mappings, _, _, _, _, _, _) = Self::extract_app_config(&template);
         let app_cfc_dir = std::path::Path::new(path)

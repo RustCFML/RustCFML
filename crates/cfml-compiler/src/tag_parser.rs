@@ -348,16 +348,21 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
             }
             let text: String = chars[start..i].iter().collect();
             // Structural gap suppression: whitespace between </cfcatch> (or the
-            // try body) and <cffinally> would otherwise be emitted as
-            // __writeText(...) right at the `} finally {` junction, producing
-            // "} __writeText(...); finally {" which is a parse error. CFML
-            // treats this inter-tag whitespace as structural, not output, so
-            // drop a whitespace-only node when the next tag is <cffinally>.
-            let next_is_cffinally = i + 10 <= len && {
+            // try body) and <cffinally>/<cfcatch> would otherwise be emitted as
+            // __writeText(...) right at the `} finally {` / `} catch {` junction,
+            // producing "} __writeText(...); finally {" or "} __writeText(...);
+            // catch {" — a parse error, because a statement can't sit between a
+            // try/catch and its following catch/finally clause (the clause is
+            // orphaned: "Expected RParen, found Identifier cfcatch"). CFML treats
+            // this inter-tag whitespace as structural, not output, so drop a
+            // whitespace-only node when the next tag is <cffinally> or <cfcatch>.
+            // (Masa CMS core/setup/inc/_process.cfm chains two <cfcatch> blocks.)
+            let next_is_catch_junction = {
                 let peek: String = chars[i..std::cmp::min(i + 10, len)].iter().collect();
-                peek.to_lowercase().starts_with("<cffinally")
+                let peek = peek.to_lowercase();
+                peek.starts_with("<cffinally") || peek.starts_with("<cfcatch")
             };
-            if next_is_cffinally && text.trim().is_empty() {
+            if next_is_catch_junction && text.trim().is_empty() {
                 // suppress
             } else if !text.is_empty() {
                 // Output ALL text including whitespace-only nodes.
@@ -825,7 +830,33 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfcatch" => {
             let catch_type = attrs.get("type").cloned().unwrap_or("any".to_string());
-            (format!("}} catch ({} cfcatch) {{\n", catch_type), tag_end - start)
+            // A `<cfcatch>` opens `catch (T cfcatch) {`, but the preceding block
+            // must be closed first. For the FIRST catch that block is the `try {`
+            // body, so we emit the leading `}`. For a CHAINED catch (multiple
+            // `<cfcatch>` on one `<cftry>`, e.g. `type="database"` then
+            // `type="any"`) the preceding `</cfcatch>` already emitted its own
+            // closing `}`, so a leading `}` here would DOUBLE-close and orphan the
+            // `catch` (parser: "Expected RParen, found Identifier cfcatch").
+            // Mirror the `<cffinally>` look-back: scan back over whitespace for a
+            // preceding `</cfcatch>` and drop the leading brace in that case.
+            // (Masa CMS core/setup/inc/_process.cfm has a two-catch try.)
+            let mut j = start;
+            while j > 0 && chars[j - 1].is_whitespace() {
+                j -= 1;
+            }
+            let preceded_by_catch = j > 0 && chars[j - 1] == '>' && {
+                let mut k = j - 1;
+                while k > 0 && chars[k - 1] != '<' {
+                    k -= 1;
+                }
+                let tag: String = chars[k.saturating_sub(1)..j]
+                    .iter()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                tag.eq_ignore_ascii_case("</cfcatch>")
+            };
+            let prefix = if preceded_by_catch { "" } else { "}\n" };
+            (format!("{}catch ({} cfcatch) {{\n", prefix, catch_type), tag_end - start)
         }
         "cfabort" => {
             // `<cfabort showError="msg">` raises a CATCHABLE error that is routed

@@ -108,6 +108,41 @@ assert("`new` passed as a call argument", takesTwo(new, "second"), "first|second
 // Masa formBuilderManager wrap expandPath calls that way inside a script block.
 scriptHashVal = #uCase("ok")#;
 assert("script-context hash-wrapped expression is stripped", scriptHashVal, "OK");
+</cfscript>
+
+<!--- 10. Multiple <cfcatch> clauses on one <cftry> --------------------------
+      A `<cftry>` with more than one `<cfcatch type="...">` (e.g. a typed catch
+      then a catch-all `type="any"`) must generate a valid catch chain. The
+      preprocessor previously double-closed the first catch body AND emitted the
+      inter-catch whitespace as a `__writeText(...)` statement between the
+      clauses, orphaning the second `catch` ("Expected RParen, found Identifier
+      cfcatch"). Also verify a stripped CFML comment sitting at the try/catch
+      junction doesn't reintroduce the gap. Masa core/setup/inc/_process.cfm
+      chains a `type="database"` catch and a `type="any"` catch. --->
+<cffunction name="multiCatch" output="false">
+    <cfargument name="doThrowDb">
+    <cftry>
+        <cfif arguments.doThrowDb>
+            <cfthrow type="database" message="db boom">
+        <cfelse>
+            <cfset var z = 1 / 0>
+        </cfif>
+        <cfset var r = "no-error">
+        <!--- a comment between the try body and the first catch --->
+        <cfcatch type="database">
+            <cfset r = "db:" & cfcatch.message>
+        </cfcatch>
+        <cfcatch type="any">
+            <cfset r = "any:" & cfcatch.message>
+        </cfcatch>
+    </cftry>
+    <cfreturn r>
+</cffunction>
+
+<cfscript>
+assert("multi-catch routes a typed error to its typed clause", multiCatch(true), "db:db boom");
+assert("multi-catch falls through to the catch-all clause",
+    left(multiCatch(false), 4), "any:");
 
 suiteEnd();
 </cfscript>
