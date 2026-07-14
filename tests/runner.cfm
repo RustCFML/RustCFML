@@ -143,6 +143,7 @@ include "harness.cfm";
 <!--- assertions, does NOT abort the run. --->
 <cf_runtest file="core/test_this_dot_call_detaches_writes.cfm">
 <cf_runtest file="core/test_server_scope.cfm">
+<cf_runtest file="core/test_scope_writeback_masa_fixes.cfm">
 <cf_runtest file="core/test_pagecontext_request_response.cfm">
 <cf_runtest file="core/test_localmode.cfm">
 <cf_runtest file="core/test_error_context.cfm">

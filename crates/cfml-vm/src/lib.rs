@@ -12340,14 +12340,65 @@ impl CfmlVirtualMachine {
                     if key.is_empty() {
                         return Ok(CfmlValue::Null);
                     }
-                    // Only support a flat key (no further '.' or brackets) at
-                    // runtime. Nested-path mutation through caller locals is
-                    // the parser's job.
-                    if key.contains('.') || key.contains('[') {
+                    // A DOTTED nested key (`application.objectMappings.<x>.synthedFunctions`)
+                    // walks/creates the intermediate structs and sets only the
+                    // missing leaf — Lucee/ACF `param` semantics. Mura/Masa's
+                    // bean.cfc params dozens of these during entity registration.
+                    // Bracket paths are still not lowered at runtime (rare).
+                    if key.contains('[') {
                         return Err(CfmlError::runtime(format!(
-                            "param: dynamic name '{}' addresses a nested path that cannot be assigned at runtime",
+                            "param: dynamic name '{}' addresses a bracket path that cannot be assigned at runtime",
                             var_name
                         )));
+                    }
+                    if key.contains('.') {
+                        // Navigate `root` through all-but-last segments (creating
+                        // intermediate structs, reusing existing ones), then set
+                        // the leaf only if absent.
+                        fn ensure_nested(root: &CfmlStruct, segs: &[&str], default: CfmlValue) {
+                            let mut cur = root.clone();
+                            for seg in &segs[..segs.len() - 1] {
+                                cur = cur.get_or_insert_struct(seg);
+                            }
+                            let leaf = segs[segs.len() - 1];
+                            if cur.get_ci(leaf).is_none() {
+                                cur.insert(leaf.to_string(), default);
+                            }
+                        }
+                        let segs: Vec<&str> = key.split('.').collect();
+                        match scope {
+                            "application" => {
+                                if let Some(ref app) = self.application_scope {
+                                    ensure_nested(app, &segs, default_val);
+                                }
+                            }
+                            "request" => ensure_nested(&self.request_scope, &segs, default_val),
+                            "variables" => {
+                                // `globals` is a flat ValueMap; ensure the first
+                                // segment is a struct, then descend into it.
+                                let first = segs[0];
+                                let root = match self.globals.get(first) {
+                                    Some(CfmlValue::Struct(s)) => s.clone(),
+                                    _ => {
+                                        let s = CfmlStruct::empty();
+                                        self.globals
+                                            .insert(first.to_string(), CfmlValue::Struct(s.clone()));
+                                        s
+                                    }
+                                };
+                                ensure_nested(&root, &segs[1..], default_val);
+                            }
+                            // Session storage is indirected through
+                            // set_session_variable; nested session params are
+                            // vanishingly rare, so leave them unlowered.
+                            _ => {
+                                return Err(CfmlError::runtime(format!(
+                                    "param: dynamic name '{}' addresses a nested path that cannot be assigned at runtime",
+                                    var_name
+                                )));
+                            }
+                        }
+                        return Ok(CfmlValue::Null);
                     }
                     match scope {
                         "variables" => {
@@ -16919,8 +16970,13 @@ impl CfmlVirtualMachine {
             // `arguments.x = …` round-trip doesn't fork a literal "arguments"
             // key, which belongs to a user `local.arguments` var).
             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
-        } else if locals.contains_key(name) {
-            locals.insert(name.to_string(), val);
+        } else if let Some(existing) = imap_key_ci(locals, name) {
+            // Update the EXISTING frame-local case-insensitively (CFML idents are
+            // case-insensitive). Storing under `name`'s own casing forked a second
+            // key — e.g. `cfdbinfo name="rsCheck"` result-writeback into a frame
+            // that declared `var rscheck` created a stray `rsCheck` while the
+            // `var rscheck` stayed empty (Mura/Masa dbUtility.version()).
+            locals.insert(existing, val);
         } else if !modern
             && locals.contains_key("__variables")
             && !matches!(name_lower.as_str(), "cfcatch" | "cookie" | "server" | "attributes")
@@ -26718,6 +26774,16 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// anything was removed. Direct-case first (the common path), then a scan —
 /// mirrors `CfmlStruct::remove_ci` for the plain-`IndexMap` scopes (locals/
 /// globals) used by CFML null-assignment deletion.
+/// Return the actual (case-preserving) key in `m` that matches `key`
+/// case-insensitively, if any. CFML identifiers are case-insensitive, so a
+/// store/lookup for `rsCheck` must find an existing `rscheck`.
+fn imap_key_ci(m: &ValueMap, key: &str) -> Option<String> {
+    if m.contains_key(key) {
+        return Some(key.to_string());
+    }
+    m.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned()
+}
+
 fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
     if m.shift_remove(key).is_some() {
         return true;
