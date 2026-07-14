@@ -686,7 +686,51 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             ("} else {\n".to_string(), tag_end - start)
         }
         "cfloop" => {
-            parse_cfloop_tag(&attrs, tag_end - start)
+            // A `<cfloop query="q">` with no index/item binding needs its whole
+            // body captured (not just the opener) so the query variable can be
+            // RESTORED after the loop. The loop reassigns `q` to the current row
+            // each iteration (so `q.col` and the pseudo-columns work); without a
+            // restore, `q` is left as the last row struct, which corrupts a
+            // re-entrant/nested loop over the same variable (`for (row in <row
+            // struct>)` iterates keys → non-struct rows). Other cfloop forms keep
+            // the lightweight opener-only path (`</cfloop>` emits the closing `}`).
+            let is_query_row_loop = attrs.contains_key("query")
+                && !attrs.contains_key("index")
+                && !attrs.contains_key("item");
+            if is_query_row_loop {
+                let query = strip_hashes(attrs.get("query").unwrap());
+                let (body, consumed) = if let Some(end_tag_pos) =
+                    find_closing_tag(chars, tag_end, len, "cfloop")
+                {
+                    let body: String = chars[tag_end..end_tag_pos].iter().collect();
+                    let close_end = find_tag_end(chars, end_tag_pos, len);
+                    (body, close_end - start)
+                } else {
+                    let body: String = chars[tag_end..len].iter().collect();
+                    (body, len - start)
+                };
+                let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
+                let q = format!("__cfloopq_q_{}", start);
+                let rc = format!("__cfloopq_rc_{}", start);
+                let cl = format!("__cfloopq_cl_{}", start);
+                let i = format!("__cfloopq_i_{}", start);
+                let row = format!("__cfloopq_row_{}", start);
+                (
+                    format!(
+                        "var {q} = {query};\nvar {rc} = {q}.recordcount;\nvar {cl} = {q}.columnlist;\nvar {i} = 0;\nfor (var {row} in {q}) {{\n{i} = {i} + 1;\n{row}.currentRow = {i};\n{row}.recordCount = {rc};\n{row}.columnList = {cl};\n{query} = {row};\n{body}\n}}\n{query} = {q};\n",
+                        q = q,
+                        rc = rc,
+                        cl = cl,
+                        i = i,
+                        row = row,
+                        query = query,
+                        body = body_script,
+                    ),
+                    consumed,
+                )
+            } else {
+                parse_cfloop_tag(&attrs, tag_end - start)
+            }
         }
         "cfscript" => {
             // Everything between <cfscript> and </cfscript> is raw script
@@ -3065,8 +3109,11 @@ fn parse_cfloop_tag(
                 consumed,
             )
         } else {
-            // <cfloop query="q"> without index — CFML query row loop
-            // q.column resolves to the current row's column value
+            // <cfloop query="q"> without index — CFML query row loop. NOTE: the
+            // real handling (body capture + query-var restore + currentRow/
+            // recordCount/columnList pseudo-columns) lives in the `"cfloop"` arm
+            // of `parse_cf_tag`, which intercepts this shape before we get here.
+            // This branch is a defensive fallback only (e.g. a direct caller).
             (
                 format!("for (var __qrow in {}) {{ {} = __qrow;\n", query, query),
                 consumed,
