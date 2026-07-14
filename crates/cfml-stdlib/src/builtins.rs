@@ -9056,7 +9056,29 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     let (sanitized, ssl) = mysql_extract_ssl(url);
     let opts = mysql::Opts::from_url(&sanitized)
         .map_err(|e| CfmlError::database(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
-    let builder = mysql::OptsBuilder::from_opts(opts).ssl_opts(ssl);
+    // Two mysql-crate pool defaults break scripts that span multiple statements sharing
+    // session/user state — which JDBC (and therefore Lucee/ACF) support because pooled
+    // connections retain their session state:
+    //   1. `reset_connection = true` fires COM_RESET_CONNECTION on return-to-pool, wiping all
+    //      session/user variables.
+    //   2. `pool_min = 10` eagerly opens ten connections and hands them out FIFO, so a serial
+    //      workload round-robins across ten distinct physical connections — a user variable set
+    //      by one statement is absent on the connection the next statement lands on.
+    // Masa CMS's `core/setup/db/mysql.sql` (a mysqldump-style script Masa splits and runs one
+    // statement per cfquery) relies on exactly this: it opens with
+    // `SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'` and later restores with
+    // `SET SQL_MODE=@OLD_SQL_MODE`. With the defaults, `@OLD_SQL_MODE` is NULL by the time the
+    // restore runs, and MariaDB rejects `SET sql_mode = NULL` (ERROR 1231). Disabling reset and
+    // pinning min to 1 keeps a serial workload on one connection with its user vars intact,
+    // matching the reference engines (and avoiding the wasteful eager 10-connection burst).
+    let constraints =
+        mysql::PoolConstraints::new(1, 100).unwrap_or(mysql::PoolConstraints::DEFAULT);
+    let pool_opts = mysql::PoolOpts::default()
+        .with_reset_connection(false)
+        .with_constraints(constraints);
+    let builder = mysql::OptsBuilder::from_opts(opts)
+        .ssl_opts(ssl)
+        .pool_opts(pool_opts);
     let pool = mysql::Pool::new(builder)
         .map_err(|e| CfmlError::database(format!("queryExecute: MySQL pool creation error: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
