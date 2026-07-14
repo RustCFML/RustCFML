@@ -7,10 +7,14 @@ assertTrue("server.coldfusion.productversion is non-empty", len(server.coldfusio
 assertTrue("server.coldfusion.productlevel exists", structKeyExists(server.coldfusion, "productlevel"));
 
 // --- server.lucee (engine-detection shim: frameworks like Wheels/ColdBox/
-// Preside sniff server.lucee.version to identify a Lucee-dialect engine) ---
+// Preside sniff server.lucee.version to identify a Lucee-dialect engine).
+// Detection keys on the *existence* of `server.lucee`, not a numeric version —
+// so `server.lucee.version` carries the real RustCFML version (its natural
+// home, the slot Lucee uses for its own version). ACF-minimum-version gates are
+// satisfied instead by the emulated `server.coldfusion.productversion`. ---
 assertTrue("server.lucee exists", structKeyExists(server, "lucee"));
-assertTrue("server.lucee.version is non-empty", len(server.lucee.version) GT 0);
-assertTrue("server.lucee.version major >= 5", listFirst(server.lucee.version, ".") GTE 5);
+assertTrue("server.lucee.version is non-empty (carries the RustCFML version)", len(server.lucee.version) GT 0);
+assert("server.lucee.versionName identifies RustCFML", server.lucee.versionName, "RustCFML");
 
 // --- server.railo (Lucee's back-compat alias for server.lucee; Preside's
 // Lucee error template reads server.railo.version) ---

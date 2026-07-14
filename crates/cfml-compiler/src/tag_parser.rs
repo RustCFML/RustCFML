@@ -164,13 +164,27 @@ pub fn has_cfml_tags(source: &str) -> bool {
             && b[i + 3] == b'-'
             && b[i + 4] == b'-'
         {
+            // CFML comments nest — track depth so an inner `<!--- … --->` does
+            // not end the outer comment early (which could expose a commented-out
+            // `<cf…>` and wrongly force tag mode).
             i += 5;
-            while i + 3 < n {
-                if b[i] == b'-' && b[i + 1] == b'-' && b[i + 2] == b'-' && b[i + 3] == b'>' {
-                    i += 4;
-                    break;
+            let mut depth = 1usize;
+            while i < n && depth > 0 {
+                if i + 4 < n
+                    && b[i] == b'<'
+                    && b[i + 1] == b'!'
+                    && b[i + 2] == b'-'
+                    && b[i + 3] == b'-'
+                    && b[i + 4] == b'-'
+                {
+                    depth += 1;
+                    i += 5;
+                } else if i + 2 < n && b[i] == b'-' && b[i + 1] == b'-' && b[i + 2] == b'>' {
+                    depth -= 1;
+                    i += 3;
+                } else {
+                    i += 1;
                 }
-                i += 1;
             }
             continue;
         }
@@ -247,16 +261,39 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
     while i < len {
         // Strip CFML comments: <!--- ... --->
         if i + 4 < len && chars[i] == '<' && chars[i + 1] == '!' && chars[i + 2] == '-' && chars[i + 3] == '-' && chars[i + 4] == '-' {
-            // Find closing --->
+            // Find the closing `--->`. CFML comments NEST (unlike HTML): the
+            // comment `<!--- a <!--- b ---> c --->` is a SINGLE comment. Track
+            // depth so an inner `<!--- … --->` doesn't terminate the outer one
+            // early. Mura/Masa comment out whole `<cftry>/<cfcatch>` blocks that
+            // themselves contain `<!--- … --->` notes; a non-nesting scan ended
+            // the comment at the inner `--->` and left the tail (`</cftry>` etc.)
+            // as stray active code, corrupting the surrounding cflock/brace
+            // structure ("Expected RParen, found __lock_e").
             let mut j = i + 5;
-            while j + 2 < len {
-                if chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>' {
+            let mut depth = 1usize;
+            while j < len {
+                if j + 4 < len
+                    && chars[j] == '<'
+                    && chars[j + 1] == '!'
+                    && chars[j + 2] == '-'
+                    && chars[j + 3] == '-'
+                    && chars[j + 4] == '-'
+                {
+                    depth += 1;
+                    j += 5;
+                    continue;
+                }
+                if j + 2 < len && chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>' {
+                    depth -= 1;
                     j += 3;
-                    break;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
                 }
                 j += 1;
             }
-            if j + 2 >= len && !(j >= 3 && chars[j - 1] == '>' && chars[j - 2] == '-' && chars[j - 3] == '-') {
+            if depth > 0 {
                 j = len; // unclosed comment, skip to end
             }
             // Preserve the newlines that lived inside the comment so downstream
@@ -724,8 +761,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     }
                 })
             };
-            let var = attrs.get("var").cloned().unwrap_or("\"\"".to_string());
-            let var = strip_hashes(&var);
+            // `var` must go through the same attribute-value handling as the
+            // other attrs: a pure `#expr#` keeps the expression's native type,
+            // but a literal string that merely CONTAINS interpolation
+            // (`var="An error happened: #x#"`, as Mura/Masa's settingsBundleBean
+            // cfdump uses) must be emitted as a proper quoted/concatenated
+            // string. `strip_hashes` produced a bare unquoted `An error ... x`
+            // that failed to parse.
+            let var = attr_expr("var").unwrap_or_else(|| "\"\"".to_string());
             let mut call_args = format!("var={}", var);
             for key in ["label", "expand", "top"] {
                 if let Some(expr) = attr_expr(key) {
@@ -2514,6 +2557,26 @@ fn strip_hashes(s: &str) -> String {
     while i < len {
         let c = chars[i];
         if let Some(q) = string_quote {
+            // A `#...#` interpolation inside the string is EXPRESSION context:
+            // its contents (including nested quotes, e.g. `'#gv('a')#'`) must not
+            // be mistaken for the string's closing delimiter. Copy the whole
+            // interpolation across verbatim using the same string/paren-aware
+            // scanner the rest of the preprocessor uses. Without this, the first
+            // inner quote flipped `string_quote` off mid-string and the hashes
+            // were then mangled — producing an "unterminated '#'" from Mura/Masa
+            // expressions like `'#iif(a eq '',de('#x#'),de('#y# #z#'))#'`.
+            if c == '#' {
+                result.push(c);
+                if let Some(end) = find_closing_hash(&chars, i + 1, len) {
+                    for k in (i + 1)..=end {
+                        result.push(chars[k]);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
             // Inside a string literal — preserve everything, watch for the
             // closing quote (with `""`/`''` doubling treated as an escape).
             result.push(c);
@@ -3058,16 +3121,30 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfcase") {
                     let case_body: String = chars[tag_end..close_pos].iter().collect();
                     let case_script = tags_to_script_inner(&case_body, imports, in_cfoutput);
-                    // Value can be comma-separated for multiple case values
-                    let values: Vec<&str> = value.split(',').map(|v| v.trim()).filter(|v| !v.is_empty()).collect();
-                    let quoted_values: Vec<String> = values.iter().map(|v| {
-                        let v = strip_hashes(v);
-                        if v.parse::<f64>().is_ok() {
-                            v
-                        } else {
-                            format!("\"{}\"", escape_for_string_literal(&v))
-                        }
-                    }).collect();
+                    // Value can be comma-separated for multiple case values.
+                    // `<cfcase value="">` is legal and matches the empty string —
+                    // a SINGLE `case "":` value (Mura/Masa's setCookieLegacy uses
+                    // it). The empty-filter is only for skipping empties WITHIN a
+                    // comma list (e.g. `value="a,,b"`); when the whole value is
+                    // empty it must still emit one `""` case, not a valueless
+                    // `case :` that corrupts the switch and leaks a parse error.
+                    let quoted_values: Vec<String> = if value.trim().is_empty() {
+                        vec!["\"\"".to_string()]
+                    } else {
+                        value
+                            .split(',')
+                            .map(|v| v.trim())
+                            .filter(|v| !v.is_empty())
+                            .map(|v| {
+                                let v = strip_hashes(v);
+                                if v.parse::<f64>().is_ok() {
+                                    v
+                                } else {
+                                    format!("\"{}\"", escape_for_string_literal(&v))
+                                }
+                            })
+                            .collect()
+                    };
                     result.push_str(&format!("case {}: \n{}break;\n", quoted_values.join(", "), case_script));
                     let close_end = find_tag_end(&chars, close_pos, len);
                     i = close_end;
@@ -3497,9 +3574,14 @@ fn process_sql_hashes(sql: &str) -> String {
 
     while i < len {
         if chars[i] == '#' {
-            // Look for closing #
-            if let Some(end_offset) = chars[i + 1..].iter().position(|&c| c == '#') {
-                let end = i + 1 + end_offset;
+            // Look for the MATCHING closing `#`, skipping `#` that live inside
+            // nested string literals (and honouring paren depth). A naive
+            // "next `#`" scan split a nested interpolation like
+            // `#right("IX_#arguments.table#",30)#` at the inner `#`, extracting
+            // the malformed expression `right("IX_` and failing to parse — this
+            // is exactly what broke Mura/Masa's `dbCreateIndex` SQL. Reuse the
+            // same string-aware scanner the general interpolation path uses.
+            if let Some(end) = find_closing_hash(&chars, i + 1, len) {
                 // Flush current text
                 if !current_text.is_empty() {
                     parts.push(format!("\"{}\"", current_text.replace('"', "\"\"")));

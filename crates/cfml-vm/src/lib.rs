@@ -512,9 +512,17 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         "productname".to_string(),
         CfmlValue::string(product_name.to_string()),
     );
+    // Mirror Lucee's emulated-ACF version string (Lucee 7.0.4 reports
+    // "2016,0,03,300357"). Lucee deliberately reports an ACF-style version here
+    // so the ubiquitous minimum-ACF-version gates in CFML apps pass — e.g. Mura/
+    // Masa's onApplicationStart aborts with "requires Adobe Coldfusion 9.0.1 or
+    // greater" when `listFirst(server.coldfusion.productversion) < 9`. Reporting
+    // our own SemVer ("0.468.0") failed that gate. The real RustCFML version is
+    // still available via the CLI `--version` and the build metadata; app-facing
+    // engine detection uses `server.coldfusion.productname` / `server.lucee`.
     cf.insert(
         "productversion".to_string(),
-        CfmlValue::string(env!("CARGO_PKG_VERSION").to_string()),
+        CfmlValue::string("2016,0,03,300357".to_string()),
     );
     cf.insert(
         "productlevel".to_string(),
@@ -524,13 +532,13 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
 
     // Advertise Lucee compatibility. RustCFML targets the Lucee dialect, and
     // frameworks (Wheels, ColdBox, Preside, …) sniff the engine via
-    // `StructKeyExists(server, "lucee")` and branch on `server.lucee.version`.
-    // Without this they fall through to the Adobe ColdFusion branch and reject
-    // RustCFML on the version gate. We still self-identify as "RustCFML" through
-    // `server.coldfusion.productname` (which `isRustCFML()` keys on), so engine
-    // detection in our own test suite is unaffected. The reported version
-    // mirrors our cross-engine reference build (Lucee 7).
-    let lucee_version = "7.0.0.243".to_string();
+    // `StructKeyExists(server, "lucee")` — detection keys on the *existence* of
+    // this struct, not its numeric version. So `server.lucee.version` carries
+    // the real RustCFML version (its natural home — the slot Lucee uses for its
+    // own version number), while ACF-style minimum-version gates are satisfied
+    // by the emulated `server.coldfusion.productversion` above. `versionName`
+    // stays "RustCFML" for identity.
+    let lucee_version = env!("CARGO_PKG_VERSION").to_string();
     let mut lucee = ValueMap::default();
     lucee.insert("version".to_string(), CfmlValue::string(lucee_version.clone()));
     lucee.insert(
@@ -13812,7 +13820,7 @@ impl CfmlVirtualMachine {
                             let params = Self::extract_query_params(args.get(1));
                             match args.get(2) {
                                 Some(CfmlValue::Struct(opts)) => Some((
-                                    opts.get_ci("datasource").map(|v| v.as_string()).unwrap_or_default(),
+                                    opts.get_ci("datasource").map(|v| Self::datasource_arg_to_name(&v)).unwrap_or_default(),
                                     opts.get_ci("name").map(|v| v.as_string()).unwrap_or_default(),
                                     is_qoq,
                                     params,
@@ -13872,7 +13880,7 @@ impl CfmlVirtualMachine {
                             if let Some(txn_begin) = self.txn_begin {
                                 let ds = match args.get(2) {
                                     Some(CfmlValue::Struct(opts)) => {
-                                        opts.get_ci("datasource").map(|v| v.as_string())
+                                        opts.get_ci("datasource").map(|v| Self::datasource_arg_to_name(&v))
                                     }
                                     _ => None,
                                 }
@@ -14126,7 +14134,7 @@ impl CfmlVirtualMachine {
                         let current = attrs
                             .iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-                            .map(|(_, v)| v.as_string());
+                            .map(|(_, v)| Self::datasource_arg_to_name(v));
                         let new_url = match current {
                             Some(ref n) => self.resolve_app_datasource(n),
                             None => self.app_default_datasource.clone(),
@@ -24615,6 +24623,34 @@ impl CfmlVirtualMachine {
     /// stdlib pool layer by the caller (via the `__register_ds_timeout` builtin),
     /// keeping cfml-vm free of a hard dependency on cfml-stdlib (wasm targets
     /// build without it).
+    /// Extract the resolvable datasource identifier from a `datasource`
+    /// attribute value. Lucee accepts a struct as well as a string: either a
+    /// *reference* `{name, username, password}` (Mura/Masa pass this to every
+    /// `cfquery`/`cfdbinfo`) or an inline *definition* `{driver|type, host,
+    /// port, database, …}`. A reference resolves by its `name`; an inline
+    /// definition is synthesised straight to a connection URL. A plain string
+    /// (name or connection string) passes through. Without this a struct value
+    /// was stringified — `{name: masa, …}` — and no datasource ever matched.
+    fn datasource_arg_to_name(val: &CfmlValue) -> String {
+        match val {
+            CfmlValue::Struct(s) => {
+                if let Some(name) = s
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                    .map(|(_, v)| v.as_string())
+                    .filter(|n| !n.is_empty())
+                {
+                    return name;
+                }
+                if let Some((url, _)) = Self::datasource_value_to_url(val) {
+                    return url;
+                }
+                val.as_string()
+            }
+            _ => val.as_string(),
+        }
+    }
+
     fn datasource_value_to_url(val: &CfmlValue) -> Option<(String, u32)> {
         match val {
             CfmlValue::String(s) if !s.is_empty() => Some((s.to_string(), 0)),
@@ -24676,11 +24712,16 @@ impl CfmlVirtualMachine {
                 }
             }
         }
-        // `this.datasource` (singular) names the application's default datasource.
+        // `this.datasource` (singular) names the application's default
+        // datasource. Lucee accepts a struct here too — either a reference
+        // `{name, username, password}` (Mura/Masa set exactly this) or an inline
+        // definition — so extract the resolvable identifier rather than
+        // stringifying the struct (which produced a bogus "{name: masa, …}"
+        // default that no query could resolve).
         if let Some(name) = s
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v.as_string())
+            .map(|(_, v)| Self::datasource_arg_to_name(&v))
             .filter(|n| !n.is_empty())
         {
             // Resolve the named default through the per-app map; if it isn't a
@@ -24731,7 +24772,7 @@ impl CfmlVirtualMachine {
         let current = map
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v.as_string())
+            .map(|(_, v)| Self::datasource_arg_to_name(v))
             .filter(|s| !s.is_empty());
         let new_url = match current {
             Some(ref name) => self.resolve_app_datasource(name),
@@ -25039,6 +25080,76 @@ impl CfmlVirtualMachine {
         };
 
         // No func_idx fixup: the template's method values carry stable global_ids.
+
+        // Attach lifecycle methods that were defined via `include` in the
+        // Application.cfc body. Mura/Masa declare every lifecycle handler by
+        // `include "core/appcfc/onApplicationStart_method.cfm"` etc. inside the
+        // component body rather than writing the `function onApplicationStart(){}`
+        // inline. Include-defined functions are registered in `user_functions`
+        // (by name) + `fn_registry` (by global_id) but are NOT attached to the
+        // component struct — and `call_lifecycle_method_impl` looks the handler
+        // up as a key ON the struct, so without this the engine never fires
+        // onApplicationStart/onRequestStart/… and the app silently never boots.
+        // Only attach the standard lifecycle names, and only when the struct
+        // doesn't already carry the method (an inline declaration wins).
+        if let Some(app_struct) = template.as_cfml_struct() {
+            const LIFECYCLE_METHODS: &[&str] = &[
+                "onApplicationStart",
+                "onApplicationEnd",
+                "onSessionStart",
+                "onSessionEnd",
+                "onRequestStart",
+                "onRequest",
+                "onRequestEnd",
+                "onError",
+                "onMissingTemplate",
+                "onAbort",
+                "onCFCRequest",
+            ];
+            for name in LIFECYCLE_METHODS {
+                let already = app_struct.with_read(|m| {
+                    m.keys().any(|k| k.eq_ignore_ascii_case(name))
+                });
+                if already {
+                    continue;
+                }
+                let bf = match self
+                    .user_functions
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| Arc::clone(v))
+                {
+                    Some(bf) => bf,
+                    None => continue,
+                };
+                let cf = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+                    name: bf.name.clone(),
+                    params: bf
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, pname)| cfml_common::dynamic::CfmlParam {
+                            name: pname.clone(),
+                            param_type: bf.param_types.get(i).cloned().flatten(),
+                            default: None,
+                            required: bf.required_params.get(i).copied().unwrap_or(false),
+                            annotations: bf
+                                .param_annotations
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_default(),
+                        })
+                        .collect(),
+                    body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+                        CfmlValue::Int(bf.global_id as i64),
+                    )),
+                    return_type: bf.return_type.clone(),
+                    access: bf.access.clone(),
+                    captured_scope: None,
+                }));
+                app_struct.insert(bf.name.clone(), cf);
+            }
+        }
 
         // Store component body variables as __variables on the template
         // This makes variables.framework etc. accessible to component methods
