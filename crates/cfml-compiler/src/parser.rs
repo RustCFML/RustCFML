@@ -5785,6 +5785,16 @@ impl Parser {
         let token = self.advance().token.clone();
 
         match token {
+            // Lucee tolerates redundant `#expr#` around an expression in SCRIPT
+            // context and just strips the hashes (e.g. Mura/Masa's
+            // formBuilderManager `if(!directoryExists(#expandPath(...)# & "/x"))`
+            // written inside a <cfscript> block). Parse the inner expression and
+            // consume the matching closing `#`, returning the inner value.
+            Token::HashSign => {
+                let inner = self.parse_expression()?;
+                self.consume(&Token::HashSign)?;
+                Ok(inner)
+            }
             Token::True => Ok(Expression::Literal(Literal {
                 value: LiteralValue::Bool(true),
                 location: self.current_location(),
@@ -6068,8 +6078,43 @@ impl Parser {
                         name: "new".to_string(),
                         location: self.current_location(),
                     }))
+                } else if matches!(
+                    self.peek(0),
+                    Token::Comma
+                        | Token::RParen
+                        | Token::RBracket
+                        | Token::RBrace
+                        | Token::Semicolon
+                        | Token::Colon
+                        | Token::Eof
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Star
+                        | Token::Slash
+                        | Token::Percent
+                        | Token::Equal
+                        | Token::EqualEqual
+                        | Token::BangEqual
+                        | Token::Less
+                        | Token::Greater
+                        | Token::LessEqual
+                        | Token::GreaterEqual
+                        | Token::Amp
+                        | Token::AndKeyword
+                        | Token::OrKeyword
+                ) {
+                    // `new` is followed by a value-terminator or binary operator,
+                    // so it's a plain variable named `new` (Lucee/ACF allow this;
+                    // Mura/Masa's fileWriter does `var new = FileOpen(...);
+                    // FileWrite(new, x)`). Return it as an ordinary identifier.
+                    Ok(Expression::Identifier(Identifier {
+                        name: "new".to_string(),
+                        location: self.current_location(),
+                    }))
                 } else {
-                    // Fallback for non-identifier new (e.g. `new "#path#"()`).
+                    // Fallback for new with a non-Identifier class name — a
+                    // string (`new "#path#"()`) OR a reserved-word class name
+                    // that lexes as a keyword (`new Component()`, `new Query()`).
                     // Parse ONLY the class-name expression as a primary — NOT a
                     // full call — then consume the constructor `(args)` here. If
                     // we used parse_call, its postfix loop would swallow the

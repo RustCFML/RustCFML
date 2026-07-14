@@ -83,5 +83,31 @@ assert("server.lucee struct exists (engine detected as Lucee-compatible)",
 assertTrue("coldfusion.productversion passes a >=9 major-version gate",
     val(listFirst(server.coldfusion.productversion)) GTE 9);
 
+// --- 7. Leading-dot decimal literal (`.5`, `x*.000001`) --------------------
+// A `.<digit>` after an operator is a number literal, not Dot + Integer.
+// Mura/Masa utility.cfc: `NumberFormat(theSize*.000001, 9.99)`.
+assert("leading-dot decimal after * multiplies correctly", 5000000 * .000001, 5);
+assert("leading-dot decimal after + adds correctly", 5 + .5, 5.5);
+assert("standalone leading-dot decimal", .25, 0.25);
+q = {}; q["5"] = "col";
+assert("member access on a numeric key still works (not mis-lexed as number)",
+    structKeyExists(q, "5"), true);
+
+// --- 8. `new` as an ordinary variable name ---------------------------------
+// `new` is a soft keyword; used as a variable (followed by `,`/`)`/operator)
+// it's an identifier. Mura/Masa fileWriter: `var new = FileOpen(...);
+// FileWrite(new, x)`. `new Foo()` instantiation must still work.
+newVar = "a value";
+assert("`new` used as a variable resolves", newVar, "a value");
+function takesTwo(a, b) { return a & "|" & b; }
+new = "first";
+assert("`new` passed as a call argument", takesTwo(new, "second"), "first|second");
+
+// --- 9. Redundant hashes around an expression in script context ------------
+// Lucee strips hash delimiters wrapping an expression inside cfscript. Mura and
+// Masa formBuilderManager wrap expandPath calls that way inside a script block.
+scriptHashVal = #uCase("ok")#;
+assert("script-context hash-wrapped expression is stripped", scriptHashVal, "OK");
+
 suiteEnd();
 </cfscript>

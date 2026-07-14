@@ -71,6 +71,25 @@ impl Lexer {
         }
     }
 
+    /// True when the most recently emitted token is something a following `.`
+    /// would be member access on (an identifier, a closing `)`/`]`, or a
+    /// literal). Used to disambiguate `.5` (leading-dot number, e.g. `x * .5`)
+    /// from member access (`q.5`): only when the previous token is NOT one of
+    /// these do we treat `.<digit>` as a number literal.
+    fn prev_is_member_target(&self) -> bool {
+        matches!(
+            self.tokens.last().map(|t| &t.token),
+            Some(
+                Token::Identifier(_)
+                    | Token::RParen
+                    | Token::RBracket
+                    | Token::Integer(_)
+                    | Token::Double(_)
+                    | Token::String(_)
+            )
+        )
+    }
+
     fn peek(&self, offset: usize) -> char {
         let idx = self.pos + offset;
         if idx >= self.source.len() {
@@ -122,6 +141,15 @@ impl Lexer {
                     self.advance(); // consume second dot
                     self.advance(); // consume third dot
                     self.add_token(Token::DotDotDot);
+                } else if self.peek(0).is_ascii_digit() && !self.prev_is_member_target() {
+                    // Leading-dot decimal literal (`.5`, `.000001`) — valid CFML
+                    // where a value is expected (after an operator, `(`, `,`,
+                    // `=`, …). Route through number() so `x * .000001` lexes as
+                    // multiplication by 0.000001 instead of a stray Dot + Integer
+                    // (Mura/Masa utility.cfc renderFileSize). We only treat it as
+                    // a number when the previous token is NOT a member-access
+                    // target, so `q.5`-style access still lexes as Dot + number.
+                    self.number('.');
                 } else {
                     self.add_token(Token::Dot);
                 }
