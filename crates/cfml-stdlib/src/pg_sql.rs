@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn query_column_param_flattened_to_first_row() {
-        let col = CfmlValue::QueryColumn(std::sync::Arc::new(vec![s("first"), s("second")]));
+        let col = CfmlValue::QueryColumn(std::sync::Arc::new(vec![s("first"), s("second")]), 0);
         let p = prepare_pg_statements("select * from t where x = ?", &arr(vec![col]), false)
             .unwrap();
         assert_eq!(params_str(&p[0]), vec!["first"]);

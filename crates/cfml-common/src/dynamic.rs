@@ -916,10 +916,13 @@ pub enum CfmlValue {
     /// handle. Aliases see each other's mutations. See `CfmlArray`.
     Array(CfmlArray),
     /// Lucee-style query column proxy: behaves as Array for iteration/indexing/length,
-    /// but stringifies to the first row's value (so `q.col & "x"` works) and reports
-    /// `type_name()` as "Array" so `isArray()` is true. Produced by `query.colname`
-    /// member-access on a Query. Payload is the column's row values.
-    QueryColumn(Arc<Vec<CfmlValue>>),
+    /// but stringifies to the query's current-row value (so `q.col & "x"` works) and
+    /// reports `type_name()` as "Array" so `isArray()` is true. Produced by
+    /// `query.colname` member-access on a Query. The first payload is the column's row
+    /// values; the second is the 0-based row the proxy stands in for in scalar contexts
+    /// — snapshotted from the query's cursor at access time, so it reflects the current
+    /// row inside a `<cfloop query>`/`<cfoutput query>` (0 = first row, the default).
+    QueryColumn(Arc<Vec<CfmlValue>>, usize),
     /// Reference-typed struct (Lucee semantics): a shared, interior-mutable
     /// handle. Aliases (and CFC instances sharing it) see each other's
     /// mutations. See `CfmlStruct`.
@@ -980,7 +983,7 @@ impl fmt::Debug for CfmlValue {
                 DEBUG_VISITED.with(|v| { v.borrow_mut().pop(); });
                 r
             }
-            CfmlValue::QueryColumn(a) => f.debug_tuple("QueryColumn").field(&**a).finish(),
+            CfmlValue::QueryColumn(a, row) => f.debug_tuple("QueryColumn").field(&**a).field(row).finish(),
             CfmlValue::Struct(s) => {
                 let ptr = s.backing_ptr();
                 if DEBUG_VISITED.with(|v| v.borrow().contains(&ptr)) {
@@ -1024,7 +1027,7 @@ impl CfmlValue {
             // Lucee@7: `isArray(q.col)` is false — QueryColumn is a string proxy
             // with bracket-indexing for rows, not an array. Distinct type_name
             // means isArray/isStruct/etc. all report false.
-            CfmlValue::QueryColumn(_) => "QueryColumn",
+            CfmlValue::QueryColumn(..) => "QueryColumn",
             CfmlValue::Struct(_) => "Struct",
             CfmlValue::Closure(_) => "Closure",
             CfmlValue::Component(_) => "Component",
@@ -1054,8 +1057,11 @@ impl CfmlValue {
             }
             CfmlValue::Array(a) => !a.is_empty(),
             // (CfmlArray::is_empty locks briefly.)
-            // QueryColumn truthiness: first row's truthiness (Lucee proxies to first row).
-            CfmlValue::QueryColumn(a) => a.first().map(|v| v.is_true()).unwrap_or(false),
+            // QueryColumn truthiness: the current row's truthiness (Lucee proxies
+            // to the query's cursor row; falls back to the first row).
+            CfmlValue::QueryColumn(a, row) => {
+                a.get(*row).or_else(|| a.first()).map(|v| v.is_true()).unwrap_or(false)
+            }
             CfmlValue::Struct(s) => !s.is_empty(),
             CfmlValue::Closure(_) => true,
             CfmlValue::Component(_) => true,
@@ -1164,9 +1170,12 @@ impl CfmlValue {
                 visited.pop();
                 format!("[{}]", items.join(", "))
             }
-            // QueryColumn stringifies to the first row's value, matching Lucee's
-            // proxy behavior so `q.col & "x"` concatenates the first row.
-            CfmlValue::QueryColumn(a) => a.first().map(|v| v.as_string()).unwrap_or_default(),
+            // QueryColumn stringifies to the current-row value, matching Lucee's
+            // proxy behavior so `q.col & "x"` concatenates the query's cursor row
+            // (falls back to the first row).
+            CfmlValue::QueryColumn(a, row) => {
+                a.get(*row).or_else(|| a.first()).map(|v| v.as_string()).unwrap_or_default()
+            }
             CfmlValue::Struct(s) => {
                 // A java.util.Locale shim stringifies to its Java-style id
                 // (`en`, `en_US`) — matching Locale.toString() — so cbi18n's
@@ -1216,7 +1225,7 @@ impl CfmlValue {
         static EMPTY: std::sync::LazyLock<CfmlValue> =
             std::sync::LazyLock::new(|| CfmlValue::String(Arc::new(String::new())));
         match self {
-            CfmlValue::QueryColumn(a) => match a.first() {
+            CfmlValue::QueryColumn(a, row) => match a.get(*row).or_else(|| a.first()) {
                 Some(CfmlValue::Null) | None => &*EMPTY,
                 Some(v) => v,
             },
@@ -1228,7 +1237,7 @@ impl CfmlValue {
         match self {
             CfmlValue::Struct(s) => s.get(key),
             CfmlValue::Array(a) => key.parse::<usize>().ok().and_then(|idx| a.get(idx)),
-            CfmlValue::QueryColumn(a) => {
+            CfmlValue::QueryColumn(a, _) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     a.get(idx).cloned()
                 } else {
@@ -1267,7 +1276,7 @@ impl CfmlValue {
                 // step of `q.col[row] = v`). Replace the column in place on the
                 // shared query so all aliases observe it.
                 let new_values: Vec<CfmlValue> = match value {
-                    CfmlValue::QueryColumn(a) => a.as_ref().clone(),
+                    CfmlValue::QueryColumn(a, _) => a.as_ref().clone(),
                     CfmlValue::Array(a) => a.snapshot(),
                     other => vec![other],
                 };
@@ -1328,7 +1337,7 @@ impl CfmlValue {
     pub fn as_array_or_query_column(&self) -> Option<Vec<CfmlValue>> {
         match self {
             CfmlValue::Array(a) => Some(a.snapshot()),
-            CfmlValue::QueryColumn(a) => Some((**a).clone()),
+            CfmlValue::QueryColumn(a, _) => Some((**a).clone()),
             _ => None,
         }
     }
@@ -1437,7 +1446,7 @@ impl CfmlValue {
                         )
                     })
                     .collect();
-                let copy = CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None }));
+                let copy = CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None, current_row: 1 }));
                 seen.insert(ptr, copy.clone());
                 copy
             }
@@ -1481,19 +1490,19 @@ impl CfmlValue {
             }
             (
                 CfmlValue::Array(a),
-                CfmlValue::QueryColumn(b),
+                CfmlValue::QueryColumn(b, _),
             ) => {
                 let a = a.snapshot();
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
             }
             (
-                CfmlValue::QueryColumn(a),
+                CfmlValue::QueryColumn(a, _),
                 CfmlValue::Array(b),
             ) => {
                 let b = b.snapshot();
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
             }
-            (CfmlValue::QueryColumn(a), CfmlValue::QueryColumn(b)) => {
+            (CfmlValue::QueryColumn(a, _), CfmlValue::QueryColumn(b, _)) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
             }
             (CfmlValue::Struct(a), CfmlValue::Struct(b)) => {
@@ -1629,13 +1638,26 @@ pub struct CfmlQueryData {
     /// run via `queryExecute`/`cfquery`. `None` for queries built in memory
     /// (queryNew, QoQ before timing). Surfaced in `writeDump`'s query metadata.
     pub execution_time: Option<i64>,
+    /// 1-based cursor row — the "current row" of the recordset. Advanced by
+    /// `<cfloop query>`/`<cfoutput query>` so that `q.col` reads the current
+    /// row's value and `q.currentRow` reports the position, matching Lucee/ACF
+    /// (where the cursor lives on the query object). `0` is treated as row 1 —
+    /// see [`current_row`](Self::current_row) — so `#[derive(Default)]` and the
+    /// pre-cursor struct literals keep working.
+    pub current_row: usize,
 }
 
 impl CfmlQueryData {
     /// Empty data block with the given columns.
     pub fn new(columns: Vec<String>) -> Self {
         let n = columns.len();
-        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None, execution_time: None }
+        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None, execution_time: None, current_row: 1 }
+    }
+
+    /// The 1-based cursor row, normalising the `0` default to row 1.
+    #[inline]
+    pub fn current_row(&self) -> usize {
+        if self.current_row == 0 { 1 } else { self.current_row }
     }
 
     /// Build from columns + already-row-shaped rows (the legacy IndexMap shape).
@@ -1999,6 +2021,20 @@ impl CfmlQuery {
         self.0.read().row_count()
     }
 
+    /// 1-based cursor row (the recordset's "current row"). Defaults to 1.
+    #[inline]
+    pub fn current_row(&self) -> usize {
+        self.0.read().current_row()
+    }
+
+    /// Move the 1-based cursor row (used by `<cfloop query>`/`<cfoutput query>`).
+    /// Shared through the backing Arc, so all handles onto the same recordset —
+    /// and any `QueryColumn` proxies created afterwards — observe the new row.
+    #[inline]
+    pub fn set_current_row(&self, row: usize) {
+        self.0.write().current_row = row.max(1);
+    }
+
     /// True when the query has no rows.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -2149,7 +2185,7 @@ impl serde::Serialize for CfmlValue {
                 }
                 seq.end()
             }
-            CfmlValue::QueryColumn(a) => {
+            CfmlValue::QueryColumn(a, _) => {
                 let mut seq = s.serialize_seq(Some(a.len()))?;
                 for v in a.iter() {
                     seq.serialize_element(v)?;

@@ -58,6 +58,27 @@ pairs = "";
 assert("nested: independent currentRow counters",
        trim(pairs), "1-1 1-2 1-3 2-1 2-2 2-3");
 
+// The looped variable STAYS the query (Lucee cursor model): passing it to a
+// function inside the loop must yield the whole query, so column/cell access
+// (`qry[col][row]`) works — this is the exact Masa dbUtility.tables ->
+// utility.queryRowToStruct pattern that broke under the old reassign-to-row hack.
+q5 = queryNew("a,b", "varchar,varchar", [["x","1"],["y","2"]]);
+function rowToStruct(qry, row) {
+    var cols = listToArray(qry.columnList);
+    var s = {};
+    for (var ii = 1; ii lte arrayLen(cols); ii++) { s[cols[ii]] = qry[cols[ii]][row]; }
+    return s;
+}
+built = "";
+</cfscript>
+<cfloop query="q5">
+  <cfset r = rowToStruct(q5, q5.currentRow)>
+  <cfset built = built & r.a & r.b & " ">
+</cfloop>
+<cfscript>
+assert("looped query var passed to fn stays a query (Masa queryRowToStruct)",
+       trim(built), "x1 y2");
+
 // currentRow must be a number (usable in arithmetic / queryRowToStruct-style
 // row indexing), not a string.
 q4 = queryNew("a", "varchar", [["only"]]);

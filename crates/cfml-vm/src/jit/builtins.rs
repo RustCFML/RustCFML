@@ -278,7 +278,7 @@ extern "C" fn cfml_len_boxed_i64(tagged: i64) -> i64 {
         CfmlValue::Array(a) => a.len() as i64,
         CfmlValue::Struct(s) => s.len() as i64,
         CfmlValue::Binary(b) => b.len() as i64,
-        CfmlValue::QueryColumn(_) => v.as_string().chars().count() as i64,
+        CfmlValue::QueryColumn(..) => v.as_string().chars().count() as i64,
         _ => 0,
     }
 }
@@ -595,7 +595,7 @@ extern "C" fn cfml_array_len_boxed_i64(tagged: i64, bail: *mut i64) -> i64 {
     let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     match &v {
         CfmlValue::Array(a) => a.len() as i64,
-        CfmlValue::QueryColumn(_) => {
+        CfmlValue::QueryColumn(..) => {
             // Surface as a bail; interpreter throws on re-run.
             unsafe {
                 *bail = 1;

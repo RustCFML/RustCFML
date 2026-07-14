@@ -1235,7 +1235,7 @@ fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
 fn value_to_cells(v: &CfmlValue, delimiter: &str) -> Vec<CfmlValue> {
     match v {
         CfmlValue::Array(a) => a.snapshot(),
-        CfmlValue::QueryColumn(a) => (**a).clone(),
+        CfmlValue::QueryColumn(a, _) => (**a).clone(),
         CfmlValue::Null => Vec::new(),
         other => {
             let s = other.as_string();

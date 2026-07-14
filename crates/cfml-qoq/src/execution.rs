@@ -2598,6 +2598,7 @@ fn build_query(
         data,
         sql: None,
         execution_time: None,
+        current_row: 1,
     }
 }
 

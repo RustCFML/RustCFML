@@ -168,7 +168,7 @@ fn render_html(
             out.push_str("</table>");
             close_box(out, visited, ptr);
         }
-        CfmlValue::QueryColumn(col) => {
+        CfmlValue::QueryColumn(col, _) => {
             box_open(out, "k-array", "Array", &col.len().to_string(), opts.expand);
             out.push_str("<table>");
             for (i, item) in col.iter().enumerate() {

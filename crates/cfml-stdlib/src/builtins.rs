@@ -700,6 +700,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("queryColumnData".into(), fn_query_column_data as BuiltinFunction);
     f.insert("queryColumnArray".into(), fn_query_column_data as BuiltinFunction);  // alias
     f.insert("queryCurrentRow".into(), fn_query_current_row as BuiltinFunction);
+    f.insert("__querySetRow".into(), fn_query_move_cursor as BuiltinFunction);
     // QoQ custom-function registration (VM-intercepted).
     f.insert("queryRegisterFunction".into(), fn_query_register_function_stub as BuiltinFunction);
 
@@ -1266,7 +1267,7 @@ fn fn_len(args: Vec<CfmlValue>) -> CfmlResult {
         // Lucee@7 parity: len(q.col) treats the column as a string and returns
         // the first row's stringified length. This deliberately disagrees with
         // arrayLen() — which errors instead, matching Lucee's stricter rules.
-        Some(v @ CfmlValue::QueryColumn(_)) => Ok(CfmlValue::Int(v.as_string().chars().count() as i64)),
+        Some(v @ CfmlValue::QueryColumn(..)) => Ok(CfmlValue::Int(v.as_string().chars().count() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
 }
@@ -2291,7 +2292,7 @@ fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
         Some(CfmlValue::Array(a)) => Ok(CfmlValue::Int(a.len() as i64)),
         // Lucee@7 parity: arrayLen(q.col) errors — column proxies are NOT arrays.
-        Some(v @ CfmlValue::QueryColumn(_)) => Err(CfmlError::runtime(format!(
+        Some(v @ CfmlValue::QueryColumn(..)) => Err(CfmlError::runtime(format!(
             "Can't cast String [{}] to a value of type [Array]",
             v.as_string()
         ))),
@@ -5624,7 +5625,7 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
                 .unwrap_or_else(|_| "poisoned".to_string());
             format!("\"<NativeObject:{}>\"", json_escape_str(&name))
         }
-        CfmlValue::QueryColumn(_) => {
+        CfmlValue::QueryColumn(..) => {
             // A bare query-column access (q.col) is a proxy standing in for its
             // first-row scalar in scalar contexts. Serializing a struct/array
             // holding a query cell must emit the value, not drop it to null
@@ -5735,7 +5736,7 @@ fn serialize_cfml_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
                 format!("query({})", cols.join(","))
             })
         }
-        CfmlValue::QueryColumn(_) => serialize_cfml_value(val.query_column_scalar(), visited),
+        CfmlValue::QueryColumn(..) => serialize_cfml_value(val.query_column_scalar(), visited),
         CfmlValue::NativeObject(obj) => {
             let name = obj.read().map(|g| g.class_name().to_string())
                 .unwrap_or_else(|_| "poisoned".to_string());
@@ -11425,7 +11426,7 @@ fn cfml_to_pg_param(val: &CfmlValue) -> PgParam {
         CfmlValue::Binary(b) => PgParam::Bytes(b.clone()),
         // A query-column proxy stands in for its first-row scalar (defensive:
         // prepare_pg_statements already flattens these).
-        CfmlValue::QueryColumn(_) => cfml_to_pg_param(val.query_column_scalar()),
+        CfmlValue::QueryColumn(..) => cfml_to_pg_param(val.query_column_scalar()),
         _ => PgParam::Text(val.as_string()),
     }
 }
@@ -14794,7 +14795,7 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
                 } else {
                     d.columns.iter().map(|_| std::sync::Arc::new(Vec::new())).collect()
                 };
-                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None }
+                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None, current_row: 1 }
             });
             Ok(CfmlValue::Query(CfmlQuery::from_data(sliced)))
         }
@@ -14829,9 +14830,21 @@ fn fn_query_column_data(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_current_row(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
-        Some(CfmlValue::Query(_)) => Ok(CfmlValue::Int(0)),
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Int(q.current_row() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
+}
+
+/// Internal helper emitted by the `<cfloop query>` / `loop query=` desugaring to
+/// advance the query's 1-based cursor so `q.col` and `q.currentRow` read the
+/// current row (the query itself stays a query — Lucee/ACF semantics). Not a
+/// user-facing BIF. Returns Null; a non-query first arg is a no-op.
+fn fn_query_move_cursor(args: Vec<CfmlValue>) -> CfmlResult {
+    if let (Some(CfmlValue::Query(q)), Some(row)) = (args.get(0), args.get(1)) {
+        let n = row.as_string().trim().parse::<i64>().unwrap_or(1).max(1) as usize;
+        q.set_current_row(n);
+    }
+    Ok(CfmlValue::Null)
 }
 
 fn fn_value_list(args: Vec<CfmlValue>) -> CfmlResult {

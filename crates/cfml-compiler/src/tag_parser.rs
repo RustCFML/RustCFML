@@ -710,19 +710,21 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     (body, len - start)
                 };
                 let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
+                // Cursor model (Lucee/ACF): the query variable STAYS the query;
+                // each iteration moves the query's current-row cursor via the
+                // internal __querySetRow helper, so `q.col` reads the current
+                // row, `q.currentRow` reports the position, and `q` can still be
+                // passed to functions that expect the whole query. The cursor is
+                // reset to row 1 after the loop.
                 let q = format!("__cfloopq_q_{}", start);
                 let rc = format!("__cfloopq_rc_{}", start);
-                let cl = format!("__cfloopq_cl_{}", start);
                 let i = format!("__cfloopq_i_{}", start);
-                let row = format!("__cfloopq_row_{}", start);
                 (
                     format!(
-                        "var {q} = {query};\nvar {rc} = {q}.recordcount;\nvar {cl} = {q}.columnlist;\nvar {i} = 0;\nfor (var {row} in {q}) {{\n{i} = {i} + 1;\n{row}.currentRow = {i};\n{row}.recordCount = {rc};\n{row}.columnList = {cl};\n{query} = {row};\n{body}\n}}\n{query} = {q};\n",
+                        "var {q} = {query};\nvar {rc} = {q}.recordcount;\nfor (var {i} = 1; {i} <= {rc}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
                         q = q,
                         rc = rc,
-                        cl = cl,
                         i = i,
-                        row = row,
                         query = query,
                         body = body_script,
                     ),

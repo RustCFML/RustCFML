@@ -3484,11 +3484,16 @@ impl CfmlVirtualMachine {
                 } else if name.eq_ignore_ascii_case("columnlist") {
                     // columnList reports column names uppercased, matching Lucee/ACF.
                     CfmlValue::string(q.column_list())
+                } else if name.eq_ignore_ascii_case("currentrow") {
+                    // The query's 1-based cursor — advanced by <cfloop query>/
+                    // <cfoutput query> (Lucee/ACF pseudo-column).
+                    CfmlValue::Int(q.current_row() as i64)
                 } else if let Some(col_data) = q.column_values_ci(name) {
                     // QueryColumn proxy: acts as Array for indexing/iteration
-                    // but stringifies to first row (Lucee parity). Shares the
-                    // column's Arc directly with the source query (zero-copy).
-                    CfmlValue::QueryColumn(col_data)
+                    // but stringifies to the query's CURRENT row (Lucee parity).
+                    // Snapshot the cursor now so the proxy reflects the row that
+                    // was current at access time.
+                    CfmlValue::QueryColumn(col_data, q.current_row().saturating_sub(1))
                 } else {
                     CfmlValue::Null
                 }
@@ -6975,7 +6980,7 @@ impl CfmlVirtualMachine {
                             let idx = one_based_to_zero(&index);
                             stack.push(arr.get(idx).unwrap_or(CfmlValue::Null));
                         }
-                        CfmlValue::QueryColumn(arr) => {
+                        CfmlValue::QueryColumn(arr, _) => {
                             let idx = one_based_to_zero(&index);
                             stack.push(arr.get(idx).cloned().unwrap_or(CfmlValue::Null));
                         }
@@ -6996,7 +7001,9 @@ impl CfmlVirtualMachine {
                             match &index {
                                 CfmlValue::String(name) => {
                                     if let Some(col_data) = q.column_values_ci(name.as_str()) {
-                                        stack.push(CfmlValue::QueryColumn(col_data));
+                                        stack.push(CfmlValue::QueryColumn(col_data, q.current_row().saturating_sub(1)));
+                                    } else if name.eq_ignore_ascii_case("currentrow") {
+                                        stack.push(CfmlValue::Int(q.current_row() as i64));
                                     } else if let Ok(n) = name.trim().parse::<i64>() {
                                         stack.push(row_at_oneless(n));
                                     } else {
@@ -7202,7 +7209,7 @@ impl CfmlVirtualMachine {
                                 collection = CfmlValue::strukt(s);
                             }
                         }
-                        CfmlValue::QueryColumn(arc) => {
+                        CfmlValue::QueryColumn(arc, _) => {
                             // Inner step of `q[col][row] = v`: GetIndex(query, col)
                             // produced this column proxy; assign the 1-based row cell.
                             // The column CoW-detaches here; the outer SetIndex's
@@ -7228,7 +7235,7 @@ impl CfmlVirtualMachine {
                             // (e.g. the cached query in request scope) observes it.
                             let col_name = index.as_string();
                             let new_values: Vec<CfmlValue> = match value {
-                                CfmlValue::QueryColumn(a) => a.as_ref().clone(),
+                                CfmlValue::QueryColumn(a, _) => a.as_ref().clone(),
                                 CfmlValue::Array(a) => a.snapshot(),
                                 other => vec![other],
                             };
@@ -7616,12 +7623,15 @@ impl CfmlVirtualMachine {
                                         // Uppercase column names, matching Lucee/ACF columnList.
                                         stack.push(CfmlValue::string(q.column_list()));
                                     }
+                                    "currentrow" => {
+                                        stack.push(CfmlValue::Int(q.current_row() as i64));
+                                    }
                                     _ => {
                                         // Column access: q.columnName returns a QueryColumn
                                         // proxy — acts as Array for indexing/iteration/length,
-                                        // but stringifies to the first row (Lucee parity).
+                                        // but stringifies to the query's current row (Lucee parity).
                                         if let Some(col_data) = q.column_values_ci(name) {
-                                            stack.push(CfmlValue::QueryColumn(col_data));
+                                            stack.push(CfmlValue::QueryColumn(col_data, q.current_row().saturating_sub(1)));
                                         } else {
                                             stack.push(CfmlValue::Null);
                                         }
@@ -9077,7 +9087,7 @@ impl CfmlVirtualMachine {
                                     CfmlValue::Null
                                 }
                             }
-                            CfmlValue::QueryColumn(arr) => {
+                            CfmlValue::QueryColumn(arr, _) => {
                                 let i = method_name.parse::<usize>().unwrap_or(0);
                                 if i > 0 {
                                     arr.get(i - 1).cloned().unwrap_or(CfmlValue::Null)
@@ -9263,11 +9273,11 @@ impl CfmlVirtualMachine {
                                 stack.push(CfmlValue::array(rows));
                             }
                             // Lucee@7 parity: `for (v in q.col)` yields a single
-                            // element — the stringified first row — because
+                            // element — the stringified current row — because
                             // Lucee treats QueryColumn as a string in iter context.
-                            CfmlValue::QueryColumn(a) => {
-                                let first = a.first().cloned().unwrap_or(CfmlValue::Null);
-                                stack.push(CfmlValue::array(vec![first]));
+                            CfmlValue::QueryColumn(a, row) => {
+                                let cell = a.get(row).or_else(|| a.first()).cloned().unwrap_or(CfmlValue::Null);
+                                stack.push(CfmlValue::array(vec![cell]));
                             }
                             other => stack.push(other), // arrays pass through
                         }
@@ -21664,7 +21674,7 @@ impl CfmlVirtualMachine {
                     Self::collect_app_fn_ids(&value, ids, visited);
                 }
             }
-            CfmlValue::QueryColumn(values) => {
+            CfmlValue::QueryColumn(values, _) => {
                 let ptr = Arc::as_ptr(values) as usize;
                 if !visited.insert((4, ptr)) {
                     return;

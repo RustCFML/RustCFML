@@ -2165,46 +2165,53 @@ impl Parser {
                     location: loc,
                 })));
             }
-            // No binding — reassign the query var to the current row so `q.col`
-            // resolves to that row's scalar, and expose the built-in per-row
-            // pseudo-columns currentRow/recordCount/columnList (mirrors the
-            // <cfoutput query> and <cfloop query> tag forms). The query is
-            // hoisted into a temp, iterated, and — crucially — RESTORED after the
-            // loop, so a re-entrant/nested loop over the same variable doesn't
-            // find a leftover row struct in place of the query.
+            // No binding — cursor model (Lucee/ACF): the query variable STAYS the
+            // query; each iteration moves the query's current-row cursor via the
+            // internal __querySetRow helper, so `q.col` reads the current row,
+            // `q.currentRow` reports the position, and `q` can still be passed to
+            // functions expecting the whole query. Cursor reset to 1 after the loop.
             let q_tmp = format!("__cfloop_q_{}", uniq);
             let rc_tmp = format!("__cfloop_qrc_{}", uniq);
-            let cl_tmp = format!("__cfloop_qcl_{}", uniq);
             let i_tmp = format!("__cfloop_qi_{}", uniq);
-            let row_tmp = format!("__cfloop_qrow_{}", uniq);
-            // Restore only when the query is a plain variable (an lvalue).
+            // Rebind the query var to the (cursor-positioned) query only when it
+            // is a plain variable (an lvalue).
             let query_name = if let Expression::Identifier(id) = &query {
                 Some(id.name.clone())
             } else {
                 None
             };
-            let mut for_body = vec![
-                assign(i_tmp.clone(), bin(ident(&i_tmp), BinaryOpType::Add, int(1))),
-                assign(format!("{}.currentRow", row_tmp), ident(&i_tmp)),
-                assign(format!("{}.recordCount", row_tmp), ident(&rc_tmp)),
-                assign(format!("{}.columnList", row_tmp), ident(&cl_tmp)),
-            ];
+            let set_row = |row: Expression| {
+                Statement::Expression(ExpressionStatement {
+                    expr: call("__querySetRow", vec![ident(&q_tmp), row]),
+                    location: loc,
+                })
+            };
+            let mut for_body = vec![set_row(ident(&i_tmp))];
             if let Some(ref qname) = query_name {
-                for_body.push(assign(qname.clone(), ident(&row_tmp)));
+                for_body.push(assign(qname.clone(), ident(&q_tmp)));
             }
             for_body.extend(body);
-            // Run [hoist…, loop, restore] exactly once via a one-shot `for`.
+            let for_loop = Statement::For(For {
+                init: Some(Box::new(Statement::Var(Var {
+                    name: i_tmp.clone(),
+                    value: Some(int(1)),
+                    location: loc,
+                }))),
+                condition: Some(bin(ident(&i_tmp), BinaryOpType::LessEqual, ident(&rc_tmp))),
+                increment: Some(Box::new(bin(
+                    ident(&i_tmp),
+                    BinaryOpType::Assign,
+                    bin(ident(&i_tmp), BinaryOpType::Add, int(1)),
+                ))),
+                body: for_body,
+                location: loc,
+            });
+            // Run [hoist…, loop, reset] exactly once via a one-shot `for`.
             let mut once_body = vec![
                 assign(q_tmp.clone(), query),
                 assign(rc_tmp.clone(), ident(&format!("{}.recordcount", q_tmp))),
-                assign(cl_tmp.clone(), ident(&format!("{}.columnlist", q_tmp))),
-                assign(i_tmp.clone(), int(0)),
-                Statement::ForIn(ForIn {
-                    variable: row_tmp,
-                    iterable: ident(&q_tmp),
-                    body: for_body,
-                    location: loc,
-                }),
+                for_loop,
+                set_row(int(1)),
             ];
             if let Some(ref qname) = query_name {
                 once_body.push(assign(qname.clone(), ident(&q_tmp)));

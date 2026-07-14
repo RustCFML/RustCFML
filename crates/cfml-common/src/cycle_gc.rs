@@ -550,7 +550,7 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
                 classify(cv, in_set, emit);
             }
         }
-        CfmlValue::QueryColumn(col) => {
+        CfmlValue::QueryColumn(col, _) => {
             for cv in col.iter() {
                 classify(cv, in_set, emit);
             }
