@@ -2502,8 +2502,16 @@ fn load_embedded_cfconfig(vfs: &dyn Vfs, base_dir: &str) -> RustCfmlConfig {
 /// still registered — they'll fail later at query time with a clearer
 /// "driver not available" error from the stdlib than from a silent miss.
 fn populate_datasource_registry(cfg: &RustCfmlConfig) {
+    // Relative SQLite paths anchor to the directory of the .cfconfig.json that
+    // declared them (not the process cwd), so a configured `database: "app.db"`
+    // lands next to the config predictably instead of in the launch directory.
+    let base_dir = cfg
+        .source_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(std::path::Path::to_path_buf);
     for (name, ds) in cfg.datasources.iter() {
-        if let Some(url) = ds.connection_url() {
+        if let Some(url) = ds.connection_url_anchored(base_dir.as_deref()) {
             cfml_stdlib::builtins::register_datasource(name, url.clone());
             cfml_stdlib::builtins::register_datasource_timeout(&url, ds.connection_timeout);
             if ds.default {

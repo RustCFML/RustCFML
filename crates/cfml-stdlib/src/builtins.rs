@@ -8671,6 +8671,31 @@ pub(crate) enum DbDriver {
     Mssql(String),
 }
 
+/// Read the `datasource` option value as a connection string. Usually a plain
+/// string (a logical name or a connection URL), but CFML also accepts an
+/// INLINE datasource STRUCT — the ACF/Lucee `{ class:"org.sqlite.JDBC",
+/// connectionString:"jdbc:sqlite::memory:" }` form. For a struct we read its
+/// `connectionString` key (falling back to a `database`/`url` key) rather than
+/// stringifying the whole struct — otherwise `as_string()` produced a filename
+/// like `{class: org.sqlite.JDBC, connectionString: jdbc:sqlite::memory:}` that
+/// SQLite then created as a literal on-disk file, losing the `:memory:` intent.
+pub(crate) fn datasource_attr_string(v: &CfmlValue) -> String {
+    match v {
+        CfmlValue::Struct(ds) => {
+            for key in ["connectionString", "url", "database"] {
+                if let Some((_, cs)) = ds.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                    let s = cs.as_string();
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+            v.as_string()
+        }
+        _ => v.as_string(),
+    }
+}
+
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub(crate) fn parse_datasource(ds: &str) -> DbDriver {
     // JDBC URL normalisation. `this.datasources` (Lucee/ACF/BoxLang style) and
@@ -8971,6 +8996,25 @@ fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, Cf
     if let Some(pool_any) = manager.get(&key) {
         if let Some(pool) = pool_any.downcast_ref::<r2d2::Pool<SqliteConnectionManager>>() {
             return Ok(pool.clone());
+        }
+    }
+    // Ensure the parent directory of a file-backed SQLite DB exists before
+    // opening: SQLite creates the file itself but NOT missing intermediate
+    // directories, so a full path like `/data/app.db` where `/data` doesn't yet
+    // exist fails with a cryptic "unable to open database file". Create the
+    // directory chain up front so a configured path just works. In-memory and
+    // other special (`:...`) targets have no filesystem parent — skip them.
+    if !path.is_empty() && !path.starts_with(':') && !path.contains("mode=memory") {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return Err(CfmlError::database(format!(
+                        "queryExecute: cannot create SQLite database directory '{}': {}",
+                        parent.display(),
+                        e
+                    )));
+                }
+            }
         }
     }
     let mgr = SqliteConnectionManager { path: path.to_string() };
@@ -10192,7 +10236,7 @@ pub fn fn_query_execute_dynamic(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Struct(opts) => opts
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v.as_string()),
+            .map(|(_, v)| datasource_attr_string(&v)),
         _ => None,
     };
     let ds_name = datasource_attr.unwrap_or_default();
@@ -10270,7 +10314,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Struct(opts) => opts
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v.as_string()),
+            .map(|(_, v)| datasource_attr_string(&v)),
         _ => None,
     };
 

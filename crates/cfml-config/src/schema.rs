@@ -404,6 +404,39 @@ impl DatasourceCfg {
         }
     }
 
+    /// Like [`connection_url`](Self::connection_url) but resolves a RELATIVE
+    /// SQLite file path against `base_dir` (the directory of the `.cfconfig.json`
+    /// that declared this datasource). Without this a relative `database`/
+    /// `connectionString` path is handed to SQLite verbatim and resolved against
+    /// the process working directory — which on a desktop launch is typically
+    /// the user's home, so the DB silently lands in the wrong place. Absolute
+    /// paths, `:memory:`, and non-SQLite drivers are returned unchanged.
+    pub fn connection_url_anchored(&self, base_dir: Option<&std::path::Path>) -> Option<String> {
+        let url = self.connection_url()?;
+        let Some(base) = base_dir else { return Some(url) };
+        if self.canonical_driver() != "sqlite" {
+            return Some(url);
+        }
+        // Peel the SQLite path out of whichever URL form connection_url produced.
+        let (prefix, raw) = if let Some(p) = url.strip_prefix("sqlite://") {
+            ("sqlite://", p)
+        } else if let Some(p) = url.strip_prefix("jdbc:sqlite:") {
+            ("jdbc:sqlite:", p)
+        } else if !url.contains("://") && !url.starts_with("jdbc:") {
+            ("", url.as_str()) // bare path (parse_datasource routes it to SQLite)
+        } else {
+            return Some(url);
+        };
+        let path = std::path::Path::new(raw);
+        // Leave in-memory / already-absolute / empty targets alone.
+        if raw.is_empty() || raw.starts_with(':') || raw.contains("mode=memory") || path.is_absolute()
+        {
+            return Some(url);
+        }
+        let abs = base.join(path);
+        Some(format!("{}{}", prefix, abs.display()))
+    }
+
     /// Resolve the canonical lowercase driver id from the `driver` key (also
     /// aliased from Lucee's `type`/`dbdriver`) or, failing that, a JDBC `class`
     /// name. Lucee/ACF apps declare drivers as `type:"MySQL"` or via the JDBC
@@ -1089,6 +1122,54 @@ mod tests {
         assert_eq!(cfg.runtime.session_timeout, "0,0,30,0");
         assert!(cfg.security.csrf_enabled);
         assert!(cfg.url_rewriting.enabled);
+    }
+
+    #[test]
+    fn sqlite_relative_path_anchors_to_config_dir() {
+        // A relative SQLite `database` path resolves against the config dir, not
+        // the process cwd (GH-reported: DB silently landed in ~ on macOS).
+        let json = r#"{ "datasources": { "app": { "driver": "sqlite", "database": "app.db" } } }"#;
+        let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
+        let ds = cfg.datasources.get("app").unwrap();
+        let base = std::path::Path::new("/srv/myapp/config");
+        assert_eq!(
+            ds.connection_url_anchored(Some(base)).unwrap(),
+            "sqlite:///srv/myapp/config/app.db"
+        );
+        // With no base dir, the path is left as-is.
+        assert_eq!(ds.connection_url_anchored(None).unwrap(), "sqlite://app.db");
+    }
+
+    #[test]
+    fn sqlite_absolute_and_memory_paths_are_untouched() {
+        let base = std::path::Path::new("/srv/myapp/config");
+        let abs: RustCfmlConfig = serde_json::from_str(
+            r#"{ "datasources": { "a": { "driver": "sqlite", "database": "/data/app.db" } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            abs.datasources.get("a").unwrap().connection_url_anchored(Some(base)).unwrap(),
+            "sqlite:///data/app.db"
+        );
+        let mem: RustCfmlConfig = serde_json::from_str(
+            r#"{ "datasources": { "m": { "class": "org.sqlite.JDBC", "connectionString": "jdbc:sqlite::memory:" } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mem.datasources.get("m").unwrap().connection_url_anchored(Some(base)).unwrap(),
+            "jdbc:sqlite::memory:"
+        );
+    }
+
+    #[test]
+    fn non_sqlite_driver_is_not_anchored() {
+        let json = r#"{ "datasources": { "db": { "driver": "mysql", "host": "127.0.0.1", "port": "3306", "database": "app" } } }"#;
+        let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
+        let base = std::path::Path::new("/srv/myapp/config");
+        assert_eq!(
+            cfg.datasources.get("db").unwrap().connection_url_anchored(Some(base)).unwrap(),
+            "mysql://127.0.0.1:3306/app"
+        );
     }
 
     #[test]
