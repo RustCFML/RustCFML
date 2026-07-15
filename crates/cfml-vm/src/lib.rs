@@ -24240,8 +24240,12 @@ impl CfmlVirtualMachine {
             .get_ci("listinfo")
             .map(|v| v.as_string().to_lowercase())
             .unwrap_or_else(|| "all".to_string());
+        let sort = opts
+            .get_ci("sort")
+            .map(|v| v.as_string())
+            .unwrap_or_default();
         match self.resolve_directory_path_with_mappings(&dir) {
-            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter, &list_info),
+            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter, &list_info, &sort),
             // Lucee/ACF: `action="list"` on a missing directory returns an EMPTY
             // query (recordcount=0), it does NOT throw. (Wheels' controller-
             // discovery lists a non-existent nested controllers/ subdir.)
@@ -24261,6 +24265,7 @@ impl CfmlVirtualMachine {
         recurse: bool,
         filter: &str,
         list_info: &str,
+        sort: &str,
     ) -> CfmlResult {
         let mut entries = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -24269,6 +24274,7 @@ impl CfmlVirtualMachine {
         }
         self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
         entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
+        Self::sort_directory_entries(&mut entries, sort);
         // Lucee/ACF: `cfdirectory action="list" listinfo="name"` returns a
         // single-column (`name`) query whose `name` is the path RELATIVE to the
         // listed directory (subdirectories included, `/`-separated) when
@@ -24301,6 +24307,65 @@ impl CfmlVirtualMachine {
             query.add_row(row);
         }
         CfmlValue::Query(query)
+    }
+
+    /// Sort collected directory entries in place per the `cfdirectory` `sort`
+    /// attribute — "col [asc|desc][, col2 [asc|desc] …]", default ascending
+    /// (Lucee/ACF). Supports `name` (default), `size`, `type` ("Dir" < "File"),
+    /// and `datelastmodified`. Without this the OS enumeration order leaked
+    /// through, so `<cfdirectory sort="name asc">` + a driving loop (e.g. Masa's
+    /// schema-migration runner) executed files out of order.
+    fn sort_directory_entries(entries: &mut [(String, String, bool)], sort: &str) {
+        let keys: Vec<(String, bool)> = sort
+            .split(',')
+            .filter_map(|part| {
+                let mut it = part.split_whitespace();
+                let col = it.next()?.to_lowercase();
+                let asc = !it
+                    .next()
+                    .map(|d| d.eq_ignore_ascii_case("desc"))
+                    .unwrap_or(false);
+                Some((col, asc))
+            })
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        entries.sort_by(|a, b| {
+            for (col, asc) in &keys {
+                let ord = match col.as_str() {
+                    "size" => {
+                        let sz = |e: &(String, String, bool)| -> u64 {
+                            if e.2 {
+                                0
+                            } else {
+                                std::fs::metadata(&e.1).map(|m| m.len()).unwrap_or(0)
+                            }
+                        };
+                        sz(a).cmp(&sz(b))
+                    }
+                    // Lucee reports type as "Dir"/"File"; "Dir" sorts before "File".
+                    "type" => {
+                        let t = |e: &(String, String, bool)| if e.2 { "dir" } else { "file" };
+                        t(a).cmp(t(b))
+                    }
+                    "datelastmodified" => {
+                        let dt = |e: &(String, String, bool)| {
+                            std::fs::metadata(&e.1).and_then(|m| m.modified()).ok()
+                        };
+                        dt(a).cmp(&dt(b))
+                    }
+                    // "name" (default) and any unrecognised column → by name,
+                    // case-insensitive (textual, matching Lucee's default).
+                    _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                };
+                let ord = if *asc { ord } else { ord.reverse() };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
     }
 
     /// Build a real `Query` value from collected directory entries

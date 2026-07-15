@@ -9057,25 +9057,24 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     let (sanitized, ssl) = mysql_extract_ssl(url);
     let opts = mysql::Opts::from_url(&sanitized)
         .map_err(|e| CfmlError::database(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
-    // Two mysql-crate pool defaults break scripts that span multiple statements sharing
-    // session/user state — which JDBC (and therefore Lucee/ACF) support because pooled
-    // connections retain their session state:
-    //   1. `reset_connection = true` fires COM_RESET_CONNECTION on return-to-pool, wiping all
-    //      session/user variables.
-    //   2. `pool_min = 10` eagerly opens ten connections and hands them out FIFO, so a serial
-    //      workload round-robins across ten distinct physical connections — a user variable set
-    //      by one statement is absent on the connection the next statement lands on.
-    // Masa CMS's `core/setup/db/mysql.sql` (a mysqldump-style script Masa splits and runs one
-    // statement per cfquery) relies on exactly this: it opens with
-    // `SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'` and later restores with
-    // `SET SQL_MODE=@OLD_SQL_MODE`. With the defaults, `@OLD_SQL_MODE` is NULL by the time the
-    // restore runs, and MariaDB rejects `SET sql_mode = NULL` (ERROR 1231). Disabling reset and
-    // pinning min to 1 keeps a serial workload on one connection with its user vars intact,
-    // matching the reference engines (and avoiding the wasteful eager 10-connection burst).
+    // Connection-per-request model (matching Lucee/ACF, which pool by request):
+    //   * `reset_connection = true` (the crate default) — a connection is reset
+    //     (COM_RESET_CONNECTION) when it is actually returned to the pool, wiping
+    //     session/user state so it can NOT leak to the next request that reuses it.
+    //   * A request HOLDS one connection per datasource for its whole duration (see
+    //     REQUEST_MYSQL_CONNS / checkout_request_mysql_conn); it is only returned to
+    //     the pool — and thus only reset — at the request boundary
+    //     (`release_request_db_conns`). So within a request, session/user state
+    //     persists across statements (Masa's `core/setup/db/mysql.sql` sets
+    //     `@OLD_SQL_MODE`/`SQL_MODE` in separate cfqueries and restores them later;
+    //     `SET SQL_MODE=@OLD_SQL_MODE` needs @OLD_SQL_MODE to still be set), but a
+    //     transient `SET foreign_key_checks=0` / `sql_mode` does NOT outlive the
+    //     request (GitHub #275 — the reset-disabled pool leaked pool-wide and across
+    //     requests). `pool_min = 1` avoids the wasteful eager 10-connection burst.
     let constraints =
         mysql::PoolConstraints::new(1, 100).unwrap_or(mysql::PoolConstraints::DEFAULT);
     let pool_opts = mysql::PoolOpts::default()
-        .with_reset_connection(false)
+        .with_reset_connection(true)
         .with_constraints(constraints);
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
@@ -9084,6 +9083,58 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         .map_err(|e| CfmlError::database(format!("queryExecute: MySQL pool creation error: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
     Ok(pool)
+}
+
+#[cfg(feature = "mysql_db")]
+thread_local! {
+    /// Request-scoped MySQL connections, keyed by connection URL. A request reuses
+    /// one connection per datasource so session/user state (SET sql_mode, user
+    /// variables like @OLD_SQL_MODE, foreign_key_checks, autocommit) persists across
+    /// the request's statements — the Lucee/ACF connection-per-request model. The
+    /// held connection is only returned to the pool — and thus only reset
+    /// (COM_RESET_CONNECTION, since the pool has reset_connection=true) — at the
+    /// request boundary via `release_request_db_conns`, so transient session state
+    /// does NOT leak into the next request (GitHub #275).
+    static REQUEST_MYSQL_CONNS: std::cell::RefCell<HashMap<String, mysql::PooledConn>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Take the request's held MySQL connection for `url`, or check a fresh one out of
+/// the pool. The caller MUST return it via `return_request_mysql_conn` so it is
+/// held for the rest of the request (and reset at the request boundary).
+#[cfg(feature = "mysql_db")]
+fn checkout_request_mysql_conn(
+    url: &str,
+    pool: &mysql::Pool,
+) -> Result<mysql::PooledConn, CfmlError> {
+    if let Some(conn) = REQUEST_MYSQL_CONNS.with(|c| c.borrow_mut().remove(url)) {
+        return Ok(conn);
+    }
+    pool.get_conn()
+        .map_err(|e| CfmlError::database(format!("queryExecute: MySQL connection error: {}", e)))
+}
+
+/// Return a MySQL connection to the request-scoped cache (held until request end).
+/// Kept out of the pool for the request's duration so its session state survives
+/// across statements.
+#[cfg(feature = "mysql_db")]
+fn return_request_mysql_conn(url: &str, conn: mysql::PooledConn) {
+    REQUEST_MYSQL_CONNS.with(|c| {
+        c.borrow_mut().insert(url.to_string(), conn);
+    });
+}
+
+/// Release every request-scoped DB connection back to its pool. The serve loop
+/// calls this at request boundaries (both before and after running a request, so a
+/// prior request that died mid-flight can't leak its connection to the next one on
+/// the same worker thread). Dropping each held MySQL connection returns it to the
+/// pool, which — with `reset_connection = true` — fires COM_RESET_CONNECTION and
+/// wipes its session/user state. Cheap no-op when nothing is held.
+pub fn release_request_db_conns() {
+    #[cfg(feature = "mysql_db")]
+    REQUEST_MYSQL_CONNS.with(|c| {
+        c.borrow_mut().clear();
+    });
 }
 
 #[cfg(feature = "postgres_db")]
@@ -10786,12 +10837,29 @@ fn execute_mysql(
     return_type: &str,
     timeout_secs: Option<u32>,
 ) -> CfmlResult {
+    // Run on the request's held connection (connection-per-request), then return
+    // it to the request-scoped cache so its session state persists for the rest of
+    // the request and is reset only at the request boundary. Returning the
+    // connection on BOTH the ok and error paths keeps it available (a query error
+    // does not break the connection) and ensures it is eventually reset.
+    let pool = get_mysql_pool(url)?;
+    let mut conn = checkout_request_mysql_conn(url, &pool)?;
+    let result = execute_mysql_on_conn(&mut conn, url, sql, params_arg, return_type, timeout_secs);
+    return_request_mysql_conn(url, conn);
+    result
+}
+
+#[cfg(feature = "mysql_db")]
+fn execute_mysql_on_conn(
+    conn: &mut mysql::PooledConn,
+    url: &str,
+    sql: &str,
+    params_arg: &CfmlValue,
+    return_type: &str,
+    timeout_secs: Option<u32>,
+) -> CfmlResult {
     use mysql::*;
     use mysql::prelude::*;
-
-    let pool = get_mysql_pool(url)?;
-    let mut conn = pool.get_conn()
-        .map_err(|e| CfmlError::database(format!("queryExecute: MySQL connection error: {}", e)))?;
 
     // Build the SQL we actually execute plus its bound params. For NAMED (struct)
     // params we rewrite `:name` placeholders to positional `?` ourselves rather
@@ -10843,21 +10911,26 @@ fn execute_mysql(
     };
 
     if mysql_returns_rows(sql) {
-        let result: Vec<Row> = conn.exec(sql, &params)
+        // Use a streaming QueryResult so the column metadata is read from the
+        // result set itself — NOT inferred from the first row. A zero-row result
+        // (`SELECT * FROM t WHERE 0=1`, the canonical "give me the column list"
+        // idiom) still carries its columns, so `query.columnList` is populated.
+        // (Deriving columns from `result.first()` returned an EMPTY column list
+        // for 0 rows, so Masa's schema migrations mis-fired: `<cfif not
+        // listFindNoCase(rsCheck.columnList,"comments")>` was always true and it
+        // tried to rename a column that no longer existed.)
+        let mut result = conn.exec_iter(sql, &params)
             .map_err(|e| map_err(e, "query error"))?;
+        let columns: Vec<String> = result
+            .columns()
+            .as_ref()
+            .iter()
+            .map(|c| c.name_str().to_string())
+            .collect();
 
-        // Extract column names from result set
-        let columns: Vec<String> = if let Some(first_row) = result.first() {
-            first_row.columns_ref().iter()
-                .map(|c| c.name_str().to_string())
-                .collect()
-        } else {
-            // No rows - try to get columns from prepared statement
-            vec![]
-        };
-
-        let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
-        for row in &result {
+        let mut rows: Vec<ValueMap> = Vec::new();
+        for row_result in result.by_ref() {
+            let row = row_result.map_err(|e| map_err(e, "query error"))?;
             let mut row_map = ValueMap::default();
             for (i, col) in columns.iter().enumerate() {
                 let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
@@ -12827,6 +12900,58 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                 visited.insert(canon);
             }
             list_dir(Path::new(&directory), &filter, &type_filter, recurse, &mut rows, &mut visited)?;
+
+            // Apply the `sort` attribute — "col [asc|desc][, col2 [asc|desc] …]",
+            // default ascending — matching Lucee/ACF. Without this the OS
+            // enumeration order leaked through: Masa runs its schema migrations
+            // via `<cfdirectory sort="name asc">` then a loop over the result, so
+            // an unsorted listing runs migrations out of order and a later one
+            // references a column an earlier-by-name one adds ("Unknown column
+            // 'urltitle'"). `name`/`type`/`datelastmodified`/`directory` sort as
+            // text (case-insensitive, Lucee parity); `size` sorts numerically.
+            if let Some(sort_spec) = get_ci(opts, "sort").map(|v| v.as_string()) {
+                let keys: Vec<(String, bool)> = sort_spec
+                    .split(',')
+                    .filter_map(|part| {
+                        let mut it = part.split_whitespace();
+                        let col = it.next()?.to_lowercase();
+                        let asc = !it
+                            .next()
+                            .map(|d| d.eq_ignore_ascii_case("desc"))
+                            .unwrap_or(false);
+                        Some((col, asc))
+                    })
+                    .collect();
+                if !keys.is_empty() {
+                    let cell = |row: &ValueMap, col: &str| -> CfmlValue {
+                        row.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(col))
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(CfmlValue::Null)
+                    };
+                    rows.sort_by(|a, b| {
+                        for (col, asc) in &keys {
+                            let av = cell(a, col);
+                            let bv = cell(b, col);
+                            let ord = if col == "size" {
+                                av.as_string()
+                                    .parse::<i64>()
+                                    .unwrap_or(0)
+                                    .cmp(&bv.as_string().parse::<i64>().unwrap_or(0))
+                            } else {
+                                av.as_string()
+                                    .to_lowercase()
+                                    .cmp(&bv.as_string().to_lowercase())
+                            };
+                            let ord = if *asc { ord } else { ord.reverse() };
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+            }
 
             Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)))
         }

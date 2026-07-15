@@ -702,6 +702,24 @@ fn compile_and_run(
     persist_jit: bool,
     web_context: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
+    // Connection-per-request DB isolation. Serve-mode requests run on reused
+    // tokio blocking threads, and each request holds one pooled DB connection per
+    // datasource (so session/user state persists across a request's statements —
+    // see REQUEST_MYSQL_CONNS). Release those held connections at the request
+    // boundary so their session state (SET foreign_key_checks / sql_mode / …) is
+    // reset before the connection serves the next request (GitHub #275) and does
+    // not corrupt it (Masa admin boot). Release up-front too, so a prior request
+    // that died mid-flight on this thread can't leak its connection into this one.
+    // The drop guard covers every early return and panic.
+    cfml_stdlib::builtins::release_request_db_conns();
+    struct DbConnRequestGuard;
+    impl Drop for DbConnRequestGuard {
+        fn drop(&mut self) {
+            cfml_stdlib::builtins::release_request_db_conns();
+        }
+    }
+    let _db_conn_guard = DbConnRequestGuard;
+
     // onMissingTemplate path: there is no target page to compile, so use an
     // empty program. execute_with_lifecycle never runs it — it dispatches to
     // the Application.cfc onMissingTemplate handler and returns.

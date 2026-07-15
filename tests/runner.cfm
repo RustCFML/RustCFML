@@ -462,6 +462,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfdbinfo.cfm">
 <cf_runtest file="tags/test_cfdirectory_mapping_path.cfm">
 <cf_runtest file="tags/test_cfdirectory_function_form.cfm">
+<cf_runtest file="tags/test_cfdirectory_sort.cfm">
 <cf_runtest file="tags/test_cfdirectory_recurse_symlink.cfm">
 <cf_runtest file="tags/test_cfdirectory_listinfo_name_relative.cfm">
 <cf_runtest file="tags/test_mapping_dotdot_normalization.cfm">

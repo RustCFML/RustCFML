@@ -70,3 +70,68 @@ fn sql_mode_save_restore_round_trip() {
     // on the (different / reset) connection this statement landed on.
     run(&url, "SET SQL_MODE=@OLD_SQL_MODE").expect("restoring sql_mode must not fail with 1231");
 }
+
+/// GitHub #275: a transient `SET foreign_key_checks=0` must NOT outlive the
+/// request. `release_request_db_conns` (called at request boundaries) returns the
+/// held connection to the pool, which resets it — so the next request's queries
+/// see the default session state, not the leaked one.
+#[test]
+fn session_state_reset_at_request_boundary() {
+    let Ok(url) = std::env::var("RUSTCFML_MYSQL_TEST_URL") else {
+        eprintln!("skipping: RUSTCFML_MYSQL_TEST_URL not set");
+        return;
+    };
+
+    // "Request A": disable FK checks, then confirm it took on the held connection.
+    run(&url, "SET SESSION foreign_key_checks=0").expect("SET fkc=0 should succeed");
+    let within = run(&url, "SELECT @@session.foreign_key_checks AS v")
+        .expect("read fkc within request A");
+    assert!(
+        format!("{:?}", within).contains('0'),
+        "within the same request the SET persists (Lucee parity), got: {:?}",
+        within
+    );
+
+    // Request boundary: release held connections (resets session state).
+    cfml_stdlib::builtins::release_request_db_conns();
+
+    // "Request B": the leaked `foreign_key_checks=0` must be gone (back to 1).
+    let after = run(&url, "SELECT @@session.foreign_key_checks AS v")
+        .expect("read fkc in request B");
+    assert!(
+        format!("{:?}", after).contains('1'),
+        "foreign_key_checks must reset to 1 after the request boundary, got: {:?}",
+        after
+    );
+}
+
+/// A zero-row result set must still expose its column list — the
+/// `SELECT * FROM t WHERE 0=1` "give me the columns" idiom. Columns are read from
+/// the result-set metadata, not inferred from the first row.
+#[test]
+fn zero_row_result_keeps_column_list() {
+    let Ok(url) = std::env::var("RUSTCFML_MYSQL_TEST_URL") else {
+        eprintln!("skipping: RUSTCFML_MYSQL_TEST_URL not set");
+        return;
+    };
+
+    run(&url, "DROP TABLE IF EXISTS _rcf_cols_probe").expect("drop temp table");
+    run(
+        &url,
+        "CREATE TABLE _rcf_cols_probe (alpha INT, beta VARCHAR(10), gamma INT)",
+    )
+    .expect("create temp table");
+    let result = run(&url, "SELECT * FROM _rcf_cols_probe WHERE 0=1")
+        .expect("zero-row select should succeed");
+    let CfmlValue::Query(q) = &result else {
+        panic!("expected a Query, got: {:?}", result);
+    };
+    assert_eq!(q.row_count(), 0, "probe returns no rows");
+    let cols = q.columns().join(",").to_lowercase();
+    assert_eq!(
+        cols, "alpha,beta,gamma",
+        "zero-row result must carry its column list, got: {}",
+        cols
+    );
+    run(&url, "DROP TABLE IF EXISTS _rcf_cols_probe").expect("drop temp table");
+}
