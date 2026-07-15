@@ -2260,6 +2260,94 @@ pub fn handle_java_inputstreamreader(
     }
 }
 
+pub fn handle_java_bufferedreader(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            // new BufferedReader(reader) — the reader is an InputStreamReader shim
+            // carrying the file path + charset. Read the whole file now, split into
+            // lines, and expose a `readLine()` cursor (Mura's resourceBundle reads
+            // `.properties` files this way). A bare no-arg construction returns an
+            // empty reader.
+            let (path, charset) = match args.first() {
+                Some(CfmlValue::Struct(s)) => (
+                    s.get("__stream_path").map(|v| v.as_string()).unwrap_or_default(),
+                    s.get("__charset").map(|v| v.as_string()).unwrap_or_else(|| "UTF-8".to_string()),
+                ),
+                _ => (String::new(), "UTF-8".to_string()),
+            };
+            let mut lines: Vec<CfmlValue> = Vec::new();
+            if !path.is_empty() {
+                let content = match std::fs::read(&path) {
+                    Ok(bytes) => decode_bytes(&bytes, &charset),
+                    Err(e) => {
+                        return Err(CfmlError::runtime(format!(
+                            "BufferedReader: cannot read file [{}]: {}",
+                            path, e
+                        )))
+                    }
+                };
+                // BufferedReader.readLine() splits on \n, \r, or \r\n and drops the
+                // terminator. str::lines() matches this (and ignores a trailing
+                // newline), which is the behavior resourceBundle depends on.
+                for line in content.lines() {
+                    lines.push(CfmlValue::string(line.to_string()));
+                }
+            }
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.io.bufferedreader".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__br_lines".to_string(), CfmlValue::array(lines));
+            shim.insert("__br_pos".to_string(), CfmlValue::Int(0));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "readline" => {
+            // Return the next line, advancing the in-place cursor (Arc-backed
+            // shim). At EOF return Null so `isDefined()`/null-check loops end.
+            if let CfmlValue::Struct(ref s) = object {
+                let pos = s.get("__br_pos").map(|v| java_int_arg(&v)).unwrap_or(0);
+                if let Some(CfmlValue::Array(ref a)) = s.get("__br_lines") {
+                    if (pos as usize) < a.len() {
+                        s.insert("__br_pos".to_string(), CfmlValue::Int(pos + 1));
+                        return Ok(a.get(pos as usize).unwrap_or(CfmlValue::Null));
+                    }
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "ready" => {
+            if let CfmlValue::Struct(ref s) = object {
+                let pos = s.get("__br_pos").map(|v| java_int_arg(&v)).unwrap_or(0);
+                if let Some(CfmlValue::Array(ref a)) = s.get("__br_lines") {
+                    return Ok(CfmlValue::Bool((pos as usize) < a.len()));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "close" => Ok(CfmlValue::string(String::new())),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// Decode raw file bytes with a named charset. UTF-8 (the common case) uses a
+/// lossy decode; latin-1/1252 map bytes to code points; unknown charsets fall
+/// back to lossy UTF-8.
+fn decode_bytes(bytes: &[u8], charset: &str) -> String {
+    let cs = charset.to_lowercase().replace(['-', '_', ' '], "");
+    match cs.as_str() {
+        "iso88591" | "latin1" | "cp1252" | "windows1252" => {
+            bytes.iter().map(|&b| b as char).collect()
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 pub fn handle_java_propertyresourcebundle(
     method: &str,
     args: Vec<CfmlValue>,
@@ -3991,6 +4079,246 @@ pub fn handle_java_decimalformatsymbols(
         "getinfinity" => s("\u{221e}"),
         "getnan" => s("NaN"),
         _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// `java.text.MessageFormat` — locale-aware message templating with `{index}`
+/// argument placeholders (optionally `{index,number[,style]}` / `{index,date}` /
+/// `{index,time}`). Mura/Masa's `resourceBundle.formatRB()` builds one via
+/// `msgFormat.init(pattern, locale)` then calls `.format(argsArray)`.
+///
+/// Supported: positional substitution, MessageFormat quoting (`'text'` is
+/// literal, `''` is a literal apostrophe), and the `number` format type with
+/// `integer`/`percent`/`currency` sub-styles. `date`/`time`/`choice` types
+/// fall back to the value's plain string form (rarely used in resource
+/// bundles). Grouping uses the en-style comma/dot separators — locale-specific
+/// separators beyond that are not applied (documented in docs/known-issues.md).
+pub fn handle_java_messageformat(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let pattern_of = |o: &CfmlValue| -> String {
+        if let CfmlValue::Struct(s) = o {
+            if let Some(p) = s.get("__mf_pattern") {
+                return p.as_string();
+            }
+        }
+        String::new()
+    };
+    let make = |pattern: String, locale: String| {
+        let mut shim = jshim("java.text.messageformat");
+        shim.insert("__mf_pattern".to_string(), CfmlValue::string(pattern));
+        shim.insert("__mf_locale".to_string(), CfmlValue::string(locale));
+        CfmlValue::strukt(shim)
+    };
+    match method {
+        "init" => {
+            // No-arg createObject → bare class-ref shim. `init(pattern[, locale])`
+            // (used as the constructor `new MessageFormat(pattern, locale)`) →
+            // formatter carrying the pattern.
+            if args.is_empty() {
+                return Ok(CfmlValue::strukt(jshim("java.text.messageformat")));
+            }
+            let pattern = args[0].as_string();
+            let locale = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+            Ok(make(pattern, locale))
+        }
+        "applypattern" => {
+            let pattern = args.first().map(|v| v.as_string()).unwrap_or_default();
+            let locale = if let CfmlValue::Struct(s) = object {
+                s.get("__mf_locale").map(|v| v.as_string()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Ok(make(pattern, locale))
+        }
+        "topattern" => Ok(CfmlValue::string(pattern_of(object))),
+        "format" => {
+            // `.format(argsArray)` (static-style `MessageFormat.format(pattern,
+            // args)` isn't how Mura calls it, but support a 2-arg form too).
+            let (pattern, fmt_args) = if let CfmlValue::Struct(s) = object {
+                if s.contains_key("__mf_pattern") {
+                    (pattern_of(object), args.first().cloned())
+                } else {
+                    // class-ref receiver: static form format(pattern, args)
+                    (
+                        args.first().map(|v| v.as_string()).unwrap_or_default(),
+                        args.get(1).cloned(),
+                    )
+                }
+            } else {
+                (pattern_of(object), args.first().cloned())
+            };
+            let arg_vec: Vec<CfmlValue> = match fmt_args {
+                Some(CfmlValue::Array(a)) => a.iter().collect(),
+                Some(other) => vec![other],
+                None => Vec::new(),
+            };
+            Ok(CfmlValue::string(format_message_pattern(&pattern, &arg_vec)))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// Render a `java.text.MessageFormat` pattern against positional `args`.
+fn format_message_pattern(pattern: &str, args: &[CfmlValue]) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let len = chars.len();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        if c == '\'' {
+            // MessageFormat quoting: '' -> literal ', 'text' -> literal text
+            if i + 1 < len && chars[i + 1] == '\'' {
+                out.push('\'');
+                i += 2;
+                continue;
+            }
+            // Opening quote — copy verbatim until the closing quote (or EOS).
+            i += 1;
+            while i < len && chars[i] != '\'' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                i += 1; // consume closing quote
+            }
+            continue;
+        }
+        if c == '{' {
+            // Collect up to the matching '}' (account for nested {} in styles).
+            let mut depth = 1;
+            let mut j = i + 1;
+            let mut inner = String::new();
+            while j < len && depth > 0 {
+                match chars[j] {
+                    '{' => {
+                        depth += 1;
+                        inner.push('{');
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if depth > 0 {
+                            inner.push('}');
+                        }
+                    }
+                    other => inner.push(other),
+                }
+                j += 1;
+            }
+            out.push_str(&format_message_element(&inner, args));
+            i = j;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Format one `{index[,type[,style]]}` element.
+fn format_message_element(inner: &str, args: &[CfmlValue]) -> String {
+    let mut parts = inner.splitn(3, ',');
+    let idx_str = parts.next().unwrap_or("").trim();
+    let ftype = parts.next().map(|s| s.trim().to_lowercase());
+    let fstyle = parts.next().map(|s| s.trim().to_lowercase());
+
+    let idx: usize = match idx_str.parse() {
+        Ok(n) => n,
+        Err(_) => return format!("{{{}}}", inner),
+    };
+    let value = match args.get(idx) {
+        Some(v) => v,
+        None => return String::new(),
+    };
+
+    match ftype.as_deref() {
+        Some("number") => format_message_number(value, fstyle.as_deref()),
+        // date/time/choice: best-effort plain rendering (resource-bundle
+        // patterns overwhelmingly use bare {n} and {n,number}).
+        _ => value.as_string(),
+    }
+}
+
+/// `{n,number[,style]}` — en-style grouped number, matching the JVM's default.
+fn format_message_number(value: &CfmlValue, style: Option<&str>) -> String {
+    let num = match value {
+        CfmlValue::Int(n) => *n as f64,
+        CfmlValue::Double(d) => *d,
+        other => match other.as_string().trim().parse::<f64>() {
+            Ok(n) => n,
+            Err(_) => return other.as_string(),
+        },
+    };
+    match style {
+        Some("integer") => group_thousands(&format!("{}", num.round() as i64)),
+        Some("percent") => group_thousands(&format!("{}", (num * 100.0).round() as i64)) + "%",
+        Some("currency") => format!("${}", group_decimal(num, 2)),
+        _ => {
+            if num.fract() == 0.0 && num.abs() < 1e15 {
+                group_thousands(&format!("{}", num as i64))
+            } else {
+                // JVM number format shows up to 3 fraction digits by default.
+                let s = format!("{:.3}", num);
+                let s = s.trim_end_matches('0').trim_end_matches('.');
+                let (int_part, frac_part) = match s.split_once('.') {
+                    Some((a, b)) => (a, Some(b)),
+                    None => (s, None),
+                };
+                let neg = int_part.starts_with('-');
+                let grouped = group_thousands(int_part.trim_start_matches('-'));
+                let mut r = String::new();
+                if neg {
+                    r.push('-');
+                }
+                r.push_str(&grouped);
+                if let Some(f) = frac_part {
+                    r.push('.');
+                    r.push_str(f);
+                }
+                r
+            }
+        }
+    }
+}
+
+/// Insert comma thousands separators into an integer string (may be negative).
+fn group_thousands(s: &str) -> String {
+    let neg = s.starts_with('-');
+    let digits = s.trim_start_matches('-');
+    let bytes: Vec<char> = digits.chars().collect();
+    let mut out = String::new();
+    let n = bytes.len();
+    for (k, ch) in bytes.iter().enumerate() {
+        if k > 0 && (n - k) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*ch);
+    }
+    if neg {
+        format!("-{}", out)
+    } else {
+        out
+    }
+}
+
+/// Grouped fixed-point with `frac` fraction digits (for currency).
+fn group_decimal(num: f64, frac: usize) -> String {
+    let s = format!("{:.*}", frac, num);
+    let neg = s.starts_with('-');
+    let s = s.trim_start_matches('-');
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+    let mut r = group_thousands(int_part);
+    if !frac_part.is_empty() {
+        r.push('.');
+        r.push_str(frac_part);
+    }
+    if neg {
+        format!("-{}", r)
+    } else {
+        r
     }
 }
 

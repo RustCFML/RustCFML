@@ -3113,6 +3113,25 @@ impl CfmlVirtualMachine {
         {
             return Some(q.clone());
         }
+        // Inside a CFC method the component's `variables` scope lives as a
+        // `__variables` struct on the frame's locals (not on `self.globals`,
+        // which is the page-level scope). A query written via `name="variables.x"`
+        // — or an unscoped write under classic localmode — lands there, so QoQ
+        // source tables must be resolvable from it. Masa's pluginManager builds
+        // `variables.rsScripts` via QoQ, then a second QoQ reads it back.
+        if let Some(CfmlValue::Struct(vars)) = parent_locals
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("__variables"))
+            .map(|(_, v)| v)
+        {
+            if let Some(CfmlValue::Query(q)) = vars
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+                .map(|(_, v)| v)
+            {
+                return Some(q.clone());
+            }
+        }
         if let Some(CfmlValue::Query(q)) = self
             .globals
             .iter()
@@ -13187,7 +13206,12 @@ impl CfmlVirtualMachine {
                                 "java.util.treemap" => {
                                     handle_java_treemap("init", empty_args, &CfmlValue::Null)
                                 }
-                                "java.util.linkedhashmap" => {
+                                // java.util.HashMap is unordered in the JVM, but an
+                                // insertion-ordered LinkedHashMap shim is a faithful
+                                // superset for CFML use — reuse it (the shim's
+                                // internal class becomes linkedhashmap, so all method
+                                // dispatch follows automatically).
+                                "java.util.hashmap" | "java.util.linkedhashmap" => {
                                     handle_java_linkedhashmap("init", empty_args, &CfmlValue::Null)
                                 }
                                 "java.util.concurrent.linkedqueue"
@@ -13285,6 +13309,9 @@ impl CfmlVirtualMachine {
                                 "java.text.dateformat" | "java.text.simpledateformat" => {
                                     java_shims::handle_java_dateformat("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.text.messageformat" => {
+                                    java_shims::handle_java_messageformat("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.lang.class" => {
                                     java_shims::handle_java_class("init", empty_args, &CfmlValue::Null)
                                 }
@@ -13310,6 +13337,9 @@ impl CfmlVirtualMachine {
                                 }
                                 "java.io.inputstreamreader" => {
                                     java_shims::handle_java_inputstreamreader("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.io.bufferedreader" => {
+                                    java_shims::handle_java_bufferedreader("init", empty_args, &CfmlValue::Null)
                                 }
                                 "java.util.propertyresourcebundle" => {
                                     java_shims::handle_java_propertyresourcebundle("init", empty_args, &CfmlValue::Null)
@@ -19069,6 +19099,9 @@ impl CfmlVirtualMachine {
                     "java.io.inputstreamreader" => {
                         java_shims::handle_java_inputstreamreader(&m, all_args, object)
                     }
+                    "java.io.bufferedreader" => {
+                        java_shims::handle_java_bufferedreader(&m, all_args, object)
+                    }
                     "java.util.propertyresourcebundle" => {
                         java_shims::handle_java_propertyresourcebundle(&m, all_args, object)
                     }
@@ -19104,6 +19137,9 @@ impl CfmlVirtualMachine {
                     }
                     "java.text.dateformat" | "java.text.simpledateformat" => {
                         java_shims::handle_java_dateformat(&m, all_args, object)
+                    }
+                    "java.text.messageformat" => {
+                        java_shims::handle_java_messageformat(&m, all_args, object)
                     }
                     _ => Ok(CfmlValue::Null),
                 };

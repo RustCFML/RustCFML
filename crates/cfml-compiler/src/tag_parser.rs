@@ -1709,10 +1709,61 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // Method: always quoted
             let method_expr = format!("\"{}\"", method);
 
-            // Third argument: argumentcollection or struct of remaining attrs
+            // `<cfinvoke>` may be a container with `<cfinvokeargument name= value=>`
+            // children (each a distinct method argument) — e.g. Mura/Masa's event
+            // dispatch passes the scope object as an argument literally named `$`.
+            // The children are the ONLY place those args live, so a self-closing
+            // parse silently dropped every argument. If a matching `</cfinvoke>`
+            // exists (and the open tag isn't self-closed), harvest the children.
+            let mut child_parts: Vec<String> = Vec::new();
+            let mut consumed = tag_end - start;
+            if !is_self_closing_tag(chars, tag_end) {
+                if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfinvoke") {
+                    let mut i = tag_end;
+                    while i < close_pos {
+                        if chars[i] == '<' {
+                            let rem: String =
+                                chars[i..].iter().take(17).collect::<String>().to_lowercase();
+                            if rem.starts_with("<cfinvokeargument") {
+                                // Name-end: skip past the tag name to its attributes.
+                                let mut ne = i + 1;
+                                while ne < len
+                                    && (chars[ne].is_alphanumeric() || chars[ne] == '_')
+                                {
+                                    ne += 1;
+                                }
+                                let (cattrs, cquoted, _order, cend) =
+                                    parse_tag_attributes_ordered(chars, ne, len);
+                                if let Some(argname) = cattrs.get("name") {
+                                    // The arg key is the (possibly `$`) name; always
+                                    // quote it so keys like `$` are legal struct keys.
+                                    let key = strip_hashes(argname);
+                                    let val = cattrs
+                                        .get("value")
+                                        .map(|v| format_attr_value(v, cquoted.contains("value")))
+                                        .unwrap_or_else(|| "\"\"".to_string());
+                                    child_parts.push(format!("\"{}\": {}", key, val));
+                                }
+                                i = cend;
+                                continue;
+                            }
+                        }
+                        i += 1;
+                    }
+                    consumed = find_tag_end(chars, close_pos, len) - start;
+                }
+            }
+
+            // Third argument: argumentcollection or struct of remaining attrs +
+            // any harvested `<cfinvokeargument>` children.
             let third_arg = if let Some(ac) = arg_collection {
                 let ac = strip_hashes(&ac);
-                ac
+                if child_parts.is_empty() {
+                    ac
+                } else {
+                    // Base collection plus per-arg overrides (individual args win).
+                    format!("structAppend(duplicate({}), {{ {} }}, true)", ac, child_parts.join(", "))
+                }
             } else {
                 let reserved = ["component", "method", "returnvariable", "argumentcollection"];
                 let mut extra_parts = Vec::new();
@@ -1722,14 +1773,15 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     }
                     extra_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
                 }
+                extra_parts.extend(child_parts);
                 format!("{{ {} }}", extra_parts.join(", "))
             };
 
             let call = format!("__cfinvoke({}, {}, {})", comp_expr, method_expr, third_arg);
             if let Some(rv) = return_var {
-                (format!("{} = {};\n", rv, call), tag_end - start)
+                (format!("{} = {};\n", rv, call), consumed)
             } else {
-                (format!("{};\n", call), tag_end - start)
+                (format!("{};\n", call), consumed)
             }
         }
         "cfmodule" => {

@@ -536,6 +536,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
 <cf_runtest file="java_shims/test_optional.cfm">
+<cf_runtest file="java_shims/test_masa_io_text_shims.cfm">
 
 <!--- --- Engine Compatibility --- --->
 <cf_runtest file="compat_engine/test_math_functions.cfm">
@@ -664,6 +665,7 @@ include "harness.cfm";
 <!--- also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee --->
 <!--- rejects it, so the cross-engine test uses the cf-less `invoke`.) --->
 <cf_runtest file="tags/test_cfinvoke_statement.cfm">
+<cf_runtest file="tags/test_cfinvoke_argument_children.cfm">
 <!--- - cfinvoke_call_form_marshaling: the cf-PREFIXED parenthesized CALL form --->
 <!--- cfinvoke(...) — the spelling Lucee accepts and Wheels' Global.cfc --->
 <!--- $invoke() uses — must marshal attributeCollection, deliver --->
@@ -856,6 +858,7 @@ include "harness.cfm";
 <cf_runtest file="qoq/test_qoq_rustcfml_ext.cfm">
 <cf_runtest file="qoq/test_queryexecute_maxrows_list.cfm">
 <cf_runtest file="qoq/test_queryexecute_returntype_result.cfm">
+<cf_runtest file="qoq/test_qoq_component_variables_scope.cfm">
 
 <!--- WebSocket / realtime: connection-free harness coverage (live-socket --->
 <!--- behaviour is covered by crates/cli/tests/websocket_raw.rs). --->
