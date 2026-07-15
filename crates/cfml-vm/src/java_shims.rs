@@ -435,7 +435,9 @@ pub fn handle_java_messagedigest(
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("__algorithm".to_string(), CfmlValue::string(algorithm));
-            shim.insert("__data".to_string(), CfmlValue::string(String::new()));
+            // Accumulate the fed bytes verbatim (raw byte[]), so binary input
+            // hashes correctly — a lossy UTF-8 String round-trip would corrupt it.
+            shim.insert("__data".to_string(), CfmlValue::Binary(Vec::new()));
             Ok(CfmlValue::strukt(shim))
         }
         "update" => {
@@ -443,32 +445,43 @@ pub fn handle_java_messagedigest(
             // Binary (from "...".getBytes()) and String (lenient) so Lucee and
             // RustCFML run the same interop code without rewrites.
             if let CfmlValue::Struct(ref shim) = object {
-                let current = shim
-                    .get("__data")
-                    .map(|d| d.as_string())
-                    .unwrap_or_default();
-                let input = match args.first() {
-                    Some(CfmlValue::Binary(b)) => String::from_utf8_lossy(b).to_string(),
-                    Some(v) => v.as_string(),
-                    None => String::new(),
+                let mut current = match shim.get("__data") {
+                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(other) => other.as_string().into_bytes(),
+                    None => Vec::new(),
+                };
+                match args.first() {
+                    Some(CfmlValue::Binary(b)) => current.extend_from_slice(b),
+                    Some(v) => current.extend_from_slice(v.as_string().as_bytes()),
+                    None => {}
                 };
                 let mut new_shim = shim.snapshot();
-                new_shim.insert(
-                    "__data".to_string(),
-                    CfmlValue::string(format!("{}{}", current, input)),
-                );
+                new_shim.insert("__data".to_string(), CfmlValue::Binary(current));
                 Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
             }
         }
         "digest" => {
+            // Real Java MessageDigest.digest() returns the byte[] hash of the
+            // accumulated input under the configured algorithm. An optional arg
+            // is a final chunk to feed before finishing (Java's digest(byte[])).
             if let CfmlValue::Struct(ref shim) = object {
-                let data = shim
-                    .get("__data")
-                    .map(|d| d.as_string())
-                    .unwrap_or_default();
-                Ok(CfmlValue::Binary(data.into_bytes()))
+                let mut data = match shim.get("__data") {
+                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(other) => other.as_string().into_bytes(),
+                    None => Vec::new(),
+                };
+                match args.first() {
+                    Some(CfmlValue::Binary(b)) => data.extend_from_slice(b),
+                    Some(v) => data.extend_from_slice(v.as_string().as_bytes()),
+                    None => {}
+                }
+                let algorithm = shim
+                    .get("__algorithm")
+                    .map(|a| a.as_string())
+                    .unwrap_or_else(|| "sha-256".to_string());
+                Ok(CfmlValue::Binary(message_digest_hash(&algorithm, &data)))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -494,13 +507,29 @@ pub fn handle_java_messagedigest(
         "reset" => {
             if let CfmlValue::Struct(ref shim) = object {
                 let mut new_shim = shim.snapshot();
-                new_shim.insert("__data".to_string(), CfmlValue::string(String::new()));
+                new_shim.insert("__data".to_string(), CfmlValue::Binary(Vec::new()));
                 Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
             }
         }
         _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// Compute a raw byte[] hash of `data` under a Java `MessageDigest` algorithm
+/// name (case-insensitive; `-` optional, e.g. "SHA-256"/"sha256"). Mirrors the
+/// algorithm set of cfml-stdlib's `hash()`. Unknown algorithms fall back to
+/// MD5, matching that builtin's behaviour.
+fn message_digest_hash(algorithm: &str, data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    let normalized = algorithm.to_ascii_uppercase().replace('-', "");
+    match normalized.as_str() {
+        "SHA1" => sha1::Sha1::digest(data).to_vec(),
+        "SHA256" => sha2::Sha256::digest(data).to_vec(),
+        "SHA384" => sha2::Sha384::digest(data).to_vec(),
+        "SHA512" => sha2::Sha512::digest(data).to_vec(),
+        _ => md5::Md5::digest(data).to_vec(),
     }
 }
 

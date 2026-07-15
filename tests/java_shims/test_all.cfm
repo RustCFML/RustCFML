@@ -218,6 +218,29 @@ if ( len( far_source ) >= far_pos ) {
 }
 assert( "in-place find-and-replace preserves order", arrayToList( far_builder, "" ), "Lorem [{{a}}] ipsum [{{bb}}] sit." );
 
+// MessageDigest — digest() must produce the REAL hash of the fed bytes, not
+// echo them back. Known SHA-256 of "abc" and cross-check against hash().
+md = createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" );
+md.update( "abc".getBytes() );
+mdHex = lCase( binaryEncode( md.digest(), "hex" ) );
+assert(
+    "MessageDigest SHA-256 of 'abc' matches known digest",
+    mdHex,
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+);
+assert( "MessageDigest SHA-256 agrees with hash()", mdHex, lCase( hash( "abc", "SHA-256" ) ) );
+
+// update() accumulates across calls, exactly like Java.
+md2 = createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" );
+md2.update( "ab".getBytes() );
+md2.update( "c".getBytes() );
+assert( "MessageDigest update() accumulates chunks", lCase( binaryEncode( md2.digest(), "hex" ) ), mdHex );
+
+// MD5 (the default algorithm) also hashes for real.
+md5 = createObject( "java", "java.security.MessageDigest" ).getInstance( "MD5" );
+md5.update( "abc".getBytes() );
+assert( "MessageDigest MD5 of 'abc'", lCase( binaryEncode( md5.digest(), "hex" ) ), "900150983cd24fb0d6963f7d28e17f72" );
+
 writeOutput( "\n=== All Java shim tests passed! ===\n" );
 
 suiteEnd( "Java Shims" );
