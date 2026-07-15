@@ -11,6 +11,12 @@ assert("toBase64 round-trip", decoded, "hello");
 urlEncoded = urlEncodedFormat("hello world");
 assertTrue("urlEncodedFormat encodes space", find("+", urlEncoded) > 0 || find("%20", urlEncoded) > 0);
 assert("urlDecode round-trip", urlDecode(urlEncodedFormat("hello world")), "hello world");
+// GH #270: space must encode as %20 (Lucee/ACF), never `+`.
+assert("urlEncodedFormat space is %20", urlEncodedFormat("My app"), "My%20app");
+assert("encodeForURL space is %20", encodeForURL("My app"), "My%20app");
+assert("urlEncodedFormat + is %2B", urlEncodedFormat("a+b"), "a%2Bb");
+// urlDecode still tolerates + as space (form-encoded input).
+assert("urlDecode tolerates +", urlDecode("My+app"), "My app");
 
 // --- htmlEditFormat ---
 htmlEscaped = htmlEditFormat("<b>hi</b>");

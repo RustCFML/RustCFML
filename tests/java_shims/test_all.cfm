@@ -218,6 +218,17 @@ if ( len( far_source ) >= far_pos ) {
 }
 assert( "in-place find-and-replace preserves order", arrayToList( far_builder, "" ), "Lorem [{{a}}] ipsum [{{bb}}] sit." );
 
+// GH #271: String.getBytes() returns a native byte[] — on Lucee that is
+// array-like (isArray true, arrayLen = byte count, signed-byte elements).
+gb = "foobar".getBytes();
+assertTrue( "getBytes() isArray", isArray( gb ) );
+assert( "getBytes() arrayLen", arrayLen( gb ), 6 );
+assert( "getBytes() first byte (ASCII 'f')", gb[ 1 ], 102 );
+// High-bit byte comes back SIGNED (Java byte semantics): 0xE2 -> -30.
+euroBytes = "€".getBytes();  // UTF-8 E2 82 AC
+assert( "getBytes() UTF-8 length", arrayLen( euroBytes ), 3 );
+assert( "getBytes() signed high byte", euroBytes[ 1 ], -30 );
+
 // MessageDigest — digest() must produce the REAL hash of the fed bytes, not
 // echo them back. Known SHA-256 of "abc" and cross-check against hash().
 md = createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" );

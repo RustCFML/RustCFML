@@ -969,7 +969,17 @@ impl CfmlCompiler {
                 if let Some(path) = Self::scope_rooted_nested_path(obj, member) {
                     Some(path)
                 } else if let Expression::Identifier(ref ident) = **obj {
-                    Some(format!("{}.{}", ident.name, member))
+                    // Single-level `base.member = null`. A reserved SCOPE root
+                    // (variables/local/request/this/…) keeps scope
+                    // null-assignment semantics (delete the key). A plain STRUCT
+                    // variable does NOT: a null value stays an enumerable null
+                    // key, matching the bracket form `s["x"]=null`, struct
+                    // literals, and Lucee (GH #268).
+                    if Self::is_reserved_scope_name(&ident.name) {
+                        Some(format!("{}.{}", ident.name, member))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -992,7 +1002,14 @@ impl CfmlCompiler {
                 if Self::scope_rooted_nested_path(&access.object, &access.member).is_some() {
                     None
                 } else if let Expression::Identifier(ref ident) = *access.object {
-                    Some(format!("{}.{}", ident.name, access.member))
+                    // See assign_unset_path: only a reserved SCOPE root keeps
+                    // null-delete; a plain struct member keeps the enumerable
+                    // null key (GH #268).
+                    if Self::is_reserved_scope_name(&ident.name) {
+                        Some(format!("{}.{}", ident.name, access.member))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }

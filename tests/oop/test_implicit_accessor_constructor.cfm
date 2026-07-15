@@ -35,5 +35,25 @@ assert( "explicit init wins over implicit population", withInit.getApi(), "from-
 plain = new oop.PlainDto( api="/v1" );
 assert( "non-accessor component is not populated", plain.readApi(), "/" );
 
+// GH #266: the implicit accessor constructor maps INHERITED (parent-declared)
+// properties too, not just the component's own.
+child = new oop.AccessorInheritChild( foo="cf", bar="cb", baz="cz" );
+assert( "inherited property populated (foo)", child.getFoo(), "cf" );
+assert( "inherited property populated (bar)", child.getBar(), "cb" );
+assert( "own property populated (baz)",       child.getBaz(), "cz" );
+// Inherited default still applies when not passed.
+childDef = new oop.AccessorInheritChild( baz="only" );
+assert( "inherited default retained", childDef.getFoo(), "D" );
+
+// GH #267: serializeJSON includes accessor-property values that live only in
+// the private variables scope — inherited and default-only properties.
+j = deserializeJSON( serializeJSON( child ) );
+assert( "serializeJSON includes inherited foo", j.foo, "cf" );
+assert( "serializeJSON includes inherited bar", j.bar, "cb" );
+assert( "serializeJSON includes own baz",       j.baz, "cz" );
+// Default-only inherited property (never explicitly set) is serialized too.
+jd = deserializeJSON( serializeJSON( childDef ) );
+assert( "serializeJSON includes default-only foo", jd.foo, "D" );
+
 suiteEnd();
 </cfscript>

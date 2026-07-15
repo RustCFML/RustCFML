@@ -1950,7 +1950,9 @@ fn fn_url_encode(args: Vec<CfmlValue>) -> CfmlResult {
     for c in s.chars() {
         match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => result.push(c),
-            ' ' => result.push('+'),
+            // CFML (Lucee/ACF) encode a space as %20, NOT `+`. Only
+            // application/x-www-form-urlencoded uses `+`; urlEncodedFormat /
+            // encodeForURL / urlEncode all produce %20. (GH #270)
             _ => {
                 for b in c.to_string().as_bytes() {
                     result.push_str(&format!("%{:02X}", b));
@@ -5650,7 +5652,7 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) 
     // must too, or a struct built via structAppend(s, arguments) leaks
     // them into the JSON (Lucee has no such keys).
     let is_args = s.contains_key("__arguments_scope");
-    let items: Vec<String> = s
+    let mut items: Vec<String> = s
         .iter()
         .filter(|(k, _)| k.as_str() != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER)
         .filter(|(k, _)| {
@@ -5669,6 +5671,43 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) 
         })
         .map(|(k, v)| format!("\"{}\":{}", json_escape_str(&k), serialize_value(&v, visited, by_columns)))
         .collect();
+
+    // For a CFC, accessor-`property` values that were never written to the
+    // top-level `this` scope live only in the private `variables` backing — this
+    // is the case for default-only properties (declared `default=` but never
+    // set) and inherited ones. Lucee serializes these too; enumerating only
+    // top-level keys drops them (GH #267). Pull each declared property's value
+    // from `__variables` when it wasn't already emitted above.
+    if is_cfc {
+        let vars_val = s.get("__variables");
+        if let (Some(props), Some(vars_val)) =
+            (s.get("__properties").and_then(|v| v.as_array()), vars_val)
+        {
+            for prop in &props {
+                let Some(pname) = prop
+                    .as_cfml_struct()
+                    .and_then(|ps| ps.get_ci("name"))
+                    .map(|n| n.as_string())
+                else {
+                    continue;
+                };
+                // Already emitted from the top level? (case-insensitive)
+                if s.contains_key_ci(&pname) {
+                    continue;
+                }
+                if let Some(pv) = vars_val.get_ci(&pname) {
+                    if matches!(pv, CfmlValue::Function(_) | CfmlValue::Closure(_)) {
+                        continue;
+                    }
+                    items.push(format!(
+                        "\"{}\":{}",
+                        json_escape_str(&pname),
+                        serialize_value(&pv, visited, by_columns)
+                    ));
+                }
+            }
+        }
+    }
     format!("{{{}}}", items.join(","))
 }
 
@@ -10921,11 +10960,16 @@ fn execute_mysql_on_conn(
         // tried to rename a column that no longer existed.)
         let mut result = conn.exec_iter(sql, &params)
             .map_err(|e| map_err(e, "query error"))?;
-        let columns: Vec<String> = result
-            .columns()
+        let cols_meta = result.columns();
+        let columns: Vec<String> = cols_meta
             .as_ref()
             .iter()
             .map(|c| c.name_str().to_string())
+            .collect();
+        let col_types: Vec<mysql::consts::ColumnType> = cols_meta
+            .as_ref()
+            .iter()
+            .map(|c| c.column_type())
             .collect();
 
         let mut rows: Vec<ValueMap> = Vec::new();
@@ -10934,7 +10978,7 @@ fn execute_mysql_on_conn(
             let mut row_map = ValueMap::default();
             for (i, col) in columns.iter().enumerate() {
                 let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
-                row_map.insert(col.clone(), mysql_value_to_cfml(val));
+                row_map.insert(col.clone(), mysql_value_to_cfml_typed(val, col_types.get(i).copied()));
             }
             rows.push(row_map);
         }
@@ -10982,15 +11026,16 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
                 Err(_) => CfmlValue::Binary(b),
             }
         }
-        // DATE columns come with all-zero time fields; DATETIME/TIMESTAMP have
-        // populated time fields. Match CFML's canonical formats so dateFormat
-        // and timeFormat work without further coercion.
+        // DATE / DATETIME / TIMESTAMP all arrive as `Value::Date`; a DATE column
+        // (and a DATETIME at midnight) carries all-zero time fields. Lucee/ACF
+        // surface EVERY temporal column as a full datetime — a DATE becomes a
+        // datetime at midnight, and a DATETIME never drops its (possibly
+        // midnight) time. Always emit the full `YYYY-MM-DD HH:MM:SS` form (the
+        // same canonical datetime string now()/createDateTime produce), so the
+        // time component is never lost. (GH #273 — the old all-zero-time
+        // heuristic collapsed a real DATETIME to a bare date.)
         mysql::Value::Date(y, mo, d, h, mi, s, _us) => {
-            if h == 0 && mi == 0 && s == 0 {
-                CfmlValue::string(format!("{:04}-{:02}-{:02}", y, mo, d))
-            } else {
-                CfmlValue::string(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s))
-            }
+            CfmlValue::string(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s))
         }
         // TIME columns — CFML idiom is the epoch-style 1899-12-30 prefix so
         // dateFormat/timeFormat work. `days` can carry overflow; fold into hours.
@@ -11000,6 +11045,31 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
             CfmlValue::string(format!("1899-12-30 {}{:02}:{:02}:{:02}", sign, total_h, mi, s))
         }
     }
+}
+
+/// Column-type-aware value conversion. Most columns need no type context, but a
+/// few MySQL types are ambiguous at the `Value` level and must key off the
+/// result-set metadata:
+///   - BIT columns arrive as raw big-endian `Bytes` — indistinguishable from a
+///     BINARY/BLOB — yet Lucee/ACF surface the numeric value (`BIT(1)` -> 0/1,
+///     wider BIT -> the integer). (GH #274)
+#[cfg(feature = "mysql_db")]
+fn mysql_value_to_cfml_typed(
+    val: mysql::Value,
+    col_type: Option<mysql::consts::ColumnType>,
+) -> CfmlValue {
+    use mysql::consts::ColumnType;
+    if matches!(col_type, Some(ColumnType::MYSQL_TYPE_BIT)) {
+        if let mysql::Value::Bytes(ref b) = val {
+            // Big-endian bytes -> integer (BIT is stored MSB-first).
+            let mut n: i64 = 0;
+            for &byte in b.iter() {
+                n = (n << 8) | byte as i64;
+            }
+            return CfmlValue::Int(n);
+        }
+    }
+    mysql_value_to_cfml(val)
 }
 
 // -----------------------------------------------
@@ -12515,19 +12585,22 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
             .map_err(|e| CfmlError::database(format!("queryExecute: MySQL query error: {}", e)))?;
-        let columns: Vec<String> = if let Some(first_row) = result.first() {
-            first_row.columns_ref().iter()
-                .map(|c| c.name_str().to_string())
-                .collect()
-        } else {
-            vec![]
-        };
+        let (columns, col_types): (Vec<String>, Vec<mysql::consts::ColumnType>) =
+            if let Some(first_row) = result.first() {
+                let cols = first_row.columns_ref();
+                (
+                    cols.iter().map(|c| c.name_str().to_string()).collect(),
+                    cols.iter().map(|c| c.column_type()).collect(),
+                )
+            } else {
+                (vec![], vec![])
+            };
         let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
         for row in &result {
             let mut row_map = ValueMap::default();
             for (i, col) in columns.iter().enumerate() {
                 let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
-                row_map.insert(col.clone(), mysql_value_to_cfml(val));
+                row_map.insert(col.clone(), mysql_value_to_cfml_typed(val, col_types.get(i).copied()));
             }
             rows.push(row_map);
         }

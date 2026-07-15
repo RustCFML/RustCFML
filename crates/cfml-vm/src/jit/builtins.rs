@@ -406,7 +406,7 @@ extern "C" fn cfml_url_encoded_format_boxed(tagged: i64) -> i64 {
     for c in s.chars() {
         match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => result.push(c),
-            ' ' => result.push('+'),
+            // Space -> %20 (Lucee/ACF parity), not `+`. See GH #270.
             _ => {
                 for b in c.to_string().as_bytes() {
                     let _ = write!(result, "%{:02X}", b);

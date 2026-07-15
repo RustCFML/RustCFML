@@ -124,7 +124,8 @@ assert("decodeFromURL special chars", urlDecoded3, "<>&");
 // urlEncode
 // ========================================
 urlEnc = urlEncode("hello world");
-assertTrue("urlEncode encodes space", find("+", urlEnc) > 0);
+// GH #270: space encodes as %20 (Lucee/ACF), not `+`.
+assertTrue("urlEncode encodes space as %20", find("%20", urlEnc) > 0);
 
 urlEnc2 = urlEncode("a&b=c");
 assertTrue("urlEncode encodes amp", find("%26", urlEnc2) > 0);

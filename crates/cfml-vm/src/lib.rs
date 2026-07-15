@@ -19205,11 +19205,20 @@ impl CfmlVirtualMachine {
                 }
                 "len" | "length" => Some("len"),
                 "getbytes" => {
-                    // java.lang.String.getBytes() returns byte[]. Users wire
-                    // this into e.g. MessageDigest.update(...).getBytes()).
-                    // We honour the common no-arg form and ignore encoding
-                    // arg (Rust strings are UTF-8 already).
-                    return Ok(CfmlValue::Binary(object.as_string().into_bytes()));
+                    // java.lang.String.getBytes() returns byte[]. On Lucee this
+                    // is a native array (isArray -> true, arrayLen -> byte
+                    // count, elements are SIGNED Java bytes, -128..127). Return
+                    // a CFML Array of signed-byte ints to match (GH #271). The
+                    // MessageDigest shims (update/digest/isEqual) accept this
+                    // array form as well as Binary. Encoding arg is ignored
+                    // (Rust strings are UTF-8 already).
+                    let bytes: Vec<CfmlValue> = object
+                        .as_string()
+                        .into_bytes()
+                        .into_iter()
+                        .map(|b| CfmlValue::Int(b as i8 as i64))
+                        .collect();
+                    return Ok(CfmlValue::array(bytes));
                 }
                 "tochararray" => {
                     let chars: Vec<CfmlValue> = object
@@ -23636,6 +23645,45 @@ impl CfmlVirtualMachine {
             parent_map.insert("__variables".to_string(), CfmlValue::strukt(merged_vars));
         }
 
+        // Merge __properties: a child inherits its parent's declared
+        // `property`s. Without this the child's list overwrites the parent's, so
+        // the implicit accessor constructor never maps inherited properties and
+        // serializeJSON skips them (GH #266 / #267). Parent props first (base
+        // class declares them first), then child props; a child property with
+        // the same name replaces the parent's in place.
+        let parent_props: Vec<CfmlValue> = parent_map
+            .get("__properties")
+            .and_then(|v| v.as_array())
+            .unwrap_or_default();
+        let child_props: Vec<CfmlValue> = child_map
+            .get("__properties")
+            .and_then(|v| v.as_array())
+            .unwrap_or_default();
+        if !parent_props.is_empty() || !child_props.is_empty() {
+            let prop_name = |p: &CfmlValue| -> Option<String> {
+                p.as_cfml_struct()
+                    .and_then(|ps| ps.get_ci("name"))
+                    .map(|n| n.as_string())
+            };
+            let mut merged_props = parent_props;
+            for cp in child_props {
+                match prop_name(&cp) {
+                    Some(cn) => {
+                        if let Some(slot) = merged_props
+                            .iter_mut()
+                            .find(|pp| prop_name(pp).is_some_and(|pn| pn.eq_ignore_ascii_case(&cn)))
+                        {
+                            *slot = cp;
+                        } else {
+                            merged_props.push(cp);
+                        }
+                    }
+                    None => merged_props.push(cp),
+                }
+            }
+            parent_map.insert("__properties".to_string(), CfmlValue::array(merged_props));
+        }
+
         // Component-level metadata (displayName, hint, and any other
         // <cfcomponent>-declared attributes) is per-class and must NOT be
         // inherited onto a child's leaf metadata. Lucee/ACF/BoxLang expose a
@@ -23654,7 +23702,7 @@ impl CfmlVirtualMachine {
 
         // Layer child on top of parent (child overrides parent)
         for (k, v) in child_map.iter() {
-            if k == "__extends" || k == "__variables" || k == "__metadata" {
+            if k == "__extends" || k == "__variables" || k == "__metadata" || k == "__properties" {
                 continue; // Already merged above; don't overwrite
             }
             // CFML is case-insensitive: a child member overrides a parent member
@@ -27092,6 +27140,16 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
                     return a == b;
                 }
             }
+            // Date-aware equality: two date VALUES are equal when they name the
+            // same instant, even if their textual forms differ (a plain
+            // `1990-01-01 00:00:00` DB column vs the `{ts '...'}` ODBC literal
+            // `createODBCDateTime` produces). Only engages when BOTH parse as
+            // dates; otherwise a plain case-insensitive string compare. (GH #273)
+            if let (Some(da), Some(db)) =
+                (try_parse_cfml_datetime(x), try_parse_cfml_datetime(y))
+            {
+                return da == db;
+            }
             x.eq_ignore_ascii_case(y)
         }
         // String-number comparison: try to coerce. A boolean-literal string
@@ -27178,6 +27236,58 @@ fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
 }
 
 /// CFML comparison ordering
+/// Best-effort parse of a CFML date/datetime STRING to a comparable instant.
+/// Recognises the ODBC literal forms (`{ts '...'}`, `{d '...'}`, `{t '...'}`)
+/// and the canonical `YYYY-MM-DD[ HH:MM[:SS]]` / `MM/DD/YYYY` forms that
+/// `now()`/`createDateTime` and the DB adapters emit. Returns `None` for
+/// anything that isn't unmistakably a date, so ordinary strings keep their
+/// lexical comparison. A cheap pre-check (a digit plus a `-`/`/`/`{`) keeps the
+/// common non-date string-compare path allocation-free.
+///
+/// Used to make `eq`/`compare` date-aware: Lucee compares two date VALUES as
+/// dates even when their textual forms differ — e.g. a plain
+/// `1990-01-01 00:00:00` (a DB column) vs the `{ts '1990-01-01 00:00:00'}`
+/// literal `createODBCDateTime` produces. (GH #273)
+fn try_parse_cfml_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
+    let s = s.trim();
+    // Quick reject: a date needs a digit AND a date separator (`-`/`/`) or the
+    // ODBC-literal `{` marker. Plain words/identifiers never reach the parser.
+    let has_digit = s.bytes().any(|c| c.is_ascii_digit());
+    let has_sep = s.bytes().any(|c| c == b'-' || c == b'/' || c == b'{');
+    if !has_digit || !has_sep {
+        return None;
+    }
+    // Unwrap an ODBC date/time literal: `{ts '...'}` / `{d '...'}` / `{t '...'}`.
+    let inner: String = if let Some(rest) = s.strip_prefix('{') {
+        let rest = rest.trim_end_matches('}').trim();
+        let rest = rest
+            .strip_prefix("ts ")
+            .or_else(|| rest.strip_prefix("d "))
+            .or_else(|| rest.strip_prefix("t "))
+            .unwrap_or(rest);
+        rest.trim().trim_matches('\'').trim().to_string()
+    } else {
+        s.to_string()
+    };
+    let inner = inner.trim();
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+    ] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(inner, fmt) {
+            return Some(dt);
+        }
+    }
+    for fmt in ["%Y-%m-%d", "%m/%d/%Y"] {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(inner, fmt) {
+            return d.and_hms_opt(0, 0, 0);
+        }
+    }
+    None
+}
+
 fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
     let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
@@ -27210,6 +27320,15 @@ fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
             // Try numeric comparison first
             if let (Ok(a), Ok(b)) = (x.parse::<f64>(), y.parse::<f64>()) {
                 return a.partial_cmp(&b).map_or(0, |o| o as i32);
+            }
+            // Date-aware: Lucee compares two date VALUES as dates even when their
+            // textual forms differ (plain `1990-01-01 00:00:00` vs the ODBC
+            // literal `{ts '1990-01-01 00:00:00'}`). Only engages when BOTH
+            // operands parse as dates; otherwise fall through to lexical. (GH #273)
+            if let (Some(da), Some(db)) =
+                (try_parse_cfml_datetime(x), try_parse_cfml_datetime(y))
+            {
+                return da.cmp(&db) as i32;
             }
             x.to_lowercase().cmp(&y.to_lowercase()) as i32
         }

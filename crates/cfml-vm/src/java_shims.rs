@@ -16,6 +16,27 @@ fn system_property_store(
     PROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Coerce a CFML value used as a Java `byte[]` into raw bytes. Accepts:
+/// - `Binary` (from `toBinary`, `binaryDecode`, …) verbatim;
+/// - an `Array` of signed-byte ints (what `String.getBytes()` returns — see
+///   GH #271); each element is masked to its low 8 bits;
+/// - anything else, via its UTF-8 string form (lenient fallback).
+fn java_byte_array(v: &CfmlValue) -> Vec<u8> {
+    match v {
+        CfmlValue::Binary(b) => b.clone(),
+        CfmlValue::Array(a) => a
+            .snapshot()
+            .iter()
+            .map(|e| match e {
+                CfmlValue::Int(i) => (*i & 0xFF) as u8,
+                CfmlValue::Double(d) => (*d as i64 & 0xFF) as u8,
+                other => other.as_string().parse::<i64>().unwrap_or(0) as u8,
+            })
+            .collect(),
+        other => other.as_string().into_bytes(),
+    }
+}
+
 /// Build a bare java-shim marker map for `class`.
 fn java_shim_map(class: &str) -> ValueMap {
     let mut m = ValueMap::default();
@@ -451,8 +472,7 @@ pub fn handle_java_messagedigest(
                     None => Vec::new(),
                 };
                 match args.first() {
-                    Some(CfmlValue::Binary(b)) => current.extend_from_slice(b),
-                    Some(v) => current.extend_from_slice(v.as_string().as_bytes()),
+                    Some(v) => current.extend_from_slice(&java_byte_array(v)),
                     None => {}
                 };
                 let mut new_shim = shim.snapshot();
@@ -473,8 +493,7 @@ pub fn handle_java_messagedigest(
                     None => Vec::new(),
                 };
                 match args.first() {
-                    Some(CfmlValue::Binary(b)) => data.extend_from_slice(b),
-                    Some(v) => data.extend_from_slice(v.as_string().as_bytes()),
+                    Some(v) => data.extend_from_slice(&java_byte_array(v)),
                     None => {}
                 }
                 let algorithm = shim
@@ -493,13 +512,7 @@ pub fn handle_java_messagedigest(
             // via as_string() made ANY two byte arrays compare equal, defeating
             // JWT signature / password verification. Compare the raw bytes.
             if args.len() >= 2 {
-                fn to_bytes(v: &CfmlValue) -> Vec<u8> {
-                    match v {
-                        CfmlValue::Binary(b) => b.clone(),
-                        other => other.as_string().into_bytes(),
-                    }
-                }
-                Ok(CfmlValue::Bool(to_bytes(&args[0]) == to_bytes(&args[1])))
+                Ok(CfmlValue::Bool(java_byte_array(&args[0]) == java_byte_array(&args[1])))
             } else {
                 Ok(CfmlValue::Null)
             }

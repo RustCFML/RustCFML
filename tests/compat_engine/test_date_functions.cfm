@@ -195,4 +195,25 @@ t1 = getTickCount();
 t2 = getTickCount();
 assertTrue("getTickCount monotonic", t2 >= t1);
 suiteEnd();
+
+// ============================================================
+// GH #273: date-aware EQ/compare — two date VALUES are equal when they name
+// the same instant, even if their textual forms differ. A DB temporal column
+// stringifies to the plain `YYYY-MM-DD HH:MM:SS` form; createODBCDateTime
+// produces the `{ts '...'}` ODBC literal. Comparing the two (e.g. Preside's
+// PresideObjectServiceTest) must be true, matching Lucee.
+// ============================================================
+suiteBegin("GH ##273: date-aware comparison");
+plain = "1990-01-01 00:00:00";
+odbc  = "{ts '1990-01-01 00:00:00'}";
+assertTrue(  "plain EQ odbc-literal",           plain EQ odbc );
+assertTrue(  "odbc-literal EQ plain",           odbc EQ plain );
+assertTrue(  "createODBCDateTime EQ plain date-only-promoted",
+             createODBCDateTime( createDateTime(1990,1,1,0,0,0) ) EQ plain );
+assertFalse( "different instants are NOT equal", plain EQ "{ts '1990-01-02 00:00:00'}" );
+assertTrue(  "earlier LT later (date-aware)",    plain LT "1990-01-02 00:00:00" );
+// A non-date string never engages date comparison (stays lexical).
+assertFalse( "plain word NEQ date", "hello" EQ plain );
+assertTrue(  "two identical words still equal", "hello" EQ "hello" );
+suiteEnd();
 </cfscript>
