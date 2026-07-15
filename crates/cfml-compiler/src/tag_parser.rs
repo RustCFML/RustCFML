@@ -2459,7 +2459,7 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
     // particular need this so attributeCollection="#someStruct#" arrives as
     // a struct, not its stringified form.
     if let Some(inner) = single_hash_expr(raw) {
-        return inner.to_string();
+        return inner;
     }
     // Quoted attribute. Split into literal segments and `#...#` expressions.
     let chars: Vec<char> = raw.chars().collect();
@@ -2510,15 +2510,28 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
 }
 
 /// If `raw` is exactly one `#expr#` spanning the whole value (no surrounding
-/// literal text and no inner `#`), return the inner expression. Such a value
-/// keeps the expression's native type instead of being coerced to a string —
-/// e.g. cfparam default="#[]#" must yield an array, not "".
-fn single_hash_expr(raw: &str) -> Option<&str> {
-    if raw.len() < 2 || !raw.starts_with('#') || !raw.ends_with('#') {
+/// literal text and no second `#...#` segment), return the inner expression.
+/// Such a value keeps the expression's native type instead of being coerced to a
+/// string — e.g. cfparam default="#[]#" must yield an array, not "", and
+/// `attributeCollection="#getQueryAttrs(...)#"` must arrive as a struct.
+///
+/// A nested `#...#` living inside a string literal *within* the expression is
+/// fine: `#f(x='#g()#')#` is still ONE expression. We locate the hash that
+/// closes the opening `#` with `find_closing_hash` (string/paren aware) and only
+/// treat the value as a single expression when that closing hash is the very
+/// last character.
+fn single_hash_expr(raw: &str) -> Option<String> {
+    if !raw.starts_with('#') || raw.len() < 2 {
         return None;
     }
-    let inner = &raw[1..raw.len() - 1];
-    if inner.is_empty() || inner.contains('#') {
+    let chars: Vec<char> = raw.chars().collect();
+    let len = chars.len();
+    let close = find_closing_hash(&chars, 1, len)?;
+    if close != len - 1 {
+        return None;
+    }
+    let inner: String = chars[1..close].iter().collect();
+    if inner.is_empty() {
         return None;
     }
     Some(inner)
@@ -3994,6 +4007,32 @@ mod tests {
         assert!(result.contains("for (var i = 1; ("));
         assert!(result.contains("i >= 10 : i <= 10"));
         assert!(result.contains("i = i + __cfloop_step_"));
+    }
+
+    #[test]
+    fn test_single_hash_expr_with_nested_interpolation() {
+        // A whole-value `#expr#` whose expression contains a nested `#...#`
+        // inside a string literal is still ONE expression and must keep its
+        // native type — NOT be coerced through `"" & (...)` string concat.
+        // Regression: <cfdbinfo attributeCollection="#getQueryAttrs(name='rs',
+        // table='#qualifySchema(t)#',type='columns')#"> was arriving as a
+        // STRING, so cfdbinfo could not find [name] (Masa admin boot).
+        let raw = "#getQueryAttrs(name='rs',table='#qualifySchema(t)#',type='columns')#";
+        let out = format_attr_value(raw, true);
+        assert!(!out.starts_with("\"\" &"), "must not string-coerce: {out}");
+        assert_eq!(
+            out,
+            "getQueryAttrs(name='rs',table='#qualifySchema(t)#',type='columns')"
+        );
+
+        // Plain single-expression case still works (no nested hash).
+        assert_eq!(format_attr_value("#getQueryAttrs(x=1)#", true), "getQueryAttrs(x=1)");
+
+        // Two separate interpolations are NOT a single expression — the
+        // interpolation (concat) path must still apply.
+        assert!(format_attr_value("#a#-#b#", true).contains(" & "));
+        // Trailing literal after the expression is also interpolation.
+        assert!(format_attr_value("#a#x", true).contains(" & "));
     }
 
     #[test]
