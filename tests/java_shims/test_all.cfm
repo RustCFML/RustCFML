@@ -185,6 +185,20 @@ while ( multiMatcher.find() ) {
 assert( "Pattern find loop walks all matches", arrayToList( foundNumbers ), "1,22,333" );
 assertFalse( "Pattern find returns false once exhausted", multiMatcher.find() );
 
+// Static compile-flag constants must be readable off the Pattern handle (JVM bit
+// values). Mura/Masa resourceBundle.messageFormat does
+// `pattern.compile(re, pattern.CASE_INSENSITIVE)`.
+flagPattern = createObject( "java", "java.util.regex.Pattern" );
+assert( "Pattern.CASE_INSENSITIVE constant", flagPattern.CASE_INSENSITIVE, 2 );
+assert( "Pattern.MULTILINE constant", flagPattern.MULTILINE, 8 );
+assert( "Pattern.DOTALL constant", flagPattern.DOTALL, 32 );
+assert( "Pattern.LITERAL constant", flagPattern.LITERAL, 16 );
+// compile(regex, CASE_INSENSITIVE) actually matches case-insensitively.
+ciMatcher = flagPattern
+    .compile( javaCast( "string", "hello" ), flagPattern.CASE_INSENSITIVE )
+    .matcher( javaCast( "string", "xxHELLOxx" ) );
+assertTrue( "compile with CASE_INSENSITIVE flag matches mixed case", ciMatcher.find() );
+
 // Matcher.start()/end() — 0-based char offsets of the most recent match,
 // needed for in-place find-and-replace (Preside DynamicFindAndReplaceService).
 // Without these the service prepended all replacements and left tokens intact.

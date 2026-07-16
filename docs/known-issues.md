@@ -578,6 +578,23 @@ binary values, so this is what lets binary `expect().toBe()` assertions pass (e.
 still differs too — Lucee throws "can't compare complex object types"; RustCFML currently
 returns `false` — but no exercised consumer depends on that edge.
 
+## 21. `server.coldfusion.supportedLocales` — ACF list, not Lucee's JVM locale set 🌟 *(divergence)*
+
+`server.coldfusion.supportedLocales` is a comma-delimited locale list. It originated as an
+Adobe ColdFusion field; Lucee emulates it by returning the JVM's full
+`Locale.getAvailableLocales()` set — ~900 entries, and the exact contents vary by the JVM
+version Lucee runs on (locale display names plus `en_US_#Latn`-style tags).
+
+RustCFML has no JVM, so replicating that list exactly is infeasible and would be unstable
+across builds. Instead it exposes the **ACF-documented supported-locale set** (~47 entries:
+`English (US)`, `French (Standard)`, `Japanese`, …) — which is what this field historically
+meant and what locale-dropdown consumers were designed around (e.g. Mura/Masa admin
+`csettings/editsite.cfm`, whose `isSupportedLocale()` flags anything outside its own set as
+deprecated regardless). Apps that enumerate this list get a sensible, stable locale menu;
+apps that assume a *specific* JVM locale tag string will see fewer entries than on Lucee.
+
+---
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*

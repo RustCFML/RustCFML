@@ -552,6 +552,34 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         "productlevel".to_string(),
         CfmlValue::string("Final".to_string()),
     );
+    // `server.coldfusion.supportedLocales` — a comma-delimited locale list. This
+    // is historically an ACF field (Lucee emulates it, returning the full JVM
+    // `Locale.getAvailableLocales()` set — ~900 JVM-version-specific entries).
+    // RustCFML has no JVM, so replicating that exact list is infeasible and
+    // unstable; instead we expose the ACF-documented supported-locale set, which
+    // is what this field originally meant and what Mura/Masa's isSupportedLocale
+    // was designed around. Apps read this to build locale dropdowns (e.g.
+    // Masa admin csettings/editsite.cfm). Known Lucee divergence — see
+    // docs/known-issues.md.
+    cf.insert(
+        "supportedLocales".to_string(),
+        CfmlValue::string(
+            "Albanian (Albania),Arabic (Algeria),Arabic (Bahrain),Arabic (Egypt),\
+             Arabic (Iraq),Arabic (Jordan),Arabic (Kuwait),Arabic (Lebanon),\
+             Arabic (Libya),Arabic (Morocco),Arabic (Oman),Arabic (Qatar),\
+             Arabic (Saudi Arabia),Arabic (Sudan),Arabic (Syria),Arabic (Tunisia),\
+             Arabic (United Arab Emirates),Arabic (Yemen),Chinese (China),\
+             Chinese (Hong Kong),Chinese (Singapore),Chinese (Taiwan),\
+             Dutch (Belgium),Dutch (Standard),English (Australia),English (Canada),\
+             English (New Zealand),English (United Kingdom),English (US),\
+             French (Belgium),French (Canada),French (Standard),French (Switzerland),\
+             German (Austria),German (Standard),German (Switzerland),\
+             Italian (Standard),Italian (Switzerland),Japanese,Korean,\
+             Norwegian (Bokmal),Norwegian (Nynorsk),Portuguese (Brazilian),\
+             Portuguese (Standard),Spanish (Modern),Spanish (Standard),Swedish"
+                .to_string(),
+        ),
+    );
     info.insert("coldfusion".to_string(), CfmlValue::strukt(cf));
 
     // Advertise Lucee compatibility. RustCFML targets the Lucee dialect, and
@@ -7478,7 +7506,24 @@ impl CfmlVirtualMachine {
                     // Fused StoreLocal + SetProperty. Pops value from stack,
                     // gets the local struct, sets the property, stores back.
                     if let Some(value) = stack.pop() {
-                        if let Some(obj) = locals.get_mut(local_name.as_str()) {
+                        // CFML identifiers are case-insensitive: `nextN.x = v`
+                        // must mutate an existing local stored as `nextn`, not
+                        // fork a phantom `nextN`. `get_mut` on the raw IndexMap
+                        // is case-SENSITIVE, so resolve the actual stored key
+                        // case-insensitively first. The exact-case hit is the
+                        // fast path (no scan); the linear key scan only runs
+                        // when the exact case misses (i.e. the buggy case).
+                        let resolved_local = if locals.contains_key(local_name.as_str()) {
+                            Some(local_name.clone())
+                        } else {
+                            locals
+                                .keys()
+                                .find(|k| k.eq_ignore_ascii_case(local_name))
+                                .cloned()
+                        };
+                        if let Some(obj) =
+                            resolved_local.as_ref().and_then(|k| locals.get_mut(k.as_str()))
+                        {
                             // CFC with a Rust-backed parent: try the native
                             // setter first; None defers to the CFC struct.
                             if let CfmlValue::Struct(ref s) = *obj {

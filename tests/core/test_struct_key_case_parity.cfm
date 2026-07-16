@@ -92,5 +92,18 @@ assert("CONTROL: structDelete is case-insensitive", structCount(ctrlDelete), 1);
 assertFalse("CONTROL: deleted key gone under its original casing",
     structKeyExists(ctrlDelete, "foo"));
 
+// The base VARIABLE name of a compound write is also case-insensitive: a member
+// write through a differently-cased variable name must mutate the EXISTING
+// struct, not fork a phantom second variable. RustCFML 0.485 forked `nextN`
+// from `nextn`, so `nextn.lastPage` read back undefined (Masa CMS utility.cfc
+// getNextN mixes nextN/nextn → cUsers.list 500). Lucee mutates in place.
+nextn = structNew();
+nextn.firstPage = 1;
+nextN.lastPage = 99;   // cross-case base var — must land in the same struct
+assert("cross-case base var writes into the same struct",
+    listSort(structKeyList(nextn), "textnocase"), "firstPage,lastPage");
+assert("member written via cross-case base var reads back", nextn.lastPage, 99);
+assert("original member still present", nextn.firstPage, 1);
+
 suiteEnd();
 </cfscript>

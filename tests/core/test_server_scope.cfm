@@ -5,6 +5,13 @@ suiteBegin("Server scope (Lucee compatibility shim)");
 assert("server.coldfusion.productname", server.coldfusion.productname, "RustCFML");
 assertTrue("server.coldfusion.productversion is non-empty", len(server.coldfusion.productversion) GT 0);
 assertTrue("server.coldfusion.productlevel exists", structKeyExists(server.coldfusion, "productlevel"));
+// supportedLocales — an ACF-origin comma-list read by apps to build locale
+// dropdowns (Masa admin csettings/editsite.cfm). See docs/known-issues.md for
+// the documented Lucee divergence (ACF list vs Lucee's full JVM locale set).
+assertTrue("server.coldfusion.supportedLocales is a non-empty list",
+    listLen(server.coldfusion.supportedLocales) GT 0);
+assertTrue("server.coldfusion.supportedLocales contains English (US)",
+    listFindNoCase(server.coldfusion.supportedLocales, "English (US)") GT 0);
 
 // --- server.lucee (engine-detection shim: frameworks like Wheels/ColdBox/
 // Preside sniff server.lucee.version to identify a Lucee-dialect engine).

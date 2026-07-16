@@ -3261,6 +3261,54 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
         })
     };
 
+    // Expose `java.util.regex.Pattern`'s public static compile-flag constants as
+    // struct fields on the shim, so `pattern.CASE_INSENSITIVE` etc. resolve to
+    // their JVM bit values (used e.g. by Mura/Masa resourceBundle.messageFormat:
+    // `pattern.compile(re, pattern.CASE_INSENSITIVE)`).
+    let add_flag_consts = |shim: &mut ValueMap| {
+        for (name, bits) in [
+            ("UNIX_LINES", 1),
+            ("CASE_INSENSITIVE", 2),
+            ("COMMENTS", 4),
+            ("MULTILINE", 8),
+            ("LITERAL", 16),
+            ("DOTALL", 32),
+            ("UNICODE_CASE", 64),
+            ("CANON_EQ", 128),
+            ("UNICODE_CHARACTER_CLASS", 256),
+        ] {
+            shim.insert(name.to_string(), CfmlValue::Int(bits));
+        }
+    };
+    // Translate the subset of Java Pattern flags Rust's `regex` crate supports
+    // into a leading inline-flag group. CASE_INSENSITIVE→(?i), MULTILINE→(?m),
+    // DOTALL→(?s), COMMENTS→(?x). LITERAL escapes the whole pattern. Flags with
+    // no Rust equivalent (UNIX_LINES, UNICODE_CASE, CANON_EQ) are ignored.
+    let apply_flags = |regex: &str, flags: i64| -> String {
+        if flags & 16 != 0 {
+            // LITERAL: match the pattern verbatim.
+            return regex::escape(regex);
+        }
+        let mut inline = String::new();
+        if flags & 2 != 0 {
+            inline.push('i');
+        }
+        if flags & 8 != 0 {
+            inline.push('m');
+        }
+        if flags & 32 != 0 {
+            inline.push('s');
+        }
+        if flags & 4 != 0 {
+            inline.push('x');
+        }
+        if inline.is_empty() {
+            regex.to_string()
+        } else {
+            format!("(?{}){}", inline, regex)
+        }
+    };
+
     match method {
         // createObject(...) with no pattern yet — an uncompiled Pattern handle.
         "init" => {
@@ -3270,11 +3318,18 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
                 CfmlValue::string("java.util.regex.pattern".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            add_flag_consts(&mut shim);
             Ok(CfmlValue::strukt(shim))
         }
         // Pattern.compile(regex[, flags]) — returns a compiled Pattern shim.
         "compile" => {
             let regex_str = args.first().map(|a| a.as_string()).unwrap_or_default();
+            let flags = match args.get(1) {
+                Some(CfmlValue::Int(n)) => *n,
+                Some(other) => other.as_string().trim().parse::<i64>().unwrap_or(0),
+                None => 0,
+            };
+            let regex_str = apply_flags(&java_regex_to_rust(&regex_str), flags);
             compile(&regex_str)?; // validate up front
             let mut shim = ValueMap::default();
             shim.insert(
@@ -3283,6 +3338,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("__regex".to_string(), CfmlValue::string(regex_str));
+            add_flag_consts(&mut shim);
             Ok(CfmlValue::strukt(shim))
         }
         "pattern" | "tostring" => Ok(CfmlValue::string(object_regex())),
