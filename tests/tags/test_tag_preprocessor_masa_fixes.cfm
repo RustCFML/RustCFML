@@ -38,6 +38,35 @@ assert("non-empty case still works", classify("x"), "ex");
 <cfscript>
 assert("tag cfcase empty value", classifyTag(""), "empty");
 assert("tag cfcase comma-list value", classifyTag("b"), "ab");
+</cfscript>
+
+<!--- output="false" suppresses ALL body output — inter-tag whitespace, plain
+      text AND cfoutput — like wrapping the body in <cfsilent> (Lucee parity).
+      A function with NO output attribute still emits its body whitespace (both
+      engines leak it). Masa emits inline <script> via output="false" helpers,
+      e.g. `var siteid='#esapiEncode('javascript',session.siteid)#'`; the leaked
+      whitespace landed inside the JS string, breaking every admin page's JS. --->
+<cffunction name="silentFn" output="false" returntype="string">
+
+	<cfset var z = 1>
+	<cfoutput>SHOULD_NOT_APPEAR</cfoutput>
+	<cfreturn "RET">
+</cffunction>
+<cffunction name="leakyFn" returntype="string">
+
+	<cfset var z = 1>
+	<cfreturn "RET">
+</cffunction>
+<cfscript>
+savecontent variable="capSilent" { writeOutput(silentFn()); }
+assert("output=false suppresses body whitespace AND cfoutput", capSilent, "RET");
+savecontent variable="capLeaky" { writeOutput(leakyFn()); }
+assertTrue("no output attr still emits body whitespace (Lucee parity)",
+    len(capLeaky) GT len("RET"));
+assertTrue("leaky body preserves the return value too", capLeaky contains "RET");
+</cfscript>
+
+<cfscript>
 
 // --- 3. Nested #...# interpolation inside a string literal ------------------
 // A `#...#` interpolation inside a string is expression context: nested quotes

@@ -766,7 +766,18 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 sig.push_str(&return_type);
                 sig.push(' ');
             }
-            sig.push_str(&format!("function {}({}) {{\n", name, param_names.join(", ")));
+            sig.push_str(&format!("function {}({})", name, param_names.join(", ")));
+            // Carry the `output` attribute through as a script-function attribute so
+            // the parser records it in the function metadata. `output="false"` must
+            // suppress the body's output (whitespace/text/cfoutput) at runtime — a
+            // tag `<cffunction output="false">` otherwise leaked its inter-tag
+            // whitespace into the caller (breaking Masa CMS admin inline JS). No
+            // attribute (or output="true") is left off → body text still emits,
+            // matching Lucee.
+            if let Some(output) = attrs.get("output") {
+                sig.push_str(&format!(" output=\"{}\"", output));
+            }
+            sig.push_str(" {\n");
             (sig, tag_end - start)
         }
         "cfargument" => {

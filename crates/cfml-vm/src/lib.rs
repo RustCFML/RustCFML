@@ -522,6 +522,20 @@ fn os_version_string() -> String {
     }
 }
 
+/// True when a function is declared `output="false"` (or `output="no"`/`="0"`),
+/// meaning its body must produce NO page output — inter-tag whitespace, plain
+/// text, and cfoutput/writeOutput are all suppressed, exactly like wrapping the
+/// body in `<cfsilent>` (Lucee/ACF semantics). A function with no `output`
+/// attribute, or `output="true"`, is NOT suppressed (its body text is emitted;
+/// both engines do this). Reads the metadata the parser captured from the
+/// tag/script function header.
+fn function_output_suppressed(func: &BytecodeFunction) -> bool {
+    func.metadata.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("output")
+            && matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "no" | "0")
+    })
+}
+
 fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     let mut info = ValueMap::default();
 
@@ -3985,6 +3999,24 @@ impl CfmlVirtualMachine {
         let frame_ctx_before = self.frame_ctx.len();
         let try_depth_before = self.try_stack.len();
         let saved_buffers_before = self.saved_output_buffers.len();
+
+        // `output="false"` on a cffunction/component method suppresses ALL output
+        // the body produces — inter-tag whitespace, plain text, AND cfoutput/
+        // writeOutput — exactly like wrapping the body in <cfsilent>. (A function
+        // with NO output attribute, or output="true", still emits its body text;
+        // both engines leak that, verified against Lucee 7.) Masa CMS emits inline
+        // <script> via output="false" helpers — e.g. `var siteid='#esapiEncode(
+        // 'javascript',session.siteid)#'` — and the leaked body whitespace landed
+        // *inside* the JS string literal, producing a browser SyntaxError on every
+        // admin page. Implement by swapping in a throwaway output buffer for the
+        // body; the buffer is discarded on the normal-return cleanup below (and by
+        // restore_capture_state on a caught throw), so nothing the body writes ever
+        // reaches the page.
+        let suppress_body_output = function_output_suppressed(func);
+        if suppress_body_output {
+            self.saved_output_buffers
+                .push(std::mem::take(&mut self.output_buffer));
+        }
 
         // Function enter/exit hook (Phase 3 — OTel spans). Fired from the call
         // WRAPPER, not the body: the body has many early-return paths (`?` on
