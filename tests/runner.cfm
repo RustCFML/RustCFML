@@ -144,6 +144,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_this_dot_call_detaches_writes.cfm">
 <cf_runtest file="core/test_server_scope.cfm">
 <cf_runtest file="core/test_scope_writeback_masa_fixes.cfm">
+<cf_runtest file="core/test_web_scope_no_component_leak.cfm">
 <cf_runtest file="core/test_setencoding_masa.cfm">
 <cf_runtest file="core/test_pagecontext_request_response.cfm">
 <cf_runtest file="core/test_localmode.cfm">

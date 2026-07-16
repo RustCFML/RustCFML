@@ -5142,6 +5142,22 @@ impl CfmlVirtualMachine {
                             // The arguments scope lives under the reserved key, not
                             // the literal "arguments" (which is a user local var).
                             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
+                        } else if Self::is_web_request_scope(&name_lower)
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
+                        {
+                            // Web request scopes (url/form/cgi/cookie) are always
+                            // request-global: a `url.path = x` writeback (LoadLocal
+                            // url + SetProperty + this StoreLocal, with the value
+                            // already mutated in place on the live globals struct)
+                            // commits to `self.globals`, NEVER a component's
+                            // persistent `__variables` — for an application-scoped
+                            // singleton the latter leaks across requests (Masa
+                            // front-controller infinite redirect loop:
+                            // contentServer.parseURLRoot accumulates url.path). A
+                            // genuine `var url` frame-local is guarded out above.
+                            self.globals.insert(name_lower.clone(), val);
                         } else if locals.contains_key("__variables")
                             && !declared_locals.contains(name)
                             && !declared_locals.contains(&name_lower)
@@ -7564,6 +7580,25 @@ impl CfmlVirtualMachine {
                     // Fused StoreLocal + SetProperty. Pops value from stack,
                     // gets the local struct, sets the property, stores back.
                     if let Some(value) = stack.pop() {
+                        // Web request scopes (url/form/cgi/cookie): `url.path = x`
+                        // must mutate the LIVE per-request scope in `self.globals`,
+                        // never vivify a `url` key into a component's persistent
+                        // `__variables` (leaks across requests for an
+                        // application-scoped singleton — Masa front-controller
+                        // redirect loop; see is_web_request_scope). A genuine
+                        // frame-local of that name (rare) still takes the path below.
+                        if Self::is_web_request_scope(local_name)
+                            && !locals.keys().any(|k| k.eq_ignore_ascii_case(local_name))
+                        {
+                            let entry = self
+                                .globals
+                                .entry(local_name.to_lowercase())
+                                .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+                            if let Some(s) = entry.as_cfml_struct() {
+                                s.insert(prop_name.clone(), value);
+                            }
+                            continue;
+                        }
                         // CFML identifiers are case-insensitive: `nextN.x = v`
                         // must mutate an existing local stored as `nextn`, not
                         // fork a phantom `nextN`. `get_mut` on the raw IndexMap
@@ -16745,6 +16780,19 @@ impl CfmlVirtualMachine {
         )
     }
 
+    /// The per-request "web" scopes: always request-global (populated by the
+    /// host into `self.globals`), NEVER a component's `variables` scope. A
+    /// scoped write like `url.path = x` inside a classic-localmode CFC method
+    /// must mutate the LIVE per-request scope in `self.globals`, not vivify a
+    /// `url` key into the component's persistent `__variables` — for an
+    /// application-scoped singleton that leaks across requests (Masa CMS
+    /// front-controller infinite redirect loop: `contentServer.parseURLRoot`
+    /// accumulates `url.path` on the singleton). Likewise a bare read must
+    /// resolve to `self.globals`, never a stale `__variables` shadow.
+    fn is_web_request_scope(name: &str) -> bool {
+        matches!(name.to_lowercase().as_str(), "url" | "form" | "cgi" | "cookie")
+    }
+
     fn is_mutating_method(method: &str) -> bool {
         let lower = method.to_lowercase();
         // Implicit property setters (setXxx) are mutating
@@ -16949,6 +16997,15 @@ impl CfmlVirtualMachine {
         if let Some(v) = locals.get(name) {
             return Some(v.clone());
         }
+        // Web request scopes (url/form/cgi/cookie) are always request-global:
+        // resolve straight from `self.globals`, never a component's stale
+        // `__variables` shadow (see is_web_request_scope). A genuine frame-local
+        // `var url` above still wins.
+        if Self::is_web_request_scope(&name_lower) {
+            if let Some(v) = self.globals.get(name).or_else(|| self.globals.get(&name_lower)) {
+                return Some(v.clone());
+            }
+        }
         // Check __variables scope for CFC methods
         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
             if let Some(v) = vars.get(name).or_else(|| {
@@ -17092,6 +17149,18 @@ impl CfmlVirtualMachine {
                 }) {
                     return Some(v.clone());
                 }
+            }
+        }
+        // Web request scopes (url/form/cgi/cookie) are always request-global:
+        // resolve from `self.globals`, never a component's stale `__variables`
+        // shadow (see is_web_request_scope). Placed after the local/arguments
+        // checks (so a genuine `var url` frame-local still wins) but BEFORE
+        // __variables, so an application-scoped singleton reads the LIVE
+        // per-request scope instead of a `url` key that leaked onto its
+        // `variables` scope (Masa front-controller infinite redirect loop).
+        if Self::is_web_request_scope(name_lower) {
+            if let Some(v) = self.globals.get(name).or_else(|| self.globals.get(name_lower)) {
+                return Some(v.clone());
             }
         }
         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
@@ -17316,6 +17385,13 @@ impl CfmlVirtualMachine {
             // that declared `var rscheck` created a stray `rsCheck` while the
             // `var rscheck` stayed empty (Mura/Masa dbUtility.version()).
             locals.insert(existing, val);
+        } else if Self::is_web_request_scope(&name_lower) {
+            // Request-global web scopes commit to `self.globals`, never a
+            // component `variables` scope (see is_web_request_scope). Without
+            // this a `url.path = x` writeback inside a classic-localmode CFC
+            // method fell into the `__variables` branch below and, for an
+            // application-scoped singleton, leaked across requests.
+            self.globals.insert(name.to_string(), val);
         } else if !modern
             && locals.contains_key("__variables")
             && !matches!(name_lower.as_str(), "cfcatch" | "cookie" | "server" | "attributes")
