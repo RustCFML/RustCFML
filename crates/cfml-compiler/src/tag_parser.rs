@@ -1534,7 +1534,11 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfprocessingdirective") {
                     let body: String = chars[tag_end..end_tag_pos].iter().collect();
                     let close_end = find_tag_end(chars, end_tag_pos, len);
-                    let body_script = tags_to_script_impl(&body, imports);
+                    // Preserve the enclosing cfoutput context so `#expr#` in the
+                    // body still interpolates when the directive is nested inside
+                    // <cfoutput> (Masa's admin layouts wrap the whole body in
+                    // `<cfoutput><cfprocessingdirective suppresswhitespace>`).
+                    let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
                     // Capture output, collapse whitespace, then re-emit
                     (format!("__cfsavecontent_start();\n{}writeOutput(__cfprocessingdirective_collapse(__cfsavecontent_end()));\n", body_script), close_end - start)
                 } else {
@@ -1546,7 +1550,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfprocessingdirective") {
                     let body: String = chars[tag_end..end_tag_pos].iter().collect();
                     let close_end = find_tag_end(chars, end_tag_pos, len);
-                    let body_script = tags_to_script_impl(&body, imports);
+                    let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
                     (body_script, close_end - start)
                 } else {
                     (String::new(), tag_end - start)

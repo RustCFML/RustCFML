@@ -498,6 +498,30 @@ fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
     }
 }
 
+/// Best-effort OS release string for `server.os.version` /
+/// `server.system.properties["os.version"]` (Lucee's
+/// System.getProperty("os.version")). Built once when the server scope is
+/// seeded, so a single `uname -r` on unix is cheap. Returns "" when the value
+/// cannot be determined (wasm, non-unix, or the command failing) — the key still
+/// exists, which is what unguarded consumers like Masa's admin nav require.
+fn os_version_string() -> String {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    {
+        String::new()
+    }
+}
+
 fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     let mut info = ValueMap::default();
 
@@ -566,6 +590,13 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         "arch".to_string(),
         CfmlValue::string(std::env::consts::ARCH.to_string()),
     );
+    // server.os.version — Lucee/ACF expose the OS release string here
+    // (System.getProperty("os.version")). Masa's admin nav reads it UNGUARDED
+    // (`#server.os.version#`), so the key must always exist.
+    os.insert(
+        "version".to_string(),
+        CfmlValue::string(os_version_string()),
+    );
     if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
         os.insert("hostname".to_string(), CfmlValue::string(host));
     }
@@ -624,6 +655,10 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     props.insert(
         "os.arch".to_string(),
         CfmlValue::string(std::env::consts::ARCH.to_string()),
+    );
+    props.insert(
+        "os.version".to_string(),
+        CfmlValue::string(os_version_string()),
     );
     props.insert("user.dir".to_string(), CfmlValue::string(cwd));
     props.insert("user.home".to_string(), CfmlValue::string(home));
@@ -3051,16 +3086,27 @@ impl CfmlVirtualMachine {
         column_key: Option<String>,
         max_rows: Option<usize>,
         parent_locals: &ValueMap,
+        attr_sources: &[(String, cfml_common::dynamic::CfmlQuery)],
     ) -> CfmlResult {
         let stmt = cfml_qoq::parse(sql)
             .map_err(|e| CfmlError::runtime(format!("Query of Queries syntax error: {}", e)))?;
 
-        // Resolve each referenced query variable from scope (owned clones, so
-        // the borrow can't collide with the &mut self UDF callback below).
+        // Resolve each referenced query variable. A query passed as a queryExecute
+        // OPTION (Lucee's `new Query().setAttributes(rsList=q)` / a cfquery
+        // attributeCollection carrying a query) takes precedence over a same-named
+        // scope variable; otherwise fall back to the scope chain. Owned clones, so
+        // the borrow can't collide with the &mut self UDF callback below.
         let names = cfml_qoq::base_table_names(&stmt);
         let owned: Vec<(String, cfml_common::dynamic::CfmlQuery)> = names
             .iter()
-            .filter_map(|n| self.find_query_in_scope(n, parent_locals).map(|q| (n.clone(), q)))
+            .filter_map(|n| {
+                attr_sources
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                    .map(|(_, q)| q.clone())
+                    .or_else(|| self.find_query_in_scope(n, parent_locals))
+                    .map(|q| (n.clone(), q))
+            })
             .collect();
         let sources: Vec<(String, &cfml_common::dynamic::CfmlQuery)> =
             owned.iter().map(|(n, q)| (n.clone(), q)).collect();
@@ -3104,6 +3150,66 @@ impl CfmlVirtualMachine {
         parent_locals: &ValueMap,
     ) -> Option<cfml_common::dynamic::CfmlQuery> {
         let lower = name.to_lowercase();
+        // A DOTTED source name is a query held at a nested struct path — e.g.
+        // `FROM variables.internal.iplog` (Masa's front-end IP block-list check).
+        // Resolve the first segment as a scope/variable, then walk struct keys.
+        if lower.contains('.') {
+            let segs: Vec<&str> = lower.split('.').collect();
+            // Walk struct keys from a starting value; the terminal must be a Query.
+            fn walk(mut cur: CfmlValue, path: &[&str]) -> Option<cfml_common::dynamic::CfmlQuery> {
+                for s in path {
+                    cur = match cur {
+                        CfmlValue::Struct(st) => st.get_ci(s)?,
+                        _ => return None,
+                    };
+                }
+                if let CfmlValue::Query(q) = cur { Some(q) } else { None }
+            }
+            let vm_get = |m: &ValueMap, k: &str| {
+                m.iter().find(|(kk, _)| kk.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone())
+            };
+            match segs[0] {
+                "variables" if segs.len() > 1 => {
+                    // CFC method: component `variables` lives on `__variables`.
+                    if let Some(CfmlValue::Struct(v)) = parent_locals
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("__variables"))
+                        .map(|(_, v)| v.clone())
+                    {
+                        if let Some(v0) = v.get_ci(segs[1]) {
+                            if let Some(q) = walk(v0, &segs[2..]) { return Some(q); }
+                        }
+                    }
+                    // Page scope: the variables scope is the caller's locals, or
+                    // globals when running at the top level.
+                    if let Some(v0) = vm_get(parent_locals, segs[1]).or_else(|| vm_get(&self.globals, segs[1])) {
+                        if let Some(q) = walk(v0, &segs[2..]) { return Some(q); }
+                    }
+                    return None;
+                }
+                "request" if segs.len() > 1 => {
+                    if let Some(v0) = self.request_scope.get_ci(segs[1]) {
+                        return walk(v0, &segs[2..]);
+                    }
+                    return None;
+                }
+                "application" if segs.len() > 1 => {
+                    if let Some(app) = self.application_scope.as_ref() {
+                        if let Some(v0) = app.get_ci(segs[1]) {
+                            return walk(v0, &segs[2..]);
+                        }
+                    }
+                    return None;
+                }
+                _ => {
+                    // No scope prefix: resolve the whole path from local then page scope.
+                    if let Some(v0) = vm_get(parent_locals, segs[0]).or_else(|| vm_get(&self.globals, segs[0])) {
+                        if let Some(q) = walk(v0, &segs[1..]) { return Some(q); }
+                    }
+                    return None;
+                }
+            }
+        }
         // Cloning a query handle shares the Arc (cheap) — the QoQ engine only
         // reads the source tables, so sharing is correct and avoids a deep copy.
         if let Some(CfmlValue::Query(q)) = parent_locals
@@ -5572,8 +5678,8 @@ impl CfmlVirtualMachine {
                         // short-circuit — numeric strings fall through to coercion
                         // below; only genuinely non-numeric operands concatenate.
                         _ => {
-                            let a_num = to_number(&a);
-                            let b_num = to_number(&b);
+                            let a_num = to_arith_number(&a);
+                            let b_num = to_arith_number(&b);
                             match (a_num, b_num) {
                                 (Some(x), Some(y)) => CfmlValue::Double(x + y),
                                 _ => {
@@ -5591,8 +5697,8 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        let x = to_number(&a).unwrap_or(0.0);
-                        let y = to_number(&b).unwrap_or(1.0);
+                        let x = to_arith_number(&a).unwrap_or(0.0);
+                        let y = to_arith_number(&b).unwrap_or(1.0);
                         if y == 0.0 {
                             // CFML throws on division by zero
                             let mut exception = ValueMap::default();
@@ -13357,10 +13463,13 @@ impl CfmlVirtualMachine {
                                 | "coldfusion.runtime.java.javaproxy" => {
                                     Ok(java_shims::make_deferred_java(&args[1].as_string()))
                                 }
-                                // Legacy Preside password hashing. The shim's
+                                // Legacy Preside/Mura password hashing. The shim's
                                 // gensalt/hashpw/checkpw route to the native
-                                // bcrypt builtins (see handle_jbcrypt_method).
-                                "org.mindrot.jbcrypt.bcrypt" => {
+                                // bcrypt builtins (see handle_jbcrypt_method). The
+                                // bare `BCrypt` alias mirrors Lucee resolving the
+                                // classpath name to org.mindrot.jbcrypt.BCrypt —
+                                // Masa's utility.getBCrypt() uses createObject("java","BCrypt").
+                                "org.mindrot.jbcrypt.bcrypt" | "bcrypt" => {
                                     java_shims::handle_java_bcrypt("init", empty_args, &CfmlValue::Null)
                                 }
                                 // Legacy Preside YAML (cfflow YamlParser). The
@@ -13985,6 +14094,20 @@ impl CfmlVirtualMachine {
                             }
                             _ => ("query".to_string(), None, None),
                         };
+                        // A query passed as an option (Lucee's Query builder
+                        // `setAttributes(rsList=q)`, or a cfquery
+                        // attributeCollection carrying a query) is a QoQ source.
+                        let attr_sources: Vec<(String, cfml_common::dynamic::CfmlQuery)> =
+                            match args.get(2) {
+                                Some(CfmlValue::Struct(opts)) => opts
+                                    .iter()
+                                    .filter_map(|(k, v)| match v {
+                                        CfmlValue::Query(q) => Some((k, q)),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
                         self.execute_qoq(
                             &sql,
                             &params_arg,
@@ -13992,6 +14115,7 @@ impl CfmlVirtualMachine {
                             column_key,
                             max_rows,
                             parent_locals,
+                            &attr_sources,
                         )?
                     } else {
                         // Resolve a per-application datasource (this.datasources /
@@ -14787,7 +14911,35 @@ impl CfmlVirtualMachine {
                 }
                 "__cfcookie" => {
                     // Set a cookie via response headers
-                    if let Some(CfmlValue::Struct(opts)) = args.get(0) {
+                    if let Some(CfmlValue::Struct(raw_opts)) = args.get(0) {
+                        // Flatten an `attributeCollection` (Masa's utility.setCookie
+                        // calls `<cfcookie attributeCollection="#arguments#">`). Per
+                        // CFML, an explicit attribute overrides an attributeCollection
+                        // entry of the same name.
+                        let snap = raw_opts.snapshot();
+                        let opts: ValueMap = if snap
+                            .keys()
+                            .any(|k| k.eq_ignore_ascii_case("attributecollection"))
+                        {
+                            let mut m = ValueMap::default();
+                            if let Some(CfmlValue::Struct(ac)) = snap
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("attributecollection"))
+                                .map(|(_, v)| v)
+                            {
+                                for (k, v) in ac.iter() {
+                                    m.insert(k, v);
+                                }
+                            }
+                            for (k, v) in snap.iter() {
+                                if !k.eq_ignore_ascii_case("attributecollection") {
+                                    m.insert(k.clone(), v.clone());
+                                }
+                            }
+                            m
+                        } else {
+                            snap
+                        };
                         let name = opts
                             .iter()
                             .find(|(k, _)| k.to_lowercase() == "name")
@@ -27087,6 +27239,36 @@ fn to_number(val: &CfmlValue) -> Option<f64> {
     }
 }
 
+/// CFML numeric ("serial") date value: whole days since 1899-12-30, with the
+/// time-of-day carried in the fraction. Sub-second precision is preserved via
+/// milliseconds (Lucee's serials carry the fractional part exactly).
+fn cfml_date_to_serial(dt: &chrono::NaiveDateTime) -> f64 {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1899, 12, 30)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    (*dt - epoch).num_milliseconds() as f64 / 86_400_000.0
+}
+
+/// Numeric coercion for the arithmetic operators (`+`, `-`, `*`). Unlike
+/// `to_number`, a date/datetime STRING coerces to its CFML serial value so that
+/// `now() + 1` (add a day), `date + createTimeSpan(...)`, and `dateB - dateA`
+/// (days between) behave as they do on Lucee/ACF — where `+`/`-` on dates yield
+/// a numeric serial (NOT a date string), which date functions re-parse via the
+/// serial branch of `parse_cfml_date`. A genuinely non-numeric, non-date string
+/// still returns None so the caller can fall back to `&`-style concatenation.
+fn to_arith_number(val: &CfmlValue) -> Option<f64> {
+    if let Some(n) = to_number(val) {
+        return Some(n);
+    }
+    if let CfmlValue::String(s) = val.query_column_scalar() {
+        if let Some(dt) = try_parse_cfml_datetime(s) {
+            return Some(cfml_date_to_serial(&dt));
+        }
+    }
+    None
+}
+
 fn numeric_op<F>(a: &CfmlValue, b: &CfmlValue, op: F) -> CfmlValue
 where
     F: FnOnce(f64, f64) -> f64,
@@ -27104,8 +27286,10 @@ where
             }
         }
         _ => {
-            let x = to_number(a).unwrap_or(0.0);
-            let y = to_number(b).unwrap_or(0.0);
+            // Date-aware coercion so `date - date` (days between) and
+            // `date - n` behave like Lucee (numeric serial result).
+            let x = to_arith_number(a).unwrap_or(0.0);
+            let y = to_arith_number(b).unwrap_or(0.0);
             CfmlValue::Double(op(x, y))
         }
     }

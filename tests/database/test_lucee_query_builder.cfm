@@ -44,5 +44,32 @@ q4.setSQL("select :wanted as bound");
 q4.setParams({ wanted = { value = 5, cfsqltype = "cf_sql_integer" } });
 assert("named setParams binds", q4.execute().getResult().bound, 5);
 
+// 7. Query-of-Queries via setDbType('query') + setAttributes(name=queryVar).
+//    This is the exact idiom Masa CMS's home.cfc uses to pick a default site:
+//      qs.setDbType('query');
+//      qs.setAttributes(rsList=rsList);
+//      qs.execute(sql="SELECT ... FROM rsList WHERE ...").getResult();
+//    The in-memory query is provided as an ATTRIBUTE (not a scope variable), so
+//    the QoQ engine must resolve the source table from the queryExecute options.
+srcQry = queryNew("siteid,orderno", "varchar,integer",
+    [ ["alpha", 2], ["bravo", 1], ["charlie", 3] ]);
+
+qq = new Query();
+qq.addParam(name = "wantid", cfsqltype = "cf_sql_varchar", value = "bravo");
+qq.setDbType('query');
+qq.setAttributes(rsList = srcQry);
+qqRes = qq.execute(sql = "SELECT siteid FROM rsList WHERE siteid = :wantid").getResult();
+assert("QoQ via setAttributes finds the attribute-provided query (recordCount)", qqRes.recordCount, 1);
+assert("QoQ via setAttributes returns the right row", qqRes.siteid, "bravo");
+assert("getDbType() reflects setDbType", qq.getDbType(), "query");
+
+// 7b. QoQ with ORDER BY over the attribute-provided query (home.cfc's 2nd path).
+qq2 = new Query();
+qq2.setDbType('query');
+qq2.setAttributes(rsList = srcQry);
+ordered = qq2.execute(sql = "SELECT siteid FROM rsList ORDER BY orderno").getResult();
+assert("QoQ ORDER BY row count", ordered.recordCount, 3);
+assert("QoQ ORDER BY first row (orderno asc)", ordered.siteid, "bravo");
+
 suiteEnd();
 </cfscript>

@@ -44,6 +44,15 @@ component output=false {
 		return this;
 	}
 
+	public any function setDbType( required string dbtype ) {
+		variables.attributes.dbtype = arguments.dbtype;
+		return this;
+	}
+
+	public string function getDbType() {
+		return variables.attributes.dbtype ?: "";
+	}
+
 	public any function setMaxRows( required numeric maxrows ) {
 		variables.attributes.maxrows = arguments.maxrows;
 		return this;

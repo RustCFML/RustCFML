@@ -4454,13 +4454,17 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
             let base = NaiveDate::from_ymd_opt(1899, 12, 30)?;
             let days = n.floor() as i64;
             let frac = n - n.floor();
-            let secs = (frac * 86400.0) as u32;
-            // try_days/try_seconds return None on overflow instead of panicking
-            // ("TimeDelta::days out of bounds") — a bare epoch-millis value like
-            // 1.7e12 parsed as a date serial would otherwise crash the process.
+            // Round to the nearest millisecond (NOT truncate) — the fraction is
+            // a float, so 51 seconds can land at 50.9999s and truncate to 50.
+            // Milliseconds also preserve sub-second precision through a
+            // date -> serial -> date round-trip.
+            let ms = (frac * 86_400_000.0).round() as i64;
+            // try_days/try_milliseconds return None on overflow instead of
+            // panicking ("TimeDelta::days out of bounds") — a bare epoch-millis
+            // value like 1.7e12 parsed as a date serial would otherwise crash.
             return base.and_hms_opt(0, 0, 0)
                 .and_then(|dt| chrono::Duration::try_days(days).and_then(|d| dt.checked_add_signed(d)))
-                .and_then(|dt| chrono::Duration::try_seconds(secs as i64).and_then(|d| dt.checked_add_signed(d)));
+                .and_then(|dt| chrono::Duration::try_milliseconds(ms).and_then(|d| dt.checked_add_signed(d)));
         }
     }
 

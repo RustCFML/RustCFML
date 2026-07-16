@@ -659,6 +659,8 @@ include "harness.cfm";
 <!--- PARSE. Now soft; genuine declarations still parse. --->
 <cf_runtest file="core/test_component_soft_keyword.cfm">
 <cf_runtest file="core/test_abort_soft_keyword.cfm">
+<cf_runtest file="core/test_param_attr_order.cfm">
+<cf_runtest file="core/test_date_arithmetic_serial.cfm">
 <!--- - cfinvoke_statement: `invoke` as a CFScript statement (attributes + optional --->
 <!--- invokeargument block) is now compiled to __cfinvoke(...). RustCFML previously --->
 <!--- only supported the <cfinvoke> tag and the invoke(...) call forms. (RustCFML --->
@@ -846,11 +848,13 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfloop_list_literal.cfm">
 <cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_cfloop_query_currentrow.cfm">
+<cf_runtest file="tags/test_cfcookie_attributecollection.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
 <cf_runtest file="tags/test_cfspreadsheet.cfm">
 
 <!--- --- Query of Queries --- --->
 <cf_runtest file="qoq/test_qoq_select.cfm">
+<cf_runtest file="qoq/test_qoq_dotted_table.cfm">
 <cf_runtest file="qoq/test_qoq_aggregates.cfm">
 <cf_runtest file="qoq/test_qoq_joins.cfm">
 <cf_runtest file="qoq/test_qoq_subqueries_union.cfm">

@@ -53,6 +53,21 @@ assert("enableCFOutputOnly reset", ws7, "VISIBLE");
 assert("suppressWhiteSpace=false passthrough", ws8, "  hello  ");
 </cfscript>
 
+<!--- Test 9: cfprocessingdirective NESTED INSIDE cfoutput keeps interpolation.
+      Masa's admin layouts wrap the whole body in
+      `<cfoutput><cfprocessingdirective suppresswhitespace="true">…#expr#…`.
+      The directive body must inherit the enclosing cfoutput context so `#x#`
+      still evaluates (previously it rendered the literal text `#x#`). --->
+<cfset wx = "WORLD">
+<cfsavecontent variable="ws9"><cfoutput><cfprocessingdirective suppresswhitespace="true">a[#wx#]b</cfprocessingdirective></cfoutput></cfsavecontent>
+<cfscript>
+assert("cfprocessingdirective inside cfoutput interpolates (suppress=true)", ws9, "a[WORLD]b");
+</cfscript>
+<cfsavecontent variable="ws10"><cfoutput><cfprocessingdirective suppresswhitespace="false">a[#wx#]b</cfprocessingdirective></cfoutput></cfsavecontent>
+<cfscript>
+assert("cfprocessingdirective inside cfoutput interpolates (suppress=false)", ws10, "a[WORLD]b");
+</cfscript>
+
 <cfscript>
 suiteEnd();
 </cfscript>

@@ -2558,8 +2558,19 @@ impl Parser {
     /// Converts to: if (!isDefined("varName")) varName = defaultValue;
     fn parse_param_statement(&mut self, loc: SourceLocation, in_parens: bool) -> Result<CfmlNode, ParseError> {
         // Check if it's the named-attribute form: param name="..." default="..."
-        let is_named_form = matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "name")
-            && matches!(self.peek(1), Token::Equal);
+        // The attribute keys may appear in ANY order — Masa/Mura write
+        // `param default="" name="arguments.rc.status";` (default-first). Treat
+        // the statement as the named form whenever it opens with any of the
+        // reserved param attribute keywords followed by `=` (Lucee/ACF/BoxLang
+        // treat these as attribute keywords in `param` context, not lvalues).
+        // `default` lexes as the keyword Token::Default (not an Identifier); the
+        // others are plain identifiers.
+        let opens_with_attr_keyword = matches!(self.peek(0), Token::Default)
+            || matches!(self.peek(0), Token::Identifier(ref s) if matches!(
+                s.to_lowercase().as_str(),
+                "name" | "type" | "min" | "max" | "pattern"
+            ));
+        let is_named_form = opens_with_attr_keyword && matches!(self.peek(1), Token::Equal);
 
         if is_named_form {
             // Parse name=value attributes and emit __cfparam(name, default) call

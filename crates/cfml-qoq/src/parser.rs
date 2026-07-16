@@ -298,7 +298,15 @@ impl Parser {
                 alias,
             })
         } else {
-            let name = self.parse_ident()?;
+            // A QoQ source can be a query held at a nested struct path, so the
+            // table name may be DOTTED — e.g. `FROM variables.internal.iplog`
+            // (Masa's front-end IP block-list check). Accumulate `.segment`s
+            // into the full name; the VM resolves the path against scope.
+            let mut name = self.parse_ident()?;
+            while self.eat(&Token::Dot) {
+                name.push('.');
+                name.push_str(&self.parse_ident()?);
+            }
             let alias = if self.eat(&Token::As) {
                 Some(self.parse_ident()?)
             } else if matches!(self.current, Token::Identifier(_)) {
