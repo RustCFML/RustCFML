@@ -48,6 +48,23 @@ assertTrue("getHTTPTimeString contains time", reFind("\d{2}:\d{2}:\d{2}", httpSt
 // Verify the day-of-week abbreviation for Saturday June 15, 2024
 assertTrue("getHTTPTimeString correct DOW", find("Sat", httpStr) > 0);
 
+// --- blank input to FORMAT functions returns "" (Lucee parity) ---
+// dateFormat/timeFormat/dateTimeFormat return an empty string for a blank date,
+// UNLIKE dateAdd/year/parseDateTime which throw a cast error. Masa's admin
+// content-edit + Staging views pass empty date columns straight to
+// dateTimeFormat(); throwing 500'd those pages. Cross-checked on Lucee 7.
+assert("dateFormat('') returns empty", dateFormat(""), "");
+assert("dateFormat(' ') returns empty", dateFormat(" "), "");
+assert("timeFormat('') returns empty", timeFormat(""), "");
+assert("dateTimeFormat('') returns empty", dateTimeFormat(""), "");
+assert("dateTimeFormat('', mask) returns empty", dateTimeFormat("", "yyyy-mm-dd"), "");
+// A real date still formats normally (guard against over-broad blanking).
+assert("dateFormat still formats a real date",
+	dateFormat("2024-06-15", "yyyy-mm-dd"), "2024-06-15");
+// The strict date functions still THROW for blank (Lucee parity — not blanked).
+assertThrows("year('') still throws", function(){ year(""); });
+assertThrows("parseDateTime('') still throws", function(){ parseDateTime(""); });
+
 // --- nowServer ---
 assertTrue("nowServer returns a date", isDate(nowServer()));
 // nowServer should return same time as now (approximately)

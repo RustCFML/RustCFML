@@ -299,6 +299,7 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_property_no_accessors_onmissing.cfm">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">
 <cf_runtest file="oop/test_arg_type_validation.cfm">
 <cf_runtest file="oop/test_new_keyword_path.cfm">
@@ -863,6 +864,7 @@ include "harness.cfm";
 <cf_runtest file="qoq/test_queryexecute_maxrows_list.cfm">
 <cf_runtest file="qoq/test_queryexecute_returntype_result.cfm">
 <cf_runtest file="qoq/test_qoq_component_variables_scope.cfm">
+<cf_runtest file="qoq/test_qoq_arguments_scope.cfm">
 
 <!--- WebSocket / realtime: connection-free harness coverage (live-socket --->
 <!--- behaviour is covered by crates/cli/tests/websocket_raw.rs). --->

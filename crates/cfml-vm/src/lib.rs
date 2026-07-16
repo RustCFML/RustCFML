@@ -3229,6 +3229,26 @@ impl CfmlVirtualMachine {
                     }
                     return None;
                 }
+                "arguments" if segs.len() > 1 => {
+                    // A QoQ source table named `arguments.rsX` refers to a query
+                    // passed into the current function. The arguments scope lives
+                    // under the reserved ARGUMENTS_SCOPE_KEY, not a literal
+                    // "arguments" local, so the default branch below can't find it.
+                    // Masa's admin framework builds `arguments.rsplugins` and reads
+                    // it back via QoQ (framework.cfc pluginConfig list).
+                    if let Some(CfmlValue::Struct(a)) = parent_locals
+                        .iter()
+                        .find(|(k, _)| k.as_str() == ARGUMENTS_SCOPE_KEY)
+                        .map(|(_, v)| v.clone())
+                    {
+                        if let Some(v0) = a.get_ci(segs[1]) {
+                            if let Some(q) = walk(v0, &segs[2..]) {
+                                return Some(q);
+                            }
+                        }
+                    }
+                    return None;
+                }
                 "request" if segs.len() > 1 => {
                     if let Some(v0) = self.request_scope.get_ci(segs[1]) {
                         return walk(v0, &segs[2..]);
@@ -4607,7 +4627,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::strukt(locals.clone())
                         }
                     } else if name_lower == "request" && !scope_shadowed_by_local {
-                        CfmlValue::strukt(self.request_scope.snapshot())
+                        CfmlValue::Struct(self.request_scope.clone())
                     } else if name_lower == "static" {
                         // The shared per-type static scope (see find_static_scope).
                         // Falls back to an empty struct when no static block exists,
@@ -4887,7 +4907,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::strukt(locals.clone())
                         }
                     } else if name_lower == "request" {
-                        CfmlValue::strukt(self.request_scope.snapshot())
+                        CfmlValue::Struct(self.request_scope.clone())
                     } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             // Live handle clone (see LoadLocal), not a snapshot.
@@ -5009,7 +5029,13 @@ impl CfmlVirtualMachine {
                             // `local.request = …` stays a plain local, not a
                             // write-back into the shared request scope.
                             if let CfmlValue::Struct(s) = &val {
-                                self.request_scope.with_write(|m| *m = s.snapshot());
+                                // Self-alias guard: `request` is a live handle, so a
+                                // member write already hit the shared backing; copying
+                                // it onto itself reentrant-deadlocks the RwLock.
+                                if s.backing_ptr() != self.request_scope.backing_ptr() {
+                                    let snap = s.snapshot();
+                                    self.request_scope.with_write(|m| *m = snap);
+                                }
                             }
                         } else if name_lower == "application"
                             && !declared_locals.contains(name.as_str())
@@ -16894,7 +16920,7 @@ impl CfmlVirtualMachine {
             }
         }
         if name_lower == "request" {
-            return Some(CfmlValue::strukt(self.request_scope.snapshot()));
+            return Some(CfmlValue::Struct(self.request_scope.clone()));
         }
         if name_lower == "server" {
             // `server.x = v` / `server[k] = v` load base: the live handle, so
@@ -17204,7 +17230,15 @@ impl CfmlVirtualMachine {
             }
         } else if name_lower == "request" {
             if let CfmlValue::Struct(s) = &val {
-                self.request_scope.with_write(|m| *m = s.snapshot());
+                // Self-alias guard (see application above): `request` is now a live
+                // handle (StoreLocal/LoadLocal return request_scope.clone()), so a
+                // member/index write already mutated the shared backing in place.
+                // Copying it onto itself would reentrant-deadlock the RwLock
+                // (snapshot() read-locks inside with_write()); skip the no-op.
+                if s.backing_ptr() != self.request_scope.backing_ptr() {
+                    let snap = s.snapshot();
+                    self.request_scope.with_write(|m| *m = snap);
+                }
             }
         } else if name_lower == "server" {
             // `server` is a live handle (see live_server_scope): SetProperty/
@@ -20740,7 +20774,24 @@ impl CfmlVirtualMachine {
             if s.contains_key("__name") || s.iter().any(|(k, _)| k.to_lowercase() == "__properties")
             {
                 let method_lower = method.to_lowercase();
-                if method_lower.starts_with("get") && method_lower.len() > 3 {
+                // Implicit getX/setX accessors are synthesized ONLY when the
+                // component declares accessors="true" (real methods are compiled
+                // for that case — see compiler.rs). Without it, CFML does NOT
+                // provide implicit accessors: a getX/setX call must reach the
+                // component's onMissingMethod (Lucee/ACF parity). The lenient
+                // fallback below stays for plain data CFCs that have neither
+                // accessors nor onMissingMethod, but a component WITH
+                // onMissingMethod and WITHOUT accessors must route there — else
+                // Masa's bean.cfc setTable()/getTable() (which onMissingMethod
+                // maps onto variables.instance.table) silently wrote the wrong
+                // scope, leaving the ORM table name empty (cfdbinfo "Missing
+                // attribute [table]"). See tests/oop/test_property_no_accessors_onmissing.cfm.
+                let has_accessors =
+                    matches!(s.get("__accessors"), Some(CfmlValue::Bool(true)));
+                let defines_on_missing =
+                    s.iter().any(|(k, _)| k.eq_ignore_ascii_case("onmissingmethod"));
+                let route_to_on_missing = defines_on_missing && !has_accessors;
+                if !route_to_on_missing && method_lower.starts_with("get") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
                     let val = s
                         .iter()
@@ -20762,12 +20813,14 @@ impl CfmlVirtualMachine {
                         return Ok(v);
                     }
                 }
-                if method_lower.starts_with("set") && method_lower.len() > 3 {
+                if !route_to_on_missing && method_lower.starts_with("set") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
                     // Don't let the implicit setter shadow a dynamic-dispatch method:
                     // if the property isn't already a member AND the component defines
                     // onMissingMethod (e.g. a Wheels model's association `setProfile`),
                     // fall through so onMissingMethod handles it (Lucee routes there).
+                    // (The accessors="true"+onMissingMethod case is already handled by
+                    // `route_to_on_missing` above for a declared-but-unset property.)
                     let is_known_member = s.iter().any(|(k, _)| k.eq_ignore_ascii_case(prop_name))
                         || s.iter().any(|(k, v)| {
                             k.eq_ignore_ascii_case("__properties")
@@ -20776,8 +20829,7 @@ impl CfmlVirtualMachine {
                                         if ps.get_ci("name").map(|n| n.as_string().eq_ignore_ascii_case(prop_name)).unwrap_or(false))
                                 }))
                         });
-                    let has_on_missing = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("onmissingmethod"));
-                    if !is_known_member && has_on_missing {
+                    if !is_known_member && defines_on_missing {
                         // fall through to the onMissingMethod handler below
                     } else if let Some(value) = extra_args.first() {
                         let modified = object.clone();
@@ -21118,7 +21170,7 @@ impl CfmlVirtualMachine {
             // array — the WireBox property-injection regression).
             locals.get(ARGUMENTS_SCOPE_KEY).cloned()
         } else if root == "request" {
-            Some(CfmlValue::strukt(self.request_scope.snapshot()))
+            Some(CfmlValue::Struct(self.request_scope.clone()))
         } else if root == "application" {
             if let Some(ref app_scope) = self.application_scope {
                 // Live handle clone (Lucee scope-reference semantics).

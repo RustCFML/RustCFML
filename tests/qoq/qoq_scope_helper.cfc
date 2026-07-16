@@ -16,4 +16,16 @@
 
 		<cfreturn variables.result>
 	</cffunction>
+
+	<!--- Mirrors Masa's admin framework.cfc: a query is passed INTO a method as an
+	      argument and read back via QoQ using an `arguments.rsX` source-table name.
+	      find_query_in_scope had no `arguments` case, so QoQ raised
+	      "table 'arguments.rsplugins' not found". --->
+	<cffunction name="buildFromArgs" output="false" returntype="query">
+		<cfargument name="rsplugins" type="query" required="true">
+		<cfquery name="local.filtered" dbtype="query">
+		select id, val from arguments.rsplugins where id >= 2 order by id
+		</cfquery>
+		<cfreturn local.filtered>
+	</cffunction>
 </cfcomponent>

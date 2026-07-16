@@ -4797,6 +4797,13 @@ fn fn_date_diff(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_date_format(args: Vec<CfmlValue>) -> CfmlResult {
     let date_str = get_str(&args, 0);
+    // Lucee returns an empty string for a blank date in the FORMAT functions
+    // (dateFormat/timeFormat/dateTimeFormat) — unlike dateAdd/year/parseDateTime,
+    // which throw a cast error. Masa's admin content-edit + staging views pass
+    // empty date columns straight to dateTimeFormat(); throwing 500'd the page.
+    if date_str.trim().is_empty() {
+        return Ok(CfmlValue::string(String::new()));
+    }
     let mask = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
     let dt = parse_cfml_date(&date_str)
         .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
@@ -4805,6 +4812,10 @@ fn fn_date_format(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_time_format(args: Vec<CfmlValue>) -> CfmlResult {
     let date_str = get_str(&args, 0);
+    // Blank input → "" (Lucee parity; see fn_date_format).
+    if date_str.trim().is_empty() {
+        return Ok(CfmlValue::string(String::new()));
+    }
     let mask = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
     let dt = parse_cfml_date(&date_str)
         .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
@@ -4813,6 +4824,10 @@ fn fn_time_format(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_date_time_format(args: Vec<CfmlValue>) -> CfmlResult {
     let date_str = get_str(&args, 0);
+    // Blank input → "" (Lucee parity; see fn_date_format).
+    if date_str.trim().is_empty() {
+        return Ok(CfmlValue::string(String::new()));
+    }
     let mask = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
     let dt = parse_cfml_date(&date_str)
         .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
