@@ -1250,6 +1250,14 @@ pub struct CfmlVirtualMachine {
     /// Captured locals from most recent execute_function_with_args call
     /// Used to capture component body variables (variables scope) after component loading
     captured_locals: Option<ValueMap>,
+    /// Set by an `<cfinclude>` executed *inside a function* immediately before it
+    /// runs the included template's `__main__` frame. Holds exactly the caller's
+    /// genuine `local`-scope keys (its locals minus its inherited/param keys). The
+    /// frame builder consumes+clears this so those keys stay part of the included
+    /// template's `local` view instead of being seeded as inherited — a CFML
+    /// `cfinclude` runs in the SAME function-local scope as its caller, so
+    /// `local.foo` set before the include is visible in the included file.
+    include_share_local_keys: Option<std::collections::HashSet<String>>,
     /// The calling frame's `__variables` scope, captured at each `CallMethod`
     /// dispatch. Used as a FALLBACK when a `this.method()` receiver carries no
     /// `__variables` of its own — which happens while a component is still
@@ -1841,6 +1849,7 @@ impl CfmlVirtualMachine {
             base_template_path: None,
             mappings: Vec::new(),
             captured_locals: None,
+            include_share_local_keys: None,
             dispatch_caller_variables: None,
             dispatch_caller_this: None,
             transaction_conn: None,
@@ -4298,6 +4307,23 @@ impl CfmlVirtualMachine {
         // of its keys are lexical/page scope (propagate) vs its own locals.
         let mut inherited_from_parent: std::collections::HashSet<String> =
             std::collections::HashSet::with_capacity(parent_len);
+        // For a function-scoped `<cfinclude>`, the caller passes down exactly its
+        // genuine `local`-scope keys here. Those keys are seeded into this frame's
+        // locals like any other parent var, but must remain part of the frame's
+        // `local` view (not marked inherited) — the included template runs in the
+        // caller's function-local scope, so `local.foo` set before the include is
+        // both readable and writable in the included file. Taken (cleared) so
+        // nested/subsequent calls don't inherit the flag.
+        let share_local_keys = self.include_share_local_keys.take();
+        // Does this frame own a genuine function `local` scope that an
+        // `<cfinclude>` in its body should share with the included template?
+        // True for a real function/method frame, and for a template frame that
+        // itself received a shared `local` scope (an include nested inside a
+        // function-scoped include chain — the local scope propagates down the
+        // whole chain). A top-level page `__main__` has NO local scope (its
+        // "locals" are the page `variables` scope), so its includes must not
+        // leak page vars in as `local.*`.
+        let frame_has_local_scope = !is_template_frame || share_local_keys.is_some();
         if let Some(parent) = parent_scope {
             for (k, v) in parent {
                 // Function values are normally skipped here: a named function /
@@ -4318,7 +4344,14 @@ impl CfmlVirtualMachine {
                 };
                 if carry {
                     locals.insert(k.clone(), v.clone());
-                    inherited_or_param_keys.insert(k.clone());
+                    // A shared `local` key from a function-scoped cfinclude stays
+                    // in this frame's `local` view — do NOT mark it inherited.
+                    if share_local_keys
+                        .as_ref()
+                        .is_none_or(|s| !s.contains(k))
+                    {
+                        inherited_or_param_keys.insert(k.clone());
+                    }
                     inherited_from_parent.insert(k.clone());
                 }
             }
@@ -9639,6 +9672,20 @@ impl CfmlVirtualMachine {
                             if __tmpl_start.is_some() {
                                 self.template_frame_begin();
                             }
+                            // A cfinclude runs in the caller's function-`local`
+                            // scope: hand down this frame's genuine local keys so
+                            // `local.foo` set before the include is visible (and
+                            // shared) in the included template. Skipped for a
+                            // top-level page, which has no local scope.
+                            if frame_has_local_scope {
+                                self.include_share_local_keys = Some(
+                                    locals
+                                        .keys()
+                                        .filter(|k| !inherited_or_param_keys.contains(*k))
+                                        .cloned()
+                                        .collect(),
+                                );
+                            }
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
@@ -9809,6 +9856,17 @@ impl CfmlVirtualMachine {
                             #[cfg(feature = "observability")]
                             if __tmpl_start.is_some() {
                                 self.template_frame_begin();
+                            }
+                            // Share the caller's function-`local` scope with the
+                            // included template (see the static Include op above).
+                            if frame_has_local_scope {
+                                self.include_share_local_keys = Some(
+                                    locals
+                                        .keys()
+                                        .filter(|k| !inherited_or_param_keys.contains(*k))
+                                        .cloned()
+                                        .collect(),
+                                );
                             }
                             let result = self.execute_function_with_args(
                                 &inc_func,
