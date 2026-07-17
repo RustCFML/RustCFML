@@ -468,6 +468,23 @@ fn java_shim_string(s: &CfmlStruct) -> Option<String> {
     s.get("__java_class").map(|c| c.as_string())
 }
 
+/// True when a struct is a CFC instance's internal backing map. This engine
+/// materialises components as marker-bearing structs (carrying a `__variables`
+/// scope plus a `this`/`__name` marker) as well as via the `Component` variant,
+/// and those backing structs sometimes land in value slots (async cbproxies, a
+/// component stored in another object's data). Their `__variables` scope holds
+/// the whole object graph — for framework objects (WireBox's injector↔binder,
+/// the async scheduler↔executor↔task) that graph is BOTH cyclic and densely
+/// shared, so deep-rendering it as `{k: v}` re-emits each shared subtree once per
+/// path → O(2^depth) BYTES (memoization bounds the compute but not the output
+/// size, and cyclic nodes are never cacheable). Lucee never dumps a component's
+/// internals on string coercion, so `as_string`/`to_string_sorted` render the
+/// same bounded `<Component>` token a real `CfmlValue::Component` does. Mirrors
+/// cfml-vm's `is_component_struct`.
+fn is_component_backing(s: &CfmlStruct) -> bool {
+    s.contains_key_ci("__variables") && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
+}
+
 #[derive(Clone)]
 pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
@@ -1248,6 +1265,12 @@ impl CfmlValue {
                 if let Some(js) = java_shim_string(s) {
                     return (js, true);
                 }
+                // A CFC instance's backing struct renders as a bounded token,
+                // exactly like a `CfmlValue::Component`, rather than deep-dumping
+                // its `__variables` graph (cyclic + shared → O(2^depth) bytes).
+                if is_component_backing(s) {
+                    return ("<Component>".to_string(), true);
+                }
                 let ptr = s.backing_ptr();
                 if path.contains(&ptr) {
                     return ("{...}".to_string(), false);
@@ -1356,6 +1379,12 @@ impl CfmlValue {
                 // it validates against (rather than a struct dump).
                 if let Some(js) = java_shim_string(s) {
                     return (js, true);
+                }
+                // A CFC instance's backing struct renders as a bounded token,
+                // exactly like a `CfmlValue::Component`, rather than deep-dumping
+                // its `__variables` graph (cyclic + shared → O(2^depth) bytes).
+                if is_component_backing(s) {
+                    return ("<Component>".to_string(), true);
                 }
                 let ptr = s.backing_ptr();
                 if path.contains(&ptr) {
@@ -2539,5 +2568,66 @@ mod size_probe {
             "CfmlValue grew to {cfml_value} B (ceiling 32 B) — a perf regression. \
              If intentional, justify and raise the ceiling."
         );
+    }
+}
+
+#[cfg(test)]
+mod component_backing_render {
+    //! A CFC instance's backing struct (this engine materialises components as
+    //! marker-bearing structs) must render as a bounded `<Component>` token in
+    //! `as_string`/`to_string_sorted`, NOT deep-dump its `__variables` graph.
+    //! On framework objects that graph is cyclic AND densely shared, so the old
+    //! deep dump was O(2^depth) BYTES and hung ColdBox boot (the async scheduler
+    //! stringifying `task.getStats()`, whose members reach back into the
+    //! scheduler/executor). Memoization bounds compute but not output size, and
+    //! cyclic nodes are never cacheable — so the fix is to prune at the component
+    //! boundary. See is_component_backing.
+    use super::*;
+
+    fn backing(name: &str) -> CfmlValue {
+        let mut m = ValueMap::default();
+        m.insert("__name".to_string(), CfmlValue::string(name));
+        m.insert("this".to_string(), CfmlValue::strukt(ValueMap::default()));
+        CfmlValue::strukt(m)
+    }
+
+    #[test]
+    fn component_backing_renders_as_bounded_token_not_its_variables_graph() {
+        // A component backing whose private `__variables` scope holds many
+        // members AND a back-reference to the component itself (a cycle) — the
+        // shape ColdBox's async scheduler produces (task.getStats() reaches back
+        // into the scheduler/executor). The fix must render the bounded token and
+        // NEVER descend into `__variables`.
+        let comp = backing("SchedulerTask");
+        let mut vars = ValueMap::default();
+        for i in 0..50 {
+            vars.insert(format!("member{i}"), CfmlValue::string(format!("value-{i}")));
+        }
+        vars.insert("selfRef".to_string(), comp.clone()); // cycle
+        if let CfmlValue::Struct(cs) = &comp {
+            cs.insert("__variables".to_string(), CfmlValue::strukt(vars));
+        }
+
+        // Both stringifiers emit exactly the bounded token a real
+        // `CfmlValue::Component` does — not the `__variables` dump.
+        assert_eq!(comp.as_string(), "<Component>");
+        assert_eq!(comp.to_string_sorted(), "<Component>");
+
+        // A struct that references the SAME component under 50 keys stays linear
+        // in the number of references (each collapses to `<Component>`); it never
+        // expands the member/cyclic graph, so the output is tiny.
+        let mut wide = ValueMap::default();
+        for i in 0..50 {
+            wide.insert(format!("ref{i}"), comp.clone());
+        }
+        let root = CfmlValue::strukt(wide);
+        let start = std::time::Instant::now();
+        let s = root.to_string_sorted();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed.as_secs() < 2, "component-graph stringify took {elapsed:?}");
+        assert!(!s.contains("value-"), "must not descend into the component's __variables members");
+        assert!(!s.contains("selfRef"), "must not descend into the component's __variables");
+        assert_eq!(s.matches("<Component>").count(), 50, "each ref collapses to a bounded token");
     }
 }
