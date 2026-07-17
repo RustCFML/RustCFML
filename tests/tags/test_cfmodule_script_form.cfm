@@ -33,5 +33,37 @@ savecontent variable="acOut2" {
 }
 assert( "attributeCollection merges with inline attrs", trim( acOut2 ), "[out foo=MERGED]" );
 
+// --- function-call form `cfmodule( template=…, attr=… )` (ColdBox's
+// Renderer.renderViewComposite calls cfmodule() this way). Must resolve the
+// same as the tag/statement forms; previously threw "Variable 'cfmodule' is
+// undefined" because the cf-prefixed tag function wasn't routed to __cfmodule. ---
+savecontent variable="fnOut" {
+	cfmodule( template="cfmodule_target.cfm", foo="FUNC" );
+}
+assert( "cfmodule() function-call form emits output", trim( fnOut ), "[out foo=FUNC]" );
+
+// --- a cfmodule template inherits the CALLING function's `arguments` scope
+// (Lucee semantics). ColdBox's RendererEncapsulator reads
+// `arguments.viewHelperPath` expecting the enclosing Renderer method's args. ---
+string function renderViaModule( required array viewHelperPath ){
+	var captured = "";
+	savecontent variable="captured" {
+		cfmodule( template="cfmodule_args_target.cfm" );
+	}
+	return captured;
+}
+assert(
+	"cfmodule template sees caller's arguments scope",
+	trim( renderViaModule( viewHelperPath = [ "CALLERARG" ] ) ),
+	"[argVHP=CALLERARG]"
+);
+
+// --- String.isEmpty() member function returns a real boolean (was Null, which
+// is falsy — broke ColdBox's `if ( !thisAllowedMethods.isEmpty() )` guard and
+// 405'd every default GET request). ---
+assertTrue( "empty string .isEmpty() is true", "".isEmpty() );
+assertFalse( "non-empty string .isEmpty() is false", "GET".isEmpty() );
+assertTrue( "String.isEmpty() returns a boolean", isBoolean( "".isEmpty() ) );
+
 suiteEnd();
 </cfscript>

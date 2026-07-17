@@ -5763,8 +5763,13 @@ impl CfmlVirtualMachine {
                             | "cfhtmlhead"
                             | "cfhtmlbody"
                             | "cfcache"
+                            | "cfmodule"
                     ) {
                         // Script-style tag calls: `cfcontent(reset=true)` routes to `__cfcontent`.
+                        // `cfmodule(template=…, attr=…)` — the function-call form of
+                        // <cfmodule> / `module attr=…;` — routes to `__cfmodule`
+                        // (ColdBox's Renderer.renderViewComposite calls
+                        // `cfmodule( template="RendererEncapsulator.cfm", … )`).
                         // `location(...)` is the documented script alias for `cflocation(...)`
                         // (CFML BIF `Location(url, addToken, statusCode)`); both must reach the
                         // `__cflocation` VM intercept, else `location()` falls through to the
@@ -6837,6 +6842,23 @@ impl CfmlVirtualMachine {
                             // shape. Without this the struct lands as a literal
                             // `attributecollection` key and the real attrs —
                             // directory/action/name — never reach the intercept.)
+                            // A single LEADING POSITIONAL struct is also treated as
+                            // the attribute bundle: the CFScript statement form of
+                            // these tags (`module template=…;` → `__cfmodule({…})`)
+                            // lowers to one positional struct, and it must fold into
+                            // opts exactly like attributeCollection — otherwise a
+                            // tag added to is_tag_call_builtin would drop every attr
+                            // of its statement form (empty-named args are skipped in
+                            // Pass 2). Only the first arg, and only when unnamed.
+                            if let (Some(name), Some(CfmlValue::Struct(s))) =
+                                (expanded_names.first(), expanded_values.first())
+                            {
+                                if name.is_empty() {
+                                    for (k, v) in s.iter() {
+                                        apply_attr(&k, v, &mut opts, &mut writeback_var);
+                                    }
+                                }
+                            }
                             for (i, name) in expanded_names.iter().enumerate() {
                                 if name.eq_ignore_ascii_case("attributecollection") {
                                     if let Some(CfmlValue::Struct(s)) = expanded_values.get(i) {
@@ -16674,6 +16696,16 @@ impl CfmlVirtualMachine {
                         CfmlValue::strukt(caller_snapshot.clone()),
                     );
                     tag_locals.insert("thistag".to_string(), CfmlValue::strukt(this_tag));
+                    // A custom-tag / cfmodule template is not a function frame, so it
+                    // has no `arguments` scope of its own. On Lucee an unqualified
+                    // `arguments.X` inside the template resolves to the CALLING
+                    // function's `arguments` scope — ColdBox's RendererEncapsulator
+                    // reads `arguments.viewHelperPath` expecting the enclosing
+                    // Renderer method's args. Bridge the caller's arguments scope in
+                    // so that lookup succeeds (was: no arguments scope → undefined).
+                    if let Some(caller_args) = parent_locals.get(ARGUMENTS_SCOPE_KEY) {
+                        tag_locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), caller_args.clone());
+                    }
 
                     self.execute_custom_tag_template(&resolved, &tag_locals)?;
 
@@ -16782,6 +16814,16 @@ impl CfmlVirtualMachine {
                         CfmlValue::strukt(caller_snapshot.clone()),
                     );
                     tag_locals.insert("thistag".to_string(), CfmlValue::strukt(this_tag));
+                    // A custom-tag / cfmodule template is not a function frame, so it
+                    // has no `arguments` scope of its own. On Lucee an unqualified
+                    // `arguments.X` inside the template resolves to the CALLING
+                    // function's `arguments` scope — ColdBox's RendererEncapsulator
+                    // reads `arguments.viewHelperPath` expecting the enclosing
+                    // Renderer method's args. Bridge the caller's arguments scope in
+                    // so that lookup succeeds (was: no arguments scope → undefined).
+                    if let Some(caller_args) = parent_locals.get(ARGUMENTS_SCOPE_KEY) {
+                        tag_locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), caller_args.clone());
+                    }
 
                     self.execute_custom_tag_template(&resolved, &tag_locals)?;
 
@@ -17925,6 +17967,12 @@ impl CfmlVirtualMachine {
                 // `$cache()` — bundles its named args into one options struct so
                 // the intercept consumes them cleanly instead of 500-ing.
                 | "__cfcache"
+                // cfmodule script call form `cfmodule(template=…, attr=…)` bundles
+                // its named args into one options struct that the __cfmodule
+                // intercept unwraps (merge_attribute_collection + split_module_path).
+                // The statement form `module attr=…;` (a lone positional struct)
+                // is folded by Pass 1's positional-struct handling above.
+                | "__cfmodule"
         )
     }
 
@@ -17948,8 +17996,10 @@ impl CfmlVirtualMachine {
             // Response/control tags have no return-value write-back: their
             // `name` attribute is a real option (header/cookie name), not a
             // caller-scope target.
+            // cfmodule's `name` attribute is the module dot-path, not a
+            // caller-scope write-back target — keep it in the options struct.
             "cfheader" | "cfcontent" | "cflocation" | "cfcookie" | "cflog"
-            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" | "cfcache" => &[],
+            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" | "cfcache" | "cfmodule" => &[],
             _ => &["name", "variable"],
         }
     }
@@ -19739,6 +19789,15 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::string(object.as_string()));
                 }
                 "len" | "length" => Some("len"),
+                // `"".isEmpty()` / `s.isEmpty()` — string member form of the
+                // isEmpty() builtin (Java String.isEmpty parity). Was absent, so
+                // it fell through to None → Null, which is *falsy*. ColdBox's
+                // Controller._runEvent guards the allowedMethods override with
+                // `if ( !thisAllowedMethods.isEmpty() )`; a Null result made the
+                // guard always fire, clobbering `handler.allowedMethods["index"]`
+                // ("GET") to "" and 405-ing every default GET request to the
+                // test-harness ("invalid http: main.index").
+                "isempty" => Some("isEmpty"),
                 "getbytes" => {
                     // java.lang.String.getBytes() returns byte[]. On Lucee this
                     // is a native array (isArray -> true, arrayLen -> byte
