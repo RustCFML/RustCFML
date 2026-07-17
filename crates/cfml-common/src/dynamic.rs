@@ -1,6 +1,6 @@
 //! Dynamic value types for CFML runtime
 
-use crate::vm::CfmlResult;
+use crate::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 use parking_lot::RwLock as PlRwLock;
 use std::collections::HashMap;
@@ -410,6 +410,62 @@ pub fn format_double(d: f64) -> String {
         s = "0".to_string();
     }
     s
+}
+
+/// If `s` is a Java-object shim (`createObject("java", …)`, represented
+/// internally as a struct tagged with `__java_shim`), return its Java
+/// `toString()` string. Lucee coerces Java objects to their `toString()` in
+/// every string context — `"" & obj`, `replace(obj, …)`, `<cfoutput>#obj#` —
+/// rather than dumping the object or throwing, so RustCFML must do the same for
+/// its shim representation. Mirrors the per-class `toString` handlers in
+/// cfml-vm's `java_shims.rs` for the classes whose string form real apps rely
+/// on (UUID, StringBuilder/Buffer, Locale, URL, InetAddress, …); any other
+/// shim falls back to its Java class name — never a struct dump, never a throw.
+///
+/// Returns `None` for a plain CFML struct so the caller keeps normal
+/// struct-dump / throw behaviour.
+fn java_shim_string(s: &CfmlStruct) -> Option<String> {
+    if !s.get("__java_shim").map(|v| v.is_true()).unwrap_or(false) {
+        return None;
+    }
+    // java.util.UUID -> canonical 8-4-4-4-12 form (matches UUID.toString()).
+    if let Some(u) = s.get("__uuid") {
+        let uuid = u.as_string();
+        if uuid.len() >= 32 {
+            return Some(format!(
+                "{}-{}-{}-{}-{}",
+                &uuid[0..8],
+                &uuid[8..12],
+                &uuid[12..16],
+                &uuid[16..20],
+                &uuid[20..32]
+            ));
+        }
+        return Some(uuid);
+    }
+    // java.lang.StringBuilder / StringBuffer -> buffered contents.
+    if let Some(b) = s.get("__buffer") {
+        return Some(b.as_string());
+    }
+    // java.util.Locale -> its id (`en`, `en_US`), matching Locale.toString().
+    if let Some(id) = s.get("__locale_id") {
+        return Some(id.as_string());
+    }
+    // java.net.URL -> its spec (URL.toString() == toExternalForm()).
+    if let Some(spec) = s.get("__spec") {
+        return Some(spec.as_string());
+    }
+    // java.net.InetAddress -> its hostname.
+    if let Some(h) = s.get("__hostname") {
+        return Some(h.as_string());
+    }
+    // Generic single-value wrapper shims store the scalar under `__value`.
+    if let Some(v) = s.get("__value") {
+        return Some(v.as_string());
+    }
+    // Any other Java object: fall back to its class name (never a struct dump,
+    // never a coercion throw).
+    s.get("__java_class").map(|c| c.as_string())
 }
 
 #[derive(Clone)]
@@ -1073,8 +1129,58 @@ impl CfmlValue {
     }
 
     pub fn as_string(&self) -> String {
-        let mut visited: Vec<usize> = Vec::new();
-        self.as_string_guarded(&mut visited)
+        let mut path: Vec<usize> = Vec::new();
+        let mut memo: HashMap<usize, String> = HashMap::new();
+        self.as_string_memo(&mut path, &mut memo).0
+    }
+
+    /// Lucee-parity strict string coercion for the contexts Lucee *rejects* for
+    /// complex values — the `&` concat operator, output (`<cfoutput>#x#</cfoutput>`
+    /// / `writeOutput`), and `toString()`. Lucee throws
+    /// `Can't cast Complex Object Type [Struct] to String` (type `expression`)
+    /// rather than dumping a `{k: v}` representation; RustCFML historically
+    /// produced the dump, which — on a densely cross-linked object graph like
+    /// WireBox's injector↔binder↔builder — expanded to an O(2^depth) string and
+    /// hung the process (ColdBox boot). Matching Lucee both fixes that and
+    /// surfaces the real coercion site to the CFML author.
+    ///
+    /// Scalars, dates, binary, XML, Java `NativeObject`s and `QueryColumn`
+    /// proxies coerce normally (Lucee casts those); only the genuinely-complex
+    /// types throw.
+    pub fn to_string_strict(&self) -> Result<String, CfmlError> {
+        match self {
+            // A Java-object shim (`createObject("java", …)`) is represented
+            // internally as a tagged struct, but Lucee coerces Java objects to
+            // their `toString()` in string contexts (concat, output) rather than
+            // throwing — e.g. `"" & java.util.UUID.randomUUID()` yields the UUID
+            // string. Route those through the shim stringifier; only genuine
+            // CFML structs throw.
+            CfmlValue::Struct(s) if java_shim_string(s).is_some() => {
+                Ok(java_shim_string(s).unwrap())
+            }
+            CfmlValue::Struct(_) => Err(CfmlError::expression(
+                "Can't cast Complex Object Type [Struct] to String".to_string(),
+            )),
+            CfmlValue::Array(_) => Err(CfmlError::expression(
+                "Can't cast Complex Object Type [Array] to String".to_string(),
+            )),
+            CfmlValue::Query(_) => Err(CfmlError::expression(
+                "Can't cast Complex Object Type [Query] to String".to_string(),
+            )),
+            CfmlValue::Component(c) => Err(CfmlError::expression(format!(
+                "Can't cast Component [{}] to String",
+                c.name
+            ))),
+            CfmlValue::Function(f) => Err(CfmlError::expression(format!(
+                "Can't cast Object type [user defined function ({})] to a value of type [string]",
+                f.name
+            ))),
+            CfmlValue::Closure(_) => Err(CfmlError::expression(
+                "Can't cast Object type [user defined function (closure)] to a value of type [string]"
+                    .to_string(),
+            )),
+            _ => Ok(self.as_string()),
+        }
     }
 
     /// Content-deterministic stringification: identical to `as_string` except a
@@ -1097,115 +1203,192 @@ impl CfmlValue {
     /// keys makes our `toString()` content-deterministic like Lucee's, so the
     /// setup and call hashes match. See docs/known-issues.md §15.
     pub fn to_string_sorted(&self) -> String {
-        let mut visited: Vec<usize> = Vec::new();
-        self.to_string_sorted_guarded(&mut visited)
+        let mut path: Vec<usize> = Vec::new();
+        let mut memo: HashMap<usize, String> = HashMap::new();
+        self.to_string_sorted_memo(&mut path, &mut memo).0
     }
 
-    fn to_string_sorted_guarded(&self, visited: &mut Vec<usize>) -> String {
+    /// Sorted-key counterpart of [`as_string_memo`]. Same memoization contract:
+    /// `path` guards cycles on the current chain, `memo` caches the rendered
+    /// string of every *clean* (cycle-free) container so a shared sub-graph is
+    /// rendered once, not once per path to it.
+    fn to_string_sorted_memo(
+        &self,
+        path: &mut Vec<usize>,
+        memo: &mut HashMap<usize, String>,
+    ) -> (String, bool) {
         match self {
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
-                if visited.contains(&ptr) {
-                    return "[...]".to_string();
+                if path.contains(&ptr) {
+                    return ("[...]".to_string(), false);
                 }
-                visited.push(ptr);
+                if let Some(cached) = memo.get(&ptr) {
+                    return (cached.clone(), true);
+                }
+                path.push(ptr);
+                let mut clean = true;
                 let items: Vec<String> = a
                     .snapshot()
                     .iter()
-                    .map(|v| v.to_string_sorted_guarded(visited))
+                    .map(|v| {
+                        let (s, c) = v.to_string_sorted_memo(path, memo);
+                        clean &= c;
+                        s
+                    })
                     .collect();
-                visited.pop();
-                format!("[{}]", items.join(", "))
+                path.pop();
+                let out = format!("[{}]", items.join(", "));
+                if clean {
+                    memo.insert(ptr, out.clone());
+                }
+                (out, clean)
             }
             CfmlValue::Struct(s) => {
-                if let Some(id) = s.get("__locale_id") {
-                    if s.get("__java_shim").map(|v| v.is_true()).unwrap_or(false) {
-                        return id.as_string();
-                    }
+                if let Some(js) = java_shim_string(s) {
+                    return (js, true);
                 }
                 let ptr = s.backing_ptr();
-                if visited.contains(&ptr) {
-                    return "{...}".to_string();
+                if path.contains(&ptr) {
+                    return ("{...}".to_string(), false);
                 }
-                visited.push(ptr);
+                if let Some(cached) = memo.get(&ptr) {
+                    return (cached.clone(), true);
+                }
+                path.push(ptr);
                 let mut entries: Vec<(String, CfmlValue)> = s.iter().collect();
                 entries.sort_by(|a, b| {
                     a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0))
                 });
+                let mut clean = true;
                 let items: Vec<String> = entries
                     .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.to_string_sorted_guarded(visited)))
+                    .map(|(k, v)| {
+                        let (s, c) = v.to_string_sorted_memo(path, memo);
+                        clean &= c;
+                        format!("{}: {}", k, s)
+                    })
                     .collect();
-                visited.pop();
-                format!("{{{}}}", items.join(", "))
+                path.pop();
+                let out = format!("{{{}}}", items.join(", "));
+                if clean {
+                    memo.insert(ptr, out.clone());
+                }
+                (out, clean)
             }
             // Everything else stringifies identically to as_string.
-            _ => self.as_string_guarded(visited),
+            _ => self.as_string_memo(path, memo),
         }
     }
 
-    /// Cycle-guarded stringification. Structs are reference types, so an object
-    /// graph can contain cycles (e.g. WireBox's injector ↔ binder ↔ builder).
-    /// Stringifying one would otherwise recurse until the native stack overflows
-    /// (no catchable error — a hard process abort). The `visited` set of backing
-    /// Arc pointers terminates revisited containers, mirroring `deep_copy_guarded`.
-    fn as_string_guarded(&self, visited: &mut Vec<usize>) -> String {
+    /// Cycle- *and* sharing-guarded stringification. Structs/arrays are reference
+    /// types, so an object graph can contain both cycles (WireBox's injector ↔
+    /// binder ↔ builder) and *shared* sub-graphs reachable by many paths (a
+    /// densely cross-linked config/metadata tree). The old per-path `visited`
+    /// guard stopped cycles from overflowing the stack, but a shared child was
+    /// still re-rendered once per path to it — O(2^depth) time and intermediate
+    /// string allocation. On ColdBox boot that hung the process at ~14 GB RSS.
+    ///
+    /// Two-part guard:
+    /// - `path` is the set of container pointers on the *current* recursion
+    ///   chain; revisiting one is a genuine cycle → emit `{...}`/`[...]`.
+    /// - `memo` caches the finished string of every container whose whole
+    ///   sub-graph rendered *without* hitting a cycle placeholder ("clean"). A
+    ///   shared clean sub-graph is then rendered once and reused, collapsing the
+    ///   exponential blow-up to O(nodes). The output is byte-identical to the old
+    ///   full re-rendering — only faster.
+    ///
+    /// A node is memoized only when clean, because a string that embedded a
+    /// `{...}` placeholder is context-dependent (the placeholder fired only
+    /// because an ancestor was mid-render) and must not be reused on another path.
+    /// Returns `(rendered, clean)`.
+    fn as_string_memo(
+        &self,
+        path: &mut Vec<usize>,
+        memo: &mut HashMap<usize, String>,
+    ) -> (String, bool) {
         match self {
-            CfmlValue::Null => String::new(),
-            CfmlValue::Bool(b) => b.to_string(),
-            CfmlValue::Int(i) => i.to_string(),
-            CfmlValue::Double(d) => format_double(*d),
+            CfmlValue::Null => (String::new(), true),
+            CfmlValue::Bool(b) => (b.to_string(), true),
+            CfmlValue::Int(i) => (i.to_string(), true),
+            CfmlValue::Double(d) => (format_double(*d), true),
             // Stringifies exactly like its fractional-day Double value, so string
             // concatenation and number-via-string coercion are unchanged.
-            CfmlValue::TimeSpan(d) => format_double(*d),
-            CfmlValue::String(s) => (**s).clone(),
+            CfmlValue::TimeSpan(d) => (format_double(*d), true),
+            CfmlValue::String(s) => ((**s).clone(), true),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
-                if visited.contains(&ptr) {
-                    return "[...]".to_string();
+                if path.contains(&ptr) {
+                    return ("[...]".to_string(), false);
                 }
-                visited.push(ptr);
-                let items: Vec<String> =
-                    a.snapshot().iter().map(|v| v.as_string_guarded(visited)).collect();
-                visited.pop();
-                format!("[{}]", items.join(", "))
+                if let Some(cached) = memo.get(&ptr) {
+                    return (cached.clone(), true);
+                }
+                path.push(ptr);
+                let mut clean = true;
+                let items: Vec<String> = a
+                    .snapshot()
+                    .iter()
+                    .map(|v| {
+                        let (s, c) = v.as_string_memo(path, memo);
+                        clean &= c;
+                        s
+                    })
+                    .collect();
+                path.pop();
+                let out = format!("[{}]", items.join(", "));
+                if clean {
+                    memo.insert(ptr, out.clone());
+                }
+                (out, clean)
             }
             // QueryColumn stringifies to the current-row value, matching Lucee's
             // proxy behavior so `q.col & "x"` concatenates the query's cursor row
             // (falls back to the first row).
-            CfmlValue::QueryColumn(a, row) => {
-                a.get(*row).or_else(|| a.first()).map(|v| v.as_string()).unwrap_or_default()
-            }
+            CfmlValue::QueryColumn(a, row) => (
+                a.get(*row).or_else(|| a.first()).map(|v| v.as_string()).unwrap_or_default(),
+                true,
+            ),
             CfmlValue::Struct(s) => {
                 // A java.util.Locale shim stringifies to its Java-style id
                 // (`en`, `en_US`) — matching Locale.toString() — so cbi18n's
                 // `arrayToList( Locale.getAvailableLocales() )` yields the ids
                 // it validates against (rather than a struct dump).
-                if let Some(id) = s.get("__locale_id") {
-                    if s.get("__java_shim").map(|v| v.is_true()).unwrap_or(false) {
-                        return id.as_string();
-                    }
+                if let Some(js) = java_shim_string(s) {
+                    return (js, true);
                 }
                 let ptr = s.backing_ptr();
-                if visited.contains(&ptr) {
-                    return "{...}".to_string();
+                if path.contains(&ptr) {
+                    return ("{...}".to_string(), false);
                 }
-                visited.push(ptr);
+                if let Some(cached) = memo.get(&ptr) {
+                    return (cached.clone(), true);
+                }
+                path.push(ptr);
+                let mut clean = true;
                 let items: Vec<String> = s
                     .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.as_string_guarded(visited)))
+                    .map(|(k, v)| {
+                        let (sv, c) = v.as_string_memo(path, memo);
+                        clean &= c;
+                        format!("{}: {}", k, sv)
+                    })
                     .collect();
-                visited.pop();
-                format!("{{{}}}", items.join(", "))
+                path.pop();
+                let out = format!("{{{}}}", items.join(", "));
+                if clean {
+                    memo.insert(ptr, out.clone());
+                }
+                (out, clean)
             }
-            CfmlValue::Closure(_) => "<Closure>".to_string(),
-            CfmlValue::Component(_) => "<Component>".to_string(),
-            CfmlValue::Function(f) => f.name.clone(),
-            CfmlValue::Query(_) => "<Query>".to_string(),
-            CfmlValue::Binary(_) => "<Binary>".to_string(),
+            CfmlValue::Closure(_) => ("<Closure>".to_string(), true),
+            CfmlValue::Component(_) => ("<Component>".to_string(), true),
+            CfmlValue::Function(f) => (f.name.clone(), true),
+            CfmlValue::Query(_) => ("<Query>".to_string(), true),
+            CfmlValue::Binary(_) => ("<Binary>".to_string(), true),
             CfmlValue::NativeObject(obj) => match obj.read() {
-                Ok(g) => format!("<NativeObject:{}>", g.class_name()),
-                Err(_) => "<NativeObject:poisoned>".to_string(),
+                Ok(g) => (format!("<NativeObject:{}>", g.class_name()), true),
+                Err(_) => ("<NativeObject:poisoned>".to_string(), true),
             },
         }
     }

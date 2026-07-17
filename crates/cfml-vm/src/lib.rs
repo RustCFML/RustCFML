@@ -3979,7 +3979,21 @@ impl CfmlVirtualMachine {
             stack.push(exc);
             Ok(handler.catch_ip)
         } else {
-            Err(self.wrap_error(CfmlError::runtime(message.to_string())))
+            // No handler in the CURRENT frame: propagate as an Err so an outer
+            // frame's try/catch can still catch it. Preserve the caller's
+            // `err_type` (don't downgrade to `runtime`) so a cross-frame
+            // `catch( expression e )` / `catch( database e )` still matches and
+            // `e.type` reports the real type — matching Lucee.
+            let err = match err_type {
+                "expression" => CfmlError::expression(message.to_string()),
+                "database" => CfmlError::database(message.to_string()),
+                "" | "runtime" => CfmlError::runtime(message.to_string()),
+                other => CfmlError::new(
+                    message.to_string(),
+                    CfmlErrorType::Custom(other.to_string()),
+                ),
+            };
+            Err(self.wrap_error(err))
         }
     }
 
@@ -5949,9 +5963,30 @@ impl CfmlVirtualMachine {
 
                 // String concatenation
                 BytecodeOp::Concat => {
-                    binary_op(&mut stack, |a, b| {
-                        CfmlValue::string(format!("{}{}", a.as_string(), b.as_string()))
-                    });
+                    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+                        // Lucee parity: `&` (and multi-part `"a#x#b"`) on a complex
+                        // value throws a catchable `expression` error — "Can't cast
+                        // Complex Object Type [Struct] to String" — instead of
+                        // dumping it. The dump was not just wrong-vs-Lucee: on a
+                        // densely shared object graph it expanded to an O(2^depth)
+                        // string and hung the process (ColdBox boot). Left operand
+                        // is checked first, matching CFML left-to-right evaluation.
+                        let sa = match a.to_string_strict() {
+                            Ok(s) => s,
+                            Err(e) => match self.raise_catchable(&mut stack, &e.message, "expression") {
+                                Ok(catch_ip) => { ip = catch_ip; continue; }
+                                Err(e) => return Err(e),
+                            },
+                        };
+                        let sb = match b.to_string_strict() {
+                            Ok(s) => s,
+                            Err(e) => match self.raise_catchable(&mut stack, &e.message, "expression") {
+                                Ok(catch_ip) => { ip = catch_ip; continue; }
+                                Err(e) => return Err(e),
+                            },
+                        };
+                        stack.push(CfmlValue::string(format!("{}{}", sa, sb)));
+                    }
                 }
 
                 // Comparison - proper value comparison
@@ -9649,6 +9684,18 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Include(path) => {
+                    // Collapse a leading run of slashes to a single '/' before any
+                    // resolution — Lucee/ACF/BoxLang treat `include "//x"` /
+                    // `"///x"` the same as `"/x"` (expandPath already does this).
+                    // ColdBox's `includeUDF` builds `"/" & appMapping & "/" &
+                    // udflibrary` with an EMPTY appMapping and an already-rooted
+                    // udflibrary ("/coldbox/…"), yielding "///coldbox/…"; the
+                    // extra slashes must not defeat mapping resolution.
+                    let path: String = if path.starts_with('/') || path.starts_with('\\') {
+                        format!("/{}", path.trim_start_matches(['/', '\\']))
+                    } else {
+                        path.clone()
+                    };
                     // Resolve path relative to source file or CWD.
                     // NB: source_dir.join(path) with an *absolute* path returns
                     // the absolute path unchanged (Path::join semantics), so a
@@ -9849,6 +9896,15 @@ impl CfmlVirtualMachine {
                 BytecodeOp::IncludeDynamic => {
                     // Pop dynamic path from stack and include
                     let path = stack.pop().unwrap_or(CfmlValue::Null).as_string();
+                    // Collapse a leading run of slashes to a single '/' (see the
+                    // static Include arm above) — Lucee treats "//x"/"///x" as
+                    // "/x". ColdBox's `includeUDF` uses `include targetLocation`
+                    // with a "///coldbox/…" path built from an empty appMapping.
+                    let path: String = if path.starts_with('/') || path.starts_with('\\') {
+                        format!("/{}", path.trim_start_matches(['/', '\\']))
+                    } else {
+                        path
+                    };
 
                     let resolved = if let Some(ref source) = self.source_file {
                         let source_dir = std::path::Path::new(source)
@@ -10013,7 +10069,16 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::Print => {
                     if let Some(val) = stack.pop() {
-                        self.output_buffer.push_str(&val.as_string());
+                        // Lucee parity: outputting a complex value throws a
+                        // catchable `expression` error rather than dumping it.
+                        let s = match val.to_string_strict() {
+                            Ok(s) => s,
+                            Err(e) => match self.raise_catchable(&mut stack, &e.message, "expression") {
+                                Ok(catch_ip) => { ip = catch_ip; continue; }
+                                Err(e) => return Err(e),
+                            },
+                        };
+                        self.output_buffer.push_str(&s);
                         self.output_buffer.push('\n');
                     }
                 }
@@ -10384,8 +10449,11 @@ impl CfmlVirtualMachine {
             // writeOutput/writeDump must be handled before the builtin lookup
             // so output goes to output_buffer (not stdout via the builtin fn)
             if name_lower == "writeoutput" || name_lower == "echo" {
+                // Lucee parity: writeOutput/echo of a complex value throws a
+                // catchable `expression` error rather than dumping it.
                 for arg in &args {
-                    self.output_buffer.push_str(&arg.as_string());
+                    let s = arg.to_string_strict().map_err(|e| self.wrap_error(e))?;
+                    self.output_buffer.push_str(&s);
                 }
                 return Ok(CfmlValue::Null);
             }

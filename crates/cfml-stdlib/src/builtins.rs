@@ -4064,7 +4064,11 @@ fn fn_to_string(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::Binary(bytes)) => {
             Ok(CfmlValue::string(String::from_utf8_lossy(bytes).to_string()))
         }
-        _ => Ok(CfmlValue::string(get_str(&args, 0))),
+        // Lucee parity: `toString()` of a complex value throws
+        // `Can't cast Complex Object Type [Struct] to String` (type `expression`)
+        // rather than dumping it. Scalars/dates/binary coerce as before.
+        Some(v) => Ok(CfmlValue::string(v.to_string_strict()?)),
+        None => Ok(CfmlValue::string(String::new())),
     }
 }
 

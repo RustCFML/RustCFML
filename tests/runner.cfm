@@ -155,6 +155,7 @@ include "harness.cfm";
 <cf_runtest file="types/test_null.cfm">
 <cf_runtest file="types/test_null_struct_key_absent.cfm">
 <cf_runtest file="types/test_boolean.cfm">
+<cf_runtest file="types/test_complex_string_coercion.cfm">
 <cf_runtest file="types/test_numeric.cfm">
 <cf_runtest file="types/test_string.cfm">
 <cf_runtest file="types/test_array.cfm">
