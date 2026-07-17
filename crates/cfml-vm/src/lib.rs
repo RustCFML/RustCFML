@@ -23256,7 +23256,45 @@ impl CfmlVirtualMachine {
                             }
                             _ => None,
                         });
-                        let defining_pkg: Option<String> =
+                        // Preferred: the DEFINING class's own logical dotted
+                        // name, recorded per source file at inheritance-merge
+                        // time (__source_names). self.source_file is swapped to
+                        // the executing method's defining file, so for an
+                        // inherited method this yields the parent class's
+                        // mapping-qualified package (testbox.system) rather than
+                        // the webroot-relative one (system) the filesystem
+                        // derivation below produces — and for a same-class
+                        // method it matches the instance's own package. Falls
+                        // through to the anchor logic when the map is absent
+                        // (e.g. a component with no inheritance).
+                        let source_name_pkg: Option<String> = self
+                            .source_file
+                            .as_deref()
+                            .and_then(|cur| {
+                                locals
+                                    .get("this")
+                                    .and_then(|t| match t {
+                                        CfmlValue::Struct(cs) => {
+                                            cs.get("__source_names").and_then(|v| v.as_struct())
+                                        }
+                                        _ => None,
+                                    })
+                                    .and_then(|m| {
+                                        m.get(cur)
+                                            .map(|v| v.as_string())
+                                            .or_else(|| {
+                                                m.iter()
+                                                    .find(|(k, _)| k.eq_ignore_ascii_case(cur))
+                                                    .map(|(_, v)| v.as_string())
+                                            })
+                                    })
+                            })
+                            .and_then(|nm| {
+                                nm.rfind('.')
+                                    .map(|i| nm[..i].to_string())
+                                    .filter(|p| !p.is_empty())
+                            });
+                        let defining_pkg: Option<String> = source_name_pkg.or_else(|| {
                             anchor.as_ref().and_then(|(name, src)| {
                                 // Common (non-inherited) case: the `new X()` is
                                 // lexically in the instance's OWN component file
@@ -23316,7 +23354,8 @@ impl CfmlVirtualMachine {
                                 } else {
                                     Some(parts.join("."))
                                 }
-                            });
+                            })
+                        });
                         if let Some(pkg) = defining_pkg {
                             dotted = format!("{}.{}", pkg, dotted);
                         } else if let Some(caller_pkg) =
@@ -24170,6 +24209,35 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // Record each ancestor's OWN logical dotted name keyed by its source
+        // file. An unqualified `new X()` written in an INHERITED method needs
+        // the DEFINING class's mapping-qualified package to name the new
+        // instance the way Lucee does (e.g. `new Expectation()` inside
+        // testbox.system.BaseSpec must yield testbox.system.Expectation, not
+        // the webroot-relative system.Expectation — see the __name derivation
+        // in the `new` handler). The physical webroot derivation there drops
+        // the mapping prefix the defining file was loaded under; this map
+        // preserves it. Captured before the child-merge overwrites
+        // parent_map["__source_file"]; carries forward the parent's own map so
+        // grandparent+ levels stay resolvable.
+        let mut source_names: ValueMap = parent_map
+            .get("__source_names")
+            .and_then(|v| v.as_struct())
+            .unwrap_or_default();
+        if let Some(CfmlValue::String(parent_src)) = parent_map.get("__source_file") {
+            source_names
+                .entry(parent_src.to_string())
+                .or_insert_with(|| CfmlValue::string(parent_name.to_string()));
+        }
+        if let (Some(CfmlValue::String(child_src)), Some(child_nm)) =
+            (child_map.get("__source_file"), child_map.get("__name"))
+        {
+            let nm = child_nm.as_string();
+            if !nm.is_empty() && nm != "Anonymous" {
+                source_names.insert(child_src.to_string(), CfmlValue::string(nm));
+            }
+        }
+
         // Collect parent methods for __super
         let mut super_methods = ValueMap::default();
         for (k, v) in parent_map.iter() {
@@ -24382,6 +24450,12 @@ impl CfmlVirtualMachine {
             parent_map.insert(
                 "__implements_src".to_string(),
                 CfmlValue::strukt(implements_src),
+            );
+        }
+        if !source_names.is_empty() {
+            parent_map.insert(
+                "__source_names".to_string(),
+                CfmlValue::strukt(source_names),
             );
         }
 
