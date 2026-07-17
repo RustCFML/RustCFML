@@ -1145,6 +1145,19 @@ pub struct CfmlVirtualMachine {
     /// Wheels Global.cfc promoteIncludedGlobalsMemoSpec). A stack (not an Option)
     /// keeps nested construction correct.
     constructing_component_names: Vec<String>,
+    /// Parent's explicit `this.*` DATA members (non-function, non-internal),
+    /// staged immediately before a subclass pseudo-constructor (`__cfc_body__`)
+    /// body runs and consumed when that body binds `this` (its first
+    /// `StoreLocal("this")`). CFML runs the parent pseudo-constructor first and
+    /// on the SAME `this` object, so members a parent set via `this.x = …` are
+    /// present on `this` when the child body executes (e.g. Masa/Mura
+    /// contentRenderer: the core parent sets `this.formInputClass`, the site
+    /// child reads it as `this.commentInputClass = this.formInputClass`). We
+    /// resolve the parent separately and merge only AFTER the child body, so
+    /// without this staging the child body's `this.parentMember` read throws
+    /// "Variable is undefined". Merged keys never overwrite ones the child body
+    /// already set. `take()`n on first consume so it fires exactly once per body.
+    pending_pseudo_ctor_parent_this: Option<ValueMap>,
     /// After a component method executes, holds modified variables scope entries for
     /// write-back to the component's __variables. Enables `variables.x = y` to persist.
     method_variables_writeback: Option<CfmlStruct>,
@@ -1821,6 +1834,7 @@ impl CfmlVirtualMachine {
             method_this_writeback: None,
             pseudo_ctor_super: Vec::new(),
             constructing_component_names: Vec::new(),
+            pending_pseudo_ctor_parent_this: None,
             method_variables_writeback: None,
             closure_parent_writeback: None,
             request_scope: CfmlStruct::empty(),
@@ -4990,6 +5004,26 @@ impl CfmlVirtualMachine {
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
                         let name_lower = name.to_lowercase();
+                        // Subclass pseudo-constructor: the body's `this`-binding
+                        // (LoadLocal(name) → StoreLocal("this"), emitted before any
+                        // body statement). Merge the parent's explicit `this.*` data
+                        // members in now so the child body can read them — CFML runs
+                        // the parent pseudo-ctor first on the same `this`. Only fills
+                        // keys the just-built struct lacks (child overrides stay
+                        // authoritative); `take()` so it fires exactly once per body.
+                        if name_lower == "this" {
+                            if let Some(parent_members) =
+                                self.pending_pseudo_ctor_parent_this.take()
+                            {
+                                if let CfmlValue::Struct(ref s) = val {
+                                    for (k, v) in parent_members {
+                                        if s.get_ci(&k).is_none() {
+                                            s.insert(k, v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if name_lower == "local" {
                             // `local.X = Y` — write back into the function's locals
                             // (or the template-scope locals when called outside a function),
@@ -22846,20 +22880,35 @@ impl CfmlVirtualMachine {
             // values) keeps it reachable only via `super.x()` dispatch, avoiding
             // the unqualified-call recursion the note above warns about.
             let mut super_value: Option<CfmlValue> = None;
+            // Parent's explicit `this.*` data members, staged for the child body
+            // (see `pending_pseudo_ctor_parent_this`).
+            let mut parent_this_members: Option<ValueMap> = None;
             let injected_scope: ValueMap = if let Some(ref pname) = parent_name {
                 if let Some(parent_template) = self.resolve_component_template(pname, locals) {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals);
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         let mut super_methods = ValueMap::default();
+                        let mut this_members = ValueMap::default();
                         for (k, v) in ps.iter() {
-                            if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+                            if k.starts_with("__") {
+                                continue;
+                            }
+                            if matches!(v, CfmlValue::Function(_)) {
                                 super_methods.insert(k.clone(), v.clone());
+                            } else {
+                                // A parent's `this.x = …` data member. Methods are
+                                // reachable via `super`/`__variables`; only data
+                                // members need seeding onto the child body's `this`.
+                                this_members.insert(k.clone(), v.clone());
                             }
                         }
                         if !super_methods.is_empty() {
                             super_methods
                                 .insert("__is_super".to_string(), CfmlValue::Bool(true));
                             super_value = Some(CfmlValue::strukt(super_methods));
+                        }
+                        if !this_members.is_empty() {
+                            parent_this_members = Some(this_members);
                         }
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get("__variables") {
                             parent_vars.snapshot()
@@ -23048,7 +23097,12 @@ impl CfmlVirtualMachine {
             // the body returns (GitHub #212).
             self.constructing_component_names
                 .push(Self::dotted_component_name(class_name));
+            // Stage the parent's explicit `this.*` data members so the child
+            // body sees them on `this` (consumed at its first `StoreLocal("this")`
+            // — the body's `this`-binding, before any user statement runs).
+            self.pending_pseudo_ctor_parent_this = parent_this_members;
             let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            self.pending_pseudo_ctor_parent_this = None;
             self.constructing_component_names.pop();
             if pushed_super {
                 self.pseudo_ctor_super.pop();
@@ -23798,21 +23852,37 @@ impl CfmlVirtualMachine {
         // (e.g. `pkg.Mock implements="IFace"`) resolved `IFace` against the
         // current execution's source_file (the entry template's dir) and failed
         // with "Interface 'IFace' not found". Point source_file at the component's
-        // CFC for the duration of resolution, then restore it.
-        let old_source_file = match component.get("__source_file") {
-            Some(CfmlValue::String(src)) => {
-                let prev = self.source_file.clone();
-                self.source_file = Some(src.to_string());
-                Some(prev)
-            }
+        // CFC for the duration of resolution, then restore it. An INHERITED
+        // interface, however, must resolve against the ANCESTOR that declared it,
+        // not the leaf's directory — `__implements_src` (built during inheritance
+        // merge) records each interface's declaring source; it overrides the base
+        // per interface below.
+        let prev_source_file = self.source_file.clone();
+        let base_source: Option<String> = match component.get("__source_file") {
+            Some(CfmlValue::String(src)) => Some(src.to_string()),
             _ => None,
         };
+        let implements_src: Option<ValueMap> = component
+            .get("__implements_src")
+            .and_then(|v| v.as_struct());
 
         let mut all_interfaces = Vec::new();
         let mut error: Option<CfmlError> = None;
 
         for iface_val in iface_names.iter() {
             let iface_name = iface_val.as_string();
+
+            // Point source_file at the cfc that DECLARED this interface (an
+            // ancestor for an inherited clause), falling back to the instance's
+            // own source, then the caller's original.
+            let decl_src: Option<String> = implements_src
+                .as_ref()
+                .and_then(|m| match m.get(&iface_name.to_lowercase()) {
+                    Some(CfmlValue::String(s)) => Some(s.to_string()),
+                    _ => None,
+                })
+                .or_else(|| base_source.clone());
+            self.source_file = decl_src.or_else(|| prev_source_file.clone());
 
             // Collect all transitive interface names
             let mut visited_ifaces = std::collections::HashSet::new();
@@ -23850,9 +23920,7 @@ impl CfmlVirtualMachine {
         }
 
         // Restore source_file regardless of outcome.
-        if let Some(prev) = old_source_file {
-            self.source_file = prev;
-        }
+        self.source_file = prev_source_file;
 
         match error {
             Some(e) => Err(e),
@@ -24071,6 +24139,37 @@ impl CfmlVirtualMachine {
             _ => return CfmlValue::Struct(child_map),
         };
 
+        // Record which source file DECLARED each `implements=` interface, so a
+        // relative interface path (e.g. "providers.ICacheProvider") is resolved
+        // against the declaring cfc's directory even when it is INHERITED by a
+        // subclass in a different package. Captured now, before the child-merge
+        // loop below overwrites `parent_map["__source_file"]` with the child's.
+        // Carries forward any `__implements_src` the parent accumulated from its
+        // own ancestors (grandparent+), then stamps the parent's OWN declared
+        // interfaces against the parent's source. The child's own interfaces are
+        // added after the merge. (ColdBox: AbstractCacheBoxProvider in
+        // system/cache/ declares implements="providers.ICacheProvider"; the
+        // concrete LuceeProvider lives in system/cache/providers/, so resolving
+        // that relative path against the leaf's dir looked for a spurious
+        // providers/providers/ICacheProvider and failed.)
+        let mut implements_src: ValueMap = parent_map
+            .get("__implements_src")
+            .and_then(|v| v.as_struct())
+            .unwrap_or_default();
+        if let Some(CfmlValue::String(parent_src)) = parent_map.get("__source_file") {
+            let parent_src = parent_src.to_string();
+            if let Some(CfmlValue::Array(parent_ifaces)) = parent_map.get("__implements") {
+                for v in parent_ifaces.iter() {
+                    let key = v.as_string().to_lowercase();
+                    if !key.is_empty() {
+                        implements_src
+                            .entry(key)
+                            .or_insert_with(|| CfmlValue::string(parent_src.clone()));
+                    }
+                }
+            }
+        }
+
         // Collect parent methods for __super
         let mut super_methods = ValueMap::default();
         for (k, v) in parent_map.iter() {
@@ -24262,6 +24361,28 @@ impl CfmlVirtualMachine {
                 .map(|s| CfmlValue::string(s))
                 .collect();
             parent_map.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+        }
+
+        // Stamp the child's OWN declared interfaces against the child's source
+        // (child wins over an inherited same-named entry), then persist the
+        // accumulated declaring-source map so `validate_interface_implementation`
+        // resolves each relative interface path against the cfc that declared it.
+        if let Some(CfmlValue::String(child_src)) = child_map.get("__source_file") {
+            let child_src = child_src.to_string();
+            if let Some(CfmlValue::Array(child_ifaces)) = child_map.get("__implements") {
+                for v in child_ifaces.iter() {
+                    let key = v.as_string().to_lowercase();
+                    if !key.is_empty() {
+                        implements_src.insert(key, CfmlValue::string(child_src.clone()));
+                    }
+                }
+            }
+        }
+        if !implements_src.is_empty() {
+            parent_map.insert(
+                "__implements_src".to_string(),
+                CfmlValue::strukt(implements_src),
+            );
         }
 
         // Re-establish the parent's `this`<->`variables` shared references

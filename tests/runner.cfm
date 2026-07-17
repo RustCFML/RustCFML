@@ -301,6 +301,7 @@ include "harness.cfm";
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
 <cf_runtest file="oop/test_property_no_accessors_onmissing.cfm">
+<cf_runtest file="oop/test_pseudo_ctor_parent_this.cfm">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">
 <cf_runtest file="oop/test_arg_type_validation.cfm">
 <cf_runtest file="oop/test_new_keyword_path.cfm">
@@ -324,6 +325,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_implicit_accessor_constructor.cfm">
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_implements_unqualified_sibling.cfm">
+<cf_runtest file="oop/test_inherited_relative_implements.cfm">
 <cf_runtest file="oop/test_unqualified_new_package_relative.cfm">
 <cf_runtest file="oop/test_unqualified_new_inherited_package.cfm">
 <cf_runtest file="oop/test_runtime_added_method_via_structappend.cfm">
