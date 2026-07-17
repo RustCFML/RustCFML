@@ -17199,6 +17199,21 @@ impl CfmlVirtualMachine {
         if let Some(v) = locals.get(name) {
             return Some(v.clone());
         }
+        // CFML identifiers are case-insensitive, so a frame-local declared with
+        // one casing (`var cbController`) must resolve when loaded with another
+        // (`cbcontroller.getRenderer()...`). scope_aware_store already updates
+        // the existing local case-insensitively via imap_key_ci; a case-SENSITIVE
+        // load here broke that symmetry — the method-receiver write-back's
+        // identity guard did scope_aware_load(path[0]), missed the differently-cased
+        // local, saw `existing = None`, disarmed the chained-CFC guard, and let a
+        // chained call's foreign `this` clobber the variable (ColdBox
+        // `cbcontroller.getRenderer().layout()` overwrote the ControllerDecorator
+        // local with the Renderer). Fall back to a case-insensitive locals scan.
+        if let Some(k) = imap_key_ci(locals, name) {
+            if let Some(v) = locals.get(&k) {
+                return Some(v.clone());
+            }
+        }
         // Web request scopes (url/form/cgi/cookie) are always request-global:
         // resolve straight from `self.globals`, never a component's stale
         // `__variables` shadow (see is_web_request_scope). A genuine frame-local

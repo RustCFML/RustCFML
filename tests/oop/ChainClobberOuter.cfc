@@ -25,4 +25,19 @@ component accessors="true" {
 		return [ "b", "a", "c" ];
 	}
 
+	// Reproduces ColdBox blocker #8: a function-local `var` declared with one
+	// casing (`baseVar`) but chain-called with another (`basevar`). The chained
+	// outer call runs on a DIFFERENT CFC (the inner dep), and codegen propagates
+	// the single-segment write-back path (["basevar"]) to it. The write-back's
+	// chained-CFC identity guard did scope_aware_load("basevar") — which was
+	// case-SENSITIVE while scope_aware_store is case-INSENSITIVE — missed the
+	// `baseVar` local, saw existing=None, disarmed, and let the inner dep clobber
+	// the base local. (ColdBox `cbcontroller.getRenderer().layout()` overwrote the
+	// `var cbController` ControllerDecorator with the Renderer.)
+	function probeCaseMismatch(){
+		var baseVar = new ChainClobberOuter();
+		basevar.getDep().setMark( "Z" );
+		return baseVar.whoAmI();
+	}
+
 }

@@ -56,5 +56,14 @@ assert("chained array sort returns the sorted array", arrayToList( sorted ), "a,
 assert("base still a component after chained array sort", isObject( o2 ), true);
 assert("base method still callable after chained array sort", o2.whoAmI(), "Outer");
 
+// ColdBox blocker #8: single-segment chained call where the base function-local
+// is REFERENCED with different casing than it was DECLARED
+// (`var cbController` … `cbcontroller.getRenderer().layout()`). The write-back
+// guard's scope_aware_load was case-sensitive while scope_aware_store was
+// case-insensitive, so the guard missed the local and the chained call's foreign
+// `this` overwrote the base. See ChainClobberOuter.probeCaseMismatch().
+mm = new ChainClobberOuter();
+assert("mixed-case single-segment chained call does not clobber base local", mm.probeCaseMismatch(), "Outer");
+
 suiteEnd();
 </cfscript>
