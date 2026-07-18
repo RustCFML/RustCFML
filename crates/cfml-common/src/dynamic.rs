@@ -485,6 +485,98 @@ fn is_component_backing(s: &CfmlStruct) -> bool {
     s.contains_key_ci("__variables") && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
 }
 
+/// True when `s` is an XML DOM value produced by `xmlParse`/`xmlNew`/`xmlSearch`:
+/// a document node (`__xmlDoc` marker or an `xmlRoot` key) or an element node
+/// (`xmlName` + `xmlChildren` + `xmlAttributes`). `isStruct` is true for these,
+/// so without this they would hit the generic "Can't cast … [Struct]" throw in
+/// `to_string_strict` (GH #277 — the XML analog of the v0.495 `<Component>` fix).
+fn is_xml_backing(s: &CfmlStruct) -> bool {
+    s.contains_key_ci("__xmlDoc")
+        || s.contains_key_ci("xmlRoot")
+        || (s.contains_key_ci("xmlName")
+            && s.contains_key_ci("xmlChildren")
+            && s.contains_key_ci("xmlAttributes"))
+}
+
+/// Serialize an XML DOM struct back to markup, matching Lucee 7's `toString(xml)`
+/// form. RustCFML stores XML as a parsed DOM (`xmlName`/`xmlAttributes`/`xmlText`/
+/// `xmlChildren`) and keeps no source text, so the tree is walked and re-emitted.
+/// Deterministic (same DOM → same string) so TestBox's `toString(a) eq toString(b)`
+/// XML comparison works. Attribute order is the DOM's insertion order (= source
+/// order from the parser), matching Lucee and keeping equal docs byte-identical.
+pub fn xml_backing_to_markup(s: &CfmlStruct) -> String {
+    // Document node → XML declaration (with `standalone`) + the root element.
+    if let Some(CfmlValue::Struct(root)) = s.get_ci("xmlRoot") {
+        let mut out =
+            String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>");
+        xml_serialize_node(&root, &mut out);
+        return out;
+    }
+    // A document marker with no root element yet (`xmlNew()`): declaration only.
+    if s.contains_key_ci("__xmlDoc") {
+        return String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>");
+    }
+    // Element node → declaration (no `standalone`, matching Lucee) + the element.
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    xml_serialize_node(s, &mut out);
+    out
+}
+
+fn xml_serialize_node(s: &CfmlStruct, out: &mut String) {
+    let name = s.get_ci("xmlName").map(|v| v.as_string()).unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+    out.push('<');
+    out.push_str(&name);
+    if let Some(CfmlValue::Struct(attrs)) = s.get_ci("xmlAttributes") {
+        for (k, v) in attrs.iter() {
+            out.push(' ');
+            out.push_str(&k);
+            out.push_str("=\"");
+            xml_escape_into(&v.as_string(), true, out);
+            out.push('"');
+        }
+    }
+    let text = s.get_ci("xmlText").map(|v| v.as_string()).unwrap_or_default();
+    let children = match s.get_ci("xmlChildren") {
+        Some(CfmlValue::Array(a)) => Some(a),
+        _ => None,
+    };
+    let no_children = children.as_ref().map(|a| a.is_empty()).unwrap_or(true);
+    if text.is_empty() && no_children {
+        out.push_str("/>");
+        return;
+    }
+    out.push('>');
+    if !text.is_empty() {
+        xml_escape_into(&text, false, out);
+    }
+    if let Some(children) = children {
+        for child in children.iter() {
+            if let CfmlValue::Struct(cs) = child {
+                xml_serialize_node(&cs, out);
+            }
+        }
+    }
+    out.push_str("</");
+    out.push_str(&name);
+    out.push('>');
+}
+
+/// Entity-escape XML character data (`&`, `<`, `>`) — plus `"` when `in_attr`.
+fn xml_escape_into(s: &str, in_attr: bool, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if in_attr => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
@@ -1175,6 +1267,10 @@ impl CfmlValue {
             CfmlValue::Struct(s) if java_shim_string(s).is_some() => {
                 Ok(java_shim_string(s).unwrap())
             }
+            // An XML document/element coerces to its serialized markup (Lucee
+            // parity), not a throw — GH #277. `isStruct` is true for XML, so this
+            // must precede the generic Struct throw below.
+            CfmlValue::Struct(s) if is_xml_backing(s) => Ok(xml_backing_to_markup(s)),
             CfmlValue::Struct(_) => Err(CfmlError::expression(
                 "Can't cast Complex Object Type [Struct] to String".to_string(),
             )),
@@ -1270,6 +1366,12 @@ impl CfmlValue {
                 // its `__variables` graph (cyclic + shared → O(2^depth) bytes).
                 if is_component_backing(s) {
                     return ("<Component>".to_string(), true);
+                }
+                // An XML document/element renders as its serialized markup
+                // (Lucee parity, GH #277) — deterministic, so writeDump / `#xml#`
+                // / mock-arg hashing stay consistent with `toString`.
+                if is_xml_backing(s) {
+                    return (xml_backing_to_markup(s), true);
                 }
                 let ptr = s.backing_ptr();
                 if path.contains(&ptr) {
@@ -1385,6 +1487,12 @@ impl CfmlValue {
                 // its `__variables` graph (cyclic + shared → O(2^depth) bytes).
                 if is_component_backing(s) {
                     return ("<Component>".to_string(), true);
+                }
+                // An XML document/element renders as its serialized markup
+                // (Lucee parity, GH #277) — deterministic, so writeDump / `#xml#`
+                // / mock-arg hashing stay consistent with `toString`.
+                if is_xml_backing(s) {
+                    return (xml_backing_to_markup(s), true);
                 }
                 let ptr = s.backing_ptr();
                 if path.contains(&ptr) {

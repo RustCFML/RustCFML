@@ -1158,6 +1158,18 @@ pub struct CfmlVirtualMachine {
     /// "Variable is undefined". Merged keys never overwrite ones the child body
     /// already set. `take()`n on first consume so it fires exactly once per body.
     pending_pseudo_ctor_parent_this: Option<ValueMap>,
+    /// `this.*` DATA members written by a `super.method(...)` call made during a
+    /// component pseudo-constructor whose body had NOT yet materialized a `this`
+    /// (e.g. Preside's `Application.cfc` doing only `super.setupApplication(...)`,
+    /// which sets `this.allowPingRequests`, `this.presideSessionManagement`, …).
+    /// The parent method runs on a throwaway receiver in that case, so its writes
+    /// would be lost; instead the super-dispatch stashes them here and both
+    /// pseudo-constructor paths (regular `new X()` and `load_application_cfc`) merge
+    /// them onto the finished instance's `this` scope after the body returns —
+    /// matching Lucee, where those members are visible to sibling and later
+    /// lifecycle methods. Saved/cleared around each body run so nested `new`
+    /// construction cannot cross-contaminate. `None` = no such writes.
+    pseudo_ctor_super_this_writes: Option<ValueMap>,
     /// After a component method executes, holds modified variables scope entries for
     /// write-back to the component's __variables. Enables `variables.x = y` to persist.
     method_variables_writeback: Option<CfmlStruct>,
@@ -1847,6 +1859,7 @@ impl CfmlVirtualMachine {
             pseudo_ctor_super: Vec::new(),
             constructing_component_names: Vec::new(),
             pending_pseudo_ctor_parent_this: None,
+            pseudo_ctor_super_this_writes: None,
             method_variables_writeback: None,
             closure_parent_writeback: None,
             request_scope: CfmlStruct::empty(),
@@ -8821,12 +8834,43 @@ impl CfmlVirtualMachine {
                                                 .insert("__variables".to_string(), vars.clone());
                                         }
                                     }
-                                    // Use the actual child 'this' from caller's locals
-                                    if let Some(real_this) = locals.get("this") {
-                                        method_locals.insert("this".to_string(), real_this.clone());
-                                    } else {
-                                        method_locals.insert("this".to_string(), object.clone());
-                                    }
+                                    // Use the actual child 'this' from caller's locals.
+                                    // During a subclass pseudo-constructor whose body has
+                                    // not yet materialized `this` (e.g. Preside's
+                                    // `Application.cfc` doing only
+                                    // `super.setupApplication(...)`), the frame has NO
+                                    // `this` — the body never emitted the
+                                    // LoadLocal→StoreLocal("this") binding. Giving the
+                                    // parent method the `object` (`__is_super` struct) as
+                                    // `this` sent its `this.x = …` writes onto a throwaway
+                                    // that is discarded on return (they never reach the
+                                    // instance — a regression from v0.468's shared-
+                                    // `variables` rework; Lucee persists them). Instead give
+                                    // it a real *temporary* `this` seeded with the frame's
+                                    // method table (so the parent method's variable reads
+                                    // resolve); its `this.*` data writes are harvested after
+                                    // the call into `pseudo_ctor_super_this_writes` for the
+                                    // pseudo-ctor path to merge onto the finished instance.
+                                    // Deliberately NOT inserted into `locals` — a frame
+                                    // `this` there would disturb Application.cfc component
+                                    // registration.
+                                    let super_temp_this: Option<cfml_common::dynamic::CfmlStruct> =
+                                        if let Some(real_this) = locals.get("this") {
+                                            method_locals
+                                                .insert("this".to_string(), real_this.clone());
+                                            None
+                                        } else {
+                                            let mut ts = ValueMap::default();
+                                            if let Some(vars) = locals.get("__variables") {
+                                                ts.insert("__variables".to_string(), vars.clone());
+                                            }
+                                            let temp = cfml_common::dynamic::CfmlStruct::new(ts);
+                                            method_locals.insert(
+                                                "this".to_string(),
+                                                CfmlValue::Struct(temp.clone()),
+                                            );
+                                            Some(temp)
+                                        };
                                     // Execute directly by global_id to avoid a
                                     // name collision with the child's override;
                                     // resolved through the registry, independent
@@ -8861,6 +8905,31 @@ impl CfmlVirtualMachine {
                                     if let Ok(ref _val) = call_result {
                                         if let Some(ref wb) = self.closure_parent_writeback {
                                             Self::write_back_to_captured_scope(&prop, wb);
+                                        }
+                                    }
+                                    // Harvest `this.*` DATA members the parent method wrote
+                                    // on the temporary receiver (pseudo-ctor with no `this`
+                                    // yet) into the stash so the pseudo-ctor path can merge
+                                    // them onto the finished instance. Prefer the method's
+                                    // writeback snapshot (captures a `this` the parent
+                                    // rebuilt via `this = …`); else the temp we passed in.
+                                    if let Some(temp) = super_temp_this {
+                                        if call_result.is_ok() {
+                                            let harvested = match &self.method_this_writeback {
+                                                Some(CfmlValue::Struct(s)) => s.clone(),
+                                                _ => temp,
+                                            };
+                                            let store = self
+                                                .pseudo_ctor_super_this_writes
+                                                .get_or_insert_with(ValueMap::default);
+                                            for (k, v) in harvested.snapshot() {
+                                                if k.starts_with("__")
+                                                    || matches!(v, CfmlValue::Function(_))
+                                                {
+                                                    continue;
+                                                }
+                                                store.insert(k, v);
+                                            }
                                         }
                                     }
                                     call_result
@@ -23256,7 +23325,13 @@ impl CfmlVirtualMachine {
             // body sees them on `this` (consumed at its first `StoreLocal("this")`
             // — the body's `this`-binding, before any user statement runs).
             self.pending_pseudo_ctor_parent_this = parent_this_members;
+            // Isolate this body's `super.method()` this-writes from any outer
+            // construction in progress (a nested `new` inside the body restores
+            // the outer stash on its own return). See pseudo_ctor_super_this_writes.
+            let saved_super_this_writes = self.pseudo_ctor_super_this_writes.take();
             let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
+            self.pseudo_ctor_super_this_writes = saved_super_this_writes;
             self.pending_pseudo_ctor_parent_this = None;
             self.constructing_component_names.pop();
             if pushed_super {
@@ -23316,6 +23391,19 @@ impl CfmlVirtualMachine {
             // it (independent scopes). Nested component references inside it are
             // shared, not cloned (see `deep_copy_with`).
             let mut result = result.map(|v| v.deep_copy_with(&mut dc_seen, true));
+            // Merge `this.*` members a `super.method(...)` set during the body (when
+            // the body had no materialized `this` — see pseudo_ctor_super_this_writes)
+            // onto the instance's `this` scope. Only fill keys the instance lacks, so
+            // an explicit child `this.x = …` still wins (parent-before-child order).
+            if let Some(writes) = body_super_this_writes {
+                if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
+                    for (k, v) in writes {
+                        if s.get_ci(&k).is_none() {
+                            s.insert(k, v);
+                        }
+                    }
+                }
+            }
             // The component struct's method values carry stable global_ids (set
             // when the CFC body's DefineFunction ops ran), so no func_idx fixup
             // is needed here any more.
@@ -26116,8 +26204,13 @@ impl CfmlVirtualMachine {
         // `/tests/runner.cfm`) triggered the request. Without this, the include
         // resolves against the target page's dir and escapes to the wrong place.
         let saved_source_file = self.source_file.replace(path.to_string());
+        // Isolate this Application.cfc body's `super.setupApplication()` this-writes
+        // (see pseudo_ctor_super_this_writes) from any outer construction.
+        let saved_super_this_writes = self.pseudo_ctor_super_this_writes.take();
         let exec_result =
             self.execute_function_with_args(&cfc_body, Vec::new(), Some(&app_body_scope));
+        let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
+        self.pseudo_ctor_super_this_writes = saved_super_this_writes;
         self.source_file = saved_source_file;
         if pushed_super {
             self.pseudo_ctor_super.pop();
@@ -26376,6 +26469,21 @@ impl CfmlVirtualMachine {
             self.mappings = early_mappings;
         }
 
+        // Merge `this.*` members set by `super.setupApplication(...)` (or any
+        // `super.method()`) during the Application.cfc body onto the app component's
+        // `this` scope, so lifecycle methods read them (e.g. Preside's `_pingCheck`
+        // reads `this.allowPingRequests`, `onError` reads
+        // `this.presideSessionManagement`). Only fill keys the component lacks so an
+        // explicit body-level `this.x` still wins. See pseudo_ctor_super_this_writes.
+        if let Some(writes) = body_super_this_writes {
+            if let Some(s) = template.as_cfml_struct() {
+                for (k, v) in writes {
+                    if s.get_ci(&k).is_none() {
+                        s.insert(k, v);
+                    }
+                }
+            }
+        }
         // Resolve inheritance (e.g. extends="taffy.core.api")
         let resolved = self.resolve_inheritance(template, &ValueMap::default());
         // Stamp the source path so the observability layer (debug footer) can

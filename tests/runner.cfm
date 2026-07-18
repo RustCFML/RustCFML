@@ -269,6 +269,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_higher_order_functions.cfm">
 <cf_runtest file="stdlib/test_bitmask_functions.cfm">
 <cf_runtest file="stdlib/test_xml_dom_functions.cfm">
+<cf_runtest file="stdlib/test_xml_tostring.cfm">
 <cf_runtest file="stdlib/test_misc_functions.cfm">
 <cf_runtest file="stdlib/test_len_scalar_coercion.cfm">
 <cf_runtest file="stdlib/test_len_multibyte_and_output_buffer.cfm">
@@ -849,6 +850,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_mixin_private_scope_dispatch.cfm">
 <cf_runtest file="oop/test_struct_get_vs_component_method.cfm">
 <cf_runtest file="oop/test_fluent_return_this_chain.cfm">
+<cf_runtest file="oop/test_super_ctor_this_writes.cfm">
 
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">
