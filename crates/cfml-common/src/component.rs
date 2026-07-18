@@ -58,6 +58,49 @@ impl<'a> CompRef<'a> {
     pub fn backing(&self) -> &'a CfmlStruct {
         self.backing
     }
+
+    /// See the free function [`type_identifiers`].
+    #[inline]
+    pub fn type_identifiers(&self) -> Vec<String> {
+        type_identifiers(self.backing)
+    }
+}
+
+/// The dotted type identifiers a component instance satisfies for `isInstanceOf`
+/// / type checks: its own class name (`__name`), its resolved superclass chain
+/// (`__extends_chain`), and its interface lists (`__implements`,
+/// `__implements_chain`, `__implements_fqns`). Names are returned as stored
+/// (original case); callers compare case-insensitively.
+///
+/// This is the canonical read of the introspection keys — the single place that
+/// knows their names, so the representation can move under it (C.3/C.4) without
+/// touching consumers.
+///
+/// CAUTION: this deliberately flattens every key with NO per-key distinction, so
+/// it is only correct for callers that apply *uniform* matching. A caller that
+/// needs different matching per key — notably `isInstanceOf`
+/// (`crate`-external `fn_is_instance_of`), which requires path-EXACT matching for
+/// `__implements_fqns` (issue #206) while allowing last-segment matches for the
+/// others, and also special-cases the base `"component"` type and `__java_class`
+/// — must NOT use this and keeps its own walk.
+pub fn type_identifiers(s: &CfmlStruct) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(CfmlValue::String(name)) = s.get_ci("__name") {
+        ids.push(name.to_string());
+    }
+    for key in [
+        "__extends_chain",
+        "__implements",
+        "__implements_chain",
+        "__implements_fqns",
+    ] {
+        if let Some(CfmlValue::Array(arr)) = s.get_ci(key) {
+            for item in arr.iter() {
+                ids.push(item.as_string());
+            }
+        }
+    }
+    ids
 }
 
 impl CfmlValue {

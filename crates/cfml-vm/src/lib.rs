@@ -18383,19 +18383,14 @@ impl CfmlVirtualMachine {
                     // A plain struct is not a component instance.
                     return false;
                 }
-                if let Some(CfmlValue::String(n)) = s.get("__name") {
-                    if matches_name(n.as_str()) {
-                        return true;
-                    }
-                }
-                for key in ["__extends_chain", "__implements", "__implements_chain", "__implements_fqns"] {
-                    if let Some(CfmlValue::Array(arr)) = s.get(key) {
-                        if arr.iter().any(|item| matches_name(&item.as_string())) {
-                            return true;
-                        }
-                    }
-                }
-                false
+                // Introspection-key reads centralized in the component facade
+                // (Phase C.1). The uniform last-segment matching stays here —
+                // NB this path intentionally applies last-segment matching to
+                // every identifier including __implements_fqns, unlike
+                // fn_is_instance_of (which keeps its own key-specific walk).
+                cfml_common::component::type_identifiers(s)
+                    .iter()
+                    .any(|id| matches_name(id.as_str()))
             }
             _ => false,
         }
