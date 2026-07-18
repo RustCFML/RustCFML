@@ -1582,6 +1582,18 @@ pub struct CfmlVirtualMachine {
     /// instance whose `__variables.__static` is the shared static scope. Lets the
     /// `::` operator reach static members/methods without re-instantiating.
     pub static_holders: HashMap<String, CfmlValue>,
+    /// Per-class cache of class-INVARIANT metadata keys, keyed by source file.
+    /// Populated on the first fully-resolved instance of a class and spliced
+    /// (Arc-shared) into every later instance, so N instances of a class share
+    /// ONE metadata graph instead of each re-deriving/deep-copying it
+    /// (`resolve_inheritance` otherwise re-merges every key on every `new`).
+    /// Holds only genuinely class-invariant keys (`__metadata`, `__properties`,
+    /// `__super_map`, `__extends_chain`, `__implements*`, `__source_names`,
+    /// `__accessors`) — never `__super` (a live per-instance NativeObject for
+    /// `rust:` parents) or `__variables` (the mutable instance scope). Production
+    /// mode only: classes are immutable there, so the cache can't go stale;
+    /// dev keeps per-instance copies. Same VM lifetime as `static_stores`.
+    pub class_meta_cache: HashMap<String, Arc<Vec<(String, CfmlValue)>>>,
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
@@ -1937,6 +1949,7 @@ impl CfmlVirtualMachine {
             cancel_flag: None,
             static_stores: HashMap::new(),
             static_holders: HashMap::new(),
+            class_meta_cache: HashMap::new(),
             last_component_compile_error: None,
             #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
             jit: jit::JitEngine::maybe_new(),
@@ -24203,7 +24216,70 @@ impl CfmlVirtualMachine {
             visited.insert(name.to_lowercase());
         }
 
-        self.resolve_inheritance_chain(template, &extends_name, locals, &mut visited)
+        let merged = self.resolve_inheritance_chain(template, &extends_name, locals, &mut visited);
+        // Phase A: class-invariant metadata (the merged `__metadata`/`__properties`/
+        // `__super_map`/... just re-derived above) is identical for every instance
+        // of this class. Splice one shared Arc-backed copy in so N instances don't
+        // each retain their own — the memory sink for component-heavy apps.
+        self.share_class_invariant_metadata(merged)
+    }
+
+    /// Class-invariant metadata keys — identical for every instance of a class,
+    /// never mutated per-instance after construction (verified: only writers are
+    /// codegen, the inheritance merge, and ctor stamping; no introspection path
+    /// writes back). Deliberately EXCLUDES `__super` (a live per-instance
+    /// `NativeObject` for `rust:` parents) and `__variables` (the mutable scope).
+    const CLASS_INVARIANT_META_KEYS: &'static [&'static str] = &[
+        "__metadata",
+        "__properties",
+        "__extends_chain",
+        "__implements",
+        "__implements_src",
+        "__implements_chain",
+        "__implements_fqns",
+        "__source_names",
+        "__super_map",
+        "__accessors",
+    ];
+
+    /// Phase A: share class-invariant metadata across every instance of a class.
+    /// On the first fully-resolved instance of a class (keyed by source file) we
+    /// cache Arc-shared handles of the invariant keys; on every later instance we
+    /// splice those shared handles in, dropping the freshly re-derived per-instance
+    /// copies. Production mode only — classes are immutable there, so the cache
+    /// cannot go stale; in dev we leave the per-instance copies alone.
+    fn share_class_invariant_metadata(&mut self, instance: CfmlValue) -> CfmlValue {
+        let production = self
+            .server_state
+            .as_ref()
+            .map_or(false, |s| s.production_mode);
+        if !production {
+            return instance;
+        }
+        let s = match &instance {
+            CfmlValue::Struct(s) => s,
+            _ => return instance,
+        };
+        // Key by physical source file — one class definition per file, so this is
+        // a stable per-class key (mirrors `static_stores`).
+        let key = match s.get("__source_file") {
+            Some(CfmlValue::String(f)) => f.to_string(),
+            _ => return instance,
+        };
+        if let Some(cached) = self.class_meta_cache.get(&key).cloned() {
+            // Later instance: replace re-derived invariant keys with shared handles.
+            for (k, v) in cached.iter() {
+                s.insert(k.clone(), v.clone());
+            }
+        } else {
+            // First instance: cache Arc-shared handles of the invariant keys.
+            let snap: Vec<(String, CfmlValue)> = Self::CLASS_INVARIANT_META_KEYS
+                .iter()
+                .filter_map(|k| s.get(k).map(|v| (k.to_string(), v)))
+                .collect();
+            self.class_meta_cache.insert(key, Arc::new(snap));
+        }
+        instance
     }
 
     fn resolve_inheritance_chain(
