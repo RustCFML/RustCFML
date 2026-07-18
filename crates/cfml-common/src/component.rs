@@ -21,6 +21,56 @@
 
 use crate::dynamic::{CfmlStruct, CfmlValue};
 
+// ---------------------------------------------------------------------------
+// Phase C.2 prototype: flyweight backing (feature-gated, OFF by default).
+//
+// `ClassBlueprint` is built once per CFC and shared (Arc) across ALL instances;
+// `Instance` is the thin per-instance value. The current marker-struct
+// representation duplicates, per instance, two full scope maps each carrying an
+// entry for every method plus the class metadata — those move onto the shared
+// blueprint here. NOT yet wired to a `CfmlValue::Instance` variant or a producer
+// (see COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md, steps C.2.1/C.2.2); these types
+// exist so the scaffolding compiles under the flag before that surgery.
+// Minimal on purpose: parent chain / properties / static scope / rust_extends
+// are deferred to the full C.2.
+// ---------------------------------------------------------------------------
+
+/// One per CFC file. Immutable after build; `Arc`-shared across every instance
+/// and request. Holds the class-invariant bulk (methods + metadata) that the
+/// marker-struct representation currently copies into each instance.
+#[cfg(feature = "component-instance")]
+#[allow(dead_code)]
+pub struct ClassBlueprint {
+    /// Dotted component name (`__name`).
+    pub name: String,
+    /// Source file the class was loaded from (super keying / heal rehoming).
+    pub source_file: String,
+    /// Shared method table (public + private), stored ONCE per class rather than
+    /// duplicated into each instance's `this`/`variables` maps.
+    pub methods: indexmap::IndexMap<String, std::sync::Arc<crate::dynamic::CfmlFunction>>,
+    /// Per-method access modifier, for gating EXTERNAL calls (the Lucee rule:
+    /// all methods visible in both scopes, but only public/remote callable from
+    /// outside `this`/`super`).
+    pub method_access: rustc_hash::FxHashMap<String, crate::dynamic::CfmlAccess>,
+    /// The class-invariant metadata blob (reuses the existing per-class shape).
+    pub metadata: CfmlValue,
+}
+
+/// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
+/// `Arc<RwLock<Instance>>` with real `Arc::ptr_eq` identity (added in C.2.1).
+#[cfg(feature = "component-instance")]
+#[allow(dead_code)]
+pub struct Instance {
+    /// Shared blueprint — zero per-instance copy.
+    pub class: std::sync::Arc<ClassBlueprint>,
+    /// Public DATA members only (Lucee `_data`); no methods, no `__*` metadata.
+    pub this_members: CfmlStruct,
+    /// Private DATA members only (Lucee `shadow`); independent map (see §core).
+    pub variables_members: CfmlStruct,
+    /// Logical identity for `duplicate()` disambiguation / fluent-chain guards.
+    pub instance_id: u64,
+}
+
 /// The canonical component-instance marker predicate: a struct is a component
 /// instance iff it carries the private `__variables` scope **and** either a
 /// public-scope handle (`this`) or a class name (`__name`). Mid-construction

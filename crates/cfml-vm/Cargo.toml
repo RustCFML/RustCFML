@@ -66,6 +66,9 @@ std = []
 # call site in the VM vanishes (`#[cfg(feature = "observability")]`), so the
 # hot path is byte-identical to a no-observability build.
 observability = []
+# Component-model flyweight prototype (Phase C.2) — propagates to cfml-common.
+# OFF by default; see COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
+component-instance = ["cfml-common/component-instance"]
 # Real OS-thread cfthread support. On by default for native targets; the wasm
 # targets (cfml-worker, rustcfml-wasm) build with default-features disabled and
 # fall back to the synchronous-inline cfthread path (no std::thread on wasm32).

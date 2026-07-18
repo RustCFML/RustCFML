@@ -12,6 +12,13 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Component-model flyweight prototype (Phase C.2). OFF by default: gates the
+# ClassBlueprint/Instance types (and, later, the CfmlValue::Instance variant +
+# producer). A default build is byte-identical to before this feature existed.
+# See COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
+component-instance = []
+
 [dependencies]
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
