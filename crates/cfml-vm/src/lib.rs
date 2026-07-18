@@ -23652,40 +23652,35 @@ impl CfmlVirtualMachine {
                         vars_scope.insert(k.clone(), v.deep_copy_with(&mut dc_seen, false));
                     }
                 }
-                // Add all component methods (public + private) to variables scope
-                // These override component_variables entries for public methods.
-                // Strip captured_scope — CFC methods use __variables, not closures.
+                // Backstop: ensure every component method is present in the
+                // variables scope so unqualified in-method calls resolve via the
+                // scope chain. The `body_scope`/`component_variables` loop above
+                // already inserts the pre-seeded method table (it seeds
+                // `variables` BEFORE the pseudo-constructor runs, then the body's
+                // `variables.x = …` writes accumulate into that same handle), so
+                // this loop is a no-op for the vast majority of methods — it only
+                // fires for a method somehow absent from `body_vars`.
                 //
-                // EXCEPTION: if the pseudo-constructor explicitly reassigned a
-                // method's name to a non-function value (e.g. a CFC with both a
-                // `property name="foo"` accessor and a same-named method `foo()`,
-                // where the body did `variables.foo = {...}`), that write must win.
-                // Lucee/ACF hoist methods into the variables scope FIRST, then run
-                // the pseudo-constructor, so a `variables.foo = value` assignment
-                // shadows the same-named method. Without this guard the method
-                // clobbers the assigned value and `getFoo()` reads back empty.
+                // Inserting ONLY when the key is absent also preserves the
+                // property/method name-collision rule for free: if the
+                // pseudo-constructor did `variables.foo = {…}` (a CFC with both a
+                // `property name="foo"` accessor and a `foo()` method), that value
+                // already occupies the slot from the loop above, so the same-named
+                // method is not re-inserted over it. (This replaces a per-method
+                // O(body-size) `shadowed_by_ctor` scan that produced an identical
+                // result — a slot occupied by a ctor value is, by definition,
+                // already present here.)
                 for (k, v) in s.iter() {
                     if k.starts_with("__") {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
-                        // A `variables.foo = value` write in the body now lands
-                        // in body_scope (the injected handle); a `var foo = value`
-                        // local stays in component_variables. Either non-function
-                        // shadow must beat the same-named method.
-                        let shadowed_by_ctor = body_scope
-                            .iter()
-                            .chain(component_variables.iter())
-                            .any(|(ck, cv)| {
-                                ck.eq_ignore_ascii_case(&k)
-                                    && !matches!(cv, CfmlValue::Function(_))
-                            });
-                        if shadowed_by_ctor {
+                        if vars_scope.contains_key(&k) {
                             continue;
                         }
                         // Only clone the wrapper when there's a captured_scope to
                         // strip (usually None) — avoids a per-method CfmlFunction
-                        // clone on every instance.
+                        // clone.
                         if f.captured_scope.is_some() {
                             let mut clean = f.clone();
                             Arc::make_mut(&mut clean).captured_scope = None;
