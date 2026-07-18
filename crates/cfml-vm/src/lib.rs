@@ -23299,7 +23299,10 @@ impl CfmlVirtualMachine {
             // first to seed the map; `vars_scope` is copied through `dc_seen`.
             let mut dc_seen: std::collections::HashMap<usize, CfmlValue> =
                 std::collections::HashMap::new();
-            let mut result = result.map(|v| v.deep_copy_with(&mut dc_seen));
+            // `is_root = true`: this IS the instance's own backing struct, so copy
+            // it (independent scopes). Nested component references inside it are
+            // shared, not cloned (see `deep_copy_with`).
+            let mut result = result.map(|v| v.deep_copy_with(&mut dc_seen, true));
             // The component struct's method values carry stable global_ids (set
             // when the CFC body's DefineFunction ops ran), so no func_idx fixup
             // is needed here any more.
@@ -23612,9 +23615,18 @@ impl CfmlVirtualMachine {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
-                        let mut clean = f.clone();
-                        Arc::make_mut(&mut clean).captured_scope = None;
-                        vars_scope.insert(k.clone(), CfmlValue::Function(clean));
+                        // Only clone the CfmlFunction wrapper (name + params) when
+                        // there's actually a captured_scope to strip — the common
+                        // case is None, and an unconditional `make_mut` cloned every
+                        // method wrapper per instance for nothing (same guard the
+                        // top-level method loop already uses).
+                        if f.captured_scope.is_some() {
+                            let mut clean = f.clone();
+                            Arc::make_mut(&mut clean).captured_scope = None;
+                            vars_scope.insert(k.clone(), CfmlValue::Function(clean));
+                        } else {
+                            vars_scope.insert(k.clone(), v.clone());
+                        }
                     } else {
                         // Deep-copy through the SAME map used for the `this`
                         // scope above: a value the body stored in both `this.x`
@@ -23622,7 +23634,9 @@ impl CfmlVirtualMachine {
                         // `dc_seen` returns that copy here — the two stay one
                         // shared reference (GitHub #221). A variables-only value
                         // (not in `this`) gets a fresh independent copy.
-                        vars_scope.insert(k.clone(), v.deep_copy_with(&mut dc_seen));
+                        // `is_root = false`: these are content values, so a nested
+                        // component here (e.g. an injected singleton) is shared.
+                        vars_scope.insert(k.clone(), v.deep_copy_with(&mut dc_seen, false));
                     }
                 }
                 // Add all component methods (public + private) to variables scope
@@ -23656,9 +23670,16 @@ impl CfmlVirtualMachine {
                         if shadowed_by_ctor {
                             continue;
                         }
-                        let mut clean = f.clone();
-                        Arc::make_mut(&mut clean).captured_scope = None;
-                        vars_scope.insert(k.clone(), CfmlValue::Function(clean));
+                        // Only clone the wrapper when there's a captured_scope to
+                        // strip (usually None) — avoids a per-method CfmlFunction
+                        // clone on every instance.
+                        if f.captured_scope.is_some() {
+                            let mut clean = f.clone();
+                            Arc::make_mut(&mut clean).captured_scope = None;
+                            vars_scope.insert(k.clone(), CfmlValue::Function(clean));
+                        } else {
+                            vars_scope.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 // Merge compiler-generated __variables (property defaults) into

@@ -1589,7 +1589,9 @@ impl CfmlValue {
     /// one shared reference after the instance template is deep-copied.)
     pub fn deep_copy(&self) -> CfmlValue {
         let mut seen: HashMap<usize, CfmlValue> = HashMap::new();
-        self.deep_copy_guarded(&mut seen)
+        // `duplicate()` clones everything, including nested components (Lucee's
+        // deep `duplicate()` recurses into a struct's nested CFCs).
+        self.deep_copy_guarded(&mut seen, false, true)
     }
 
     /// Deep-copy sharing a caller-supplied `seen` map, so that a series of
@@ -1599,11 +1601,26 @@ impl CfmlValue {
     /// scope is deep-copied first, then its `variables` scope is deep-copied
     /// through the same map, so an object the pseudo-constructor stored in both
     /// `this.x` and `variables.x` stays one shared reference in the instance.
-    pub fn deep_copy_with(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
-        self.deep_copy_guarded(seen)
+    ///
+    /// This is the INSTANTIATION path, so it treats a *nested* component instance
+    /// as a **reference boundary**: a component value stored inside the template
+    /// (e.g. an injected `variables.controller` singleton) is SHARED (Arc clone),
+    /// not deep-copied. Components are reference types in CFML — Lucee/BoxLang
+    /// never clone a referenced component at `new`. Without this, every `new X()`
+    /// re-cloned the entire graph of every singleton it referenced (the ColdBox
+    /// `Controller` graph was copied 332× in one spec run → ~10 GB). `is_root` is
+    /// true for the template's own backing struct (which MUST be copied so the
+    /// instance gets independent scopes) and false for content values.
+    pub fn deep_copy_with(&self, seen: &mut HashMap<usize, CfmlValue>, is_root: bool) -> CfmlValue {
+        self.deep_copy_guarded(seen, true, is_root)
     }
 
-    fn deep_copy_guarded(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
+    fn deep_copy_guarded(
+        &self,
+        seen: &mut HashMap<usize, CfmlValue>,
+        share_nested_components: bool,
+        is_root: bool,
+    ) -> CfmlValue {
         match self {
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
@@ -1615,20 +1632,33 @@ impl CfmlValue {
                 // copy instead of recursing forever / splitting into two.
                 let dest = CfmlArray::empty();
                 seen.insert(ptr, CfmlValue::Array(dest.clone()));
-                let items: Vec<CfmlValue> =
-                    a.snapshot().iter().map(|v| v.deep_copy_guarded(seen)).collect();
+                let items: Vec<CfmlValue> = a
+                    .snapshot()
+                    .iter()
+                    .map(|v| v.deep_copy_guarded(seen, share_nested_components, false))
+                    .collect();
                 dest.with_write(|w| *w = items);
                 CfmlValue::Array(dest)
             }
             CfmlValue::Struct(s) => {
+                // Reference boundary: on the instantiation path, a nested component
+                // instance is a reference, not a value — share its Arc handle
+                // rather than recursively cloning its (often huge, cyclic, shared)
+                // backing graph. The instance's OWN backing struct is `is_root` and
+                // still gets copied so its scopes are independent.
+                if share_nested_components && !is_root && is_component_backing(s) {
+                    return CfmlValue::Struct(s.clone());
+                }
                 let ptr = s.backing_ptr();
                 if let Some(existing) = seen.get(&ptr) {
                     return existing.clone();
                 }
                 let dest = CfmlStruct::empty();
                 seen.insert(ptr, CfmlValue::Struct(dest.clone()));
-                let entries: ValueMap =
-                    s.iter().map(|(k, v)| (k, v.deep_copy_guarded(seen))).collect();
+                let entries: ValueMap = s
+                    .iter()
+                    .map(|(k, v)| (k, v.deep_copy_guarded(seen, share_nested_components, false)))
+                    .collect();
                 dest.with_write(|w| *w = entries);
                 CfmlValue::Struct(dest)
             }
@@ -1654,7 +1684,9 @@ impl CfmlValue {
                     .into_iter()
                     .map(|col| {
                         Arc::new(
-                            col.iter().map(|v| v.deep_copy_guarded(seen)).collect(),
+                            col.iter()
+                                .map(|v| v.deep_copy_guarded(seen, share_nested_components, false))
+                                .collect(),
                         )
                     })
                     .collect();

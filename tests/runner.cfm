@@ -365,6 +365,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_metadata_implements_extends.cfm">
 <cf_runtest file="oop/test_component_bool_attr.cfm">
 <cf_runtest file="oop/test_chained_writeback_clobber.cfm">
+<cf_runtest file="oop/test_instance_shares_injected_component.cfm">
 <cf_runtest file="oop/test_unscoped_compound_variables_write.cfm">
 <cf_runtest file="oop/test_method_return_name_collision.cfm">
 <!--- Bare component name resolves relative to the CALLING CFC's package. From --->
