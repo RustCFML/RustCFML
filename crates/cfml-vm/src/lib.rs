@@ -1089,6 +1089,18 @@ pub struct CfmlVirtualMachine {
     /// Held as `Arc<BytecodeFunction>` so that cloning (very hot on every call)
     /// is a refcount bump rather than a deep clone of the whole bytecode body.
     pub user_functions: HashMap<String, Arc<BytecodeFunction>>,
+    /// Per-class-invariant cache of component-method `CfmlFunction` values, keyed
+    /// by the function's process-unique `global_id`. A CFC method's `CfmlFunction`
+    /// (name + params + `global_id` body + access, `captured_scope: None`) is
+    /// fully determined by its compiled definition, so it is byte-identical across
+    /// every instance of the class. Without this, instantiation rebuilt a fresh
+    /// `Arc<CfmlFunction>` — cloning the whole params `Vec` — for every method of
+    /// every instance (~800 B/method/instance, e.g. ~50 KB for a 27-method CFC),
+    /// the dominant per-instance memory cost. Caching lets each instance share the
+    /// one `Arc` (an 8-byte refcount bump). `Arc::make_mut` keeps the rare
+    /// per-instance mutation (binding a captured_scope) copy-on-write, so sharing
+    /// is safe. See COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
+    pub method_arc_cache: HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
     /// Source file path (for include resolution)
     pub source_file: Option<String>,
     /// Call stack for tracking execution
@@ -1844,6 +1856,7 @@ impl CfmlVirtualMachine {
             output_buffer: String::new(),
             vfs: Arc::new(RealFs),
             user_functions: HashMap::new(),
+            method_arc_cache: HashMap::new(),
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
@@ -22792,6 +22805,43 @@ impl CfmlVirtualMachine {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Dedup a freshly-built instance's method `CfmlFunction` values against the
+    /// per-class `method_arc_cache`, so every instance of a class shares ONE `Arc`
+    /// per method rather than the fresh copy the component body created during this
+    /// instantiation. Applied to the `this` scope and the `__variables` scope. Only
+    /// method values (`captured_scope: None`, body = `Int(global_id)`) whose cached
+    /// counterpart matches in name AND access are replaced — the cache is seeded
+    /// from the compiled definition (correct access), so this can never widen a
+    /// private method to public.
+    fn canonicalize_method_arcs(&self, s: &CfmlStruct) {
+        Self::canon_method_scope(&self.method_arc_cache, s);
+        if let Some(CfmlValue::Struct(vs)) = s.get("__variables") {
+            Self::canon_method_scope(&self.method_arc_cache, &vs);
+        }
+    }
+
+    fn canon_method_scope(
+        cache: &HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
+        sc: &CfmlStruct,
+    ) {
+        let mut repl: Vec<(String, Arc<cfml_common::dynamic::CfmlFunction>)> = Vec::new();
+        for (k, v) in sc.iter() {
+            let CfmlValue::Function(f) = &v else { continue };
+            if f.captured_scope.is_some() {
+                continue;
+            }
+            let cfml_common::dynamic::CfmlClosureBody::Expression(b) = &f.body else { continue };
+            let CfmlValue::Int(gid) = **b else { continue };
+            let Some(cached) = cache.get(&(gid as u32)) else { continue };
+            if !Arc::ptr_eq(cached, f) && cached.name == f.name && cached.access == f.access {
+                repl.push((k.clone(), cached.clone()));
+            }
+        }
+        for (k, arc) in repl {
+            sc.insert(k, CfmlValue::Function(arc));
+        }
+    }
+
     /// Whether two CFC instance structs are the *same logical instance*. Prefers
     /// the stable `__instance_id` stamped at construction (survives the value-semantics
     /// deep-copy / write-back rebuild that detaches the Arc); falls back to Arc
@@ -23241,36 +23291,56 @@ impl CfmlVirtualMachine {
                 // method defined anywhere in the body is visible from the first
                 // statement (Lucee parity). Built with no captured_scope — CFC
                 // methods resolve via __variables injected at call time.
-                for bf in self.program.functions.iter() {
+                //
+                // The `CfmlFunction` value for a method is class-invariant, so it
+                // is memoised in `method_arc_cache` by the method's process-unique
+                // `global_id` and SHARED across every instance (an `Arc` bump
+                // instead of a fresh alloc + params-`Vec` clone per instance —
+                // previously ~800 B/method/instance, the dominant per-instance
+                // cost). Disjoint field borrows (`&self.program` + `&mut
+                // self.method_arc_cache`) let the cache be filled while iterating
+                // the program's functions.
+                let program = &self.program;
+                let method_arc_cache = &mut self.method_arc_cache;
+                for bf in program.functions.iter() {
                     if !bf.is_component_method || bf.name.starts_with("__") {
                         continue;
                     }
-                    let cf = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
-                        name: bf.name.clone(),
-                        params: bf
-                            .params
-                            .iter()
-                            .enumerate()
-                            .map(|(i, name)| cfml_common::dynamic::CfmlParam {
-                                name: name.clone(),
-                                param_type: bf.param_types.get(i).cloned().flatten(),
-                                default: None,
-                                required: bf.required_params.get(i).copied().unwrap_or(false),
-                                annotations: bf
-                                    .param_annotations
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or_default(),
+                    let arc = method_arc_cache
+                        .entry(bf.global_id)
+                        .or_insert_with(|| {
+                            Arc::new(cfml_common::dynamic::CfmlFunction {
+                                name: bf.name.clone(),
+                                params: bf
+                                    .params
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, name)| cfml_common::dynamic::CfmlParam {
+                                        name: name.clone(),
+                                        param_type: bf.param_types.get(i).cloned().flatten(),
+                                        default: None,
+                                        required: bf
+                                            .required_params
+                                            .get(i)
+                                            .copied()
+                                            .unwrap_or(false),
+                                        annotations: bf
+                                            .param_annotations
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    })
+                                    .collect(),
+                                body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+                                    CfmlValue::Int(bf.global_id as i64),
+                                )),
+                                return_type: bf.return_type.clone(),
+                                access: bf.access.clone(),
+                                captured_scope: None,
                             })
-                            .collect(),
-                        body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                            CfmlValue::Int(bf.global_id as i64),
-                        )),
-                        return_type: bf.return_type.clone(),
-                        access: bf.access.clone(),
-                        captured_scope: None,
-                    }));
-                    method_table.insert(bf.name.clone(), cf);
+                        })
+                        .clone();
+                    method_table.insert(bf.name.clone(), CfmlValue::Function(arc));
                 }
                 CfmlStruct::new(method_table)
             };
@@ -23789,6 +23859,18 @@ impl CfmlVirtualMachine {
                 if !vars_scope.is_empty() {
                     s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
                 }
+            }
+            // Canonicalise each method's `CfmlFunction` value to the shared,
+            // per-class cache (`method_arc_cache`) so every instance points at ONE
+            // `Arc` per method instead of the fresh copy the component body created
+            // on this instantiation. The body re-materialises method values during
+            // execution (the pre-seeded table is overwritten), so this dedup runs
+            // at finalize, over both the `this` scope and the `__variables` scope.
+            // Safe because the cache is seeded from the compiled definition with
+            // the correct access, and we only replace when name+access match.
+            if let Some(CfmlValue::Struct(cs)) = result.as_ref() {
+                let cs = cs.clone();
+                self.canonicalize_method_arcs(&cs);
             }
             // Break the per-instantiation closure-env retention: clear captured
             // scopes on every member function of the assembled instance. CFC
