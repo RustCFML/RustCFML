@@ -260,6 +260,29 @@ fn render_html(
             }
             out.push_str("</table></div>");
         }
+        #[cfg(feature = "component-instance")]
+        CfmlValue::Instance(inst) => {
+            // Render a flyweight instance as a Component box from its public
+            // `this` data — the marker-struct component renders the same way via
+            // the `component_view` branch in the Struct arm above.
+            let g = inst.read();
+            let snap = g.this_members.snapshot();
+            box_open(out, "k-comp", &format!("Component {}", esc(&g.class.name)), &snap.len().to_string(), opts.expand);
+            if depth_exceeded(out, opts, depth) || snap.is_empty() {
+                if snap.is_empty() { out.push_str("<div class=\"rcf-empty\">[no public members]</div>"); }
+                out.push_str("</div>");
+                return;
+            }
+            out.push_str("<table>");
+            for (k, v) in snap.iter() {
+                out.push_str("<tr><td class=\"rcf-k\">");
+                out.push_str(&esc(k));
+                out.push_str("</td><td>");
+                render_child(v, opts, depth, out, visited);
+                out.push_str("</td></tr>");
+            }
+            out.push_str("</table></div>");
+        }
         CfmlValue::Query(q) => {
             let data = q.with_read(|d| d.clone());
             let rows = data.row_count();

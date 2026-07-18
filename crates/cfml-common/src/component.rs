@@ -35,11 +35,18 @@ use crate::dynamic::{CfmlStruct, CfmlValue};
 // are deferred to the full C.2.
 // ---------------------------------------------------------------------------
 
+/// Shared handle to a flyweight instance. `CfmlValue::Instance` wraps one of
+/// these; cloning it is an `Arc` refcount bump, and identity comparisons use
+/// `Arc::ptr_eq` (revives the old `CfmlValue::Component` identity semantics).
+#[cfg(feature = "component-instance")]
+pub type InstanceRef = std::sync::Arc<parking_lot::RwLock<Instance>>;
+
 /// One per CFC file. Immutable after build; `Arc`-shared across every instance
 /// and request. Holds the class-invariant bulk (methods + metadata) that the
 /// marker-struct representation currently copies into each instance.
 #[cfg(feature = "component-instance")]
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct ClassBlueprint {
     /// Dotted component name (`__name`).
     pub name: String,
@@ -57,7 +64,7 @@ pub struct ClassBlueprint {
 }
 
 /// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
-/// `Arc<RwLock<Instance>>` with real `Arc::ptr_eq` identity (added in C.2.1).
+/// `Arc<RwLock<Instance>>` with real `Arc::ptr_eq` identity.
 #[cfg(feature = "component-instance")]
 #[allow(dead_code)]
 pub struct Instance {
@@ -71,6 +78,33 @@ pub struct Instance {
     pub instance_id: u64,
 }
 
+// `CfmlStruct` has no `Debug` impl (the outer `CfmlValue` Debug is hand-rolled),
+// so `Instance` can't derive it. Hand-roll a shallow form — class name + id,
+// without recursing into the data maps — mirroring the concise style used for
+// `NativeObject`.
+#[cfg(feature = "component-instance")]
+impl std::fmt::Debug for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Instance")
+            .field("class", &self.class.name)
+            .field("instance_id", &self.instance_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "component-instance")]
+#[allow(dead_code)]
+impl Instance {
+    /// The dotted type identifiers this instance satisfies (see the free
+    /// [`type_identifiers`]). Prototype minimal: the blueprint only carries the
+    /// class name so far (parent chain / interfaces are DEFERRED to full C.2),
+    /// so leaf/concrete allowlisted classes are answered correctly and anything
+    /// needing the chain is out of the prototype's scope.
+    pub fn type_identifiers(&self) -> Vec<String> {
+        vec![self.class.name.clone()]
+    }
+}
+
 /// The canonical component-instance marker predicate: a struct is a component
 /// instance iff it carries the private `__variables` scope **and** either a
 /// public-scope handle (`this`) or a class name (`__name`). Mid-construction
@@ -82,12 +116,19 @@ pub fn is_component_backing(s: &CfmlStruct) -> bool {
 
 /// Lightweight, borrowed read view over a component instance.
 ///
-/// Phase C.1 backs this with the marker struct; Phase C.2 will add an
-/// `Instance` backing and this type becomes the dispatch point. Kept `Copy` so
+/// It abstracts over the two possible backings: the legacy marker struct
+/// ([`CompRef::Marker`]) and — when the `component-instance` feature is on — the
+/// flyweight [`Instance`] ([`CompRef::Instance`]). Consumers go through the
+/// accessor methods so the representation can move underneath them (C.3/C.4)
+/// without touching call sites. Kept `Copy` (both arms are shared references) so
 /// call sites can pass it around freely without lifetime friction.
 #[derive(Clone, Copy)]
-pub struct CompRef<'a> {
-    backing: &'a CfmlStruct,
+pub enum CompRef<'a> {
+    /// The current representation: a marker [`CfmlValue::Struct`].
+    Marker(&'a CfmlStruct),
+    /// The flyweight representation: a shared [`Instance`].
+    #[cfg(feature = "component-instance")]
+    Instance(&'a InstanceRef),
 }
 
 impl<'a> CompRef<'a> {
@@ -95,24 +136,42 @@ impl<'a> CompRef<'a> {
     #[inline]
     pub fn for_struct(s: &'a CfmlStruct) -> Option<CompRef<'a>> {
         if is_component_backing(s) {
-            Some(CompRef { backing: s })
+            Some(CompRef::Marker(s))
         } else {
             None
         }
     }
 
-    /// The raw backing struct. This is the C.1 escape hatch: as later slices
-    /// add typed accessors (`get_public`, `get_var`, `lookup_method`, …) the
-    /// direct-backing uses shrink until C.4 can drop it entirely.
+    /// Wrap a flyweight instance handle as a component view.
+    #[cfg(feature = "component-instance")]
     #[inline]
-    pub fn backing(&self) -> &'a CfmlStruct {
-        self.backing
+    pub fn for_instance(inst: &'a InstanceRef) -> CompRef<'a> {
+        CompRef::Instance(inst)
+    }
+
+    /// The raw marker-struct backing, if this view is marker-backed. This is the
+    /// C.1 escape hatch: as later slices add typed accessors (`get_public`,
+    /// `get_var`, `lookup_method`, …) the direct-backing uses shrink until C.4
+    /// can drop it entirely. Returns `None` for a flyweight-backed view — a
+    /// boundary that still needs the old shape must bridge explicitly rather
+    /// than assume a marker struct is always present.
+    #[inline]
+    pub fn backing(&self) -> Option<&'a CfmlStruct> {
+        match self {
+            CompRef::Marker(s) => Some(s),
+            #[cfg(feature = "component-instance")]
+            CompRef::Instance(_) => None,
+        }
     }
 
     /// See the free function [`type_identifiers`].
     #[inline]
     pub fn type_identifiers(&self) -> Vec<String> {
-        type_identifiers(self.backing)
+        match self {
+            CompRef::Marker(s) => type_identifiers(s),
+            #[cfg(feature = "component-instance")]
+            CompRef::Instance(inst) => inst.read().type_identifiers(),
+        }
     }
 }
 
@@ -161,6 +220,8 @@ impl CfmlValue {
     pub fn as_component(&self) -> Option<CompRef<'_>> {
         match self {
             CfmlValue::Struct(s) => CompRef::for_struct(s),
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => Some(CompRef::for_instance(inst)),
             _ => None,
         }
     }

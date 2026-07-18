@@ -1115,6 +1115,15 @@ pub enum CfmlValue {
     /// `CfmlVirtualMachine::register_native_class`. Method dispatch goes
     /// through the `CfmlNative` trait.
     NativeObject(Arc<RwLock<dyn CfmlNative>>),
+    /// Flyweight CFC instance (Phase C.2 prototype, feature-gated OFF by
+    /// default). A thin per-instance value sharing its class-invariant bulk
+    /// (methods + metadata) via an `Arc<ClassBlueprint>`, replacing the marker
+    /// `Struct` representation for allowlisted classes. When the
+    /// `component-instance` feature is off this variant does not exist, so a
+    /// default build is byte-identical and no match arm changes. See
+    /// COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
+    #[cfg(feature = "component-instance")]
+    Instance(crate::component::InstanceRef),
 }
 
 thread_local! {
@@ -1170,6 +1179,8 @@ impl fmt::Debug for CfmlValue {
                     .finish(),
                 Err(_) => f.debug_tuple("NativeObject").field(&"<poisoned>").finish(),
             },
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => f.debug_tuple("Instance").field(inst).finish(),
         }
     }
 }
@@ -1199,6 +1210,14 @@ impl CfmlValue {
             CfmlValue::Query(_) => "Query",
             CfmlValue::Binary(_) => "Binary",
             CfmlValue::NativeObject(_) => "NativeObject",
+            // A flyweight instance IS a component; reports the same as the (dead)
+            // Component variant it revives. NOTE: the *marker-struct* component
+            // representation reports "Struct" (it is a Struct), so isStruct()/
+            // getMetaData() sites that key on type_name may differ once the C.2.2
+            // producer swaps Instance in — a behaviour-identity item to reconcile
+            // during the producer step / measured in C.2.3.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(_) => "Component",
         }
     }
 
@@ -1229,6 +1248,8 @@ impl CfmlValue {
             CfmlValue::Struct(s) => !s.is_empty(),
             CfmlValue::Closure(_) => true,
             CfmlValue::Component(_) => true,
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(_) => true,
             CfmlValue::Function(_) => true,
             CfmlValue::Query(q) => !q.is_empty(),
             CfmlValue::Binary(b) => !b.is_empty(),
@@ -1526,6 +1547,11 @@ impl CfmlValue {
                 Ok(g) => (format!("<NativeObject:{}>", g.class_name()), true),
                 Err(_) => ("<NativeObject:poisoned>".to_string(), true),
             },
+            // Same bounded token as a marker-struct component (which returns
+            // "<Component>" via the is_component_backing branch above) — never a
+            // deep dump of the instance graph.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(_) => ("<Component>".to_string(), true),
         }
     }
 
@@ -2574,6 +2600,21 @@ impl serde::Serialize for CfmlValue {
             CfmlValue::Closure(_) | CfmlValue::Function(_) | CfmlValue::Component(_) | CfmlValue::NativeObject(_) => {
                 log::debug!("serializing non-serializable CfmlValue variant as null");
                 s.serialize_none()
+            }
+            // Serialize a flyweight instance as its public `this` data map — the
+            // marker-struct component serializes through the Struct arm above, so
+            // this keeps serializeJSON output component-shaped. (Note: the marker
+            // path also carries `__variables`/`__name`; serializeJSON of a CFC is
+            // VM-intercepted, so this raw serde path is a rarely-hit fallback.)
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let g = inst.read();
+                let snap = g.this_members.snapshot();
+                let mut map = s.serialize_map(Some(snap.len()))?;
+                for (k, v) in snap.iter() {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
             }
         }
     }
