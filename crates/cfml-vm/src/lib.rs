@@ -159,8 +159,10 @@ pub struct SessionData {
 /// component instance, not user data. Used to suppress engine internals during
 /// for-in iteration and serialization.
 fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool {
-    s.contains_key_ci("__variables")
-        && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
+    // Delegates to the single source of truth in the component facade
+    // (Phase C.1). Kept as a thin local alias so the many existing call sites
+    // taking a `&CfmlStruct` need no churn this slice.
+    cfml_common::component::is_component_backing(s)
 }
 
 /// Build the *leaf* (own-class) metadata for a component from a raw class
@@ -269,12 +271,8 @@ fn validate_session_value(path: &str, v: &CfmlValue) -> Result<(), String> {
             let snap = m.snapshot();
             // A struct carrying CFC instance markers is a component instance
             // (this engine materialises CFCs as marker-bearing structs as well
-            // as the `Component` variant).
-            let looks_like_cfc = snap.keys().any(|k| k.eq_ignore_ascii_case("__variables"))
-                && snap.keys().any(|k| {
-                    k.eq_ignore_ascii_case("this") || k.eq_ignore_ascii_case("__name")
-                });
-            if looks_like_cfc {
+            // as the `Component` variant). Uses the component-facade predicate.
+            if cfml_common::component::is_component_backing(m) {
                 return Err(format!("{} is a component", path));
             }
             for (k, val) in snap.iter() {

@@ -468,22 +468,21 @@ fn java_shim_string(s: &CfmlStruct) -> Option<String> {
     s.get("__java_class").map(|c| c.as_string())
 }
 
-/// True when a struct is a CFC instance's internal backing map. This engine
-/// materialises components as marker-bearing structs (carrying a `__variables`
-/// scope plus a `this`/`__name` marker) as well as via the `Component` variant,
-/// and those backing structs sometimes land in value slots (async cbproxies, a
-/// component stored in another object's data). Their `__variables` scope holds
-/// the whole object graph — for framework objects (WireBox's injector↔binder,
-/// the async scheduler↔executor↔task) that graph is BOTH cyclic and densely
-/// shared, so deep-rendering it as `{k: v}` re-emits each shared subtree once per
-/// path → O(2^depth) BYTES (memoization bounds the compute but not the output
-/// size, and cyclic nodes are never cacheable). Lucee never dumps a component's
-/// internals on string coercion, so `as_string`/`to_string_sorted` render the
-/// same bounded `<Component>` token a real `CfmlValue::Component` does. Mirrors
-/// cfml-vm's `is_component_struct`.
-fn is_component_backing(s: &CfmlStruct) -> bool {
-    s.contains_key_ci("__variables") && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
-}
+/// True when a struct is a CFC instance's internal backing map. Re-exported from
+/// the [`crate::component`] facade — the single source of truth for the marker
+/// predicate. Kept as a local alias here because the string-coercion / dump paths
+/// below (and their doc-comments) reference it: this engine materialises
+/// components as marker-bearing structs (carrying a `__variables` scope plus a
+/// `this`/`__name` marker), and those backing structs sometimes land in value
+/// slots (async cbproxies, a component stored in another object's data). Their
+/// `__variables` scope holds the whole object graph — for framework objects
+/// (WireBox's injector↔binder, the async scheduler↔executor↔task) that graph is
+/// BOTH cyclic and densely shared, so deep-rendering it as `{k: v}` re-emits each
+/// shared subtree once per path → O(2^depth) BYTES (memoization bounds the compute
+/// but not the output size, and cyclic nodes are never cacheable). Lucee never
+/// dumps a component's internals on string coercion, so `as_string`/
+/// `to_string_sorted` render the same bounded `<Component>` token.
+use crate::component::is_component_backing;
 
 /// True when `s` is an XML DOM value produced by `xmlParse`/`xmlNew`/`xmlSearch`:
 /// a document node (`__xmlDoc` marker or an `xmlRoot` key) or an element node
