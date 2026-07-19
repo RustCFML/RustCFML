@@ -273,6 +273,17 @@ pub struct StructInner {
     /// instance forever (the v0.185.0 per-request serve-mode leak). `None` on
     /// every non-component struct, so unrelated structs pay nothing.
     pub this_alias: Option<Weak<PlRwLock<StructInner>>>,
+    /// Shared per-class method table (component-model flyweight). When set (only
+    /// on a component instance's `this` and `__variables` scope structs), method
+    /// lookups that MISS the per-instance `map` fall through here. The `Arc` is
+    /// ONE table per class, shared by every instance — so the ~40 method entries
+    /// (name + `Arc<CfmlFunction>`) that used to be copied into each instance's
+    /// two scope maps (~360 B/method/instance, the dominant per-instance cost of
+    /// a method-heavy CFC) live once per class instead. `None` on every plain
+    /// struct, so unrelated structs pay nothing (one `Option` check). Writes
+    /// always go to `map`, so an injected/overridden method (MockBox `$()`,
+    /// `structAppend`, `this.fn = …`) shadows the table entry naturally.
+    pub method_table: Option<Arc<ValueMap>>,
 }
 
 static STRUCT_SHAPE_COUNTER: std::sync::atomic::AtomicU64 =
@@ -600,9 +611,37 @@ impl CfmlStruct {
             ci,
             shape_id: next_shape_id(),
             this_alias: None,
+            method_table: None,
         }));
         crate::cycle_gc::log_struct(&arc);
         CfmlStruct(arc)
+    }
+
+    /// Attach a shared per-class method table (component-model flyweight). After
+    /// this, method lookups that miss the per-instance `map` fall through to
+    /// `table`. Bumps `shape_id` so JIT/IC caches re-resolve.
+    #[inline]
+    pub fn set_method_table(&self, table: Arc<ValueMap>) {
+        let mut g = self.0.write();
+        g.method_table = Some(table);
+        g.shape_id = next_shape_id();
+    }
+
+    /// Drop the shared method table for THIS struct only (e.g. `structClear()`
+    /// on a component empties its public scope, methods included).
+    #[inline]
+    pub fn clear_method_table(&self) {
+        let mut g = self.0.write();
+        if g.method_table.take().is_some() {
+            g.shape_id = next_shape_id();
+        }
+    }
+
+    /// The shared method table, if any. Component-aware iteration
+    /// (`structKeyList`/for-in/`getMetadata`) unions these keys with `map`.
+    #[inline]
+    pub fn method_table(&self) -> Option<Arc<ValueMap>> {
+        self.0.read().method_table.clone()
     }
 
     #[inline]
@@ -646,8 +685,34 @@ impl CfmlStruct {
     /// Clone the value for `key` (case-sensitive), or `None`.
     #[inline]
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
-        if let Some(v) = self.0.read().map.get(key).cloned() {
-            return Some(v);
+        {
+            let g = self.0.read();
+            if let Some(v) = g.map.get(key) {
+                return Some(v.clone());
+            }
+            // Shared per-class method table (component flyweight): a method
+            // missing from this instance's `map` resolves here. Method names are
+            // case-insensitive, so exact then a scan (tables are small).
+            if let Some(t) = &g.method_table {
+                // Instance data ALWAYS shadows a shared class method, so before
+                // consulting the table resolve a case-variant *map* key first.
+                // (Without this, `test = createObject(...)` stored under casing
+                // `Test` in the map is shadowed by a class method `test()` in
+                // the table — TestBox's xUnit `test` var vs BaseSpec.test().)
+                // This only matters when a table is present; plain structs keep
+                // `get()`'s exact-case contract.
+                if let Some(orig) = g.resolve_ci_key(key) {
+                    if let Some(v) = g.map.get(orig) {
+                        return Some(v.clone());
+                    }
+                }
+                if let Some(v) = t.get(key) {
+                    return Some(v.clone());
+                }
+                if let Some((_, v)) = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                    return Some(v.clone());
+                }
+            }
         }
         // Live `variables.this` alias (Lucee/ACF): a CFC `__variables` with no
         // stored `this` key resolves it to the live public scope via a Weak
@@ -698,6 +763,15 @@ impl CfmlStruct {
             // ci resolution: O(1) index for large structs, linear scan for small.
             if let Some(orig) = g.resolve_ci_key(key) {
                 if let Some(v) = g.map.get(orig) {
+                    return Some(v.clone());
+                }
+            }
+            // Shared per-class method table fallthrough (component flyweight).
+            if let Some(t) = &g.method_table {
+                if let Some(v) = t.get(key) {
+                    return Some(v.clone());
+                }
+                if let Some((_, v)) = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
                     return Some(v.clone());
                 }
             }
@@ -759,13 +833,40 @@ impl CfmlStruct {
         if g.map.contains_key(key) {
             return Some(key.to_string()); // exact-case fast path
         }
-        g.resolve_ci_key(key).cloned()
+        if let Some(orig) = g.resolve_ci_key(key) {
+            return Some(orig.clone());
+        }
+        // Shared method table (component flyweight): resolve a tabled method to
+        // its stored key so structKeyExists/structFindKey see it as a member.
+        if let Some(t) = &g.method_table {
+            if t.contains_key(key) {
+                return Some(key.to_string());
+            }
+            if let Some((k, _)) = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                return Some(k.clone());
+            }
+        }
+        None
     }
 
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.0.read().map.contains_key(key)
-            || (key.eq_ignore_ascii_case("this") && self.this_alias_struct().is_some())
+        {
+            let g = self.0.read();
+            if g.map.contains_key(key) {
+                return true;
+            }
+            // Shared method table (component flyweight): the method exists on the
+            // instance even though it lives once per class, not in `map`.
+            if let Some(t) = &g.method_table {
+                if t.contains_key(key)
+                    || t.keys().any(|k| k.eq_ignore_ascii_case(key))
+                {
+                    return true;
+                }
+            }
+        }
+        key.eq_ignore_ascii_case("this") && self.this_alias_struct().is_some()
     }
 
     /// Case-insensitive key presence check.
@@ -774,6 +875,12 @@ impl CfmlStruct {
         // exact hit, else ci resolution (O(1) index for large, scan for small).
         if g.map.contains_key(key) || g.resolve_ci_key(key).is_some() {
             return true;
+        }
+        // Shared method table fallthrough (component flyweight).
+        if let Some(t) = &g.method_table {
+            if t.contains_key(key) || t.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+                return true;
+            }
         }
         drop(g);
         // `StructKeyExists(variables, "this")` must see the live alias (Lucee
@@ -904,12 +1011,67 @@ impl CfmlStruct {
         self.0.read().map.keys().cloned().collect()
     }
 
+    /// Per-instance keys UNIONED with the shared method-table keys (component
+    /// flyweight). Own keys first (they shadow same-named table entries), then
+    /// any table method not already present. For a plain struct (no table) this
+    /// is exactly `keys()`. Component-aware introspection (structKeyList/for-in/
+    /// getMetadata) uses this so methods — which now live once per class in the
+    /// table rather than per-instance in `map` — still enumerate as members.
+    pub fn all_keys(&self) -> Vec<String> {
+        let g = self.0.read();
+        let mut keys: Vec<String> = g.map.keys().cloned().collect();
+        if let Some(t) = &g.method_table {
+            for k in t.keys() {
+                if !g.map.contains_key(k) && !keys.iter().any(|e| e.eq_ignore_ascii_case(k)) {
+                    keys.push(k.clone());
+                }
+            }
+        }
+        keys
+    }
+
     /// A point-in-time copy of the contents. Use this before iterating when the
     /// loop body may call back into code that touches the same struct — it
     /// releases the lock so re-entrancy can't deadlock.
     #[inline]
     pub fn snapshot(&self) -> ValueMap {
         self.0.read().map.clone()
+    }
+
+    /// A `snapshot()` UNIONED with the shared method table (component flyweight):
+    /// a `ValueMap` containing the per-instance data + the class methods. Used by
+    /// component-metadata builders that consume a flat `ValueMap` and must still
+    /// see the methods. Plain structs (no table) == `snapshot()`.
+    pub fn snapshot_with_methods(&self) -> ValueMap {
+        let g = self.0.read();
+        let mut m = g.map.clone();
+        if let Some(t) = &g.method_table {
+            for (k, v) in t.iter() {
+                if !m.contains_key(k) {
+                    m.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        m
+    }
+
+    /// Owned `(key, value)` pairs UNIONED with the shared method table (component
+    /// flyweight): own entries first (they shadow same-named table methods), then
+    /// table methods not present in `map`. Plain structs (no table) == `iter()`.
+    /// Used by component-aware value iteration (e.g. `getMetadata()`'s function
+    /// enumeration) so methods that now live once per class still appear.
+    pub fn all_entries(&self) -> Vec<(String, CfmlValue)> {
+        let g = self.0.read();
+        let mut out: Vec<(String, CfmlValue)> =
+            g.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        if let Some(t) = &g.method_table {
+            for (k, v) in t.iter() {
+                if !g.map.contains_key(k) && !out.iter().any(|(e, _)| e.eq_ignore_ascii_case(k)) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Iterate a point-in-time **snapshot** of the entries (yields owned
@@ -1793,6 +1955,13 @@ impl CfmlValue {
                     .map(|(k, v)| (k, v.deep_copy_guarded(seen, share_nested_components, false)))
                     .collect();
                 dest.with_write(|w| *w = entries);
+                // Preserve the shared per-class method table (component
+                // flyweight): `iter()` yields only the per-instance `map` (data),
+                // so the copy must re-attach the Arc-shared method table, else a
+                // duplicated component would lose its methods.
+                if let Some(t) = s.method_table() {
+                    dest.set_method_table(t);
+                }
                 CfmlValue::Struct(dest)
             }
             // Queries are reference-typed, so `duplicate()` must break the

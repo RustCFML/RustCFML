@@ -302,6 +302,7 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_flyweight_instance.cfm">
 <cf_runtest file="oop/test_property_no_accessors_onmissing.cfm">
 <cf_runtest file="oop/test_pseudo_ctor_parent_this.cfm">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">

@@ -44,10 +44,15 @@ if (!structKeyExists(request, "_test_totalPassed")) {
 // Those are wrapped in `if (isRustCFML())` so they exercise RustCFML but are
 // skipped on Lucee, keeping a clean cross-engine bar. See
 // docs/lucee-differences.md for the catalogue and the one unresolved item.
+// Detect via `server.lucee.versionName`, which is consistently "RustCFML"
+// regardless of the `reportAsLucee` setting (RustCFML reports
+// `server.coldfusion.productname` as "Lucee" by default, so that field is NOT a
+// reliable RustCFML marker). Real Lucee has no `versionName == "RustCFML"`, so
+// this stays false on cross-engine (Lucee) runs.
 function isRustCFML() {
-    return structKeyExists(server, "coldfusion")
-        && structKeyExists(server.coldfusion, "productname")
-        && server.coldfusion.productname == "RustCFML";
+    return structKeyExists(server, "lucee")
+        && structKeyExists(server.lucee, "versionName")
+        && server.lucee.versionName == "RustCFML";
 }
 
 // ---- suiteBegin(name) ----

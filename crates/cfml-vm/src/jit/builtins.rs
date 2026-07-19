@@ -624,7 +624,9 @@ extern "C" fn cfml_struct_key_list_boxed(tagged: i64) -> i64 {
     let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let out = if let CfmlValue::Struct(s) = &v {
         // Inline `visible_struct_keys`: hide the arguments-scope markers.
-        let keys: Vec<String> = s.keys();
+        // `all_keys()` includes shared-table methods (component flyweight), as
+        // this path did when methods lived in the per-instance map.
+        let keys: Vec<String> = s.all_keys();
         let visible: Vec<String> = if keys.iter().any(|k| k == "__arguments_scope") {
             keys.into_iter()
                 .filter(|k| k != "__arguments_scope" && k != "__arguments_params")

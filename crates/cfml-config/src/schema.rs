@@ -235,13 +235,15 @@ pub struct RuntimeCfg {
     #[serde(rename = "trustedCache")]
     #[serde(deserialize_with = "de_lenient_bool")]
     pub trusted_cache: bool,
-    /// When true, `server.coldfusion.productname` reports `"Lucee"` instead of
-    /// `"RustCFML"`. RustCFML targets the Lucee dialect and already advertises
-    /// `server.lucee`, but some frameworks (e.g. ColdBox's mapping-helper
-    /// selection) branch specifically on `productname` and only take their
-    /// Lucee code path when it equals "Lucee". Opt in per-app when a framework
-    /// needs that. `server.lucee.versionName` stays `"RustCFML"` regardless, so
-    /// engine self-identification is unaffected.
+    /// When true (**the default**), `server.coldfusion.productname` reports
+    /// `"Lucee"`. RustCFML targets the Lucee dialect and advertises
+    /// `server.lucee`, and frameworks (ColdBox's mapping-helper selection,
+    /// Wheels' engine gate, Preside) branch specifically on `productname` /
+    /// the Lucee identity — so RustCFML identifies as Lucee out of the box and
+    /// those Lucee code paths are taken with zero configuration. Set
+    /// `reportAsLucee: false` to **opt out** and report `"RustCFML"` instead.
+    /// `server.lucee.versionName` stays `"RustCFML"` regardless, so engine
+    /// self-identification (`isRustCFML()`-style checks) is unaffected either way.
     #[serde(rename = "reportAsLucee")]
     #[serde(deserialize_with = "de_lenient_bool")]
     pub report_as_lucee: bool,
@@ -263,7 +265,8 @@ impl Default for RuntimeCfg {
             timezone: String::new(),
             whitespace_compression_enabled: false,
             trusted_cache: false,
-            report_as_lucee: false,
+            // Report as Lucee by default (opt out with `reportAsLucee: false`).
+            report_as_lucee: true,
             application_timeout: "1,0,0,0".into(),
             session_timeout: "0,0,30,0".into(),
             client_timeout: "7,0,0,0".into(),

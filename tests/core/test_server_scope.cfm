@@ -2,7 +2,9 @@
 suiteBegin("Server scope (Lucee compatibility shim)");
 
 // --- server.coldfusion ---
-assert("server.coldfusion.productname", server.coldfusion.productname, "RustCFML");
+// RustCFML reports as Lucee by default (reportAsLucee defaults true); the
+// RustCFML identity lives in server.lucee.versionName (asserted below).
+assert("server.coldfusion.productname", server.coldfusion.productname, "Lucee");
 assertTrue("server.coldfusion.productversion is non-empty", len(server.coldfusion.productversion) GT 0);
 assertTrue("server.coldfusion.productlevel exists", structKeyExists(server.coldfusion, "productlevel"));
 // supportedLocales — an ACF-origin comma-list read by apps to build locale
@@ -15,12 +17,20 @@ assertTrue("server.coldfusion.supportedLocales contains English (US)",
 
 // --- server.lucee (engine-detection shim: frameworks like Wheels/ColdBox/
 // Preside sniff server.lucee.version to identify a Lucee-dialect engine).
-// Detection keys on the *existence* of `server.lucee`, not a numeric version —
-// so `server.lucee.version` carries the real RustCFML version (its natural
-// home, the slot Lucee uses for its own version). ACF-minimum-version gates are
-// satisfied instead by the emulated `server.coldfusion.productversion`. ---
+// Detection keys on the *existence* of `server.lucee`; some frameworks also run
+// a Lucee minimum-version gate on `server.lucee.version`, so it reports a
+// supported Lucee major ("7.") with the real RustCFML version embedded after it
+// (e.g. "7.0.506.0"). ACF-minimum-version gates are satisfied instead by the
+// emulated `server.coldfusion.productversion`. ---
 assertTrue("server.lucee exists", structKeyExists(server, "lucee"));
-assertTrue("server.lucee.version is non-empty (carries the RustCFML version)", len(server.lucee.version) GT 0);
+assertTrue("server.lucee.version is non-empty", len(server.lucee.version) GT 0);
+// The version is prefixed with a supported Lucee major ("7.") so framework
+// Lucee-minimum-version gates (e.g. Wheels' >= 5.3.2.77) pass, with the real
+// RustCFML version embedded after it (e.g. "7.0.506.0").
+if (isRustCFML()) {
+    assertTrue("server.lucee.version reports a Lucee 7.x major (framework min-version gates)",
+        listFirst(server.lucee.version, ".") EQ "7");
+}
 assert("server.lucee.versionName identifies RustCFML", server.lucee.versionName, "RustCFML");
 
 // --- server.railo (Lucee's back-compat alias for server.lucee; Preside's

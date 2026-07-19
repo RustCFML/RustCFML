@@ -2904,7 +2904,10 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
     // check (fn_struct_key_exists), so listing null keys here does NOT make the two
     // disagree. (Query rows store NULL columns as "" — a real value — so they are
     // unaffected either way.)
-    let keys: Vec<String> = s.keys();
+    // `all_keys()` unions the shared method table (component flyweight) so a
+    // component's public methods still enumerate even though they now live once
+    // per class rather than per-instance. Plain structs have no table → == keys().
+    let keys: Vec<String> = s.all_keys();
     // A Java-collection shim (e.g. createObject("java","java.util.LinkedHashMap"))
     // is a transparent map facade — its `__java_class`/`__java_shim` markers are
     // engine-internal and must never surface as struct keys (ColdBox's
@@ -3242,8 +3245,16 @@ fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
                 .filter(|(k, _)| k.starts_with("__"))
                 .collect();
             s.clear();
+            // Methods live in the shared per-class table (component flyweight);
+            // clearing the map alone would leave them resolvable via delegation.
+            // Drop the table too so `structKeyExists(cleared, "init")` is false
+            // and the object has no methods until re-mixed (MockBox clearMethods).
+            s.clear_method_table();
             for (k, v) in preserved {
                 s.insert(k, v);
+            }
+            if let Some(CfmlValue::Struct(vs)) = s.get("__variables") {
+                vs.clear_method_table();
             }
             return Ok(CfmlValue::Struct(s.clone()));
         }
@@ -3277,7 +3288,17 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
             let src_is_component = b.contains_key("__variables")
                 || b.contains_key("__name")
                 || b.contains_key("__is_component");
-            for (k, v) in b.iter() {
+            // For a component source, its public methods live in the shared
+            // method table (component-model flyweight), NOT the instance map, so
+            // `b.iter()` (map-only) would miss them entirely — e.g. TestBox's
+            // `addMatchers( new CustomMatcher() )` folds a matcher CFC's public
+            // methods into a plain struct. Enumerate map ∪ table for components.
+            let entries: Vec<(String, CfmlValue)> = if src_is_component {
+                b.all_entries()
+            } else {
+                b.iter().collect()
+            };
+            for (k, v) in entries {
                 if src_is_component
                     && (k.starts_with("__")
                         || k.eq_ignore_ascii_case("this")
@@ -6708,9 +6729,11 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                     meta.insert("metadata".to_string(), CfmlValue::Struct(md.clone()));
                 }
 
-                // Enumerate functions
+                // Enumerate functions. `all_entries()` unions the shared method
+                // table (component flyweight) so methods that now live once per
+                // class — not per instance — still appear in getMetadata().
                 let mut functions = Vec::new();
-                for (k, v) in s.iter() {
+                for (k, v) in s.all_entries() {
                     if k.starts_with("__") { continue; }
                     if let CfmlValue::Function(f) = v {
                         let mut func_meta = ValueMap::default();

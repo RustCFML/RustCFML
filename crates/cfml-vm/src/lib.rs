@@ -538,10 +538,11 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     let mut info = ValueMap::default();
 
     let mut cf = ValueMap::default();
-    // RustCFML self-identifies as "RustCFML" by default. The `reportAsLucee`
-    // cfconfig knob makes it report "Lucee" instead, for frameworks (e.g.
-    // ColdBox's mapping-helper selection) that branch specifically on
-    // `productname == "Lucee"`. `server.lucee.versionName` stays "RustCFML"
+    // RustCFML reports as "Lucee" BY DEFAULT (it targets the Lucee dialect), so
+    // the many frameworks that branch on `productname == "Lucee"` (ColdBox's
+    // mapping-helper selection, Wheels' engine gate, …) take their Lucee code
+    // path with no configuration. The `reportAsLucee: false` cfconfig knob opts
+    // out and reports "RustCFML". `server.lucee.versionName` stays "RustCFML"
     // either way, so `isRustCFML()`-style detection via that field is stable.
     let product_name = if report_as_lucee { "Lucee" } else { "RustCFML" };
     cf.insert(
@@ -596,13 +597,16 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
 
     // Advertise Lucee compatibility. RustCFML targets the Lucee dialect, and
     // frameworks (Wheels, ColdBox, Preside, …) sniff the engine via
-    // `StructKeyExists(server, "lucee")` — detection keys on the *existence* of
-    // this struct, not its numeric version. So `server.lucee.version` carries
-    // the real RustCFML version (its natural home — the slot Lucee uses for its
-    // own version number), while ACF-style minimum-version gates are satisfied
-    // by the emulated `server.coldfusion.productversion` above. `versionName`
-    // stays "RustCFML" for identity.
-    let lucee_version = env!("CARGO_PKG_VERSION").to_string();
+    // `StructKeyExists(server, "lucee")`. Some of them ALSO run a Lucee
+    // MINIMUM-version gate on `server.lucee.version` (e.g. Wheels requires Lucee
+    // >= 5.3.2.77 and rejects a `0.x` major), so we prefix the real RustCFML
+    // SemVer with a supported Lucee major — "7." — matching the Lucee 7 line
+    // RustCFML tracks. The result ("7.<rustcfml-version>", e.g. "7.0.506.0")
+    // parses as Lucee 7.x for those gates while still embedding the true
+    // RustCFML version. `versionName` stays "RustCFML" for identity, and
+    // ACF-style minimum-version gates are satisfied by the emulated
+    // `server.coldfusion.productversion` above.
+    let lucee_version = format!("7.{}", env!("CARGO_PKG_VERSION"));
     let mut lucee = ValueMap::default();
     lucee.insert("version".to_string(), CfmlValue::string(lucee_version.clone()));
     lucee.insert(
@@ -1101,6 +1105,20 @@ pub struct CfmlVirtualMachine {
     /// per-instance mutation (binding a captured_scope) copy-on-write, so sharing
     /// is safe. See COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
     pub method_arc_cache: HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
+    /// Component-model flyweight: shared per-class method tables, keyed by the
+    /// CFC's source file. `.0` is the `this`-scope table (public members), `.1`
+    /// the `__variables`-scope table (all members). Built once per class from the
+    /// first fully-constructed instance; every later instance strips its own
+    /// method entries and points its scope structs at these shared `Arc`s — so
+    /// the ~40 method map entries a method-heavy CFC used to carry per instance
+    /// (in BOTH scopes) live once per class instead. This is the memory win.
+    pub class_method_tables: HashMap<
+        String,
+        (
+            Arc<cfml_common::dynamic::ValueMap>,
+            Arc<cfml_common::dynamic::ValueMap>,
+        ),
+    >,
     /// Source file path (for include resolution)
     pub source_file: Option<String>,
     /// Call stack for tracking execution
@@ -1857,6 +1875,7 @@ impl CfmlVirtualMachine {
             vfs: Arc::new(RealFs),
             user_functions: HashMap::new(),
             method_arc_cache: HashMap::new(),
+            class_method_tables: HashMap::new(),
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
@@ -2207,7 +2226,9 @@ impl CfmlVirtualMachine {
 
     /// Resolve a `global_id` to its `BytecodeFunction` via the dense registry.
     /// Effective `reportAsLucee` cfconfig flag: the per-request application
-    /// overlay wins, else the server baseline, else false (default identity).
+    /// overlay wins, else the server baseline, else `true` (report as Lucee by
+    /// default — RustCFML targets the Lucee dialect; opt out with
+    /// `reportAsLucee: false`).
     fn report_as_lucee(&self) -> bool {
         if let Some(ref cfg) = self.app_cfconfig {
             return cfg.runtime.report_as_lucee;
@@ -2215,7 +2236,7 @@ impl CfmlVirtualMachine {
         if let Some(ref ss) = self.server_state {
             return ss.cfconfig.runtime.report_as_lucee;
         }
-        false
+        true
     }
 
     /// O(1), no hashing, independent of the active `self.program`.
@@ -7208,8 +7229,19 @@ impl CfmlVirtualMachine {
                                         "__variables".to_string(),
                                         CfmlValue::Struct(vars.clone()),
                                     );
+                                    let rebuilt = CfmlValue::strukt(updated);
+                                    // Preserve the shared per-class method table
+                                    // (component flyweight): `snapshot()` yields
+                                    // only `map`, so the rebuilt `this` must
+                                    // re-attach the table or the returned instance
+                                    // loses its methods (`obj.init()` → no methods).
+                                    if let (CfmlValue::Struct(rs), Some(t)) =
+                                        (&rebuilt, top_s.method_table())
+                                    {
+                                        rs.set_method_table(t);
+                                    }
                                     let last_idx = stack.len() - 1;
-                                    stack[last_idx] = CfmlValue::strukt(updated);
+                                    stack[last_idx] = rebuilt;
                                 }
                             }
                         }
@@ -9672,7 +9704,7 @@ impl CfmlVirtualMachine {
                                     .map(|v| v.as_string().eq_ignore_ascii_case("java.util.treemap"))
                                     .unwrap_or(false);
                                 let mut keys: Vec<CfmlValue> = s
-                                    .keys()
+                                    .all_keys()
                                     .into_iter()
                                     .filter(|k| {
                                         !is_args
@@ -13523,7 +13555,7 @@ impl CfmlVirtualMachine {
                     if let Some(arg) = args.get(0) {
                         // If the argument is already a struct (component instance), extract metadata directly
                         if let CfmlValue::Struct(ref s) = arg {
-                            let snap = s.snapshot();
+                            let snap = s.snapshot_with_methods();
                             // Interfaces carry their signatures in __methods, not
                             // as Function entries — build their metadata separately
                             // (issue #205).
@@ -13584,7 +13616,7 @@ impl CfmlVirtualMachine {
                         {
                             let resolved = self.resolve_inheritance(template, parent_locals);
                             if let CfmlValue::Struct(ref s) = resolved {
-                                let snap = s.snapshot();
+                                let snap = s.snapshot_with_methods();
                                 if matches!(
                                     snap.get("__is_interface"),
                                     Some(CfmlValue::Bool(true))
@@ -16664,28 +16696,92 @@ impl CfmlVirtualMachine {
                 }
 
                 "callstackget" => {
-                    let frames = self.build_stack_trace();
+                    // Lucee/ACF signature: callStackGet( type="array", offset=0,
+                    // maxFrames=-1 ). The FIRST arg is the output TYPE, not an
+                    // offset — a prior version mis-read it as the offset, so
+                    // `callStackGet("string")` parsed "string"→0 and returned the
+                    // default array, which then can't be `&`-concatenated (Preside's
+                    // datamanager _objectDataTable.cfm:51 does exactly that to seed a
+                    // hash → "Can't cast Array to String" 500 on the admin listing).
+                    let ftype = args.get(0).map(|v| v.as_string()).unwrap_or_default().to_lowercase();
                     let offset = args
-                        .get(0)
+                        .get(1)
                         .map(|v| v.as_string().parse::<i64>().unwrap_or(0).max(0) as usize)
                         .unwrap_or(0);
-                    let max_frames = args
-                        .get(1)
-                        .map(|v| v.as_string().parse::<usize>().unwrap_or(usize::MAX))
-                        .unwrap_or(usize::MAX);
-                    let result: Vec<CfmlValue> = frames
+                    let max_frames = match args.get(2).map(|v| v.as_string().parse::<i64>().unwrap_or(-1)) {
+                        Some(n) if n > 0 => n as usize,
+                        _ => usize::MAX,
+                    };
+                    let selected: Vec<cfml_common::vm::StackFrame> = self
+                        .build_stack_trace()
                         .into_iter()
                         .skip(offset)
                         .take(max_frames)
-                        .map(|f| {
-                            let mut s = ValueMap::default();
-                            s.insert("Function".to_string(), CfmlValue::string(f.function));
-                            s.insert("Template".to_string(), CfmlValue::string(f.template));
-                            s.insert("LineNumber".to_string(), CfmlValue::Int(f.line as i64));
-                            CfmlValue::strukt(s)
-                        })
                         .collect();
-                    return Ok(CfmlValue::array(result));
+                    // Lucee renders a page-level frame (no enclosing UDF) as
+                    // `{template}:{line}` and a function frame as
+                    // `{template}.{fn}():{line}`. RustCFML names the page frame
+                    // "__main__"; treat that (and empty) as page-level.
+                    let is_page = |f: &cfml_common::vm::StackFrame| f.function.is_empty() || f.function == "__main__";
+                    let fmt_frame = |f: &cfml_common::vm::StackFrame| -> String {
+                        if is_page(f) {
+                            format!("{}:{}", f.template, f.line)
+                        } else {
+                            format!("{}.{}():{}", f.template, f.function, f.line)
+                        }
+                    };
+                    match ftype.as_str() {
+                        "string" => {
+                            let s = selected.iter().map(fmt_frame).collect::<Vec<_>>().join("; ");
+                            return Ok(CfmlValue::string(s));
+                        }
+                        "html" => {
+                            let items: String = selected
+                                .iter()
+                                .map(|f| format!("<li>{}</li>", fmt_frame(f)))
+                                .collect();
+                            return Ok(CfmlValue::string(format!(
+                                "<ul class='-lucee-array'>{}</ul>",
+                                items
+                            )));
+                        }
+                        "json" => {
+                            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+                            let items: Vec<String> = selected
+                                .iter()
+                                .map(|f| {
+                                    let fname = if is_page(f) { "" } else { f.function.as_str() };
+                                    format!(
+                                        "{{\"template\":\"{}\",\"LineNumber\":{},\"function\":\"{}\"}}",
+                                        esc(&f.template), f.line, esc(fname)
+                                    )
+                                })
+                                .collect();
+                            return Ok(CfmlValue::string(format!("[{}]", items.join(","))));
+                        }
+                        // "array" (default) or any unrecognised type → array of
+                        // structs. Key set + casing + order match Lucee
+                        // (template, LineNumber, function); page frame's function
+                        // is the empty string, as Lucee reports it.
+                        _ => {
+                            let result: Vec<CfmlValue> = selected
+                                .into_iter()
+                                .map(|f| {
+                                    let fname = if f.function == "__main__" {
+                                        String::new()
+                                    } else {
+                                        f.function
+                                    };
+                                    let mut s = ValueMap::default();
+                                    s.insert("template".to_string(), CfmlValue::string(f.template));
+                                    s.insert("LineNumber".to_string(), CfmlValue::Int(f.line as i64));
+                                    s.insert("function".to_string(), CfmlValue::string(fname));
+                                    CfmlValue::strukt(s)
+                                })
+                                .collect();
+                            return Ok(CfmlValue::array(result));
+                        }
+                    }
                 }
 
                 "callstackdump" => {
@@ -20934,14 +21030,13 @@ impl CfmlVirtualMachine {
         // struct-builtin interception), so it already ran for any __java_shim
         // receiver. Control only reaches here for non-shim objects.
 
-        // If no builtin match found, try to get property and call it
-        // This handles user-defined methods on components
+        // If no builtin match found, try to get property and call it.
+        // This handles user-defined methods on components. `get_ci` is
+        // table-aware (component flyweight): a method that now lives once per
+        // class in the shared table — not in the per-instance map — resolves
+        // here, while a same-named data member in the map still shadows it.
         let prop = if let CfmlValue::Struct(ref s) = object {
-            let method_lower = method.to_lowercase();
-            s.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
-                .map(|(_, v)| v.clone())
-                .unwrap_or(CfmlValue::Null)
+            s.get_ci(method).unwrap_or(CfmlValue::Null)
         } else {
             object.get(method).unwrap_or(CfmlValue::Null)
         };
@@ -21186,8 +21281,9 @@ impl CfmlVirtualMachine {
                 // attribute [table]"). See tests/oop/test_property_no_accessors_onmissing.cfm.
                 let has_accessors =
                     matches!(s.get("__accessors"), Some(CfmlValue::Bool(true)));
-                let defines_on_missing =
-                    s.iter().any(|(k, _)| k.eq_ignore_ascii_case("onmissingmethod"));
+                // `contains_key_ci` includes the shared method table (component
+                // flyweight), where `onMissingMethod` now lives.
+                let defines_on_missing = s.contains_key_ci("onmissingmethod");
                 let route_to_on_missing = defines_on_missing && !has_accessors;
                 if !route_to_on_missing && method_lower.starts_with("get") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
@@ -21279,12 +21375,10 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // onMissingMethod fallback for components
+        // onMissingMethod fallback for components. `get_ci` includes the shared
+        // method table (component flyweight), where onMissingMethod now lives.
         if let CfmlValue::Struct(ref s) = object {
-            let missing_handler = s
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == "onmissingmethod")
-                .map(|(_, v)| v.clone());
+            let missing_handler = s.get_ci("onmissingmethod");
             if let Some(handler) = missing_handler {
                 if !matches!(handler, CfmlValue::Function(_)) {
                     // not a function — fall through to the no-method error below
@@ -21639,11 +21733,11 @@ impl CfmlVirtualMachine {
             let seg_lower = segment.to_lowercase();
             match &current {
                 CfmlValue::Struct(s) => {
-                    if let Some(v) = s
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&seg_lower))
-                        .map(|(_, v)| v.clone())
-                    {
+                    // `get_ci` is table-aware (component flyweight): a CFC
+                    // method — including an include-attached lifecycle handler —
+                    // now lives in the shared method table, not the instance map,
+                    // so a map-only scan would miss `isDefined("variables.onXxx")`.
+                    if let Some(v) = s.get_ci(&seg_lower) {
                         current = v;
                     } else {
                         return false;
@@ -22388,6 +22482,19 @@ impl CfmlVirtualMachine {
                 for (_, value) in values.iter() {
                     Self::collect_app_fn_ids(&value, ids, visited);
                 }
+                // Component flyweight: a CFC instance's methods live in a shared
+                // per-class method table, not the instance `map`, so the walk
+                // above misses them. Walk the table too (deduped by its shared
+                // identity) so app-scope CFC methods are re-homed and stay
+                // resolvable across requests.
+                if let Some(table) = values.method_table() {
+                    let tptr = Arc::as_ptr(&table) as usize;
+                    if visited.insert((5, tptr)) {
+                        for (_, value) in table.iter() {
+                            Self::collect_app_fn_ids(value, ids, visited);
+                        }
+                    }
+                }
             }
             CfmlValue::Array(values) => {
                 let ptr = values.backing_ptr();
@@ -22820,6 +22927,74 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Component-model flyweight (the memory win): move a finished instance's
+    /// per-scope method entries into a SHARED per-class table its scope structs
+    /// delegate to. `s` is the instance's `this`-scope backing struct (with a
+    /// `__variables` sub-struct). Builds the pair of tables (this-scope + vars-
+    /// scope) once per class (keyed by source file, from the first instance),
+    /// then for THIS instance strips its own method entries and attaches the
+    /// shared tables. Reads/dispatch resolve methods via the table on a map miss;
+    /// introspection unions it — so behaviour is identical to methods-in-map.
+    fn share_methods_into_table(&mut self, s: &CfmlStruct) {
+        // Cache key: the CFC's physical source file (stable per class, like
+        // `static_stores`). Without one (rare hand-built struct) leave methods
+        // inline — correctness over the memory win.
+        let src = match s.get("__source_file") {
+            Some(CfmlValue::String(p)) if !p.is_empty() => p.to_string(),
+            _ => return,
+        };
+        let vars = match s.get("__variables") {
+            Some(CfmlValue::Struct(vs)) => Some(vs),
+            _ => None,
+        };
+        let (this_table, vars_table) =
+            if let Some(pair) = self.class_method_tables.get(&src) {
+                pair.clone()
+            } else {
+                let this_table = Arc::new(Self::collect_scope_methods(s));
+                let vars_table = Arc::new(
+                    vars.as_ref()
+                        .map(Self::collect_scope_methods)
+                        .unwrap_or_default(),
+                );
+                let pair = (this_table.clone(), vars_table.clone());
+                self.class_method_tables.insert(src, pair.clone());
+                pair
+            };
+        // Strip this instance's own method entries and delegate to the shared
+        // tables. (An injected/overridden method added LATER goes to the map and
+        // shadows the table — see CfmlStruct read/`all_keys`.)
+        Self::strip_scope_methods(s);
+        s.set_method_table(this_table);
+        if let Some(vs) = vars {
+            Self::strip_scope_methods(&vs);
+            vs.set_method_table(vars_table);
+        }
+    }
+
+    /// Collect a scope struct's user-method entries (non-`__`, `Function`-valued)
+    /// into a `ValueMap` for the shared class table. Values are the canonicalised
+    /// shared `Arc<CfmlFunction>`s (see `canonicalize_method_arcs`), so the table
+    /// holds one `Arc` per method for the whole class.
+    fn collect_scope_methods(sc: &CfmlStruct) -> cfml_common::dynamic::ValueMap {
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        for (k, v) in sc.iter() {
+            if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+                m.insert(k, v);
+            }
+        }
+        m
+    }
+
+    /// Remove a scope struct's user-method entries in place (they move to the
+    /// shared table). Keeps `__`-prefixed function entries (e.g.
+    /// `__cfc_static_init__`) and all data.
+    fn strip_scope_methods(sc: &CfmlStruct) {
+        sc.with_write(|m| {
+            m.retain(|k, v| !(matches!(v, CfmlValue::Function(_)) && !k.starts_with("__")));
+        });
+    }
+
     fn canon_method_scope(
         cache: &HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
         sc: &CfmlStruct,
@@ -23156,7 +23331,10 @@ impl CfmlVirtualMachine {
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         let mut super_methods = ValueMap::default();
                         let mut this_members = ValueMap::default();
-                        for (k, v) in ps.iter() {
+                        // `all_entries()` includes the parent's shared method
+                        // table (component flyweight) so inherited methods are
+                        // seeded into the child's construction scope.
+                        for (k, v) in ps.all_entries() {
                             if k.starts_with("__") {
                                 continue;
                             }
@@ -23178,7 +23356,11 @@ impl CfmlVirtualMachine {
                             parent_this_members = Some(this_members);
                         }
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get("__variables") {
-                            parent_vars.snapshot()
+                            // Include the parent's shared method table (component
+                            // flyweight) so inherited methods are present in the
+                            // child body's `variables` during construction (a bare
+                            // inherited call / StructKeyExists(variables, sibling)).
+                            parent_vars.snapshot_with_methods()
                         } else {
                             ValueMap::default()
                         }
@@ -23871,6 +24053,11 @@ impl CfmlVirtualMachine {
             if let Some(CfmlValue::Struct(cs)) = result.as_ref() {
                 let cs = cs.clone();
                 self.canonicalize_method_arcs(&cs);
+                // NOTE: the flyweight strip+attach (share_methods_into_table) runs
+                // LATER, in `resolve_inheritance` on the fully-assembled instance —
+                // NOT here. This template may still be merged into a subclass (or
+                // seeded into a child body), which reads its methods; stripping now
+                // would drop them from that merge. Methods stay in `map` here.
             }
             // Break the per-instantiation closure-env retention: clear captured
             // scopes on every member function of the assembled instance. CFC
@@ -24271,7 +24458,9 @@ impl CfmlVirtualMachine {
             match self.resolve_interface_methods(&iface_name, locals, &mut visited) {
                 Ok(required_methods) => {
                     for method_name in &required_methods {
-                        // Check if component has this method (case-insensitive)
+                        // Check if component has this method (case-insensitive).
+                        // `component` is a snapshot_with_methods() ValueMap, so it
+                        // already includes the shared method table entries.
                         let has_method = component.iter().any(|(k, v)| {
                             k.eq_ignore_ascii_case(method_name)
                                 && matches!(v, CfmlValue::Function(_))
@@ -24312,7 +24501,9 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> Result<CfmlValue, CfmlError> {
         if let CfmlValue::Struct(ref s) = instance {
-            let snap = s.snapshot();
+            // Include the shared method table (component flyweight) so interface
+            // method-implementation validation sees the (now class-shared) methods.
+            let snap = s.snapshot_with_methods();
             let all_ifaces = self.validate_interface_implementation(&snap, locals)?;
 
             // Package-qualify each unqualified declared interface (issue #206).
@@ -24365,7 +24556,14 @@ impl CfmlVirtualMachine {
         // Check for __extends key
         let extends_name = match s.get("__extends") {
             Some(CfmlValue::String(name)) => name.clone(),
-            _ => return template, // No extends, return as-is
+            _ => {
+                // No parent: this IS the final instance. Move its methods into the
+                // shared per-class table (component flyweight) — the single strip
+                // point, run here (not `resolve_component_template`) so a template
+                // still merged into a subclass keeps its methods in `map`.
+                self.share_methods_into_table(s);
+                return template;
+            }
         };
 
         // Prevent circular inheritance
@@ -24379,7 +24577,14 @@ impl CfmlVirtualMachine {
         // `__super_map`/... just re-derived above) is identical for every instance
         // of this class. Splice one shared Arc-backed copy in so N instances don't
         // each retain their own — the memory sink for component-heavy apps.
-        self.share_class_invariant_metadata(merged)
+        let merged = self.share_class_invariant_metadata(merged);
+        // Component flyweight: the merged instance (own + inherited methods, all in
+        // `map`) is the final assembled object — strip its methods into the shared
+        // per-class table now.
+        if let CfmlValue::Struct(cs) = &merged {
+            self.share_methods_into_table(cs);
+        }
+        merged
     }
 
     /// Class-invariant metadata keys — identical for every instance of a class,
@@ -24570,8 +24775,11 @@ impl CfmlVirtualMachine {
         // Snapshot the parent into an owned map so the merge never mutates the
         // shared parent template (preserves the old `Arc::make_mut` copy-on-write
         // behaviour now that structs are reference-typed).
+        // `snapshot_with_methods()` folds the parent's shared method table
+        // (component flyweight) back into a flat map so its methods are merged
+        // into the child exactly as when methods lived in the parent's map.
         let mut parent_map: ValueMap = match parent {
-            CfmlValue::Struct(s) => s.snapshot(),
+            CfmlValue::Struct(s) => s.snapshot_with_methods(),
             _ => return CfmlValue::Struct(child_map),
         };
 
@@ -26185,7 +26393,10 @@ impl CfmlVirtualMachine {
                 if let CfmlValue::Struct(ref ps) = resolved_parent {
                     let mut super_methods = ValueMap::default();
                     let mut pvars = ValueMap::default();
-                    for (k, v) in ps.iter() {
+                    // `all_entries()` includes the parent's shared method table
+                    // (component flyweight) so inherited framework methods seed
+                    // the child's `__variables` method table for the body.
+                    for (k, v) in ps.all_entries() {
                         if k.starts_with("__") {
                             // Fold the parent's own resolved `variables` (property
                             // defaults + inherited data) into the seed so the body
@@ -26389,10 +26600,15 @@ impl CfmlVirtualMachine {
                 "onCFCRequest",
             ];
             for name in LIFECYCLE_METHODS {
-                let already = app_struct.with_read(|m| {
-                    m.keys().any(|k| k.eq_ignore_ascii_case(name))
-                });
-                if already {
+                // Table-aware (component flyweight): a normally-declared lifecycle
+                // method lives in the shared per-class method table, not the
+                // instance map. A map-only key scan would think it's missing and
+                // attach the FIRST same-named function from `user_functions` — the
+                // PARENT's `OnApplicationStart` when a child overrides it with a
+                // different casing — clobbering the child's tabled override. Only
+                // the include-defined case (method truly absent from map AND table)
+                // should fall through to the user_functions attach.
+                if app_struct.contains_key_ci(name) {
                     continue;
                 }
                 let bf = match self
@@ -26557,6 +26773,21 @@ impl CfmlVirtualMachine {
                         s.insert(k, v);
                     }
                 }
+            }
+        }
+        // Stamp the Application.cfc's own source path BEFORE resolving inheritance.
+        // The inheritance merge layers the child's `__source_file` over the parent's;
+        // if the child app component carries none (the app-load path builds it from
+        // globals, unlike `new X()` which stamps it), the merged instance would keep
+        // the PARENT's source file. That mis-keys the component-flyweight method
+        // table (`share_methods_into_table` is keyed by `__source_file`), so a child
+        // Application.cfc that overrides an inherited lifecycle method (e.g.
+        // `onApplicationStart` over a base's `OnApplicationStart`) would REUSE the
+        // parent's method table and silently run the parent's method instead of the
+        // override. Stamp it here so the merge and table keying use the child's path.
+        if let Some(s) = template.as_cfml_struct() {
+            if s.get_ci("__source_file").is_none() {
+                s.insert("__source_file".to_string(), CfmlValue::string(path.to_string()));
             }
         }
         // Resolve inheritance (e.g. extends="taffy.core.api")
@@ -26864,22 +27095,19 @@ impl CfmlVirtualMachine {
             _ => return Ok(false),
         };
 
-        // Case-insensitive lookup for the method
-        let method_lower = method.to_lowercase();
-        let func_val = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
-            .map(|(_, v)| v.clone());
+        // Case-insensitive lookup for the method. `get_ci` is table-aware
+        // (component flyweight): an Application.cfc that `extends` a base (e.g.
+        // Preside's Bootstrap) has its lifecycle methods — onApplicationStart/
+        // onRequest/... — in the SHARED method table, not the per-instance map. A
+        // map-only scan missed them, so NO lifecycle method fired and the app
+        // never booted (served an empty page).
+        let func_val = s.get_ci(method);
 
         match func_val {
             Some(ref func @ CfmlValue::Function(_)) => {
                 // Bind `this` and __variables as a single struct (not expanded)
                 let mut parent_locals = ValueMap::default();
-                if let Some(vars) = s
-                    .iter()
-                    .find(|(k, _)| *k == "__variables")
-                    .map(|(_, v)| v.clone())
-                {
+                if let Some(vars) = s.get("__variables") {
                     parent_locals.insert("__variables".to_string(), vars);
                 }
                 parent_locals.insert("this".to_string(), template.clone());
@@ -26932,10 +27160,8 @@ impl CfmlVirtualMachine {
             _ => return Ok(None),
         };
 
-        let func_val = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("onmissingtemplate"))
-            .map(|(_, v)| v.clone());
+        // Table-aware (component flyweight): onMissingTemplate may be inherited.
+        let func_val = s.get_ci("onmissingtemplate");
 
         let func = match func_val {
             Some(f @ CfmlValue::Function(_)) => f,
@@ -27801,10 +28027,13 @@ impl CfmlVirtualMachine {
         }
 
         // 7. Check for onRequest — if exists, call it; else execute normally
+        // Table-aware (component flyweight): an INHERITED `onRequest` (e.g. from a
+        // BaseApplication the app's Application.cfc extends) lives in the shared
+        // per-class method table, not the instance map. A map-only scan missed it,
+        // so the engine ran the target page directly instead of delegating to the
+        // inherited onRequest.
         let has_on_request = if let CfmlValue::Struct(ref s) = template {
-            s.iter().any(|(k, v)| {
-                k.to_lowercase() == "onrequest" && matches!(v, CfmlValue::Function(_))
-            })
+            matches!(s.get_ci("onrequest"), Some(CfmlValue::Function(_)))
         } else {
             false
         };
