@@ -7771,6 +7771,28 @@ fn fn_charset_decode(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
     let bytes = match args.first() {
         Some(CfmlValue::Binary(b)) => b.clone(),
+        // A native Java byte[] surfaces in CFML as an Array of SIGNED-byte ints
+        // (e.g. `String.getBytes()`, `ByteArrayOutputStream.toByteArray()` — see
+        // GH #271/#276). Lucee's charsetEncode accepts that byte[] directly; treat
+        // an all-integer array as raw bytes (each masked to its low 8 bits) rather
+        // than stringifying it to "72,105,...".
+        Some(CfmlValue::Array(a)) => {
+            let elems = a.snapshot();
+            if !elems.is_empty()
+                && elems.iter().all(|e| matches!(e, CfmlValue::Int(_) | CfmlValue::Double(_)))
+            {
+                elems
+                    .iter()
+                    .map(|e| match e {
+                        CfmlValue::Int(i) => (*i & 0xFF) as u8,
+                        CfmlValue::Double(d) => (*d as i64 & 0xFF) as u8,
+                        _ => 0,
+                    })
+                    .collect()
+            } else {
+                CfmlValue::Array(a.clone()).as_string().into_bytes()
+            }
+        }
         Some(other) => other.as_string().into_bytes(),
         None => Vec::new(),
     };

@@ -19,34 +19,58 @@ fn compile(src: &str) -> BytecodeProgram {
     CfmlCompiler::new().compile(ast)
 }
 
+/// Run `f` on a thread with a 64 MB stack, matching the production CLI/serve
+/// worker threads (`crates/cli/src/lib.rs`). The VM recurses on the Rust stack
+/// for nested CFML calls, so the deep (and mutual) recursion these tests
+/// exercise overflows the default ~2 MB `cargo test` thread stack — a
+/// test-harness artifact the real binary never hits. A panic inside `f` is
+/// re-raised on the caller so the test still fails with its original message.
+fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+    {
+        Ok(v) => v,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// Run `src` with the JIT forced on (threshold=1 so any hot function
 /// compiles on its second call). Returns `(stdout, fn_compiled_count)`.
 fn run_jit(src: &str) -> (String, usize) {
-    let mut vm = CfmlVirtualMachine::new(compile(src));
-    // API, not env vars: parallel test threads share the process environment.
-    vm.jit_set_threshold(1);
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-    vm.execute().expect("execute");
-    (vm.get_output().trim().to_string(), vm.jit_compiled_count())
+    let src = src.to_string();
+    on_big_stack(move || {
+        let mut vm = CfmlVirtualMachine::new(compile(&src));
+        // API, not env vars: parallel test threads share the process environment.
+        vm.jit_set_threshold(1);
+        for (name, value) in get_builtins() {
+            vm.globals.insert(name, value);
+        }
+        for (name, func) in get_builtin_functions() {
+            vm.builtins.insert(name, func);
+        }
+        vm.execute().expect("execute");
+        (vm.get_output().trim().to_string(), vm.jit_compiled_count())
+    })
 }
 
 /// Same program, JIT off — the trusted oracle.
 fn run_interp(src: &str) -> String {
-    let mut vm = CfmlVirtualMachine::new(compile(src));
-    vm.jit_disable();
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-    vm.execute().expect("execute");
-    vm.get_output().trim().to_string()
+    let src = src.to_string();
+    on_big_stack(move || {
+        let mut vm = CfmlVirtualMachine::new(compile(&src));
+        vm.jit_disable();
+        for (name, value) in get_builtins() {
+            vm.globals.insert(name, value);
+        }
+        for (name, func) in get_builtin_functions() {
+            vm.builtins.insert(name, func);
+        }
+        vm.execute().expect("execute");
+        vm.get_output().trim().to_string()
+    })
 }
 
 /// A↔B mutual recursion (classic isEven / isOdd). Neither function can be

@@ -13892,6 +13892,25 @@ impl CfmlVirtualMachine {
                                 "java.io.bufferedreader" => {
                                     java_shims::handle_java_bufferedreader("init", empty_args, &CfmlValue::Null)
                                 }
+                                // Fixed-size, zero-padded byte accumulator. Preside's
+                                // GoogleAuthenticator (TOTP base32 encode) allocates one,
+                                // writes via putLong/put, then reads array(). The bare
+                                // holder just carries the class marker; allocate()/wrap()
+                                // mint the actual buffer. See #276.
+                                "java.nio.bytebuffer" => {
+                                    Ok(CfmlValue::strukt({
+                                        let mut m = ValueMap::default();
+                                        m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                                        m.insert("__java_class".to_string(), CfmlValue::string("java.nio.bytebuffer".to_string()));
+                                        m
+                                    }))
+                                }
+                                // Growable in-memory byte sink. GoogleAuthenticator's
+                                // base32 decode writes bytes one at a time then reads
+                                // toByteArray(). See #276.
+                                "java.io.bytearrayoutputstream" => {
+                                    java_shims::handle_java_bytearrayoutputstream("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.util.propertyresourcebundle" => {
                                     java_shims::handle_java_propertyresourcebundle("init", empty_args, &CfmlValue::Null)
                                 }
@@ -19850,6 +19869,12 @@ impl CfmlVirtualMachine {
                     "java.io.bufferedreader" => {
                         java_shims::handle_java_bufferedreader(&m, all_args, object)
                     }
+                    "java.nio.bytebuffer" => {
+                        java_shims::handle_java_bytebuffer(&m, all_args, object)
+                    }
+                    "java.io.bytearrayoutputstream" => {
+                        java_shims::handle_java_bytearrayoutputstream(&m, all_args, object)
+                    }
                     "java.util.propertyresourcebundle" => {
                         java_shims::handle_java_propertyresourcebundle(&m, all_args, object)
                     }
@@ -19942,7 +19967,16 @@ impl CfmlVirtualMachine {
                     // must not be mistaken for "method unhandled" and fall
                     // through to generic dispatch.
                     || (java_class == "java.util.optional"
-                        && method_lower == "ifpresent");
+                        && method_lower == "ifpresent")
+                    // ByteArrayOutputStream.write/reset/flush/close/writeTo are
+                    // `void` — their null return is a real result, not "method
+                    // unhandled". Falling through would let the generic implicit-
+                    // setter machinery mishandle write()/reset(). See #276.
+                    || (java_class == "java.io.bytearrayoutputstream"
+                        && matches!(
+                            method_lower.as_str(),
+                            "write" | "writebytes" | "reset" | "flush" | "close" | "writeto"
+                        ));
                 match result {
                     Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the

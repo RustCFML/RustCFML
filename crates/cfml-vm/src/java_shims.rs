@@ -37,6 +37,19 @@ fn java_byte_array(v: &CfmlValue) -> Vec<u8> {
     }
 }
 
+/// Coerce a CFML value to an `i64` the way a Java numeric arg would be — used by
+/// the ByteBuffer / ByteArrayOutputStream shims for `putLong`, `write(int)`, etc.
+fn to_i64(v: &CfmlValue) -> i64 {
+    match v {
+        CfmlValue::Int(n) => *n,
+        CfmlValue::Double(d) => *d as i64,
+        CfmlValue::Bool(b) => *b as i64,
+        other => other.as_string().trim().parse::<i64>().unwrap_or_else(|_| {
+            other.as_string().trim().parse::<f64>().map(|f| f as i64).unwrap_or(0)
+        }),
+    }
+}
+
 /// Build a bare java-shim marker map for `class`.
 fn java_shim_map(class: &str) -> ValueMap {
     let mut m = ValueMap::default();
@@ -1728,6 +1741,285 @@ pub fn handle_java_stringbuilder(
                 Ok(CfmlValue::Null)
             }
         }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// Render a raw byte slice as a CFML Array of SIGNED-byte ints (-128..127) — the
+/// same "native byte[]" shape `String.getBytes()` returns (GH #271). Callers
+/// (`base32Encode`'s `bytes[i]` loop, `arrayLen`, `mac.doFinal`) index it 1-based
+/// and re-normalise negatives with `if (b < 0) b += 256`, so signed matches Lucee.
+fn bytes_to_signed_array(bytes: &[u8]) -> CfmlValue {
+    CfmlValue::array(
+        bytes
+            .iter()
+            .map(|b| CfmlValue::Int(*b as i8 as i64))
+            .collect(),
+    )
+}
+
+// ---- java.nio.ByteBuffer ----
+//
+// Preside's GoogleAuthenticator (TOTP/2FA) uses a ByteBuffer purely as a
+// fixed-size, zero-padded byte accumulator: `allocate(n)` reserves a zero-filled
+// backing array, `putLong`/`put` write big-endian bytes at the running position,
+// and `array()` hands back the WHOLE backing array (written bytes + trailing
+// zeros). That zero-fill is exactly what `base32Encode`'s padding branch relies
+// on. No JVM needed — a `Binary` backing buffer + a position cursor.
+//
+// State: `__buffer` (Binary, the backing array) + `__position` (Int cursor).
+pub fn handle_java_bytebuffer(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    // Build a fresh buffer struct wrapping `backing`, cursor at 0.
+    let make = |backing: Vec<u8>| -> CfmlValue {
+        let mut shim = java_shim_map("java.nio.bytebuffer");
+        shim.insert("__buffer".to_string(), CfmlValue::Binary(backing));
+        shim.insert("__position".to_string(), CfmlValue::Int(0));
+        CfmlValue::strukt(shim)
+    };
+    // Read current backing bytes + position off the receiver.
+    let state = |obj: &CfmlValue| -> Option<(Vec<u8>, usize)> {
+        if let CfmlValue::Struct(s) = obj {
+            let buf = match s.get("__buffer") {
+                Some(CfmlValue::Binary(b)) => b,
+                _ => Vec::new(),
+            };
+            let pos = match s.get("__position") {
+                Some(CfmlValue::Int(n)) => n.max(0) as usize,
+                _ => 0,
+            };
+            Some((buf, pos))
+        } else {
+            None
+        }
+    };
+    // Commit mutated backing + position back into the shared handle (in place, so
+    // a buffer passed into a function still sees the write — cf. StringBuilder).
+    let commit = |obj: &CfmlValue, buf: Vec<u8>, pos: usize| {
+        if let CfmlValue::Struct(s) = obj {
+            s.insert("__buffer".to_string(), CfmlValue::Binary(buf));
+            s.insert("__position".to_string(), CfmlValue::Int(pos as i64));
+        }
+    };
+
+    match method {
+        // Static factories (called on the class holder from createObject).
+        "allocate" | "allocatedirect" => {
+            let cap = args.first().map(|a| to_i64(a).max(0)).unwrap_or(0) as usize;
+            Ok(make(vec![0u8; cap]))
+        }
+        "wrap" => {
+            let bytes = args.first().map(java_byte_array).unwrap_or_default();
+            Ok(make(bytes))
+        }
+        // Writers — advance the cursor, return `this` (Java ByteBuffer is fluent).
+        "putlong" | "putint" | "putshort" | "putchar" | "putdouble" | "putfloat" => {
+            let (mut buf, mut pos) = match state(object) {
+                Some(v) => v,
+                None => return Ok(CfmlValue::Null),
+            };
+            let v = args.first().map(to_i64).unwrap_or(0);
+            let be: Vec<u8> = match method {
+                "putlong" | "putdouble" => v.to_be_bytes().to_vec(),
+                "putint" | "putfloat" => (v as i32).to_be_bytes().to_vec(),
+                _ => (v as i16).to_be_bytes().to_vec(), // putShort / putChar (2 bytes)
+            };
+            for b in be {
+                if pos < buf.len() {
+                    buf[pos] = b;
+                } else {
+                    buf.push(b);
+                }
+                pos += 1;
+            }
+            commit(object, buf, pos);
+            Ok(object.clone())
+        }
+        "put" => {
+            let (mut buf, mut pos) = match state(object) {
+                Some(v) => v,
+                None => return Ok(CfmlValue::Null),
+            };
+            // put(byte[], offset, length) | put(byte[]) | put(byte)
+            let write_slice = |buf: &mut Vec<u8>, pos: &mut usize, src: &[u8]| {
+                for &b in src {
+                    if *pos < buf.len() {
+                        buf[*pos] = b;
+                    } else {
+                        buf.push(b);
+                    }
+                    *pos += 1;
+                }
+            };
+            match args.len() {
+                3 => {
+                    let src = java_byte_array(&args[0]);
+                    let off = to_i64(&args[1]).max(0) as usize;
+                    let len = to_i64(&args[2]).max(0) as usize;
+                    let end = (off + len).min(src.len());
+                    if off <= end {
+                        write_slice(&mut buf, &mut pos, &src[off..end]);
+                    }
+                }
+                1 => match &args[0] {
+                    // A lone int is put(byte); anything array-ish is put(byte[]).
+                    CfmlValue::Int(n) => write_slice(&mut buf, &mut pos, &[(*n & 0xFF) as u8]),
+                    CfmlValue::Double(d) => {
+                        write_slice(&mut buf, &mut pos, &[(*d as i64 & 0xFF) as u8])
+                    }
+                    other => {
+                        let src = java_byte_array(other);
+                        write_slice(&mut buf, &mut pos, &src);
+                    }
+                },
+                _ => {}
+            }
+            commit(object, buf, pos);
+            Ok(object.clone())
+        }
+        // The whole backing array, including unwritten zero padding.
+        "array" => {
+            let (buf, _) = state(object).unwrap_or_default();
+            Ok(bytes_to_signed_array(&buf))
+        }
+        "capacity" | "limit" => {
+            let (buf, _) = state(object).unwrap_or_default();
+            Ok(CfmlValue::Int(buf.len() as i64))
+        }
+        "remaining" => {
+            let (buf, pos) = state(object).unwrap_or_default();
+            Ok(CfmlValue::Int((buf.len().saturating_sub(pos)) as i64))
+        }
+        "position" => {
+            let (buf, pos) = state(object).unwrap_or_default();
+            if let Some(a) = args.first() {
+                let new = to_i64(a).max(0) as usize;
+                commit(object, buf, new);
+                Ok(object.clone())
+            } else {
+                Ok(CfmlValue::Int(pos as i64))
+            }
+        }
+        // flip/rewind/clear all reset the cursor to 0 for our purposes (we don't
+        // track a separate limit — capacity() already reports the full backing).
+        "flip" | "rewind" | "clear" | "reset" | "mark" => {
+            let (buf, _) = state(object).unwrap_or_default();
+            commit(object, buf, 0);
+            Ok(object.clone())
+        }
+        "get" => {
+            let (buf, mut pos) = match state(object) {
+                Some(v) => v,
+                None => return Ok(CfmlValue::Null),
+            };
+            let b = buf.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            commit(object, buf, pos);
+            Ok(CfmlValue::Int(b as i8 as i64))
+        }
+        "getlong" | "getint" | "getshort" => {
+            let (buf, mut pos) = match state(object) {
+                Some(v) => v,
+                None => return Ok(CfmlValue::Null),
+            };
+            let n = match method {
+                "getlong" => 8,
+                "getint" => 4,
+                _ => 2,
+            };
+            let mut acc: i64 = 0;
+            for _ in 0..n {
+                acc = (acc << 8) | buf.get(pos).copied().unwrap_or(0) as i64;
+                pos += 1;
+            }
+            commit(object, buf, pos);
+            Ok(CfmlValue::Int(acc))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+// ---- java.io.ByteArrayOutputStream ----
+//
+// A growable byte sink. Preside's GoogleAuthenticator `base32Decode` writes one
+// byte at a time via `write(int)` (low 8 bits) then reads the result back with
+// `toByteArray()`; cfflow's PlantUmlDiagramService uses the same. Pure data —
+// a `Binary` accumulator. State: `__buffer` (Binary).
+pub fn handle_java_bytearrayoutputstream(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let buf_of = |obj: &CfmlValue| -> Vec<u8> {
+        if let CfmlValue::Struct(s) = obj {
+            if let Some(CfmlValue::Binary(b)) = s.get("__buffer") {
+                return b;
+            }
+        }
+        Vec::new()
+    };
+    let commit = |obj: &CfmlValue, buf: Vec<u8>| {
+        if let CfmlValue::Struct(s) = obj {
+            s.insert("__buffer".to_string(), CfmlValue::Binary(buf));
+        }
+    };
+    match method {
+        "init" => {
+            let mut shim = java_shim_map("java.io.bytearrayoutputstream");
+            shim.insert("__buffer".to_string(), CfmlValue::Binary(Vec::new()));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // write(int) writes the low 8 bits; write(byte[]) / write(byte[],off,len)
+        // append a range. All are void — the null return is authoritative (see
+        // the BAOS entries in call_member_function_impl's map_getter_owns_null).
+        "write" => {
+            let mut buf = buf_of(object);
+            match args.len() {
+                3 => {
+                    let src = java_byte_array(&args[0]);
+                    let off = to_i64(&args[1]).max(0) as usize;
+                    let len = to_i64(&args[2]).max(0) as usize;
+                    let end = (off + len).min(src.len());
+                    if off <= end {
+                        buf.extend_from_slice(&src[off..end]);
+                    }
+                }
+                _ => match args.first() {
+                    Some(CfmlValue::Int(n)) => buf.push((*n & 0xFF) as u8),
+                    Some(CfmlValue::Double(d)) => buf.push((*d as i64 & 0xFF) as u8),
+                    Some(other) => buf.extend_from_slice(&java_byte_array(other)),
+                    None => {}
+                },
+            }
+            commit(object, buf);
+            Ok(CfmlValue::Null)
+        }
+        "writebytes" => {
+            let mut buf = buf_of(object);
+            if let Some(a) = args.first() {
+                buf.extend_from_slice(&java_byte_array(a));
+            }
+            commit(object, buf);
+            Ok(CfmlValue::Null)
+        }
+        "tobytearray" => Ok(bytes_to_signed_array(&buf_of(object))),
+        "tostring" => {
+            let buf = buf_of(object);
+            Ok(CfmlValue::string(
+                String::from_utf8(buf.clone())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&buf).to_string()),
+            ))
+        }
+        "size" => Ok(CfmlValue::Int(buf_of(object).len() as i64)),
+        "reset" => {
+            commit(object, Vec::new());
+            Ok(CfmlValue::Null)
+        }
+        // flush/close/writeto are no-ops on an in-memory stream (void).
+        "flush" | "close" | "writeto" => Ok(CfmlValue::Null),
         _ => Ok(CfmlValue::Null),
     }
 }

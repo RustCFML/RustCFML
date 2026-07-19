@@ -138,23 +138,43 @@ fn fuzz_seed() -> u64 {
         .unwrap_or(0x00C0_FFEE_u64)
 }
 
+/// Run `f` on a thread with a 64 MB stack, matching the production CLI/serve
+/// worker threads (`crates/cli/src/lib.rs`). The VM recurses on the Rust stack
+/// for nested CFML calls, and the deep mutual-recursion these random call
+/// graphs generate overflows the default ~2 MB `cargo test` thread stack — a
+/// test-harness artifact the real binary never hits. A panic inside `f` (a
+/// divergence assertion) is re-raised on the caller so the test still fails.
+fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+    {
+        Ok(v) => v,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// Run `gen` `n_programs` times, asserting JIT-on output == interpreter
 /// output. On divergence, panic with the source + both outputs + seed so
 /// the failure reproduces.
-fn fuzz_with(gen: fn(&mut Lcg) -> String, label: &str) {
-    let seed = fuzz_seed();
-    let mut rng = Lcg::new(seed);
-    let n = fuzz_count();
-    for i in 0..n {
-        let src = gen(&mut rng);
-        let interp = run(&src, false);
-        let jit = run(&src, true);
-        assert_eq!(
-            interp, jit,
-            "[{label} #{i}, seed=0x{seed:016X}] JIT diverges from interpreter\n\
-             --- source ---\n{src}\n--- interpreter ---\n{interp}\n--- jit ---\n{jit}\n",
-        );
-    }
+fn fuzz_with(gen: fn(&mut Lcg) -> String, label: &'static str) {
+    on_big_stack(move || {
+        let seed = fuzz_seed();
+        let mut rng = Lcg::new(seed);
+        let n = fuzz_count();
+        for i in 0..n {
+            let src = gen(&mut rng);
+            let interp = run(&src, false);
+            let jit = run(&src, true);
+            assert_eq!(
+                interp, jit,
+                "[{label} #{i}, seed=0x{seed:016X}] JIT diverges from interpreter\n\
+                 --- source ---\n{src}\n--- interpreter ---\n{interp}\n--- jit ---\n{jit}\n",
+            );
+        }
+    })
 }
 
 #[test]

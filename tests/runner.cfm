@@ -193,6 +193,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_regex_lookaround.cfm">
 <cf_runtest file="stdlib/test_inetaddress_loopback.cfm">
 <cf_runtest file="stdlib/test_java_files_shims.cfm">
+<cf_runtest file="stdlib/test_java_bytebuffer_baos.cfm">
 <cf_runtest file="stdlib/test_path_sanitization.cfm">
 <cf_runtest file="stdlib/test_structdelete_return_and_gettime.cfm">
 <cf_runtest file="stdlib/test_numberformat_mask_padding.cfm">

@@ -18,35 +18,60 @@ fn compile(src: &str) -> BytecodeProgram {
     CfmlCompiler::new().compile(ast)
 }
 
+/// Run `f` on a thread with a 64 MB stack, matching the production CLI/serve
+/// worker threads (`crates/cli/src/lib.rs` — `STACK_SIZE`/`thread_stack_size`).
+/// The VM recurses on the Rust stack for nested CFML calls, so the deep
+/// recursion these tests exercise overflows the default ~2 MB `cargo test`
+/// thread stack — a test-harness artifact, never hit by the real binary. A
+/// panic inside `f` (e.g. a failed `assert_eq!`) is re-raised on the caller so
+/// the test still fails with its original message.
+fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+    {
+        Ok(v) => v,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn run(src: &str) -> (String, usize) {
-    let mut vm = CfmlVirtualMachine::new(compile(src));
-    // Compile the native body on the 2nd invocation of a hot function.
-    // Set via API, not env vars: parallel test threads share the process
-    // environment, so env mutation makes JIT engagement nondeterministic.
-    vm.jit_set_threshold(1);
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-    vm.execute().expect("execute");
-    (vm.get_output().trim().to_string(), vm.jit_compiled_count())
+    let src = src.to_string();
+    on_big_stack(move || {
+        let mut vm = CfmlVirtualMachine::new(compile(&src));
+        // Compile the native body on the 2nd invocation of a hot function.
+        // Set via API, not env vars: parallel test threads share the process
+        // environment, so env mutation makes JIT engagement nondeterministic.
+        vm.jit_set_threshold(1);
+        for (name, value) in get_builtins() {
+            vm.globals.insert(name, value);
+        }
+        for (name, func) in get_builtin_functions() {
+            vm.builtins.insert(name, func);
+        }
+        vm.execute().expect("execute");
+        (vm.get_output().trim().to_string(), vm.jit_compiled_count())
+    })
 }
 
 /// Run `src` with the JIT force-disabled — the interpreter oracle. Returns
 /// the trimmed output.
 fn run_interpreter(src: &str) -> String {
-    let mut vm = CfmlVirtualMachine::new(compile(src));
-    vm.jit_disable();
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-    vm.execute().expect("execute");
-    vm.get_output().trim().to_string()
+    let src = src.to_string();
+    on_big_stack(move || {
+        let mut vm = CfmlVirtualMachine::new(compile(&src));
+        vm.jit_disable();
+        for (name, value) in get_builtins() {
+            vm.globals.insert(name, value);
+        }
+        for (name, func) in get_builtin_functions() {
+            vm.builtins.insert(name, func);
+        }
+        vm.execute().expect("execute");
+        vm.get_output().trim().to_string()
+    })
 }
 
 #[test]
@@ -178,20 +203,23 @@ fn builtin_calls_jit_and_match_interpreter() {
 /// Same setup as `run` but also returns the count of OSR-compiled loop bodies
 /// — used to confirm OSR specifically fired (not just whole-fn JIT).
 fn run_with_osr(src: &str) -> (String, usize, usize) {
-    let mut vm = CfmlVirtualMachine::new(compile(src));
-    vm.jit_set_threshold(1);
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-    vm.execute().expect("execute");
-    (
-        vm.get_output().trim().to_string(),
-        vm.jit_compiled_count(),
-        vm.osr_compiled_count(),
-    )
+    let src = src.to_string();
+    on_big_stack(move || {
+        let mut vm = CfmlVirtualMachine::new(compile(&src));
+        vm.jit_set_threshold(1);
+        for (name, value) in get_builtins() {
+            vm.globals.insert(name, value);
+        }
+        for (name, func) in get_builtin_functions() {
+            vm.builtins.insert(name, func);
+        }
+        vm.execute().expect("execute");
+        (
+            vm.get_output().trim().to_string(),
+            vm.jit_compiled_count(),
+            vm.osr_compiled_count(),
+        )
+    })
 }
 
 #[test]
