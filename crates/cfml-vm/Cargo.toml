@@ -56,7 +56,7 @@ cranelift-native = { workspace = true, optional = true }
 cfml-stdlib = { workspace = true, default-features = false }
 
 [features]
-default = ["std", "real-threads", "jit", "observability"]
+default = ["std", "real-threads", "jit", "observability", "scope-pool"]
 std = []
 # Observability & debugging hook bus + the classic CF debug footer (Phase 0/1
 # of docs/observability-implementation-plan.md). Pure-Rust, host-only: it pulls
@@ -66,10 +66,13 @@ std = []
 # call site in the VM vanishes (`#[cfg(feature = "observability")]`), so the
 # hot path is byte-identical to a no-observability build.
 observability = []
-# Call-dispatch Lever D1 (scope pooling) prototype — recycle the per-call owned
-# `locals` map through a VM-held free-list instead of allocating/dropping it every
-# call. OFF by default; when off, every pool call site vanishes via
-# `#[cfg(feature = "scope-pool")]` so the hot path is byte-identical. See
+# Call-dispatch Lever D1 (scope pooling) — recycle the per-call owned `locals`
+# map through a VM-held free-list instead of allocating/dropping it every call.
+# ON by default (listed in `default` above): CPU-neutral and reduces retained
+# memory under diverse workloads. Every pool call site is
+# `#[cfg(feature = "scope-pool")]`, so disabling it (`--no-default-features` plus
+# the other defaults) restores the original per-call allocation. The wasm crates
+# build cfml-vm with `default-features = false`, so they never include it. See
 # SCOPE_ALLOC_LEVER_PLAN.md §5 Lever D.
 scope-pool = []
 # Component-model flyweight prototype (Phase C.2) — propagates to cfml-common.
