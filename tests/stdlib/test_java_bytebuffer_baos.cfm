@@ -74,6 +74,14 @@ enc = createObject("java", "java.io.ByteArrayOutputStream").init();
 enc.write(72); enc.write(105);
 assert("charsetEncode(toByteArray())", charsetEncode(enc.toByteArray(), "utf-8"), "Hi");
 
+// GH #278 — an EMPTY byte[]-as-Array must charsetEncode to "" (empty byte run),
+// NOT the stringified "[]". base32decodeString("") does charsetEncode of a
+// zero-length toByteArray(); Lucee yields "".
+empty = createObject("java", "java.io.ByteArrayOutputStream").init().toByteArray();
+assert("empty byte[] isArray", isArray(empty), true);
+assert("empty byte[] arrayLen", arrayLen(empty), 0);
+assert("charsetEncode(empty byte[]) is the empty string", charsetEncode(empty, "utf-8"), "");
+
 // ---- Preside base32 encode/decode round-trip (verbatim algorithm) ----
 // This is the exact code path #276 unblocks; it exercises getBytes + ByteBuffer
 // (encode padding) + ByteArrayOutputStream (decode) together.

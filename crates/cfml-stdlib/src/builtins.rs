@@ -7778,9 +7778,11 @@ fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
         // than stringifying it to "72,105,...".
         Some(CfmlValue::Array(a)) => {
             let elems = a.snapshot();
-            if !elems.is_empty()
-                && elems.iter().all(|e| matches!(e, CfmlValue::Int(_) | CfmlValue::Double(_)))
-            {
+            // An EMPTY byte[]-as-Array must yield "" (an empty byte run), not the
+            // stringified "[]" — `iter().all()` is vacuously true for an empty
+            // iterator, so the byte-mapping branch naturally produces no bytes
+            // (GH #278: base32decodeString("") must be "").
+            if elems.iter().all(|e| matches!(e, CfmlValue::Int(_) | CfmlValue::Double(_))) {
                 elems
                     .iter()
                     .map(|e| match e {
@@ -10522,16 +10524,17 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
             .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
 
         let column_count = stmt.column_count();
-        let columns: Vec<String> = (0..column_count)
+        let raw_columns: Vec<String> = (0..column_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
+        let (columns, keep) = dedup_result_columns(raw_columns);
 
         let rows_result: Result<Vec<ValueMap>, _> = stmt
             .query_map(rusqlite::params_from_iter(bound_params.iter()), |row| {
                 let mut row_map = ValueMap::default();
-                for (i, col) in columns.iter().enumerate() {
-                    let val: SqlValue = row.get_unwrap(i);
-                    row_map.insert(col.clone(), sqlite_to_cfml(val));
+                for (out_i, &src_i) in keep.iter().enumerate() {
+                    let val: SqlValue = row.get_unwrap(src_i);
+                    row_map.insert(columns[out_i].clone(), sqlite_to_cfml(val));
                 }
                 Ok(row_map)
             })
@@ -11073,7 +11076,7 @@ fn execute_mysql_on_conn(
         let mut result = conn.exec_iter(sql, &params)
             .map_err(|e| map_err(e, "query error"))?;
         let cols_meta = result.columns();
-        let columns: Vec<String> = cols_meta
+        let raw_columns: Vec<String> = cols_meta
             .as_ref()
             .iter()
             .map(|c| c.name_str().to_string())
@@ -11083,14 +11086,15 @@ fn execute_mysql_on_conn(
             .iter()
             .map(|c| c.column_type())
             .collect();
+        let (columns, keep) = dedup_result_columns(raw_columns);
 
         let mut rows: Vec<ValueMap> = Vec::new();
         for row_result in result.by_ref() {
             let row = row_result.map_err(|e| map_err(e, "query error"))?;
             let mut row_map = ValueMap::default();
-            for (i, col) in columns.iter().enumerate() {
-                let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
-                row_map.insert(col.clone(), mysql_value_to_cfml_typed(val, col_types.get(i).copied()));
+            for (out_i, &src_i) in keep.iter().enumerate() {
+                let val: mysql::Value = row.get(src_i).unwrap_or(mysql::Value::NULL);
+                row_map.insert(columns[out_i].clone(), mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
             }
             rows.push(row_map);
         }
@@ -11356,13 +11360,14 @@ fn run_postgres_statements(
             Err(e) => return Err(PgRunError::from_postgres("queryExecute: PostgreSQL query error", e, true)),
         };
 
-        let columns: Vec<String> = prepared.columns().iter().map(|c| c.name().to_string()).collect();
+        let raw_columns: Vec<String> = prepared.columns().iter().map(|c| c.name().to_string()).collect();
+        let (columns, keep) = dedup_result_columns(raw_columns);
 
         let mut result_rows: Vec<ValueMap> = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut row_map = ValueMap::default();
-            for (i, col) in columns.iter().enumerate() {
-                row_map.insert(col.clone(), postgres_row_to_cfml(row, i));
+            for (out_i, &src_i) in keep.iter().enumerate() {
+                row_map.insert(columns[out_i].clone(), postgres_row_to_cfml(row, src_i));
             }
             result_rows.push(row_map);
         }
@@ -12120,20 +12125,21 @@ fn run_mssql_statement(
             let result = stream.into_first_result().await
                 .map_err(|e| MssqlRunError::from_tiberius("result error", e, true))?;
 
-            let columns: Vec<String> = if let Some(first_row) = result.first() {
+            let raw_columns: Vec<String> = if let Some(first_row) = result.first() {
                 first_row.columns().iter()
                     .map(|c| c.name().to_string())
                     .collect()
             } else {
                 vec![]
             };
+            let (columns, keep) = dedup_result_columns(raw_columns);
 
             let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
             for row in &result {
                 let mut row_map = ValueMap::default();
-                for (i, col) in columns.iter().enumerate() {
-                    let val = mssql_column_to_cfml(row, i);
-                    row_map.insert(col.clone(), val);
+                for (out_i, &src_i) in keep.iter().enumerate() {
+                    let val = mssql_column_to_cfml(row, src_i);
+                    row_map.insert(columns[out_i].clone(), val);
                 }
                 rows.push(row_map);
             }
@@ -12641,15 +12647,16 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
         let mut stmt = conn.prepare(&exec_sql)
             .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
         let column_count = stmt.column_count();
-        let columns: Vec<String> = (0..column_count)
+        let raw_columns: Vec<String> = (0..column_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
+        let (columns, keep) = dedup_result_columns(raw_columns);
         let rows_result: Result<Vec<ValueMap>, _> = stmt
             .query_map(rusqlite::params_from_iter(bound_params.iter()), |row| {
                 let mut row_map = ValueMap::default();
-                for (i, col) in columns.iter().enumerate() {
-                    let val: SqlValue = row.get_unwrap(i);
-                    row_map.insert(col.clone(), sqlite_to_cfml(val));
+                for (out_i, &src_i) in keep.iter().enumerate() {
+                    let val: SqlValue = row.get_unwrap(src_i);
+                    row_map.insert(columns[out_i].clone(), sqlite_to_cfml(val));
                 }
                 Ok(row_map)
             })
@@ -12697,7 +12704,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
             .map_err(|e| CfmlError::database(format!("queryExecute: MySQL query error: {}", e)))?;
-        let (columns, col_types): (Vec<String>, Vec<mysql::consts::ColumnType>) =
+        let (raw_columns, col_types): (Vec<String>, Vec<mysql::consts::ColumnType>) =
             if let Some(first_row) = result.first() {
                 let cols = first_row.columns_ref();
                 (
@@ -12707,12 +12714,13 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
             } else {
                 (vec![], vec![])
             };
+        let (columns, keep) = dedup_result_columns(raw_columns);
         let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
         for row in &result {
             let mut row_map = ValueMap::default();
-            for (i, col) in columns.iter().enumerate() {
-                let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
-                row_map.insert(col.clone(), mysql_value_to_cfml_typed(val, col_types.get(i).copied()));
+            for (out_i, &src_i) in keep.iter().enumerate() {
+                let val: mysql::Value = row.get(src_i).unwrap_or(mysql::Value::NULL);
+                row_map.insert(columns[out_i].clone(), mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
             }
             rows.push(row_map);
         }
@@ -12737,6 +12745,28 @@ fn execute_postgres_with_conn(conn: &mut PgConn, sql: &str, params_arg: &CfmlVal
 // -----------------------------------------------
 // Shared result builders
 // -----------------------------------------------
+
+/// Lucee collapses a SQL result set's duplicate column names to the FIRST
+/// occurrence — a later column whose name matches an earlier one (case-
+/// insensitively) is discarded entirely, name AND data (GH #279: `select 'x' as
+/// id, 1 as id` yields a single `id` column holding `'x'`). Given the driver's
+/// raw positional column names this returns the surviving names paired with the
+/// source column position each should read from. With no duplicates the source
+/// positions are simply `0..n`, so the row-building loop is unchanged in the
+/// common case; only a genuinely duplicated result pays the collapse.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn dedup_result_columns(raw: Vec<String>) -> (Vec<String>, Vec<usize>) {
+    let mut names: Vec<String> = Vec::with_capacity(raw.len());
+    let mut keep: Vec<usize> = Vec::with_capacity(raw.len());
+    for (i, name) in raw.into_iter().enumerate() {
+        if names.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+            continue; // duplicate — the first occurrence already won
+        }
+        names.push(name);
+        keep.push(i);
+    }
+    (names, keep)
+}
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn build_query_result(columns: Vec<String>, rows: Vec<ValueMap>, sql: &str, return_type: &str) -> CfmlResult {
