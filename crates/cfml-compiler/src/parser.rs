@@ -5779,7 +5779,45 @@ impl Parser {
                 // We must detect this before parse_expression consumes `=` as assignment.
                 let is_named_arg = (matches!(self.peek(0), Token::Identifier(_)) || self.is_identifier_like())
                     && (matches!(self.peek(1), Token::Equal | Token::Colon));
-                if is_named_arg {
+                // Parenthesized named argument: Lucee strips redundant parens
+                // around a simple `( name = value )` binding and treats it as a
+                // NAMED argument. Preside ships this idiom
+                // (`event.buildLink( ( assetId=args.id ), derivative=... )` in
+                // system/views/renderers/asset/image/richEditor.cfm). It only
+                // applies when the WHOLE argument is the parenthesized binding;
+                // `(x=1) & y` is a positional expression, so we tentatively
+                // parse and backtrack if anything other than the argument
+                // terminator (`,`/`)`) follows the inner close paren.
+                let paren_named = matches!(self.peek(0), Token::LParen)
+                    && matches!(self.peek(1), Token::Identifier(_))
+                    && matches!(self.peek(2), Token::Equal | Token::Colon);
+                if paren_named {
+                    let saved = self.current;
+                    self.advance(); // consume '('
+                    let name = self.extract_identifier()?;
+                    let loc = self.current_location();
+                    if !self.match_token(&Token::Equal) {
+                        self.consume(&Token::Colon)?;
+                    }
+                    let value = self.parse_expression()?;
+                    // The inner ')' must close here, and the next token must end
+                    // this argument — otherwise it's a positional expression.
+                    if self.check(&Token::RParen)
+                        && matches!(self.peek(1), Token::Comma | Token::RParen)
+                    {
+                        self.advance(); // consume the inner ')'
+                        collected.push((
+                            Some(Expression::Literal(Literal {
+                                value: LiteralValue::String(name),
+                                location: loc,
+                            })),
+                            value,
+                        ));
+                    } else {
+                        self.current = saved;
+                        collected.push((None, self.parse_expression()?));
+                    }
+                } else if is_named_arg {
                     let name = self.extract_identifier()?;
                     let loc = self.current_location();
                     // Consume either = or :

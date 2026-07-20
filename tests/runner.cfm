@@ -51,6 +51,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_server_scope_write.cfm">
 <cf_runtest file="core/test_compound_assignment.cfm">
 <cf_runtest file="core/test_undeclared_named_args.cfm">
+<cf_runtest file="core/test_paren_wrapped_named_args.cfm">
 <!--- - invoke_undeclared_keys: the argument struct of the positional BIF --->
 <!--- invoke(obj, method, argStruct) is a named-argument collection — EVERY --->
 <!--- key must reach the callee's arguments scope, declared param or not, --->
@@ -169,6 +170,7 @@ include "harness.cfm";
 <cf_runtest file="types/test_nested_writeback.cfm">
 <cf_runtest file="types/test_query.cfm">
 <cf_runtest file="types/test_query_column.cfm">
+<cf_runtest file="types/test_query_columndata_member.cfm">
 <!--- A query cell must be a SIMPLE value: IsSimpleValue()=true and SerializeJSON of a --->
 <!--- struct holding it preserves the value. RustCFML 0.161.0 returned boxed cells. --->
 <cf_runtest file="types/test_query_cell_simple_value.cfm">

@@ -20891,6 +20891,16 @@ impl CfmlVirtualMachine {
                     };
                     return Ok(CfmlValue::string(list));
                 }
+                // Lucee query member `columnData(col)` → the `queryColumnData`
+                // builtin (object prepended as the query arg). Without this arm
+                // the member call fell through to `_ => None` and returned Null,
+                // so `var x = q.columnData(col)` silently left `x` UNDEFINED (a
+                // null-assignment unsets the var) — which surfaced as "Variable
+                // 'validValues' is undefined" in Preside's
+                // ObjectPicker._removeInvalidValues (widget/image picker
+                // prefill). NB Lucee's `columnArray` is NOT an alias — it errors
+                // on a column arg — so it is deliberately not mapped here.
+                "columndata" => Some("queryColumnData"),
                 "addrow" => Some("queryAddRow"),
                 "getrow" => Some("queryGetRow"),
                 "each" => {
