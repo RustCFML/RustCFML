@@ -22,7 +22,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.511.0"
+version = "0.512.0"
 authors = ["RustCFML Team"]
 edition = "2021"
 rust-version = "1.75.0"
@@ -31,13 +31,13 @@ homepage = "https://github.com/RustCFML/RustCFML"
 license = "MIT"
 
 [workspace.dependencies]
-cfml-common = { path = "crates/cfml-common", version = "0.511.0" }
-cfml-config = { path = "crates/cfml-config", version = "0.511.0" }
-cfml-compiler = { path = "crates/cfml-compiler", version = "0.511.0" }
-cfml-codegen = { path = "crates/cfml-codegen", version = "0.511.0" }
-cfml-vm = { path = "crates/cfml-vm", version = "0.511.0" }
-cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.511.0", default-features = false }
-cfml-qoq = { path = "crates/cfml-qoq", version = "0.511.0" }
+cfml-common = { path = "crates/cfml-common", version = "0.512.0" }
+cfml-config = { path = "crates/cfml-config", version = "0.512.0" }
+cfml-compiler = { path = "crates/cfml-compiler", version = "0.512.0" }
+cfml-codegen = { path = "crates/cfml-codegen", version = "0.512.0" }
+cfml-vm = { path = "crates/cfml-vm", version = "0.512.0" }
+cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.512.0", default-features = false }
+cfml-qoq = { path = "crates/cfml-qoq", version = "0.512.0" }
 
 log = "0.4"
 thiserror = "1.0"

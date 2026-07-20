@@ -1497,6 +1497,22 @@ pub struct CfmlVirtualMachine {
     /// Paramless functions store nothing (the marker is omitted entirely —
     /// absent is indistinguishable from an empty array at both read sites).
     arguments_params_cache: HashMap<u32, CfmlValue>,
+    /// Call-dispatch Lever A — memoized per-function decision (`global_id` →
+    /// bool) of whether this function's `arguments` scope is ever OBSERVABLE.
+    /// Most functions use named params (read via `local`/bare names, which are
+    /// copied into `locals`) and never touch the `arguments` scope at all; for
+    /// those we skip building the per-call `arguments` `CfmlStruct` entirely
+    /// (one `Arc<RwLock<StructInner>>` heap alloc + a cycle-GC `log_push` in
+    /// serve mode, per call). The scope is built eagerly (unchanged behavior)
+    /// only when the body could observe it: an explicit `arguments` reference,
+    /// a `cfinclude` (the included template may read the caller's arguments —
+    /// GH #158), a custom-tag/`cfmodule` invocation (bridges the caller's
+    /// arguments into the tag frame), or — decided per-call, not cached — the
+    /// presence of overflow/extra args (values that live ONLY in the arguments
+    /// scope, e.g. ColdBox `rc`/`prc`) or a template frame. Keyed by the
+    /// process-stable `global_id`: a function's bytecode never changes, so a
+    /// cached entry stays valid across requests in serve mode.
+    arguments_scope_needed_cache: HashMap<u32, bool>,
     /// Set whenever a `DefineFunction` op runs during a request. A new
     /// `CfmlValue::Function` can ONLY be born via that op (closures, arrows,
     /// component methods, and function references all compile to it), so if it
@@ -1995,6 +2011,7 @@ impl CfmlVirtualMachine {
             app_function_table: Vec::new(),
             fn_registry: Vec::new(),
             arguments_params_cache: HashMap::new(),
+            arguments_scope_needed_cache: HashMap::new(),
             app_fn_table_dirty: false,
             cache: HashMap::new(),
             cache_hits: 0,
@@ -4241,6 +4258,72 @@ impl CfmlVirtualMachine {
         result
     }
 
+    /// Call-dispatch Lever A — static scan deciding whether a function's
+    /// per-call `arguments` scope can ever be OBSERVED, so a call that can't
+    /// observe it skips building the `arguments` `CfmlStruct` (one Arc/RwLock
+    /// heap alloc + a serve-mode cycle-GC `log_push` per call). Conservative:
+    /// returns `true` (build eagerly, unchanged behavior) on any doubt. The
+    /// per-CALL signals — overflow/extra args and template frames — are NOT
+    /// covered here (they can't be known statically); the caller ORs them in.
+    ///
+    /// Observable when the body:
+    ///  - references `arguments` directly (`LoadLocal`/`TryLoadLocal
+    ///    "arguments"`, which also covers `arguments[N]`, `structKeyExists(
+    ///    arguments,…)` and `argumentCollection=arguments` — all lower to a
+    ///    `LoadLocal("arguments")`), or via a string form (`isDefined(
+    ///    "arguments")`, QoQ `… FROM arguments.rsX`, `evaluate("arguments.x")`),
+    ///  - does a `cfinclude` (`Include`/`IncludeDynamic`): the included
+    ///    `__main__` seeds its `arguments` from the caller's (GH #158), or
+    ///  - invokes a custom tag / `cfmodule` (`LoadGlobal("__cfcustomtag"|
+    ///    "__cfcustomtag_start"|"__cfmodule")`): the tag frame bridges the
+    ///    caller's `arguments` in (ColdBox RendererEncapsulator).
+    fn function_needs_arguments_scope(instructions: &[BytecodeOp]) -> bool {
+        instructions.iter().any(|op| match op {
+            BytecodeOp::LoadLocal(s) | BytecodeOp::TryLoadLocal(s) => {
+                s.eq_ignore_ascii_case("arguments")
+            }
+            BytecodeOp::Include(_) | BytecodeOp::IncludeDynamic => true,
+            BytecodeOp::LoadGlobal(s) => {
+                // Custom-tag / `cfmodule` callee. All call forms lower to a
+                // `LoadGlobal` of the callee name, but the name reaches bytecode
+                // either bare (`cfmodule(…)` function form → `LoadGlobal(
+                // "cfmodule")`, routed to `__cfmodule` only at runtime) or already
+                // internal (`module …;` statement / `<cf_foo>` tag →
+                // `__cfmodule` / `__cfcustomtag` / `__cfcustomtag_start`). Match
+                // with a leading `__` stripped so both spellings are caught.
+                let base = s.strip_prefix("__").unwrap_or(s);
+                base.eq_ignore_ascii_case("cfmodule")
+                    || base.eq_ignore_ascii_case("cfcustomtag")
+                    || base.eq_ignore_ascii_case("cfcustomtag_start")
+            }
+            BytecodeOp::String(s) => {
+                // String-form references to the arguments scope: the bare word
+                // `"arguments"` (e.g. `isDefined("arguments")`), or a dotted /
+                // indexed `arguments.` / `arguments[` ANYWHERE in the string. The
+                // latter is a substring match, not a prefix, so it catches the
+                // reference mid-SQL in a QoQ source table (`select … from
+                // arguments.rsX …`, Masa framework.cfc / `find_query_in_scope`'s
+                // `arguments` case) as well as dynamic isDefined/evaluate/
+                // structKeyExists paths. Conservative: any string containing the
+                // literal `arguments.`/`arguments[` forces the eager path.
+                let l = s.to_ascii_lowercase();
+                l == "arguments" || l.contains("arguments.") || l.contains("arguments[")
+            }
+            _ => false,
+        })
+    }
+
+    /// Memoized wrapper over [`function_needs_arguments_scope`], keyed by the
+    /// process-stable `global_id` (a function's bytecode never changes).
+    fn arguments_scope_needed(&mut self, func: &BytecodeFunction) -> bool {
+        if let Some(&b) = self.arguments_scope_needed_cache.get(&func.global_id) {
+            return b;
+        }
+        let b = Self::function_needs_arguments_scope(&func.instructions);
+        self.arguments_scope_needed_cache.insert(func.global_id, b);
+        b
+    }
+
     fn execute_function_body(
         &mut self,
         func: &BytecodeFunction,
@@ -4500,12 +4583,50 @@ impl CfmlVirtualMachine {
         // seeds the local + the `arguments` key at runtime. An omitted param
         // with no default must stay ABSENT from both `locals` and `arguments`,
         // so `structKeyExists(arguments, "p")` is false — matching Lucee/ACF.
-        // Pre-size: one entry per bound/overflow arg (whichever is larger) plus
-        // the two `__arguments_*` markers.
-        let mut arguments_map: ValueMap = ValueMap::with_capacity_and_hasher(
-            args.len().max(func.params.len()) + 2,
-            Default::default(),
-        );
+        //
+        // Call-dispatch Lever A — the `arguments` `CfmlStruct` (an
+        // `Arc<RwLock<StructInner>>` heap alloc + a serve-mode cycle-GC
+        // `log_push`, every call) is built ONLY when it can be observed. It's
+        // observable when the body references it, does a `cfinclude`, or invokes
+        // a custom tag/`cfmodule` (all detected by the memoized static scan), OR
+        // — decided here per-call — when there are overflow/extra args (which
+        // live ONLY in the arguments scope, e.g. ColdBox `rc`/`prc`) or this is
+        // a `__main__`/`__cfc_body__` template frame (seeds from / bridges the
+        // caller's arguments). Otherwise every observer (`lookup_name_in_scopes`
+        // cascade, `argument_scope_key_set`, isDefined, the filter sites) is
+        // provably a no-op on an absent key, so we skip the alloc entirely and
+        // answer the default-preamble's `JumpIfArgPresent` from a lightweight
+        // supplied-param set instead. Params always land in `locals` regardless,
+        // so bare/`local`-scoped param reads are unaffected.
+        let has_overflow_args = args.len() > func.params.len()
+            || self
+                .pending_extra_named_args
+                .as_ref()
+                .is_some_and(|e| !e.is_empty());
+        let build_arguments_eager =
+            is_template_frame || has_overflow_args || self.arguments_scope_needed(func);
+        // Pre-size (eager only): one entry per bound/overflow arg (whichever is
+        // larger) plus the two `__arguments_*` markers. In the skip path this
+        // stays an empty map that never allocates and is dropped unused.
+        let mut arguments_map: ValueMap = if build_arguments_eager {
+            ValueMap::with_capacity_and_hasher(
+                args.len().max(func.params.len()) + 2,
+                Default::default(),
+            )
+        } else {
+            ValueMap::default()
+        };
+        // Skip path: lowercased names of the params the caller actually supplied
+        // — the exact set `JumpIfArgPresent` needs (an omitted param stays
+        // absent, so its default runs; GH #240's carried-parent-value hazard is
+        // avoided because this is NOT the enclosing `locals`). `None` in the
+        // eager path, where `JumpIfArgPresent` reads the real arguments struct.
+        let mut arguments_supplied: Option<std::collections::HashSet<String>> =
+            if build_arguments_eager {
+                None
+            } else {
+                Some(std::collections::HashSet::with_capacity(func.params.len()))
+            };
         // Lucee/ACF/BoxLang: a value bound to a declared parameter appears in
         // the `arguments` scope under its parameter NAME — never under its
         // 1-based positional index. Positional access (`arguments[1]`) still
@@ -4542,7 +4663,14 @@ impl CfmlVirtualMachine {
                         }
                     }
                     locals.insert(param_name.clone(), value.clone());
-                    arguments_map.insert(param_name.clone(), value);
+                    if build_arguments_eager {
+                        arguments_map.insert(param_name.clone(), value);
+                    } else {
+                        arguments_supplied
+                            .as_mut()
+                            .unwrap()
+                            .insert(param_name.to_lowercase());
+                    }
                 }
                 None => {
                     // Omitted. Do NOT pre-seed the local: the default preamble
@@ -4554,22 +4682,6 @@ impl CfmlVirtualMachine {
                     // empty slot as Null instead of the outer `x` (GitHub #240).
                     let _ = has_default;
                 }
-            }
-        }
-        // Extras: named args from the callsite that didn't match a declared
-        // param. Take the pending list (set by the named-args reorder) so a
-        // recursive call doesn't see stale state.
-        let extras = self.pending_extra_named_args.take().unwrap_or_default();
-        // Add any args beyond declared params. A named overflow arg is keyed by
-        // name ONLY; a positional overflow arg is keyed by its 1-based position.
-        // (Lucee/ACF/BoxLang: calling a paramless function purely by name yields
-        // an arguments scope of exactly those names — no spurious numeric keys.)
-        for i in func.params.len()..args.len() {
-            let value = args[i].clone();
-            if let Some((_, name)) = extras.iter().find(|(idx, _)| *idx == i) {
-                arguments_map.insert(name.clone(), value);
-            } else {
-                arguments_map.insert((i + 1).to_string(), value);
             }
         }
         // Check required parameters. A param declared `required` BUT also given
@@ -4589,59 +4701,85 @@ impl CfmlVirtualMachine {
                 ))));
             }
         }
-        // Tag this struct as the arguments scope. `__arguments_scope` is the
-        // sentinel; `__arguments_params` carries the declared param names so
-        // `arguments[N]` (1-based) can fall through to params[N-1] at the
-        // GetIndex site without having to thread the param list separately.
-        // Both markers are filtered from user-visible struct introspection.
-        arguments_map.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
-        // v0.442 (call-dispatch Lever 2) — the `__arguments_params` positional
-        // marker is only consulted for functions that declare params; for a
-        // paramless function an absent marker behaves identically to the empty
-        // array at both read sites (`is_declared_arg_param` and the `arguments[N]`
-        // GetIndex fallback), so skip the per-call allocation entirely. For
-        // declared params, reuse a memoized Arc-backed array (built once per
-        // function, keyed by global_id) rather than rebuilding a `Vec` + one
-        // `String` clone per param + a fresh `CfmlArray` on every single call.
-        if !func.params.is_empty() {
-            let params_marker = self
-                .arguments_params_cache
-                .entry(func.global_id)
-                .or_insert_with(|| {
-                    CfmlValue::array(
-                        func.params
-                            .iter()
-                            .map(|p| CfmlValue::string(p.clone()))
-                            .collect(),
-                    )
-                })
-                .clone();
-            arguments_map.insert("__arguments_params".to_string(), params_marker);
-        }
-        // A `cfinclude`d template (the included file's `__main__`, run with the
-        // caller's scope as parent) shares the CALLER's `arguments` scope in
-        // CFML — e.g. Wheels renders error/view templates with
-        // `$includeAndReturnOutput($template=…, wheelsError=…)` and the template
-        // reads `arguments.wheelsError`. The included `__main__` has no params of
-        // its own, so without this its `arguments` would be empty and every such
-        // reference would silently render blank (GitHub issue #158). Seed this
-        // frame's `arguments` from the parent's so those entries are visible;
-        // our freshly-built markers/params take precedence.
-        if func.name == "__main__" {
-            if let Some(parent) = parent_scope {
-                if let Some(CfmlValue::Struct(parent_args)) = parent.get(ARGUMENTS_SCOPE_KEY) {
-                    for (k, v) in parent_args.snapshot() {
-                        if !arguments_map.contains_key(&k) {
-                            arguments_map.insert(k, v);
+        if build_arguments_eager {
+            // Extras: named args from the callsite that didn't match a declared
+            // param. Take the pending list (set by the named-args reorder) so a
+            // recursive call doesn't see stale state.
+            let extras = self.pending_extra_named_args.take().unwrap_or_default();
+            // Add any args beyond declared params. A named overflow arg is keyed
+            // by name ONLY; a positional overflow arg is keyed by its 1-based
+            // position. (Lucee/ACF/BoxLang: calling a paramless function purely by
+            // name yields an arguments scope of exactly those names — no spurious
+            // numeric keys.)
+            for i in func.params.len()..args.len() {
+                let value = args[i].clone();
+                if let Some((_, name)) = extras.iter().find(|(idx, _)| *idx == i) {
+                    arguments_map.insert(name.clone(), value);
+                } else {
+                    arguments_map.insert((i + 1).to_string(), value);
+                }
+            }
+            // Tag this struct as the arguments scope. `__arguments_scope` is the
+            // sentinel; `__arguments_params` carries the declared param names so
+            // `arguments[N]` (1-based) can fall through to params[N-1] at the
+            // GetIndex site without having to thread the param list separately.
+            // Both markers are filtered from user-visible struct introspection.
+            arguments_map.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
+            // v0.442 (call-dispatch Lever 2) — the `__arguments_params` positional
+            // marker is only consulted for functions that declare params; for a
+            // paramless function an absent marker behaves identically to the empty
+            // array at both read sites (`is_declared_arg_param` and the
+            // `arguments[N]` GetIndex fallback), so skip the per-call allocation
+            // entirely. For declared params, reuse a memoized Arc-backed array
+            // (built once per function, keyed by global_id) rather than rebuilding
+            // a `Vec` + one `String` clone per param + a fresh `CfmlArray` on every
+            // single call.
+            if !func.params.is_empty() {
+                let params_marker = self
+                    .arguments_params_cache
+                    .entry(func.global_id)
+                    .or_insert_with(|| {
+                        CfmlValue::array(
+                            func.params
+                                .iter()
+                                .map(|p| CfmlValue::string(p.clone()))
+                                .collect(),
+                        )
+                    })
+                    .clone();
+                arguments_map.insert("__arguments_params".to_string(), params_marker);
+            }
+            // A `cfinclude`d template (the included file's `__main__`, run with the
+            // caller's scope as parent) shares the CALLER's `arguments` scope in
+            // CFML — e.g. Wheels renders error/view templates with
+            // `$includeAndReturnOutput($template=…, wheelsError=…)` and the template
+            // reads `arguments.wheelsError`. The included `__main__` has no params of
+            // its own, so without this its `arguments` would be empty and every such
+            // reference would silently render blank (GitHub issue #158). Seed this
+            // frame's `arguments` from the parent's so those entries are visible;
+            // our freshly-built markers/params take precedence.
+            if func.name == "__main__" {
+                if let Some(parent) = parent_scope {
+                    if let Some(CfmlValue::Struct(parent_args)) = parent.get(ARGUMENTS_SCOPE_KEY) {
+                        for (k, v) in parent_args.snapshot() {
+                            if !arguments_map.contains_key(&k) {
+                                arguments_map.insert(k, v);
+                            }
                         }
                     }
                 }
             }
+            locals.insert(
+                ARGUMENTS_SCOPE_KEY.to_string(),
+                CfmlValue::strukt(arguments_map),
+            );
+        } else {
+            // Skip path: the arguments scope is unobservable this call, so no
+            // `CfmlStruct` is built. Still drain the extra-named-args handoff so
+            // it can't leak into the next call (it is empty here — any extras
+            // would have set `has_overflow_args` and taken the eager path).
+            self.pending_extra_named_args.take();
         }
-        locals.insert(
-            ARGUMENTS_SCOPE_KEY.to_string(),
-            CfmlValue::strukt(arguments_map),
-        );
 
         // The name this call was dispatched under (a member-call alias, if any).
         // Always drained so it can't leak into a later call; falls back to the
@@ -9915,10 +10053,18 @@ impl CfmlVirtualMachine {
                     // scope, never the enclosing scope, so an omitted param whose
                     // default reads a same-named outer variable is not shadowed by
                     // its own (absent) slot (GitHub #240). No stack traffic.
-                    let supplied = matches!(
-                        locals.get(ARGUMENTS_SCOPE_KEY),
-                        Some(CfmlValue::Struct(a)) if a.contains_key_ci(name)
-                    );
+                    //
+                    // Lever A skip path: when the arguments `CfmlStruct` was not
+                    // built (unobservable this call), the equivalent supplied-key
+                    // set is `arguments_supplied` — same GH #240 guarantee (it holds
+                    // only the params the caller passed, never carried enclosing
+                    // vars). `contains` uses the pre-lowercased key.
+                    let supplied = match locals.get(ARGUMENTS_SCOPE_KEY) {
+                        Some(CfmlValue::Struct(a)) => a.contains_key_ci(name),
+                        _ => arguments_supplied
+                            .as_ref()
+                            .is_some_and(|s| s.contains(&name.to_lowercase())),
+                    };
                     if supplied {
                         ip = *target;
                     }
