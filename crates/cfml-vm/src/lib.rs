@@ -1155,6 +1155,15 @@ pub struct CfmlVirtualMachine {
     /// mixed-in `renderViewlet()`). Maintained in lockstep with `call_stack` via
     /// `execute_function_with_args`'s truncate-to-entry-depth epilogue.
     frame_ctx: Vec<(std::sync::Arc<std::collections::HashSet<String>>, bool)>,
+    /// Call-dispatch Lever D1 (scope pooling) — free-list of emptied per-call
+    /// `locals` maps. `execute_function_body` pops one at entry (pre-sized) and
+    /// pushes it back (cleared) at a non-escaping success exit, so warm calls
+    /// reuse the backing IndexMap allocation instead of alloc/free per call.
+    /// Cleared-on-return so it retains no `CfmlValue` between calls (RSS-neutral).
+    /// Frames strictly nest (LIFO) and only ever touched via `&mut self` on one
+    /// thread, so no synchronization is needed.
+    #[cfg(feature = "scope-pool")]
+    locals_pool: Vec<ValueMap>,
     /// Try-catch handler stack
     try_stack: Vec<TryHandler>,
     /// Current exception (if any)
@@ -1933,6 +1942,8 @@ impl CfmlVirtualMachine {
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
+            #[cfg(feature = "scope-pool")]
+            locals_pool: Vec::new(),
             try_stack: Vec::new(),
             current_exception: None,
             last_exception: None,
@@ -4324,6 +4335,35 @@ impl CfmlVirtualMachine {
         b
     }
 
+    /// Lever D1: take a per-call `locals` map from the free-list (pre-sized to
+    /// `cap`), or allocate a fresh one when the pool is empty. Pooled maps are
+    /// empty (cleared on return), so `reserve` just pre-sizes the reused backing.
+    #[cfg(feature = "scope-pool")]
+    #[inline]
+    fn take_locals_map(&mut self, cap: usize) -> ValueMap {
+        match self.locals_pool.pop() {
+            Some(mut m) => {
+                m.reserve(cap);
+                m
+            }
+            None => ValueMap::with_capacity_and_hasher(cap, Default::default()),
+        }
+    }
+
+    /// Lever D1: return a per-call `locals` map to the free-list. MUST only be
+    /// called for a map that does not escape the frame (i.e. a non-template frame
+    /// — template frames hand `locals` to `captured_locals`). Clears it first so
+    /// no `CfmlValue` is retained between calls. The cap bounds pool memory under
+    /// deep recursion; excess maps are simply dropped.
+    #[cfg(feature = "scope-pool")]
+    #[inline]
+    fn recycle_locals_map(&mut self, mut m: ValueMap) {
+        if self.locals_pool.len() < 128 {
+            m.clear();
+            self.locals_pool.push(m);
+        }
+    }
+
     fn execute_function_body(
         &mut self,
         func: &BytecodeFunction,
@@ -4464,6 +4504,12 @@ impl CfmlVirtualMachine {
         // loops never trigger an incremental rehash-and-grow.
         let parent_len = parent_scope.map(|p| p.len()).unwrap_or(0);
         let seed_cap = parent_len + func.params.len();
+        // Lever D1 (scope-pool): reuse a per-call `locals` backing from the
+        // free-list; recycled at the non-escaping success exits below. Flag-off
+        // path is the original per-call allocation, byte-identical.
+        #[cfg(feature = "scope-pool")]
+        let mut locals: ValueMap = self.take_locals_map(seed_cap + 1);
+        #[cfg(not(feature = "scope-pool"))]
         let mut locals: ValueMap =
             ValueMap::with_capacity_and_hasher(seed_cap + 1, Default::default());
         let mut stack: Vec<CfmlValue> = Vec::new();
@@ -7565,6 +7611,13 @@ impl CfmlVirtualMachine {
                         func.name,
                         stack.len()
                     );
+                    // Lever D1: recycle the per-call `locals` backing. Only for
+                    // non-template frames — a template frame already handed
+                    // `locals` to `captured_locals` above, so it must NOT be pooled.
+                    #[cfg(feature = "scope-pool")]
+                    if !is_template_frame {
+                        self.recycle_locals_map(std::mem::take(&mut locals));
+                    }
                     return Ok(stack.pop().unwrap_or(CfmlValue::Null));
                 }
 
@@ -10708,7 +10761,11 @@ impl CfmlVirtualMachine {
             if let Some(ref env) = closure_env {
                 env.write().unwrap().clear();
             }
-            self.captured_locals = Some(locals);
+            // `mem::take` (not a by-value move) so `locals` stays a valid — empty —
+            // binding afterwards; the Lever D1 recycle below is a separate `if`, and
+            // the borrow checker can't prove the two branches are exclusive. The
+            // handed-off map is identical either way. Mirrors the Return-op path.
+            self.captured_locals = Some(std::mem::take(&mut locals));
 
             // `cfexit` stops at the template boundary: a template frame is the
             // owner of an unwinding exit. Hand the method off to
@@ -10726,6 +10783,13 @@ impl CfmlVirtualMachine {
             func.name,
             stack.len()
         );
+        // Lever D1: recycle the per-call `locals` backing at the run-off-end
+        // success exit. Non-template frames only — template frames handed
+        // `locals` to `captured_locals` above (must not be pooled).
+        #[cfg(feature = "scope-pool")]
+        if !is_template_frame {
+            self.recycle_locals_map(std::mem::take(&mut locals));
+        }
         Ok(stack.pop().unwrap_or(CfmlValue::Null))
     }
 

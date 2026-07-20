@@ -66,6 +66,12 @@ std = []
 # call site in the VM vanishes (`#[cfg(feature = "observability")]`), so the
 # hot path is byte-identical to a no-observability build.
 observability = []
+# Call-dispatch Lever D1 (scope pooling) prototype — recycle the per-call owned
+# `locals` map through a VM-held free-list instead of allocating/dropping it every
+# call. OFF by default; when off, every pool call site vanishes via
+# `#[cfg(feature = "scope-pool")]` so the hot path is byte-identical. See
+# SCOPE_ALLOC_LEVER_PLAN.md §5 Lever D.
+scope-pool = []
 # Component-model flyweight prototype (Phase C.2) — propagates to cfml-common.
 # OFF by default; see COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
 component-instance = ["cfml-common/component-instance"]
