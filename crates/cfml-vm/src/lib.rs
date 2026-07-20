@@ -5297,6 +5297,36 @@ impl CfmlVirtualMachine {
                             // contentServer.parseURLRoot accumulates url.path). A
                             // genuine `var url` frame-local is guarded out above.
                             self.globals.insert(name_lower.clone(), val);
+                        } else if !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                            && !locals.contains_key(name.as_str())
+                            && name_lower != "arguments"
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                            && locals
+                                .get(ARGUMENTS_SCOPE_KEY)
+                                .and_then(|v| v.as_cfml_struct())
+                                .is_some_and(|a| a.get_ci(name).is_some())
+                        {
+                            // Undeclared named argument (the ColdBox `preHandler(event,
+                            // action)` idiom — `rc`/`prc` are passed but not declared,
+                            // so they live in the arguments scope, not frame locals).
+                            // An unscoped store of such a name — including the ROOT
+                            // write-back of a multi-level member assign `prc.a.b = v`,
+                            // which lands here as StoreLocal("prc") — must write back to
+                            // the arguments scope, mirroring the read cascade
+                            // (local -> arguments -> variables). Without this the
+                            // modified root fell into the CFC `__variables` branch below
+                            // and the caller (action/view) never saw it. Single-level
+                            // `prc.x = v` is handled in StoreLocalProperty; this covers
+                            // the nested-path root store. Guarded to names that ALREADY
+                            // exist in the arguments scope, so brand-new locals and
+                            // declared params are unaffected.
+                            if let Some(args) = locals
+                                .get_mut(ARGUMENTS_SCOPE_KEY)
+                                .and_then(|v| v.as_cfml_struct())
+                            {
+                                args.insert(name.clone(), val);
+                            }
                         } else if locals.contains_key("__variables")
                             && !declared_locals.contains(name)
                             && !declared_locals.contains(&name_lower)
@@ -7842,14 +7872,37 @@ impl CfmlVirtualMachine {
                             // The name isn't a frame local (or named param). Before
                             // auto-vivifying a brand-new local, mirror how unscoped
                             // READS resolve and look for an existing same-named
-                            // container in the variables scope (`__variables`, present
-                            // in CFC methods / templates included into a CFC). An
-                            // unscoped compound write `instance.newkey = v` where
-                            // `variables.instance` already exists must mutate THAT
-                            // struct — NOT fork a phantom `local.instance` that is
-                            // silently discarded when the method returns. This is the
-                            // classic ColdBox `instance` struct pattern. (GitHub #180)
-                            let existing_var = if let Some(CfmlValue::Struct(vars)) =
+                            // container up the scope cascade: `arguments` first (CFML
+                            // resolves local -> arguments -> variables), then the
+                            // variables scope.
+                            //
+                            // Arguments: an unscoped compound write `prc.newkey = v`
+                            // where `prc` is an UNDECLARED named argument must mutate
+                            // the struct in the arguments scope. This is the ColdBox
+                            // `preHandler( event, action )` idiom — the framework passes
+                            // `rc`/`prc` as named args that the method doesn't declare,
+                            // so they live in the arguments struct, not frame locals.
+                            // Without this the write forks a phantom `local.prc` that is
+                            // discarded on return, so a `prc.foo = …` set in preHandler
+                            // never reaches the action/view (Preside LinkPicker's empty
+                            // link-type menu; the whole preHandler-populates-prc pattern).
+                            //
+                            // Variables: `instance.newkey = v` where `variables.instance`
+                            // already exists must mutate THAT struct — NOT fork a phantom
+                            // `local.instance` discarded when the method returns. This is
+                            // the classic ColdBox `instance` struct pattern. (GitHub #180)
+                            let existing_arg = if let Some(CfmlValue::Struct(args_scope)) =
+                                locals.get(ARGUMENTS_SCOPE_KEY)
+                            {
+                                args_scope
+                                    .get_ci(local_name)
+                                    .filter(|v| v.as_cfml_struct().is_some())
+                            } else {
+                                None
+                            };
+                            let existing_var = if existing_arg.is_some() {
+                                None
+                            } else if let Some(CfmlValue::Struct(vars)) =
                                 locals.get("__variables")
                             {
                                 vars.get_ci(local_name)
@@ -7857,7 +7910,7 @@ impl CfmlVirtualMachine {
                             } else {
                                 None
                             };
-                            if let Some(existing) = existing_var {
+                            if let Some(existing) = existing_arg.or(existing_var) {
                                 // `existing` is a clone of the variables-scope value;
                                 // for a Struct that shares the same Arc-backed store,
                                 // so this insert is visible through `variables.<name>`.
@@ -17422,6 +17475,18 @@ impl CfmlVirtualMachine {
                 return Some(v.clone());
             }
         }
+        // Undeclared named argument: a nested store/load root (`prc.a.b`) resolves
+        // through the arguments scope, matching the read cascade (local ->
+        // arguments -> variables) that single-var reads already honor. Returns the
+        // live (Arc-shared) struct so an in-place nested mutation persists to the
+        // caller's argument — the ColdBox `preHandler( event, action )` idiom where
+        // `rc`/`prc` are passed but not declared, so they live only in the arguments
+        // scope. Comes BEFORE `__variables`/web scopes, per the CFML cascade.
+        if let Some(CfmlValue::Struct(args_scope)) = locals.get(ARGUMENTS_SCOPE_KEY) {
+            if let Some(v) = args_scope.get_ci(name) {
+                return Some(v);
+            }
+        }
         // Web request scopes (url/form/cgi/cookie) are always request-global:
         // resolve straight from `self.globals`, never a component's stale
         // `__variables` shadow (see is_web_request_scope). A genuine frame-local
@@ -17938,7 +18003,27 @@ impl CfmlVirtualMachine {
                 "local" | "variables" | "application" | "request"
                     | "thread" | "session" | "static" | "arguments"
             );
-            if !is_reserved_store_scope
+            // Undeclared named argument (ColdBox `preHandler` prc/rc): the modified
+            // root belongs in the arguments scope, mirroring the read cascade + the
+            // StoreLocal / StoreLocalProperty rules. scope_aware_load returned the
+            // live arguments struct, so the walk already mutated it in place; commit
+            // it back to arguments — NOT the component `__variables` (where it would
+            // leak per-request data onto a singleton) or a phantom local. Guarded to
+            // names already present in arguments and not a frame local.
+            let is_undeclared_arg = !is_reserved_store_scope
+                && !locals.contains_key(scope)
+                && locals
+                    .get(ARGUMENTS_SCOPE_KEY)
+                    .and_then(|v| v.as_cfml_struct())
+                    .is_some_and(|a| a.get_ci(scope).is_some());
+            if is_undeclared_arg {
+                if let Some(args) = locals
+                    .get_mut(ARGUMENTS_SCOPE_KEY)
+                    .and_then(|v| v.as_cfml_struct())
+                {
+                    args.insert(scope.to_string(), root);
+                }
+            } else if !is_reserved_store_scope
                 && !local_mode_modern
                 && !locals.contains_key(scope)
                 && !self.globals.contains_key(scope)
