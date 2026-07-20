@@ -445,6 +445,14 @@ impl BytecodeCache {
         }
     }
 
+    /// Return a cached program WITHOUT the freshness (mtime) re-check. Callers
+    /// use this only after validating the file's freshness this request (see
+    /// `request_validated_files`): within one request a file can't change, so
+    /// re-`stat`ing it on every repeat load is wasted work.
+    pub fn get_no_check(&self, path: &str) -> Option<BytecodeProgram> {
+        self.entries.read().get(path).map(|e| e.program.clone())
+    }
+
     /// Insert a freshly compiled program into the cache.
     pub fn insert(&self, path: String, program: BytecodeProgram, mtime: SystemTime) {
         self.entries
@@ -928,6 +936,17 @@ pub struct ServerState {
     /// `production_mode` and only for paths that actually exist (negatives
     /// re-probe). Never populated in dev mode (the tree may change).
     pub component_path_cache: Arc<parking_lot::RwLock<HashMap<String, String>>>,
+    /// Production-mode cache of a path → its `canonicalize()` (realpath) result.
+    /// `canonicalize` is a syscall that resolves every symlink and normalizes
+    /// `.`/`..`. The `expandPath`, `getCurrentTemplatePath` and
+    /// `getBaseTemplatePath` BIFs call it on every invocation, and ColdBox
+    /// (`Util.getAbsolutePath`) / Preside hammer `expandPath` — a live Preside
+    /// profile showed ~8.6% of all CPU here even after `component_path_cache`
+    /// landed. For an immutable production tree the (path → canonical) mapping is
+    /// stable, so we memoise. Only populated when `production_mode` and only for
+    /// `Ok` results (a not-yet-created path must re-probe). Never populated in
+    /// dev mode (files/symlinks may appear/change between requests).
+    pub canonicalize_cache: Arc<parking_lot::RwLock<HashMap<String, String>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -987,6 +1006,7 @@ impl ServerState {
             app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             app_cfconfig_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             component_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            canonicalize_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -1634,6 +1654,24 @@ pub struct CfmlVirtualMachine {
     /// mode only: classes are immutable there, so the cache can't go stale;
     /// dev keeps per-instance copies. Same VM lifetime as `static_stores`.
     pub class_meta_cache: HashMap<String, Arc<Vec<(String, CfmlValue)>>>,
+    /// Request-scoped cache of a component name → its resolved `.cfc` path.
+    /// Sibling of `ServerState::component_path_cache` (cross-request, production
+    /// only), but on the per-request VM so it is safe in ALL modes: the on-disk
+    /// tree can't change within one request and it is dropped at request end, so
+    /// dev still picks up new/edited files next request. Kills the candidate-path
+    /// `exists()` storm when a request instantiates the same component many times.
+    pub request_component_cache: HashMap<String, String>,
+    /// Request-scoped cache of a path → its `canonicalize()` (realpath) result.
+    /// Request-lifetime sibling of `ServerState::canonicalize_cache`; safe in all
+    /// modes for the same reason. `RwLock` because `canonicalize_cached` is `&self`.
+    pub request_canon_cache: parking_lot::RwLock<HashMap<String, String>>,
+    /// Request-scoped set of file paths whose bytecode-cache freshness (mtime)
+    /// has already been validated this request. In dev the shared `BytecodeCache`
+    /// re-`stat`s a file on every load to detect edits; within one request a file
+    /// can't change, so once validated we skip the stat on repeat loads (see
+    /// `compile_file_cached_req`). Dropped at request end → next request
+    /// re-checks. `RwLock` so the `&self` wrapper composes with self-borrowed args.
+    pub request_validated_files: parking_lot::RwLock<std::collections::HashSet<String>>,
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
@@ -1993,6 +2031,9 @@ impl CfmlVirtualMachine {
             static_stores: HashMap::new(),
             static_holders: HashMap::new(),
             class_meta_cache: HashMap::new(),
+            request_component_cache: HashMap::new(),
+            request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
+            request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             last_component_compile_error: None,
             #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
             jit: jit::JitEngine::maybe_new(),
@@ -9922,8 +9963,7 @@ impl CfmlVirtualMachine {
                     };
 
                     // Read, parse, compile, and execute the included file
-                    let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-                    match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
+                    match self.compile_file_cached_req(&resolved) {
                         Ok(sub_program) => {
                             let old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
@@ -10122,8 +10162,7 @@ impl CfmlVirtualMachine {
                         resolved
                     };
 
-                    let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-                    match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
+                    match self.compile_file_cached_req(&resolved) {
                         Ok(sub_program) => {
                             let old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
@@ -12813,7 +12852,7 @@ impl CfmlVirtualMachine {
                 }
                 "getcurrenttemplatepath" => {
                     if let Some(ref source) = self.source_file {
-                        if let Ok(abs) = self.vfs.canonicalize(source) {
+                        if let Ok(abs) = self.canonicalize_cached(source) {
                             return Ok(CfmlValue::string(abs));
                         }
                         return Ok(CfmlValue::string(source.clone()));
@@ -12826,14 +12865,14 @@ impl CfmlVirtualMachine {
                 }
                 "getbasetemplatepath" => {
                     if let Some(ref base) = self.base_template_path {
-                        if let Ok(abs) = self.vfs.canonicalize(base) {
+                        if let Ok(abs) = self.canonicalize_cached(base) {
                             return Ok(CfmlValue::string(abs));
                         }
                         return Ok(CfmlValue::string(base.clone()));
                     }
                     // Fall back to source_file
                     if let Some(ref source) = self.source_file {
-                        if let Ok(abs) = self.vfs.canonicalize(source) {
+                        if let Ok(abs) = self.canonicalize_cached(source) {
                             return Ok(CfmlValue::string(abs));
                         }
                         return Ok(CfmlValue::string(source.clone()));
@@ -12929,7 +12968,7 @@ impl CfmlVirtualMachine {
 
                     // Canonicalize if it exists, otherwise return the joined path
                     let path_str = resolved.to_string_lossy().to_string();
-                    let mut result = self.vfs.canonicalize(&path_str).unwrap_or(path_str);
+                    let mut result = self.canonicalize_cached(&path_str).unwrap_or(path_str);
                     // Preserve a trailing slash from the input. Lucee/ACF/BoxLang
                     // mirror the input's trailing slash on the output; canonicalize
                     // strips it for existing paths, so reapply when the caller had one.
@@ -19618,8 +19657,7 @@ impl CfmlVirtualMachine {
         // request's registry. The borrow of `server_state`/`vfs` ends with the
         // call, before the `&mut self` register below.
         let program = {
-            let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-            compile_file_cached(&src, cache, self.vfs.as_ref()).ok()?
+            self.compile_file_cached_req(&src).ok()?
         };
         self.register_program_fns(&program);
         // If the original gid now resolves (same cached program restored), the
@@ -22564,8 +22602,7 @@ impl CfmlVirtualMachine {
         template_path: &str,
         tag_locals: &ValueMap,
     ) -> Result<(), CfmlError> {
-        let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-        let sub_program = compile_file_cached(template_path, cache, self.vfs.as_ref())?;
+        let sub_program = self.compile_file_cached_req(template_path)?;
 
         let old_program = self.push_program_swap(sub_program);
         let old_source = self.source_file.clone();
@@ -23159,6 +23196,66 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// `compile_file_cached` with a request-scoped freshness memo. In dev the
+    /// shared `BytecodeCache::get` does a `vfs.modified()` stat per load to catch
+    /// edits; within one request a file can't change, so after the first
+    /// validated load we skip that stat on repeat loads of the same path (the
+    /// memo is dropped at request end, so dev re-checks next request). Production
+    /// already trusts the cache, so this adds no cost there.
+    fn compile_file_cached_req(&self, path: &str) -> Result<BytecodeProgram, CfmlError> {
+        let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
+        if self.request_validated_files.read().contains(path) {
+            if let Some(c) = cache {
+                if let Some(program) = c.get_no_check(path) {
+                    return Ok(program);
+                }
+            }
+        }
+        let program = compile_file_cached(path, cache, self.vfs.as_ref())?;
+        self.request_validated_files.write().insert(path.to_string());
+        Ok(program)
+    }
+
+    /// `canonicalize()` (realpath) with layered memo caches.
+    ///
+    /// `expandPath`/`getCurrentTemplatePath`/`getBaseTemplatePath` call the
+    /// underlying syscall on every invocation and frameworks lean on
+    /// `expandPath` heavily. Two layers:
+    ///   * `request_canon_cache` — on the per-request VM, so request-scoped and
+    ///     safe in ALL modes (incl. dev): a path's realpath can't change within
+    ///     one request, and the cache is dropped at request end. Behind a
+    ///     `RwLock` because this helper takes `&self` (its call sites borrow
+    ///     `self.source_file`/`base_template_path`).
+    ///   * `ServerState::canonicalize_cache` — cross-request, production only
+    ///     (immutable tree).
+    /// Only `Ok` results are cached — a not-yet-existing path must re-probe.
+    fn canonicalize_cached(&self, path: &str) -> std::io::Result<String> {
+        // Layer 1: request-scoped (all modes).
+        if let Some(hit) = self.request_canon_cache.read().get(path) {
+            return Ok(hit.clone());
+        }
+        // Layer 2: cross-request production cache.
+        let prod = self.server_state.as_ref().filter(|s| s.production_mode);
+        if let Some(ss) = prod {
+            if let Some(hit) = ss.canonicalize_cache.read().get(path).cloned() {
+                self.request_canon_cache
+                    .write()
+                    .insert(path.to_string(), hit.clone());
+                return Ok(hit);
+            }
+        }
+        let canon = self.vfs.canonicalize(path)?;
+        self.request_canon_cache
+            .write()
+            .insert(path.to_string(), canon.clone());
+        if let Some(ss) = prod {
+            ss.canonicalize_cache
+                .write()
+                .insert(path.to_string(), canon.clone());
+        }
+        Ok(canon)
+    }
+
     fn resolve_component_template(
         &mut self,
         class_name: &str,
@@ -23213,38 +23310,44 @@ impl CfmlVirtualMachine {
         }
         // 4. Try loading .cfc file — first relative, then via mappings.
         //
-        // Production-mode resolution cache: the exists()-probing below is a pure
-        // function of (class name, caller dir, base template) for an immutable
-        // tree, so in production we memoise the winning path and skip the stat
-        // storm on repeat (the biggest slice of a Preside cold boot). Compute the
-        // key + look for a hit first, releasing the borrow before the probing
-        // block (which needs `&mut self`).
-        let cache_key: Option<String> = if self
+        // Two-layer resolution cache, same key
+        // "<class_lower>\x1f<source_file>\x1f<base_template>":
+        //   * request_component_cache — on the per-request VM, so request-scoped
+        //     and safe in ALL modes (incl. dev): the on-disk tree can't change
+        //     within a single request, and the cache is dropped when the request
+        //     VM is dropped, so dev still picks up new/edited files next request.
+        //     Kills the candidate-path exists() storm when one request
+        //     instantiates the same component many times (WireBox, viewlets,
+        //     formcontrols) — the dev-mode analogue of the production cache.
+        //   * ServerState::component_path_cache — cross-request, production only
+        //     (immutable tree); RUSTCFML_NO_COMPONENT_CACHE disables this layer.
+        // In-memory definitions (steps 1-3) are checked BEFORE both layers, so a
+        // component defined later can never be shadowed.
+        let cache_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            lower,
+            self.source_file.as_deref().unwrap_or(""),
+            self.base_template_path.as_deref().unwrap_or(""),
+        );
+        // The cross-request production layer additionally requires production
+        // mode (immutable tree) and honours the RUSTCFML_NO_COMPONENT_CACHE
+        // escape hatch. `production_mode` short-circuits the env read in dev.
+        let prod_cache_ok = self
             .server_state
             .as_ref()
             .map_or(false, |s| s.production_mode)
-            // Ops/diagnostic escape hatch: RUSTCFML_NO_COMPONENT_CACHE=1 forces
-            // full path re-probing every time even in production.
             && std::env::var("RUSTCFML_NO_COMPONENT_CACHE")
                 .map(|v| v.is_empty() || v == "0")
-                .unwrap_or(true)
-        {
-            Some(format!(
-                "{}\u{1f}{}\u{1f}{}",
-                class_name.to_ascii_lowercase(),
-                self.source_file.as_deref().unwrap_or(""),
-                self.base_template_path.as_deref().unwrap_or(""),
-            ))
-        } else {
-            None
-        };
-        let cached_path: Option<String> = cache_key.as_ref().and_then(|k| {
-            self.server_state
+                .unwrap_or(true);
+        let mut cached: Option<String> = self.request_component_cache.get(&cache_key).cloned();
+        if cached.is_none() && prod_cache_ok {
+            cached = self
+                .server_state
                 .as_ref()
-                .and_then(|s| s.component_path_cache.read().get(k).cloned())
-        });
+                .and_then(|s| s.component_path_cache.read().get(&cache_key).cloned());
+        }
 
-        let cfc_path = if let Some(hit) = cached_path {
+        let cfc_path = if let Some(hit) = cached {
             hit
         } else {
             let resolved = {
@@ -23378,24 +23481,30 @@ impl CfmlVirtualMachine {
                 }
             }
             };
-            // Cache the resolved path in production so repeat resolutions skip
-            // the probing above. Cached unconditionally (no verify-stat): an
-            // immutable production tree means a not-found stays not-found, and
-            // in-memory definitions (steps 1-3) are always checked before this
-            // cache, so a negative entry can never shadow a component defined
-            // later. Skipping the verify keeps the miss path a stat cheaper.
-            if let Some(key) = &cache_key {
+            // Cross-request production cache: repeat resolutions skip the probing
+            // above. Cached unconditionally (no verify-stat) — an immutable
+            // production tree means a not-found stays not-found, and in-memory
+            // definitions (steps 1-3) are always checked before this cache.
+            if prod_cache_ok {
                 if let Some(ss) = self.server_state.as_ref() {
                     ss.component_path_cache
                         .write()
-                        .insert(key.clone(), resolved.clone());
+                        .insert(cache_key.clone(), resolved.clone());
                 }
+            }
+            // Request-scoped cache (all modes). Only cache paths that EXIST, so a
+            // component generated on disk later in the same request isn't shadowed
+            // by an earlier not-found fallback (unlike the production layer, dev
+            // can create files mid-run — but never at a path already resolved as
+            // existing within the same request).
+            if self.vfs.exists(&resolved) {
+                self.request_component_cache
+                    .insert(cache_key.clone(), resolved.clone());
             }
             resolved
         };
 
-        let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-        let compiled = compile_file_cached(&cfc_path, cache, self.vfs.as_ref());
+        let compiled = self.compile_file_cached_req(&cfc_path);
         // A parse/tag error inside an EXISTING component file must not be silently
         // swallowed into the caller's "Could not find the component" message
         // (which sends you hunting for a missing file/mapping). Stash the real
@@ -26421,8 +26530,7 @@ impl CfmlVirtualMachine {
     /// and `Err(e)` when the Application.cfc pseudo-constructor itself threw —
     /// a load failure must abort the request, not silently run the page.
     fn load_application_cfc(&mut self, path: &str) -> Result<Option<CfmlValue>, CfmlError> {
-        let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-        let sub_program = match compile_file_cached(path, cache, self.vfs.as_ref()) {
+        let sub_program = match self.compile_file_cached_req(path) {
             Ok(p) => p,
             Err(e) => return Err(e),
         };
