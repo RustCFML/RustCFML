@@ -9231,7 +9231,17 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         .with_constraints(constraints);
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
-        .pool_opts(pool_opts);
+        .pool_opts(pool_opts)
+        // Report rows MATCHED (not rows CHANGED) as the affected-row count, matching
+        // Lucee/ACF — MySQL Connector/J negotiates CLIENT_FOUND_ROWS by default
+        // (`useAffectedRows=false`), so an UPDATE whose new values equal the current
+        // row still reports 1 affected row. Without this flag the MySQL server
+        // reports 0 for such a no-op UPDATE, which diverges from the reference
+        // engines and breaks Preside's DB session storage: `_updateSessionRecord`
+        // returns `recordCount > 0`, so a same-second/unchanged session write
+        // reported 0 and Preside minted a brand-new session every time (spurious
+        // INSERT + `psid` cookie churn). CLIENT_FOUND_ROWS restores parity.
+        .additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_FOUND_ROWS);
     let pool = mysql::Pool::new(builder)
         .map_err(|e| CfmlError::database(format!("queryExecute: MySQL pool creation error: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));

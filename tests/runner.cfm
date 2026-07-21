@@ -265,6 +265,7 @@ include "harness.cfm";
 <cf_runtest file="database/test_datasource_list_maxrows.cfm">
 <cf_runtest file="database/test_sqlite_datasource_paths.cfm">
 <cf_runtest file="database/test_duplicate_result_columns.cfm">
+<cf_runtest file="database/test_update_affected_rows_matched.cfm">
 <cf_runtest file="stdlib/test_date_functions_extra.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">

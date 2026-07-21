@@ -946,7 +946,11 @@ pub struct ServerState {
     /// stable, so we memoise. Only populated when `production_mode` and only for
     /// `Ok` results (a not-yet-created path must re-probe). Never populated in
     /// dev mode (files/symlinks may appear/change between requests).
-    pub canonicalize_cache: Arc<parking_lot::RwLock<HashMap<String, String>>>,
+    /// `None` = a cached NEGATIVE (path failed to canonicalize / does not exist).
+    /// Safe cross-request in production (immutable tree): a not-found stays
+    /// not-found, so we avoid re-`stat`ing non-existent candidate paths that
+    /// Preside probes on every render (helper/view/mapping resolution).
+    pub canonicalize_cache: Arc<parking_lot::RwLock<HashMap<String, Option<String>>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -1689,7 +1693,7 @@ pub struct CfmlVirtualMachine {
     /// Request-scoped cache of a path → its `canonicalize()` (realpath) result.
     /// Request-lifetime sibling of `ServerState::canonicalize_cache`; safe in all
     /// modes for the same reason. `RwLock` because `canonicalize_cached` is `&self`.
-    pub request_canon_cache: parking_lot::RwLock<HashMap<String, String>>,
+    pub request_canon_cache: parking_lot::RwLock<HashMap<String, Option<String>>>,
     /// Request-scoped set of file paths whose bytecode-cache freshness (mtime)
     /// has already been validated this request. In dev the shared `BytecodeCache`
     /// re-`stat`s a file on every load to detect edits; within one request a file
@@ -23440,9 +23444,10 @@ impl CfmlVirtualMachine {
     ///     (immutable tree).
     /// Only `Ok` results are cached — a not-yet-existing path must re-probe.
     fn canonicalize_cached(&self, path: &str) -> std::io::Result<String> {
-        // Layer 1: request-scoped (all modes).
+        let not_found = || std::io::Error::new(std::io::ErrorKind::NotFound, "cached negative");
+        // Layer 1: request-scoped (all modes). A cached `None` = known negative.
         if let Some(hit) = self.request_canon_cache.read().get(path) {
-            return Ok(hit.clone());
+            return hit.clone().ok_or_else(not_found);
         }
         // Layer 2: cross-request production cache.
         let prod = self.server_state.as_ref().filter(|s| s.production_mode);
@@ -23451,19 +23456,39 @@ impl CfmlVirtualMachine {
                 self.request_canon_cache
                     .write()
                     .insert(path.to_string(), hit.clone());
-                return Ok(hit);
+                return hit.ok_or_else(not_found);
             }
         }
-        let canon = self.vfs.canonicalize(path)?;
-        self.request_canon_cache
-            .write()
-            .insert(path.to_string(), canon.clone());
-        if let Some(ss) = prod {
-            ss.canonicalize_cache
-                .write()
-                .insert(path.to_string(), canon.clone());
+        // Cache BOTH outcomes. A NotFound canonicalize (Preside probes many
+        // non-existent candidate paths per render) is cached as a negative so it
+        // isn't re-`stat`ed every request — safe by the same immutable-tree
+        // argument as `component_path_cache`: request-scoped within a request
+        // (the tree can't change mid-request, even in dev), and cross-request in
+        // production (the tree is immutable). Other error kinds (permissions,
+        // transient I/O) are NOT cached, so they retry.
+        match self.vfs.canonicalize(path) {
+            Ok(canon) => {
+                self.request_canon_cache
+                    .write()
+                    .insert(path.to_string(), Some(canon.clone()));
+                if let Some(ss) = prod {
+                    ss.canonicalize_cache
+                        .write()
+                        .insert(path.to_string(), Some(canon.clone()));
+                }
+                Ok(canon)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.request_canon_cache
+                    .write()
+                    .insert(path.to_string(), None);
+                if let Some(ss) = prod {
+                    ss.canonicalize_cache.write().insert(path.to_string(), None);
+                }
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
-        Ok(canon)
     }
 
     fn resolve_component_template(
@@ -28155,7 +28180,11 @@ impl CfmlVirtualMachine {
             self.app_local_mode_modern = modern;
         }
 
-        // 3b. Expand mapping paths relative to Application.cfc directory
+        // 3b. Expand mapping paths relative to Application.cfc directory.
+        // Route through `canonicalize_cached` (not `vfs.canonicalize`) so these
+        // per-request expansions of the immutable Application.cfc/cfconfig mapping
+        // set become cross-request cache hits in production instead of re-`stat`ing
+        // every mapping target dir on every request.
         let app_cfc_dir = std::path::Path::new(&app_cfc_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -28167,7 +28196,7 @@ impl CfmlVirtualMachine {
                     .join(&mapping.path)
                     .to_string_lossy()
                     .to_string();
-                self.vfs.canonicalize(&joined).unwrap_or(joined)
+                self.canonicalize_cached(&joined).unwrap_or(joined)
             };
             mapping.path = expanded;
         }
@@ -28194,19 +28223,19 @@ impl CfmlVirtualMachine {
         }
         self.mappings = mappings;
 
-        // 3c. Expand customTagPaths relative to Application.cfc directory
-        let vfs = &self.vfs;
-        self.custom_tag_paths = custom_tag_paths
-            .into_iter()
-            .map(|p| {
-                if std::path::Path::new(&p).is_absolute() {
-                    p
-                } else {
-                    let joined = app_cfc_dir.join(&p).to_string_lossy().to_string();
-                    vfs.canonicalize(&joined).unwrap_or(joined)
-                }
-            })
-            .collect();
+        // 3c. Expand customTagPaths relative to Application.cfc directory. Same
+        // cache routing as 3b: `canonicalize_cached` makes these per-request
+        // expansions cross-request cache hits in production.
+        let mut expanded_ctp = Vec::with_capacity(custom_tag_paths.len());
+        for p in custom_tag_paths {
+            if std::path::Path::new(&p).is_absolute() {
+                expanded_ctp.push(p);
+            } else {
+                let joined = app_cfc_dir.join(&p).to_string_lossy().to_string();
+                expanded_ctp.push(self.canonicalize_cached(&joined).unwrap_or(joined));
+            }
+        }
+        self.custom_tag_paths = expanded_ctp;
 
         // 4. Wire up application scope
         if let Some(ref server_state) = self.server_state.clone() {
