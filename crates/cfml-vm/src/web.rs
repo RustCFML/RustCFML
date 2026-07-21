@@ -259,11 +259,38 @@ pub fn parse_query_string(qs: &str) -> ValueMap {
             let key = url_decode(key);
             let value = url_decode(value);
             if !key.is_empty() {
-                map.insert(key.to_lowercase(), CfmlValue::string(value));
+                insert_query_value(&mut map, key.to_lowercase(), value);
             }
         }
     }
     map
+}
+
+fn insert_query_value(map: &mut ValueMap, key: String, value: String) {
+    if value.is_empty() {
+        // An empty value never contributes to a merge, but the key must still
+        // exist (a lone `dup=` yields an empty string).
+        map.entry(key)
+            .or_insert_with(|| CfmlValue::string(String::new()));
+        return;
+    }
+    if let Some(existing) = map.get_mut(&key) {
+        if let CfmlValue::String(existing_value) = existing {
+            if existing_value.is_empty() {
+                *existing = CfmlValue::string(value);
+            } else {
+                let mut merged =
+                    String::with_capacity(existing_value.len() + 1 + value.len());
+                merged.push_str(existing_value);
+                merged.push(',');
+                merged.push_str(&value);
+                *existing = CfmlValue::string(merged);
+            }
+            return;
+        }
+    }
+
+    map.insert(key, CfmlValue::string(value));
 }
 
 /// HTTP "singleton" response headers: ones that must carry exactly one value
@@ -532,6 +559,25 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn duplicate_query_keys_join_with_commas() {
+        // CFML semantics (verified live on Lucee 5.3.10 AND 7.0.4): duplicate
+        // FORM/URL keys merge into a comma-separated list in document order,
+        // with EMPTY values dropped from the merge. Last-one-wins loses data.
+        let m = parse_query_string("dup=first&dup=&dup=third");
+        assert_eq!(m["dup"].as_string(), "first,third");
+        // all-empty: key exists, value is ""
+        let m = parse_query_string("dup=&dup=");
+        assert_eq!(m["dup"].as_string(), "");
+        // trailing/leading empty never leaves a placeholder
+        assert_eq!(parse_query_string("dup=x&dup=")["dup"].as_string(), "x");
+        assert_eq!(parse_query_string("dup=&dup=x")["dup"].as_string(), "x");
+        // duplicates are NOT deduped
+        assert_eq!(parse_query_string("dup=a&dup=a")["dup"].as_string(), "a,a");
+        // single key unaffected
+        assert_eq!(parse_query_string("solo=1")["solo"].as_string(), "1");
     }
 
     #[test]
