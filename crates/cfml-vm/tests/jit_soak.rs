@@ -23,6 +23,25 @@ fn compile(src: &str) -> BytecodeProgram {
     CfmlCompiler::new().compile(ast)
 }
 
+/// Run `f` on a thread with a 64 MB stack, matching the production CLI/serve
+/// worker threads. The VM recurses on the Rust stack for nested CFML calls, so
+/// even the modest mutual-recursion these soak programs exercise can overflow
+/// the default ~2 MB `cargo test` thread stack — a harness artifact never hit by
+/// the real binary (whose worker threads are 64 MB). Mirrors the wrapper the
+/// other JIT test suites (`jit_numeric`/`jit_fuzz`/`jit_recursion`) already use.
+/// A panic inside `f` (a failed assert) is re-raised so the test still fails.
+fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+    {
+        Ok(v) => v,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn fresh_vm(program: BytecodeProgram) -> CfmlVirtualMachine {
     let mut vm = CfmlVirtualMachine::new(program);
     // API, not env vars: parallel test threads share the process environment.
@@ -50,6 +69,12 @@ fn soak_iterations() -> usize {
 /// the per-iteration compile count is stable (it is bounded by the program's
 /// distinct JIT-eligible functions, not by the iteration index).
 fn soak(label: &str, src: &str) {
+    let label = label.to_string();
+    let src = src.to_string();
+    on_big_stack(move || soak_inner(&label, &src));
+}
+
+fn soak_inner(label: &str, src: &str) {
     let program = compile(src);
     let iters = soak_iterations();
     let mut first_out: Option<String> = None;

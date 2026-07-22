@@ -2066,6 +2066,9 @@ impl CfmlValue {
                         this_members: this_members.clone(),
                         variables_members: variables_members.clone(),
                         instance_id: g.instance_id,
+                        accessor_private: parking_lot::RwLock::new(
+                            g.accessor_private.read().clone(),
+                        ),
                     },
                 ));
                 seen.insert(ptr, CfmlValue::Instance(new_inst.clone()));

@@ -93,6 +93,17 @@ pub struct ClassBlueprint {
     /// parent super struct) for multi-level `super` resolution — `super` resolves
     /// relative to the DEFINING class of the executing method (Phase C.3 Slice 5).
     pub super_map: Option<CfmlValue>,
+    /// The marker `__source_names` map (source_file -> logical dotted name recorded
+    /// at inheritance-merge time). Needed so an unqualified `new X()` executed
+    /// inside an instance method resolves relative to the DEFINING class's
+    /// mapping-qualified package (GH #229/#237 + the mapping-prefix specs). Absent
+    /// for a class with no inheritance.
+    pub source_names: Option<CfmlValue>,
+    /// The marker `__properties` array (declared `property name=…` list, including
+    /// inherited). Used by `serializeJSON` to include accessor-property values that
+    /// live only in the private `variables` scope — default-only and inherited
+    /// properties (GH #267). Absent for a component with no declared properties.
+    pub properties: Option<CfmlValue>,
 }
 
 /// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
@@ -108,6 +119,13 @@ pub struct Instance {
     pub variables_members: CfmlStruct,
     /// Logical identity for `duplicate()` disambiguation / fluent-chain guards.
     pub instance_id: u64,
+    /// Accessor-`property` names whose VALUES live in `this_members` but must stay
+    /// HIDDEN from user introspection (`structKeyExists`/`structKeyList`/`for … in`)
+    /// — Lucee keeps accessor values in the private `variables` scope; getX() and
+    /// `serializeJSON` still read them. Lowercased. Interior-mutable because a
+    /// runtime `setX()` marks the property after construction (see the
+    /// `MarkAccessorPrivate` opcode). Mirrors the marker `__cfml_accessor_private__`.
+    pub accessor_private: parking_lot::RwLock<std::collections::HashSet<String>>,
 }
 
 // `CfmlStruct` has no `Debug` impl (the outer `CfmlValue` Debug is hand-rolled),
@@ -245,6 +263,8 @@ impl ClassBlueprint {
         // from the data maps) — reused by the marker `__is_super` dispatch path.
         let super_handle = marker.get_ci("__super");
         let super_map = marker.get_ci("__super_map");
+        let source_names = marker.get_ci("__source_names");
+        let properties = marker.get_ci("__properties");
 
         ClassBlueprint {
             name,
@@ -258,6 +278,8 @@ impl ClassBlueprint {
             static_scope,
             super_handle,
             super_map,
+            source_names,
+            properties,
         }
     }
 }
@@ -298,11 +320,30 @@ impl Instance {
         if let Some(ref stat) = class.static_scope {
             variables_members.insert("__static".to_string(), stat.clone());
         }
+        // Live `variables.this` alias (Lucee/ACF parity): the private scope carries
+        // a WEAK back-edge to the public `this` scope, so `variables.this.x = v` and
+        // `StructAppend(variables.this, fns)` reach the public members and
+        // `StructKeyExists(variables, "this")` is true (Wheels Plugins mixin
+        // injection). Weak ⇒ no Arc cycle ⇒ no per-request leak — the same mechanism
+        // the marker path used, reused here rather than a strong self-reference.
+        variables_members.set_this_alias_if_changed(&this_members);
+        // Capture the construction-time accessor-private property set (the marker's
+        // `__cfml_accessor_private__`, a case-insensitive name set) so introspection
+        // hides those public-map values exactly as the marker path did.
+        let mut accessor_private = std::collections::HashSet::new();
+        if let Some(CfmlValue::Struct(m)) = marker.get_ci(crate::dynamic::ACCESSOR_PRIVATE_MARKER) {
+            m.with_read(|mm| {
+                for (k, _) in mm.iter() {
+                    accessor_private.insert(k.to_ascii_lowercase());
+                }
+            });
+        }
         Instance {
             class,
             this_members,
             variables_members,
             instance_id,
+            accessor_private: parking_lot::RwLock::new(accessor_private),
         }
     }
 
@@ -583,7 +624,19 @@ impl<'a> CompRef<'a> {
         #[cfg(feature = "component-instance")]
         if let CompRef::Instance(inst) = self {
             let g = inst.read();
-            let mut keys: Vec<String> = g.this_members.snapshot().into_keys().collect();
+            let ap = g.accessor_private.read();
+            let mut keys: Vec<String> = g
+                .this_members
+                .snapshot()
+                .into_keys()
+                .filter(|k| !ap.contains(&k.to_ascii_lowercase()))
+                .collect();
+            // Methods enumerate only while the shared table is still attached —
+            // `structClear(instance)` drops it (MockBox `clearMethods`), after which
+            // the object is method-less until re-mixed.
+            if g.this_members.method_table().is_none() {
+                return keys;
+            }
             for name in g.class.methods.keys() {
                 let is_public = matches!(
                     g.class.method_access.get(&name.to_ascii_lowercase()),
@@ -609,8 +662,15 @@ impl<'a> CompRef<'a> {
         #[cfg(feature = "component-instance")]
         if let CompRef::Instance(inst) = self {
             let g = inst.read();
+            let ap = g.accessor_private.read();
             for (k, v) in g.this_members.snapshot() {
+                if ap.contains(&k.to_ascii_lowercase()) {
+                    continue; // accessor-private: hidden from for-in / member iteration
+                }
                 out.insert(k, v);
+            }
+            if g.this_members.method_table().is_none() {
+                return out;
             }
             for (name, f) in g.class.methods.iter() {
                 let is_public = matches!(
@@ -634,6 +694,46 @@ impl<'a> CompRef<'a> {
             return inst.read().this_members.snapshot();
         }
         crate::dynamic::ValueMap::default()
+    }
+
+    /// Full `serializeJSON` DATA for a flyweight instance: public data members
+    /// PLUS each declared `property` value that lives only in the private
+    /// `variables` scope (default-only / inherited accessor properties — GH #267).
+    /// Lucee serializes those too; reading `this_members` alone would drop them.
+    /// Methods/closures are never included. Returns empty for a marker view.
+    pub fn instance_serialize_data(&self) -> crate::dynamic::ValueMap {
+        #[allow(unused_mut)]
+        let mut out = self.instance_public_data();
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            if let Some(CfmlValue::Array(props)) = &g.class.properties {
+                let vars = g.variables_members.snapshot();
+                for prop in props.iter() {
+                    let pname = match prop
+                        .as_cfml_struct()
+                        .and_then(|ps| ps.get_ci("name"))
+                        .map(|n| n.as_string())
+                    {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if out.keys().any(|k| k.eq_ignore_ascii_case(&pname)) {
+                        continue; // already emitted from the public scope
+                    }
+                    if let Some(v) = vars
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&pname))
+                        .map(|(_, v)| v.clone())
+                    {
+                        if !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_)) {
+                            out.insert(pname, v);
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Write a public DATA member (or inject a method as data) in place — the
@@ -668,7 +768,8 @@ impl<'a> CompRef<'a> {
         if let CompRef::Instance(inst) = self {
             let g = inst.read();
             return g.this_members.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
-                || g.class.methods.keys().any(|k| k.eq_ignore_ascii_case(name));
+                || (g.this_members.method_table().is_some()
+                    && g.class.methods.keys().any(|k| k.eq_ignore_ascii_case(name)));
         }
         #[cfg(not(feature = "component-instance"))]
         let _ = name;

@@ -3475,6 +3475,11 @@ fn fn_is_struct(args: Vec<CfmlValue>) -> CfmlResult {
                 true
             }
         }
+        // A flyweight component instance is struct-like, exactly as the marker
+        // representation was (RustCFML treats components as structs —
+        // structKeyList/structEach/etc. all work). Detected via the facade rather
+        // than a `#[cfg]` arm (cfml-stdlib has no `component-instance` feature).
+        Some(other) if other.is_component() => true,
         _ => false,
     };
     Ok(CfmlValue::Bool(is))
@@ -3651,12 +3656,16 @@ fn fn_is_query(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_is_object(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Bool(match args.first() {
-        Some(CfmlValue::Component(_)) => true,
+        Some(CfmlValue::Component(_)) | Some(CfmlValue::NativeObject(_)) => true,
         Some(CfmlValue::Struct(s)) => {
             s.contains_key("__name") || s.contains_key("__java_shim")
         }
-        Some(CfmlValue::NativeObject(_)) => true,
-        _ => false,
+        // Flyweight component instance (Phase C.3). Detected via the facade rather
+        // than a `#[cfg]` arm: cfml-stdlib has no `component-instance` feature of
+        // its own (feature unification supplies the variant), so a cfg gate would
+        // compile this arm out. `is_component()` is `false` for every scalar.
+        Some(other) => other.is_component(),
+        None => false,
     }))
 }
 
@@ -5692,7 +5701,7 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
     // untouched.
     if let Some(comp) = val.as_component() {
         if comp.is_instance_backed() {
-            let data = comp.instance_public_data();
+            let data = comp.instance_serialize_data();
             let items: Vec<String> = data
                 .iter()
                 .filter(|(_, v)| !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_)))

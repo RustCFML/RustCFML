@@ -8672,6 +8672,16 @@ impl CfmlVirtualMachine {
                     if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
                         Self::mark_accessor_private(this_s, name);
                     }
+                    // Flyweight instance: record on the instance's accessor-private set
+                    // (the marker's `__cfml_accessor_private__` analogue) so a runtime
+                    // `setX()` after construction hides the property from introspection.
+                    #[cfg(feature = "component-instance")]
+                    if let Some(CfmlValue::Instance(inst)) = locals.get("this") {
+                        inst.read()
+                            .accessor_private
+                            .write()
+                            .insert(name.to_ascii_lowercase());
+                    }
                 }
                 BytecodeOp::SetProperty(name) => {
                     if let Some(value) = stack.pop() {
@@ -9309,15 +9319,45 @@ impl CfmlVirtualMachine {
                         self.method_this_writeback = None;
                         self.method_variables_writeback = None;
                         let saved_try = std::mem::take(&mut self.try_stack);
-                        let res = self.call_instance_method(
-                            &inst,
-                            method_name,
-                            &mut extra_args,
-                            method_arg_names,
-                        );
+                        // Reject mixing positional + named args (Lucee parity) — the
+                        // marker CallMethod path validates here too; the Instance arm
+                        // must not skip it.
+                        let res = match method_arg_names
+                            .map_or(Ok(()), Self::validate_named_args)
+                        {
+                            Err(e) => Err(e),
+                            Ok(()) => self.call_instance_method(
+                                &inst,
+                                method_name,
+                                &mut extra_args,
+                                method_arg_names,
+                            ),
+                        };
                         self.try_stack = saved_try;
                         match res {
                             Ok(val) => {
+                                // A closure invoked behind this instance method (e.g.
+                                // the method called `arguments.someClosure()`) writes
+                                // into the shared closure env, not this frame's
+                                // `closure_parent_writeback` (which the callee frame
+                                // already consumed). Drain any parent-writeback and
+                                // reconcile the env into locals so an unscoped
+                                // enclosing var sees the mutation across the CFC-method
+                                // boundary — the marker CallMethod tail does the same.
+                                if let Some(wb) = self.closure_parent_writeback.take() {
+                                    for (k, v) in wb {
+                                        self.scope_aware_store(
+                                            &k,
+                                            v,
+                                            &mut locals,
+                                            effective_local_mode_modern,
+                                        );
+                                    }
+                                }
+                                Self::reconcile_closure_env_into_locals(
+                                    &closure_env,
+                                    &mut locals,
+                                );
                                 stack.push(val);
                                 continue;
                             }
@@ -9638,15 +9678,33 @@ impl CfmlVirtualMachine {
                                 // (A CFC's own in-place state mutation rides the separate
                                 // `this`-writeback below, not this value-writeback.)
                                 let cur_val = self.scope_aware_load(var_name, &locals);
-                                let cur_is_cfc = matches!(
+                                #[allow(unused_mut)]
+                                let mut cur_is_cfc = matches!(
                                     &cur_val,
                                     Some(CfmlValue::Struct(ref cur)) if cur.contains_key("__variables")
                                 );
-                                let result_same_instance = matches!(
+                                #[allow(unused_mut)]
+                                let mut result_same_instance = matches!(
                                     (&cur_val, &result),
                                     (Some(CfmlValue::Struct(ref cur)), CfmlValue::Struct(ref res))
                                         if cur.ptr_eq(res)
                                 );
+                                // A flyweight component instance is also a CFC base
+                                // (`o.getItems().sort()` must not clobber `o` with the
+                                // sorted array); identity is Arc-equality.
+                                #[cfg(feature = "component-instance")]
+                                {
+                                    if matches!(&cur_val, Some(CfmlValue::Instance(_))) {
+                                        cur_is_cfc = true;
+                                    }
+                                    if matches!(
+                                        (&cur_val, &result),
+                                        (Some(CfmlValue::Instance(a)), CfmlValue::Instance(b))
+                                            if std::sync::Arc::ptr_eq(a, b)
+                                    ) {
+                                        result_same_instance = true;
+                                    }
+                                }
                                 let clobbers_cfc = cur_is_cfc && !result_same_instance;
                                 // structDelete on a struct receiver returns a
                                 // BOOLEAN and mutates the struct in place — writing
@@ -13949,34 +14007,8 @@ impl CfmlVirtualMachine {
                     // the shared blueprint (built once per class).
                     #[cfg(feature = "component-instance")]
                     if let Some(CfmlValue::Instance(inst)) = args.first() {
-                        if let Some(cached) = inst.read().class.metadata_cache.read().clone() {
-                            return Ok(cached);
-                        }
-                        let (name, src) = {
-                            let g = inst.read();
-                            let s = g.class.source_file.clone();
-                            (
-                                g.class.name.clone(),
-                                if s.is_empty() { None } else { Some(s) },
-                            )
-                        };
-                        let meta = if name.is_empty() {
-                            CfmlValue::strukt(ValueMap::default())
-                        } else {
-                            let mut visited = std::collections::HashSet::new();
-                            self.build_inheritance_metadata(
-                                &name,
-                                src,
-                                parent_locals,
-                                &mut visited,
-                            )
-                            .map(CfmlValue::strukt)
-                            .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()))
-                        };
-                        if let Some(CfmlValue::Instance(inst)) = args.first() {
-                            *inst.read().class.metadata_cache.write() = Some(meta.clone());
-                        }
-                        return Ok(meta);
+                        let inst = inst.clone();
+                        return Ok(self.instance_metadata(&inst, parent_locals));
                     }
                     // During a component's pseudo-constructor, the in-construction
                     // `this` still carries the parser placeholder __name =
@@ -14149,32 +14181,8 @@ impl CfmlVirtualMachine {
                     // marker path), cached on the blueprint.
                     #[cfg(feature = "component-instance")]
                     if let Some(CfmlValue::Instance(inst)) = args.first() {
-                        if let Some(cached) = inst.read().class.metadata_cache.read().clone() {
-                            return Ok(cached);
-                        }
-                        let (name, src) = {
-                            let g = inst.read();
-                            let s = g.class.source_file.clone();
-                            (
-                                g.class.name.clone(),
-                                if s.is_empty() { None } else { Some(s) },
-                            )
-                        };
-                        if !name.is_empty() {
-                            let mut visited = std::collections::HashSet::new();
-                            if let Some(meta) = self.build_inheritance_metadata(
-                                &name,
-                                src,
-                                parent_locals,
-                                &mut visited,
-                            ) {
-                                let meta = CfmlValue::strukt(meta);
-                                *inst.read().class.metadata_cache.write() =
-                                    Some(meta.clone());
-                                return Ok(meta);
-                            }
-                        }
-                        return Ok(CfmlValue::strukt(ValueMap::default()));
+                        let inst = inst.clone();
+                        return Ok(self.instance_metadata(&inst, parent_locals));
                     }
                     // Helper: extract metadata from a component struct
                     fn extract_component_meta(
@@ -14482,6 +14490,16 @@ impl CfmlVirtualMachine {
                             {
                                 let instance = self.resolve_inheritance(template, parent_locals);
                                 let instance = self.attach_native_parent(instance)?;
+                                // NB (Phase C.3): `createObject("component", …)` still
+                                // yields the MARKER backing (unlike `new X()`). Converting
+                                // it — so framework bean factories (FW/1 DI/1, WireBox,
+                                // Preside) get the flyweight + `__`-hiding fix + RSS win —
+                                // is the next systematic step, but it exposed Instance-path
+                                // gaps under TestBox's mixin virtualization (FW/1 116p→81p,
+                                // e.g. `getVariablesScope` via injected `__$$fetchVariables`)
+                                // that regress compatibility. Must be hardened against
+                                // Lucee/BoxLang mixin semantics BEFORE flipping. See
+                                // C2planDoc.md §8 (Slice 6 follow-on).
                                 return self.attach_implements_chain(instance, parent_locals);
                             }
                             // Unresolved component path: throw rather than return
@@ -18704,6 +18722,53 @@ impl CfmlVirtualMachine {
     /// auto-vivifying intermediate structs. Shared by `SetDynamicVar`
     /// (dynamic quoted-LHS assignment) and the pending-result writeback
     /// (queryExecute `result` / cfquery `name`/`result` delivery).
+    /// Set a nested member path starting from a reference-typed `root` (Struct or
+    /// flyweight Instance), navigating and mutating IN PLACE. Both backings are
+    /// Arc-shared, so no store-back of `root` is needed. Missing intermediates
+    /// auto-vivify as plain structs (matching dotted-assignment semantics).
+    /// `keys` is the path relative to `root` (at least one segment).
+    #[cfg(feature = "component-instance")]
+    fn store_member_path_in_place(root: &CfmlValue, keys: &[&str], value: CfmlValue) {
+        let (leaf, mids) = match keys.split_last() {
+            Some(x) => x,
+            None => return,
+        };
+        let mut cur = root.clone();
+        for k in mids {
+            let next = match &cur {
+                CfmlValue::Struct(s) => match s.get_ci(k) {
+                    Some(v @ CfmlValue::Struct(_)) => v,
+                    Some(v @ CfmlValue::Instance(_)) => v,
+                    _ => {
+                        let ns = CfmlValue::strukt(ValueMap::default());
+                        s.insert((*k).to_string(), ns.clone());
+                        ns
+                    }
+                },
+                CfmlValue::Instance(inst) => match inst.read().get_member(k) {
+                    Some(v @ CfmlValue::Struct(_)) => v,
+                    Some(v @ CfmlValue::Instance(_)) => v,
+                    _ => {
+                        let ns = CfmlValue::strukt(ValueMap::default());
+                        inst.read().this_members.insert((*k).to_string(), ns.clone());
+                        ns
+                    }
+                },
+                _ => return, // non-navigable intermediate
+            };
+            cur = next;
+        }
+        match &cur {
+            CfmlValue::Struct(s) => {
+                s.insert((*leaf).to_string(), value);
+            }
+            CfmlValue::Instance(inst) => {
+                inst.read().this_members.insert((*leaf).to_string(), value);
+            }
+            _ => {}
+        }
+    }
+
     fn store_runtime_path(
         &mut self,
         path: &str,
@@ -18746,6 +18811,17 @@ impl CfmlVirtualMachine {
                     }
                     cur.insert(parts[parts.len() - 1].to_string(), value);
                 }
+                return;
+            }
+            // A flyweight component-instance root (`a.b.c = v` where `a` is an
+            // Instance): descend through its data members IN PLACE rather than
+            // rebuilding the path as a plain struct (which discarded the instance —
+            // its methods, __variables and identity — leaving `a = {b:{c:v}}`). Both
+            // Struct and Instance intermediates are reference-typed (shared Arc), so
+            // an in-place walk persists without any store-back of `a`.
+            #[cfg(feature = "component-instance")]
+            if matches!(root, CfmlValue::Instance(_)) {
+                Self::store_member_path_in_place(&root, &parts[1..], value);
                 return;
             }
             let root = if matches!(root, CfmlValue::Struct(_)) {
@@ -20320,6 +20396,17 @@ impl CfmlVirtualMachine {
         arg_names: Option<&[String]>,
         caller_locals: &ValueMap,
     ) -> CfmlResult {
+        // Phase C.3 — flyweight instance: route to the dedicated dispatcher. This
+        // reaches the non-bytecode call sites too (createDynamicProxy SAM invoke,
+        // higher-order member callbacks) that don't go through the CallMethod op's
+        // Instance arm — otherwise an Instance receiver falls through the scalar/
+        // struct `match object` below to Null (java.util.concurrent Callable proxy
+        // returned empty instead of its value).
+        #[cfg(feature = "component-instance")]
+        if let CfmlValue::Instance(inst) = object {
+            let inst = inst.clone();
+            return self.call_instance_method(&inst, method, extra_args, arg_names);
+        }
         #[cfg(feature = "observability")]
         {
             if self.interest.contains(observe::Interest::TEMPLATE) {
@@ -23848,13 +23935,22 @@ impl CfmlVirtualMachine {
             Some(CfmlValue::Int(id)) => id as u64,
             _ => Self::next_component_id(),
         };
-        // The blueprint is class-invariant, so cache & Arc-share it per source
-        // file (the class file is 1:1 with its resolved method+metadata set).
-        // Anonymous / inline components with no source file get a fresh blueprint.
-        // Build a blueprint from the finished marker, then top up the shared
-        // per-class `static` scope from `static_stores` (the authoritative per-type
-        // store, keyed by source file) — the finished instance's `__variables`
-        // doesn't retain `__static`, so `from_marker` alone can miss it.
+        // The blueprint holds both the class-invariant bulk (methods) AND the
+        // per-load-context-dependent name/metadata/type_ids. The SAME .cfc file
+        // loaded under different mapping/package prefixes (unqualified `new X()`
+        // relative to the defining package, a mapping-qualified path, etc.) yields
+        // a DIFFERENT `__name` — and metadata.name / isInstanceOf FQN must reflect
+        // it. So the cache key is (source_file, __name), not source_file alone: a
+        // stale-named blueprint would otherwise leak the first load's short name
+        // into every subsequent differently-qualified load (GH #229/#237 + the
+        // mapping-prefix specs). Same name ⟹ identical FQN-resolution context ⟹
+        // safe to Arc-share. Anonymous/inline components (no source file) always
+        // get a fresh blueprint.
+        let bp_name = s.get_ci("__name").map(|v| v.as_string()).unwrap_or_default();
+        // Top up the shared per-class `static` scope from `static_stores` (the
+        // authoritative per-type store, keyed by source file) — the finished
+        // instance's `__variables` doesn't retain `__static`, so `from_marker`
+        // alone can miss it.
         let build_bp = |vm: &Self, s: &cfml_common::dynamic::CfmlStruct, src: &str| {
             let mut bp = cfml_common::component::ClassBlueprint::from_marker(s);
             if bp.static_scope.is_none() && !src.is_empty() {
@@ -23866,12 +23962,15 @@ impl CfmlVirtualMachine {
         };
         let blueprint = if source_file.is_empty() {
             build_bp(self, &s, &source_file)
-        } else if let Some(bp) = self.component_blueprints.get(&source_file) {
-            bp.clone()
         } else {
-            let bp = build_bp(self, &s, &source_file);
-            self.component_blueprints.insert(source_file, bp.clone());
-            bp
+            let cache_key = format!("{}\u{0}{}", source_file, bp_name);
+            if let Some(bp) = self.component_blueprints.get(&cache_key) {
+                bp.clone()
+            } else {
+                let bp = build_bp(self, &s, &source_file);
+                self.component_blueprints.insert(cache_key, bp.clone());
+                bp
+            }
         };
         cfml_common::component::make_instance_value(&s, blueprint, instance_id)
     }
@@ -24004,6 +24103,36 @@ impl CfmlVirtualMachine {
                 let mut positional = 0usize;
                 for (i, a) in args_array.into_iter().enumerate() {
                     let name = names.get(i).map(String::as_str).unwrap_or("");
+                    // Expand `argumentCollection` into the collection (Lucee parity):
+                    // a struct spreads its keys (numeric keys → positional), an array
+                    // spreads positionally. Otherwise the handler would see a single
+                    // `argumentcollection` key instead of the named args (Preside
+                    // PresideObjectDecorator proxies insertData via onMissingMethod).
+                    if name.eq_ignore_ascii_case("argumentcollection") {
+                        match &a {
+                            CfmlValue::Struct(s) => {
+                                for (k, v) in s.iter() {
+                                    if let Ok(pos) = k.parse::<usize>() {
+                                        if pos >= 1 {
+                                            positional += 1;
+                                            missing_args.insert(positional.to_string(), v);
+                                            continue;
+                                        }
+                                    }
+                                    missing_args.insert(k, v);
+                                }
+                                continue;
+                            }
+                            CfmlValue::Array(items) => {
+                                for v in items.iter() {
+                                    positional += 1;
+                                    missing_args.insert(positional.to_string(), v);
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     if name.is_empty() {
                         positional += 1;
                         missing_args.insert(positional.to_string(), a);
@@ -24052,6 +24181,50 @@ impl CfmlVirtualMachine {
             "Component [{}] has no function with name [{}].",
             name, method
         ))))
+    }
+
+    /// `getMetadata`/`getComponentMetadata` for a flyweight instance. Rebuilds via
+    /// the SAME inheritance-aware builder the marker path uses (keyed off the
+    /// blueprint's class name + source), cached once per class on the shared
+    /// blueprint. Guarantees the result ALWAYS carries a `name` key from the
+    /// blueprint (Lucee/BoxLang parity — `getMetadata(x).name` is never absent),
+    /// and NEVER caches a nameless result, so a transient resolution miss in one
+    /// call context cannot poison the shared cache for every later instance
+    /// (this was TestBox's `targetMD.name` "Variable 'name' is undefined" crash
+    /// when a virtualized bundle's metadata was built in a context where the
+    /// inheritance walk couldn't resolve the template).
+    #[cfg(feature = "component-instance")]
+    fn instance_metadata(
+        &mut self,
+        inst: &cfml_common::component::InstanceRef,
+        parent_locals: &ValueMap,
+    ) -> CfmlValue {
+        if let Some(cached) = inst.read().class.metadata_cache.read().clone() {
+            return cached;
+        }
+        let (name, src) = {
+            let g = inst.read();
+            let s = g.class.source_file.clone();
+            (g.class.name.clone(), if s.is_empty() { None } else { Some(s) })
+        };
+        let mut meta_map = if name.is_empty() {
+            ValueMap::default()
+        } else {
+            let mut visited = std::collections::HashSet::new();
+            self.build_inheritance_metadata(&name, src, parent_locals, &mut visited)
+                .unwrap_or_default()
+        };
+        let has_name = meta_map.keys().any(|k| k.eq_ignore_ascii_case("name"));
+        if !name.is_empty() && !has_name {
+            meta_map.insert("name".to_string(), CfmlValue::string(name.clone()));
+        }
+        let meta = CfmlValue::strukt(meta_map);
+        // Cache only a resolved (named) result — a nameless transient must not
+        // stick on the shared blueprint.
+        if !name.is_empty() {
+            *inst.read().class.metadata_cache.write() = Some(meta.clone());
+        }
+        meta
     }
 
     /// Dedup a freshly-built instance's method `CfmlFunction` values against the
@@ -24980,6 +25153,11 @@ impl CfmlVirtualMachine {
                                 let src = cs.get("__source_file").map(|v| v.as_string())?;
                                 Some((name, src))
                             }
+                            #[cfg(feature = "component-instance")]
+                            CfmlValue::Instance(inst) => {
+                                let g = inst.read();
+                                Some((g.class.name.clone(), g.class.source_file.clone()))
+                            }
                             _ => None,
                         });
                         // Preferred: the DEFINING class's own logical dotted
@@ -25003,6 +25181,13 @@ impl CfmlVirtualMachine {
                                         CfmlValue::Struct(cs) => {
                                             cs.get("__source_names").and_then(|v| v.as_struct())
                                         }
+                                        #[cfg(feature = "component-instance")]
+                                        CfmlValue::Instance(inst) => inst
+                                            .read()
+                                            .class
+                                            .source_names
+                                            .as_ref()
+                                            .and_then(|v| v.as_struct()),
                                         _ => None,
                                     })
                                     .and_then(|m| {
@@ -25978,6 +26163,12 @@ impl CfmlVirtualMachine {
                 match v {
                     CfmlValue::Struct(s) => Some(s.backing_ptr()),
                     CfmlValue::Array(a) => Some(a.backing_ptr()),
+                    // A flyweight instance shares by Arc identity (GitHub #227:
+                    // `variables.x = this.x = new Foo()` where Foo is a component).
+                    #[cfg(feature = "component-instance")]
+                    CfmlValue::Instance(inst) => {
+                        Some(std::sync::Arc::as_ptr(inst) as *const () as usize)
+                    }
                     _ => None,
                 }
             };
@@ -26311,6 +26502,8 @@ impl CfmlVirtualMachine {
             }
             let this_val = match parent_map.get(k).cloned() {
                 Some(v @ (CfmlValue::Struct(_) | CfmlValue::Array(_))) => v,
+                #[cfg(feature = "component-instance")]
+                Some(v @ CfmlValue::Instance(_)) => v,
                 _ => continue,
             };
             if let Some(vars) = parent_map
