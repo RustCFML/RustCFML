@@ -2951,7 +2951,14 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
         return keys
             .into_iter()
             .filter(|k| {
-                if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                // Hide ONLY the exact engine-reserved bookkeeping keys, not every
+                // `__`-prefixed key: `__`/`___` are legal identifiers frameworks use
+                // for real public data (FW/1 AOP's `this["___doReverse"]`/`___orig`),
+                // which Lucee/ACF surface. `is_reserved_component_key` is the exact
+                // set (C.4 blanket-`__`-filter deletion, applied to the marker path).
+                if cfml_common::component::is_reserved_component_key(k)
+                    || k.eq_ignore_ascii_case("this")
+                {
                     return false;
                 }
                 match s.get(k) {
@@ -3331,9 +3338,12 @@ fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
         let is_component =
             s.contains_key_ci("__variables") && (s.contains_key_ci("__name") || s.contains_key_ci("this"));
         if is_component {
+            // Preserve ONLY the exact engine sentinels — a user/framework `__`/`___`
+            // public data member (FW/1 AOP `___orig`) is user data and MUST be
+            // cleared like any other public member (C.4 marker-path narrowing).
             let preserved: Vec<(String, CfmlValue)> = s
                 .iter()
-                .filter(|(k, _)| k.starts_with("__"))
+                .filter(|(k, _)| cfml_common::component::is_reserved_component_key(k))
                 .collect();
             s.clear();
             // Methods live in the shared per-class table (component flyweight);
@@ -3388,7 +3398,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
                     if b.contains_key("__variables") || b.contains_key("__name"));
                 for (k, v) in src {
                     if src_is_marker
-                        && (k.starts_with("__")
+                        && (cfml_common::component::is_reserved_component_key(&k)
                             || k.eq_ignore_ascii_case("this")
                             || k.eq_ignore_ascii_case("super"))
                     {
@@ -3428,7 +3438,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
             };
             for (k, v) in entries {
                 if src_is_component
-                    && (k.starts_with("__")
+                    && (cfml_common::component::is_reserved_component_key(&k)
                         || k.eq_ignore_ascii_case("this")
                         || k.eq_ignore_ascii_case("super"))
                 {
@@ -5897,7 +5907,11 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) 
             if !is_cfc {
                 return true;
             }
-            if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+            // Only EXACT engine-reserved keys are hidden; user/framework `__`/`___`
+            // public data (FW/1 AOP `___orig`) is real data Lucee serializes.
+            if cfml_common::component::is_reserved_component_key(k)
+                || k.eq_ignore_ascii_case("this")
+            {
                 return false;
             }
             !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
@@ -6043,7 +6057,11 @@ fn serialize_cfml_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
             if !is_cfc {
                 return true;
             }
-            if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+            // Only EXACT engine-reserved keys are hidden; user/framework `__`/`___`
+            // public data (FW/1 AOP `___orig`) is real data Lucee serializes.
+            if cfml_common::component::is_reserved_component_key(k)
+                || k.eq_ignore_ascii_case("this")
+            {
                 return false;
             }
             !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))

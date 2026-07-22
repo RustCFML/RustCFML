@@ -10652,7 +10652,14 @@ impl CfmlVirtualMachine {
                                         if !is_cfc {
                                             return true;
                                         }
-                                        if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                                        // Hide only the EXACT engine-reserved keys,
+                                        // not every `__`-prefixed key — user/framework
+                                        // `__`/`___` data members (FW/1 AOP `___orig`)
+                                        // are real public members Lucee for-in surfaces
+                                        // (C.4 blanket-filter deletion on marker path).
+                                        if cfml_common::component::is_reserved_component_key(k)
+                                            || k.eq_ignore_ascii_case("this")
+                                        {
                                             return false;
                                         }
                                         // Methods: keep only public/remote ones.

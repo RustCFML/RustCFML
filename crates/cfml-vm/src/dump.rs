@@ -544,7 +544,10 @@ fn component_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<
         .unwrap_or_default();
     let mut entries = Vec::new();
     for (k, v) in snap.iter() {
-        if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+        // Only the EXACT engine-reserved keys are hidden — user/framework `__`/`___`
+        // data members (FW/1 AOP `___orig`) are real members Lucee dumps (C.4
+        // blanket-`__`-filter deletion, applied to the marker path).
+        if cfml_common::component::is_reserved_component_key(k) || k.eq_ignore_ascii_case("this") {
             continue;
         }
         entries.push((k.clone(), v.clone()));

@@ -22,6 +22,11 @@ component {
             , inKeyList  = listFindNoCase( structKeyList( this ), "___orig" ) GT 0
             , inJson     = findNoCase( "___orig", serializeJSON( this ) ) GT 0
             , singleVisible = structKeyExists( this, "_single" )
+            // Engine bookkeeping keys MUST stay hidden (narrowing must not leak
+            // reserved keys): `__variables` is an engine sentinel, never a user key.
+            , engineKeyHidden  = NOT structKeyExists( this, "__variables" )
+            , engineNotInList  = listFindNoCase( structKeyList( this ), "__variables" ) EQ 0
+            , engineNotInJson  = findNoCase( """__variables""", serializeJSON( this ) ) EQ 0
         };
     }
 }
