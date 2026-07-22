@@ -2089,6 +2089,10 @@ impl CfmlValue {
                         accessor_private: parking_lot::RwLock::new(
                             g.accessor_private.read().clone(),
                         ),
+                        // A `rust:` native parent is an opaque NativeObject: carry
+                        // the handle (shared Arc), matching how the marker path's
+                        // `__super` NativeObject survives a duplicate().
+                        native_parent: g.native_parent.clone(),
                     },
                 ));
                 seen.insert(ptr, CfmlValue::Instance(new_inst.clone()));

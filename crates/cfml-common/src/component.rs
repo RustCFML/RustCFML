@@ -104,6 +104,13 @@ pub struct ClassBlueprint {
     /// live only in the private `variables` scope — default-only and inherited
     /// properties (GH #267). Absent for a component with no declared properties.
     pub properties: Option<CfmlValue>,
+    /// The Rust-class parent name (marker `__rust_extends`) for a CFC declaring
+    /// `extends="rust:Name"`. Class-invariant (the parent CLASS is the same for
+    /// every instance), so it lives on the blueprint; the per-instance parent
+    /// OBJECT lives on [`Instance::native_parent`]. Needed so an in-`init()`
+    /// `super(args)` (`CallRustSuperCtor`) can reconstruct the parent with args.
+    /// `None` for a pure-CFC class.
+    pub rust_extends: Option<String>,
 }
 
 /// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
@@ -126,6 +133,14 @@ pub struct Instance {
     /// runtime `setX()` marks the property after construction (see the
     /// `MarkAccessorPrivate` opcode). Mirrors the marker `__cfml_accessor_private__`.
     pub accessor_private: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Per-instance native (Rust-class) parent for a CFC `extends="rust:Name"` —
+    /// the live `NativeObject` holding THIS instance's parent state (marker
+    /// `__super`). Per-instance (NOT on the shared blueprint) so each instance has
+    /// independent parent state; `super.method()`, unresolved-method fall-through,
+    /// and `this.X` property get/set all route through it. `None` for a pure-CFC
+    /// class. Interior mutability via the outer `RwLock<Instance>` lets an
+    /// in-`init()` `super(args)` (`CallRustSuperCtor`) replace it.
+    pub native_parent: Option<CfmlValue>,
 }
 
 // `CfmlStruct` has no `Debug` impl (the outer `CfmlValue` Debug is hand-rolled),
@@ -261,10 +276,22 @@ impl ClassBlueprint {
 
         // Super-dispatch handles (reserved keys, captured before they are dropped
         // from the data maps) — reused by the marker `__is_super` dispatch path.
-        let super_handle = marker.get_ci("__super");
+        // A NativeObject `__super` (a `rust:` parent) is DELIBERATELY excluded here:
+        // it holds PER-INSTANCE parent state and must not be shared across all
+        // instances via the blueprint. It is captured per-instance on
+        // `Instance::native_parent` instead; the blueprint records only the parent
+        // CLASS name (`rust_extends`) so `super(args)` can reconstruct it.
+        let super_handle = match marker.get_ci("__super") {
+            Some(CfmlValue::NativeObject(_)) => None,
+            other => other,
+        };
         let super_map = marker.get_ci("__super_map");
         let source_names = marker.get_ci("__source_names");
         let properties = marker.get_ci("__properties");
+        let rust_extends = match marker.get_ci("__rust_extends") {
+            Some(CfmlValue::String(n)) => Some(n.to_string()),
+            _ => None,
+        };
 
         ClassBlueprint {
             name,
@@ -280,6 +307,7 @@ impl ClassBlueprint {
             super_map,
             source_names,
             properties,
+            rust_extends,
         }
     }
 }
@@ -338,12 +366,21 @@ impl Instance {
                 }
             });
         }
+        // Capture the PER-INSTANCE native parent (a `rust:` extends yields a
+        // `NativeObject` under `__super`, holding this instance's parent state).
+        // A CFC super struct (`__is_super`-tagged) is class-invariant and lives on
+        // the blueprint instead, so only a NativeObject is taken here.
+        let native_parent = match marker.get_ci("__super") {
+            Some(v @ CfmlValue::NativeObject(_)) => Some(v),
+            _ => None,
+        };
         Instance {
             class,
             this_members,
             variables_members,
             instance_id,
             accessor_private: parking_lot::RwLock::new(accessor_private),
+            native_parent,
         }
     }
 

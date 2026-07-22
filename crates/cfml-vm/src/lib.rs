@@ -3878,9 +3878,24 @@ impl CfmlVirtualMachine {
                 .and_then(|g| g.get_property(name))
                 .unwrap_or(CfmlValue::Null),
             // Phase C.3: flyweight instance — public then private data (method-table
-            // aware), no `__` filtering needed (the data maps are pure DATA).
+            // aware), no `__` filtering needed (the data maps are pure DATA). A miss
+            // falls through to a `rust:` native parent's `get_property` (e.g.
+            // `this.value` on a CFC extending a Rust class that exposes `value`).
             #[cfg(feature = "component-instance")]
-            CfmlValue::Instance(inst) => inst.read().get_member(name).unwrap_or(CfmlValue::Null),
+            CfmlValue::Instance(inst) => {
+                let g = inst.read();
+                if let Some(v) = g.get_member(name) {
+                    v
+                } else if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
+                    parent
+                        .read()
+                        .ok()
+                        .and_then(|p| p.get_property(name))
+                        .unwrap_or(CfmlValue::Null)
+                } else {
+                    CfmlValue::Null
+                }
+            }
             _ => obj.get(name).unwrap_or(CfmlValue::Null),
         }
     }
@@ -3894,9 +3909,22 @@ impl CfmlVirtualMachine {
     fn lookup_property_opt(obj: &CfmlValue, name: &str) -> Option<CfmlValue> {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = obj {
+            let g = inst.read();
+            if let Some(v) = g.get_member(name) {
+                return Some(v);
+            }
+            // Fall through to a `rust:` native parent's `get_property` before
+            // signalling a miss.
+            if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
+                if let Ok(p) = parent.read() {
+                    if let Some(v) = p.get_property(name) {
+                        return Some(v);
+                    }
+                }
+            }
             // Genuine member miss → None so the fused throwing read reports
             // "Variable is undefined" (Lucee/ACF parity), same as the marker path.
-            return inst.read().get_member(name);
+            return None;
         }
         if let CfmlValue::Struct(s) = obj {
             let val = s.get_ci(name).or_else(|| {
@@ -8252,9 +8280,29 @@ impl CfmlVirtualMachine {
                             }
                             // Phase C.3 — Slice 3: `this.x = v` (and any local
                             // holding an instance) writes the public DATA map in place.
+                            // A `rust:` native parent gets first refusal (mirrors the
+                            // Struct arm above); None defers to the CFC public map.
                             #[cfg(feature = "component-instance")]
                             if let CfmlValue::Instance(ref inst) = *obj {
-                                inst.read().this_members.insert(prop_name.clone(), value);
+                                let handled = {
+                                    let g = inst.read();
+                                    if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
+                                        let mut guard = parent.write().map_err(|_| {
+                                            CfmlError::runtime(
+                                                "NativeObject lock poisoned".to_string(),
+                                            )
+                                        })?;
+                                        guard.set_property(prop_name, value.clone())
+                                    } else {
+                                        None
+                                    }
+                                };
+                                match handled {
+                                    Some(result) => result?,
+                                    None => {
+                                        inst.read().this_members.insert(prop_name.clone(), value);
+                                    }
+                                }
                                 continue;
                             }
                             if let Some(s) = obj.as_cfml_struct() {
@@ -8385,6 +8433,15 @@ impl CfmlVirtualMachine {
                         if !pushed {
                             if let Some(sup) = g.class.super_handle.clone() {
                                 stack.push(sup);
+                                pushed = true;
+                            }
+                        }
+                        // `rust:` parent: the per-instance NativeObject IS `super`
+                        // (a subsequent `CallMethod`/`GetProperty` on it dispatches
+                        // through the native short-circuit / trait getter).
+                        if !pushed {
+                            if let Some(np) = g.native_parent.clone() {
+                                stack.push(np);
                                 pushed = true;
                             }
                         }
@@ -8707,9 +8764,31 @@ impl CfmlVirtualMachine {
                             }
                             // Phase C.3 — Slice 3: `instance.x = v` writes the public
                             // DATA map in place (shared Arc → persists on the instance).
+                            // A CFC with a `rust:` native parent routes writes the
+                            // native side recognises to `set_property` first (Rust
+                            // state stays first-class); a None return defers to the
+                            // CFC public map — mirrors the marker Struct arm below.
                             #[cfg(feature = "component-instance")]
                             if let CfmlValue::Instance(ref inst) = obj {
-                                inst.read().this_members.insert(name.clone(), value);
+                                let handled = {
+                                    let g = inst.read();
+                                    if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
+                                        let mut guard = parent.write().map_err(|_| {
+                                            CfmlError::runtime(
+                                                "NativeObject lock poisoned".to_string(),
+                                            )
+                                        })?;
+                                        guard.set_property(name, value.clone())
+                                    } else {
+                                        None
+                                    }
+                                };
+                                match handled {
+                                    Some(result) => result?,
+                                    None => {
+                                        inst.read().this_members.insert(name.clone(), value);
+                                    }
+                                }
                                 stack.push(obj);
                                 continue;
                             }
@@ -11193,6 +11272,32 @@ impl CfmlVirtualMachine {
                             "super(...) called outside of a CFC method".to_string(),
                         )
                     })?;
+                    // Flyweight: `this` is an `Instance`. Reconstruct the native
+                    // parent with the passed args (the parent CLASS name lives on
+                    // the blueprint's `rust_extends`) and store it PER-INSTANCE on
+                    // `native_parent`, replacing the default-constructed one.
+                    #[cfg(feature = "component-instance")]
+                    if let CfmlValue::Instance(ref inst) = this_val {
+                        let rust_class = {
+                            inst.read().class.rust_extends.clone().ok_or_else(|| {
+                                CfmlError::runtime(
+                                    "super(...) is only valid in a CFC that extends a rust: class"
+                                        .to_string(),
+                                )
+                            })?
+                        };
+                        let key = rust_class.to_lowercase();
+                        let ctor = self.native_classes.get(&key).copied().ok_or_else(|| {
+                            CfmlError::runtime(format!(
+                                "No native (Rust) class registered with name '{}'",
+                                rust_class
+                            ))
+                        })?;
+                        let parent = ctor(ctor_args)?;
+                        inst.write().native_parent = Some(parent);
+                        stack.push(CfmlValue::Null);
+                        continue;
+                    }
                     let this_struct = match this_val {
                         CfmlValue::Struct(s) => s,
                         _ => {
@@ -24399,6 +24504,20 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // 2.5 Native (rust:) parent fall-through — a CFC `extends="rust:Name"`
+        // carries a PER-INSTANCE `NativeObject` parent (`Instance::native_parent`).
+        // A method not found on the CFC and not matching an implicit accessor
+        // dispatches to the native parent, mirroring the marker path
+        // (`call_member_function_impl`), which tries the native parent BEFORE
+        // onMissingMethod — so a `rust:` parent wins over a child onMissingMethod.
+        if let Some(CfmlValue::NativeObject(parent_obj)) = { inst.read().native_parent.clone() } {
+            let args: Vec<CfmlValue> = extra_args.drain(..).collect();
+            let mut guard = parent_obj.write().map_err(|_| {
+                CfmlError::runtime("NativeObject lock poisoned".to_string())
+            })?;
+            return guard.call_method(method, args);
+        }
+
         // 3. onMissingMethod.
         if defines_on_missing {
             if let Some(handler) = { inst.read().lookup_method("onmissingmethod") } {
@@ -28825,6 +28944,21 @@ impl CfmlVirtualMachine {
     ) -> Result<bool, CfmlError> {
         let s = match template {
             CfmlValue::Struct(ref s) => s.clone(),
+            // Flyweight lifecycle dispatch (latent until Application.cfc converts
+            // to an Instance under §3c). Fire ONLY an actually-defined method —
+            // marker parity: a missing lifecycle method is a no-op, never routed
+            // to onMissingMethod. `lookup_method` is table-aware, so an inherited
+            // lifecycle method (Preside Bootstrap) resolves. The Instance's shared
+            // data maps mutate in place, so there is no writeback merge to do.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(ref inst) => {
+                if inst.read().lookup_method(method).is_none() {
+                    return Ok(false);
+                }
+                let mut extra = args;
+                self.call_instance_method(inst, method, &mut extra, None)?;
+                return Ok(true);
+            }
             _ => return Ok(false),
         };
 
@@ -28890,6 +29024,19 @@ impl CfmlVirtualMachine {
     ) -> Result<Option<CfmlValue>, CfmlError> {
         let s = match template {
             CfmlValue::Struct(ref s) => s.clone(),
+            // Flyweight (latent until Application.cfc converts — §3c): dispatch
+            // onMissingTemplate only if actually defined (preserve the Ok(None)
+            // "fall through" contract), returning its real value. Maps mutate in
+            // place, so no writeback.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(ref inst) => {
+                if inst.read().lookup_method("onmissingtemplate").is_none() {
+                    return Ok(None);
+                }
+                let mut extra = vec![target_page];
+                let r = self.call_instance_method(inst, "onmissingtemplate", &mut extra, None)?;
+                return Ok(Some(r));
+            }
             _ => return Ok(None),
         };
 
@@ -29162,6 +29309,44 @@ impl CfmlVirtualMachine {
         let instance = self.resolve_inheritance(template, &locals);
         // Honour `extends="rust:Name"` channels (same as `new`).
         let template = self.attach_native_parent(instance)?;
+
+        // Flyweight (latent — WS channels still instantiate as markers here, since
+        // this function builds `template` itself and does not call
+        // `to_instance_value`; the arm is a §3c prerequisite so a future
+        // conversion here cannot silently no-op). Resolve the handler + secured
+        // gate against the instance's public view (`this_members` carries the
+        // `__funcmeta_` keys and the shared method table), then dispatch the
+        // resolved method BY NAME through `call_instance_method` (maps mutate in
+        // place → no writeback).
+        #[cfg(feature = "component-instance")]
+        if let CfmlValue::Instance(ref inst) = template {
+            let view = inst.read().this_members.clone();
+            let func = match Self::resolve_ws_handler(&view, method, event) {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            if let CfmlValue::Function(f) = &func {
+                if let Some(secured) = Self::ws_secured_annotation(&view, &f.name) {
+                    let data = args.first().and_then(Self::ws_socket_data);
+                    if !Self::ws_secured_ok(&secured, data.as_ref()) {
+                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                            "Not authorized to call WebSocket handler [{}]",
+                            f.name
+                        ))));
+                    }
+                }
+            }
+            let fname = if let CfmlValue::Function(f) = &func {
+                f.name.clone()
+            } else {
+                method.to_string()
+            };
+            let prev_instance = self.current_ws_instance.replace(template.clone());
+            let mut extra = args;
+            let result = self.call_instance_method(inst, &fname, &mut extra, None);
+            self.current_ws_instance = prev_instance;
+            return result.map(Some);
+        }
 
         let s = match &template {
             CfmlValue::Struct(ref s) => s.clone(),

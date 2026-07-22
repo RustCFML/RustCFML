@@ -76,5 +76,41 @@ assert("parent state visible via super.get()",       propInst.get(),    250);
 propInst.cfcOnly = "hello";
 assert("unknown property writes land on the CFC struct", propInst.cfcOnly, "hello");
 
+// --- `new X()` path -------------------------------------------------------
+// The flyweight (component-instance) build produces a flyweight Instance for
+// `new X()` (createObject stays a marker for now). The native parent must be
+// stored PER-INSTANCE on the Instance — not on the shared class blueprint —
+// so each instance has independent parent state and method/property
+// fall-through still reaches the Rust parent. Passes on the marker build too.
+n = new oop.native_cfcs.counter_child();
+assert("new: implicit fall-through to parent.increment", n.increment(), 1);
+assert("new: implicit fall-through to parent.get",       n.get(),       1);
+assert("new: super.X dispatch (bumpTwice)",              n.bumpTwice(),  3);
+assert("new: CFC override wrapping super.add",           n.add(5),       13);
+
+// Per-instance independence — the crux of the per-instance-parent fix.
+na = new oop.native_cfcs.counter_child();
+nb = new oop.native_cfcs.counter_child();
+na.increment();
+assert("new: instance na parent state",     na.get(), 1);
+assert("new: instance nb parent untouched", nb.get(), 0);
+
+// super(args) in init() reconstructs the parent per-instance.
+nseed = new oop.native_cfcs.counter_seeded(42);
+assert("new: super(args) seeded parent state",  nseed.get(), 42);
+assert("new: seeded parent still dispatches add()", nseed.add(8), 50);
+nseed2 = new oop.native_cfcs.counter_seeded(7);
+assert("new: second seeded instance independent", nseed2.get(), 7);
+assert("new: first seeded instance unaffected",   nseed.get(),  50);
+
+// Property fall-through to the native parent (read + write).
+nprop = new oop.native_cfcs.counter_seeded(100);
+assert("new: read this.value falls through to parent", nprop.value, 100);
+nprop.value = 250;
+assert("new: write this.value routes to parent.set_property", nprop.value, 250);
+assert("new: parent state visible via super.get()",   nprop.get(),  250);
+nprop.cfcOnly = "hi";
+assert("new: unknown property writes land on the CFC", nprop.cfcOnly, "hi");
+
 suiteEnd();
 </cfscript>
