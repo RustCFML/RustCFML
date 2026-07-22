@@ -94,6 +94,11 @@ cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # build that opts out of cfml-vm defaults can still flip the JIT back on
 # explicitly from the CLI side. Runtime kill-switch: `RUSTCFML_JIT=0`.
 jit = ["cfml-vm/jit"]
+# Phase C.3 (component-model flyweight): passthrough to the VM's `Instance`
+# backing. OFF by default; the marker-struct representation ships until the
+# flyweight is flipped default-on at Slice 6. Lets the CFML suite run feature-on
+# (`cargo run --features component-instance -- tests/runner.cfm`) during C.3.
+component-instance = ["cfml-vm/component-instance"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.28"

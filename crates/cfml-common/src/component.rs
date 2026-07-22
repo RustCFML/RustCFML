@@ -61,6 +61,38 @@ pub struct ClassBlueprint {
     pub method_access: rustc_hash::FxHashMap<String, crate::dynamic::CfmlAccess>,
     /// The class-invariant metadata blob (reuses the existing per-class shape).
     pub metadata: CfmlValue,
+    /// The method table as a shared `Arc<ValueMap>` of `name -> Function`, ready to
+    /// hang off the instance data maps via [`CfmlStruct::set_method_table`]. This is
+    /// the mechanism that lets unscoped sibling-method resolution and `this.method`
+    /// dispatch find methods without copying them per instance: `get_ci` on a data
+    /// map falls through to this table on a miss. Built once per class.
+    pub method_values: std::sync::Arc<crate::dynamic::ValueMap>,
+    /// Lazily-built full `getMetadata()` result (name/extends/functions/properties/
+    /// implements), cached once per class (Phase C.3 Slice 5). Filled on the first
+    /// `getMetadata(instance)` via the same builder the marker path uses, so the
+    /// output matches exactly. `None` until first requested.
+    pub metadata_cache: parking_lot::RwLock<Option<CfmlValue>>,
+    /// The dotted type identifiers this class satisfies for `isInstanceOf` / typed
+    /// argument validation: own name + resolved superclass chain + interface lists
+    /// (Phase C.3 Slice 5). Precomputed once from the finished marker via the free
+    /// [`type_identifiers`] so `Instance::type_identifiers` no longer under-reports.
+    pub type_ids: Vec<String>,
+    /// The shared per-class `static` scope (`__variables.__static`), if the class
+    /// declares one (Phase C.3 Slice 5). Held as the original (Arc-backed) struct so
+    /// every instance's methods see the SAME static store and mutations persist
+    /// across instances. Injected into the method frame as `__static` at dispatch.
+    pub static_scope: Option<CfmlValue>,
+    /// The immediate parent's super-dispatch struct (marker `__super`: a
+    /// `__is_super`-tagged struct carrying the parent's methods), captured once per
+    /// class (Phase C.3 Slice 5). `super.method()` inside an instance method pushes
+    /// this (or the level-specific entry from [`super_map`](Self::super_map)) and
+    /// reuses the existing `__is_super` dispatch, which binds `this` to the live
+    /// child instance from the frame.
+    pub super_handle: Option<CfmlValue>,
+    /// Per-defining-source parent structs (marker `__super_map`: source_file ->
+    /// parent super struct) for multi-level `super` resolution — `super` resolves
+    /// relative to the DEFINING class of the executing method (Phase C.3 Slice 5).
+    pub super_map: Option<CfmlValue>,
 }
 
 /// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
@@ -95,14 +127,281 @@ impl std::fmt::Debug for Instance {
 #[cfg(feature = "component-instance")]
 #[allow(dead_code)]
 impl Instance {
-    /// The dotted type identifiers this instance satisfies (see the free
-    /// [`type_identifiers`]). Prototype minimal: the blueprint only carries the
-    /// class name so far (parent chain / interfaces are DEFERRED to full C.2),
-    /// so leaf/concrete allowlisted classes are answered correctly and anything
-    /// needing the chain is out of the prototype's scope.
+    /// The dotted type identifiers this instance satisfies (own name + superclass
+    /// chain + interface lists), precomputed on the blueprint at produce time (see
+    /// the free [`type_identifiers`]). Used by `isInstanceOf` / typed-argument
+    /// validation.
     pub fn type_identifiers(&self) -> Vec<String> {
-        vec![self.class.name.clone()]
+        self.class.type_ids.clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.3 — Slice 2: the `Instance` producer.
+//
+// Partition a *finished* marker instance (post-init, post-inheritance) into the
+// flyweight form: the class-invariant bulk (methods + metadata) onto a shared
+// `ClassBlueprint`, the per-instance user DATA into two data-only maps.
+//
+// The producer is the §5.1 "data-loss landmine" and the §5.2/C.2.3 self-reference
+// audit in `C2planDoc.md`, so the routing rules are load-bearing:
+//   * DATA vs bookkeeping is decided by the EXACT reserved set
+//     (`is_reserved_component_key`), NEVER by a `starts_with("__")` prefix. `__`/
+//     `___` are legal identifiers frameworks use for real data (FW/1 AOP's
+//     `___doReverse`); a prefix test would DISCARD them — strictly worse than the
+//     marker path's hiding.
+//   * Methods move to the shared blueprint (not copied per instance).
+//   * A data member that is the marker itself (the classic `variables[classname]
+//     = this` self-reference) is retargeted to the live instance handle rather
+//     than retained as a stale marker clone.
+//
+// Feature-gated OFF by default; wired at instantiation finalize in `cfml-vm`.
+// The VM owns the per-`__source_file` blueprint cache and calls
+// [`make_instance_value`].
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "component-instance")]
+#[allow(dead_code)]
+impl ClassBlueprint {
+    /// Build the class-invariant blueprint from a finished marker instance.
+    ///
+    /// Collects the shared method table (public + private, deduped by name) plus
+    /// the class name / source file / metadata blob. Everything read here is
+    /// invariant across instances of the class, so the producer `Arc`-shares the
+    /// result via its per-`__source_file` cache. Per-instance DATA is deliberately
+    /// NOT read here — it belongs to [`Instance::from_marker`].
+    pub fn from_marker(marker: &CfmlStruct) -> ClassBlueprint {
+        use crate::dynamic::{CfmlFunction, CfmlAccess};
+        let mut methods: indexmap::IndexMap<String, std::sync::Arc<CfmlFunction>> =
+            indexmap::IndexMap::new();
+        let mut method_access: rustc_hash::FxHashMap<String, CfmlAccess> =
+            rustc_hash::FxHashMap::default();
+        let mut name = String::new();
+        let mut source_file = String::new();
+        let mut metadata = CfmlValue::Null;
+
+        // Helper: harvest Function values from a scope's DATA map AND its shared
+        // method table (the marker-path per-class flyweight, v0.506/507, keeps the
+        // methods in the table rather than the map — a map-only read would find
+        // ZERO methods on a finished instance).
+        let mut harvest = |scope: &CfmlStruct| {
+            scope.with_read(|m| {
+                for (k, v) in m.iter() {
+                    if let CfmlValue::Function(f) = v {
+                        method_access
+                            .entry(k.to_ascii_lowercase())
+                            .or_insert_with(|| f.access.clone());
+                        methods.entry(k.clone()).or_insert_with(|| f.clone());
+                    }
+                }
+            });
+            if let Some(table) = scope.method_table() {
+                for (k, v) in table.iter() {
+                    if let CfmlValue::Function(f) = v {
+                        method_access
+                            .entry(k.to_ascii_lowercase())
+                            .or_insert_with(|| f.access.clone());
+                        methods.entry(k.clone()).or_insert_with(|| f.clone());
+                    }
+                }
+            }
+        };
+        // Public (top-level) scope, then the private `__variables` scope. §core
+        // surfaces the full method set in both scopes, so the public view is
+        // normally complete; the private sweep is defensive (a private-only method).
+        harvest(marker);
+        if let Some(CfmlValue::Struct(vars)) = marker.get_ci("__variables") {
+            harvest(&vars);
+        }
+        marker.with_read(|m| {
+            if let Some(CfmlValue::String(n)) = m.get("__name") {
+                name = n.to_string();
+            }
+            if let Some(CfmlValue::String(sf)) = m.get("__source_file") {
+                source_file = sf.to_string();
+            }
+            if let Some(md) = m.get("__metadata") {
+                metadata = md.clone();
+            }
+        });
+
+        // Materialize the method table once as an Arc<ValueMap> of Function values,
+        // ready to share onto every instance's data maps (set_method_table).
+        let mut mv = crate::dynamic::ValueMap::default();
+        for (k, f) in &methods {
+            mv.insert(k.clone(), CfmlValue::Function(f.clone()));
+        }
+
+        let type_ids = type_identifiers(marker);
+
+        // The shared per-class static scope lives at `__variables.__static`; capture
+        // the original Arc-backed struct so every instance shares it.
+        let static_scope = match marker.get_ci("__variables") {
+            Some(CfmlValue::Struct(vars)) => vars.get_ci("__static"),
+            _ => None,
+        };
+
+        // Super-dispatch handles (reserved keys, captured before they are dropped
+        // from the data maps) — reused by the marker `__is_super` dispatch path.
+        let super_handle = marker.get_ci("__super");
+        let super_map = marker.get_ci("__super_map");
+
+        ClassBlueprint {
+            name,
+            source_file,
+            methods,
+            method_access,
+            metadata,
+            method_values: std::sync::Arc::new(mv),
+            metadata_cache: parking_lot::RwLock::new(None),
+            type_ids,
+            static_scope,
+            super_handle,
+            super_map,
+        }
+    }
+}
+
+#[cfg(feature = "component-instance")]
+#[allow(dead_code)]
+impl Instance {
+    /// Partition a finished marker instance into the flyweight two-map form.
+    ///
+    /// **§5.1 data-loss landmine:** the DATA/bookkeeping split is by the EXACT
+    /// reserved set ([`is_reserved_component_key`]), NEVER by a `starts_with("__")`
+    /// prefix. A user/framework `__`/`___` member is ordinary DATA and MUST land in
+    /// the data maps. Methods (shared on the blueprint) and the `this`/`super`
+    /// scope handles (re-derived, not data) are also excluded from the data maps.
+    pub fn from_marker(
+        marker: &CfmlStruct,
+        class: std::sync::Arc<ClassBlueprint>,
+        instance_id: u64,
+    ) -> Instance {
+        let this_members = partition_data_map(marker);
+        let variables_members = match marker.get_ci("__variables") {
+            Some(CfmlValue::Struct(vars)) => partition_data_map(&vars),
+            _ => CfmlStruct::empty(),
+        };
+        // Hang the shared blueprint method table off BOTH data maps so `get_ci`
+        // falls through to methods on a data miss — this is what makes `this.foo()`,
+        // unscoped `foo()`, and `variables.foo()` dispatch resolve without copying
+        // the method wrappers per instance. Data members still shadow (map wins in
+        // `get_ci`). Enumeration (`iter()`) is map-only, so introspection stays
+        // data-clean (Slice 4).
+        this_members.set_method_table(class.method_values.clone());
+        variables_members.set_method_table(class.method_values.clone());
+        // Re-attach the shared per-class `static` scope under the private scope so
+        // `find_static_scope` (`variables.__static`) resolves `static.X` reads/writes
+        // inside methods. Shared Arc → mutations persist across instances. It is a
+        // reserved key, so it never surfaces in public enumeration (which reads
+        // `this_members`).
+        if let Some(ref stat) = class.static_scope {
+            variables_members.insert("__static".to_string(), stat.clone());
+        }
+        Instance {
+            class,
+            this_members,
+            variables_members,
+            instance_id,
+        }
+    }
+
+    /// Read a member for property access (`obj.name` / `obj["name"]`): public data
+    /// first, then private data, each `get_ci`-resolved so a method found via the
+    /// shared table is returned as its `Function` value. `None` on a genuine miss
+    /// (the caller decides Null vs throw). Mirrors the marker path's lenient
+    /// public→variables fallthrough (RustCFML does not gate data-member access).
+    pub fn get_member(&self, name: &str) -> Option<CfmlValue> {
+        // Compat shim: `instance.__variables` exposes the private scope as a struct,
+        // the way the marker representation did (a few RustCFML tests / helpers poke
+        // it directly). Not a Lucee-visible member, but harmless and marker-parity.
+        if name.eq_ignore_ascii_case("__variables") {
+            return Some(CfmlValue::Struct(self.variables_members.clone()));
+        }
+        self.this_members
+            .get_ci(name)
+            .or_else(|| self.variables_members.get_ci(name))
+    }
+
+    /// Resolve a callable method: an injected/mixin data-member function (public
+    /// then private) shadows the shared blueprint table, exactly as `get_ci`'s
+    /// map-before-table order gives us for free.
+    pub fn lookup_method(&self, name: &str) -> Option<CfmlValue> {
+        self.this_members
+            .get_ci(name)
+            .filter(|v| matches!(v, CfmlValue::Function(_)))
+            .or_else(|| {
+                self.variables_members
+                    .get_ci(name)
+                    .filter(|v| matches!(v, CfmlValue::Function(_)))
+            })
+    }
+}
+
+/// Extract the pure user-DATA subset of a component scope map: drop methods
+/// (shared on the blueprint), reserved bookkeeping keys (§3), and the `this`/
+/// `super` scope handles. Everything surviving — INCLUDING `__`/`___` user keys —
+/// is copied verbatim. See §5.1: partition by the reserved SET, never by prefix.
+#[cfg(feature = "component-instance")]
+fn partition_data_map(scope: &CfmlStruct) -> CfmlStruct {
+    let mut data = crate::dynamic::ValueMap::default();
+    scope.with_read(|m| {
+        for (k, v) in m.iter() {
+            if matches!(v, CfmlValue::Function(_)) {
+                continue; // method → shared blueprint
+            }
+            if is_reserved_component_key(k) {
+                continue; // engine bookkeeping → blueprint / typed Instance fields
+            }
+            if k.eq_ignore_ascii_case("this") || k.eq_ignore_ascii_case("super") {
+                continue; // scope handle, re-derived on dispatch (not data)
+            }
+            data.insert(k.clone(), v.clone());
+        }
+    });
+    CfmlStruct::new(data)
+}
+
+/// Build a [`CfmlValue::Instance`] from a finished marker instance and its
+/// (VM-cached) blueprint.
+///
+/// Performs the §5.2/C.2.3 self-reference fixup: a top-level data member that IS
+/// the marker itself (the classic `variables[classname] = this`) is retargeted to
+/// the live instance handle. Left as a plain clone it would both retain a whole
+/// stale marker AND read back as a marker struct instead of this instance.
+#[cfg(feature = "component-instance")]
+pub fn make_instance_value(
+    marker: &CfmlStruct,
+    class: std::sync::Arc<ClassBlueprint>,
+    instance_id: u64,
+) -> CfmlValue {
+    let inst = Instance::from_marker(marker, class, instance_id);
+    let handle: InstanceRef = std::sync::Arc::new(parking_lot::RwLock::new(inst));
+    let marker_ptr = marker.backing_ptr();
+    let self_val = CfmlValue::Instance(handle.clone());
+    {
+        let g = handle.read();
+        fixup_self_ref(&g.this_members, marker_ptr, &self_val);
+        fixup_self_ref(&g.variables_members, marker_ptr, &self_val);
+    }
+    CfmlValue::Instance(handle)
+}
+
+/// Retarget any top-level data member whose struct backing IS `marker_ptr` to the
+/// live instance handle (§5.2 self-reference audit). Shallow by design: the
+/// documented C.2.3 case is the direct `variables[classname] = this`; deeper
+/// cycles are the cycle collector's concern, not the producer's.
+#[cfg(feature = "component-instance")]
+fn fixup_self_ref(scope: &CfmlStruct, marker_ptr: usize, self_val: &CfmlValue) {
+    scope.with_write(|m| {
+        for (_, v) in m.iter_mut() {
+            if let CfmlValue::Struct(s) = v {
+                if s.backing_ptr() == marker_ptr {
+                    *v = self_val.clone();
+                }
+            }
+        }
+    });
 }
 
 /// The canonical component-instance marker predicate: a struct is a component
@@ -112,6 +411,85 @@ impl Instance {
 #[inline]
 pub fn is_component_backing(s: &CfmlStruct) -> bool {
     s.contains_key_ci("__variables") && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
+}
+
+/// True iff `k` is an engine-reserved component-instance bookkeeping key that
+/// must stay OUT of user-visible introspection (`structKeyExists`/`structKeyList`/
+/// `structKeyArray`/`structCount`/`structEach`, `for … in`, `serializeJSON`,
+/// `writeDump`, `getMetadata`).
+///
+/// This is the single source of truth for the reserved set (Phase C.3/C.4). It is
+/// deliberately an EXACT set plus a few structured prefixes — **NOT** a blanket
+/// `starts_with("__")` test. `__`/`___` are legal CFML identifiers and real
+/// frameworks store data members under them (FW/1 DI/1 & AOP/1 use e.g.
+/// `this["___doReverse"]`); a prefix test wrongly hides — or, in the C.3 producer
+/// partition, wrongly DISCARDS — such user data. Lucee never had this problem
+/// because its engine internals are Java object fields, never struct members.
+///
+/// Authoritative list: `C2planDoc.md` §3 / `COMPONENT_MODEL_PHASE_C0_CENSUS.md`.
+/// Uses:
+///  - C.3 producer partition (route ONLY these keys to the blueprint / typed
+///    `Instance` fields; everything else is user data → `this_members`/
+///    `variables_members`),
+///  - C.4 deletion of the blanket `starts_with("__")` filters.
+///
+/// SCOPE: component-instance members only. The `__java_shim`-gated Java-facade
+/// filters and the call-frame `__arguments__` scope key are SEPARATE concerns with
+/// their own (unchanged) handling — see `C2planDoc.md` §5.4/§6. `this` and `super`
+/// are separate scope handles, filtered by name elsewhere, not part of this set.
+///
+/// Case-insensitive on the exact set (CFML identifiers are case-insensitive; the
+/// engine stores these lowercase). A fast reject on the `__` prefix keeps the
+/// common case (every non-`__` key, including all single-`_` identifiers) at one
+/// comparison.
+#[inline]
+pub fn is_reserved_component_key(k: &str) -> bool {
+    // Fast path: only `__`-prefixed keys can be reserved. A single leading
+    // underscore is NEVER reserved (Lucee shows `_foo`; so do we).
+    if !k.as_bytes().starts_with(b"__") {
+        return false;
+    }
+    // Structured prefix families: per-method annotation blobs and the synthetic
+    // closure/arrow function-name prefixes.
+    if k.starts_with("__funcmeta_") || k.starts_with("__closure_") || k.starts_with("__arrow_") {
+        return true;
+    }
+    // Exact reserved set (C2planDoc.md §3). NOTE: reconcile against the C.0 census
+    // when wiring the C.3 producer partition — a MISSING entry leaks an engine key
+    // into user view; a SPURIOUS entry discards a user member. Keep this list and
+    // the census in lockstep.
+    const RESERVED: &[&str] = &[
+        "__variables",
+        "__name",
+        "__source_file",
+        "__source_names",
+        "__metadata",
+        "__properties",
+        "__super",
+        "__super_map",
+        "__rust_extends",
+        "__extends",
+        "__extends_chain",
+        "__implements",
+        "__implements_chain",
+        "__implements_fqns",
+        "__implements_src",
+        "__accessors",
+        "__is_interface",
+        "__is_super",
+        "__class_name",
+        "__instance_id",
+        "__static",
+        "__cfc_body__",
+        "__cfc_static_init__",
+        "__cfml_accessor_private__",
+        "__java_shim",
+        "__java_class",
+        "__dynamic_proxy",
+        "__proxy_method",
+        "__proxy_target",
+    ];
+    RESERVED.iter().any(|r| k.eq_ignore_ascii_case(r))
 }
 
 /// Lightweight, borrowed read view over a component instance.
@@ -173,6 +551,129 @@ impl<'a> CompRef<'a> {
             CompRef::Instance(inst) => inst.read().type_identifiers(),
         }
     }
+
+    /// True iff this view is backed by the flyweight [`Instance`] (vs the legacy
+    /// marker struct). Always callable: in a default build the `Instance` arm does
+    /// not exist so this is a const `false`, which lets an introspection caller
+    /// (`structKeyList`/`for`-in/`serializeJSON`/…) branch to the new data-direct
+    /// path ONLY for flyweight instances and leave the marker path byte-for-byte
+    /// unchanged — no `component-instance` feature flag needed at the call site.
+    #[inline]
+    pub fn is_instance_backed(&self) -> bool {
+        match self {
+            CompRef::Marker(_) => false,
+            #[cfg(feature = "component-instance")]
+            CompRef::Instance(_) => true,
+        }
+    }
+
+    // ---- Phase C.3 — Slice 4: introspection bridges (flyweight instances) ----
+    //
+    // These read `this_members` / `variables_members` DIRECTLY, with **NO
+    // `starts_with("__")` filter**: the flyweight data maps are already free of
+    // engine reserved keys (the producer partitioned them onto the blueprint /
+    // typed fields), and any `__`/`___` key that remains is genuine user data that
+    // MUST enumerate — FW/1 AOP's `___doReverse` is the whole reason C.3 exists
+    // (§5.2). Returns empty for a marker view; callers gate on `is_instance_backed`.
+
+    /// Public-scope keys for user-facing enumeration (`structKeyList`/`structCount`/
+    /// `structKeyArray`/`structKeyExists`, `for … in`): public DATA keys first,
+    /// then public/remote method names not shadowed by a data key.
+    pub fn instance_public_keys(&self) -> Vec<String> {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            let mut keys: Vec<String> = g.this_members.snapshot().into_keys().collect();
+            for name in g.class.methods.keys() {
+                let is_public = matches!(
+                    g.class.method_access.get(&name.to_ascii_lowercase()),
+                    Some(crate::dynamic::CfmlAccess::Public)
+                        | Some(crate::dynamic::CfmlAccess::Remote)
+                );
+                if is_public && !keys.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+                    keys.push(name.clone());
+                }
+            }
+            return keys;
+        }
+        Vec::new()
+    }
+
+    /// Public members as `name -> value` (public DATA + public/remote methods) for
+    /// `for … in` value binding and member-BIF fallbacks.
+    pub fn instance_public_members(&self) -> crate::dynamic::ValueMap {
+        // `mut` is used only in the feature-on arm below; a default build never
+        // mutates it (the marker view returns the empty map).
+        #[allow(unused_mut)]
+        let mut out = crate::dynamic::ValueMap::default();
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            for (k, v) in g.this_members.snapshot() {
+                out.insert(k, v);
+            }
+            for (name, f) in g.class.methods.iter() {
+                let is_public = matches!(
+                    g.class.method_access.get(&name.to_ascii_lowercase()),
+                    Some(crate::dynamic::CfmlAccess::Public)
+                        | Some(crate::dynamic::CfmlAccess::Remote)
+                );
+                if is_public && !out.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+                    out.insert(name.clone(), CfmlValue::Function(f.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Public DATA only (`name -> value`, no methods) — for `serializeJSON` and
+    /// any data-projection that must exclude callables.
+    pub fn instance_public_data(&self) -> crate::dynamic::ValueMap {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            return inst.read().this_members.snapshot();
+        }
+        crate::dynamic::ValueMap::default()
+    }
+
+    /// Write a public DATA member (or inject a method as data) in place — the
+    /// `structAppend(instance, …)` / mixin-injection path. No-op on a marker view.
+    pub fn instance_set_public(&self, name: String, value: CfmlValue) {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            inst.read().this_members.insert(name, value);
+        }
+        #[cfg(not(feature = "component-instance"))]
+        let _ = (name, value);
+    }
+
+    /// Empty the public scope in place — `structClear(instance)`. Clears the public
+    /// data map AND drops the shared method table from both maps, so the object is
+    /// method-less until re-mixed (MockBox `clearMethods=true`), matching the marker
+    /// path. Identity + private data survive. No-op on a marker view.
+    pub fn instance_clear_public(&self) {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            g.this_members.with_write(|m| m.clear());
+            g.this_members.clear_method_table();
+            g.variables_members.clear_method_table();
+        }
+    }
+
+    /// True iff `name` is already a public member (data or public method) — for
+    /// `structAppend`'s non-overwrite mode.
+    pub fn instance_has_public(&self, name: &str) -> bool {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            return g.this_members.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+                || g.class.methods.keys().any(|k| k.eq_ignore_ascii_case(name));
+        }
+        #[cfg(not(feature = "component-instance"))]
+        let _ = name;
+        false
+    }
 }
 
 /// The dotted type identifiers a component instance satisfies for `isInstanceOf`
@@ -230,5 +731,237 @@ impl CfmlValue {
     #[inline]
     pub fn is_component(&self) -> bool {
         self.as_component().is_some()
+    }
+}
+
+#[cfg(test)]
+mod reserved_key_tests {
+    use super::is_reserved_component_key;
+
+    #[test]
+    fn user_double_and_triple_underscore_keys_are_not_reserved() {
+        // The regression this whole phase exists for: FW/1 AOP stashes the
+        // original method under a `___`-prefixed key. These MUST be treated as
+        // ordinary user data, never hidden/discarded.
+        for k in [
+            "___doReverse",
+            "___orig",
+            "__doReverse",
+            "__myVar",
+            "__foo",
+            "___",
+            "__",
+            "__init", // user method-ish name, not a reserved bookkeeping key
+        ] {
+            assert!(!is_reserved_component_key(k), "{k} must NOT be reserved");
+        }
+    }
+
+    #[test]
+    fn single_underscore_and_plain_keys_are_not_reserved() {
+        for k in ["_single", "_variables", "name", "foo", "this", "super", "static"] {
+            assert!(!is_reserved_component_key(k), "{k} must NOT be reserved");
+        }
+    }
+
+    #[test]
+    fn engine_bookkeeping_keys_are_reserved() {
+        for k in [
+            "__variables",
+            "__name",
+            "__metadata",
+            "__properties",
+            "__super",
+            "__super_map",
+            "__extends_chain",
+            "__implements_fqns",
+            "__instance_id",
+            "__static",
+            "__source_file",
+            "__accessors",
+            "__is_super",
+            "__cfc_body__",
+            "__java_shim",
+        ] {
+            assert!(is_reserved_component_key(k), "{k} MUST be reserved");
+        }
+    }
+
+    #[test]
+    fn reserved_set_is_case_insensitive() {
+        // CFML identifiers are case-insensitive; the engine stores these lowercase
+        // but a member read/enumeration may present another casing.
+        assert!(is_reserved_component_key("__VARIABLES"));
+        assert!(is_reserved_component_key("__Name"));
+        assert!(is_reserved_component_key("__Metadata"));
+    }
+
+    #[test]
+    fn structured_prefix_families_are_reserved() {
+        assert!(is_reserved_component_key("__funcmeta_doReverse"));
+        assert!(is_reserved_component_key("__closure_1"));
+        assert!(is_reserved_component_key("__arrow_42"));
+        // ...but a user key that merely *starts like* a family prefix without the
+        // underscore boundary is still evaluated by the exact rules above.
+        assert!(!is_reserved_component_key("__funcmetadata")); // not `__funcmeta_`
+    }
+}
+
+#[cfg(all(test, feature = "component-instance"))]
+mod producer_tests {
+    use super::*;
+    use crate::dynamic::{
+        CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlStruct, CfmlValue, ValueMap,
+    };
+    use std::sync::Arc;
+
+    fn method(name: &str, access: CfmlAccess) -> CfmlValue {
+        CfmlValue::Function(Arc::new(CfmlFunction {
+            name: name.to_string(),
+            params: Vec::new(),
+            body: CfmlClosureBody::Statements(Vec::new()),
+            return_type: None,
+            access,
+            captured_scope: None,
+        }))
+    }
+
+    /// Build a finished-shape marker: public (top-level) `this` scope carries data
+    /// members, methods, and the reserved bookkeeping keys; `__variables` carries
+    /// private data + a mirrored method.
+    fn build_marker() -> CfmlStruct {
+        let mut vars = ValueMap::default();
+        vars.insert("privvar".to_string(), CfmlValue::string("PV"));
+        vars.insert("___privstash".to_string(), CfmlValue::string("PS")); // user triple-underscore
+        vars.insert("greet".to_string(), method("greet", CfmlAccess::Public));
+        vars.insert("secret".to_string(), method("secret", CfmlAccess::Private));
+
+        let mut top = ValueMap::default();
+        top.insert("plain".to_string(), CfmlValue::string("P"));
+        top.insert("___doreverse".to_string(), CfmlValue::string("STASHED")); // FW/1 AOP case
+        top.insert("_single".to_string(), CfmlValue::string("S1")); // single underscore
+        top.insert("greet".to_string(), method("greet", CfmlAccess::Public));
+        top.insert("__name".to_string(), CfmlValue::string("oop.Foo"));
+        top.insert("__source_file".to_string(), CfmlValue::string("/app/Foo.cfc"));
+        top.insert("__instance_id".to_string(), CfmlValue::Int(7));
+        top.insert(
+            "__metadata".to_string(),
+            CfmlValue::Struct(CfmlStruct::new(ValueMap::default())),
+        );
+        top.insert("__variables".to_string(), CfmlValue::Struct(CfmlStruct::new(vars)));
+
+        CfmlStruct::new(top)
+    }
+
+    #[test]
+    fn blueprint_captures_methods_and_metadata_only() {
+        let marker = build_marker();
+        let bp = ClassBlueprint::from_marker(&marker);
+        assert_eq!(bp.name, "oop.Foo");
+        assert_eq!(bp.source_file, "/app/Foo.cfc");
+        // Public + private (mirrored/private-only) methods, deduped.
+        assert!(bp.methods.contains_key("greet"));
+        assert!(bp.methods.contains_key("secret"));
+        assert_eq!(bp.method_access.get("greet"), Some(&CfmlAccess::Public));
+        assert_eq!(bp.method_access.get("secret"), Some(&CfmlAccess::Private));
+        // Data must NEVER be captured as a method.
+        assert!(!bp.methods.contains_key("plain"));
+        assert!(!bp.methods.contains_key("___doreverse"));
+        assert!(matches!(bp.metadata, CfmlValue::Struct(_)));
+    }
+
+    #[test]
+    fn data_maps_carry_user_data_including_double_underscore_keys() {
+        let marker = build_marker();
+        let bp = Arc::new(ClassBlueprint::from_marker(&marker));
+        let inst = Instance::from_marker(&marker, bp, 7);
+
+        // The raw data MAP (iter is map-only; methods live in the shared table).
+        let map_has = |s: &CfmlStruct, k: &str| s.iter().any(|(mk, _)| mk.eq_ignore_ascii_case(k));
+
+        // Public DATA: plain + the `__`/`___`/`_` user keys survive; methods and
+        // reserved bookkeeping keys are NOT in the data map.
+        let this = &inst.this_members;
+        let sval = |s: &CfmlStruct, k: &str| s.get_ci(k).map(|v| v.as_string());
+        assert_eq!(sval(this, "plain").as_deref(), Some("P"));
+        // THE regression this whole phase exists for — must be present as DATA.
+        assert_eq!(sval(this, "___doreverse").as_deref(), Some("STASHED"));
+        assert_eq!(sval(this, "_single").as_deref(), Some("S1"));
+        assert!(!map_has(this, "greet"), "method leaked into this_members map");
+        assert!(!map_has(this, "__name"), "reserved key leaked into data map");
+        assert!(!map_has(this, "__source_file"));
+        assert!(!map_has(this, "__instance_id"));
+        assert!(!map_has(this, "__metadata"));
+        assert!(!map_has(this, "__variables"));
+        // But the method IS resolvable through the shared table (dispatch path).
+        assert!(matches!(this.get_ci("greet"), Some(CfmlValue::Function(_))));
+
+        // Private DATA: user keys survive; the private method is not in the map.
+        let vars = &inst.variables_members;
+        assert_eq!(sval(vars, "privvar").as_deref(), Some("PV"));
+        assert_eq!(sval(vars, "___privstash").as_deref(), Some("PS"));
+        assert!(!map_has(vars, "greet"));
+        assert!(!map_has(vars, "secret"));
+    }
+
+    #[test]
+    fn duplicate_deep_copies_data_but_shares_blueprint() {
+        let marker = build_marker();
+        let value = make_instance_value(
+            &marker,
+            Arc::new(ClassBlueprint::from_marker(&marker)),
+            7,
+        );
+        let dup = value.deep_copy();
+        let (orig, copy) = match (&value, &dup) {
+            (CfmlValue::Instance(a), CfmlValue::Instance(b)) => (a.clone(), b.clone()),
+            _ => panic!("duplicate did not yield an Instance"),
+        };
+        // Distinct instance handles (value semantics) but the SAME shared blueprint.
+        assert!(!Arc::ptr_eq(&orig, &copy), "duplicate shared the instance handle");
+        assert!(
+            Arc::ptr_eq(&orig.read().class, &copy.read().class),
+            "duplicate should share the class blueprint"
+        );
+        // Mutating the copy's public data does not affect the original.
+        copy.read().this_members.insert("plain".to_string(), CfmlValue::string("CHANGED"));
+        assert_eq!(
+            orig.read().this_members.get_ci("plain").map(|v| v.as_string()).as_deref(),
+            Some("P")
+        );
+        assert_eq!(
+            copy.read().this_members.get_ci("plain").map(|v| v.as_string()).as_deref(),
+            Some("CHANGED")
+        );
+        // The copy still dispatches its methods (shared table survived).
+        assert!(matches!(copy.read().this_members.get_ci("greet"), Some(CfmlValue::Function(_))));
+    }
+
+    #[test]
+    fn self_reference_is_retargeted_to_the_instance_handle() {
+        // The classic C.2.3 self-reference: `variables[classname] = this`.
+        let marker = build_marker();
+        if let Some(CfmlValue::Struct(vars)) = marker.get_ci("__variables") {
+            vars.with_write(|m| {
+                m.insert("foo".to_string(), CfmlValue::Struct(marker.clone()));
+            });
+        } else {
+            panic!("no __variables");
+        }
+
+        let bp = Arc::new(ClassBlueprint::from_marker(&marker));
+        let value = make_instance_value(&marker, bp, 7);
+        let handle = match &value {
+            CfmlValue::Instance(h) => h.clone(),
+            _ => panic!("producer did not yield an Instance"),
+        };
+        let g = handle.read();
+        match g.variables_members.get_ci("foo") {
+            // Retargeted to the live instance, NOT a retained marker clone.
+            Some(CfmlValue::Instance(inner)) => {
+                assert!(Arc::ptr_eq(&inner, &handle), "self-ref points at a different instance");
+            }
+            other => panic!("self-reference not retargeted: {other:?}"),
+        }
     }
 }

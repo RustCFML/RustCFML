@@ -2977,6 +2977,14 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
 }
 
 fn fn_struct_count(args: Vec<CfmlValue>) -> CfmlResult {
+    // Phase C.3 — Slice 4: a flyweight instance enumerates its public members from
+    // the data maps directly (no `__` filter). `is_instance_backed()` is const
+    // `false` in a default build, so the marker path below is untouched.
+    if let Some(comp) = args.first().and_then(|v| v.as_component()) {
+        if comp.is_instance_backed() {
+            return Ok(CfmlValue::Int(comp.instance_public_keys().len() as i64));
+        }
+    }
     match args.first() {
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Int(visible_struct_keys(s).len() as i64)),
         // A query's columns are its keys (Lucee parity, issue #146).
@@ -2988,6 +2996,16 @@ fn fn_struct_count(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let key = args[1].as_string();
+        // Phase C.3 — Slice 4: flyweight instance — check public members directly.
+        if let Some(comp) = args[0].as_component() {
+            if comp.is_instance_backed() {
+                let exists = comp
+                    .instance_public_keys()
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(&key));
+                return Ok(CfmlValue::Bool(exists));
+            }
+        }
         match &args[0] {
             CfmlValue::Struct(s) => {
                 let found = struct_find_key_ci(s, &key).is_some();
@@ -3047,6 +3065,12 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(comp) = args.first().and_then(|v| v.as_component()) {
+        if comp.is_instance_backed() {
+            let delimiter = get_delimiter(&args, 1);
+            return Ok(CfmlValue::string(comp.instance_public_keys().join(&delimiter)));
+        }
+    }
     match args.first() {
         Some(CfmlValue::Struct(s)) => {
             let delimiter = get_delimiter(&args, 1);
@@ -3061,6 +3085,16 @@ fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(comp) = args.first().and_then(|v| v.as_component()) {
+        if comp.is_instance_backed() {
+            let keys: Vec<CfmlValue> = comp
+                .instance_public_keys()
+                .into_iter()
+                .map(CfmlValue::string)
+                .collect();
+            return Ok(CfmlValue::array(keys));
+        }
+    }
     let keys: Vec<CfmlValue> = match args.first() {
         Some(CfmlValue::Struct(s)) => {
             visible_struct_keys(s).into_iter().map(CfmlValue::string).collect()
@@ -3226,6 +3260,14 @@ fn struct_find_value_recursive(
 }
 
 fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    // Phase C.3 — Slice 4/5: a flyweight instance clears its public scope (data +
+    // method table) in place, keeping identity + private data (MockBox pattern).
+    if let Some(comp) = args.first().and_then(|v| v.as_component()) {
+        if comp.is_instance_backed() {
+            comp.instance_clear_public();
+            return Ok(args.into_iter().next().unwrap_or(CfmlValue::Null));
+        }
+    }
     // Empty the shared handle in place (Lucee reference semantics).
     if let Some(CfmlValue::Struct(s)) = args.first() {
         // A CFC instance is represented as a Struct carrying engine-internal
@@ -3274,6 +3316,42 @@ fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // Phase C.3 — Slice 4: destination is a flyweight instance (the mixin
+        // injection path `structAppend(target, mixins, true)` — the merged Function
+        // values become injected data-methods on the instance). `is_instance_backed`
+        // is const false in a default build, so the marker path below is untouched.
+        if let Some(dst) = args[0].as_component() {
+            if dst.is_instance_backed() {
+                let overwrite = if args.len() >= 3 { args[2].is_true() } else { true };
+                // Source members: a plain struct's entries, or a component's public
+                // members (data + public methods). Skip engine `__` keys from a
+                // marker source; user `__`/`___` DATA keys from a flyweight source
+                // are already the only `__` keys its public view yields.
+                let src: ValueMap = match &args[1] {
+                    CfmlValue::Struct(b) => b.snapshot(),
+                    other => other
+                        .as_component()
+                        .map(|c| c.instance_public_members())
+                        .unwrap_or_default(),
+                };
+                let src_is_marker = matches!(&args[1], CfmlValue::Struct(b)
+                    if b.contains_key("__variables") || b.contains_key("__name"));
+                for (k, v) in src {
+                    if src_is_marker
+                        && (k.starts_with("__")
+                            || k.eq_ignore_ascii_case("this")
+                            || k.eq_ignore_ascii_case("super"))
+                    {
+                        continue;
+                    }
+                    if !overwrite && dst.instance_has_public(&k) {
+                        continue;
+                    }
+                    dst.instance_set_public(k, v);
+                }
+                return Ok(args[0].clone());
+            }
+        }
         if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (&args[0], &args[1]) {
             // Mutate the first struct's shared handle in place (Lucee semantics).
             let overwrite = if args.len() >= 3 { args[2].is_true() } else { true };
@@ -3311,6 +3389,23 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             return Ok(CfmlValue::Struct(a.clone()));
+        }
+        // Phase C.3 — Slice 4: destination is a plain struct, SOURCE is a flyweight
+        // instance (ColdBox `structAppend(settings, new Settings())`, TestBox
+        // `addMatchers(new CustomMatcher())` — fold the CFC's public data + methods
+        // into the struct).
+        if let CfmlValue::Struct(a) = &args[0] {
+            if let Some(src) = args[1].as_component() {
+                if src.is_instance_backed() {
+                    let overwrite = if args.len() >= 3 { args[2].is_true() } else { true };
+                    for (k, v) in src.instance_public_members() {
+                        if overwrite || struct_find_key_ci(a, &k).is_none() {
+                            a.insert(k, v);
+                        }
+                    }
+                    return Ok(CfmlValue::Struct(a.clone()));
+                }
+            }
         }
     }
     Ok(args.into_iter().next().unwrap_or(CfmlValue::strukt(ValueMap::default())))
@@ -5590,6 +5685,28 @@ fn json_escape_str(s: &str) -> String {
 }
 
 fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) -> String {
+    // Phase C.3 — Slice 4: a flyweight instance serializes its public DATA members
+    // directly (no methods, no `__` filter — the data map is already clean, so
+    // user `__`/`___` keys serialize like any other). `is_instance_backed()` is
+    // const `false` in a default build, leaving the marker path (serialize_struct)
+    // untouched.
+    if let Some(comp) = val.as_component() {
+        if comp.is_instance_backed() {
+            let data = comp.instance_public_data();
+            let items: Vec<String> = data
+                .iter()
+                .filter(|(_, v)| !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_)))
+                .map(|(k, v)| {
+                    format!(
+                        "\"{}\":{}",
+                        json_escape_str(k),
+                        serialize_value(v, visited, by_columns)
+                    )
+                })
+                .collect();
+            return format!("{{{}}}", items.join(","));
+        }
+    }
     match val {
         CfmlValue::Null => "null".to_string(),
         CfmlValue::Bool(b) => b.to_string(),
@@ -6854,6 +6971,23 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
     let obj = &args[0];
     let type_name = args[1].as_string();
     let type_lower = type_name.to_lowercase();
+
+    // Phase C.3 — Slice 5: flyweight instance — match against its precomputed type
+    // identifiers (own name + superclass chain + interfaces), plus the base
+    // "component" type. `is_instance_backed()` is const false in a default build.
+    if let Some(comp) = obj.as_component() {
+        if comp.is_instance_backed() {
+            if type_lower == "component" {
+                return Ok(CfmlValue::Bool(true));
+            }
+            let matched = comp.type_identifiers().iter().any(|id| {
+                let l = id.to_lowercase();
+                l == type_lower
+                    || l.rsplit('.').next().map(|seg| seg == type_lower).unwrap_or(false)
+            });
+            return Ok(CfmlValue::Bool(matched));
+        }
+    }
 
     if let CfmlValue::Struct(s) = obj {
         // Lucee parity: every CFC is an instance of the base type "Component"

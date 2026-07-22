@@ -2040,6 +2040,48 @@ impl CfmlValue {
                 seen.insert(ptr, copy.clone());
                 copy
             }
+            // Phase C.3 — Slice 5: `duplicate()` of a flyweight instance. Break the
+            // shared handle: fresh instance with DEEP-copied data maps, but the
+            // class blueprint + static scope stay shared (class-invariant). Cycle-
+            // safe: the new (empty-map) instance is registered in `seen` BEFORE the
+            // data is copied, so a self-reference resolves to the copy.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let ptr = std::sync::Arc::as_ptr(inst) as *const () as usize;
+                if let Some(existing) = seen.get(&ptr) {
+                    return existing.clone();
+                }
+                let g = inst.read();
+                let this_members = CfmlStruct::empty();
+                let variables_members = CfmlStruct::empty();
+                this_members.set_method_table(g.class.method_values.clone());
+                variables_members.set_method_table(g.class.method_values.clone());
+                if let Some(ref stat) = g.class.static_scope {
+                    // Shared per-class static store — attach, do NOT deep-copy.
+                    variables_members.insert("__static".to_string(), stat.clone());
+                }
+                let new_inst = std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::component::Instance {
+                        class: g.class.clone(),
+                        this_members: this_members.clone(),
+                        variables_members: variables_members.clone(),
+                        instance_id: g.instance_id,
+                    },
+                ));
+                seen.insert(ptr, CfmlValue::Instance(new_inst.clone()));
+                for (k, v) in g.this_members.snapshot() {
+                    let dv = v.deep_copy_guarded(seen, share_nested_components, false);
+                    this_members.insert(k, dv);
+                }
+                for (k, v) in g.variables_members.snapshot() {
+                    if k.eq_ignore_ascii_case("__static") {
+                        continue; // shared, already attached
+                    }
+                    let dv = v.deep_copy_guarded(seen, share_nested_components, false);
+                    variables_members.insert(k, dv);
+                }
+                CfmlValue::Instance(new_inst)
+            }
             other => other.clone(),
         }
     }
