@@ -313,6 +313,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_property_no_accessors_onmissing.cfm">
 <cf_runtest file="oop/test_unquoted_property_accessors.cfm">
 <cf_runtest file="oop/test_called_name_alias.cfm">
+<cf_runtest file="oop/test_new_returns_init.cfm">
 <cf_runtest file="oop/test_pseudo_ctor_parent_this.cfm">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">
 <cf_runtest file="oop/test_arg_type_validation.cfm">

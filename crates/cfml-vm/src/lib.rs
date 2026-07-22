@@ -9113,32 +9113,58 @@ impl CfmlVirtualMachine {
                                     let _ = &result;
                                     instance.clone()
                                 }
-                                // Marker path (default build) — unchanged.
+                                // Marker path (default build).
                                 _ => {
                                     // Apply variables scope writeback from init() to the component
                                     let vars_wb = self.method_variables_writeback.take();
-                                    let final_obj = if let Some(modified_this) =
-                                        self.method_this_writeback.take()
-                                    {
-                                        modified_this
-                                    } else if let CfmlValue::Struct(_) = &result {
+                                    let this_wb = self.method_this_writeback.take();
+                                    // Lucee/ACF: `new X(args)` desugars to
+                                    // `createObject("component","X").init(args)` and returns
+                                    // init()'s RETURN VALUE when it is non-null — not always the
+                                    // instance. The explicit createObject().init() form already
+                                    // does this; `new X()` must match. Almost every init() ends
+                                    // `return this;` (result shares the instance's Arc — its
+                                    // this/variables mutations are already present) or returns
+                                    // void/null (return the instance). Only when init returns a
+                                    // GENUINELY DIFFERENT object — e.g. FW/1's facade whose init
+                                    // returns `request._fw1.theFramework` — does the distinction
+                                    // bite: Lucee hands that object back, and we must NOT graft
+                                    // this (facade) component's variables scope onto it.
+                                    let result_is_foreign = match (&result, &instance) {
+                                        (CfmlValue::Null, _) => false,
+                                        (CfmlValue::Struct(rs), CfmlValue::Struct(is)) => {
+                                            !rs.ptr_eq(is)
+                                        }
+                                        // A non-null, non-struct return (or a struct from a
+                                        // non-struct instance) is a distinct value Lucee returns
+                                        // verbatim.
+                                        _ => true,
+                                    };
+                                    if result_is_foreign {
                                         result
                                     } else {
-                                        instance.clone()
-                                    };
-                                    // Merge init()'s __variables mutations back into the component.
-                                    // `vars` is the (Arc-shared) __variables the init frame
-                                    // mutated in place; storing the handle is an identity write
-                                    // when the component already shares that store.
-                                    if let Some(vars) = vars_wb {
-                                        if let Some(s) = final_obj.as_cfml_struct() {
-                                            s.insert(
-                                                "__variables".to_string(),
-                                                CfmlValue::Struct(vars),
-                                            );
+                                        let final_obj = if let Some(modified_this) = this_wb {
+                                            modified_this
+                                        } else if let CfmlValue::Struct(_) = &result {
+                                            result
+                                        } else {
+                                            instance.clone()
+                                        };
+                                        // Merge init()'s __variables mutations back into the
+                                        // component. `vars` is the (Arc-shared) __variables the
+                                        // init frame mutated in place; storing the handle is an
+                                        // identity write when the component already shares that
+                                        // store.
+                                        if let Some(vars) = vars_wb {
+                                            if let Some(s) = final_obj.as_cfml_struct() {
+                                                s.insert(
+                                                    "__variables".to_string(),
+                                                    CfmlValue::Struct(vars),
+                                                );
+                                            }
                                         }
+                                        final_obj
                                     }
-                                    final_obj
                                 }
                             }
                         } else if let CfmlValue::Struct(_) = instance {
