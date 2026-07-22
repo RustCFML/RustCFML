@@ -617,6 +617,42 @@ impl CfmlStruct {
         CfmlStruct(arc)
     }
 
+    /// Like [`CfmlStruct::new`] but SKIPS the cycle-GC allocation log
+    /// ([`cycle_gc::log_struct`]) — the per-allocation `LocalKey::with` /
+    /// `Weak::downgrade` that dominates serve-mode call dispatch (~25% in the
+    /// profile; call-dispatch Lever C).
+    ///
+    /// SOUNDNESS: only ever pass a struct the caller can PROVE never outlives its
+    /// creating call frame — i.e. it is dropped by refcounting at frame return and
+    /// can never become part of a cycle that survives the request. An *unlogged*
+    /// allocation is absent from the collector's survivor set, so edges to it read
+    /// as external ownership (a live root) and its subgraph is protected
+    /// (`cycle_gc.rs` "unlogged ⟹ external root ⟹ never over-collected"). Thus an
+    /// untracked struct can NEVER be over-collected (no UAF); the only failure mode
+    /// of a WRONG call is a bounded per-request leak if the "non-escaping" struct
+    /// actually did form a surviving cycle — which the RSS-flat gate guards. When
+    /// in doubt, use [`CfmlStruct::new`].
+    #[inline]
+    pub fn new_untracked(m: ValueMap) -> Self {
+        let ci = if m.len() > CI_THRESHOLD {
+            let mut ci =
+                HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
+            for k in m.keys() {
+                ci.insert(k.to_ascii_lowercase(), k.clone());
+            }
+            ci
+        } else {
+            HashMap::with_hasher(ValueBuildHasher::default())
+        };
+        CfmlStruct(Arc::new(PlRwLock::new(StructInner {
+            map: m,
+            ci,
+            shape_id: next_shape_id(),
+            this_alias: None,
+            method_table: None,
+        })))
+    }
+
     /// Attach a shared per-class method table (component-model flyweight). After
     /// this, method lookups that miss the per-instance `map` fall through to
     /// `table`. Bumps `shape_id` so JIT/IC caches re-resolve.
@@ -1816,6 +1852,14 @@ impl CfmlValue {
     #[inline]
     pub fn strukt(m: ValueMap) -> Self {
         CfmlValue::Struct(CfmlStruct::new(m))
+    }
+
+    /// `strukt` variant that skips the cycle-GC allocation log — see
+    /// [`CfmlStruct::new_untracked`] for the strict soundness contract. Use ONLY
+    /// for a struct provably confined to its creating call frame.
+    #[inline]
+    pub fn strukt_untracked(m: ValueMap) -> Self {
+        CfmlValue::Struct(CfmlStruct::new_untracked(m))
     }
 
     /// Borrow the shared array handle (no copy). Mutating through it is visible

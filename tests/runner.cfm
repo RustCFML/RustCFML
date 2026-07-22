@@ -354,6 +354,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_repeated_instantiation.cfm">
 <cf_runtest file="oop/test_component_mapping_paths.cfm">
 <cf_runtest file="functions/test_dynamic_named_args.cfm">
+<cf_runtest file="functions/test_arguments_scope_lever_c.cfm">
 <cf_runtest file="oop/test_component_method_named_args.cfm">
 <cf_runtest file="oop/test_component_method_precedence.cfm">
 <cf_runtest file="oop/test_method_ref_binding.cfm">

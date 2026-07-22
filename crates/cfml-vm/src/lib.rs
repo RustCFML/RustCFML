@@ -68,6 +68,19 @@ const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 /// `scope_aware_store` / `lookup_name_in_scopes`.
 const ARGUMENTS_SCOPE_KEY: &str = "__arguments__";
 
+/// Call-dispatch **Lever C** kill-switch. When `true` (the default), a per-call
+/// `arguments` scope that provably can't escape its frame is allocated *untracked*
+/// (skipping the cycle-GC `log_struct` = `LocalKey::with` + `Weak::downgrade`).
+/// Set `RUSTCFML_NO_UNTRACKED_ARGS=1` to force every arguments scope back onto the
+/// tracked path — a field safety valve (mirroring `RUSTCFML_NO_CYCLE_GC`) and the
+/// A/B toggle for the mandated serve-mode RSS-flat / profile gate. Read once.
+#[inline]
+fn lever_c_untracking_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTCFML_NO_UNTRACKED_ARGS").is_none())
+}
+
 /// A stored `CfmlValue::Function` body is `CfmlClosureBody::Expression(Int(n))`
 /// where `n` is the target function's process-stable `BytecodeFunction.global_id`
 /// (see `cfml_codegen::compiler::next_global_fn_id`). `DefineFunction` ops carry
@@ -1526,6 +1539,12 @@ pub struct CfmlVirtualMachine {
     /// process-stable `global_id`: a function's bytecode never changes, so a
     /// cached entry stays valid across requests in serve mode.
     arguments_scope_needed_cache: HashMap<u32, bool>,
+    /// Memoized companion to `arguments_scope_needed_cache` for call-dispatch
+    /// Lever C: `true` when the eagerly-built `arguments` scope struct provably
+    /// CANNOT escape its call frame, so it may be allocated *untracked* (skipping
+    /// the per-alloc cycle-GC `log_struct` / `LocalKey::with`). Keyed by the same
+    /// process-stable `global_id`. See `arguments_scope_can_skip_tracking`.
+    arguments_scope_untracked_cache: HashMap<u32, bool>,
     /// Set whenever a `DefineFunction` op runs during a request. A new
     /// `CfmlValue::Function` can ONLY be born via that op (closures, arrows,
     /// component methods, and function references all compile to it), so if it
@@ -2027,6 +2046,7 @@ impl CfmlVirtualMachine {
             fn_registry: Vec::new(),
             arguments_params_cache: HashMap::new(),
             arguments_scope_needed_cache: HashMap::new(),
+            arguments_scope_untracked_cache: HashMap::new(),
             app_fn_table_dirty: false,
             cache: HashMap::new(),
             cache_hits: 0,
@@ -4339,6 +4359,91 @@ impl CfmlVirtualMachine {
         b
     }
 
+    /// Call-dispatch **Lever C**: decide, from a function's bytecode alone,
+    /// whether its eagerly-built `arguments` scope struct provably CANNOT escape
+    /// the call frame — in which case it can be allocated *untracked*
+    /// ([`CfmlStruct::new_untracked`]), skipping the per-allocation cycle-GC
+    /// `log_struct` (`LocalKey::with` + `Weak::downgrade`) that dominates
+    /// serve-mode call dispatch.
+    ///
+    /// The only handle to the arguments struct inside a body is a
+    /// `LoadLocal`/`TryLoadLocal("arguments")` op, which pushes the WHOLE struct
+    /// onto the operand stack. The struct escapes the frame iff that value can be
+    /// stored, returned, forwarded as a call argument (`argumentCollection=
+    /// arguments`), or captured by a closure. It is consumed harmlessly — only a
+    /// member VALUE, never the struct, survives — when the load is IMMEDIATELY
+    /// followed by a `GetProperty`/`TryGetProperty` (the `arguments.foo` read
+    /// shape, which for a reserved scope name compiles to exactly those two
+    /// adjacent ops). This is a deliberately CONSERVATIVE over-approximation: any
+    /// other shape (`arguments[N]`, `structKeyExists(arguments,…)`,
+    /// `argumentCollection=arguments`, a bare `arguments` load) keeps tracking.
+    ///
+    /// Returns `false` (⇒ track, the safe default) when ANY of these hold:
+    /// - a `DefineFunction` op exists — a closure/arrow/nested fn is born here and
+    ///   captures a COPY of `locals` (incl. the arguments Arc) → escape;
+    /// - an `Include`/`IncludeDynamic`/`cfmodule`/`cfcustomtag` op exists — the
+    ///   arguments scope bridges into the child/included frame;
+    /// - a `String` op references `arguments` (isDefined/evaluate/QoQ string forms
+    ///   reach the scope by name, outside this op-level model);
+    /// - a bare `LoadLocal/TryLoadLocal("arguments")` is NOT immediately followed
+    ///   by a property read.
+    ///
+    /// Correctness of program behaviour is UNAFFECTED either way (tracking is pure
+    /// GC bookkeeping); a wrong `true` can only ever cause a bounded per-request
+    /// leak (never a UAF — see [`CfmlStruct::new_untracked`]), guarded by the
+    /// mandatory serve-mode RSS-flat gate.
+    fn arguments_scope_never_escapes(instructions: &[BytecodeOp]) -> bool {
+        for (i, op) in instructions.iter().enumerate() {
+            match op {
+                // A closure/arrow/nested-fn definition captures the frame's
+                // locals (including the arguments Arc) → the struct can escape.
+                BytecodeOp::DefineFunction(_) => return false,
+                // The scope bridges into an included / custom-tag / cfmodule frame.
+                BytecodeOp::Include(_) | BytecodeOp::IncludeDynamic => return false,
+                BytecodeOp::LoadGlobal(s) => {
+                    let base = s.strip_prefix("__").unwrap_or(s);
+                    if base.eq_ignore_ascii_case("cfmodule")
+                        || base.eq_ignore_ascii_case("cfcustomtag")
+                        || base.eq_ignore_ascii_case("cfcustomtag_start")
+                    {
+                        return false;
+                    }
+                }
+                // String-form access to the scope by name (isDefined/evaluate/QoQ)
+                // — reaches the struct outside this op-adjacency model.
+                BytecodeOp::String(s) => {
+                    let l = s.to_ascii_lowercase();
+                    if l == "arguments" || l.contains("arguments.") || l.contains("arguments[") {
+                        return false;
+                    }
+                }
+                // A load of the whole arguments struct. Safe ONLY when the very
+                // next op consumes it into a member value.
+                BytecodeOp::LoadLocal(s) | BytecodeOp::TryLoadLocal(s)
+                    if s.eq_ignore_ascii_case("arguments") =>
+                {
+                    match instructions.get(i + 1) {
+                        Some(BytecodeOp::GetProperty(_)) | Some(BytecodeOp::TryGetProperty(_)) => {}
+                        _ => return false,
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Memoized wrapper over [`Self::arguments_scope_never_escapes`], keyed by the
+    /// process-stable `global_id`.
+    fn arguments_scope_can_skip_tracking(&mut self, func: &BytecodeFunction) -> bool {
+        if let Some(&b) = self.arguments_scope_untracked_cache.get(&func.global_id) {
+            return b;
+        }
+        let b = Self::arguments_scope_never_escapes(&func.instructions);
+        self.arguments_scope_untracked_cache.insert(func.global_id, b);
+        b
+    }
+
     /// Lever D1: take a per-call `locals` map from the free-list (pre-sized to
     /// `cap`), or allocate a fresh one when the pool is empty. Pooled maps are
     /// empty (cleared on return), so `reserve` just pre-sizes the reused backing.
@@ -4655,6 +4760,16 @@ impl CfmlVirtualMachine {
                 .is_some_and(|e| !e.is_empty());
         let build_arguments_eager =
             is_template_frame || has_overflow_args || self.arguments_scope_needed(func);
+        // Call-dispatch Lever C: when the eager `arguments` scope provably can't
+        // escape this frame, build it UNTRACKED (skip the per-alloc cycle-GC
+        // `log_struct` = `LocalKey::with` + `Weak::downgrade`). Template frames
+        // (bridge to included/child) and overflow-arg calls (rc/prc-style extras
+        // that tend to be forwarded) stay tracked, conservatively.
+        let untrack_arguments_scope = lever_c_untracking_enabled()
+            && build_arguments_eager
+            && !is_template_frame
+            && !has_overflow_args
+            && self.arguments_scope_can_skip_tracking(func);
         // Pre-size (eager only): one entry per bound/overflow arg (whichever is
         // larger) plus the two `__arguments_*` markers. In the skip path this
         // stays an empty map that never allocates and is dropped unused.
@@ -4821,7 +4936,12 @@ impl CfmlVirtualMachine {
             }
             locals.insert(
                 ARGUMENTS_SCOPE_KEY.to_string(),
-                CfmlValue::strukt(arguments_map),
+                if untrack_arguments_scope {
+                    // Lever C: provably frame-confined → skip cycle-GC logging.
+                    CfmlValue::strukt_untracked(arguments_map)
+                } else {
+                    CfmlValue::strukt(arguments_map)
+                },
             );
         } else {
             // Skip path: the arguments scope is unobservable this call, so no
