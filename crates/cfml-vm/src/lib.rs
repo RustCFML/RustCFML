@@ -9103,15 +9103,32 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             match &instance {
                                 // Flyweight: init() mutated the Instance's shared maps
-                                // in place — discard the writeback stashes and return
-                                // the SAME Instance so identity is preserved (`this`
-                                // captured mid-init == the value handed to the caller).
+                                // in place — discard the writeback stashes. Return the
+                                // SAME Instance so identity is preserved (`this` captured
+                                // mid-init == the value handed to the caller) UNLESS
+                                // init() returned a GENUINELY DIFFERENT non-null object
+                                // (e.g. FW/1's facade returns request._fw1.theFramework):
+                                // Lucee/ACF hand that object back (`new X()` desugars to
+                                // createObject().init()). `return this` yields the same
+                                // Instance Arc, so its mutations are already present —
+                                // detect a foreign return by Arc identity. Mirrors the
+                                // marker path below.
                                 #[cfg(feature = "component-instance")]
-                                CfmlValue::Instance(_) => {
+                                CfmlValue::Instance(inst) => {
                                     self.method_variables_writeback.take();
                                     self.method_this_writeback.take();
-                                    let _ = &result;
-                                    instance.clone()
+                                    let result_is_foreign = match &result {
+                                        CfmlValue::Null => false,
+                                        CfmlValue::Instance(rinst) => {
+                                            !std::sync::Arc::ptr_eq(inst, rinst)
+                                        }
+                                        _ => true,
+                                    };
+                                    if result_is_foreign {
+                                        result
+                                    } else {
+                                        instance.clone()
+                                    }
                                 }
                                 // Marker path (default build).
                                 _ => {
