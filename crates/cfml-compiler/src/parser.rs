@@ -4361,11 +4361,23 @@ impl Parser {
         let loc = self.current_location();
 
         // Detect key-value syntax: property name="x" [type="y"] [inject="z"] ...;
-        // Key-value syntax is detected when an identifier is followed by = and a string
+        // Key-value syntax is `<ident> = <value> [<ident> = <value> ...]`. The value
+        // may be QUOTED (`name="x"`) or UNQUOTED — Lucee/ACF accept bare scalars on
+        // property attributes (`property name = colour getters = true type = string;`,
+        // the FW/1 stub shape). Detecting only quoted values sent the unquoted form to
+        // the positional parser below, which mis-read the leading `name` token as the
+        // property name (so `getMetadata().properties` was wrong and no implicit
+        // accessors were generated — FW/1's `getUserName()` etc. vanished). We do NOT
+        // treat a bare numeric (`property foo = 5`) as kv, so the positional
+        // default-shorthand `property [type] name = <number>` still parses as a default.
         let is_kv = {
             let has_ident = matches!(self.peek(0), Token::Identifier(_))
                 || self.token_as_string(&self.peek(0).clone()).is_some();
-            has_ident && matches!(self.peek(1), Token::Equal) && matches!(self.peek(2), Token::String(_))
+            let value_after_eq = matches!(
+                self.peek(2),
+                Token::String(_) | Token::Identifier(_) | Token::True | Token::False
+            );
+            has_ident && matches!(self.peek(1), Token::Equal) && value_after_eq
         };
 
         if is_kv {
