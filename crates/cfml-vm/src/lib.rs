@@ -6005,7 +6005,38 @@ impl CfmlVirtualMachine {
                         // than cloning it a second time — this is the hottest read
                         // path. `local_hit` is only consumed again in the
                         // mutually-exclusive "restore the data" else-if below.
-                        stack.push(local_hit.unwrap().1);
+                        let mut v = local_hit.unwrap().1;
+                        // A bare call resolving to a function stored under an ALIAS
+                        // key — a method replaced in-scope, e.g. FW/1 beanProxy's
+                        // `variables.doFront` now holding the proxy's
+                        // `$callPrivateMethod` — must report the alias (`doFront`)
+                        // from getFunctionCalledName(), not the function's declared
+                        // name. The callee is loaded BEFORE the args are evaluated
+                        // (codegen pushes the function first), so a nested call in an
+                        // argument (`doRear(doFront(x))`) drains `pending_called_name`
+                        // before the outer call consumes it — setting `pending` alone
+                        // is not enough. Rebind the function's own name to the alias
+                        // so the frame's `called_name` fallback (func.name) is correct
+                        // regardless of drain order. Only aliased functions (name !=
+                        // key) pay the clone; ordinary reads and self-calls are
+                        // untouched, keeping this hot path fast.
+                        if let CfmlValue::Function(ref f) = v {
+                            // Exclude synthesized closures/arrows: their generated
+                            // `__closure_`/`__arrow_` name is load-bearing (call_function
+                            // keys its live-capture env refresh off that prefix), so
+                            // renaming one to its storage key breaks deferred-closure
+                            // capture. Only genuine named methods are aliased.
+                            if !f.name.eq_ignore_ascii_case(name.as_str())
+                                && !f.name.starts_with("__closure_")
+                                && !f.name.starts_with("__arrow_")
+                            {
+                                self.pending_called_name = Some(name.clone());
+                                let mut bf = (**f).clone();
+                                bf.name = name.clone();
+                                v = CfmlValue::Function(Arc::new(bf));
+                            }
+                        }
+                        stack.push(v);
                     // 1b. Check __variables scope for CFC methods
                     } else if let Some(val) = locals.get("__variables").filter(|_| !skip_variables_method).and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
@@ -6076,6 +6107,20 @@ impl CfmlVirtualMachine {
                                     if !bf.name.eq_ignore_ascii_case(name.as_str()) {
                                         bf.name = name.clone();
                                     }
+                                    CfmlValue::Function(Arc::new(bf))
+                                } else if !f.name.eq_ignore_ascii_case(name.as_str())
+                                    && !f.name.starts_with("__closure_")
+                                    && !f.name.starts_with("__arrow_")
+                                {
+                                    // Non-foreign alias (a plain component method
+                                    // replaced in the variables scope under a
+                                    // different key): rebind the name so the
+                                    // frame's called_name survives a nested-call
+                                    // drain of pending_called_name. Closures/arrows
+                                    // keep their generated name (load-bearing for
+                                    // call_function's live-capture refresh).
+                                    let mut bf = (**f).clone();
+                                    bf.name = name.clone();
                                     CfmlValue::Function(Arc::new(bf))
                                 } else {
                                     val
@@ -11573,6 +11618,26 @@ impl CfmlVirtualMachine {
                         } else {
                             None
                         };
+                        // Alias attribution for getFunctionCalledName(). The frame's
+                        // called_name falls back to the RESOLVED function's declared
+                        // name (`user_func.name`, keyed by global_id) — but a call
+                        // through an ALIAS carries the alias only on `func_ref.name`
+                        // (set when the callee was loaded, e.g. FW/1 beanProxy's
+                        // `variables.doFront` holding the proxy's `$callPrivateMethod`,
+                        // renamed to "doFront" at resolution). `pending_called_name`
+                        // is the channel for that, but a nested call in an ARGUMENT
+                        // (`doRear(doFront(x))`) drains it before this outer call
+                        // runs — the callee is loaded before its args (compiler.rs).
+                        // Re-derive it HERE, immediately before execution (args are
+                        // already evaluated, so nothing can drain it): if the alias on
+                        // `func` differs from the resolved name and nothing more
+                        // specific is pending, surface the alias. A CallMethod alias
+                        // (set just before this call) is already pending and wins.
+                        if self.pending_called_name.is_none()
+                            && !func.name.eq_ignore_ascii_case(&user_func.name)
+                        {
+                            self.pending_called_name = Some(func.name.clone());
+                        }
                         let result = self.execute_function_with_args(
                             &user_func,
                             args,
