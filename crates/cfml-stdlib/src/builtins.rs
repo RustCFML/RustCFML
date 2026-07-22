@@ -2454,6 +2454,17 @@ fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
         // A complex value never equals a scalar (or a struct-vs-array mismatch).
         (CfmlValue::Struct(_), _) | (_, CfmlValue::Struct(_)) => false,
         (CfmlValue::Array(_), _) | (_, CfmlValue::Array(_)) => false,
+        // Flyweight component instances compare by REFERENCE (Lucee/ACF parity —
+        // same as the marker backing-ptr identity above). Without this an Instance
+        // fell to the `_ => as_string()` arm below, where EVERY component
+        // stringifies to "<Component>" → any two components compared EQUAL, so
+        // `arrayContains(seen, obj)` matched the first component of any class
+        // (breaking Wheels' circular-association cycle detection).
+        _ if a.as_component().is_some_and(|c| c.is_instance_backed())
+            || b.as_component().is_some_and(|c| c.is_instance_backed()) =>
+        {
+            cfml_common::component::same_component_instance(a, b)
+        }
         _ => {
             if nocase {
                 a.as_string().eq_ignore_ascii_case(&b.as_string())
@@ -3107,8 +3118,32 @@ fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::array(keys))
 }
 
+/// Component flyweight: if `v` is an instance-backed component, project its PUBLIC
+/// scope (data + public methods, accessor-private hidden) into a plain struct so the
+/// struct-family BIFs (read/search/copy) can reuse their existing `CfmlValue::Struct`
+/// logic on it. Returns None for a marker component, a plain struct, or any
+/// non-component — those already flow through the existing `Struct` arms. NOTE: the
+/// projection is a snapshot copy, so this is ONLY correct for read-only BIFs; mutating
+/// BIFs must go through the live `instance_set_public`/`instance_delete_public` helpers.
+#[inline]
+fn instance_public_as_struct(v: &CfmlValue) -> Option<CfmlValue> {
+    v.as_component()
+        .filter(|c| c.is_instance_backed())
+        .map(|c| CfmlValue::strukt(c.instance_public_members()))
+}
+
 fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // Flyweight component: delete the public member in place via the live
+        // instance (a Struct-only match no-oped, silently reporting deletion of a
+        // key it never removed).
+        if let Some(comp) = args[0].as_component().filter(|c| c.is_instance_backed()) {
+            let key = args[1].as_string();
+            let existed = comp.instance_has_public(&key);
+            comp.instance_delete_public(&key);
+            let indicate = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+            return Ok(CfmlValue::Bool(if indicate { existed } else { true }));
+        }
         if let CfmlValue::Struct(s) = &args[0] {
             // Mutate the shared handle in place (Lucee reference semantics):
             // aliases of the struct observe the deletion.
@@ -3128,6 +3163,17 @@ fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_insert(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
+        // Flyweight component: set the public member in place (a Struct-only match
+        // no-oped, so structInsert/structUpdate on a component were silently lost).
+        if let Some(comp) = args[0].as_component().filter(|c| c.is_instance_backed()) {
+            let key = args[1].as_string();
+            let allow_overwrite = if args.len() >= 4 { args[3].is_true() } else { true };
+            if comp.instance_has_public(&key) && !allow_overwrite {
+                return Err(CfmlError::runtime(format!("Key '{}' already exists in struct. Use allowOverwrite=true to overwrite.", key)));
+            }
+            comp.instance_set_public(key, args[2].clone());
+            return Ok(args[0].clone());
+        }
         if let CfmlValue::Struct(s) = &args[0] {
             // Mutate the shared handle in place (Lucee reference semantics).
             let key = args[1].as_string();
@@ -3153,6 +3199,7 @@ fn fn_struct_update(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_find(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_find(a); }
     if args.len() >= 2 {
         if let CfmlValue::Struct(s) = &args[0] {
             let key = args[1].as_string();
@@ -3166,6 +3213,7 @@ fn fn_struct_find(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_find_key(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_find_key(a); }
     if args.len() >= 2 {
         if let CfmlValue::Struct(s) = &args[0] {
             let key = get_str(&args, 1);
@@ -3213,6 +3261,7 @@ fn struct_find_key_recursive(
 }
 
 fn fn_struct_find_value(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_find_value(a); }
     if args.len() >= 2 {
         if let CfmlValue::Struct(s) = &args[0] {
             let search_value = get_str(&args, 1);
@@ -3307,6 +3356,7 @@ fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_copy(a); }
     // Shallow copy: a fresh top-level struct over the same (shared) values.
     match args.first() {
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::strukt(s.snapshot())),
@@ -3412,6 +3462,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_is_empty(a); }
     match args.first() {
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Bool(s.is_empty())),
         // A query's columns are its keys, so a query with columns is never
@@ -3422,6 +3473,7 @@ fn fn_struct_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_sort(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_sort(a); }
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let sort_type = if args.len() > 1 { get_str(&args, 1).to_lowercase() } else { "text".to_string() };
         let sort_order = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "asc".to_string() };
@@ -3509,6 +3561,7 @@ fn fn_struct_get(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_value_array(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_value_array(a); }
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let values: Vec<CfmlValue> = s.iter().map(|(_, v)| v).collect();
         Ok(CfmlValue::array(values))
@@ -3518,6 +3571,15 @@ fn fn_struct_value_array(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_equals(args: Vec<CfmlValue>) -> CfmlResult {
+    // Either side may be a flyweight component — project each to its public scope.
+    if args.len() >= 2
+        && (instance_public_as_struct(&args[0]).is_some() || instance_public_as_struct(&args[1]).is_some())
+    {
+        let mut a = args;
+        if let Some(s) = instance_public_as_struct(&a[0]) { a[0] = s; }
+        if let Some(s) = instance_public_as_struct(&a[1]) { a[1] = s; }
+        return fn_struct_equals(a);
+    }
     if args.len() >= 2 {
         if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (&args[0], &args[1]) {
             if a.len() != b.len() { return Ok(CfmlValue::Bool(false)); }
@@ -3547,6 +3609,7 @@ fn fn_struct_equals(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_struct_key_translate(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_key_translate(a); }
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let retain = args.get(1).map(|v| v.is_true()).unwrap_or(false);
         let mut result = ValueMap::default();
@@ -5907,6 +5970,13 @@ fn cfml_literal_string(s: &str) -> String {
 }
 
 fn serialize_cfml_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
+    // Flyweight component: serialize its DATA members as a struct literal (mirrors
+    // the marker path + `serializeJSON`). Without this an Instance missed every arm
+    // and rendered as `nullValue()`.
+    if let Some(comp) = val.as_component().filter(|c| c.is_instance_backed()) {
+        let s = CfmlValue::strukt(comp.instance_serialize_data());
+        return serialize_cfml_value(&s, visited);
+    }
     match val {
         CfmlValue::Null => "nullValue()".to_string(),
         CfmlValue::Bool(b) => b.to_string(),

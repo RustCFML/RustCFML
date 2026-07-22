@@ -555,6 +555,20 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
                 classify(cv, in_set, emit);
             }
         }
+        // A flyweight component `Instance` (`Arc<RwLock<Instance>>`) is a NON-tracked
+        // owner — treat it as OPAQUE / an external root, exactly like `NativeObject`.
+        // Its `this_members`/`variables_members` are owned by the Instance's `Arc`, so
+        // their `strong_count` already carries an EXTERNAL reference (from the
+        // non-tracked Instance) and they are protected by refcounting. Do NOT emit
+        // internal edges to them here: this collector computes
+        // `external(n) = strong_count − 1 − internal_in(n)` and collects nodes with
+        // `external == 0`, so emitting edges to the data maps would INFLATE their
+        // `internal_in`, drop `external` to 0, and OVER-COLLECT live component data.
+        // (An earlier "fix" that emitted those ptrs did exactly this: Preside's
+        // cached `EventHandlerBean` lost `variables.viewDispatch` on a warm request,
+        // 500ing the admin login page. Verified by bisection 2026-07-22.)
+        #[cfg(feature = "component-instance")]
+        CfmlValue::Instance(_) => {}
         _ => {}
     }
 }

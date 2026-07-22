@@ -454,6 +454,25 @@ pub fn is_component_backing(s: &CfmlStruct) -> bool {
     s.contains_key_ci("__variables") && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
 }
 
+/// True iff `a` and `b` are the SAME flyweight component instance (Arc identity).
+/// Lucee/ACF compare CFC instances by reference, so this is the flyweight analog of
+/// the marker path's `CfmlStruct::backing_ptr()` identity check — used by `===`,
+/// `arrayContains`/`arrayFind`, and any component identity test. A feature-flag-free
+/// facade so `cfml-stdlib` (which has no `component-instance` feature and cannot match
+/// `CfmlValue::Instance`) can call it; always `false` in a default (marker-only) build.
+#[inline]
+pub fn same_component_instance(a: &CfmlValue, b: &CfmlValue) -> bool {
+    #[cfg(feature = "component-instance")]
+    {
+        matches!((a, b), (CfmlValue::Instance(x), CfmlValue::Instance(y)) if std::sync::Arc::ptr_eq(x, y))
+    }
+    #[cfg(not(feature = "component-instance"))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
 /// True iff `k` is an engine-reserved component-instance bookkeeping key that
 /// must stay OUT of user-visible introspection (`structKeyExists`/`structKeyList`/
 /// `structKeyArray`/`structCount`/`structEach`, `for … in`, `serializeJSON`,
@@ -770,6 +789,24 @@ impl<'a> CompRef<'a> {
             return g.this_members.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
                 || (g.this_members.method_table().is_some()
                     && g.class.methods.keys().any(|k| k.eq_ignore_ascii_case(name)));
+        }
+        #[cfg(not(feature = "component-instance"))]
+        let _ = name;
+        false
+    }
+
+    /// Remove a public DATA member in place — `structDelete(instance, key)` /
+    /// `comp.key = null`. Removes from the public map and (covering a private-only
+    /// member) the private map; returns true iff a key was removed. Methods live on
+    /// the shared blueprint and are NOT deletable per-instance (a marker `structDelete`
+    /// of a method is likewise a data-map no-op). No-op on a marker view.
+    pub fn instance_delete_public(&self, name: &str) -> bool {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            let removed_pub = g.this_members.remove_ci(name).is_some();
+            let removed_priv = g.variables_members.remove_ci(name).is_some();
+            return removed_pub || removed_priv;
         }
         #[cfg(not(feature = "component-instance"))]
         let _ = name;

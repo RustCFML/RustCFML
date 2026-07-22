@@ -488,6 +488,19 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
                 }
             }
         }
+        // Flyweight component: render its public `this` data as a Component box —
+        // the HTML path (render_html) already has this arm; the CLI/text path
+        // fell to `_ => value_string` = "[complex]".
+        #[cfg(feature = "component-instance")]
+        CfmlValue::Instance(inst) => {
+            let g = inst.read();
+            let snap = g.this_members.snapshot();
+            out.push_str(&format!("Component {} ({})\n", g.class.name, snap.len()));
+            for (k, v) in snap.iter() {
+                out.push_str(&format!("{}  {} = ", pad, k));
+                render_text_child(v, indent + 1, out, visited);
+            }
+        }
         _ => {
             out.push_str(&value_string(value));
             out.push('\n');
@@ -500,6 +513,8 @@ fn render_text_child(value: &CfmlValue, indent: usize, out: &mut String, visited
         CfmlValue::Array(_) | CfmlValue::Struct(_) | CfmlValue::Query(_) | CfmlValue::Component(_) => {
             render_text(value, indent, out, visited)
         }
+        #[cfg(feature = "component-instance")]
+        CfmlValue::Instance(_) => render_text(value, indent, out, visited),
         _ => {
             out.push_str(&value_string(value));
             out.push('\n');

@@ -1510,6 +1510,14 @@ impl CfmlValue {
                 "Can't cast Object type [user defined function (closure)] to a value of type [string]"
                     .to_string(),
             )),
+            // Flyweight component instance: like a marker Struct component, it must
+            // THROW in a strict string context (Lucee parity) — not silently return
+            // the "<Component>" anti-hang token (which `as_string` yields).
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => Err(CfmlError::expression(format!(
+                "Can't cast Component [{}] to String",
+                inst.read().class.name
+            ))),
             _ => Ok(self.as_string()),
         }
     }
@@ -1787,6 +1795,12 @@ impl CfmlValue {
                     None
                 }
             }
+            // Flyweight component: resolve a member (data then method, table-aware)
+            // so generic navigation (`deep_set`/`path_leaf_exists` walking through a
+            // component held inside a plain struct/array, e.g. `s.comp.inner`) sees
+            // it instead of the `_ => None` dead-end. `get_ci` routes here too.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => inst.read().get_member(key),
             _ => None,
         }
     }
@@ -1824,6 +1838,12 @@ impl CfmlValue {
                     other => vec![other],
                 };
                 q.set_column(&key, new_values);
+            }
+            // Flyweight component: write a public member in place (shared Arc), so a
+            // generic `deep_set` through a component node persists instead of no-oping.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                inst.read().this_members.insert(key, value);
             }
             _ => {}
         }
@@ -2159,6 +2179,13 @@ impl CfmlValue {
             // comparison; pointer-equality is the safe, useful answer — two
             // handles onto the same data are equal, distinct queries are not).
             (CfmlValue::Query(a), CfmlValue::Query(b)) => a.ptr_eq(b),
+            // Flyweight component instances compare by reference identity (Arc),
+            // consistent with `===`/`cfml_deep_equal` and the reference-typed
+            // Query/NativeObject arms above. (This `eq` has no live operator caller
+            // today, but keep it consistent so a future caller can't reintroduce the
+            // "two components are always equal" footgun.)
+            #[cfg(feature = "component-instance")]
+            (CfmlValue::Instance(a), CfmlValue::Instance(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }

@@ -8288,12 +8288,21 @@ impl CfmlVirtualMachine {
                             // already exists must mutate THAT struct — NOT fork a phantom
                             // `local.instance` discarded when the method returns. This is
                             // the classic ColdBox `instance` struct pattern. (GitHub #180)
+                            // A component receiver counts too: a plain struct OR a
+                            // flyweight `Instance` (the latter's `as_cfml_struct()` is
+                            // None, so `instance.newkey = v` where `variables.instance`
+                            // is a flyweight was NOT recognized and forked a phantom
+                            // local that was discarded on return).
+                            let is_compound_receiver = |v: &CfmlValue| {
+                                v.as_cfml_struct().is_some()
+                                    || v.as_component().is_some_and(|c| c.is_instance_backed())
+                            };
                             let existing_arg = if let Some(CfmlValue::Struct(args_scope)) =
                                 locals.get(ARGUMENTS_SCOPE_KEY)
                             {
                                 args_scope
                                     .get_ci(local_name)
-                                    .filter(|v| v.as_cfml_struct().is_some())
+                                    .filter(|v| is_compound_receiver(v))
                             } else {
                                 None
                             };
@@ -8303,15 +8312,16 @@ impl CfmlVirtualMachine {
                                 locals.get("__variables")
                             {
                                 vars.get_ci(local_name)
-                                    .filter(|v| v.as_cfml_struct().is_some())
+                                    .filter(|v| is_compound_receiver(v))
                             } else {
                                 None
                             };
-                            if let Some(existing) = existing_arg.or(existing_var) {
-                                // `existing` is a clone of the variables-scope value;
-                                // for a Struct that shares the same Arc-backed store,
-                                // so this insert is visible through `variables.<name>`.
-                                existing.as_cfml_struct().unwrap().insert(prop_name.clone(), value);
+                            if let Some(mut existing) = existing_arg.or(existing_var) {
+                                // `existing` is a clone sharing the Arc-backed store
+                                // (struct backing or the instance's public data map),
+                                // so this write is visible through `variables.<name>`.
+                                // `set` handles both Struct and flyweight Instance.
+                                existing.set(prop_name.clone(), value);
                             } else {
                                 // Auto-vivification: assigning to a member path of a
                                 // variable that does not yet exist creates that variable
@@ -8834,87 +8844,153 @@ impl CfmlVirtualMachine {
                         // transitive interface set (for isInstanceOf).
                         let instance = self.attach_implements_chain(instance, &locals)?;
 
-                        // Call init() constructor if present
-                        let final_instance = if let CfmlValue::Struct(ref s) = instance {
-                            let has_init = s
+                        // Call init() constructor if present.
+                        //
+                        // Flyweight (component-instance) — OBJECT IDENTITY across
+                        // construction: convert the finished marker to its `Instance`
+                        // BEFORE running init(), and bind `this` = that live Instance
+                        // for the init() call. A component that captures `this` into a
+                        // child during init() — ColdBox `Controller.init()` doing
+                        // `services.loaderService = new LoaderService( this )` — then
+                        // hands out the SAME object the caller receives. Converting
+                        // AFTER init() (the original order) left every such capture
+                        // pointing at an orphaned marker whose state diverged from the
+                        // finalized Instance (Preside boot: `setConfigSettings` mutated
+                        // the orphan while `getSetting` read the Instance). init()'s
+                        // this/variables writes land in the Instance's shared maps in
+                        // place, so no post-call writeback merge is needed. (The
+                        // pseudo-constructor BODY still runs on the marker before this
+                        // point; a body-level `new Child(this)` capture is a rarer,
+                        // separate case — see the hardening plan §3a.)
+                        //
+                        // The `has_user_init` peek gates the pre-init conversion; the
+                        // default (marker) build never converts here, so the marker
+                        // init path below is byte-for-byte the historical behaviour.
+                        #[allow(unused_variables)]
+                        let has_user_init = matches!(&instance, CfmlValue::Struct(ref s)
+                            if s.get("init")
+                                .or_else(|| s.get("INIT"))
+                                .or_else(|| s.get("Init"))
+                                .is_some_and(|f| matches!(f, CfmlValue::Function(_))));
+                        #[cfg(feature = "component-instance")]
+                        let instance = if has_user_init {
+                            self.to_instance_value(instance)
+                        } else {
+                            instance
+                        };
+
+                        // Locate init() (a Function) on either representation.
+                        let init_func: Option<CfmlValue> = match &instance {
+                            CfmlValue::Struct(s) => s
                                 .get("init")
                                 .or_else(|| s.get("INIT"))
                                 .or_else(|| s.get("Init"))
-                                ;
-                            if let Some(ref init_func) = has_init {
-                                if matches!(init_func, CfmlValue::Function(_)) {
-                                    // Build init scope from the component's own scope,
-                                    // NOT the caller's locals (which may be a different CFC)
-                                    let mut init_locals = ValueMap::default();
-                                    init_locals.insert("this".to_string(), instance.clone());
-                                    // Inject component __variables as a dedicated scope (like Lucee/BoxLang)
-                                    if let CfmlValue::Struct(ref cs) = instance {
-                                        if let Some(vars) = cs.get("__variables") {
-                                            init_locals
-                                                .insert("__variables".to_string(), vars.clone());
-                                        }
+                                .filter(|f| matches!(f, CfmlValue::Function(_))),
+                            #[cfg(feature = "component-instance")]
+                            CfmlValue::Instance(inst) => inst.read().lookup_method("init"),
+                            _ => None,
+                        };
+                        let final_instance = if let Some(ref init_func) = init_func {
+                            // Build init scope from the component's own scope,
+                            // NOT the caller's locals (which may be a different CFC)
+                            let mut init_locals = ValueMap::default();
+                            init_locals.insert("this".to_string(), instance.clone());
+                            // Inject the component's `variables` scope (Lucee/BoxLang).
+                            match &instance {
+                                CfmlValue::Struct(ref cs) => {
+                                    if let Some(vars) = cs.get("__variables") {
+                                        init_locals
+                                            .insert("__variables".to_string(), vars.clone());
                                     }
-                                    // Reorder named constructor args to match
-                                    // init()'s declared params (extras spill into
-                                    // the arguments scope, mirroring CallMethodNamed).
-                                    let init_args = if ctor_arg_names.is_some() {
-                                        let (reordered, extras) =
-                                            Self::reorder_named_args_with_extras(
-                                                init_func,
-                                                ctor_arg_names.as_deref(),
-                                                ctor_args,
-                                            );
-                                        self.pending_extra_named_args =
-                                            if extras.is_empty() { None } else { Some(extras) };
-                                        reordered
-                                    } else {
-                                        ctor_args
-                                    };
-                                    self.closure_parent_writeback = None;
-                                    // Isolate the try-stack so a throw inside init()
-                                    // doesn't consume the caller's handlers (and jump
-                                    // init's own ip to the caller's catch_ip). Without
-                                    // this, `new Comp(args)` inside a try{} swallowed
-                                    // init()'s exception while the explicit
-                                    // createObject(...).init(args) path (which saves the
-                                    // try-stack around CallMethod) propagated it.
-                                    let saved_try_stack = if self.try_stack.is_empty() {
-                                        None
-                                    } else {
-                                        Some(std::mem::take(&mut self.try_stack))
-                                    };
-                                    let init_call_result =
-                                        self.call_function(init_func, init_args, &init_locals);
-                                    if let Some(saved) = saved_try_stack {
-                                        self.try_stack = saved;
+                                }
+                                #[cfg(feature = "component-instance")]
+                                CfmlValue::Instance(ref inst) => {
+                                    let g = inst.read();
+                                    init_locals.insert(
+                                        "__variables".to_string(),
+                                        CfmlValue::Struct(g.variables_members.clone()),
+                                    );
+                                    if let Some(stat) = g.class.static_scope.clone() {
+                                        init_locals.insert("__static".to_string(), stat);
                                     }
-                                    // Propagate any exception thrown by init() —
-                                    // `new Comp(args)` must fail-fast exactly like the
-                                    // explicit createObject(...).init(args) path does.
-                                    // Route the error through the in-loop try/catch
-                                    // mechanism (NOT `?`, which would unwind past an
-                                    // active try handler and escape the request).
-                                    let result = match init_call_result {
-                                        Ok(val) => val,
-                                        Err(e) => {
-                                            if Self::is_control_flow_error(&e) {
-                                                return Err(e);
-                                            }
-                                            if let Some(handler) = self.try_stack.pop() {
-                                                while stack.len() > handler.stack_depth {
-                                                    stack.pop();
-                                                }
-                                                self.restore_capture_state(&handler);
-                                                let error_val = self.resolve_catch_error_val(&e);
-                                                stack.push(error_val);
-                                                ip = handler.catch_ip;
-                                                continue;
-                                            } else {
-                                                return Err(e);
-                                            }
+                                }
+                                _ => {}
+                            }
+                            // Reorder named constructor args to match
+                            // init()'s declared params (extras spill into
+                            // the arguments scope, mirroring CallMethodNamed).
+                            let init_args = if ctor_arg_names.is_some() {
+                                let (reordered, extras) =
+                                    Self::reorder_named_args_with_extras(
+                                        init_func,
+                                        ctor_arg_names.as_deref(),
+                                        ctor_args,
+                                    );
+                                self.pending_extra_named_args =
+                                    if extras.is_empty() { None } else { Some(extras) };
+                                reordered
+                            } else {
+                                ctor_args
+                            };
+                            self.closure_parent_writeback = None;
+                            // Isolate the try-stack so a throw inside init()
+                            // doesn't consume the caller's handlers (and jump
+                            // init's own ip to the caller's catch_ip). Without
+                            // this, `new Comp(args)` inside a try{} swallowed
+                            // init()'s exception while the explicit
+                            // createObject(...).init(args) path (which saves the
+                            // try-stack around CallMethod) propagated it.
+                            let saved_try_stack = if self.try_stack.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut self.try_stack))
+                            };
+                            let init_call_result =
+                                self.call_function(init_func, init_args, &init_locals);
+                            if let Some(saved) = saved_try_stack {
+                                self.try_stack = saved;
+                            }
+                            // Propagate any exception thrown by init() —
+                            // `new Comp(args)` must fail-fast exactly like the
+                            // explicit createObject(...).init(args) path does.
+                            // Route the error through the in-loop try/catch
+                            // mechanism (NOT `?`, which would unwind past an
+                            // active try handler and escape the request).
+                            let result = match init_call_result {
+                                Ok(val) => val,
+                                Err(e) => {
+                                    if Self::is_control_flow_error(&e) {
+                                        return Err(e);
+                                    }
+                                    if let Some(handler) = self.try_stack.pop() {
+                                        while stack.len() > handler.stack_depth {
+                                            stack.pop();
                                         }
-                                    };
-                                    self.closure_parent_writeback = None;
+                                        self.restore_capture_state(&handler);
+                                        let error_val = self.resolve_catch_error_val(&e);
+                                        stack.push(error_val);
+                                        ip = handler.catch_ip;
+                                        continue;
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
+                            };
+                            self.closure_parent_writeback = None;
+                            match &instance {
+                                // Flyweight: init() mutated the Instance's shared maps
+                                // in place — discard the writeback stashes and return
+                                // the SAME Instance so identity is preserved (`this`
+                                // captured mid-init == the value handed to the caller).
+                                #[cfg(feature = "component-instance")]
+                                CfmlValue::Instance(_) => {
+                                    self.method_variables_writeback.take();
+                                    self.method_this_writeback.take();
+                                    let _ = &result;
+                                    instance.clone()
+                                }
+                                // Marker path (default build) — unchanged.
+                                _ => {
                                     // Apply variables scope writeback from init() to the component
                                     let vars_wb = self.method_variables_writeback.take();
                                     let final_obj = if let Some(modified_this) =
@@ -8924,7 +9000,7 @@ impl CfmlVirtualMachine {
                                     } else if let CfmlValue::Struct(_) = &result {
                                         result
                                     } else {
-                                        instance
+                                        instance.clone()
                                     };
                                     // Merge init()'s __variables mutations back into the component.
                                     // `vars` is the (Arc-shared) __variables the init frame
@@ -8939,33 +9015,27 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                     final_obj
-                                } else {
-                                    // init key present but not a function: no
-                                    // constructor runs → apply implicit accessors.
-                                    Self::apply_implicit_accessor_ctor(
-                                        &instance,
-                                        ctor_arg_names.as_deref(),
-                                        &ctor_args,
-                                    );
-                                    instance
                                 }
-                            } else {
-                                // No init() at all → Lucee/ACF implicit accessor
-                                // constructor populates declared properties.
-                                Self::apply_implicit_accessor_ctor(
-                                    &instance,
-                                    ctor_arg_names.as_deref(),
-                                    &ctor_args,
-                                );
-                                instance
                             }
+                        } else if let CfmlValue::Struct(_) = instance {
+                            // No user init() → Lucee/ACF implicit accessor constructor
+                            // populates declared properties (runs on the marker; the
+                            // trailing to_instance_value converts afterwards).
+                            Self::apply_implicit_accessor_ctor(
+                                &instance,
+                                ctor_arg_names.as_deref(),
+                                &ctor_args,
+                            );
+                            instance
                         } else {
                             instance
                         };
 
                         // Phase C.3 — Slice 2: at instantiation finalize, partition
                         // the finished marker into the flyweight `Instance` backing.
-                        // Feature-gated OFF by default (marker path unchanged).
+                        // Feature-gated OFF by default (marker path unchanged). A
+                        // no-op when `final_instance` is ALREADY an Instance (the
+                        // has_user_init pre-init conversion above).
                         #[cfg(feature = "component-instance")]
                         let final_instance = self.to_instance_value(final_instance);
                         stack.push(final_instance);
@@ -9499,11 +9569,36 @@ impl CfmlVirtualMachine {
                                     }
                                     // Inject component __variables as a dedicated scope
                                     let this_ref = locals.get("this").unwrap_or(&object);
-                                    if let CfmlValue::Struct(ref ts) = this_ref {
-                                        if let Some(vars) = ts.get("__variables") {
-                                            method_locals
-                                                .insert("__variables".to_string(), vars.clone());
+                                    match this_ref {
+                                        CfmlValue::Struct(ref ts) => {
+                                            if let Some(vars) = ts.get("__variables") {
+                                                method_locals
+                                                    .insert("__variables".to_string(), vars.clone());
+                                            }
                                         }
+                                        // Flyweight instance: bind `variables` to the live
+                                        // shared `variables_members` map (writes persist
+                                        // in-place, no write-back — same as
+                                        // `call_instance_method`). Without this arm a
+                                        // `super.method()` whose parent method reads
+                                        // `variables.X` (e.g. ColdBox Bootstrap's
+                                        // `locateAppKey()` reading `COLDBOX_APP_KEY`, set by
+                                        // an implicit accessor during `init()`) saw NO
+                                        // `variables` scope and threw "Variable is undefined",
+                                        // breaking Preside boot under the flyweight.
+                                        #[cfg(feature = "component-instance")]
+                                        CfmlValue::Instance(ref inst) => {
+                                            let g = inst.read();
+                                            method_locals.insert(
+                                                "__variables".to_string(),
+                                                CfmlValue::Struct(g.variables_members.clone()),
+                                            );
+                                            if let Some(stat) = g.class.static_scope.clone() {
+                                                method_locals
+                                                    .insert("__static".to_string(), stat);
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                     // Use the actual child 'this' from caller's locals.
                                     // During a subclass pseudo-constructor whose body has
@@ -9793,6 +9888,28 @@ impl CfmlVirtualMachine {
                                                 skip_for_identity = true;
                                             }
                                         }
+                                        // Flyweight: the deep leaf is a component
+                                        // `Instance` and the chained mutating call ran on
+                                        // what a prior `.getX()` returned, not on the leaf
+                                        // — `X.controller.getY().someSetter()` would
+                                        // otherwise deep_set the foreign result over
+                                        // `X.controller`, replacing the Controller Instance
+                                        // with it (Preside boot: the app Router's
+                                        // `variables.controller` clobbered by a
+                                        // RequestContextDecorator → `getSetting("modules")`
+                                        // threw "has no function"). Skip unless the result
+                                        // IS that same Instance. Mirrors the Struct guard
+                                        // above and the this-writeback Instance guards.
+                                        #[cfg(feature = "component-instance")]
+                                        if matches!(&node, CfmlValue::Instance(_))
+                                            && !matches!(
+                                                (&node, &result),
+                                                (CfmlValue::Instance(a), CfmlValue::Instance(b))
+                                                    if std::sync::Arc::ptr_eq(a, b)
+                                            )
+                                        {
+                                            skip_for_identity = true;
+                                        }
                                     }
                                 }
                                 // structDelete (deep receiver `a.b.delete(k)`)
@@ -9852,6 +9969,25 @@ impl CfmlVirtualMachine {
                                             if cur.contains_key("__variables")
                                                 && !Self::same_cfc_instance(cur, snap)
                                     );
+                                // Flyweight: the existing variable holds a component
+                                // `Instance` and the chained call's receiver `this`
+                                // (`modified_this`) is a DIFFERENT object — a foreign
+                                // marker CFC or another Instance. Codegen propagates
+                                // write_back=["var"] to the OUTER call, so
+                                // `controller.getCacheBox().init(...)` would otherwise
+                                // write the CacheFactory's `this` back onto `controller`,
+                                // replacing the Controller Instance (Preside boot:
+                                // `controller` then resolved to the CacheFactory and
+                                // `controller.getSetting(...)` threw "has no function").
+                                // Mirrors the value-writeback Instance guard above.
+                                #[cfg(feature = "component-instance")]
+                                let skip_for_identity = skip_for_identity
+                                    || (matches!(&existing, Some(CfmlValue::Instance(_)))
+                                        && !matches!(
+                                            (&existing, &modified_this),
+                                            (Some(CfmlValue::Instance(a)), CfmlValue::Instance(b))
+                                                if std::sync::Arc::ptr_eq(a, b)
+                                        ));
                                 // Same-instance guard: when the snapshot IS the receiver
                                 // (same Arc), every `this.x =` in the callee already
                                 // mutated the shared struct in place — there is nothing
@@ -9941,10 +10077,18 @@ impl CfmlVirtualMachine {
                                 // Arc identity. Only fires when both sides
                                 // are CFC structs (cheap to gate on
                                 // __variables presence in modified_this).
-                                let modified_is_cfc = matches!(
+                                #[allow(unused_mut)]
+                                let mut modified_is_cfc = matches!(
                                     &modified_this,
                                     CfmlValue::Struct(s) if s.contains_key("__variables")
                                 );
+                                // Flyweight: a chained call's foreign `this` may be a
+                                // component Instance too (`a.b.getDep().init()` where the
+                                // dep is a flyweight). Arm the guard for it.
+                                #[cfg(feature = "component-instance")]
+                                if matches!(&modified_this, CfmlValue::Instance(_)) {
+                                    modified_is_cfc = true;
+                                }
                                 let mut skip_for_identity = false;
                                 if modified_is_cfc {
                                     if let Some(mut node) =
@@ -9974,6 +10118,25 @@ impl CfmlVirtualMachine {
                                                 {
                                                     skip_for_identity = true;
                                                 }
+                                            }
+                                            // Flyweight: the deep leaf holds a component
+                                            // Instance and the chained call's `this` is a
+                                            // DIFFERENT object — `variables.controller.
+                                            // getX().init()` would otherwise deep_set the
+                                            // foreign receiver over `variables.controller`
+                                            // (Preside boot: Router's `variables.controller`
+                                            // clobbered by a RequestContextDecorator, then
+                                            // `getSetting("modules")` threw "has no
+                                            // function"). Skip unless it's the SAME Instance.
+                                            #[cfg(feature = "component-instance")]
+                                            if matches!(&node, CfmlValue::Instance(_))
+                                                && !matches!(
+                                                    (&node, &modified_this),
+                                                    (CfmlValue::Instance(a), CfmlValue::Instance(b))
+                                                        if std::sync::Arc::ptr_eq(a, b)
+                                                )
+                                            {
+                                                skip_for_identity = true;
                                             }
                                         }
                                     }
@@ -12320,6 +12483,10 @@ impl CfmlVirtualMachine {
                 }
                 "structmap" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
+                        // Flyweight: project a component instance's public scope so
+                        // the iteration below sees it (mirrors structEach).
+                        let __proj = struct_val.as_component().filter(|c| c.is_instance_backed()).map(|c| CfmlValue::strukt(c.instance_public_members()));
+                        let struct_val = __proj.as_ref().unwrap_or(struct_val);
                         if let CfmlValue::Struct(s) = struct_val {
                             let mut result = ValueMap::default();
                             let callback = callback.clone();
@@ -12352,6 +12519,8 @@ impl CfmlVirtualMachine {
                 }
                 "structfilter" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
+                        let __proj = struct_val.as_component().filter(|c| c.is_instance_backed()).map(|c| CfmlValue::strukt(c.instance_public_members()));
+                        let struct_val = __proj.as_ref().unwrap_or(struct_val);
                         if let CfmlValue::Struct(s) = struct_val {
                             let mut result = ValueMap::default();
                             let callback = callback.clone();
@@ -12434,6 +12603,8 @@ impl CfmlVirtualMachine {
                 }
                 "structreduce" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
+                        let __proj = struct_val.as_component().filter(|c| c.is_instance_backed()).map(|c| CfmlValue::strukt(c.instance_public_members()));
+                        let struct_val = __proj.as_ref().unwrap_or(struct_val);
                         if let CfmlValue::Struct(s) = struct_val {
                             let mut acc = args.get(2).cloned().unwrap_or(CfmlValue::Null);
                             let callback = callback.clone();
@@ -12456,6 +12627,8 @@ impl CfmlVirtualMachine {
                 }
                 "structsome" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
+                        let __proj = struct_val.as_component().filter(|c| c.is_instance_backed()).map(|c| CfmlValue::strukt(c.instance_public_members()));
+                        let struct_val = __proj.as_ref().unwrap_or(struct_val);
                         if let CfmlValue::Struct(s) = struct_val {
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
@@ -12480,6 +12653,8 @@ impl CfmlVirtualMachine {
                 }
                 "structevery" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
+                        let __proj = struct_val.as_component().filter(|c| c.is_instance_backed()).map(|c| CfmlValue::strukt(c.instance_public_members()));
+                        let struct_val = __proj.as_ref().unwrap_or(struct_val);
                         if let CfmlValue::Struct(s) = struct_val {
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
@@ -18831,6 +19006,17 @@ impl CfmlVirtualMachine {
                 // matching auto-vivification on a normal dotted assignment.
                 CfmlValue::strukt(ValueMap::default())
             };
+            // Flyweight: route the Struct-root walk through the shared in-place
+            // walker so an Instance INTERMEDIATE (a component held in a struct
+            // scope) is descended into rather than clobbered by
+            // `get_or_insert_struct` (dynamic quoted-LHS / cfquery-result writeback
+            // into `variables.someComp.x`). Default build keeps the original walk
+            // byte-for-byte (no Instances exist there).
+            #[cfg(feature = "component-instance")]
+            if matches!(root, CfmlValue::Struct(_)) {
+                Self::store_member_path_in_place(&root, &parts[1..], value);
+            }
+            #[cfg(not(feature = "component-instance"))]
             if let CfmlValue::Struct(ref s) = root {
                 // Walk/auto-vivify intermediate structs, set the leaf.
                 let mut cur = s.clone();
@@ -18962,6 +19148,17 @@ impl CfmlVirtualMachine {
                     // Plain struct variable: `obj.member`. Reference-typed structs
                     // mutate in place; store back covers a value-typed page scope.
                     if let Some(obj) = self.scope_aware_load(scope, locals) {
+                        // Flyweight component: `structDelete(comp,"k")` / `comp.k =
+                        // null` must remove from the live data maps in place (shared
+                        // Arc → no store-back). `as_cfml_struct()` is None for an
+                        // Instance, so without this the delete silently no-oped.
+                        #[cfg(feature = "component-instance")]
+                        if let CfmlValue::Instance(ref inst) = obj {
+                            let g = inst.read();
+                            g.this_members.remove_ci(leaf);
+                            g.variables_members.remove_ci(leaf);
+                            return;
+                        }
                         if let Some(s) = obj.as_cfml_struct() {
                             s.remove_ci(leaf);
                         }
@@ -18981,10 +19178,29 @@ impl CfmlVirtualMachine {
             // in `root` — which we commit back at the end.
             let mut cur = root.clone();
             for key in &parts[1..parts.len() - 1] {
+                // Flyweight component intermediate: resolve the next segment via
+                // the Instance (as_cfml_struct is None for an Instance).
+                #[cfg(feature = "component-instance")]
+                if let CfmlValue::Instance(ref inst) = cur {
+                    let member = inst.read().get_member(key);
+                    match member {
+                        Some(next) => { cur = next; continue; }
+                        None => return,
+                    }
+                }
                 match cur.as_cfml_struct().and_then(|s| s.get_ci(key)) {
                     Some(next) => cur = next,
                     None => return,
                 }
+            }
+            // Flyweight component leaf-parent: remove from the live data maps.
+            #[cfg(feature = "component-instance")]
+            if let CfmlValue::Instance(ref inst) = cur {
+                let g = inst.read();
+                g.this_members.remove_ci(leaf);
+                g.variables_members.remove_ci(leaf);
+                self.scope_aware_store(scope, root, locals, modern);
+                return;
             }
             if let Some(s) = cur.as_cfml_struct() {
                 s.remove_ci(leaf);
@@ -20482,6 +20698,19 @@ impl CfmlVirtualMachine {
                 Some(CfmlValue::String(p)) => p.to_string(),
                 _ => return None,
             },
+            // Flyweight instance: the source lives on the shared blueprint. An
+            // application/server-scoped Instance surviving into a later request
+            // (Preside's `application.cbBootstrap.isFWReinit()`) carries method
+            // `global_id`s from the request that built it, which this request's
+            // registry may not know — recompile the class source and re-register.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let s = inst.read().class.source_file.clone();
+                if s.is_empty() {
+                    return None;
+                }
+                s
+            }
             _ => return None,
         };
         // Recompile (cache-first) and register the source's functions into this
@@ -22743,6 +22972,22 @@ impl CfmlVirtualMachine {
                 }
                 // isDefined("q.col") — a query column counts as defined (Lucee).
                 CfmlValue::Query(q) => return q.has_column_ci(segment),
+                // Flyweight instance: resolve the member through the Instance
+                // (public then private data maps, each table-aware so METHODS
+                // resolve too). Without this arm, walking a path THROUGH an
+                // Instance hit `_ => return false`, so `IsDefined(
+                // "application.cbBootstrap.getController")` was false — Preside's
+                // `_getColdboxController()` then returned null, `_getSessionStorage()`
+                // returned null, and `_persistSession()` silently skipped persist,
+                // so admin login never stuck (no session row, no `psid` cookie).
+                #[cfg(feature = "component-instance")]
+                CfmlValue::Instance(inst) => {
+                    let member = inst.read().get_member(&seg_lower);
+                    match member {
+                        Some(v) => current = v,
+                        None => return false,
+                    }
+                }
                 _ => return false,
             }
         }
@@ -23519,6 +23764,56 @@ impl CfmlVirtualMachine {
                     Self::collect_app_fn_ids_from_fn(function, ids, visited);
                 }
             }
+            // Component flyweight: an Instance's methods live on the shared
+            // blueprint (`method_values` + the `super_handle`/`super_map` parent
+            // structs), NOT in the data maps — so the walk above never reaches
+            // them. Without this arm an application/server-scoped Instance
+            // (Preside stores `application.cbBootstrap` at boot) loses its method
+            // `global_id`s on the NEXT request: the outer method still resolves
+            // (its class source is reachable) but `super.method()` — whose parent
+            // class was only compiled during boot — goes unregistered, so
+            // `application.cbBootstrap.isFWReinit()` → `super.isFWReinit()` threw
+            // "isFWReinit is not defined" on every warm request. This is a pure
+            // reachability collect of already-compiled Arcs — NO recompilation.
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let ptr = std::sync::Arc::as_ptr(inst) as usize;
+                if !visited.insert((6, ptr)) {
+                    return;
+                }
+                // Snapshot the handles, then release the lock before recursing
+                // (a nested Instance in the maps could re-enter this instance).
+                let (this_m, vars_m, methods, super_handle, super_map, static_scope) = {
+                    let g = inst.read();
+                    (
+                        g.this_members.clone(),
+                        g.variables_members.clone(),
+                        g.class.method_values.clone(),
+                        g.class.super_handle.clone(),
+                        g.class.super_map.clone(),
+                        g.class.static_scope.clone(),
+                    )
+                };
+                // Public + private data maps (injected/mixin fns, nested
+                // components). Walking them as structs also picks up the shared
+                // method table hung off each (set in `Instance::from_marker`).
+                Self::collect_app_fn_ids(&CfmlValue::Struct(this_m), ids, visited);
+                Self::collect_app_fn_ids(&CfmlValue::Struct(vars_m), ids, visited);
+                // Shared blueprint method table (explicit — the maps may have been
+                // stripped) + the parent super structs (the `super.x()` fix).
+                for (_, v) in methods.iter() {
+                    Self::collect_app_fn_ids(v, ids, visited);
+                }
+                if let Some(sh) = &super_handle {
+                    Self::collect_app_fn_ids(sh, ids, visited);
+                }
+                if let Some(sm) = &super_map {
+                    Self::collect_app_fn_ids(sm, ids, visited);
+                }
+                if let Some(st) = &static_scope {
+                    Self::collect_app_fn_ids(st, ids, visited);
+                }
+            }
             _ => {}
         }
     }
@@ -24017,6 +24312,17 @@ impl CfmlVirtualMachine {
         // 1. Direct dispatch — own / injected / (Slice-5: inherited) method.
         if let Some(func_ref) = func {
             let func_ref = Self::strip_instance_binding(&func_ref);
+            // Cross-request cached instance: the blueprint method's `global_id`
+            // may not resolve in THIS request's registry (an application/server-
+            // scoped Instance built in an earlier request — e.g. Preside stores
+            // `application.cbBootstrap` at boot, then a later request calls
+            // `application.cbBootStrap.isFWReinit()`; the gid from boot is stale
+            // in the fresh request, so dispatch threw "isFWReinit is not
+            // defined"). Recompile+re-register the defining source and substitute
+            // a fresh gid, exactly as the marker member-dispatch path does.
+            let func_ref = self
+                .heal_stale_component_method(&object, method, &func_ref)
+                .unwrap_or(func_ref);
             let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
             let (args, extras) =
                 Self::reorder_named_args_with_extras(&func_ref, arg_names, raw_args);
@@ -29984,6 +30290,11 @@ fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
         (CfmlValue::Struct(x), CfmlValue::Struct(y)) => x.backing_ptr() == y.backing_ptr(),
         (CfmlValue::Query(x), CfmlValue::Query(y)) => x.backing_ptr() == y.backing_ptr(),
         (CfmlValue::NativeObject(x), CfmlValue::NativeObject(y)) => Arc::ptr_eq(x, y),
+        // Flyweight component instances — identity by Arc, same as the marker
+        // Struct backing-ptr above. Without this, `x = new C(); y = x; x === y`
+        // was FALSE under the flyweight (an Instance fell to `_ => false`).
+        #[cfg(feature = "component-instance")]
+        (CfmlValue::Instance(x), CfmlValue::Instance(y)) => Arc::ptr_eq(x, y),
         // Any other (cross-type, or reference type without cheap identity) is
         // not strictly equal.
         _ => false,
