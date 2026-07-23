@@ -5774,6 +5774,19 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
     // untouched.
     if let Some(comp) = val.as_component() {
         if comp.is_instance_backed() {
+            // Cycle-guard on the INSTANCE's identity (its backing Arc), not the
+            // materialised data struct — `instance_serialize_data()` allocates a
+            // fresh struct each call, so a struct-ptr guard could never fire and a
+            // self-/mutually-referential instance graph would recurse until the
+            // native stack overflows (the flyweight re-opening of GH #178). Mirror
+            // the Array/Struct arms below: revisit → "null".
+            let id = comp.instance_identity_ptr();
+            if let Some(p) = id {
+                if visited.contains(&p) {
+                    return "null".to_string();
+                }
+                visited.push(p);
+            }
             let data = comp.instance_serialize_data();
             let items: Vec<String> = data
                 .iter()
@@ -5786,6 +5799,9 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
                     )
                 })
                 .collect();
+            if id.is_some() {
+                visited.pop();
+            }
             return format!("{{{}}}", items.join(","));
         }
     }
@@ -5988,7 +6004,21 @@ fn serialize_cfml_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
     // the marker path + `serializeJSON`). Without this an Instance missed every arm
     // and rendered as `nullValue()`.
     if let Some(comp) = val.as_component().filter(|c| c.is_instance_backed()) {
+        // Cycle-guard on the INSTANCE's identity (its backing Arc): the fresh
+        // `instance_serialize_data()` struct gets a new backing Arc each call, so
+        // the Struct arm's `backing_ptr` guard below never catches an instance
+        // cycle — key on the instance itself, or a self-/mutually-referential
+        // graph overflows the native stack (flyweight re-opening of GH #178).
         let s = CfmlValue::strukt(comp.instance_serialize_data());
+        if let Some(p) = comp.instance_identity_ptr() {
+            if visited.contains(&p) {
+                return "nullValue()".to_string();
+            }
+            visited.push(p);
+            let out = serialize_cfml_value(&s, visited);
+            visited.pop();
+            return out;
+        }
         return serialize_cfml_value(&s, visited);
     }
     match val {

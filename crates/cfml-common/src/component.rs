@@ -686,6 +686,26 @@ impl<'a> CompRef<'a> {
         }
     }
 
+    /// Stable identity pointer for a flyweight [`Instance`] view — its backing
+    /// `Arc` address, the flyweight analog of [`crate::dynamic::CfmlStruct::backing_ptr`].
+    /// Returns `None` for a marker view (const `None` in a default build).
+    ///
+    /// The serializers' cycle-guard needs this: a flyweight instance serializes a
+    /// FRESHLY materialised data struct on every call (`instance_serialize_data`),
+    /// so the downstream struct `backing_ptr` guard can never fire (a new `Arc`
+    /// each time) — the guard must key on the instance's own identity instead, or
+    /// a self-/mutually-referential instance graph recurses until the native stack
+    /// overflows. That is the flyweight re-opening of the GH #178 circular-reference
+    /// abort, which the marker path already guards via `CfmlStruct::backing_ptr`.
+    #[inline]
+    pub fn instance_identity_ptr(&self) -> Option<usize> {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = *self {
+            return Some(std::sync::Arc::as_ptr(inst) as *const () as usize);
+        }
+        None
+    }
+
     // ---- Phase C.3 — Slice 4: introspection bridges (flyweight instances) ----
     //
     // These read `this_members` / `variables_members` DIRECTLY, with **NO

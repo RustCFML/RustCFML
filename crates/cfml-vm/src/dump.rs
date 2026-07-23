@@ -264,13 +264,22 @@ fn render_html(
         CfmlValue::Instance(inst) => {
             // Render a flyweight instance as a Component box from its public
             // `this` data — the marker-struct component renders the same way via
-            // the `component_view` branch in the Struct arm above.
-            let g = inst.read();
-            let snap = g.this_members.snapshot();
-            box_open(out, "k-comp", &format!("Component {}", esc(&g.class.name)), &snap.len().to_string(), opts.expand);
+            // the `component_view` branch in the Struct arm above. Cycle-guard on
+            // the instance's own Arc identity (mirrors the Struct arm's
+            // `backing_ptr` guard), or a self-/mutually-referential instance graph
+            // recurses until the native stack overflows (the flyweight re-opening
+            // of GH #178). Snapshot + drop the read lock BEFORE rendering children
+            // so a self-referential member can't re-enter the same RwLock.
+            let ptr = std::sync::Arc::as_ptr(inst) as *const () as usize;
+            let (name, snap) = {
+                let g = inst.read();
+                (g.class.name.clone(), g.this_members.snapshot())
+            };
+            box_open(out, "k-comp", &format!("Component {}", esc(&name)), &snap.len().to_string(), opts.expand);
+            if recursion_guard(out, visited, ptr) { return; }
             if depth_exceeded(out, opts, depth) || snap.is_empty() {
                 if snap.is_empty() { out.push_str("<div class=\"rcf-empty\">[no public members]</div>"); }
-                out.push_str("</div>");
+                close_box(out, visited, ptr);
                 return;
             }
             out.push_str("<table>");
@@ -281,7 +290,8 @@ fn render_html(
                 render_child(v, opts, depth, out, visited);
                 out.push_str("</td></tr>");
             }
-            out.push_str("</table></div>");
+            out.push_str("</table>");
+            close_box(out, visited, ptr);
         }
         CfmlValue::Query(q) => {
             let data = q.with_read(|d| d.clone());
@@ -493,13 +503,27 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
         // fell to `_ => value_string` = "[complex]".
         #[cfg(feature = "component-instance")]
         CfmlValue::Instance(inst) => {
-            let g = inst.read();
-            let snap = g.this_members.snapshot();
-            out.push_str(&format!("Component {} ({})\n", g.class.name, snap.len()));
+            // Cycle-guard on the instance's Arc identity (mirrors the Struct arm
+            // above), else a self-/mutually-referential instance overflows the
+            // native stack (flyweight re-opening of GH #178). Snapshot + drop the
+            // read lock before rendering children so a self-referential member
+            // can't re-enter the same RwLock.
+            let ptr = std::sync::Arc::as_ptr(inst) as *const () as usize;
+            if visited.contains(&ptr) {
+                out.push_str("[recursive component]\n");
+                return;
+            }
+            visited.push(ptr);
+            let (name, snap) = {
+                let g = inst.read();
+                (g.class.name.clone(), g.this_members.snapshot())
+            };
+            out.push_str(&format!("Component {} ({})\n", name, snap.len()));
             for (k, v) in snap.iter() {
                 out.push_str(&format!("{}  {} = ", pad, k));
                 render_text_child(v, indent + 1, out, visited);
             }
+            visited.pop();
         }
         _ => {
             out.push_str(&value_string(value));
