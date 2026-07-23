@@ -466,6 +466,21 @@ impl BytecodeCache {
         self.entries.read().get(path).map(|e| e.program.clone())
     }
 
+    /// Drop the cached entries for the given path spellings. Used when THIS
+    /// process rewrites/removes a template mid-request (GH #284): forcing a
+    /// recompile on the next load guarantees the new content is picked up even
+    /// on a filesystem whose mtime granularity can't distinguish a same-second
+    /// rewrite (the plain mtime freshness check would otherwise miss it).
+    pub fn invalidate(&self, paths: &[&str]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut entries = self.entries.write();
+        for p in paths {
+            entries.remove(*p);
+        }
+    }
+
     /// Insert a freshly compiled program into the cache.
     pub fn insert(&self, path: String, program: BytecodeProgram, mtime: SystemTime) {
         self.entries
@@ -12456,20 +12471,49 @@ impl CfmlVirtualMachine {
                             return result;
                         }
                     }
-                    // Try exact match first, then case-insensitive
-                    if let Some(builtin) = self.builtins.get(&func.name) {
-                        return builtin(args);
-                    }
-
-                    // Case-insensitive builtin lookup
-                    let builtin_match = self
-                        .builtins
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                        .map(|(_, v)| *v);
-
-                    if let Some(builtin) = builtin_match {
-                        return builtin(args);
+                    // Resolve the builtin (exact match first, then
+                    // case-insensitive) to a single fn pointer so the dispatch —
+                    // and the GH #284 post-write cache flush below — happens once.
+                    let builtin_fn = self.builtins.get(&func.name).copied().or_else(|| {
+                        self.builtins
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
+                            .map(|(_, v)| *v)
+                    });
+                    if let Some(builtin) = builtin_fn {
+                        // GH #284: when this process rewrites/removes a template
+                        // (fileWrite/append/copy/move/delete, incl. the <cffile>
+                        // forms, which lower to these BIFs), flush its stale read
+                        // caches so a re-include within the SAME request picks up
+                        // the new content. Capture the target paths + their
+                        // pre-op canonical form (fileDelete can't canonicalise
+                        // afterwards) before running the op. Skipped in production,
+                        // whose contract is an immutable tree (restart to reload).
+                        // Only a serve-mode DEV build holds a bytecode cache that
+                        // can go stale within a request (the CLI has no persistent
+                        // cache — each include recompiles; production trusts the
+                        // cache and never re-checks, contract = restart to reload).
+                        // Skip the flush work everywhere else.
+                        let write_targets = Self::file_write_targets(&name_lower, &args);
+                        let needs_flush = !write_targets.is_empty()
+                            && self
+                                .server_state
+                                .as_ref()
+                                .map_or(false, |s| !s.production_mode);
+                        if !needs_flush {
+                            return builtin(args);
+                        }
+                        let pre_canon: Vec<Option<String>> = write_targets
+                            .iter()
+                            .map(|p| self.vfs.canonicalize(p).ok())
+                            .collect();
+                        let result = builtin(args);
+                        if result.is_ok() {
+                            for (raw, pre) in write_targets.iter().zip(pre_canon.iter()) {
+                                self.invalidate_written_file_caches(raw, pre.as_deref());
+                            }
+                        }
+                        return result;
                     }
                 }
             }
@@ -27345,6 +27389,86 @@ impl CfmlVirtualMachine {
                     args[i] = CfmlValue::string(resolved);
                 }
             }
+        }
+    }
+
+    /// The resolved path argument(s) of a file-mutating BIF that could alter the
+    /// on-disk content of a *template* — i.e. paths whose stale compiled/validated
+    /// caches must be flushed after the op so a re-include within the same request
+    /// sees the new content (GH #284). Paths are read *after* `resolve_file_bif_paths`
+    /// has rebased them, so they match the spelling the file op actually wrote.
+    /// Non-mutating BIFs return an empty vec.
+    fn file_write_targets(name_lower: &str, args: &[CfmlValue]) -> Vec<String> {
+        // Index of the path arg(s) that get written/created/removed. For copy the
+        // destination (1) is written; for move/rename both the source (0, now
+        // gone) and destination (1) change. Delete/write/append target arg 0.
+        let indices: &[usize] = match name_lower {
+            "filewrite" | "fileappend" | "filewriteline" | "filedelete" => &[0],
+            "filecopy" => &[1],
+            "filemove" => &[0, 1],
+            _ => return Vec::new(),
+        };
+        indices
+            .iter()
+            .filter_map(|&i| match args.get(i) {
+                Some(CfmlValue::String(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Flush this request's read caches for a template the rustcfml process just
+    /// wrote or removed, so a later `include` of the same path within the SAME
+    /// request re-reads the new content (GH #284, a v0.511.0 regression). Only
+    /// our own writes are flushed; a file changed *outside* the process mid-request
+    /// still defers to the next request — that request-scoped freshness memo is the
+    /// whole point of the v0.511.0 stat-storm optimisation, and we don't want to
+    /// re-`stat` every include again.
+    ///
+    /// The compile/include cache key is (in serve mode) the *canonicalised*
+    /// webroot-relative path, whereas the raw `FileWrite` spelling can carry a
+    /// `./` segment or a mapping/symlink alias, so matching by canonical identity
+    /// is what actually links the two. `pre_canon` is the target's canonical path
+    /// captured *before* the op ran (needed for `fileDelete`, whose target can no
+    /// longer be canonicalised afterwards).
+    fn invalidate_written_file_caches(&self, raw: &str, pre_canon: Option<&str>) {
+        // Collect every spelling that could key this file in the caches: the raw
+        // resolved path plus its canonical form (pre- and post-op).
+        let mut canon_keys: Vec<String> = Vec::new();
+        if let Some(pc) = pre_canon {
+            canon_keys.push(pc.to_string());
+        }
+        if let Ok(post) = self.vfs.canonicalize(raw) {
+            if !canon_keys.iter().any(|c| c == &post) {
+                canon_keys.push(post);
+            }
+        }
+        let mut exact: Vec<&str> = vec![raw];
+        for c in &canon_keys {
+            exact.push(c.as_str());
+        }
+
+        {
+            let mut validated = self.request_validated_files.write();
+            for k in &exact {
+                validated.remove(*k);
+            }
+            // Also drop any *other* validated spelling of the same file (a mapping
+            // alias, or a symlinked webroot) by canonical identity. The set is
+            // request-scoped and small, so the extra canonicalize calls are cheap.
+            // This is the essential correctness step: once the path leaves the
+            // freshness memo, the next load falls through to the mtime-checking
+            // `compile_file_cached`, which re-reads the changed file.
+            if let Some(target) = canon_keys.first() {
+                validated
+                    .retain(|k| self.vfs.canonicalize(k).ok().as_deref() != Some(target.as_str()));
+            }
+        }
+        // Belt-and-braces: also evict the shared bytecode-cache entry so the
+        // recompile happens even on a filesystem whose mtime can't tell a
+        // same-second rewrite apart (the mtime check alone would miss that).
+        if let Some(ss) = self.server_state.as_ref() {
+            ss.bytecode_cache.invalidate(&exact);
         }
     }
 

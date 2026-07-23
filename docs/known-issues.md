@@ -593,6 +593,32 @@ meant and what locale-dropdown consumers were designed around (e.g. Mura/Masa ad
 deprecated regardless). Apps that enumerate this list get a sensible, stable locale menu;
 apps that assume a *specific* JVM locale tag string will see fewer entries than on Lucee.
 
+## 22. Within-request template freshness — the process's own writes are picked up, external mid-request edits are not 🏗 *(GH [#284](https://github.com/RustCFML/RustCFML/issues/284))*
+
+In serve-mode **dev**, each request builds a fresh VM and carries a request-scoped
+freshness memo (`request_validated_files`): once a template's on-disk mtime has been
+validated during a request, repeat `include`s of it skip the per-load `stat`. This is a
+deliberate v0.511.0 optimisation — a live Preside profile showed ~33% of all CPU in
+`exists()`/`canonicalize()` syscalls — and the memo is dropped at request end, so the
+**next** request always re-checks (Lucee `inspectTemplate` per-request parity).
+
+The consequence: if a `.cfm`/`.cfc` is changed **by a process other than rustcfml**
+partway through a request, the change is not observed until the next request. Lucee with
+`inspectTemplates="always"` re-stats on every access and would observe it mid-request. This
+is **by design** — the common case is many repeat includes of unchanged templates, and
+paying a `stat` on each to catch a rare external mid-request edit is exactly the cost the
+memo exists to avoid.
+
+**A template rewritten by rustcfml *itself* mid-request (`fileWrite`/`fileAppend`/
+`fileCopy`/`fileMove`/`fileDelete`, including the `<cffile>` forms) IS picked up on a
+subsequent `include` in the same request** — the write flushes that file's freshness memo
+and shared bytecode-cache entry by canonical path identity (fixes the v0.511.0 regression
+that broke Wheels' `?reload=true` / `$reincludeGlobals` hot-reload flow). Only rustcfml's
+own writes trigger the flush; external edits still defer to the next request as above.
+
+**Production mode is unaffected either way** — its contract is an immutable tree (restart to
+reload), so it neither re-stats nor flushes on write.
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
