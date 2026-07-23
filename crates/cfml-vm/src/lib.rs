@@ -14885,17 +14885,14 @@ impl CfmlVirtualMachine {
                             {
                                 let instance = self.resolve_inheritance(template, parent_locals);
                                 let instance = self.attach_native_parent(instance)?;
-                                // NB (Phase C.3): `createObject("component", …)` still
-                                // yields the MARKER backing (unlike `new X()`). Converting
-                                // it — so framework bean factories (FW/1 DI/1, WireBox,
-                                // Preside) get the flyweight + `__`-hiding fix + RSS win —
-                                // is the next systematic step, but it exposed Instance-path
-                                // gaps under TestBox's mixin virtualization (FW/1 116p→81p,
-                                // e.g. `getVariablesScope` via injected `__$$fetchVariables`)
-                                // that regress compatibility. Must be hardened against
-                                // Lucee/BoxLang mixin semantics BEFORE flipping. See
-                                // C2planDoc.md §8 (Slice 6 follow-on).
-                                return self.attach_implements_chain(instance, parent_locals);
+                                let instance =
+                                    self.attach_implements_chain(instance, parent_locals)?;
+                                // Phase C.3 — Slice 6b: convert createObject's finished
+                                // marker into the flyweight Instance, mirroring new X().
+                                // Feature-gated OFF by default.
+                                #[cfg(feature = "component-instance")]
+                                let instance = self.to_instance_value(instance);
+                                return Ok(instance);
                             }
                             // Unresolved component path: throw rather than return
                             // null silently (Lucee/ACF both raise here).
@@ -26829,6 +26826,23 @@ impl CfmlVirtualMachine {
         if !parent_vars.is_empty() || !child_vars.is_empty() {
             let mut merged_vars = parent_vars;
             for (k, v) in child_vars {
+                // CFML is case-insensitive: a child `__variables` member overrides a
+                // parent one even when the casing differs (parent `setup` vs child
+                // `setUp`). A plain insert leaves BOTH casings in the private scope;
+                // the top-level `this` merge below already drops the stale one, but
+                // `__variables` did not — so a subclass method that overrides an
+                // ancestor's differently-cased method (e.g. a TestBox mxunit spec's
+                // `setUp` over the compat base's empty `setup`) left the ancestor's
+                // version in `variables`, and the per-class method table built from it
+                // resolved the STALE ancestor method (get_ci exact-match-first). Drop
+                // any differently-cased entry first so the child's is the sole winner.
+                if let Some(stale) = merged_vars
+                    .keys()
+                    .find(|ek| ek.as_str() != k.as_str() && ek.eq_ignore_ascii_case(&k))
+                    .cloned()
+                {
+                    merged_vars.shift_remove(&stale);
+                }
                 merged_vars.insert(k, v);
             }
             parent_map.insert("__variables".to_string(), CfmlValue::strukt(merged_vars));
