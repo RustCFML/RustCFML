@@ -542,6 +542,7 @@ include "harness.cfm";
 <cf_runtest file="lifecycle/test_appscope_receiver_no_resurrect.cfm">
 <cf_runtest file="server/test_front_controller_fallback.cfm">
 <cf_runtest file="server/test_location_redirect.cfm">
+<cf_runtest file="server/test_form_duplicate_fields.cfm">
 
 <!--- --- Java Shims --- --->
 <cf_runtest file="java_shims/test_all.cfm">
