@@ -22547,6 +22547,31 @@ impl CfmlVirtualMachine {
             // none) — setting `this = receiver` triggers method-writeback that
             // replaces `enc` in the caller's locals with the closure's captured
             // `this` on each subsequent call.
+            // A FLAT component scope: methods + data in ONE struct with a shared
+            // method table but no `__name`/`__variables` self-key. This is how a
+            // FLYWEIGHT component's private `variables` scope is exposed when passed
+            // as an invoke receiver — FW/1's beanProxy runs the stashed original via
+            // `invoke(variables, "___doReverse", args)`. Its own map IS the private
+            // scope, so a method dispatched on it must read `variables` from THIS
+            // struct (an unqualified `getStackLog()` -> `variables.stackLog`), while
+            // its `this`/`super` context comes from the CALLER (the injected `$call`
+            // runs in the component's context) — the flat scope carries no such
+            // handle. Without this, the method ran unbound and DI-injected members
+            // (stackLog) were invisible -> "cannot call method [log] on a null value"
+            // once createObject produced flyweight Instances. Feature-gated: on the
+            // default (marker) build there is no flat flyweight scope, and the marker
+            // `variables` scope must keep its existing caller-locals fallback path,
+            // so this stays false and call_member_function is byte-identical.
+            #[cfg(feature = "component-instance")]
+            let receiver_is_flat_scope = matches!(
+                object,
+                CfmlValue::Struct(ref s)
+                    if s.method_table().is_some()
+                        && !s.contains_key("__variables")
+                        && !s.contains_key("__name")
+            );
+            #[cfg(not(feature = "component-instance"))]
+            let receiver_is_flat_scope = false;
             let receiver_is_cfc = matches!(
                 object,
                 CfmlValue::Struct(ref s) if s.contains_key("__variables") || s.contains_key("__name")
@@ -22603,7 +22628,9 @@ impl CfmlVirtualMachine {
                     None
                 }
             });
-            let saved_source_file_method: Option<Option<String>> = if receiver_is_cfc {
+            let saved_source_file_method: Option<Option<String>> = if receiver_is_cfc
+                || receiver_is_flat_scope
+            {
                 if let Some(src) = swap_source {
                     let prev = self.source_file.clone();
                     self.source_file = Some(src);
@@ -22614,7 +22641,24 @@ impl CfmlVirtualMachine {
             } else {
                 None
             };
-            if receiver_is_cfc {
+            if receiver_is_flat_scope {
+                // Flyweight `variables` scope passed to invoke() (FW/1 beanProxy's
+                // `invoke(variables, "___doReverse", args)`). Carry the CALLER's
+                // component context — `this` and the super/relative-resolution
+                // machinery it holds — so `super.init()`/`this.x` still resolve
+                // (the flat scope has no such handle), then override `variables`
+                // with the flat scope itself, whose map carries the DI-injected
+                // members the invoked method reads (getStackLog -> stackLog). The
+                // source_file was already swapped to the method's defining CFC
+                // above so its `__super_map` lookup lands on the right parent.
+                if let Some(ct) = caller_locals.get("this") {
+                    method_locals.insert("this".to_string(), ct.clone());
+                }
+                if let Some(sup) = caller_locals.get("super") {
+                    method_locals.insert("super".to_string(), sup.clone());
+                }
+                method_locals.insert("__variables".to_string(), object.clone());
+            } else if receiver_is_cfc {
                 if let CfmlValue::Struct(ref s) = object {
                     if let Some(vars) = s.get("__variables") {
                         method_locals.insert("__variables".to_string(), vars.clone());
