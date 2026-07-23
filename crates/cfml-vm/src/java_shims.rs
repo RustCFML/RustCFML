@@ -1549,6 +1549,15 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 CfmlValue::Function(f) => {
                     std::sync::Arc::as_ptr(f) as *const () as u64
                 }
+                // Flyweight component instance: the per-instance Arc backing IS
+                // its object identity (matches the Instance's own `hashCode()`/
+                // `equals()` in call_instance_method). Without this arm an Instance
+                // fell through to the value-hash below and hashed its constant
+                // "<Component>" string, so EVERY instance got the same identity —
+                // TestBox's assertSame/assertNotSame (getIdentityHashCode) then saw
+                // two distinct beans as one (FW/1 model transient-vs-singleton specs).
+                #[cfg(feature = "component-instance")]
+                CfmlValue::Instance(inst) => std::sync::Arc::as_ptr(inst) as *const () as u64,
                 // Value types (and the cloned-by-value Component) have no
                 // shared backing store, so hash their content for a stable,
                 // non-null result.
