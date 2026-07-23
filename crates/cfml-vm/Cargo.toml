@@ -56,7 +56,7 @@ cranelift-native = { workspace = true, optional = true }
 cfml-stdlib = { workspace = true, default-features = false }
 
 [features]
-default = ["std", "real-threads", "jit", "observability", "scope-pool"]
+default = ["std", "real-threads", "jit", "observability", "scope-pool", "component-instance"]
 std = []
 # Observability & debugging hook bus + the classic CF debug footer (Phase 0/1
 # of docs/observability-implementation-plan.md). Pure-Rust, host-only: it pulls
@@ -75,8 +75,11 @@ observability = []
 # build cfml-vm with `default-features = false`, so they never include it. See
 # SCOPE_ALLOC_LEVER_PLAN.md §5 Lever D.
 scope-pool = []
-# Component-model flyweight prototype (Phase C.2) — propagates to cfml-common.
-# OFF by default; see COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
+# Component-model flyweight (Phase C) — propagates to cfml-common. DEFAULT-ON for
+# native builds as of v0.519.0 (the Slice-6 flip). The wasm crates build cfml-vm with
+# `default-features = false` and do NOT request this feature, so they stay on the
+# marker-struct representation. Toggle off with `--no-default-features` + the other
+# defaults if the marker path is ever needed on native.
 component-instance = ["cfml-common/component-instance"]
 # Real OS-thread cfthread support. On by default for native targets; the wasm
 # targets (cfml-worker, rustcfml-wasm) build with default-features disabled and
