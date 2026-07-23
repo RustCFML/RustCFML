@@ -83,6 +83,24 @@ impl CfmlError {
     }
 }
 
+impl CfmlErrorType {
+    /// The CFML-canonical `e.type` string reported to caught CFML code — as
+    /// opposed to the human-facing `Display` form used for error banners.
+    /// `Expression` maps to lowercase `expression`, the value Lucee/ACF report
+    /// and the value the VM's in-handler (same-frame) undefined-read paths
+    /// already hardcode. Without this, an undefined read that propagated across
+    /// a call frame surfaced as `Expression` (Display-cased) while the same read
+    /// at page scope surfaced as `expression` (GH #282). Other categories keep
+    /// their existing casing — notably `Application`, which the default `throw`
+    /// type and tests depend on being capitalized.
+    pub fn type_name(&self) -> String {
+        match self {
+            CfmlErrorType::Expression => "expression".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for CfmlErrorType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -3586,7 +3586,7 @@ impl CfmlVirtualMachine {
         err_struct.insert("message".to_string(), CfmlValue::string(e.message.clone()));
         err_struct.insert(
             "type".to_string(),
-            CfmlValue::string(format!("{}", e.error_type)),
+            CfmlValue::string(e.error_type.type_name()),
         );
         err_struct.insert("detail".to_string(), CfmlValue::string(String::new()));
         // `stackTrace` (Lucee/ACF parity): a multiline "message @ template:line"
@@ -4144,7 +4144,14 @@ impl CfmlVirtualMachine {
             stack.push(exc);
             Ok(handler.catch_ip)
         } else {
-            Err(self.wrap_error(CfmlError::runtime(format!(
+            // No handler in the CURRENT frame: propagate as an Err so an outer
+            // frame's try/catch can still catch it. Use `expression` (NOT
+            // `runtime`) so a cross-frame `catch( expression e )` matches and
+            // `e.type` reports the CFML-standard type — matching Lucee/ACF and
+            // the in-handler branch above. Without this, an undefined read
+            // inside a component method/UDF surfaced as `runtime` while the
+            // page-scope read was `expression` (GH #282).
+            Err(self.wrap_error(CfmlError::expression(format!(
                 "Variable '{}' is undefined",
                 name
             ))))
@@ -5409,7 +5416,12 @@ impl CfmlVirtualMachine {
                             ip = handler.catch_ip;
                             continue;
                         }
-                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                        // No handler in this frame: propagate as `expression`
+                        // (not `runtime`) so a cross-frame `catch( expression e )`
+                        // matches — matching Lucee/ACF and the in-handler branch
+                        // above. Undefined reads inside a UDF/method used to
+                        // surface as `runtime` here (GH #282).
+                        return Err(self.wrap_error(CfmlError::expression(format!(
                             "Variable '{}' is undefined",
                             name
                         ))));
@@ -6361,7 +6373,14 @@ impl CfmlVirtualMachine {
                             ip = handler.catch_ip;
                             continue;
                         }
-                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                        // No handler in this frame: propagate as `expression`
+                        // (not `runtime`) so a cross-frame `catch( expression e )`
+                        // matches and `e.type` reports the CFML-standard type —
+                        // matching Lucee/ACF and the in-handler branch above. An
+                        // undefined bare read inside a UDF/method used to surface
+                        // as `runtime` while the page-scope read was `expression`
+                        // (GH #282).
+                        return Err(self.wrap_error(CfmlError::expression(format!(
                             "Variable '{}' is undefined",
                             name
                         ))));
@@ -11034,7 +11053,7 @@ impl CfmlVirtualMachine {
                                     );
                                     err_struct.insert(
                                         "type".to_string(),
-                                        CfmlValue::string(format!("{}", e.error_type)),
+                                        CfmlValue::string(e.error_type.type_name()),
                                     );
                                     err_struct.insert(
                                         "detail".to_string(),
@@ -11082,7 +11101,7 @@ impl CfmlVirtualMachine {
                                 );
                                 err_struct.insert(
                                     "type".to_string(),
-                                    CfmlValue::string(format!("{}", err.error_type)),
+                                    CfmlValue::string(err.error_type.type_name()),
                                 );
                                 err_struct
                                     .insert("detail".to_string(), CfmlValue::string(String::new()));
@@ -11209,7 +11228,7 @@ impl CfmlVirtualMachine {
                                     );
                                     err_struct.insert(
                                         "type".to_string(),
-                                        CfmlValue::string(format!("{}", e.error_type)),
+                                        CfmlValue::string(e.error_type.type_name()),
                                     );
                                     err_struct.insert(
                                         "detail".to_string(),
@@ -11255,7 +11274,7 @@ impl CfmlVirtualMachine {
                                 );
                                 err_struct.insert(
                                     "type".to_string(),
-                                    CfmlValue::string(format!("{}", err.error_type)),
+                                    CfmlValue::string(err.error_type.type_name()),
                                 );
                                 err_struct
                                     .insert("detail".to_string(), CfmlValue::string(String::new()));
