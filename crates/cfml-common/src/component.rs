@@ -330,7 +330,9 @@ impl Instance {
         let this_members = partition_data_map(marker);
         let variables_members = match marker.get_ci("__variables") {
             Some(CfmlValue::Struct(vars)) => partition_data_map(&vars),
-            _ => CfmlStruct::empty(),
+            // Untracked, like `partition_data_map`'s output — owned by the Instance
+            // Arc, never an independent cycle-GC candidate.
+            _ => CfmlStruct::empty_untracked(),
         };
         // Hang the shared blueprint method table off BOTH data maps so `get_ci`
         // falls through to methods on a data miss — this is what makes `this.foo()`,
@@ -437,7 +439,13 @@ fn partition_data_map(scope: &CfmlStruct) -> CfmlStruct {
             data.insert(k.clone(), v.clone());
         }
     });
-    CfmlStruct::new(data)
+    // UNTRACKED: this map is owned by the Instance's Arc (the tracked cycle-GC
+    // node). It must never be an independent collection candidate — an earlier
+    // tracked-map attempt let the collector free a live component's data map out
+    // from under it (Preside `EventHandlerBean`/`viewDispatch` 500, bisected
+    // 2026-07-22). The collector reaches these values by walking the Instance
+    // node's data maps instead. See `cycle_gc::classify`/`NodeHandle::Instance`.
+    CfmlStruct::new_untracked(data)
 }
 
 /// Build a [`CfmlValue::Instance`] from a finished marker instance and its
@@ -455,12 +463,26 @@ pub fn make_instance_value(
 ) -> CfmlValue {
     let inst = Instance::from_marker(marker, class, instance_id);
     let handle: InstanceRef = std::sync::Arc::new(parking_lot::RwLock::new(inst));
+    // Register the Instance Arc as a cycle-GC node so `Instance↔Instance` (and
+    // Instance↔struct) reference cycles are reclaimable at request end. Its data
+    // maps are untracked (owned by this Arc); the collector walks them via the
+    // Instance node. No-op unless the collector is armed (serve mode).
+    crate::cycle_gc::log_instance(&handle);
     let marker_ptr = marker.backing_ptr();
     let self_val = CfmlValue::Instance(handle.clone());
     {
         let g = handle.read();
         fixup_self_ref(&g.this_members, marker_ptr, &self_val);
         fixup_self_ref(&g.variables_members, marker_ptr, &self_val);
+        // Live `variables.this` → whole-Instance alias (Lucee/ACF parity): a `this`-key
+        // read on the private scope resolves to `CfmlValue::Instance`, so
+        // `getMetadata(variables.this).fullname`/`isObject(variables.this)` recognize the
+        // component (Wheels `Plugins.$initializeMixins`). Set here — where the handle
+        // first exists — as well as at `variables`-materialization (see lib.rs), so the
+        // alias is present even if `variables` is never explicitly referenced before
+        // `variables.this` is read. Weak ⇒ no Arc cycle. Supersedes the struct alias
+        // stamped by `from_marker` on a read (writes still reach the public scope).
+        g.variables_members.set_this_instance_alias(&handle);
     }
     CfmlValue::Instance(handle)
 }
@@ -1137,6 +1159,180 @@ mod producer_tests {
                 assert!(Arc::ptr_eq(&inner, &handle), "self-ref points at a different instance");
             }
             other => panic!("self-reference not retargeted: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Cycle-GC integration: the flyweight `Instance` is a collectible node.
+    // These lock in the fix for the `Instance↔Instance` Arc-cycle leak — an
+    // OPAQUE Instance under-collected (leaked every cyclic pair), while a naive
+    // descend-through-the-holder walk OVER-collected shared children. They drive
+    // the request-scoped collector directly (`arm`/`enable`/`collect`).
+    // ---------------------------------------------------------------------
+
+    fn as_inst(v: &CfmlValue) -> crate::component::InstanceRef {
+        match v {
+            CfmlValue::Instance(h) => h.clone(),
+            _ => panic!("expected an Instance value"),
+        }
+    }
+
+    #[test]
+    fn cycle_gc_reclaims_instance_to_instance_cycle() {
+        use crate::cycle_gc;
+        // Build the marker/blueprint BEFORE arming so only the Instances (not the
+        // marker struct) land in the allocation log.
+        let marker = build_marker();
+        let bp = Arc::new(ClassBlueprint::from_marker(&marker));
+
+        cycle_gc::arm();
+        cycle_gc::enable();
+
+        // A<->B mutual strong cycle. Keep Weak handles so, once the local roots
+        // drop, the pair is reachable ONLY through the cycle.
+        let a = make_instance_value(&marker, bp.clone(), 1);
+        let b = make_instance_value(&marker, bp.clone(), 2);
+        let (ia, ib) = (as_inst(&a), as_inst(&b));
+        let (wa, wb) = (Arc::downgrade(&ia), Arc::downgrade(&ib));
+        ia.read()
+            .variables_members
+            .insert("other".to_string(), b.clone());
+        ib.read()
+            .variables_members
+            .insert("other".to_string(), a.clone());
+
+        // Drop every external root: the CfmlValue locals AND the strong handles.
+        drop(ia);
+        drop(ib);
+        drop(a);
+        drop(b);
+        assert!(
+            wa.upgrade().is_some() && wb.upgrade().is_some(),
+            "precondition: the cycle keeps both instances alive before collection"
+        );
+
+        let collected = cycle_gc::collect();
+        assert!(
+            collected >= 2,
+            "expected both cycle instances reclaimed, collected={collected}"
+        );
+        assert!(
+            wa.upgrade().is_none(),
+            "A leaked: Instance<->Instance cycle was not reclaimed"
+        );
+        assert!(
+            wb.upgrade().is_none(),
+            "B leaked: Instance<->Instance cycle was not reclaimed"
+        );
+    }
+
+    #[test]
+    fn cycle_gc_keeps_externally_held_instance_with_internal_cycle() {
+        use crate::cycle_gc;
+        // Over-collection guard: an instance with an internal self-cycle that is
+        // STILL externally held (a live root) must survive with its data intact.
+        // This is the shape (a cached bean referencing itself) that the earlier
+        // buggy walk over-collected — Preside's `viewDispatch` 500.
+        let marker = build_marker();
+        let bp = Arc::new(ClassBlueprint::from_marker(&marker));
+
+        cycle_gc::arm();
+        cycle_gc::enable();
+
+        let a = make_instance_value(&marker, bp, 1);
+        let ia = as_inst(&a);
+        ia.read()
+            .variables_members
+            .insert("selfref".to_string(), a.clone());
+        ia.read()
+            .this_members
+            .insert("keepme".to_string(), CfmlValue::string("LIVE"));
+
+        // `a` and `ia` stay in scope → external owners. Collection must treat the
+        // instance as a live root and leave it (and everything it holds) untouched.
+        let _ = cycle_gc::collect();
+
+        assert!(
+            ia.read().variables_members.get_ci("selfref").is_some(),
+            "over-collected: a live instance lost its internal self-reference"
+        );
+        assert_eq!(
+            ia.read()
+                .this_members
+                .get_ci("keepme")
+                .map(|v| v.as_string())
+                .as_deref(),
+            Some("LIVE"),
+            "over-collected: a live instance lost a data member"
+        );
+
+        // Break the intentional self-cycle so it doesn't leak past this test.
+        ia.read().variables_members.with_write(|m| m.clear());
+    }
+
+    #[test]
+    fn cycle_gc_does_not_over_collect_shared_child_of_a_dying_instance_cycle() {
+        use crate::cycle_gc;
+        // The double-walk trap this fix is designed to avoid: a GARBAGE Instance
+        // cycle (A<->B) whose member data also references a struct C that is ALSO
+        // held by an external, surviving owner. With a correct TERMINAL
+        // `classify(Instance)`, C's incoming internal edge is counted exactly ONCE
+        // (from A's node walk), so its external owner keeps it alive while A/B are
+        // reclaimed. A buggy walk that descended through every HOLDER of A would
+        // count C's edge repeatedly, zero its external count, and clear a live
+        // struct out from under its real owner — the over-collection class the
+        // opaque-vs-naive tension warned about.
+        let marker = build_marker();
+        let bp = Arc::new(ClassBlueprint::from_marker(&marker));
+
+        cycle_gc::arm();
+        cycle_gc::enable();
+
+        // C: a tracked struct with a sentinel member, held by an owner that
+        // OUTLIVES collection (mimics application scope).
+        let c = CfmlValue::Struct(CfmlStruct::new({
+            let mut m = ValueMap::default();
+            m.insert("sentinel".to_string(), CfmlValue::string("ALIVE"));
+            m
+        }));
+        let external_owner = c.clone();
+
+        let a = make_instance_value(&marker, bp.clone(), 1);
+        let b = make_instance_value(&marker, bp.clone(), 2);
+        let (ia, ib) = (as_inst(&a), as_inst(&b));
+        let (wa, wb) = (Arc::downgrade(&ia), Arc::downgrade(&ib));
+        ia.read()
+            .variables_members
+            .insert("other".to_string(), b.clone());
+        ib.read()
+            .variables_members
+            .insert("other".to_string(), a.clone());
+        ia.read()
+            .variables_members
+            .insert("child".to_string(), c.clone());
+
+        // Drop the instance roots + our own handle to C. The A<->B cycle is now
+        // pure garbage; C stays referenced by `external_owner` (and transiently by
+        // A's private scope until A is reclaimed).
+        drop(ia);
+        drop(ib);
+        drop(a);
+        drop(b);
+        drop(c);
+
+        let _ = cycle_gc::collect();
+
+        assert!(
+            wa.upgrade().is_none() && wb.upgrade().is_none(),
+            "the garbage instance cycle should have been reclaimed"
+        );
+        match &external_owner {
+            CfmlValue::Struct(s) => assert_eq!(
+                s.get_ci("sentinel").map(|v| v.as_string()).as_deref(),
+                Some("ALIVE"),
+                "over-collected: a struct still held by an external owner was cleared"
+            ),
+            _ => unreachable!(),
         }
     }
 }

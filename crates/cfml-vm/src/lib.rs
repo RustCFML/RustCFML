@@ -5131,6 +5131,16 @@ impl CfmlVirtualMachine {
                             if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
                                 vars.set_this_alias_if_changed(this_s);
                             }
+                            // Flyweight: `this` is a live `Instance`, not a Struct — the
+                            // struct-alias branch above never fires, so stamp the
+                            // Instance alias here instead. Then `variables.this` reads
+                            // back as the whole component (`getMetadata`/`isObject`
+                            // parity) while writes still route to its public scope. See
+                            // `CfmlStruct::this_instance_alias`.
+                            #[cfg(feature = "component-instance")]
+                            if let Some(CfmlValue::Instance(inst)) = locals.get("this") {
+                                vars.set_this_instance_alias(inst);
+                            }
                             CfmlValue::Struct(vars.clone())
                         } else if !is_inside_function {
                             let mut merged = self.globals.clone();

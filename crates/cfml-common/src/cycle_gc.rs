@@ -45,6 +45,8 @@
 //! collection while `live_threads` is non-empty. See `CYCLE_GC_PLAN.md`.
 
 use crate::dynamic::{CfmlQueryData, CfmlValue, StructInner, ValueMap};
+#[cfg(feature = "component-instance")]
+use crate::component::Instance;
 use parking_lot::RwLock as PlRwLock;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -86,6 +88,14 @@ enum TrackedAlloc {
     Array(Weak<PlRwLock<Vec<CfmlValue>>>),
     Query(Weak<PlRwLock<CfmlQueryData>>),
     Scope(Weak<RwLock<ValueMap>>),
+    /// A flyweight component `Instance`. The COLLECTIBLE node is the Instance Arc
+    /// itself; its `this_members`/`variables_members` are untracked and owned by
+    /// this Arc (the collector walks their values via the Instance node — see
+    /// `classify` / `NodeHandle::Instance`). Tracking the Arc (not the maps) is
+    /// what makes `Instance↔Instance` cycles reclaimable without the earlier
+    /// over-collection of live component data.
+    #[cfg(feature = "component-instance")]
+    Instance(Weak<PlRwLock<Instance>>),
 }
 
 thread_local! {
@@ -164,6 +174,10 @@ pub fn log_type_breakdown() -> (usize, usize, usize, usize) {
                     TrackedAlloc::Array(_) => t.1 += 1,
                     TrackedAlloc::Query(_) => t.2 += 1,
                     TrackedAlloc::Scope(_) => t.3 += 1,
+                    // Instances are tracked nodes but not surfaced in this
+                    // struct/array/query/scope diagnostic tuple.
+                    #[cfg(feature = "component-instance")]
+                    TrackedAlloc::Instance(_) => {}
                 }
             }
         }
@@ -408,6 +422,18 @@ pub fn log_query(arc: &Arc<PlRwLock<CfmlQueryData>>) {
     }
 }
 
+/// Track a flyweight component `Instance` Arc as a cycle node. Call once at
+/// Instance creation (`make_instance_value` / `duplicate`). Held weakly, so a
+/// short-lived Instance freed by refcounting before request end simply fails to
+/// upgrade at collection time. No-op unless the collector is armed.
+#[cfg(feature = "component-instance")]
+#[inline]
+pub fn log_instance(arc: &Arc<PlRwLock<Instance>>) {
+    if is_armed() {
+        log_push(TrackedAlloc::Instance(Arc::downgrade(arc)));
+    }
+}
+
 /// Allocate a closure-capture scope, tracking it as a cycle node. Use this in
 /// place of `Arc::new(RwLock::new(map))` for every `captured_scope`/`closure_env`
 /// so closure↔scope cycles are reclaimable.
@@ -429,6 +455,8 @@ enum NodeHandle {
     Array(Arc<PlRwLock<Vec<CfmlValue>>>),
     Query(Arc<PlRwLock<CfmlQueryData>>),
     Scope(Arc<RwLock<ValueMap>>),
+    #[cfg(feature = "component-instance")]
+    Instance(Arc<PlRwLock<Instance>>),
 }
 
 impl NodeHandle {
@@ -439,14 +467,19 @@ impl NodeHandle {
             NodeHandle::Array(a) => Arc::strong_count(a),
             NodeHandle::Query(a) => Arc::strong_count(a),
             NodeHandle::Scope(a) => Arc::strong_count(a),
+            #[cfg(feature = "component-instance")]
+            NodeHandle::Instance(a) => Arc::strong_count(a),
         }
     }
 
     /// Enumerate the immediate child *nodes* (members of `in_set`) without
-    /// cloning any `Arc` (so refcounts are undisturbed) — terminal at node
-    /// types, descending through non-node carriers (Function/Component/Closure/
+    /// disturbing any TRACKED node's refcount — terminal at node types,
+    /// descending through non-node carriers (Function/Component/Closure/
     /// QueryColumn). Holds a read guard for the duration; the callback only
-    /// records ids and never locks another node, so this cannot deadlock.
+    /// records ids and never locks another node, so this cannot deadlock. (The
+    /// `Instance` arm is the one place a handle is cloned — the two UNTRACKED
+    /// data maps, whose refcounts the collector never inspects — so the
+    /// "refcounts undisturbed" guarantee still holds for every tracked node.)
     fn for_each_child_node(&self, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
         match self {
             NodeHandle::Struct(a) => {
@@ -476,6 +509,39 @@ impl NodeHandle {
                     }
                 }
             }
+            // The Instance's OWN outgoing edges: walk both data-map value sets so
+            // edges to OTHER tracked nodes (other Instances, structs, arrays,
+            // closure scopes) are surfaced EXACTLY ONCE — here, on the Instance
+            // node — never re-walked by each holder of the Instance (`classify`'s
+            // Instance arm is terminal). This is what keeps `internal_in` accurate
+            // and avoids the double-count that would deflate a shared child's
+            // external count and over-collect it. The data maps themselves are
+            // untracked, so we never emit their backing ptrs (they can't be in
+            // `in_set`); we only classify the VALUES they hold.
+            //
+            // `try_read` + skip-if-locked (a lingering finished cfthread could hold
+            // the lock): skipping under-counts this node's outgoing internal edges,
+            // which can only INFLATE its children's external counts (protecting
+            // them) — conservative, never over-collects. Handles are cloned out and
+            // the Instance lock released before touching the maps (no nested lock).
+            #[cfg(feature = "component-instance")]
+            NodeHandle::Instance(a) => {
+                let maps = a
+                    .try_read()
+                    .map(|g| (g.this_members.clone(), g.variables_members.clone()));
+                if let Some((this_m, vars_m)) = maps {
+                    this_m.with_read(|m| {
+                        for v in m.values() {
+                            classify(v, in_set, emit);
+                        }
+                    });
+                    vars_m.with_read(|m| {
+                        for v in m.values() {
+                            classify(v, in_set, emit);
+                        }
+                    });
+                }
+            }
         }
     }
 
@@ -492,6 +558,20 @@ impl NodeHandle {
             NodeHandle::Scope(a) => {
                 if let Ok(mut g) = a.write() {
                     g.clear();
+                }
+            }
+            // Break the Instance's cycle by clearing its data maps (drops the Arcs
+            // it holds to other cycle members). We do NOT drop the Instance Arc
+            // itself — the probe handles in `nodes` are dropped after this pass and
+            // the strong count falls to zero naturally. `try_write`: a node we
+            // reached here is non-live (no external owner), so nothing should hold
+            // its lock; skip-if-contended rather than block (defensive — a stuck
+            // lock would only leak this one cycle for one request).
+            #[cfg(feature = "component-instance")]
+            NodeHandle::Instance(a) => {
+                if let Some(g) = a.try_write() {
+                    g.this_members.with_write(|m| m.clear());
+                    g.variables_members.with_write(|m| m.clear());
                 }
             }
         }
@@ -555,20 +635,24 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
                 classify(cv, in_set, emit);
             }
         }
-        // A flyweight component `Instance` (`Arc<RwLock<Instance>>`) is a NON-tracked
-        // owner — treat it as OPAQUE / an external root, exactly like `NativeObject`.
-        // Its `this_members`/`variables_members` are owned by the Instance's `Arc`, so
-        // their `strong_count` already carries an EXTERNAL reference (from the
-        // non-tracked Instance) and they are protected by refcounting. Do NOT emit
-        // internal edges to them here: this collector computes
-        // `external(n) = strong_count − 1 − internal_in(n)` and collects nodes with
-        // `external == 0`, so emitting edges to the data maps would INFLATE their
-        // `internal_in`, drop `external` to 0, and OVER-COLLECT live component data.
-        // (An earlier "fix" that emitted those ptrs did exactly this: Preside's
-        // cached `EventHandlerBean` lost `variables.viewDispatch` on a warm request,
-        // 500ing the admin login page. Verified by bisection 2026-07-22.)
+        // A flyweight component `Instance` (`Arc<RwLock<Instance>>`) is a TRACKED,
+        // collectible node (`TrackedAlloc::Instance` / `NodeHandle::Instance`), so
+        // it is TERMINAL here exactly like Struct/Array/Query: emit the Instance
+        // ptr if it is a survivor and STOP. We must NOT descend into its data maps
+        // from this arm — that descent is done once, by the Instance node's own
+        // `for_each_child_node`. Descending here would make every holder of the
+        // Instance re-walk its members, double-counting `internal_in` for shared
+        // children, deflating their external count, and OVER-COLLECTING live data.
+        // (That double-walk — plus the earlier variant that tracked the data maps
+        // directly — is what 500'd Preside's cached `EventHandlerBean` by dropping
+        // `variables.viewDispatch` on a warm request; bisected 2026-07-22.)
         #[cfg(feature = "component-instance")]
-        CfmlValue::Instance(_) => {}
+        CfmlValue::Instance(inst) => {
+            let p = Arc::as_ptr(inst) as *const () as usize;
+            if in_set.contains(&p) {
+                emit(p);
+            }
+        }
         _ => {}
     }
 }
@@ -632,6 +716,14 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
                     nodes
                         .entry(Arc::as_ptr(&a) as *const () as usize)
                         .or_insert(NodeHandle::Scope(a));
+                }
+            }
+            #[cfg(feature = "component-instance")]
+            TrackedAlloc::Instance(w) => {
+                if let Some(a) = w.upgrade() {
+                    nodes
+                        .entry(Arc::as_ptr(&a) as *const () as usize)
+                        .or_insert(NodeHandle::Instance(a));
                 }
             }
         }

@@ -273,6 +273,21 @@ pub struct StructInner {
     /// instance forever (the v0.185.0 per-request serve-mode leak). `None` on
     /// every non-component struct, so unrelated structs pay nothing.
     pub this_alias: Option<Weak<PlRwLock<StructInner>>>,
+    /// Flyweight `variables.this` alias to the OWNING `Instance` (component-model).
+    /// When set (only on a flyweight instance's private `__variables` scope) it takes
+    /// precedence over [`Self::this_alias`] when resolving the `this` key, so
+    /// `variables.this` reads back as `CfmlValue::Instance` — the whole object — rather
+    /// than the bare public DATA map. That is what the marker path did implicitly (its
+    /// `this` scope struct carried `__name`/`__source_file`), and what
+    /// `getMetadata(variables.this).fullname` (Wheels `Plugins.$initializeMixins`) and
+    /// `isObject(variables.this)` need to recognize a component. Writes
+    /// (`StructAppend(variables.this, fns)`, `variables.this.x = v`) still reach the
+    /// public scope — they route through the Instance's public-member setter. Held as a
+    /// `Weak` so it forms no strong Arc cycle (`instance -> __variables -> this ->
+    /// instance` would leak — the v0.185.0 serve-mode leak). Feature-gated: the default
+    /// (marker) build's `StructInner` layout is byte-identical.
+    #[cfg(feature = "component-instance")]
+    pub this_instance_alias: Option<Weak<PlRwLock<crate::component::Instance>>>,
     /// Shared per-class method table (component-model flyweight). When set (only
     /// on a component instance's `this` and `__variables` scope structs), method
     /// lookups that MISS the per-instance `map` fall through here. The `Arc` is
@@ -611,6 +626,8 @@ impl CfmlStruct {
             ci,
             shape_id: next_shape_id(),
             this_alias: None,
+            #[cfg(feature = "component-instance")]
+            this_instance_alias: None,
             method_table: None,
         }));
         crate::cycle_gc::log_struct(&arc);
@@ -649,6 +666,8 @@ impl CfmlStruct {
             ci,
             shape_id: next_shape_id(),
             this_alias: None,
+            #[cfg(feature = "component-instance")]
+            this_instance_alias: None,
             method_table: None,
         })))
     }
@@ -683,6 +702,17 @@ impl CfmlStruct {
     #[inline]
     pub fn empty() -> Self {
         CfmlStruct::new(ValueMap::default())
+    }
+
+    /// Like [`CfmlStruct::empty`] but SKIPS the cycle-GC allocation log — see
+    /// [`CfmlStruct::new_untracked`] for the soundness contract. Used for the
+    /// flyweight [`Instance`](crate::component::Instance) data maps, whose sole
+    /// owner is the tracked `Instance` Arc: they must NOT be independent
+    /// collection candidates (that caused the over-collection regression), and
+    /// the collector reaches their contents by walking the Instance node instead.
+    #[inline]
+    pub fn empty_untracked() -> Self {
+        CfmlStruct::new_untracked(ValueMap::default())
     }
 
     /// Two handles onto the same backing store (reference identity).
@@ -754,7 +784,7 @@ impl CfmlStruct {
         // stored `this` key resolves it to the live public scope via a Weak
         // back-edge. Only consulted on a miss, and only for the `this` key.
         if key.eq_ignore_ascii_case("this") {
-            return self.this_alias_struct().map(CfmlValue::Struct);
+            return self.this_alias_value();
         }
         None
     }
@@ -788,6 +818,49 @@ impl CfmlStruct {
         self.0.read().this_alias.as_ref().and_then(|w| w.upgrade()).map(CfmlStruct)
     }
 
+    /// Flyweight (component-model): point the `variables.this` alias at the OWNING
+    /// `Instance`, so a `this`-key read resolves to `CfmlValue::Instance` (the whole
+    /// component) rather than the bare public data map. See
+    /// [`StructInner::this_instance_alias`]. Idempotent write-avoidance mirrors
+    /// [`Self::set_this_alias_if_changed`]; held as a `Weak` (no Arc cycle).
+    #[cfg(feature = "component-instance")]
+    pub fn set_this_instance_alias(&self, inst: &crate::component::InstanceRef) {
+        {
+            let g = self.0.read();
+            if let Some(w) = &g.this_instance_alias {
+                if let Some(cur) = w.upgrade() {
+                    if Arc::ptr_eq(&cur, inst) {
+                        return;
+                    }
+                }
+            }
+        }
+        self.0.write().this_instance_alias = Some(Arc::downgrade(inst));
+    }
+
+    /// Resolve the live `variables.this` alias to the value a `this`-key read should
+    /// yield: the flyweight `Instance` alias wins (so `getMetadata`/`isObject`
+    /// recognize the component), falling back to the marker struct alias. `None` when
+    /// neither is set or both have expired. This is the single source of truth for the
+    /// `this`-key fallthrough in `get`/`get_ci` and the `StructKeyExists(_, "this")`
+    /// checks.
+    #[inline]
+    pub fn this_alias_value(&self) -> Option<CfmlValue> {
+        #[cfg(feature = "component-instance")]
+        {
+            let inst = self
+                .0
+                .read()
+                .this_instance_alias
+                .as_ref()
+                .and_then(|w| w.upgrade());
+            if let Some(inst) = inst {
+                return Some(CfmlValue::Instance(inst));
+            }
+        }
+        self.this_alias_struct().map(CfmlValue::Struct)
+    }
+
     /// Clone the value for `key`, matching keys case-insensitively (CFML keys
     /// are case-insensitive). Returns the first matching entry's value.
     pub fn get_ci(&self, key: &str) -> Option<CfmlValue> {
@@ -814,7 +887,7 @@ impl CfmlStruct {
         }
         // Live `variables.this` alias on a miss (see `get`).
         if key.eq_ignore_ascii_case("this") {
-            return self.this_alias_struct().map(CfmlValue::Struct);
+            return self.this_alias_value();
         }
         None
     }
@@ -902,7 +975,7 @@ impl CfmlStruct {
                 }
             }
         }
-        key.eq_ignore_ascii_case("this") && self.this_alias_struct().is_some()
+        key.eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
     }
 
     /// Case-insensitive key presence check.
@@ -921,7 +994,7 @@ impl CfmlStruct {
         drop(g);
         // `StructKeyExists(variables, "this")` must see the live alias (Lucee
         // parity — Wheels Plugins.cfc gates the public mixin append on it).
-        key.eq_ignore_ascii_case("this") && self.this_alias_struct().is_some()
+        key.eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
     }
 
     /// Insert (interior mutability — visible to all aliases). Returns the
@@ -2072,8 +2145,10 @@ impl CfmlValue {
                     return existing.clone();
                 }
                 let g = inst.read();
-                let this_members = CfmlStruct::empty();
-                let variables_members = CfmlStruct::empty();
+                // Untracked: owned by the new Instance Arc (tracked below), never
+                // an independent cycle-GC candidate. Mirrors `Instance::from_marker`.
+                let this_members = CfmlStruct::empty_untracked();
+                let variables_members = CfmlStruct::empty_untracked();
                 this_members.set_method_table(g.class.method_values.clone());
                 variables_members.set_method_table(g.class.method_values.clone());
                 if let Some(ref stat) = g.class.static_scope {
@@ -2095,6 +2170,9 @@ impl CfmlValue {
                         native_parent: g.native_parent.clone(),
                     },
                 ));
+                // Track the duplicated Instance Arc as a cycle-GC node (its data
+                // maps are untracked, reached via the Instance node walk).
+                crate::cycle_gc::log_instance(&new_inst);
                 seen.insert(ptr, CfmlValue::Instance(new_inst.clone()));
                 for (k, v) in g.this_members.snapshot() {
                     let dv = v.deep_copy_guarded(seen, share_nested_components, false);
