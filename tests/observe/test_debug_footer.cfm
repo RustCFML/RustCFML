@@ -62,6 +62,20 @@ if (isRustCFML() && isDebugMode()) {
     trace("footer test trace");
     assert("writeLog + trace recorded as traces",
         arrayLen(getDebugData().traces) == trBefore + 2, true);
+
+    // Regression (v0.524): a CFC method call must feed the `pages` (templates)
+    // section. The v0.519 flyweight flip made components `Instance` values, but
+    // both template-timing hooks only fired for marker `Struct` receivers, so
+    // every CFC method call recorded ZERO page rows — the debug footer collapsed
+    // to just the .cfm includes + Application.cfc lifecycle. Instantiating a
+    // component that EXTENDS another and calling its method must now surface a
+    // `pages` row whose id resolves to DebugFooterKid.cfc.
+    var kid = new observe.DebugFooterKid();
+    assert("inherited method runs", kid.kidRun(), "hello from base via kid");
+    var pageIds = getDebugData().pages.map((p) => lCase(p.id));
+    var kidRecorded = pageIds.some((id) => id.findNoCase("debugfooterkid.cfc") > 0);
+    assert("CFC method call recorded a pages row (flyweight regression guard)",
+        kidRecorded, true);
 } else if (isRustCFML()) {
     // Debug footer not active for this request (debugging disabled in the served
     // webroot's .cfconfig, or a non-whitelisted viewer). getDebugData() is empty

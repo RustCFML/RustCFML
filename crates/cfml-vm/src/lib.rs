@@ -24666,6 +24666,46 @@ impl CfmlVirtualMachine {
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
     ) -> CfmlResult {
+        // Debug-footer parity: fire a `template` hook for the flyweight Instance's
+        // defining source, timed with EXCLUSIVE self-time. Every CFC method call
+        // funnels through this single dispatcher, so timing it here restores the
+        // Templates/pages section coverage the marker-struct path used to get via
+        // `call_member_function`'s Struct+`__source_file` arm (which the Instance
+        // early-return now bypasses). Without this the debug output only lists the
+        // plain-`.cfm` includes and Application.cfc lifecycle, dropping every CFC
+        // the request actually executed (regression from the v0.519 flyweight flip).
+        #[cfg(feature = "observability")]
+        {
+            if self.interest.contains(observe::Interest::TEMPLATE) {
+                let src = {
+                    let s = inst.read().class.source_file.clone();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                };
+                if let Some(src) = src {
+                    let start = std::time::Instant::now();
+                    self.template_frame_begin();
+                    let r =
+                        self.call_instance_method_impl(inst, method, extra_args, arg_names);
+                    self.template_frame_end(&src, start.elapsed().as_micros() as i64);
+                    return r;
+                }
+            }
+        }
+        self.call_instance_method_impl(inst, method, extra_args, arg_names)
+    }
+
+    #[cfg(feature = "component-instance")]
+    fn call_instance_method_impl(
+        &mut self,
+        inst: &cfml_common::component::InstanceRef,
+        method: &str,
+        extra_args: &mut Vec<CfmlValue>,
+        arg_names: Option<&[String]>,
+    ) -> CfmlResult {
         let object = CfmlValue::Instance(inst.clone());
 
         // Snapshot the handles we need, then DROP the read lock before any
