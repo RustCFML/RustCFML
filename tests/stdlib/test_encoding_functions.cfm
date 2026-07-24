@@ -78,8 +78,16 @@ assertTrue("encodeForXMLAttribute encodes lt", find("&lt;", xmlAttr) > 0);
 efHtml = encodeForHTML("<b>bold</b>");
 assertTrue("encodeForHTML encodes lt", find("&lt;", efHtml) > 0);
 
+// GH #283: encodeForURL and urlEncodedFormat have DIFFERENT space encodings.
+// encodeForURL uses form-encoding semantics (ESAPI / java.net.URLEncoder), so a
+// space is `+` — matching Lucee 5/6/7, Adobe CF and BoxLang. urlEncodedFormat /
+// urlEncode use `%20` (GH #270). The two must not share one encoder.
 efUrl = encodeForURL("hello world");
-assertTrue("encodeForURL encodes space", find("%20", efUrl) > 0 || find("+", efUrl) > 0);
+assert("encodeForURL encodes space as +", efUrl, "hello+world");
+assert("urlEncodedFormat encodes space as %20", urlEncodedFormat("hello world"), "hello%20world");
+// A '+' in the input round-trips to %2B on both.
+assert("encodeForURL escapes a literal plus", encodeForURL("a b+c"), "a+b%2Bc");
+assert("urlEncodedFormat escapes a literal plus", urlEncodedFormat("a b+c"), "a%20b%2Bc");
 
 efJs = encodeForJavaScript("alert()");
 assertTrue("encodeForJavaScript returns string", len(efJs) > 0);

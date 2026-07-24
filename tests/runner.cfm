@@ -316,6 +316,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_new_returns_init.cfm">
 <cf_runtest file="oop/test_pseudo_ctor_parent_this.cfm">
 <cf_runtest file="oop/test_variables_this_alias.cfm">
+<cf_runtest file="oop/test_variables_scope_struct_copy.cfm">
 <cf_runtest file="oop/test_undefined_read_type_in_function.cfm">
 <cf_runtest file="oop/test_instance_serialize_cycle.cfm">
 <cf_runtest file="oop/test_include_rewrite_freshness.cfm">

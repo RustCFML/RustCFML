@@ -1944,15 +1944,19 @@ fn fn_binary_decode(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-fn fn_url_encode(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
+// Shared percent-encoder. `space_as_plus` selects between the two CFML
+// reference behaviours (GH #270 / GH #283):
+//   * urlEncodedFormat / urlEncode → space is `%20` (path-style; matches
+//     Lucee/ACF `URLEncodedFormat`).
+//   * encodeForURL → space is `+` (ESAPI routes through `java.net.URLEncoder`,
+//     i.e. application/x-www-form-urlencoded semantics; every JVM engine —
+//     Lucee 5/6/7, Adobe CF, BoxLang — encodes a space as `+`).
+fn url_encode_impl(s: &str, space_as_plus: bool) -> String {
     let mut result = String::new();
     for c in s.chars() {
         match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => result.push(c),
-            // CFML (Lucee/ACF) encode a space as %20, NOT `+`. Only
-            // application/x-www-form-urlencoded uses `+`; urlEncodedFormat /
-            // encodeForURL / urlEncode all produce %20. (GH #270)
+            ' ' if space_as_plus => result.push('+'),
             _ => {
                 for b in c.to_string().as_bytes() {
                     result.push_str(&format!("%{:02X}", b));
@@ -1960,7 +1964,11 @@ fn fn_url_encode(args: Vec<CfmlValue>) -> CfmlResult {
             }
         }
     }
-    Ok(CfmlValue::string(result))
+    result
+}
+
+fn fn_url_encode(args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), false)))
 }
 
 fn fn_url_decode(args: Vec<CfmlValue>) -> CfmlResult {
@@ -3368,7 +3376,13 @@ fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_copy(a); }
     // Shallow copy: a fresh top-level struct over the same (shared) values.
+    // A component's `variables` SCOPE is a plain Struct with the shared method
+    // table attached (GH #285) — union it in so the copy keeps its function
+    // members, matching Lucee (functions are ordinary struct values here).
     match args.first() {
+        Some(CfmlValue::Struct(s)) if s.method_table().is_some() => {
+            Ok(CfmlValue::strukt(s.snapshot_with_methods()))
+        }
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::strukt(s.snapshot())),
         _ => Ok(CfmlValue::strukt(ValueMap::default())),
     }
@@ -3426,18 +3440,23 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
             let src_is_component = b.contains_key("__variables")
                 || b.contains_key("__name")
                 || b.contains_key("__is_component");
-            // For a component source, its public methods live in the shared
-            // method table (component-model flyweight), NOT the instance map, so
-            // `b.iter()` (map-only) would miss them entirely — e.g. TestBox's
+            // For a component source, its methods live in the shared method table
+            // (component-model flyweight), NOT the instance map, so `b.iter()`
+            // (map-only) would miss them entirely — e.g. TestBox's
             // `addMatchers( new CustomMatcher() )` folds a matcher CFC's public
-            // methods into a plain struct. Enumerate map ∪ table for components.
-            let entries: Vec<(String, CfmlValue)> = if src_is_component {
+            // methods into a plain struct. A component's `variables` SCOPE
+            // (`StructAppend(c, variables)` — Wheels' plugin snapshot, GH #285)
+            // is a plain Struct with the method table attached but WITHOUT the
+            // `__` marker keys, so detect the table directly. Enumerate map ∪
+            // table whenever a table is present.
+            let src_has_methods = b.method_table().is_some();
+            let entries: Vec<(String, CfmlValue)> = if src_is_component || src_has_methods {
                 b.all_entries()
             } else {
                 b.iter().collect()
             };
             for (k, v) in entries {
-                if src_is_component
+                if (src_is_component || src_has_methods)
                     && (cfml_common::component::is_reserved_component_key(&k)
                         || k.eq_ignore_ascii_case("this")
                         || k.eq_ignore_ascii_case("super"))
@@ -7981,7 +8000,9 @@ fn fn_get_component_static_scope(_args: Vec<CfmlValue>) -> CfmlResult {
 // ===============================================
 
 fn fn_encode_for_url(args: Vec<CfmlValue>) -> CfmlResult {
-    fn_url_encode(args)
+    // GH #283: encodeForURL encodes a space as `+` (form-encoding semantics),
+    // unlike urlEncodedFormat which uses `%20`.
+    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), true)))
 }
 
 fn fn_encode_for_css(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8138,7 +8159,7 @@ fn fn_encode_for(args: Vec<CfmlValue>) -> CfmlResult {
         "xmlattribute" => fn_encode_for_xml_attribute(value_args),
         "javascript" | "js" => fn_encode_for_javascript(value_args),
         "css" => fn_encode_for_css(value_args),
-        "url" => fn_url_encode(value_args),
+        "url" => fn_encode_for_url(value_args), // ESAPI URL codec: space → `+` (GH #283)
         _ => Err(CfmlError::runtime(format!("Unsupported encoding type: {}", encoding_type))),
     }
 }

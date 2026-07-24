@@ -22572,8 +22572,22 @@ impl CfmlVirtualMachine {
                 // mis-dispatched to the caller's own `get`. Only genuine
                 // mid-construction `this` (a struct with no `__variables` yet and no
                 // shim marker) uses the caller's hoisted method table.
+                //
+                // GH #285 (secondary): the receiver must actually be an
+                // in-construction CFC `this`, not just any markerless plain struct.
+                // An in-construction `this` (before its `variables` scope is
+                // assembled) still carries the `__name` component marker, whereas a
+                // user's `core = {}; core.pluralize(...)` (Wheels snapshots a
+                // controller's methods this way) is a fully markerless struct.
+                // Without the `__name` gate the missing member `pluralize` resolved
+                // against the CALLER's own method table and, inside a method itself
+                // named `pluralize`, recursed to the depth guard. Requiring
+                // `__name` lets a foreign plain struct fall through to the
+                // undefined-variable error path (Lucee parity) instead.
                 CfmlValue::Struct(ref s)
-                    if !s.contains_key("__variables") && !s.contains_key("__java_shim") =>
+                    if s.contains_key("__name")
+                        && !s.contains_key("__variables")
+                        && !s.contains_key("__java_shim") =>
                 {
                     caller_variables
                         .as_ref()
@@ -23184,6 +23198,33 @@ impl CfmlVirtualMachine {
                 {
                     return Ok(java_time::instant_from_millis(local_dt.timestamp_millis()));
                 }
+            }
+        }
+
+        // GH #285 (secondary): a member CALL on a PLAIN struct whose key does not
+        // exist throws, mirroring the rvalue READ of the same missing member
+        // (`x = core.pluralize` already throws `Variable 'pluralize' is
+        // undefined`) — Lucee throws in both cases. Reached only after every
+        // java.lang.Object-style shim above (getClass/toString/hashCode/…) has had
+        // its chance, so those still resolve. Scoped to a genuinely plain struct:
+        // component receivers (`__variables`/`__name`) already threw "has no
+        // function" above; java shims, in-construction `this`, flyweight flat
+        // scopes (method table) and other typed receivers keep the lenient Null.
+        if let CfmlValue::Struct(ref s) = object {
+            let is_plain = !s.contains_key("__variables")
+                && !s.contains_key("__name")
+                && !s.contains_key("__is_component")
+                && !s.contains_key("__java_shim")
+                && !s.contains_key("__java_class")
+                && !s.contains_key("__is_super")
+                && s.method_table().is_none();
+            if is_plain {
+                let mut err = CfmlError::new(
+                    format!("Variable '{}' is undefined", method),
+                    CfmlErrorType::Expression,
+                );
+                err.stack_trace = self.build_stack_trace();
+                return Err(err);
             }
         }
 
