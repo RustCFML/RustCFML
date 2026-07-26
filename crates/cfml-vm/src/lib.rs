@@ -979,6 +979,12 @@ pub struct ServerState {
     /// not-found, so we avoid re-`stat`ing non-existent candidate paths that
     /// Preside probes on every render (helper/view/mapping resolution).
     pub canonicalize_cache: Arc<parking_lot::RwLock<HashMap<String, Option<String>>>>,
+    /// Cross-request custom-tag template resolution cache, `--production` only
+    /// (same immutable-tree contract as `canonicalize_cache`). Keyed by
+    /// (calling template's dir, tag path spec) → resolved template path.
+    /// Successes only — a miss must stay re-probeable. Request-lifetime sibling:
+    /// the per-request VM's `request_custom_tag_cache` (all modes).
+    pub custom_tag_path_cache: Arc<parking_lot::RwLock<HashMap<(String, String), String>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -1039,6 +1045,7 @@ impl ServerState {
             app_cfconfig_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             component_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             canonicalize_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            custom_tag_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -24208,13 +24215,30 @@ impl CfmlVirtualMachine {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let cache_key = (source_dir, path_spec.to_string());
+        // Layer 1: request-scoped (all modes).
         if let Some(hit) = self.request_custom_tag_cache.read().get(&cache_key) {
             return Ok(hit.clone());
+        }
+        // Layer 2: cross-request `--production` cache (immutable-tree contract,
+        // same as `canonicalize_cache` / `component_path_cache`).
+        let prod = self.server_state.as_ref().filter(|s| s.production_mode);
+        if let Some(ss) = prod {
+            if let Some(hit) = ss.custom_tag_path_cache.read().get(&cache_key).cloned() {
+                self.request_custom_tag_cache
+                    .write()
+                    .insert(cache_key, hit.clone());
+                return Ok(hit);
+            }
         }
         let resolved = self.resolve_custom_tag_path_uncached(path_spec)?;
         self.request_custom_tag_cache
             .write()
-            .insert(cache_key, resolved.clone());
+            .insert(cache_key.clone(), resolved.clone());
+        if let Some(ss) = prod {
+            ss.custom_tag_path_cache
+                .write()
+                .insert(cache_key, resolved.clone());
+        }
         Ok(resolved)
     }
 
