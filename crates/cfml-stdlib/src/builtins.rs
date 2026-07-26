@@ -9514,6 +9514,14 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
         .pool_opts(pool_opts)
+        // Per-connection prepared-statement LRU. The crate default (10) is far
+        // below what one framework request uses (a Preside admin page runs
+        // dozens of distinct statements), so every queryExecute thrashed the
+        // cache and paid a full COM_STMT_PREPARE round-trip per query — the
+        // MySQL wire writes were ~13% of warm-request CPU on a live Preside
+        // profile. 256 comfortably covers a request's working set; JDBC pools
+        // on Lucee ship a per-connection statement cache the same way.
+        .stmt_cache_size(256)
         // Report rows MATCHED (not rows CHANGED) as the affected-row count, matching
         // Lucee/ACF — MySQL Connector/J negotiates CLIENT_FOUND_ROWS by default
         // (`useAffectedRows=false`), so an UPDATE whose new values equal the current

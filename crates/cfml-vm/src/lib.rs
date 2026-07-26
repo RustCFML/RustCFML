@@ -24386,6 +24386,23 @@ impl CfmlVirtualMachine {
     /// scopes) with the same Arc-pointer cycle guard as the old reachability
     /// walk. Stored bodies already carry stable global_ids, so this only needs
     /// to *collect* — there is nothing to rewrite.
+    /// True for the value kinds [`collect_app_fn_ids`] can extract function
+    /// ids from (functions and the containers that may hold them). Scalars —
+    /// the bulk of a real application scope — are filtered out BEFORE being
+    /// cloned out of a locked container, keeping the rehoming walk cheap.
+    fn app_fn_walk_relevant(value: &CfmlValue) -> bool {
+        match value {
+            CfmlValue::Function(_)
+            | CfmlValue::Struct(_)
+            | CfmlValue::Array(_)
+            | CfmlValue::QueryColumn(_, _)
+            | CfmlValue::Component(_) => true,
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(_) => true,
+            _ => false,
+        }
+    }
+
     fn collect_app_fn_ids(
         value: &CfmlValue,
         ids: &mut HashSet<i64>,
@@ -24400,8 +24417,20 @@ impl CfmlVirtualMachine {
                 if !visited.insert((1, ptr)) {
                     return;
                 }
-                for (_, value) in values.iter() {
-                    Self::collect_app_fn_ids(&value, ids, visited);
+                // Clone only the values the walk can act on (functions and
+                // containers — cheap Arc bumps) inside a short read lock,
+                // instead of `iter()`, which snapshots the WHOLE map including
+                // every scalar. On a large application graph (Preside keeps
+                // all singletons in application scope) the full-map snapshots
+                // dominated the per-request rehoming walk.
+                let children: Vec<CfmlValue> = values.with_read(|map| {
+                    map.values()
+                        .filter(|v| Self::app_fn_walk_relevant(v))
+                        .cloned()
+                        .collect()
+                });
+                for value in &children {
+                    Self::collect_app_fn_ids(value, ids, visited);
                 }
                 // Component flyweight: a CFC instance's methods live in a shared
                 // per-class method table, not the instance `map`, so the walk
@@ -24422,8 +24451,14 @@ impl CfmlVirtualMachine {
                 if !visited.insert((2, ptr)) {
                     return;
                 }
-                for value in values.iter() {
-                    Self::collect_app_fn_ids(&value, ids, visited);
+                let children: Vec<CfmlValue> = values.with_read(|vec| {
+                    vec.iter()
+                        .filter(|v| Self::app_fn_walk_relevant(v))
+                        .cloned()
+                        .collect()
+                });
+                for value in &children {
+                    Self::collect_app_fn_ids(value, ids, visited);
                 }
             }
             CfmlValue::QueryColumn(values, _) => {
@@ -25543,13 +25578,19 @@ impl CfmlVirtualMachine {
         // The cross-request production layer additionally requires production
         // mode (immutable tree) and honours the RUSTCFML_NO_COMPONENT_CACHE
         // escape hatch. `production_mode` short-circuits the env read in dev.
+        // Env read memoized once per process (env vars are process-stable);
+        // reading per resolution took the env global lock on every component
+        // instantiation.
+        static COMPONENT_CACHE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let prod_cache_ok = self
             .server_state
             .as_ref()
             .map_or(false, |s| s.production_mode)
-            && std::env::var("RUSTCFML_NO_COMPONENT_CACHE")
-                .map(|v| v.is_empty() || v == "0")
-                .unwrap_or(true);
+            && *COMPONENT_CACHE_ENABLED.get_or_init(|| {
+                std::env::var("RUSTCFML_NO_COMPONENT_CACHE")
+                    .map(|v| v.is_empty() || v == "0")
+                    .unwrap_or(true)
+            });
         let mut cached: Option<String> = self.request_component_cache.get(&cache_key).cloned();
         if cached.is_none() && prod_cache_ok {
             cached = self
