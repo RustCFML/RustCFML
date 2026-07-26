@@ -2768,6 +2768,14 @@ impl CfmlCompiler {
             let jump_if_no_match = instructions.len();
             instructions.push(BytecodeOp::JumpIfFalse(0)); // -> next clause's test
             // Matched: bind the exception to the catch variable (consumes it).
+            // DeclareLocal first: the catch variable is FRAME-LOCAL on Lucee —
+            // it must never fall into the classic-localmode unscoped-store
+            // cascade and land in the component/tag `variables` scope (measured
+            // on Lucee 7: `catch (any e)` inside a function leaves a same-named
+            // `variables.e` untouched; RustCFML clobbered it — surfaced when
+            // custom-tag frames gained a live `__variables` scope and a
+            // harness `catch (any e)` started overwriting a test's `e`).
+            instructions.push(BytecodeOp::DeclareLocal(catch.var_name.clone()));
             instructions.push(BytecodeOp::StoreLocal(catch.var_name.clone()));
             // GH #244: track the caught-exception variable so a `rethrow` in this
             // body re-raises THIS clause's exception even if a nested try/catch

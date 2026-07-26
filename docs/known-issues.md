@@ -619,6 +619,34 @@ own writes trigger the flush; external edits still defer to the next request as 
 **Production mode is unaffected either way** — its contract is an immutable tree (restart to
 reload), so it neither re-stats nor flushes on write.
 
+## 23. Custom tag `caller` — read of a key shadowed by the calling function's local 🌟 *(divergence)*
+
+The custom-tag `caller` scope is a **live handle** onto the calling frame's variables
+scope (Lucee `CallerImpl` / BoxLang `Component.caller` design; replaced the old
+snapshot+diff in the caller-scope rework that also fixed lost `structDelete(caller, …)`
+and lost new-key writes into CFC callers). **Write** routing is Lucee-faithful, verified
+against Lucee 7: a `caller.x` write where `x` exists in the calling method's
+`local`/`arguments` scope lands on that scope only (shadow reconciliation), everything
+else lands live on `variables`. The one divergence is the **read** of such a shadowed
+key: Lucee's caller view reads the method local first; RustCFML's live handle reads the
+variables scope. Pinned (tolerantly, green on both engines) in
+`tests/tags/test_customtag_caller_semantics.cfm`. Full read-fidelity needs an
+intercepting scope value type — deferred.
+
+Related pre-existing (unchanged) page-frame edges, pinned in the same test: a
+caller-write of a UDF-local-shadowed key from a page-level UDF also updates variables,
+and a caller-write of an `arguments`-shadowed key misses the arguments scope.
+
+## 24. `writeLog` / `<cflog>` — `file`/`log` attribute ignored; unbuffered stderr only 🏗
+
+`writeLog()` and `<cflog>` format the message and `eprintln!` it to **stderr** —
+per-call, unbuffered, taking the global stderr lock. The `file=`/`log=` attribute is
+accepted but **no log file is ever written**, and there are no appenders/rotation
+(Lucee routes through log4j2 with buffered rolling-file appenders). Suppressed-level
+calls are cheap (level check in CFML before the tag fires); the gap only matters once a
+call actually fires — then it's ~10-20× Lucee's per-line cost and the output lands in
+the server terminal instead of `logs/<file>.log`.
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
