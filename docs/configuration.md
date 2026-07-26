@@ -230,12 +230,28 @@ First entry becomes cfmail's default when its tag attributes omit `server`.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `level` | string | `"warn"` | `error`/`warn`/`info`/`debug`/`trace`/`off` |
-| `loggers.<name>.level` | string | — | Per-logger overrides (e.g. `datasource`) |
-| `logsDirectory` | string | `""` | Reserved — currently logs always go to stderr |
+| `level` | string | `"warn"` | Engine's own (Rust) log output: `error`/`warn`/`info`/`debug`/`trace`/`off` |
+| `logsDirectory` | string | `""` | Where `<cflog file="x">` writes `x.log`. Empty ⇒ `<webroot>/logs` under `--serve`, `./logs` under the CLI |
+| `cfmlLevel` | string | `""` | Default threshold for CFML logs. Empty ⇒ `trace` (log everything), matching Lucee's handling of an unconfigured `file=` logger |
+| `loggers.<name>.level` | string | — | Per-logger override, for engine targets (e.g. `datasource`) **and** CFML log names. `off`/`none` mutes |
+| `maxFileSize` | number | `10485760` | Rotate once a log file would exceed this many bytes. `0` = never |
+| `maxFiles` | number | `10` | Rotated generations to keep (`x.1.log` … `x.N.log`) |
+| `flushEachLine` | bool | `true` | log4j2's `immediateFlush` — what makes `tail -f` work. `false` batches lines until request end |
+| `echoToStderr` | bool | `false` | Also echo CFML log lines to the console (Lucee doesn't). The `RUSTCFML_LOG_STDERR` env var forces it on |
 | `format` | string | `"text"` | Reserved — JSON sink not yet implemented |
 
-`RUST_LOG` and `--verbose` still take precedence.
+`RUST_LOG` and `--verbose` still take precedence for the engine's own `level`.
+
+`<cflog>` / `writeLog()` write Lucee 7's exact line layout, so existing log tooling
+works unchanged:
+
+```
+"Severity","ThreadID","Date","Time","Context","Application","Message"
+"ERROR","tokio-rt-worker","07/26/2026","22:56:48","http://127.0.0.1:8500","MyApp","boom"
+```
+
+The resolved directory is readable from CFML as
+`server.cfconfig.logging.logsDirectory`.
 
 ### `debugging`
 

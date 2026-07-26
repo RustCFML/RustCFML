@@ -60,3 +60,7 @@ testds
 # Stray SQLite DB materialised from a "sqlite::memory:" DSN used as a path.
 # The ':' is illegal on Windows and breaks `git checkout` in CI — never track it.
 sqlite::memory:
+
+# CFML log files written by <cflog>/writeLog() — the CLI's default log
+# directory is ./logs, so a test-suite run lands them here.
+/logs/

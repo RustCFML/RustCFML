@@ -633,11 +633,42 @@ impl Default for CacheProperties {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct LoggingCfg {
+    /// Where `<cflog file="x">` / `writeLog()` write `x.log`, and where the
+    /// engine's own logs go. Empty = `<webroot>/logs` in serve mode, `./logs`
+    /// under the CLI (Lucee's equivalent is the server context's `logs/`).
     #[serde(rename = "logsDirectory")]
     pub logs_directory: String,
+    /// Level filter for the **engine's** own (Rust) log output.
     pub level: String,
     pub format: String,
+    /// Per-logger overrides. Applies both to engine log targets and to CFML log
+    /// names — `{"loggers": {"myapp": {"level": "warn"}}}` silences
+    /// `<cflog file="myapp" type="information">`. `off`/`none` mutes entirely.
     pub loggers: IndexMap<String, LoggerCfg>,
+    /// Default threshold for CFML log names with no `loggers` entry. Empty =
+    /// `trace`, i.e. log everything — which is what Lucee does for an ad-hoc
+    /// `file=` logger it has no configuration for.
+    #[serde(rename = "cfmlLevel")]
+    pub cfml_level: String,
+    /// Rotate a log file once it would exceed this many bytes (0 = never).
+    /// Default 10485760, matching log4j2's rolling-appender default.
+    #[serde(rename = "maxFileSize")]
+    pub max_file_size: u64,
+    /// Rotated generations to keep (`myapp.1.log` … `myapp.N.log`). Default 10.
+    #[serde(rename = "maxFiles")]
+    pub max_files: u32,
+    /// Also echo every CFML log line to stderr. Default false (Lucee does not
+    /// echo to the console); `true` restores the pre-file-logging behaviour.
+    #[serde(rename = "echoToStderr")]
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub echo_to_stderr: bool,
+    /// Flush after each line — log4j2's `immediateFlush`, default `true`, and
+    /// what makes `tail -f` on a log file work. `false` batches lines until the
+    /// request ends: cheaper for a chatty logger, but a line stays invisible
+    /// until its request completes.
+    #[serde(rename = "flushEachLine")]
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub flush_each_line: bool,
 }
 
 impl Default for LoggingCfg {
@@ -647,6 +678,11 @@ impl Default for LoggingCfg {
             level: "warn".into(),
             format: "text".into(),
             loggers: IndexMap::new(),
+            cfml_level: String::new(),
+            max_file_size: 10 * 1024 * 1024,
+            max_files: 10,
+            echo_to_stderr: false,
+            flush_each_line: true,
         }
     }
 }
@@ -1076,6 +1112,7 @@ impl RustCfmlConfig {
         expand(&mut self.logging.logs_directory);
         expand(&mut self.logging.level);
         expand(&mut self.logging.format);
+        expand(&mut self.logging.cfml_level);
         for l in self.logging.loggers.values_mut() {
             expand(&mut l.level);
             expand(&mut l.appender);

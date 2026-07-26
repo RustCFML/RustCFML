@@ -494,6 +494,36 @@ impl BytecodeCache {
 /// `server.system.properties["os.name"]`, `server.separator.file`, etc. works
 /// out of the box. Snapshotted on each access; cheap because env vars and
 /// args are small.
+/// Log names Lucee ships a configured logger for. `<cflog log="scheduler">`
+/// targets `scheduler.log`; an unrecognised `log=` name falls back to
+/// `application` rather than creating a file.
+///
+/// This is exactly the `loggers` key set in Lucee 7.0.4's `.CFConfig.json` —
+/// note it is NOT simply "the .log files present in the logs directory".
+/// `felix.log` and `trace.log` exist there but are written by other machinery,
+/// and `log="felix"` / `log="trace"` fall back to `application` on Lucee
+/// (verified empirically, not just read off the config).
+const STANDARD_LOG_NAMES: &[&str] = &[
+    "application",
+    "datasource",
+    "deploy",
+    "exception",
+    "execute",
+    "gateway",
+    "http",
+    "mail",
+    "mapping",
+    "memory",
+    "orm",
+    "remoteclient",
+    "requesttimeout",
+    "rest",
+    "scheduler",
+    "scope",
+    "search",
+    "thread",
+];
+
 /// Convert a parsed `.cfconfig.json` into a CFML-visible read-only struct.
 /// Goes via `serde_json::Value` so we get a single converter for all the
 /// schema's nested types. Returns an empty struct on serialise failure
@@ -2494,7 +2524,8 @@ impl CfmlVirtualMachine {
     }
 
     /// Find a web scope (`cgi`/`url`/`form`/…) by case-insensitive name.
-    #[cfg(feature = "observability")]
+    /// Not feature-gated: the log appenders' `Context` column reads `cgi` in
+    /// every build, not just `observability` ones.
     fn scope_struct(&self, scope: &str) -> Option<&CfmlStruct> {
         self.globals
             .iter()
@@ -2531,6 +2562,95 @@ impl CfmlVirtualMachine {
             .and_then(|c| c.get_ci("remote_addr"))
             .map(|v| v.as_string())
             .unwrap_or_default()
+    }
+
+    /// The `Context` column Lucee writes into a log line: the request's base
+    /// URL (`http://host:port`), empty under the CLI where there is no request.
+    fn log_context(&self) -> String {
+        if !self.web_context {
+            return String::new();
+        }
+        let cgi = match self.scope_struct("cgi") {
+            Some(c) => c,
+            None => return String::new(),
+        };
+        // `cgi.request_url` is the full URL; Lucee's Context column is just the
+        // scheme + authority, so trim at the path.
+        if let Some(url) = cgi.get_ci("request_url").map(|v| v.as_string()) {
+            if let Some(scheme_end) = url.find("://") {
+                let rest = &url[scheme_end + 3..];
+                let authority_len = rest.find('/').unwrap_or(rest.len());
+                return url[..scheme_end + 3 + authority_len].to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Write one `<cflog>` / `writeLog()` entry through the file appenders.
+    ///
+    /// `name` is the resolved log name (see [`Self::resolve_log_name`]) and
+    /// `include_app` mirrors the `application` attribute, which defaults to true
+    /// in Lucee — the application name goes in its own column.
+    fn emit_cfml_log(
+        &mut self,
+        text: &str,
+        log_type: &str,
+        name: &str,
+        include_app: bool,
+    ) -> Result<(), CfmlError> {
+        let level = cfml_common::logging::parse_type_attr(log_type).ok_or_else(|| {
+            CfmlError::runtime(format!(
+                "Invalid value for attribute type [{}]",
+                log_type.to_lowercase()
+            ))
+        })?;
+        cfml_common::logging::validate_log_name(name).map_err(CfmlError::runtime)?;
+
+        let application = if include_app {
+            self.current_application_name.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let context = self.log_context();
+        cfml_common::logging::write_entry(name, level, &context, &application, text)
+            .map_err(CfmlError::runtime)?;
+
+        // Observability: feed the debug footer's Trace/Log section.
+        #[cfg(feature = "observability")]
+        if self.interest.contains(observe::Interest::LOG) {
+            if let Some(o) = &self.observer {
+                o.on_log(&observe::LogEvent {
+                    text,
+                    log_type,
+                    file: name,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the log a call targets from its `file=` / `log=` attributes.
+    ///
+    /// `file=` names an ad-hoc log file directly. `log=` names a *configured*
+    /// logger; Lucee falls back to the `application` logger when the name isn't
+    /// one it knows, so an unknown `log=` must not silently mint a new file.
+    /// Neither attribute ⇒ `application`, as in Lucee.
+    fn resolve_log_name(&self, file: Option<&str>, log: Option<&str>) -> String {
+        if let Some(f) = file.map(str::trim).filter(|s| !s.is_empty()) {
+            return f.to_string();
+        }
+        if let Some(l) = log.map(str::trim).filter(|s| !s.is_empty()) {
+            let lower = l.to_ascii_lowercase();
+            let configured = self
+                .server_state
+                .as_ref()
+                .map(|s| s.cfconfig.logging.loggers.keys().any(|k| k.eq_ignore_ascii_case(&lower)))
+                .unwrap_or(false);
+            if configured || STANDARD_LOG_NAMES.contains(&lower.as_str()) {
+                return l.to_string();
+            }
+        }
+        "application".to_string()
     }
 
     /// Gate 2's URL-trigger half — matches the configured param (in `url` or
@@ -12477,6 +12597,7 @@ impl CfmlVirtualMachine {
                 | "__cftransaction_rollback"
                 | "__writetext"
                 | "__cflog"
+                | "writelog"
                 | "__cfsetting"
                 | "__cflock_start"
                 | "__cflock_end"
@@ -12536,7 +12657,7 @@ impl CfmlVirtualMachine {
                 // `observability` feature is off they fall through to the no-op
                 // stub builtins registered in cfml-stdlib.
                 #[cfg(feature = "observability")]
-                "getdebugdata" | "isdebugmode" | "debugadd" | "writelog" | "trace"
+                "getdebugdata" | "isdebugmode" | "debugadd" | "trace"
                 | "getrequestprofile" | "profilenow" => {
                     // Will be handled at the end of this function (needs VM access)
                 }
@@ -16465,35 +16586,25 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cflog" => {
-                    // Extract log message from struct argument
+                    // `<cflog text=".." file=".." log=".." type=".." application="..">`
+                    // — the tag preprocessor bundles every attribute into one struct.
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        let text = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "text")
-                            .map(|(_, v)| v.as_string())
-                            .unwrap_or_default();
-                        let log_type = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "type")
-                            .map(|(_, v)| v.as_string())
-                            .unwrap_or_else(|| "Information".to_string());
-                        let file = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "file")
-                            .map(|(_, v)| v.as_string())
-                            .unwrap_or_else(|| "application".to_string());
-                        eprintln!("[CFLOG {}:{}] {}", file, log_type, text);
-                        // Observability: feed the footer's trace/log section.
-                        #[cfg(feature = "observability")]
-                        if self.interest.contains(observe::Interest::LOG) {
-                            if let Some(o) = &self.observer {
-                                o.on_log(&observe::LogEvent {
-                                    text: &text,
-                                    log_type: &log_type,
-                                    file: &file,
-                                });
-                            }
-                        }
+                        let attr = |k: &str| {
+                            opts.iter()
+                                .find(|(key, _)| key.eq_ignore_ascii_case(k))
+                                .map(|(_, v)| v.as_string())
+                        };
+                        let text = attr("text").unwrap_or_default();
+                        let log_type = attr("type").unwrap_or_else(|| "Information".to_string());
+                        let name = self.resolve_log_name(attr("file").as_deref(), attr("log").as_deref());
+                        // `application` defaults to true in Lucee.
+                        let include_app = attr("application")
+                            .map(|v| {
+                                let l = v.trim().to_ascii_lowercase();
+                                !(l == "false" || l == "no" || l == "0")
+                            })
+                            .unwrap_or(true);
+                        self.emit_cfml_log(&text, &log_type, &name, include_app)?;
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -16521,35 +16632,40 @@ impl CfmlVirtualMachine {
                     // active, false when the profiler is off server-wide.
                     return Ok(CfmlValue::Bool(self.profile_now()));
                 }
-                #[cfg(feature = "observability")]
                 "writelog" => {
-                    // Intercepted (when observability is built in) so the entry
-                    // feeds the debug footer's Trace/Log section, then performs
-                    // the same stderr side-effect as the cfml-stdlib builtin.
-                    // Accepts a bundled options struct (named-arg call) or
-                    // positional text/type/file.
-                    let (text, log_type, file) = match args.first() {
-                        Some(CfmlValue::Struct(s)) => (
-                            s.get_ci("text").map(|v| v.as_string()).unwrap_or_default(),
-                            s.get_ci("type").map(|v| v.as_string()).unwrap_or_else(|| "Information".to_string()),
-                            s.get_ci("file").map(|v| v.as_string()).unwrap_or_else(|| "application".to_string()),
-                        ),
-                        _ => (
-                            args.first().map(|v| v.as_string()).unwrap_or_default(),
-                            args.get(1).map(|v| v.as_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Information".to_string()),
-                            args.get(3).map(|v| v.as_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "application".to_string()),
-                        ),
-                    };
-                    eprintln!("[LOG] {}", text);
-                    if self.interest.contains(observe::Interest::LOG) {
-                        if let Some(o) = &self.observer {
-                            o.on_log(&observe::LogEvent {
-                                text: &text,
-                                log_type: &log_type,
-                                file: &file,
-                            });
+                    // `writeLog(text, type, application, file, log)` — the BIF form
+                    // of `<cflog>`, and the same appender path. Accepts a bundled
+                    // options struct (named-arg call) or the positional signature.
+                    let (text, log_type, app_attr, file, log) = match args.first() {
+                        Some(CfmlValue::Struct(s)) => {
+                            let g = |k: &str| s.get_ci(k).map(|v| v.as_string()).filter(|v| !v.is_empty());
+                            (
+                                g("text").unwrap_or_default(),
+                                g("type").unwrap_or_else(|| "Information".to_string()),
+                                g("application"),
+                                g("file"),
+                                g("log"),
+                            )
                         }
-                    }
+                        _ => {
+                            let g = |i: usize| args.get(i).map(|v| v.as_string()).filter(|s| !s.is_empty());
+                            (
+                                args.first().map(|v| v.as_string()).unwrap_or_default(),
+                                g(1).unwrap_or_else(|| "Information".to_string()),
+                                g(2),
+                                g(3),
+                                g(4),
+                            )
+                        }
+                    };
+                    let name = self.resolve_log_name(file.as_deref(), log.as_deref());
+                    let include_app = app_attr
+                        .map(|v| {
+                            let l = v.trim().to_ascii_lowercase();
+                            !(l == "false" || l == "no" || l == "0")
+                        })
+                        .unwrap_or(true);
+                    self.emit_cfml_log(&text, &log_type, &name, include_app)?;
                     return Ok(CfmlValue::Null);
                 }
                 #[cfg(feature = "observability")]
@@ -19744,6 +19860,12 @@ impl CfmlVirtualMachine {
                 // The statement form `module attr=…;` (a lone positional struct)
                 // is folded by Pass 1's positional-struct handling above.
                 | "__cfmodule"
+                // writeLog() is a BIF, not a tag, but it needs the same
+                // bundling: its intercept has no declared params, so the
+                // generic reorder path binds named args by CALL ORDER, making
+                // `writeLog(text=…, file=…, type=…)` deliver "file" as `type`.
+                // Bundling into one options struct keeps names attached.
+                | "writelog"
         )
     }
 
@@ -19770,7 +19892,8 @@ impl CfmlVirtualMachine {
             // cfmodule's `name` attribute is the module dot-path, not a
             // caller-scope write-back target — keep it in the options struct.
             "cfheader" | "cfcontent" | "cflocation" | "cfcookie" | "cflog"
-            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" | "cfcache" | "cfmodule" => &[],
+            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" | "cfcache" | "cfmodule"
+            | "writelog" => &[],
             _ => &["name", "variable"],
         }
     }

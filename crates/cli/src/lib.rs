@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use cfml_codegen::compiler::CfmlCompiler;
 use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::logging;
 use cfml_common::vfs::{self, Vfs};
 use cfml_config::{resolve, RustCfmlConfig};
 use cfml_compiler::lexer;
@@ -355,7 +356,7 @@ fn real_main() {
             .cfconfig
             .clone()
             .or_else(|| std::env::var("CFCONFIG").ok().filter(|s| !s.is_empty()));
-        let cfconfig = match explicit_cfconfig {
+        let mut cfconfig = match explicit_cfconfig {
             Some(path) => match RustCfmlConfig::from_file(std::path::Path::new(&path)) {
                 Ok(c) => c,
                 Err(e) => {
@@ -401,12 +402,6 @@ fn real_main() {
                 env_logger::Env::default().default_filter_or(filter),
             )
             .try_init();
-            if !cfconfig.logging.logs_directory.is_empty() {
-                log::warn!(
-                    "cfconfig logging.logsDirectory='{}' is not yet supported — logs go to stderr",
-                    cfconfig.logging.logs_directory
-                );
-            }
             if !cfconfig.logging.format.is_empty() && cfconfig.logging.format != "text" {
                 log::warn!(
                     "cfconfig logging.format='{}' is not yet supported — using text",
@@ -430,6 +425,10 @@ fn real_main() {
                 exit(1);
             }
         }
+
+        // `<cflog>`/`writeLog()` file appenders — resolved against the final
+        // webroot, so this has to follow the server.webroot fallback above.
+        configure_cfml_logging(&mut cfconfig, Some(&doc_root));
 
         run_server(
             &doc_root,
@@ -509,7 +508,7 @@ fn execute_code(source: &str, debug: bool) {
 /// Resolve cfconfig in CLI (non-serve) mode. Searches the entry file's
 /// directory, then cwd, then exe dir. Returns `None` so the VM can still
 /// operate without a server_state attached.
-fn load_cli_cfconfig(source_file: &Option<String>) -> Arc<RustCfmlConfig> {
+fn load_cli_cfconfig(source_file: &Option<String>) -> RustCfmlConfig {
     let mut search: Vec<PathBuf> = Vec::new();
     if let Some(ref f) = source_file {
         if let Some(parent) = std::path::Path::new(f).parent() {
@@ -522,14 +521,81 @@ fn load_cli_cfconfig(source_file: &Option<String>) -> Arc<RustCfmlConfig> {
     if let Some(d) = resolve::exe_dir() {
         search.push(d);
     }
-    Arc::new(RustCfmlConfig::load(&search).unwrap_or_default())
+    RustCfmlConfig::load(&search).unwrap_or_default()
+}
+
+/// Install the CFML log-appender configuration (`<cflog>` / `writeLog()`).
+///
+/// Directory precedence: `logging.logsDirectory` from cfconfig, else
+/// `<webroot>/logs` in serve mode, else `./logs` under the CLI. Lucee's
+/// equivalent is the server context's `logs/` directory; keeping ours relative
+/// to the webroot means a deployed app's logs sit beside the app.
+/// The resolved directory is written back into `logging.logsDirectory`, so CFML
+/// can read the *effective* location off `server.cfconfig.logging.logsDirectory`
+/// rather than the (usually empty) configured value.
+fn configure_cfml_logging(cfconfig: &mut RustCfmlConfig, webroot: Option<&std::path::Path>) {
+    let lg = &cfconfig.logging;
+    let directory = if !lg.logs_directory.is_empty() {
+        PathBuf::from(&lg.logs_directory)
+    } else if let Some(root) = webroot {
+        root.join("logs")
+    } else {
+        PathBuf::from("logs")
+    };
+
+    let default_level = if lg.cfml_level.is_empty() {
+        Some(logging::LogLevel::Trace)
+    } else {
+        match logging::parse_level_threshold(&lg.cfml_level) {
+            Ok(l) => l,
+            Err(()) => {
+                eprintln!(
+                    "Warning: cfconfig logging.cfmlLevel='{}' is not a valid level \
+                     (trace|debug|info|warn|error|fatal|off) — logging everything",
+                    lg.cfml_level
+                );
+                Some(logging::LogLevel::Trace)
+            }
+        }
+    };
+
+    let mut levels = std::collections::HashMap::new();
+    for (name, lcfg) in lg.loggers.iter() {
+        if lcfg.level.is_empty() {
+            continue;
+        }
+        // A `loggers` entry may name an engine (Rust) log target rather than a
+        // CFML log; those levels are `log`-crate spellings that don't map here.
+        // Skip silently — the entry is still honoured by the env_logger filter.
+        if let Ok(threshold) = logging::parse_level_threshold(&lcfg.level) {
+            levels.insert(name.to_ascii_lowercase(), threshold);
+        }
+    }
+
+    logging::configure(logging::LoggingConfig {
+        directory: Some(directory.clone()),
+        default_level,
+        levels,
+        max_file_size: lg.max_file_size,
+        max_files: lg.max_files,
+        echo_stderr: lg.echo_to_stderr || std::env::var("RUSTCFML_LOG_STDERR").is_ok(),
+        flush_each_line: lg.flush_each_line,
+    });
+
+    // Absolute where we can, so a CFML consumer doesn't have to guess the cwd.
+    let resolved = std::fs::canonicalize(&directory)
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&directory)))
+        .unwrap_or(directory);
+    cfconfig.logging.logs_directory = resolved.to_string_lossy().to_string();
 }
 
 fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>) {
     // CLI mode: load .cfconfig.json once, attach via a minimal ServerState so
     // the VM picks up runtime knobs, datasource registry, and security flags.
     // Without this, CFML tests can't observe cfconfig effects.
-    let cfconfig = load_cli_cfconfig(&source_file);
+    let mut cfconfig_owned = load_cli_cfconfig(&source_file);
+    configure_cfml_logging(&mut cfconfig_owned, None);
+    let cfconfig = Arc::new(cfconfig_owned);
     populate_datasource_registry(&cfconfig);
     populate_default_mail_server(&cfconfig);
     cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
@@ -551,7 +617,11 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     }
     let cli_vfs: Arc<dyn vfs::Vfs> =
         Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs()));
-    match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, false) {
+    let result = compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, false);
+    // Buffered `<cflog>` lines must reach disk before we return or `exit(1)`
+    // — the error path below never unwinds, so no Drop guard would run.
+    logging::flush_all();
+    match result {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
@@ -1826,7 +1896,21 @@ fn profiler_endpoint(state: &Arc<AppState>) -> Option<axum::response::Response> 
     )
 }
 
+/// Request entry point. Wraps [`handle_request_inner`] so that whichever of its
+/// many exits is taken, the request's buffered `<cflog>` lines reach disk before
+/// the response goes out — the durability bound we document for log buffering
+/// (at most one request's lines can be lost to a hard crash).
 async fn handle_request(
+    state: axum::extract::State<Arc<AppState>>,
+    addr: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let response = handle_request_inner(state, addr, req).await;
+    logging::flush_all();
+    response
+}
+
+async fn handle_request_inner(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: axum::extract::Request,

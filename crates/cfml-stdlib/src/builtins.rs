@@ -15639,9 +15639,37 @@ fn fn_read_line(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(line))
 }
 
+/// `writeLog(text, type, application, file, log)`.
+///
+/// The VM intercepts this name so it can supply the `Context` / `Application`
+/// columns from the live request; this implementation is the fallback for
+/// embedders that dispatch builtins without a VM. It writes through the same
+/// appenders, just with those two columns empty.
 fn fn_write_log(args: Vec<CfmlValue>) -> CfmlResult {
+    use cfml_common::logging;
     let text = get_str(&args, 0);
-    eprintln!("[LOG] {}", text);
+    let log_type = {
+        let t = get_str(&args, 1);
+        if t.is_empty() { "Information".to_string() } else { t }
+    };
+    let level = logging::parse_type_attr(&log_type).ok_or_else(|| {
+        CfmlError::runtime(format!(
+            "Invalid value for attribute type [{}]",
+            log_type.to_lowercase()
+        ))
+    })?;
+    let file = get_str(&args, 3);
+    let log = get_str(&args, 4);
+    // Without a VM there is no configured-logger registry to consult, so an
+    // unknown `log=` name can't be distinguished — treat it as Lucee's default.
+    let name = if !file.trim().is_empty() {
+        file.trim().to_string()
+    } else if !log.trim().is_empty() {
+        log.trim().to_string()
+    } else {
+        "application".to_string()
+    };
+    logging::write_entry(&name, level, "", "", &text).map_err(CfmlError::runtime)?;
     Ok(CfmlValue::Null)
 }
 

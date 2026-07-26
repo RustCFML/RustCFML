@@ -69,7 +69,6 @@ These deserialize without error but have no runtime effect:
 | `datasources[].connectionLimit` / `connectionTimeout` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. |
 | `mailServers[].timeout` | Carried but not applied during send. |
 | `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | In-memory cache capacity / TTL / eviction not enforced. |
-| `logging.logsDirectory` | 🛑→🔇 Warns at startup ("not yet supported"); logs still go to stderr. |
 | `logging.format` | Only `"text"`; other values warn and fall back. |
 | `logging.loggers[].appender` | Logger name used; appender ignored. |
 
@@ -637,15 +636,36 @@ Related pre-existing (unchanged) page-frame edges, pinned in the same test: a
 caller-write of a UDF-local-shadowed key from a page-level UDF also updates variables,
 and a caller-write of an `arguments`-shadowed key misses the arguments scope.
 
-## 24. `writeLog` / `<cflog>` — `file`/`log` attribute ignored; unbuffered stderr only 🏗
+## 24. `writeLog` / `<cflog>` — file logging ✅ *(fixed in v0.528.0, GH [#286](https://github.com/RustCFML/RustCFML/issues/286))*
 
-`writeLog()` and `<cflog>` format the message and `eprintln!` it to **stderr** —
-per-call, unbuffered, taking the global stderr lock. The `file=`/`log=` attribute is
-accepted but **no log file is ever written**, and there are no appenders/rotation
-(Lucee routes through log4j2 with buffered rolling-file appenders). Suppressed-level
-calls are cheap (level check in CFML before the tag fires); the gap only matters once a
-call actually fires — then it's ~10-20× Lucee's per-line cost and the output lands in
-the server terminal instead of `logs/<file>.log`.
+Resolved. `<cflog>` / `writeLog()` now write to `<log-dir>/<name>.log` through cached,
+rotating file appenders, in Lucee 7's exact line layout:
+
+```
+"Severity","ThreadID","Date","Time","Context","Application","Message"
+"ERROR","tokio-rt-worker","07/26/2026","22:56:48","http://127.0.0.1:8500","MyApp","boom"
+```
+
+Log directory: `logging.logsDirectory` from `.cfconfig.json`, else `<webroot>/logs`
+under `--serve`, else `./logs` under the CLI. The resolved path is readable from CFML as
+`server.cfconfig.logging.logsDirectory`.
+
+Semantics verified against Lucee 7.0.4 and pinned in
+`tests/tags/test_cflog_file_logging.cfm`: `type=` → log4j2 severity (an unknown type is
+an error); no `file=`/`log=` targets the `application` log; `log=` names a *configured*
+logger and falls back to `application` when unknown, whereas `file=` creates the file; a
+path separator in `file=` is an error; `application="false"` blanks the Application
+column (the attribute defaults to true).
+
+Config knobs (all under `logging`): `logsDirectory`, `cfmlLevel` (default threshold),
+`loggers.<name>.level` (per-log threshold, `off` to mute), `maxFileSize` (default 10 MB),
+`maxFiles` (default 10 rotated generations), `flushEachLine` (default `true`, log4j2's
+`immediateFlush`; `false` batches until request end), `echoToStderr` (default `false` —
+Lucee doesn't echo to the console either; the `RUSTCFML_LOG_STDERR` env var forces it on).
+
+Rotation is size-based, rolling to `<name>.log.<n>.bak` at 10 MB — the naming and
+threshold Lucee's resource appender produces (confirmed by overflowing a log on Lucee
+7.0.4). Remaining gap: no time-based (daily) rolling policy.
 
 ---
 

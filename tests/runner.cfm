@@ -523,6 +523,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfoutput_nested_interp.cfm">
 <cf_runtest file="tags/test_cffinally_tag_body.cfm">
 <cf_runtest file="tags/test_cflog_cfmail_attribute_interpolation.cfm">
+<cf_runtest file="tags/test_cflog_file_logging.cfm">
 <cf_runtest file="tags/test_tags_cfzip.cfm">
 <cf_runtest file="tags/test_tags_tld.cfm">
 <cf_runtest file="tags/test_tags_whitespace.cfm">
