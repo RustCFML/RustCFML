@@ -14361,9 +14361,17 @@ impl CfmlVirtualMachine {
                         resolved
                     };
 
-                    // Canonicalize if it exists, otherwise return the joined path
-                    let path_str = resolved.to_string_lossy().to_string();
-                    let mut result = self.canonicalize_cached(&path_str).unwrap_or(path_str);
+                    // Normalize LEXICALLY (collapse `.`/`..`/`//`) — do NOT
+                    // canonicalize. Lucee/ACF treat expandPath as a virtual-path
+                    // operation and never resolve symlinks; canonicalizing here
+                    // rewrote a path through a symlinked directory (e.g. a Preside
+                    // extension symlinked into application/extensions) to its real
+                    // location, which broke framework security checks that prefix-
+                    // compare expandPath results (Preside StaticAssetDownload
+                    // _fileExists → every symlinked-extension admin asset 404'd).
+                    let mut result = Self::lexically_normalize_path(&resolved)
+                        .to_string_lossy()
+                        .to_string();
                     // Preserve a trailing slash from the input. Lucee/ACF/BoxLang
                     // mirror the input's trailing slash on the output; canonicalize
                     // strips it for existing paths, so reapply when the caller had one.
@@ -30971,6 +30979,31 @@ impl CfmlVirtualMachine {
         self.session_lazy_pending = false;
 
         result
+    }
+
+    /// Lexical path normalization for `expandPath`: collapse `.`, `..` and
+    /// duplicate separators WITHOUT touching the filesystem — symlinks are
+    /// preserved exactly as written (Lucee/ACF parity; expandPath is a
+    /// virtual-path operation, not a realpath).
+    fn lexically_normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+        use std::path::Component;
+        let mut out = std::path::PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    // Pop the last normal component; never pop past the root.
+                    if !matches!(
+                        out.components().next_back(),
+                        None | Some(Component::RootDir) | Some(Component::Prefix(_))
+                    ) {
+                        out.pop();
+                    }
+                }
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
     }
 
     /// Request-end application-state persistence (step 9 of
