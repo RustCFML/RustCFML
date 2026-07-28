@@ -30811,6 +30811,7 @@ impl CfmlVirtualMachine {
                 if session_management {
                     let _ = self.sync_session_scope_to_store();
                 }
+                self.persist_application_state(&app_name);
                 return Ok(CfmlValue::Null);
             }
             // An uncaught exception in onRequestStart aborts the request and is
@@ -30820,7 +30821,9 @@ impl CfmlVirtualMachine {
             // framework (Preside, ColdBox) whose request bootstrap lives in
             // onRequestStart.
             Err(e) => {
-                return self.run_on_error(&mut template, e, "onRequestStart");
+                let result = self.run_on_error(&mut template, e, "onRequestStart");
+                self.persist_application_state(&app_name);
+                return result;
             }
             _ => {}
         }
@@ -30957,43 +30960,7 @@ impl CfmlVirtualMachine {
         // Skip entirely when `applicationStop()` ran this request: it already
         // reset the shared entry, and re-persisting here would re-anchor the
         // function cache from the just-cleared scope.
-        if !self.application_stopped {
-            if let Some(ref server_state) = self.server_state.clone() {
-                // Re-home every function reachable from application scope into
-                // the stable per-application table, rewriting their live
-                // app-scope bodies to tagged stable ids. After this the snapshot
-                // persisted below carries stable ids that resolve identically on
-                // any later request — no per-request append, no remap, and the
-                // stale-index bug class is gone by construction. Idempotent:
-                // functions already re-homed on an earlier request are untouched.
-                //
-                // Skip the whole walk when no function was defined this request:
-                // the table cannot have gained anything (a `Function` value is
-                // only born via a DefineFunction op), so it is byte-identical to
-                // what was loaded and needs no re-persist. The application-scope
-                // *variables* are still written back below, since non-function
-                // app state may have changed.
-                let rehomed = self.app_fn_table_dirty;
-                if rehomed {
-                    self.rehome_application_functions();
-                }
-                if let Some(ref app_scope) = self.application_scope {
-                    // Snapshot outside the store write so the application-scope
-                    // lock and the applications-store lock never nest.
-                    let scope = app_scope.snapshot();
-                    // Only re-persist the carried function table when it changed
-                    // (a function was defined this request); otherwise it is
-                    // byte-identical to what was loaded.
-                    let table_update = rehomed.then(|| self.app_function_table.clone());
-                    server_state.applications.modify(&app_name, &mut |app| {
-                        app.variables = scope.clone();
-                        if let Some(table) = table_update.clone() {
-                            app.app_function_table = table;
-                        }
-                    });
-                }
-            }
-        }
+        self.persist_application_state(&app_name);
 
         // 10. Clear request scope + stashed Application.cfc template.
         self.request_scope.clear();
@@ -31004,6 +30971,57 @@ impl CfmlVirtualMachine {
         self.session_lazy_pending = false;
 
         result
+    }
+
+    /// Request-end application-state persistence (step 9 of
+    /// `execute_with_lifecycle`): re-home every function registered this
+    /// request that is reachable from the application scope into the stable
+    /// per-application table, then write the scope snapshot (and, when it
+    /// changed, the carried function table) back to ServerState.
+    ///
+    /// MUST run on EVERY exit path of `execute_with_lifecycle` — including a
+    /// cfabort/cflocation unwind out of `onRequestStart` and an uncaught error
+    /// routed to `onError`. Historically those paths returned early and skipped
+    /// this, which (a) silently dropped every top-level `application.*` write
+    /// made during the request (a freshly-booted Preside app vanished when its
+    /// first request ended 401/500), and (b) left components cached into
+    /// already-shared NESTED containers (e.g. ColdBox's handler cache, whose
+    /// inner struct Arc is shared with the persisted snapshot) visible to later
+    /// requests but with un-rehomed function gids: their own methods heal via
+    /// `heal_stale_component_method`, but super-chain dispatch failed with
+    /// "function 'preHandler' is not defined" (Preside admin after a 401
+    /// access-denied abort — every subsequent admin request then 500s).
+    ///
+    /// No-op when `applicationStop()` ran this request: it already reset the
+    /// shared entry, and re-persisting would re-anchor from the cleared scope.
+    fn persist_application_state(&mut self, app_name: &str) {
+        if self.application_stopped {
+            return;
+        }
+        if let Some(ref server_state) = self.server_state.clone() {
+            // Skip the re-homing walk when no function was defined this
+            // request: the table cannot have gained anything (a `Function`
+            // value is only born via a DefineFunction op), so it is
+            // byte-identical to what was loaded and needs no re-persist. The
+            // application-scope *variables* are still written back, since
+            // non-function app state may have changed.
+            let rehomed = self.app_fn_table_dirty;
+            if rehomed {
+                self.rehome_application_functions();
+            }
+            if let Some(ref app_scope) = self.application_scope {
+                // Snapshot outside the store write so the application-scope
+                // lock and the applications-store lock never nest.
+                let scope = app_scope.snapshot();
+                let table_update = rehomed.then(|| self.app_function_table.clone());
+                server_state.applications.modify(app_name, &mut |app| {
+                    app.variables = scope.clone();
+                    if let Some(table) = table_update.clone() {
+                        app.app_function_table = table;
+                    }
+                });
+            }
+        }
     }
 
     pub fn get_output(&self) -> String {
