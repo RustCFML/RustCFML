@@ -152,9 +152,16 @@ impl DebugCollector {
     /// the base template being served — recorded as a `pages` row with the
     /// total request time, so the main page shows alongside its includes
     /// (Lucee lists every executed template, not just `<cfinclude>`s).
-    pub fn render(&self, scopes: &[(String, ValueMap)], main_page: Option<&str>) -> String {
+    /// `cfconfig` is the effective-vs-default settings diff (see
+    /// [`cfconfig_diff_rows`]) rendered as its own table.
+    pub fn render(
+        &self,
+        scopes: &[(String, ValueMap)],
+        main_page: Option<&str>,
+        cfconfig: &[(String, String)],
+    ) -> String {
         if let Ok(d) = self.inner.lock() {
-            render_footer(&self.cfg, &d, scopes, self.total_us(), main_page)
+            render_footer(&self.cfg, &d, scopes, self.total_us(), main_page, cfconfig)
         } else {
             String::new()
         }
@@ -351,20 +358,82 @@ pub fn render_footer(
     scopes: &[(String, ValueMap)],
     total_us: i64,
     main_page: Option<&str>,
+    cfconfig: &[(String, String)],
 ) -> String {
     match cfg.template.to_ascii_lowercase().as_str() {
         "none" => String::new(),
         "comment" => render_comment(data, total_us),
-        "simple" => render_html(cfg, data, scopes, total_us, main_page, false),
-        "classic" => render_html(cfg, data, scopes, total_us, main_page, false),
+        "simple" => render_html(cfg, data, scopes, total_us, main_page, cfconfig, false),
+        "classic" => render_html(cfg, data, scopes, total_us, main_page, cfconfig, false),
         // "modern" (default) and any unknown template fall back to the rich panel.
-        _ => render_html(cfg, data, scopes, total_us, main_page, true),
+        _ => render_html(cfg, data, scopes, total_us, main_page, cfconfig, true),
+    }
+}
+
+/// Flatten the difference between the EFFECTIVE cfconfig (server baseline +
+/// app overlay, post `${env.*}` expansion) and the engine's built-in defaults
+/// into sorted `(dotted.path, value)` rows — i.e. exactly what this deploy's
+/// `.cfconfig.json` picked up. Values whose key smells like a credential
+/// (`password`/`secret`/`token`) are redacted.
+pub fn cfconfig_diff_rows(
+    effective: &serde_json::Value,
+    defaults: &serde_json::Value,
+) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    cfconfig_diff_walk("", effective, defaults, &mut rows);
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+fn cfconfig_diff_walk(
+    path: &str,
+    eff: &serde_json::Value,
+    def: &serde_json::Value,
+    out: &mut Vec<(String, String)>,
+) {
+    use serde_json::Value;
+    match (eff, def) {
+        (Value::Object(em), _) => {
+            let empty = serde_json::Map::new();
+            let dm = match def {
+                Value::Object(m) => m,
+                _ => &empty,
+            };
+            for (k, ev) in em {
+                let sub = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                cfconfig_diff_walk(&sub, ev, dm.get(k).unwrap_or(&Value::Null), out);
+            }
+        }
+        _ => {
+            if eff != def && !eff.is_null() {
+                let leaf = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
+                let shown = if leaf.contains("password")
+                    || leaf.contains("secret")
+                    || leaf.contains("token")
+                {
+                    "••••••".to_string()
+                } else {
+                    match eff {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }
+                };
+                out.push((path.to_string(), shown));
+            }
+        }
     }
 }
 
 fn render_comment(data: &DebugData, total_us: i64) -> String {
     let mut s = String::new();
-    s.push_str("\n<!-- RustCFML Debug\n");
+    s.push_str(&format!(
+        "\n<!-- RustCFML v{} Debug\n",
+        env!("CARGO_PKG_VERSION")
+    ));
     s.push_str(&format!("  Total time: {} ms\n", fmt_us(total_us)));
     s.push_str(&format!("  Queries: {}\n", data.queries.len()));
     for q in &data.queries {
@@ -406,6 +475,7 @@ fn render_html(
     scopes: &[(String, ValueMap)],
     total_us: i64,
     main_page: Option<&str>,
+    cfconfig: &[(String, String)],
     modern: bool,
 ) -> String {
     let mut s = String::new();
@@ -419,7 +489,8 @@ fn render_html(
         style
     ));
     s.push_str(&format!(
-        "<h3 style=\"margin:4px 0\">RustCFML Debug &mdash; total {} ms</h3>\n",
+        "<h3 style=\"margin:4px 0\">RustCFML v{} Debug &mdash; total {} ms</h3>\n",
+        env!("CARGO_PKG_VERSION"),
         fmt_us(total_us)
     ));
 
@@ -581,7 +652,10 @@ fn render_html(
         s.push_str("</table>\n");
     }
 
-    // Scopes
+    // Scopes. The engine environment (process env vars + CLI flags) renders
+    // directly under the cgi scope — the natural place to look for "what was
+    // this engine started with" while reading request context.
+    let mut env_rendered = false;
     for (name, map) in scopes {
         if map.is_empty() {
             continue;
@@ -599,10 +673,89 @@ fn render_html(
             ));
         }
         s.push_str("</table>\n");
+        if name.eq_ignore_ascii_case("cgi") {
+            render_env_and_flags(&mut s);
+            render_cfconfig(&mut s, cfconfig);
+            env_rendered = true;
+        }
+    }
+    if !env_rendered {
+        render_env_and_flags(&mut s);
+        render_cfconfig(&mut s, cfconfig);
     }
 
     s.push_str("</div>\n");
     s
+}
+
+/// Render the engine's process environment variables and the runtime flags
+/// (CLI arguments) it was started with.
+fn render_env_and_flags(s: &mut String) {
+    let mut envs: Vec<(String, String)> = std::env::vars().collect();
+    envs.sort_by(|a, b| a.0.cmp(&b.0));
+    s.push_str(&format!(
+        "<h4 style=\"margin:6px 0 2px\">Environment variables ({})</h4>\n",
+        envs.len()
+    ));
+    if envs.is_empty() {
+        s.push_str("<div>(none)</div>\n");
+    } else {
+        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        for (k, v) in &envs {
+            let shown = if v.len() > 200 {
+                let mut end = 200;
+                while !v.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &v[..end])
+            } else {
+                v.clone()
+            };
+            s.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td></tr>\n",
+                esc(k),
+                esc(&shown)
+            ));
+        }
+        s.push_str("</table>\n");
+    }
+
+    let flags: Vec<String> = std::env::args().skip(1).collect();
+    s.push_str(&format!(
+        "<h4 style=\"margin:6px 0 2px\">Runtime flags ({})</h4>\n",
+        flags.len()
+    ));
+    if flags.is_empty() {
+        s.push_str("<div>(none)</div>\n");
+    } else {
+        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        for f in &flags {
+            s.push_str(&format!("<tr><td>{}</td></tr>\n", esc(f)));
+        }
+        s.push_str("</table>\n");
+    }
+}
+
+/// Render the settings this deploy's cfconfig changed from engine defaults
+/// (already flattened + credential-redacted by [`cfconfig_diff_rows`]).
+fn render_cfconfig(s: &mut String, rows: &[(String, String)]) {
+    s.push_str(&format!(
+        "<h4 style=\"margin:6px 0 2px\">CFConfig ({})</h4>\n",
+        rows.len()
+    ));
+    if rows.is_empty() {
+        s.push_str("<div>(engine defaults — no cfconfig overrides)</div>\n");
+    } else {
+        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        for (k, v) in rows {
+            s.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td></tr>\n",
+                esc(k),
+                esc(v)
+            ));
+        }
+        s.push_str("</table>\n");
+    }
 }
 
 // ── CFML struct projection (getDebugData()) ──────────────────────────────────
@@ -806,8 +959,11 @@ mod tests {
     #[test]
     fn modern_render_has_sections() {
         let c = sample_collector();
-        let html = c.render(&[], Some("/index.cfm"));
-        assert!(html.contains("RustCFML Debug"));
+        let html = c.render(&[], Some("/index.cfm"), &[("runtime.reportAsLucee".to_string(), "false".to_string())]);
+        assert!(html.contains(&format!("RustCFML v{} Debug", env!("CARGO_PKG_VERSION"))));
+        // engine environment renders even without a cgi scope in the snapshot
+        assert!(html.contains("Environment variables ("));
+        assert!(html.contains("Runtime flags ("));
         assert!(html.contains("Queries (2)"));
         assert!(html.contains("SELECT * FROM users"));
         // bound parameters are shown under the SQL (Lucee parity)
@@ -827,6 +983,32 @@ mod tests {
     }
 
     #[test]
+    fn cfconfig_diff_only_changes_and_redacts_credentials() {
+        let defaults = serde_json::json!({
+            "runtime": { "reportAsLucee": true },
+            "datasources": {}
+        });
+        let effective = serde_json::json!({
+            "runtime": { "reportAsLucee": false },
+            "datasources": { "main": { "host": "localhost", "password": "hunter2" } }
+        });
+        let rows = cfconfig_diff_rows(&effective, &defaults);
+        assert!(rows.contains(&("runtime.reportAsLucee".to_string(), "false".to_string())));
+        assert!(rows.contains(&("datasources.main.host".to_string(), "localhost".to_string())));
+        assert!(rows.contains(&("datasources.main.password".to_string(), "••••••".to_string())));
+        assert!(!rows.iter().any(|(_, v)| v == "hunter2"));
+        // unchanged values are not listed
+        assert_eq!(rows.len(), 3);
+
+        // and the section renders in the footer
+        let c = DebugCollector::new(FooterCfg::default());
+        let html = c.render(&[], None, &rows);
+        assert!(html.contains("CFConfig (3)"));
+        assert!(html.contains("datasources.main.host"));
+        assert!(!html.contains("hunter2"));
+    }
+
+    #[test]
     fn template_none_renders_empty_and_comment_renders_comment() {
         let mut cfg = FooterCfg::default();
         cfg.template = "none".into();
@@ -842,7 +1024,7 @@ mod tests {
             line: 1,
             params: &[],
         });
-        assert_eq!(c.render(&[], None), "");
+        assert_eq!(c.render(&[], None, &[]), "");
 
         let mut cfg2 = FooterCfg::default();
         cfg2.template = "comment".into();
@@ -858,8 +1040,8 @@ mod tests {
             line: 1,
             params: &[],
         });
-        let out = c2.render(&[], None);
-        assert!(out.contains("<!-- RustCFML Debug"));
+        let out = c2.render(&[], None, &[]);
+        assert!(out.contains(&format!("<!-- RustCFML v{} Debug", env!("CARGO_PKG_VERSION"))));
         assert!(out.contains("Queries: 1"));
         assert!(!out.contains("<table"));
     }
@@ -868,7 +1050,7 @@ mod tests {
     fn html_is_escaped_in_output() {
         let c = DebugCollector::new(FooterCfg::default());
         c.add_generic("x", "name", "<script>alert(1)</script>");
-        let html = c.render(&[], None);
+        let html = c.render(&[], None, &[]);
         assert!(html.contains("&lt;script&gt;"));
         assert!(!html.contains("<script>alert"));
     }
@@ -891,7 +1073,7 @@ mod tests {
             params: &[],
             });
         }
-        let html = c.render(&[], None);
+        let html = c.render(&[], None, &[]);
         assert!(html.contains("Queries (2)"));
         assert!(html.contains("+3 more queries clipped"));
     }

@@ -2937,10 +2937,33 @@ impl CfmlVirtualMachine {
         }
         let scopes = self.gather_debug_scopes();
         let main = self.base_template_path.clone();
-        let footer = collector.render(&scopes, main.as_deref());
+        let cfconfig_rows = self.cfconfig_debug_rows();
+        let footer = collector.render(&scopes, main.as_deref(), &cfconfig_rows);
         if !footer.is_empty() {
             self.output_buffer.push_str(&footer);
         }
+    }
+
+    /// Flatten the effective cfconfig (per-request app overlay, else the
+    /// server baseline) into what-changed-from-defaults rows for the debug
+    /// footer. Empty when the deploy runs on pure engine defaults.
+    #[cfg(feature = "observability")]
+    fn cfconfig_debug_rows(&self) -> Vec<(String, String)> {
+        let effective: Option<cfml_config::RustCfmlConfig> = self
+            .app_cfconfig
+            .as_ref()
+            .map(|c| (**c).clone())
+            .or_else(|| self.server_state.as_ref().map(|ss| (*ss.cfconfig).clone()));
+        let Some(effective) = effective else {
+            return Vec::new();
+        };
+        let (Ok(eff), Ok(def)) = (
+            cfml_config::to_json_value(&effective),
+            cfml_config::to_json_value(&cfml_config::RustCfmlConfig::default()),
+        ) else {
+            return Vec::new();
+        };
+        debug_footer::cfconfig_diff_rows(&eff, &def)
     }
 
     // ── Hook-fire helpers (called from the boundary sites) ──────────────────
@@ -32159,7 +32182,8 @@ mod debug_footer_gate_tests {
         // re-enabled → the footer renders into the output buffer
         vm.show_debug_output = true;
         vm.maybe_render_debug_footer();
-        assert!(vm.output_buffer.contains("RustCFML Debug"));
+        assert!(vm.output_buffer.contains("RustCFML v"));
+        assert!(vm.output_buffer.contains("Debug &mdash;"));
     }
 
     #[test]
