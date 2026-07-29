@@ -93,6 +93,74 @@ fn lever_c_untracking_enabled() -> bool {
 /// body (e.g. `Null` for native/intercepted functions) simply isn't a UDF
 /// reference and dispatches by name.
 
+/// Process-wide function registry, indexed by `global_id`, backing the
+/// cross-request fallback in [`CfmlVirtualMachine::resolve_fn`].
+///
+/// **Why this exists.** `fn_registry` is per-request. A request publishes the
+/// functions it compiled into the *application*-carried table only at request
+/// END (`rehome_application_functions`). But a component written into a nested
+/// application-scope container that already existed in the persisted snapshot
+/// shares that container's inner `Arc`, so it becomes visible to other IN-FLIGHT
+/// requests immediately. A concurrent request could therefore see a component
+/// whose method ids nothing had registered for it yet: `resolve_fn` returned
+/// `None`, dispatch fell through to by-name lookup, and an inherited method
+/// (which `heal_stale_component_method` does not cover) failed with
+/// "Variable is not a function or function 'X' is not defined". Under ColdBox
+/// that surfaced as `'_targetAction' is not defined`, because `EventHandler`'s
+/// inherited `_privateInvoker` pulls the action out as a VALUE
+/// (`var _targetAction = variables[ method ]`) and the alias is the only name the
+/// fallback has. Preside admin ajax endpoints hit this constantly, since they run
+/// concurrently with the page request that lazily builds WireBox singletons.
+///
+/// **Why it is sound.** `global_id`s come from a process-global monotonic counter
+/// (`cfml_codegen::compiler::next_global_fn_id`) and are never reused, so a given
+/// id maps to exactly one `BytecodeFunction` for the life of the process. A
+/// recompile after an edit mints fresh ids rather than rebinding old ones, so this
+/// table can never serve a stale body for an id.
+///
+/// **Why `Weak`.** Entries do not keep functions alive, so this cannot become a
+/// leak in long-running serve mode where edits recompile templates. An id stays
+/// resolvable exactly as long as its `Arc` is held somewhere real — the bytecode
+/// cache, a live request's `fn_registry`, or the application function table —
+/// which is precisely the correct lifetime. Once the last owner drops, the entry
+/// upgrades to `None` and behaves as it did before.
+static SHARED_FN_REGISTRY: RwLock<Vec<std::sync::Weak<BytecodeFunction>>> = RwLock::new(Vec::new());
+
+/// Publish function `Arc`s into [`SHARED_FN_REGISTRY`], taking the write lock
+/// once for the whole batch. Idempotent: re-publishing the same id is a no-op
+/// while the existing entry is still live (ids never rebind, so a live entry is
+/// always the same function).
+fn publish_shared_fns<'a, I>(fns: I)
+where
+    I: IntoIterator<Item = &'a Arc<BytecodeFunction>>,
+{
+    let mut it = fns.into_iter().peekable();
+    if it.peek().is_none() {
+        return;
+    }
+    let Ok(mut reg) = SHARED_FN_REGISTRY.write() else {
+        return; // poisoned: degrade to per-request resolution, never panic a request
+    };
+    for f in it {
+        let id = f.global_id as usize;
+        if id >= reg.len() {
+            reg.resize(id + 1, std::sync::Weak::new());
+        }
+        if reg[id].strong_count() == 0 {
+            reg[id] = Arc::downgrade(f);
+        }
+    }
+}
+
+/// Resolve a `global_id` through [`SHARED_FN_REGISTRY`]. Only reached on a
+/// per-request registry miss, so the read lock is off the hot path.
+fn resolve_shared_fn(id: usize) -> Option<Arc<BytecodeFunction>> {
+    SHARED_FN_REGISTRY
+        .read()
+        .ok()
+        .and_then(|reg| reg.get(id).and_then(|w| w.upgrade()))
+}
+
 /// Normalize a socket.io-lucee `rooms` argument (an array of room names, a
 /// single room string, or empty) into a list of non-empty room names. An empty
 /// result means "no room narrowing" (broadcast to the whole namespace).
@@ -2381,12 +2449,22 @@ impl CfmlVirtualMachine {
     /// stays sized to the app's distinct-function count.
     fn register_program_fns(&mut self, prog: &BytecodeProgram) {
         for f in &prog.functions {
-            self.register_fn(f);
+            self.register_fn_local(f);
         }
+        publish_shared_fns(prog.functions.iter());
     }
 
-    /// Register a single function Arc into `fn_registry` by its `global_id`.
+    /// Register a single function Arc into `fn_registry` by its `global_id`,
+    /// and publish it to the cross-request registry.
     fn register_fn(&mut self, f: &Arc<BytecodeFunction>) {
+        self.register_fn_local(f);
+        publish_shared_fns(std::iter::once(f));
+    }
+
+    /// Register into this VM's own registry only. Callers registering in bulk
+    /// use this plus one batched [`publish_shared_fns`], so the shared registry's
+    /// write lock is taken once rather than per function.
+    fn register_fn_local(&mut self, f: &Arc<BytecodeFunction>) {
         let id = f.global_id as usize;
         if id >= self.fn_registry.len() {
             self.fn_registry.resize(id + 1, None);
@@ -2411,15 +2489,20 @@ impl CfmlVirtualMachine {
         true
     }
 
-    /// O(1), no hashing, independent of the active `self.program`.
+    /// O(1), no hashing, independent of the active `self.program`. On a local
+    /// miss, falls back to the process-wide registry so a function published by
+    /// a CONCURRENTLY-RUNNING request still resolves — see
+    /// [`SHARED_FN_REGISTRY`] for why that matters and why it is sound.
     #[inline]
     fn resolve_fn(&self, global_id: i64) -> Option<Arc<BytecodeFunction>> {
         if global_id < 0 {
             return None;
         }
-        self.fn_registry
-            .get(global_id as usize)
-            .and_then(|slot| slot.clone())
+        let id = global_id as usize;
+        if let Some(f) = self.fn_registry.get(id).and_then(|slot| slot.clone()) {
+            return Some(f);
+        }
+        resolve_shared_fn(id)
     }
 
     /// Overlay `.cfconfig.json` runtime knobs onto a freshly-constructed VM.
@@ -30639,8 +30722,9 @@ impl CfmlVirtualMachine {
             self.app_function_table = app_snapshot.app_function_table.clone();
             let carried = self.app_function_table.clone();
             for f in &carried {
-                self.register_fn(f);
+                self.register_fn_local(f);
             }
+            publish_shared_fns(carried.iter());
 
             // Publish the loaded Application.cfc `this` scope BEFORE running
             // onApplicationStart, so `getApplicationMetadata()`/`getApplicationSettings()`
