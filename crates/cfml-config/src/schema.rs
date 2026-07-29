@@ -160,7 +160,12 @@ pub struct ServerCfg {
     #[serde(rename = "maxConcurrentRequests")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub max_concurrent_requests: u32,
-    /// Bytes. `0` = unlimited.
+    /// Bytes. `0` = unlimited. Defaults to 200 MB to match the Lucee/CommandBox
+    /// reference (its default post-entity limit), which real uploaders assume:
+    /// Preside's chunked asset uploader slices at exactly 10 MiB per request, so
+    /// the old 10 MB default rejected every full chunk by a few hundred bytes of
+    /// multipart envelope. Exceeding this now returns 413 rather than silently
+    /// emptying the body.
     #[serde(rename = "maxRequestBodySize")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub max_request_body_size: u64,
@@ -183,7 +188,7 @@ impl Default for ServerCfg {
             welcome_files: vec!["index.cfm".into(), "index.htm".into(), "index.html".into()],
             cfml_extensions: vec!["cfm".into(), "cfc".into()],
             max_concurrent_requests: 0,
-            max_request_body_size: 10 * 1024 * 1024,
+            max_request_body_size: 200 * 1024 * 1024,
             request_timeout: 0,
             http2: false,
             fallback: FallbackCfg::default(),

@@ -15536,6 +15536,11 @@ impl CfmlVirtualMachine {
                                 "java.io.fileinputstream" => {
                                     java_shims::handle_java_fileinputstream("init", empty_args, &CfmlValue::Null)
                                 }
+                                // Streaming byte sink — Preside's chunked asset
+                                // uploader assembles chunks through this.
+                                "java.io.fileoutputstream" => {
+                                    java_shims::handle_java_fileoutputstream("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.io.inputstreamreader" => {
                                     java_shims::handle_java_inputstreamreader("init", empty_args, &CfmlValue::Null)
                                 }
@@ -21691,6 +21696,9 @@ impl CfmlVirtualMachine {
                     }
                     "java.io.fileinputstream" => {
                         java_shims::handle_java_fileinputstream(&m, all_args, object)
+                    }
+                    "java.io.fileoutputstream" => {
+                        java_shims::handle_java_fileoutputstream(&m, all_args, object)
                     }
                     "java.io.inputstreamreader" => {
                         java_shims::handle_java_inputstreamreader(&m, all_args, object)

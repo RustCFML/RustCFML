@@ -1926,12 +1926,42 @@ async fn handle_request_inner(
         .collect();
 
     // Read body bytes. `server.maxRequestBodySize` from cfconfig caps the
-    // allowed size (default 10 MB, `0` = unlimited).
+    // allowed size (`0` = unlimited).
     let body_limit = match state.cfconfig.server.max_request_body_size {
         0 => usize::MAX,
         n => n as usize,
     };
-    let body_bytes = axum::body::to_bytes(body, body_limit).await.unwrap_or_default();
+    // An over-limit body MUST fail loudly with 413. This previously used
+    // `.unwrap_or_default()`, which silently substituted an EMPTY body: the
+    // request then ran with no form scope at all (not just a missing file), so
+    // a too-large upload surfaced as a baffling downstream "variable is
+    // undefined". Preside's asset upload hit exactly that. Note the error can
+    // fire before the whole body is read, so the declared content-length is
+    // logged for context rather than a byte count we measured.
+    let body_bytes = match axum::body::to_bytes(body, body_limit).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let declared = parts
+                .headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+            log::error!(
+                "413 {method} {url}: request body exceeds server.maxRequestBodySize ({} bytes); \
+                 declared content-length {declared}: {e}",
+                state.cfconfig.server.max_request_body_size
+            );
+            return axum::response::Response::builder()
+                .status(413)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(axum::body::Body::from(format!(
+                    "Request body too large. The server limit is {} bytes \
+                     (server.maxRequestBodySize in cfconfig; 0 = unlimited).",
+                    state.cfconfig.server.max_request_body_size
+                )))
+                .unwrap();
+        }
+    };
 
     let debug = state.debug;
 

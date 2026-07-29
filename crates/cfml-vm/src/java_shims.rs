@@ -2526,6 +2526,117 @@ pub fn handle_java_fileinputstream(
     }
 }
 
+/// `java.io.FileOutputStream` — append-oriented byte sink used to concatenate
+/// files without reading the whole result into memory. Preside's chunked asset
+/// uploader (`ChunkedUploadService.assembleTempFile`) builds the assembled file
+/// this way: `new FileOutputStream(path)`, then one `write(FileReadBinary(chunk))`
+/// per chunk, then `close()`.
+///
+/// Unlike the `ByteArrayOutputStream` shim, this cannot buffer in the shim struct
+/// — the point is to stream to disk — so each call opens the file and appends.
+/// `init` truncates (matching `new FileOutputStream(path)` with no append flag);
+/// `new FileOutputStream(path, true)` preserves existing content.
+pub fn handle_java_fileoutputstream(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    // The target path lives on the shim struct; `init` may receive a String or a
+    // `java.io.File` shim (which stores its path under `__file_path`).
+    fn path_of(object: &CfmlValue) -> String {
+        match object {
+            CfmlValue::Struct(s) => s
+                .get("__stream_path")
+                .map(|v| v.as_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    match method {
+        "init" => {
+            let path = match args.first() {
+                Some(CfmlValue::Struct(s)) => s
+                    .get("__file_path")
+                    .map(|v| v.as_string())
+                    .unwrap_or_default(),
+                Some(v) => v.as_string(),
+                None => String::new(),
+            };
+            let append = matches!(args.get(1), Some(CfmlValue::Bool(true)));
+            // `createObject("java", ...)` constructs the shim with NO arguments
+            // and the script then calls `.init(path)` explicitly, so an empty
+            // path here is the normal construction step, not an error — mirror
+            // the FileInputStream shim and just carry the (empty) path. A write
+            // with no path is what actually fails.
+            if !path.is_empty() && !append {
+                // Create/truncate now, so `new FileOutputStream(p)` has the same
+                // observable effect as on the JVM even if nothing is written.
+                if let Err(e) = std::fs::write(&path, b"") {
+                    return Err(CfmlError::runtime(format!(
+                        "java.io.FileOutputStream: cannot open '{path}' for writing: {e}"
+                    )));
+                }
+            }
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.io.fileoutputstream".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__stream_path".to_string(), CfmlValue::string(path));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // write(int) writes the low 8 bits; write(byte[]) appends the array;
+        // write(byte[], off, len) appends a range. All are void.
+        "write" | "writebytes" => {
+            let path = path_of(object);
+            if path.is_empty() {
+                return Err(CfmlError::runtime(
+                    "java.io.FileOutputStream.write: stream has no path".to_string(),
+                ));
+            }
+            let bytes: Vec<u8> = match args.len() {
+                3 => {
+                    let src = java_byte_array(&args[0]);
+                    let off = to_i64(&args[1]).max(0) as usize;
+                    let len = to_i64(&args[2]).max(0) as usize;
+                    let end = (off + len).min(src.len());
+                    if off <= end {
+                        src[off..end].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => match args.first() {
+                    Some(CfmlValue::Int(n)) => vec![(*n & 0xFF) as u8],
+                    Some(CfmlValue::Double(d)) => vec![(*d as i64 & 0xFF) as u8],
+                    Some(other) => java_byte_array(other),
+                    None => Vec::new(),
+                },
+            };
+            use std::io::Write as _;
+            let opened = std::fs::OpenOptions::new().append(true).open(&path);
+            match opened {
+                Ok(mut f) => match f.write_all(&bytes) {
+                    Ok(()) => Ok(CfmlValue::Null),
+                    Err(e) => Err(CfmlError::runtime(format!(
+                        "java.io.FileOutputStream.write: writing to '{path}' failed: {e}"
+                    ))),
+                },
+                Err(e) => Err(CfmlError::runtime(format!(
+                    "java.io.FileOutputStream.write: cannot open '{path}': {e}"
+                ))),
+            }
+        }
+        // Each write already flushed to the OS; nothing is held open. Return an
+        // empty string rather than Null so it isn't treated as "unhandled" and
+        // re-dispatched against the caller (same reasoning as FileInputStream).
+        "flush" | "close" => Ok(CfmlValue::string(String::new())),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
 pub fn handle_java_inputstreamreader(
     method: &str,
     args: Vec<CfmlValue>,

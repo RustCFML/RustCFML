@@ -1,0 +1,1 @@
+{ "server": { "maxRequestBodySize": 1048576 } }
