@@ -829,7 +829,7 @@ impl Default for DebugFieldsCfg {
             implicit_access: false,
             query_usage: false,
             dump: true,
-            scopes: vec!["cgi".into(), "url".into(), "form".into()],
+            scopes: vec!["url".into(), "form".into(), "cgi".into()],
         }
     }
 }

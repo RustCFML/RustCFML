@@ -652,9 +652,11 @@ fn render_html(
         s.push_str("</table>\n");
     }
 
-    // Scopes. The engine environment (process env vars + CLI flags) renders
-    // directly under the cgi scope — the natural place to look for "what was
-    // this engine started with" while reading request context.
+    // Scopes, in the canonical order set by `gather_debug_scopes`: url, form,
+    // cgi. The deploy-level blocks (cfconfig overrides, then the engine
+    // environment: process env vars + CLI flags) render directly under the cgi
+    // scope — the natural place to look for "what was this engine started with"
+    // while reading request context. Order: CFConfig, Environment, Runtime flags.
     let mut env_rendered = false;
     for (name, map) in scopes {
         if map.is_empty() {
@@ -674,14 +676,14 @@ fn render_html(
         }
         s.push_str("</table>\n");
         if name.eq_ignore_ascii_case("cgi") {
-            render_env_and_flags(&mut s);
             render_cfconfig(&mut s, cfconfig);
+            render_env_and_flags(&mut s);
             env_rendered = true;
         }
     }
     if !env_rendered {
-        render_env_and_flags(&mut s);
         render_cfconfig(&mut s, cfconfig);
+        render_env_and_flags(&mut s);
     }
 
     s.push_str("</div>\n");
@@ -980,6 +982,41 @@ mod tests {
         assert!(html.contains("kaboom"));
         assert!(html.contains("Generic data"));
         assert!(html.contains("controller"));
+    }
+
+    #[test]
+    fn scope_and_env_blocks_render_in_canonical_order() {
+        let scope = |k: &str| {
+            let mut m = ValueMap::default();
+            m.insert(k.to_string(), CfmlValue::string("v".to_string()));
+            m
+        };
+        // Passed cgi-first on purpose: the renderer must not depend on the
+        // caller's ordering for the deploy blocks anchored to cgi.
+        let scopes = vec![
+            ("url".to_string(), scope("a")),
+            ("form".to_string(), scope("b")),
+            ("cgi".to_string(), scope("c")),
+        ];
+        let c = sample_collector();
+        let html = c.render(
+            &scopes,
+            Some("/index.cfm"),
+            &[("runtime.reportAsLucee".to_string(), "false".to_string())],
+        );
+        let at = |needle: &str| html.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        let order = [
+            at("url scope"),
+            at("form scope"),
+            at("cgi scope"),
+            at("CFConfig ("),
+            at("Environment variables ("),
+            at("Runtime flags ("),
+        ];
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "expected URL, FORM, CGI, CFConfig, Environment, Runtime flags — got offsets {order:?}"
+        );
     }
 
     #[test]

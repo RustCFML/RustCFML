@@ -2878,6 +2878,18 @@ impl CfmlVirtualMachine {
                 out.push((lname, s.snapshot()));
             }
         }
+        // Canonical presentation order: request input (url, form) before the
+        // ambient cgi scope, which the engine environment blocks hang off. Any
+        // other configured scope keeps its configured order, after these.
+        // Sorted here rather than relying on `fields.scopes` order so a deploy
+        // whose cfconfig lists them differently still reads the same way.
+        let rank = |n: &str| match n {
+            "url" => 0,
+            "form" => 1,
+            "cgi" => 2,
+            _ => 3,
+        };
+        out.sort_by_key(|(name, _)| rank(name));
         out
     }
 
