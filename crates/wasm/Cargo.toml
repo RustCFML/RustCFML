@@ -5,6 +5,11 @@ version = "0.1.0"
 edition = "2021"
 authors = ["RustCFML Team"]
 license = "MIT"
+# wasm-pack copies the crate-local LICENSE into the published pkg/ and records
+# `repository` in its package.json — both needed so the demo/npm artifact
+# carries its terms and points back at source. (Setting `license-file` as well
+# as `license` would make cargo warn, so LICENSE is found by convention.)
+repository = "https://github.com/RustCFML/RustCFML"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
