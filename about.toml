@@ -1,0 +1,89 @@
+# cargo-about configuration — drives generation of THIRD-PARTY.txt, the
+# third-party attribution notice shipped with every release binary.
+#
+#   cargo about generate --config about.toml about.hbs -o THIRD-PARTY.txt
+#
+# (The release workflow and `scripts/gen-licenses.sh` run exactly that.)
+#
+# NOTE: deliberately NOT `--all-features`. We attribute what we actually ship,
+# which is the DEFAULT feature set. Non-default features pull in licenses that
+# are absent from released binaries — most importantly `obs-pprof`, whose
+# `pprof` -> `inferno` dependency is CDDL-1.0. If you ever publish a binary
+# built with extra features, regenerate with those features enabled and extend
+# `accepted` below to match.
+#
+# WHY THIS EXISTS: `cargo build --release -p rustcfml-cli` statically links
+# ~530 third-party crates into each published binary. MIT/BSD/ISC-style terms
+# require the copyright notice + license text to travel with that binary;
+# Apache-2.0 additionally requires NOTICE contents. Publishing a bare binary
+# with no notices does not satisfy those conditions, so we generate the notice
+# file, attach it to the GitHub release, AND embed it in the binary itself
+# (`rustcfml --licenses`) so it survives someone copying the binary out of the
+# release page.
+#
+# See also deny.toml, which *enforces* that nothing outside `accepted` below
+# ever enters the tree; this file only describes it.
+
+# Every target we publish a binary for (see .github/workflows/release.yml).
+# Crates are resolved per-target, so omitting one silently drops its
+# platform-specific dependencies (windows-sys, linux-raw-sys, ...) from the
+# notice file.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build- and dev-dependencies are not linked into the shipped binary, so they
+# carry no distribution obligation.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Our own workspace crates are covered by the top-level LICENSE file.
+private = { ignore = true }
+
+# ORDER MATTERS: for a dual/multi-licensed crate (e.g. "MIT OR Apache-2.0")
+# cargo-about picks the first entry in this list that satisfies the
+# expression. MIT first keeps the notice file short and consistent.
+#
+# Everything here was observed in the actual dependency graph of
+# `rustcfml-cli` with default features. A license appearing in this list is an
+# assertion that we have reviewed it and accept its obligations.
+accepted = [
+    # --- Permissive, notice-only -------------------------------------------
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "BSL-1.0",
+    "Unlicense",
+    "CC0-1.0",
+    "NCSA",
+    # Unicode data license, used by the ICU crates (icu_*, zerovec, yoke, ...)
+    # that reach us via idna/url. Notice-only, but must be reproduced.
+    "Unicode-3.0",
+    # webpki-roots (Mozilla CA bundle). Notice-only.
+    "CDLA-Permissive-2.0",
+
+    # --- Weak copyleft — EXTRA OBLIGATION, read before adding more ---------
+    # MPL-2.0 is file-level copyleft. Present in default builds via:
+    #   * `cluster`  -> memberlist, memberlist-core, memberlist-net,
+    #                   memberlist-proto
+    #   * `html`     -> scraper -> cssparser, cssparser-macros, dtoa-short,
+    #                   selectors
+    # We use all of them UNMODIFIED, so MPL-2.0 §3.2 (source availability to
+    # recipients) is satisfied by recording crate + exact version + upstream
+    # repository in THIRD-PARTY.txt, which about.hbs does for every crate.
+    # IF YOU EVER PATCH/VENDOR ONE OF THESE, that modified source must be
+    # published under MPL-2.0 — a notice file alone is then NOT sufficient.
+    "MPL-2.0",
+]
+
+# Crates whose SPDX expression cargo-about cannot resolve unaided.
+workarounds = ["ring"]

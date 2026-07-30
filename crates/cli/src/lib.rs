@@ -133,6 +133,11 @@ struct Args {
     #[arg(long)]
     version: bool,
 
+    /// Print RustCFML's license plus the third-party attribution notices for
+    /// every crate linked into this binary, then exit
+    #[arg(long)]
+    licenses: bool,
+
     /// Start web server with document root (default: current directory)
     #[arg(long, num_args = 0..=1, default_missing_value = ".")]
     serve: Option<String>,
@@ -282,6 +287,27 @@ pub fn run() {
     }
 }
 
+// RustCFML's own license and the generated third-party attribution notice are
+// compiled INTO the binary. Rationale: these binaries are distributed as bare
+// single files (see .github/workflows/release.yml) and are routinely copied out
+// of the release page, out of a container image, or out of a `--build` bundle.
+// A sibling LICENSE/THIRD-PARTY.txt asset does not survive that; an embedded
+// one does, so the notices required by the MIT/BSD/ISC/Apache-2.0 terms of our
+// ~530 statically linked dependencies always travel with the artifact.
+//
+// THIRD-PARTY.txt is generated and committed — regenerate with
+// `scripts/gen-licenses.sh` after any dependency change.
+const OWN_LICENSE: &str = include_str!("../../../LICENSE");
+const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY.txt");
+
+fn print_licenses() {
+    println!("RustCFML v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("{}", OWN_LICENSE.trim_end());
+    println!();
+    println!("{}", THIRD_PARTY_NOTICES.trim_end());
+}
+
 fn real_main() {
     // Check for embedded archive — if present, run as self-contained app
     if let Some(files) = vfs::extract_embedded_archive() {
@@ -293,6 +319,11 @@ fn real_main() {
 
     if args.version {
         println!("RustCFML v{}", env!("CARGO_PKG_VERSION"));
+        exit(0);
+    }
+
+    if args.licenses {
+        print_licenses();
         exit(0);
     }
 
@@ -3401,6 +3432,12 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
                 println!("Built with RustCFML v{} ({} embedded files)", env!("CARGO_PKG_VERSION"), file_count);
                 exit(0);
             }
+            // A `--build` binary redistributes the same statically linked
+            // dependencies, so it carries the same attribution obligation.
+            "--licenses" => {
+                print_licenses();
+                exit(0);
+            }
             "--sandbox" => { sandbox = true; }
             _ => {}
         }
@@ -3532,6 +3569,11 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             }
             "--version" => {
                 println!("RustCFML v{} (self-contained, {} files)", env!("CARGO_PKG_VERSION"), file_count);
+                exit(0);
+            }
+            // Same obligation as the CLI-mode embedded binary above.
+            "--licenses" => {
+                print_licenses();
                 exit(0);
             }
             "start" | "stop" | "status" => {

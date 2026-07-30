@@ -8,7 +8,46 @@ permissions:
   contents: write
 
 jobs:
+  # License compliance gate. Runs BEFORE the binaries are built so a tag can
+  # never ship an artifact whose attribution notice is stale or whose
+  # dependency graph has picked up terms we haven't reviewed.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Prebuilt binaries — `cargo install` would compile both tools from
+      # source on every tag (several minutes) for no benefit.
+      #
+      # cargo-about is PINNED on purpose: the staleness check below diffs its
+      # output against the committed THIRD-PARTY.txt, so an upstream formatting
+      # change would fail the gate spuriously. Bump deliberately, and
+      # regenerate THIRD-PARTY.txt in the same commit.
+      - name: Install cargo-about + cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.1,cargo-deny@0.20.2
+
+      # Fails the build if any crate in the shipped graph is licensed under
+      # terms outside the allow-list in deny.toml.
+      - name: Check dependency licenses
+        run: cargo deny check licenses
+
+      # THIRD-PARTY.txt is committed (it is include_str!'d into the binary), so
+      # it can drift behind a dependency bump. Regenerate and diff.
+      - name: Verify THIRD-PARTY.txt is up to date
+        run: |
+          ./scripts/gen-licenses.sh
+          if ! git diff --exit-code -- THIRD-PARTY.txt; then
+            echo "::error::THIRD-PARTY.txt is out of date. Run ./scripts/gen-licenses.sh and commit the result."
+            exit 1
+          fi
+
   build:
+    needs: licenses
     strategy:
       matrix:
         include:
@@ -46,6 +85,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Needed so LICENSE / THIRD-PARTY.txt can be attached as release assets.
+      - uses: actions/checkout@v5
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -59,6 +101,12 @@ jobs:
             chmod +x "release/rustcfml-${name}"
           done
           cp "artifacts/windows-x86_64/rustcfml.exe" "release/rustcfml-windows-x86_64.exe"
+
+      # Ship the notices alongside the binaries. They are also embedded in each
+      # binary (`rustcfml --licenses`); these assets make them readable without
+      # downloading and running anything.
+      - name: Attach license notices
+        run: cp LICENSE THIRD-PARTY.txt release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
