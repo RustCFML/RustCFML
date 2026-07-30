@@ -19,7 +19,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 524 crate(s)
+  MIT License (MIT) — 514 crate(s)
   Apache License 2.0 (Apache-2.0) — 53 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 8 crate(s)
@@ -651,16 +651,6 @@ Dependencies
 [MIT]
   convert_case 0.10.0 — https://github.com/rutrum/convert-case
 [MIT]
-  cfml-codegen 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-common 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-compiler 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-config 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-qoq 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-stdlib 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-vm 0.534.0 — https://github.com/RustCFML/RustCFML
-  cfml-worker 0.534.0 — https://github.com/RustCFML/RustCFML
-  rustcfml-cli 0.534.0 — https://github.com/RustCFML/RustCFML
-  rustcfml-wasm 0.1.0
   agnostic-io 0.2.0 — https://github.com/al8n/agnostic
   agnostic-lite 0.6.2 — https://github.com/al8n/agnostic
   agnostic-net 0.3.1 — https://github.com/al8n/agnostic
@@ -10190,16 +10180,6 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - cfml-codegen 0.534.0
-  - cfml-common 0.534.0
-  - cfml-compiler 0.534.0
-  - cfml-config 0.534.0
-  - cfml-qoq 0.534.0
-  - cfml-stdlib 0.534.0
-  - cfml-vm 0.534.0
-  - cfml-worker 0.534.0
-  - rustcfml-cli 0.534.0
-  - rustcfml-wasm 0.1.0
   - agnostic-io 0.2.0
   - agnostic-lite 0.6.2
   - agnostic-net 0.3.1

@@ -144,7 +144,7 @@ No JRE, no runtime, no dependencies. Compare: Lucee/BoxLang require a 200+ MB JR
 
 ### Licensing a binary you distribute
 
-A `--build` binary statically links the same ~530 third-party Rust crates as
+A `--build` binary statically links the same ~560 third-party Rust crates as
 RustCFML itself, and their MIT/BSD/ISC/Apache-2.0 terms require the copyright
 notices to travel with anything you ship. RustCFML embeds those notices for you
 — your binary answers:

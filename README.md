@@ -243,7 +243,7 @@ _Avatars are generated automatically from the [GitHub contributor graph](https:/
 
 RustCFML is released under the MIT License — see [LICENSE](LICENSE).
 
-The released binaries statically link ~530 third-party Rust crates. Their
+The released binaries statically link ~560 third-party Rust crates. Their
 licenses and copyright notices are reproduced in
 [THIRD-PARTY.txt](THIRD-PARTY.txt), which is attached to every
 [release](https://github.com/RustCFML/RustCFML/releases) and embedded in the

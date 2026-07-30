@@ -13,7 +13,7 @@
 # `accepted` below to match.
 #
 # WHY THIS EXISTS: `cargo build --release -p rustcfml-cli` statically links
-# ~530 third-party crates into each published binary. MIT/BSD/ISC-style terms
+# ~560 third-party crates into each published binary. MIT/BSD/ISC-style terms
 # require the copyright notice + license text to travel with that binary;
 # Apache-2.0 additionally requires NOTICE contents. Publishing a bare binary
 # with no notices does not satisfy those conditions, so we generate the notice

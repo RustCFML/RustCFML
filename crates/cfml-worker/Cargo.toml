@@ -7,6 +7,12 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Not published to crates.io — RustCFML ships as binaries. This also keeps
+# first-party crates out of THIRD-PARTY.txt: cargo-about only omits
+# workspace members that are unpublished, and listing them there made the
+# generated notice churn on every version bump (breaking the CI staleness
+# gate on every release). Our own terms live in the top-level LICENSE.
+publish = false
 
 [lib]
 # Plain rlib — the host project supplies the cdylib that workers-build consumes.

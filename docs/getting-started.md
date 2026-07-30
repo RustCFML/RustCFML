@@ -23,7 +23,7 @@ rustcfml --version
 ### Licensing
 
 RustCFML is MIT-licensed. Each release also carries `LICENSE` and
-`THIRD-PARTY.txt` (the attribution notices for the ~530 Rust crates linked into
+`THIRD-PARTY.txt` (the attribution notices for the ~560 Rust crates linked into
 the binary) as downloadable assets. Both are embedded in the binary too, so you
 can read them from a binary you have already installed:
 

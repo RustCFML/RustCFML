@@ -293,7 +293,7 @@ pub fn run() {
 // of the release page, out of a container image, or out of a `--build` bundle.
 // A sibling LICENSE/THIRD-PARTY.txt asset does not survive that; an embedded
 // one does, so the notices required by the MIT/BSD/ISC/Apache-2.0 terms of our
-// ~530 statically linked dependencies always travel with the artifact.
+// ~560 statically linked dependencies always travel with the artifact.
 //
 // THIRD-PARTY.txt is generated and committed — regenerate with
 // `scripts/gen-licenses.sh` after any dependency change.

@@ -1,0 +1,57 @@
+name: License Compliance
+
+# Runs the same gate as the `licenses` job in release.yml, but on ordinary
+# pushes and PRs so a stale THIRD-PARTY.txt or an unreviewed dependency licence
+# is caught BEFORE a tag is cut. Without this the gate only ever ran at tag
+# time, which is exactly how v0.535.0 shipped a tag whose release job never
+# started (THIRD-PARTY.txt had gone stale behind a version bump).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "about.toml"
+      - "about.hbs"
+      - "deny.toml"
+      - "THIRD-PARTY.txt"
+      - "scripts/gen-licenses.sh"
+      - ".github/workflows/licenses.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "about.toml"
+      - "about.hbs"
+      - "deny.toml"
+      - "THIRD-PARTY.txt"
+      - "scripts/gen-licenses.sh"
+  workflow_dispatch:
+
+jobs:
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Versions pinned to match release.yml — see the note there about why
+      # cargo-about in particular must not float.
+      - name: Install cargo-about + cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.1,cargo-deny@0.20.2
+
+      - name: Check dependency licenses
+        run: cargo deny check licenses
+
+      - name: Verify THIRD-PARTY.txt is up to date
+        run: |
+          ./scripts/gen-licenses.sh
+          if ! git diff --exit-code -- THIRD-PARTY.txt; then
+            echo "::error::THIRD-PARTY.txt is out of date. Run ./scripts/gen-licenses.sh and commit the result."
+            exit 1
+          fi
