@@ -1,15 +1,27 @@
 //! The Application.cfc pseudo-constructor must run against a live, writable
-//! transient `application` scope — matching Lucee. A write inside the PC
-//! (`application.x = v`) must succeed and be readable back within the same PC
-//! (the standard guard-set-then-return idiom, e.g. Preside's
-//! `_getDefaultStatelessUrlPatterns`), even though `this.name` / the real named
-//! scope is not yet bound. Those PC-local writes are DISCARDED once the named
-//! scope binds for the page body — Lucee loses them too (cross-engine verified).
+//! `application` scope — matching Lucee. Three distinct properties, all verified
+//! cross-engine against Lucee 7.0.4.34:
 //!
-//! Regression guard for the "app-scope write is a silent no-op during the PC"
-//! bug: before the fix the write vanished and the read-back returned Null
-//! (later throwing "Variable is undefined" once undefined member reads were made
-//! to throw), which broke Preside boot.
+//! 1. A write inside the PC (`application.x = v`) succeeds and is readable back
+//!    within the same PC (the guard-set-then-return idiom, e.g. Preside's
+//!    `_getDefaultStatelessUrlPatterns`), even though `this.name` / the real named
+//!    scope is not yet bound.
+//! 2. Those PC writes are NOT visible to the page body, which sees the named
+//!    scope bound after the PC completes. (Lucee: page sees nothing either.)
+//! 3. The PC scope PERSISTS ACROSS REQUESTS — the next request's PC still sees
+//!    what the previous request's PC wrote, so a guard-once block runs exactly
+//!    once. On Lucee this is the pre-`this.name` default application scope; a PC
+//!    counter increments 1,2,3,4 across requests there.
+//!
+//! Regression guard for two bugs:
+//!   - "app-scope write is a silent no-op during the PC": the write vanished and
+//!     the read-back returned Null (later throwing "Variable is undefined"),
+//!     breaking Preside boot. (Property 1.)
+//!   - "PC got a FRESH EMPTY scope every request": every PC guard-once block
+//!     re-ran forever. On a real Preside site this made
+//!     `Bootstrap._setupCustomTagPaths`'s recursive `DirectoryList` over every
+//!     extension run on EVERY request — a warm page went 35ms → 204ms.
+//!     (Property 3.)
 
 use cfml_codegen::{compiler::CfmlCompiler, BytecodeProgram};
 use cfml_common::dynamic::{CfmlValue, ValueMap};
@@ -76,20 +88,30 @@ fn pseudo_constructor_has_writable_transient_application_scope() {
     let vfs: Arc<dyn Vfs> = Arc::new(EmbeddedFs::new(files, VROOT.to_string()));
     let server_state = ServerState::with_production(false);
 
+    // First (cold) request: nothing inherited, so the guard-once branch runs.
     let out = run_request(&server_state, vfs.clone(), "index.cfm");
     assert_eq!(
-        out, "written-in-pc|SKE-TRUE|built|NOT-PERSISTED",
-        "PC must read back its own application-scope write (and Preside's guard-set-return \
-         must return the built value); those writes must NOT persist into the page body"
+        out, "written-in-pc|SKE-TRUE|built|NOT-PERSISTED|NO-PREV|GUARD-RAN",
+        "cold request: PC must read back its own application-scope write (and Preside's \
+         guard-set-return must return the built value); the write must NOT be visible to \
+         the page body; with an empty scope the guard-once branch must execute"
     );
 
-    // A second (warm) request must behave identically — the PC always gets a
-    // fresh transient scope, so the guard runs and rebuilds every request, and
-    // the prior request's PC writes never leaked into the persisted scope.
-    let out2 = run_request(&server_state, vfs, "index.cfm");
+    // Second (warm) request: the PC scope persists, so the PC sees the previous
+    // request's write and the guard-once branch is SKIPPED. This is the property
+    // that keeps Preside's per-request extension walk from re-running forever.
+    let out2 = run_request(&server_state, vfs.clone(), "index.cfm");
     assert_eq!(
-        out2, "written-in-pc|SKE-TRUE|built|NOT-PERSISTED",
-        "warm request: PC transient scope behaves identically and stays isolated from \
-         the persisted application scope"
+        out2, "written-in-pc|SKE-TRUE|built|NOT-PERSISTED|SAW-PREV|GUARD-SKIPPED",
+        "warm request: the PC application scope must persist across requests (Lucee \
+         parity) so a guard-once block runs exactly once — while still staying invisible \
+         to the page body"
+    );
+
+    // Third request: still skipped — persistence is stable, not a one-shot.
+    let out3 = run_request(&server_state, vfs, "index.cfm");
+    assert_eq!(
+        out3, "written-in-pc|SKE-TRUE|built|NOT-PERSISTED|SAW-PREV|GUARD-SKIPPED",
+        "third request: PC scope persistence must be stable across many requests"
     );
 }

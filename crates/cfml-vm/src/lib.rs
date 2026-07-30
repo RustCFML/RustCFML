@@ -1083,6 +1083,32 @@ pub struct ServerState {
     /// Successes only — a miss must stay re-probeable. Request-lifetime sibling:
     /// the per-request VM's `request_custom_tag_cache` (all modes).
     pub custom_tag_path_cache: Arc<parking_lot::RwLock<HashMap<(String, String), String>>>,
+    /// Persistent `application` scope for the Application.cfc *pseudo-constructor*
+    /// phase, keyed by Application.cfc path.
+    ///
+    /// The PC runs before `this.name` is known, so the real named scope cannot be
+    /// bound yet. Lucee nonetheless runs the PC against a **live scope that
+    /// survives across requests** (it is the pre-`this.name` default application
+    /// scope): an `application.x = v` written by one request's PC is visible to the
+    /// *next* request's PC, while remaining invisible to `onRequestStart` and the
+    /// page (which use the named scope). Verified cross-engine against Lucee
+    /// 7.0.4.34 — a PC counter increments 1,2,3,4 across requests, and the PC never
+    /// observes keys written by the page or `onRequestStart`.
+    ///
+    /// This matters because the guard-once idiom is common in framework bootstraps:
+    /// Preside's `Bootstrap._setupCustomTagPaths` does
+    /// `if ( !Len( application.__presideCustomTags ?: "" ) ) { <recursive
+    /// DirectoryList over every extension> ; application.__presideCustomTags = ... }`.
+    /// Seeding a *fresh empty* struct per request (the previous behaviour) meant the
+    /// guard never held and the walk re-ran on every single request — measured at
+    /// ~190ms/request on a real Preside site.
+    ///
+    /// Keyed by Application.cfc path rather than by web context: Lucee shares one
+    /// default scope per context, so sibling applications in the same webroot would
+    /// see each other's PC writes. Per-path keying is identical for the single-app
+    /// case and avoids that cross-application bleed. `CfmlStruct` is
+    /// `Arc<RwLock<..>>`, so the clone handed to the request shares this state.
+    pub pseudo_ctor_app_scopes: Arc<parking_lot::RwLock<HashMap<String, CfmlStruct>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -1144,6 +1170,7 @@ impl ServerState {
             component_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             canonicalize_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             custom_tag_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -30526,21 +30553,37 @@ impl CfmlVirtualMachine {
         // before Application.cfc `this.*` settings so those still win on conflict.
         self.discover_app_cfconfig(&app_cfc_path);
 
-        // 1c. Seed a TRANSIENT, writable application scope for the Application.cfc
+        // 1c. Seed the writable application scope for the Application.cfc
         // pseudo-constructor. The PC (e.g. Preside's `super.setupApplication(...)`)
         // runs inside `load_application_cfc` below — BEFORE `this.name` is known
         // and the real named scope is bound in step 4. Lucee runs the PC against a
-        // live, writable working `application` scope: writes succeed and immediate
-        // read-backs return the value (verified cross-engine), but those writes are
-        // DISCARDED once the named scope binds — a guard-set-then-return idiom like
-        // Preside's `_getDefaultStatelessUrlPatterns` relies on the read-back
-        // working. Without this, `application.x = v` in the PC is a silent no-op and
-        // `return application.x` throws "Variable is undefined". Step 4 overwrites
-        // `application_scope` with the real named scope (a fresh clone of the
-        // persisted snapshot), so these PC-local writes are dropped exactly as on
-        // Lucee. (CLI / no-Application.cfc paths seed their own scope elsewhere.)
+        // live, writable `application` scope: writes succeed, immediate read-backs
+        // return the value, and — crucially — the scope **persists across
+        // requests**, so a guard-once idiom set by one request's PC is still set for
+        // the next request's PC. Those writes stay invisible to `onRequestStart` and
+        // the page, which see the named scope bound in step 4 (verified cross-engine
+        // against Lucee 7.0.4.34).
+        //
+        // We therefore hand the PC a per-Application.cfc scope held on ServerState
+        // rather than a fresh empty struct. Seeding it empty per request made every
+        // PC guard-once block re-run forever — on a real Preside site that meant
+        // `Bootstrap._setupCustomTagPaths`'s recursive `DirectoryList` over every
+        // extension ran on EVERY request (~190ms). See
+        // `ServerState::pseudo_ctor_app_scopes`. Step 4 replaces
+        // `application_scope` with the real named scope, so the PC scope is not
+        // reachable from the page. (CLI / no-Application.cfc paths seed elsewhere.)
         if self.application_scope.is_none() {
-            self.application_scope = Some(CfmlStruct::empty());
+            let pc_scope = if let Some(ref ss) = self.server_state {
+                let mut scopes = ss.pseudo_ctor_app_scopes.write();
+                scopes
+                    .entry(app_cfc_path.clone())
+                    .or_insert_with(CfmlStruct::empty)
+                    .clone()
+            } else {
+                // CLI single-run: no cross-request lifetime to preserve.
+                CfmlStruct::empty()
+            };
+            self.application_scope = Some(pc_scope);
         }
 
         // 2. Load Application.cfc. A pseudo-constructor throw (or compile error)
