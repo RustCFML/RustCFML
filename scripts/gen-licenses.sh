@@ -24,6 +24,22 @@ fi
 
 # Default features only — that is what release binaries are built with. See the
 # note in about.toml about --all-features and the CDDL-1.0 `inferno` crate.
-cargo about generate --config about.toml about.hbs -o THIRD-PARTY.txt
+cargo about generate --config about.toml about.hbs -o THIRD-PARTY.txt.raw
+
+# Collapse runs of blank lines to a single blank line.
+#
+# WHY: crates that ship several licence files (miniz_oxide has LICENSE,
+# LICENSE-APACHE.md, LICENSE-MIT.md and LICENSE-ZLIB.md) get their text
+# harvested in filesystem-iteration order, and the number of blank lines
+# joining the harvested pieces differs between APFS (dev machines) and ext4
+# (CI runners). That made the generated file differ by a single blank line
+# between macOS and Linux, which is legally meaningless but broke the
+# byte-exact staleness gate in .github/workflows/licenses.yml.
+#
+# Squeezing blank lines makes the artifact platform-independent. It only ever
+# removes empty lines — no licence wording, copyright line or attribution is
+# altered.
+cat -s THIRD-PARTY.txt.raw > THIRD-PARTY.txt
+rm -f THIRD-PARTY.txt.raw
 
 echo "Wrote THIRD-PARTY.txt ($(wc -l < THIRD-PARTY.txt | tr -d ' ') lines)"
