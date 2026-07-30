@@ -241,4 +241,19 @@ _Avatars are generated automatically from the [GitHub contributor graph](https:/
 
 ## License
 
-MIT
+RustCFML is released under the MIT License — see [LICENSE](LICENSE).
+
+The released binaries statically link ~530 third-party Rust crates. Their
+licenses and copyright notices are reproduced in
+[THIRD-PARTY.txt](THIRD-PARTY.txt), which is attached to every
+[release](https://github.com/RustCFML/RustCFML/releases) and embedded in the
+binary itself:
+
+```bash
+rustcfml --licenses
+```
+
+`THIRD-PARTY.txt` is generated from the resolved dependency graph — run
+`./scripts/gen-licenses.sh` after any dependency change (CI fails the release
+if it is stale). `cargo deny check licenses` enforces the reviewed allow-list in
+[deny.toml](deny.toml).
