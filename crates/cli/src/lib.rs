@@ -301,11 +301,33 @@ const OWN_LICENSE: &str = include_str!("../../../LICENSE");
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY.txt");
 
 fn print_licenses() {
-    println!("RustCFML v{}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("{}", OWN_LICENSE.trim_end());
-    println!();
-    println!("{}", THIRD_PARTY_NOTICES.trim_end());
+    use std::io::Write;
+
+    let body = format!(
+        "RustCFML v{}\n\n{}\n\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        OWN_LICENSE.trim_end(),
+        THIRD_PARTY_NOTICES.trim_end()
+    );
+
+    // Written with write_all rather than println! so a closed pipe is not a
+    // panic. This output is ~13k lines, so `--licenses | head` and
+    // `--licenses | less` (quit before the end) are the normal ways to read it,
+    // and both close the pipe early. Rust ignores SIGPIPE process-wide, so
+    // println! would hit EPIPE and panic with "failed printing to stdout".
+    // Restoring SIG_DFL globally is not an option — serve mode relies on socket
+    // writes returning EPIPE instead of killing the process when a client
+    // disconnects.
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    match handle.write_all(body.as_bytes()).and_then(|_| handle.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            eprintln!("Error writing licenses: {}", e);
+            exit(1);
+        }
+    }
 }
 
 fn real_main() {
