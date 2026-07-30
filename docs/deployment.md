@@ -142,6 +142,21 @@ rustcfml --build ./webapp -o myserver --mode serve
 
 No JRE, no runtime, no dependencies. Compare: Lucee/BoxLang require a 200+ MB JRE.
 
+### Licensing a binary you distribute
+
+A `--build` binary statically links the same ~530 third-party Rust crates as
+RustCFML itself, and their MIT/BSD/ISC/Apache-2.0 terms require the copyright
+notices to travel with anything you ship. RustCFML embeds those notices for you
+— your binary answers:
+
+```bash
+./myapp --licenses
+```
+
+That prints RustCFML's MIT licence plus the full third-party attribution. It
+covers the engine and its dependencies only; the licence for your own CFML code
+and any [native modules](native-modules.md) you add is yours to declare.
+
 ### Native (Rust) modules
 
 Self-contained binaries can include user-authored Rust code that surfaces as first-class CFML built-ins and classes. See **[Native Modules](native-modules.md)**.
