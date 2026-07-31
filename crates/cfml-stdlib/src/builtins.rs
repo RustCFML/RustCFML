@@ -7634,9 +7634,14 @@ fn fn_file_append(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Null)
 }
 
+/// `fileExists()` — TRUE only for a regular file. A directory is NOT a file
+/// (Lucee/ACF both answer `false`; `directoryExists()` is the directory test),
+/// so this must be `is_file`, not `exists`. Reached only when the VM's
+/// existence intercept is bypassed — the VM routes this through its configured
+/// VFS so an embedded archive / engine-CFC overlay / S3 root is visible too.
 fn fn_file_exists(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
-    Ok(CfmlValue::Bool(std::path::Path::new(&path).exists()))
+    Ok(CfmlValue::Bool(std::path::Path::new(&path).is_file()))
 }
 
 fn fn_file_delete(args: Vec<CfmlValue>) -> CfmlResult {

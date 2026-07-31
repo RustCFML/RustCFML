@@ -19,6 +19,22 @@ assert("fileAppend adds content", fileRead(baseFile), "hello world");
 fileDelete(baseFile);
 assertFalse("fileDelete removes file", fileExists(baseFile));
 
+// --- fileExists is FILE-only (a directory is not a file) ---
+// Lucee/ACF both answer false for a directory; `directoryExists()` is the
+// directory test. RustCFML used to answer true here, because both the builtin
+// (`Path::exists()`) and the VFS route (`Vfs::exists`) accept directories.
+feDir = tempDir & "rustcfml_fedir_" & createUUID();
+directoryCreate(feDir);
+assertTrue("directoryExists true for a directory", directoryExists(feDir));
+assertFalse("fileExists FALSE for a directory", fileExists(feDir));
+feFile = feDir & "/probe.txt";
+fileWrite(feFile, "x");
+assertTrue("fileExists true for a regular file", fileExists(feFile));
+assertFalse("directoryExists FALSE for a regular file", directoryExists(feFile));
+fileDelete(feFile);
+directoryDelete(feDir);
+assertFalse("fileExists false for a removed path", fileExists(feFile));
+
 // --- directoryExists ---
 assertTrue("directoryExists on tempDir", directoryExists(tempDir));
 

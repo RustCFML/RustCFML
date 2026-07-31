@@ -12908,7 +12908,19 @@ impl CfmlVirtualMachine {
                     // runs, so both agree on the base. Mutates in place; a
                     // non-file BIF is left untouched.
                     self.resolve_file_bif_paths(&name_lower, &mut args);
-                    // Sandbox mode: intercept file operations
+                    // Existence checks ALWAYS route through the configured VFS,
+                    // sandbox or not. The plain builtins call `std::path::Path`
+                    // directly, which cannot see a bundled binary's embedded
+                    // archive, the engine-CFC overlay, or an S3-backed root — so
+                    // outside sandbox mode `fileExists()` disagreed with every
+                    // other file BIF (and with the include/component resolvers,
+                    // which have always gone through the VFS) about what exists.
+                    if matches!(name_lower.as_str(), "fileexists" | "directoryexists") {
+                        if let Some(result) = self.sandbox_intercept(&name_lower, &args) {
+                            return result;
+                        }
+                    }
+                    // Sandbox mode: intercept the remaining file operations
                     if self.sandbox {
                         if let Some(result) = self.sandbox_intercept(&name_lower, &args) {
                             return result;
@@ -28333,9 +28345,11 @@ impl CfmlVirtualMachine {
                         .map_err(|e| CfmlError::runtime(format!("fileReadBinary: {}", e))),
                 )
             }
+            // `is_file`, not `exists`: a directory is not a file (Lucee/ACF both
+            // answer false — `directoryExists()` is the directory test).
             "fileexists" => {
                 let path = get_str(0);
-                Some(Ok(CfmlValue::Bool(self.vfs.exists(&path))))
+                Some(Ok(CfmlValue::Bool(self.vfs.is_file(&path))))
             }
             "directoryexists" => {
                 let path = get_str(0);
