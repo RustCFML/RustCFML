@@ -197,15 +197,30 @@ pub struct ApplicationState {
     pub variables: ValueMap,
     pub started: bool,
     pub config: ValueMap,
-    /// Functions reachable from application scope, carried across requests so a
+    /// Functions this application can still resolve, carried across requests so a
     /// long-lived CFC instance / factory / closure stays resolvable even on a
     /// request that doesn't reload its source file. At request start these `Arc`s
     /// are registered into the VM's `fn_registry` by their stable `global_id`,
     /// which is the single function identity stored bodies carry — so dispatch
     /// never depends on a per-request program-table layout (no append, no remap).
-    /// Recomputed from reachability each request that defines a function, so it
-    /// stays bounded (abandoned functions drop out).
+    ///
+    /// Maintained ADDITIVELY: every function of every program this application
+    /// loads is retained (see `register_fn_local`), rather than recomputed from
+    /// application-scope reachability. The table is therefore a *superset* of the
+    /// reachable set — strictly safer for resolution — and costs one bitset probe
+    /// per registration instead of a full object-graph walk per request (that walk
+    /// was ~14ms, 47% of a live Preside request). The `Arc`s are already owned by
+    /// the process-wide `BytecodeCache`, so retaining them adds pointers, not
+    /// bodies. [`CfmlVirtualMachine::rehome_application_functions`] still prunes
+    /// back to the truly-reachable set when the table outgrows
+    /// [`Self::app_fn_prune_at`], which bounds growth across dev-mode recompiles
+    /// (each edit mints fresh `global_id`s).
     pub app_function_table: Vec<std::sync::Arc<cfml_codegen::compiler::BytecodeFunction>>,
+    /// Table length just after the last reachability prune; the next prune fires
+    /// once the additive table has roughly doubled past it. Converges in
+    /// production (the set of loaded programs is finite), so pruning stops
+    /// happening entirely once an app is warm.
+    pub app_fn_prune_at: usize,
     /// Value of `this.sessionStorage` from Application.cfc — name of the cache to use
     /// for session storage. Overrides the server-wide `.cfconfig.json` setting.
     pub session_storage: Option<String>,
@@ -1658,6 +1673,16 @@ pub struct CfmlVirtualMachine {
     /// registered into `fn_registry` by global_id so an application-scope
     /// function whose source file isn't reloaded this request still resolves.
     app_function_table: Vec<Arc<BytecodeFunction>>,
+    /// Bitset of the `global_id`s already present in [`Self::app_function_table`],
+    /// indexed by id. `global_id`s are dense and process-stable, so this is a
+    /// hash-free O(1) "is this function already retained by the application?"
+    /// probe — the check `register_fn_local` does on every registration.
+    app_fn_gids: Vec<u64>,
+    /// Functions registered this request whose `global_id` was NOT already in
+    /// [`Self::app_fn_gids`] — i.e. the application's retained set grew. Drained
+    /// into the table at persist time; when empty (the steady-state case) the
+    /// application function table needs no write at all.
+    pending_app_fns: Vec<Arc<BytecodeFunction>>,
     /// Dense per-request function registry, indexed by `BytecodeFunction.global_id`.
     /// Populated as programs become reachable (root program at construction, every
     /// `push_program_swap`, and the carried `app_function_table` at request start).
@@ -2221,6 +2246,8 @@ impl CfmlVirtualMachine {
             html_head_buffer: String::new(),
             html_body_buffer: String::new(),
             app_function_table: Vec::new(),
+            app_fn_gids: Vec::new(),
+            pending_app_fns: Vec::new(),
             fn_registry: Vec::new(),
             arguments_params_cache: HashMap::new(),
             arguments_scope_needed_cache: HashMap::new(),
@@ -2506,6 +2533,45 @@ impl CfmlVirtualMachine {
         if self.fn_registry[id].is_none() {
             self.fn_registry[id] = Some(Arc::clone(f));
         }
+        // Additive application retention: any function of any program this
+        // application loads must stay resolvable on later requests, so note the
+        // ones the application isn't already holding. Registration is the right
+        // chokepoint — `register_program_fns` passes EVERY function of a loaded
+        // program through here, including CFC methods (which live in compiled
+        // method tables, not `DefineFunction` ops) and nested closures that were
+        // never instantiated. Both are cases the old reachability walk needed
+        // special arms for; here they are covered by construction.
+        //
+        // EXCEPT program entry points. A `__main__` is a synthetic top-level
+        // program body: it is always located within its own program (every other
+        // site does `functions.position(|f| f.name == "__main__")`), never
+        // resolved through the gid registry, and cannot be stored as a
+        // `CfmlValue::Function` — so retaining one buys nothing. Retaining them
+        // DID cost: a fresh program is compiled on every request, so each minted
+        // a new gid and the table grew +2/request forever in production. Caught
+        // by `overwritten_application_scope_cfc_does_not_grow_function_cache`.
+        if f.name != "__main__" && !self.app_fn_gid_seen(f.global_id) {
+            self.set_app_fn_gid(f.global_id);
+            self.pending_app_fns.push(Arc::clone(f));
+        }
+    }
+
+    /// Is `gid` already retained by the application's function table?
+    #[inline]
+    fn app_fn_gid_seen(&self, gid: u32) -> bool {
+        let (w, b) = ((gid >> 6) as usize, gid & 63);
+        self.app_fn_gids
+            .get(w)
+            .is_some_and(|word| word & (1u64 << b) != 0)
+    }
+
+    #[inline]
+    fn set_app_fn_gid(&mut self, gid: u32) {
+        let (w, b) = ((gid >> 6) as usize, gid & 63);
+        if w >= self.app_fn_gids.len() {
+            self.app_fn_gids.resize(w + 1, 0);
+        }
+        self.app_fn_gids[w] |= 1u64 << b;
     }
 
     /// Resolve a `global_id` to its `BytecodeFunction` via the dense registry.
@@ -30798,6 +30864,7 @@ impl CfmlVirtualMachine {
                     started: false,
                     config: config.clone(),
                     app_function_table: Vec::new(),
+                    app_fn_prune_at: 0,
                     session_storage: app_session_storage.clone(),
                     app_caches: app_caches.clone(),
                 };
@@ -30822,6 +30889,24 @@ impl CfmlVirtualMachine {
             // into `fn_registry` by global_id, so an application-scope function
             // whose source file isn't (re)loaded this request still resolves.
             self.app_function_table = app_snapshot.app_function_table.clone();
+            // Re-baseline the additive-retention tracking onto the table we just
+            // adopted. The root program registered its functions before the
+            // application existed, so anything it queued has to be re-tested
+            // against the adopted table — otherwise a gid the application already
+            // retains would be appended a second time.
+            let pre_app = std::mem::take(&mut self.pending_app_fns);
+            self.app_fn_gids.clear();
+            let adopted: Vec<u32> =
+                self.app_function_table.iter().map(|f| f.global_id).collect();
+            for gid in adopted {
+                self.set_app_fn_gid(gid);
+            }
+            for f in pre_app {
+                if !self.app_fn_gid_seen(f.global_id) {
+                    self.set_app_fn_gid(f.global_id);
+                    self.pending_app_fns.push(f);
+                }
+            }
             let carried = self.app_function_table.clone();
             for f in &carried {
                 self.register_fn_local(f);
@@ -31253,20 +31338,49 @@ impl CfmlVirtualMachine {
             return;
         }
         if let Some(ref server_state) = self.server_state.clone() {
-            // Skip the re-homing walk when no function was defined this
-            // request: the table cannot have gained anything (a `Function`
-            // value is only born via a DefineFunction op), so it is
-            // byte-identical to what was loaded and needs no re-persist. The
-            // application-scope *variables* are still written back, since
-            // non-function app state may have changed.
+            // Additive retention (see `ApplicationState::app_function_table`).
+            // Nothing new registered ⟹ the application already holds every
+            // function it can resolve, so the table needs no write at all. This
+            // is the steady-state case: a warm request re-loads only programs the
+            // application has already seen. The application-scope *variables* are
+            // still written back below, since non-function state may have changed.
             //
-            // When the walk DOES run, it usually recomputes a set identical to
-            // the one carried in (a steady-state request defines only transient
-            // closures, which never become application-reachable). In that case
-            // `rehome_application_functions` keeps the carried `Vec` and reports
-            // `false`, so we skip re-cloning ~6k `Arc`s and re-writing the table
-            // into the shared store as well.
-            let rehomed = self.app_fn_table_dirty && self.rehome_application_functions();
+            // Replaces a full application-scope reachability walk that ran on
+            // every request that defined ANY function — i.e. essentially every
+            // ColdBox/Preside request, since a transient closure was enough to
+            // arm it. Measured at ~14ms, 47% of a live Preside request, to
+            // recompute a set that was byte-identical 29 requests out of 30.
+            let mut table_dirty = false;
+            if !self.pending_app_fns.is_empty() {
+                let new_fns = std::mem::take(&mut self.pending_app_fns);
+                self.app_function_table.extend(new_fns);
+                table_dirty = true;
+            }
+            // Bound growth: prune back to the genuinely-reachable set once the
+            // additive table has roughly doubled. Production converges (a finite
+            // set of programs), so this stops firing once warm; dev-mode edits
+            // mint fresh global_ids, and this is what keeps those from
+            // accumulating for the life of the process.
+            let prune_at = server_state
+                .applications
+                .get(app_name)
+                .map(|a| a.app_fn_prune_at)
+                .unwrap_or(0);
+            let mut pruned_to = None;
+            if self.app_function_table.len() > prune_at * 2 + 256 {
+                self.rehome_application_functions();
+                // Re-derive the gid bitset from the pruned table so later
+                // registrations of dropped functions re-queue correctly.
+                self.app_fn_gids.clear();
+                let kept: Vec<u32> =
+                    self.app_function_table.iter().map(|f| f.global_id).collect();
+                for gid in kept {
+                    self.set_app_fn_gid(gid);
+                }
+                pruned_to = Some(self.app_function_table.len());
+                table_dirty = true;
+            }
+            let rehomed = table_dirty;
             if let Some(ref app_scope) = self.application_scope {
                 // Snapshot outside the store write so the application-scope
                 // lock and the applications-store lock never nest.
@@ -31276,6 +31390,9 @@ impl CfmlVirtualMachine {
                     app.variables = scope.clone();
                     if let Some(table) = table_update.clone() {
                         app.app_function_table = table;
+                    }
+                    if let Some(n) = pruned_to {
+                        app.app_fn_prune_at = n;
                     }
                 });
             }

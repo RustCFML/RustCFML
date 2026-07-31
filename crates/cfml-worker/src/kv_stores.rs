@@ -240,6 +240,7 @@ impl KvBackedApplicationStore {
                         started: false,
                         config: cfml_common::dynamic::ValueMap::default(),
                         app_function_table: Vec::new(),
+                        app_fn_prune_at: 0,
                         session_storage: None,
                         app_caches: indexmap::IndexMap::new(),
                     },
