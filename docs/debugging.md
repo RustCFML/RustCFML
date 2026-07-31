@@ -83,7 +83,7 @@ client IP rather than the proxy's (see the config reference below).
 |---|---|
 | **Queries** | Each `queryExecute` / `<cfquery>`: name, execution time, recordcount, datasource, issuing `template:line`, the SQL, and the **bound parameters** (value + cfsqltype). |
 | **Execution Time** | The request total, split into **Application** and **Query** time. |
-| **Templates** | Every template executed — the requested page, each `<cfinclude>`, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg. |
+| **Templates** | Every template executed — the requested page, each `<cfinclude>`, every custom tag and `<cfmodule>` body, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg. Same scope as Lucee's Execution Time section ("templates, includes, modules, custom tags, and component method calls"); a body tag's start and end phases count as two executions, as they do on Lucee. |
 | **Exceptions** | Exceptions raised during the request (including ones caught by `try`/`catch`), with type, message and tag context. |
 | **Trace / Log** | `writeLog` / `<cflog>` and `trace` / `<cftrace>` entries. |
 | **Generic data** | App- and framework-injected panels (see `debugAdd` below). |

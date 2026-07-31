@@ -107,9 +107,12 @@ pub struct QueryParam {
     pub sqltype: String,
 }
 
-/// A template executed: an included file (`<cfinclude>`), a component method
-/// call, or an `Application.cfc` lifecycle method. `path` is the source file;
-/// the footer aggregates per file (Lucee's `pages`/Templates section).
+/// A template executed: an included file (`<cfinclude>`), a custom tag or
+/// `<cfmodule>` body, a component method call, or an `Application.cfc`
+/// lifecycle method — the same set Lucee's Execution Time section covers
+/// ("templates, includes, modules, custom tags, and component method calls").
+/// `path` is the source file; the footer aggregates per file (Lucee's
+/// `pages`/Templates section).
 pub struct TemplateEvent<'a> {
     pub path: &'a str,
     /// Execution time in **microseconds**.

@@ -24740,6 +24740,31 @@ impl CfmlVirtualMachine {
         template_path: &str,
         tag_locals: &ValueMap,
     ) -> Result<(), CfmlError> {
+        // Custom tags and `<cfmodule>` are templates too: Lucee's Execution Time
+        // section covers "templates, includes, modules, custom tags, and
+        // component method calls", and every one of those forms funnels through
+        // here (`__cfcustomtag`, `__cfcustomtag_start`/end, `__cfmodule`), so one
+        // timed frame covers them all. A body tag's start and end phases execute
+        // the template twice and are counted twice — matching Lucee, which
+        // records each execution.
+        #[cfg(feature = "observability")]
+        {
+            if self.interest.contains(observe::Interest::TEMPLATE) {
+                let start = std::time::Instant::now();
+                self.template_frame_begin();
+                let r = self.execute_custom_tag_template_impl(template_path, tag_locals);
+                self.template_frame_end(template_path, start.elapsed().as_micros() as i64);
+                return r;
+            }
+        }
+        self.execute_custom_tag_template_impl(template_path, tag_locals)
+    }
+
+    fn execute_custom_tag_template_impl(
+        &mut self,
+        template_path: &str,
+        tag_locals: &ValueMap,
+    ) -> Result<(), CfmlError> {
         let sub_program = self.compile_file_cached_req(template_path)?;
 
         let old_program = self.push_program_swap(sub_program);

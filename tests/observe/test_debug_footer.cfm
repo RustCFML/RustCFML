@@ -76,6 +76,20 @@ if (isRustCFML() && isDebugMode()) {
     var kidRecorded = pageIds.some((id) => id.findNoCase("debugfooterkid.cfc") > 0);
     assert("CFC method call recorded a pages row (flyweight regression guard)",
         kidRecorded, true);
+
+    // A `<cfmodule>` / custom-tag execution must ALSO feed the `pages` section.
+    // Lucee's Execution Time section is documented as covering "templates,
+    // includes, modules, custom tags, and component method calls"; RustCFML
+    // instrumented includes, CFC methods and Application.cfc lifecycle but not
+    // the custom-tag/cfmodule path, so tag-heavy apps (Preside renders every
+    // view through `module attributeCollection=…`) showed no row for them.
+    savecontent variable="modOut" {
+        module template="debug_footer_module.cfm";
+    }
+    assert("module fixture ran", trim(modOut), "[module ran]");
+    var modIds = getDebugData().pages.map((p) => lCase(p.id));
+    assert("cfmodule/custom-tag execution recorded a pages row",
+        modIds.some((id) => id.findNoCase("debug_footer_module.cfm") > 0), true);
 } else if (isRustCFML()) {
     // Debug footer not active for this request (debugging disabled in the served
     // webroot's .cfconfig, or a non-whitelisted viewer). getDebugData() is empty
