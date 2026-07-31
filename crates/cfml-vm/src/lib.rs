@@ -2,7 +2,8 @@
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp, BytecodeProgram, CmpOp};
 use cfml_common::dynamic::{
-    build_implements_meta, interface_meta_stub, CfmlQuery, CfmlStruct, CfmlValue, ValueMap,
+    build_implements_meta, interface_meta_stub, CfmlQuery, CfmlStruct, CfmlValue, ValueBuildHasher,
+    ValueMap,
 };
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
@@ -11,6 +12,12 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
+
+/// `global_id` accumulator for the application-scope function-reachability walk
+/// (see [`CfmlVirtualMachine::app_fn_walk_relevant`] for why FxHash, not SipHash).
+type AppFnIdSet = HashSet<i64, ValueBuildHasher>;
+/// `(kind tag, Arc pointer)` cycle guard for the same walk.
+type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 
 pub mod application_store;
 pub mod async_kernel;
@@ -2521,6 +2528,20 @@ impl CfmlVirtualMachine {
     /// a CONCURRENTLY-RUNNING request still resolves — see
     /// [`SHARED_FN_REGISTRY`] for why that matters and why it is sound.
     #[inline]
+    /// Is `global_id` resolvable, without cloning its `Arc`? Mirrors
+    /// [`Self::resolve_fn`]'s lookup order exactly; used by the rehoming walk's
+    /// unchanged-set fast path to count reachable-AND-registered ids cheaply.
+    fn fn_is_registered(&self, global_id: i64) -> bool {
+        if global_id < 0 {
+            return false;
+        }
+        let id = global_id as usize;
+        if self.fn_registry.get(id).is_some_and(|slot| slot.is_some()) {
+            return true;
+        }
+        resolve_shared_fn(id).is_some()
+    }
+
     fn resolve_fn(&self, global_id: i64) -> Option<Arc<BytecodeFunction>> {
         if global_id < 0 {
             return None;
@@ -24674,6 +24695,14 @@ impl CfmlVirtualMachine {
     /// ids from (functions and the containers that may hold them). Scalars —
     /// the bulk of a real application scope — are filtered out BEFORE being
     /// cloned out of a locked container, keeping the rehoming walk cheap.
+    ///
+    /// Both walk sets use [`ValueBuildHasher`] (FxHash) rather than the default
+    /// SipHash. The keys are a `global_id` and an `(kind, Arc pointer)` pair —
+    /// neither is attacker-controlled, so SipHash's DoS resistance buys nothing,
+    /// and on a live Preside application scope (~6.3k reachable functions
+    /// re-walked every request) hashing was 63% of the walk's entire cost:
+    /// `make_hash` 32% + `SipHasher13::write` 16% + `HashSet::insert` 15%.
+    /// Same reasoning, and same fix, as the `ValueMap` hasher swap.
     fn app_fn_walk_relevant(value: &CfmlValue) -> bool {
         match value {
             CfmlValue::Function(_)
@@ -24689,8 +24718,8 @@ impl CfmlVirtualMachine {
 
     fn collect_app_fn_ids(
         value: &CfmlValue,
-        ids: &mut HashSet<i64>,
-        visited: &mut HashSet<(u8, usize)>,
+        ids: &mut AppFnIdSet,
+        visited: &mut AppFnVisitedSet,
     ) {
         match value {
             CfmlValue::Function(function) => {
@@ -24818,8 +24847,8 @@ impl CfmlVirtualMachine {
 
     fn collect_app_fn_ids_from_fn(
         function: &cfml_common::dynamic::CfmlFunction,
-        ids: &mut HashSet<i64>,
-        visited: &mut HashSet<(u8, usize)>,
+        ids: &mut AppFnIdSet,
+        visited: &mut AppFnVisitedSet,
     ) {
         if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = function.body {
             if let CfmlValue::Int(gid) = body.as_ref() {
@@ -24857,12 +24886,18 @@ impl CfmlVirtualMachine {
     /// each carried function's instructions for `DefineFunction` targets and
     /// carry those transitively. Their Arcs are registered this request (their
     /// program was loaded when the function was first compiled/instantiated).
-    fn rehome_application_functions(&mut self) {
+    /// Returns `true` when the recomputed set differs from the table carried in
+    /// at request start (i.e. the caller must re-persist it). When the set is
+    /// identical — the overwhelmingly common case, since a steady-state request
+    /// only defines transient closures that never become application-reachable —
+    /// the carried `Vec` is left in place and `false` is returned, so the caller
+    /// skips cloning ~6k `Arc`s and rewriting the shared store.
+    fn rehome_application_functions(&mut self) -> bool {
         let Some(app_scope) = self.application_scope.clone() else {
-            return;
+            return false;
         };
-        let mut ids: HashSet<i64> = HashSet::new();
-        let mut visited = HashSet::new();
+        let mut ids: AppFnIdSet = AppFnIdSet::default();
+        let mut visited = AppFnVisitedSet::default();
         app_scope.with_read(|scope| {
             for value in scope.values() {
                 Self::collect_app_fn_ids(value, &mut ids, &mut visited);
@@ -24882,6 +24917,21 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        // Unchanged-set fast path. The rebuilt table would hold exactly the
+        // reachable-AND-registered ids, so compare against that count (NOT
+        // `ids.len()`, which may include ids whose source program isn't loaded
+        // this request and so would be dropped from the table). Every carried
+        // gid being reachable + equal cardinality ⟹ the sets are equal, so the
+        // table already in hand is precisely the one we would have rebuilt.
+        let reachable_registered = ids.iter().filter(|g| self.fn_is_registered(**g)).count();
+        if self.app_function_table.len() == reachable_registered
+            && self
+                .app_function_table
+                .iter()
+                .all(|f| ids.contains(&(f.global_id as i64)))
+        {
+            return false;
+        }
         // Carry the Arc for every reachable, currently-registered function.
         let mut table = Vec::with_capacity(ids.len());
         for gid in ids {
@@ -24890,6 +24940,7 @@ impl CfmlVirtualMachine {
             }
         }
         self.app_function_table = table;
+        true
     }
 
     /// Collect the `BytecodeFunction` `Arc`s reachable from an arbitrary value
@@ -24903,8 +24954,8 @@ impl CfmlVirtualMachine {
         &self,
         value: &CfmlValue,
     ) -> Vec<Arc<cfml_codegen::compiler::BytecodeFunction>> {
-        let mut ids: HashSet<i64> = HashSet::new();
-        let mut visited = HashSet::new();
+        let mut ids: AppFnIdSet = AppFnIdSet::default();
+        let mut visited = AppFnVisitedSet::default();
         Self::collect_app_fn_ids(value, &mut ids, &mut visited);
         // Close over nested `DefineFunction` targets (closures a stored function
         // defines at call time are referenced only by global_id in its bytecode).
@@ -31208,10 +31259,14 @@ impl CfmlVirtualMachine {
             // byte-identical to what was loaded and needs no re-persist. The
             // application-scope *variables* are still written back, since
             // non-function app state may have changed.
-            let rehomed = self.app_fn_table_dirty;
-            if rehomed {
-                self.rehome_application_functions();
-            }
+            //
+            // When the walk DOES run, it usually recomputes a set identical to
+            // the one carried in (a steady-state request defines only transient
+            // closures, which never become application-reachable). In that case
+            // `rehome_application_functions` keeps the carried `Vec` and reports
+            // `false`, so we skip re-cloning ~6k `Arc`s and re-writing the table
+            // into the shared store as well.
+            let rehomed = self.app_fn_table_dirty && self.rehome_application_functions();
             if let Some(ref app_scope) = self.application_scope {
                 // Snapshot outside the store write so the application-scope
                 // lock and the applications-store lock never nest.
