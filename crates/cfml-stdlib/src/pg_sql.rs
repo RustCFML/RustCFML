@@ -146,30 +146,40 @@ pub fn prepare_pg_statements(
 }
 
 /// Rewrite positional `?` placeholders to `$1..$n`, skipping quoted string
-/// literals and quoted identifiers (and their doubled-quote escapes). Returns
-/// the rewritten SQL and the number of placeholders consumed.
+/// literals, quoted identifiers (and their doubled-quote escapes) and
+/// dollar-quoted bodies. Returns the rewritten SQL and the number of
+/// placeholders consumed.
 fn rewrite_positional(stmt: &str) -> (String, usize) {
     let mut out = String::with_capacity(stmt.len() + 8);
     let mut count = 0usize;
-    let mut chars = stmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
+    let chars: Vec<char> = stmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
             '?' => {
                 count += 1;
                 out.push('$');
                 out.push_str(&count.to_string());
+                i += 1;
             }
-            '\'' | '"' => copy_quoted(c, &mut chars, &mut out),
-            _ => out.push(c),
+            '\'' | '"' => i = copy_quoted_at(&chars, i, &mut out),
+            '$' if dollar_delim_len(&chars, i).is_some() => {
+                let len = dollar_delim_len(&chars, i).unwrap();
+                i = copy_dollar_quoted(&chars, i, len, &mut out);
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     (out, count)
 }
 
 /// Rewrite named `:name` placeholders to `$1..$n` (per statement), skipping
-/// quoted regions and the `::` cast operator. Returns the rewritten SQL and the
-/// ordered list of distinct names in first-seen order (a name reused within the
-/// statement reuses its `$n`).
+/// quoted regions, dollar-quoted bodies and the `::` cast operator. Returns the
+/// rewritten SQL and the ordered list of distinct names in first-seen order (a
+/// name reused within the statement reuses its `$n`).
 fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(stmt.len() + 8);
     let mut order: Vec<String> = Vec::new();
@@ -179,22 +189,11 @@ fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
     while i < n {
         let c = chars[i];
         if c == '\'' || c == '"' {
-            let q = c;
-            out.push(q);
-            i += 1;
-            while i < n {
-                out.push(chars[i]);
-                if chars[i] == q {
-                    if chars.get(i + 1) == Some(&q) {
-                        out.push(q);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+            i = copy_quoted_at(&chars, i, &mut out);
+            continue;
+        }
+        if let Some(len) = dollar_delim_len(&chars, i) {
+            i = copy_dollar_quoted(&chars, i, len, &mut out);
             continue;
         }
         // `:name` — but not `::` (cast) and not `x:y` where x is part of an
@@ -231,30 +230,70 @@ fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
     (out, order)
 }
 
-/// Copy a quoted region into `out`, given the opening quote `q` was already
-/// consumed from `chars`. Handles SQL doubled-quote escapes (`''`, `""`).
-fn copy_quoted<I: Iterator<Item = char>>(
-    q: char,
-    chars: &mut std::iter::Peekable<I>,
-    out: &mut String,
-) {
+/// Copy the quoted region opening at `chars[i]` (a `'` or `"`) into `out`,
+/// handling SQL doubled-quote escapes (`''`, `""`). Returns the index just past
+/// the closing quote (or EOF for an unterminated region).
+fn copy_quoted_at(chars: &[char], i: usize, out: &mut String) -> usize {
+    let q = chars[i];
     out.push(q);
-    while let Some(c) = chars.next() {
-        out.push(c);
-        if c == q {
-            if chars.peek() == Some(&q) {
+    let mut j = i + 1;
+    while j < chars.len() {
+        out.push(chars[j]);
+        if chars[j] == q {
+            if chars.get(j + 1) == Some(&q) {
                 out.push(q);
-                chars.next();
+                j += 2;
                 continue;
             }
-            break;
+            return j + 1;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// If a PostgreSQL dollar-quote delimiter (`$$` or `$tag$`) opens at `chars[i]`,
+/// return its length in chars. The tag follows unquoted-identifier rules
+/// (leading letter or underscore), which is what stops an already-rewritten
+/// `$1` placeholder from looking like a delimiter.
+fn dollar_delim_len(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'$') {
+        return None;
+    }
+    let mut j = i + 1;
+    if matches!(chars.get(j), Some(&c) if c.is_ascii_alphabetic() || c == '_') {
+        j += 1;
+        while matches!(chars.get(j), Some(&c) if c.is_ascii_alphanumeric() || c == '_') {
+            j += 1;
         }
     }
+    (chars.get(j) == Some(&'$')).then(|| j + 1 - i)
+}
+
+/// Copy a dollar-quoted region verbatim into `out`, given its opening delimiter
+/// of `len` chars starts at `chars[i]`. Everything inside is opaque — `;`,
+/// quotes, comment markers and `?`/`:name` placeholders alike — up to the
+/// *identical* closing tag (a differently-tagged `$$` nested inside stays part
+/// of the body). Returns the index just past the closing delimiter, or EOF for
+/// an unterminated region.
+fn copy_dollar_quoted(chars: &[char], i: usize, len: usize, out: &mut String) -> usize {
+    out.extend(&chars[i..i + len]);
+    let mut j = i + len;
+    while j < chars.len() {
+        if chars.len() - j >= len && chars[j..j + len] == chars[i..i + len] {
+            out.extend(&chars[j..j + len]);
+            return j + len;
+        }
+        out.push(chars[j]);
+        j += 1;
+    }
+    j
 }
 
 /// Split SQL into statements on top-level `;`, respecting single/double quoted
-/// regions (and their doubled-quote escapes) and `--` / `/* */` comments so a
-/// `;` inside them doesn't cause a bad split. Trims whitespace and drops empty
+/// regions (and their doubled-quote escapes), dollar-quoted bodies
+/// (`$$ … $$` / `$tag$ … $tag$`) and `--` / `/* */` comments so a `;` inside
+/// them doesn't cause a bad split. Trims whitespace and drops empty
 /// statements; always returns at least one (possibly empty) statement.
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut stmts: Vec<String> = Vec::new();
@@ -289,22 +328,13 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
             continue;
         }
         if c == '\'' || c == '"' {
-            let q = c;
-            cur.push(q);
-            i += 1;
-            while i < n {
-                cur.push(chars[i]);
-                if chars[i] == q {
-                    if chars.get(i + 1) == Some(&q) {
-                        cur.push(q);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+            i = copy_quoted_at(&chars, i, &mut cur);
+            continue;
+        }
+        // PostgreSQL dollar-quoted body ($$ … $$ / $tag$ … $tag$): opaque, so a
+        // `;` inside a CREATE FUNCTION / DO body doesn't split the statement.
+        if let Some(len) = dollar_delim_len(&chars, i) {
+            i = copy_dollar_quoted(&chars, i, len, &mut cur);
             continue;
         }
         if c == ';' {
@@ -461,6 +491,62 @@ mod tests {
         let p = prepare_pg_statements("select * from t where x = ?", &arr(vec![col]), false)
             .unwrap();
         assert_eq!(params_str(&p[0]), vec!["first"]);
+    }
+
+    // --- GH #288: dollar-quoted bodies are opaque to the splitter/rewriters ---
+
+    #[test]
+    fn dollar_quoted_function_body_semicolon_does_not_split() {
+        let sql = "CREATE OR REPLACE FUNCTION f(p text) RETURNS text AS $$
+            SELECT s.value FROM t s WHERE s.key = p LIMIT 1;
+        $$ LANGUAGE sql; SELECT 2";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2, "got: {stmts:#?}");
+        assert!(stmts[0].ends_with("LANGUAGE sql"));
+        assert!(stmts[0].contains("LIMIT 1;"));
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn tagged_dollar_quote_do_block_does_not_split() {
+        let stmts = split_sql_statements("DO $body$ BEGIN NULL; END $body$; SELECT 1");
+        assert_eq!(stmts.len(), 2, "got: {stmts:#?}");
+        assert_eq!(stmts[0], "DO $body$ BEGIN NULL; END $body$");
+        assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn nested_untagged_quote_stays_inside_outer_tag() {
+        let stmts = split_sql_statements("DO $outer$ a; $$ b; $$ c; $outer$; SELECT 1");
+        assert_eq!(stmts.len(), 2, "got: {stmts:#?}");
+        assert_eq!(stmts[0], "DO $outer$ a; $$ b; $$ c; $outer$");
+    }
+
+    #[test]
+    fn dollar_signs_inside_ordinary_quotes_are_untouched() {
+        let stmts = split_sql_statements("SELECT '$$ not a quote'; SELECT 1");
+        assert_eq!(stmts.len(), 2, "got: {stmts:#?}");
+        assert_eq!(stmts[0], "SELECT '$$ not a quote'");
+    }
+
+    #[test]
+    fn placeholders_inside_dollar_quoted_body_are_not_rewritten() {
+        // `?` and `:name` inside a function body are pl/pgsql text, not binds.
+        let (sql, count) = rewrite_positional("CREATE FUNCTION f() AS $$ SELECT '?' $$; ");
+        assert_eq!(count, 0);
+        assert!(sql.contains("'?'"), "got: {sql}");
+        let (sql, names) = rewrite_named("DO $b$ SELECT x :: text WHERE y = :real $b$");
+        assert!(names.is_empty(), "got: {names:?}");
+        assert!(sql.contains(":real"), "got: {sql}");
+    }
+
+    #[test]
+    fn positional_placeholder_is_not_mistaken_for_a_dollar_quote() {
+        // `$1 ... $2` must not read as a `$1$`-style delimiter, and rewriting
+        // a second time must still see the rest of the statement.
+        let (sql, count) = rewrite_positional("select ? , $1 , ? from t");
+        assert_eq!(count, 2);
+        assert_eq!(sql, "select $1 , $1 , $2 from t");
     }
 
     #[test]
