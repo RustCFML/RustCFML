@@ -1239,9 +1239,10 @@ pub struct ServerState {
     /// mutate within a request (empty → cfconfig seed → `this.mappings`), so
     /// without it a pre-mappings failed probe of an `extends` parent poisoned
     /// the post-mappings resolve and nulled `super` on every request (GH #301).
-    /// Only populated when `production_mode` and only for paths that actually
-    /// exist (negatives re-probe — a miss is often transient state, not truth
-    /// about the tree). Never populated in dev mode (the tree may change).
+    /// Negatives are cached too — absence-probing (Preside extension overlays)
+    /// is a hot path, and a miss is deterministic for a given mapping state on
+    /// an immutable tree; the fingerprint is what makes that safe. Only
+    /// populated when `production_mode`; never in dev (the tree may change).
     pub component_path_cache: Arc<parking_lot::RwLock<HashMap<u64, ComponentPathEntry>>>,
     /// Production-mode cache of a path → its `canonicalize()` (realpath) result.
     /// `canonicalize` is a syscall that resolves every symlink and normalizes
@@ -26425,12 +26426,17 @@ impl CfmlVirtualMachine {
                 path: Arc::clone(&resolved),
             };
             // Cross-request production cache: repeat resolutions skip the probing
-            // above. Only paths that EXIST are cached (matching the ServerState
-            // field contract — negatives re-probe): a failed resolution is often
-            // transient state, not truth about the tree — e.g. the pre-mappings
-            // probe of an Application.cfc `extends` parent (GH #301) — and a
-            // cached miss silently nulls `super` for every later request.
-            if prod_cache_ok && self.exists_cached_path(&resolved) {
+            // above. Negatives ARE cached — Preside-style extension overlays probe
+            // the absence of override CFCs across many candidates on hot paths, and
+            // re-walking those misses every request is exactly the storm this cache
+            // exists to kill. That is only safe because `mappings_fp` is in the key:
+            // under ONE mapping state and an immutable production tree a re-probe
+            // would deterministically miss again, and a miss recorded under a
+            // different mapping state (e.g. the pre-`this.mappings` probe of an
+            // Application.cfc `extends` parent) can never answer this one — caching
+            // negatives WITHOUT that state in the key nulled `super` on every
+            // request (GH #301).
+            if prod_cache_ok {
                 if let Some(ss) = self.server_state.as_ref() {
                     ss.component_path_cache
                         .write()
