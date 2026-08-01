@@ -11607,7 +11607,7 @@ impl PgRunError {
     fn from_postgres(context: &str, e: postgres::Error, retry_safe: bool) -> Self {
         let connection_broken = pg_error_is_connection_fatal(&e);
         Self {
-            error: CfmlError::runtime(format_pg_error(context, &e)),
+            error: CfmlError::database(format_pg_error(context, &e)),
             connection_broken,
             retry_safe: connection_broken && retry_safe,
         }
@@ -12486,7 +12486,7 @@ fn mssql_txn_control(client: &mut MssqlClient, broken: &mut bool, sql: &str, lab
             if is_mssql_connection_error(&e) {
                 *broken = true;
             }
-            CfmlError::runtime(format!("cftransaction: {} error: {}", label, e))
+            CfmlError::database(format!("cftransaction: {} error: {}", label, e))
         };
         // Drain the (empty) result stream so the connection is left flushed.
         match client.simple_query(sql).await {
@@ -12694,32 +12694,32 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
         DbDriver::Sqlite(path) => {
             let pool = get_sqlite_pool(&path)?;
             let conn = pool.get()
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: SQLite pool error: {}", e)))?;
+                .map_err(|e| CfmlError::database(format!("cftransaction: SQLite pool error: {}", e)))?;
             conn.execute_batch("BEGIN")
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: BEGIN error: {}", e)))?;
+                .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?;
             Ok(TransactionConn::Sqlite(conn))
         }
         #[cfg(feature = "mysql_db")]
         DbDriver::Mysql(url) => {
             let pool = get_mysql_pool(&url)?;
             let mut conn = pool.get_conn()
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: MySQL pool error: {}", e)))?;
+                .map_err(|e| CfmlError::database(format!("cftransaction: MySQL pool error: {}", e)))?;
             use mysql::prelude::Queryable;
             conn.query_drop("BEGIN")
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: BEGIN error: {}", e)))?;
+                .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?;
             Ok(TransactionConn::Mysql(conn))
         }
         #[cfg(feature = "postgres_db")]
         DbDriver::Postgres(url) => {
             let pool = get_postgres_pool(&url)?;
             let mut conn = pool.get()
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: PostgreSQL pool error: {}", e)))?;
+                .map_err(|e| CfmlError::database(format!("cftransaction: PostgreSQL pool error: {}", e)))?;
             let pg = &mut *conn;
             if let Err(e) = pg.client.simple_query("BEGIN") {
                 if e.is_closed() {
                     pg.broken = true;
                 }
-                return Err(CfmlError::runtime(format!("cftransaction: BEGIN error: {}", e)));
+                return Err(CfmlError::database(format!("cftransaction: BEGIN error: {}", e)));
             }
             Ok(TransactionConn::Postgres(conn))
         }
@@ -12727,7 +12727,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
         DbDriver::Mssql(url) => {
             let pool = get_mssql_pool(&url)?;
             let mut conn = pool.get()
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: MSSQL pool error: {}", e)))?;
+                .map_err(|e| CfmlError::database(format!("cftransaction: MSSQL pool error: {}", e)))?;
             let m = &mut *conn;
             mssql_txn_control(&mut m.client, &mut m.broken, "BEGIN TRANSACTION", "BEGIN")?;
             Ok(TransactionConn::Mssql(conn))
@@ -12746,13 +12746,13 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {
             c.execute_batch("COMMIT")
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: COMMIT error: {}", e)))
+                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))
         }
         #[cfg(feature = "mysql_db")]
         TransactionConn::Mysql(c) => {
             use mysql::prelude::Queryable;
             c.query_drop("COMMIT")
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: COMMIT error: {}", e)))
+                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
@@ -12763,7 +12763,7 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
                     if e.is_closed() {
                         pg.broken = true;
                     }
-                    Err(CfmlError::runtime(format!("cftransaction: COMMIT error: {}", e)))
+                    Err(CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))
                 }
             }
         }
@@ -12784,13 +12784,13 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {
             c.execute_batch("ROLLBACK")
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: ROLLBACK error: {}", e)))
+                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))
         }
         #[cfg(feature = "mysql_db")]
         TransactionConn::Mysql(c) => {
             use mysql::prelude::Queryable;
             c.query_drop("ROLLBACK")
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: ROLLBACK error: {}", e)))
+                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
@@ -12801,7 +12801,7 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
                     if e.is_closed() {
                         pg.broken = true;
                     }
-                    Err(CfmlError::runtime(format!("cftransaction: ROLLBACK error: {}", e)))
+                    Err(CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))
                 }
             }
         }
@@ -12868,7 +12868,7 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
                 SavepointOp::RollbackTo => format!("ROLLBACK TO {}", name),
             };
             c.execute_batch(&sql)
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: savepoint error: {}", e)))
+                .map_err(|e| CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
         }
         #[cfg(feature = "mysql_db")]
         TransactionConn::Mysql(c) => {
@@ -12879,7 +12879,7 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
                 SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
             };
             c.query_drop(&sql)
-                .map_err(|e| CfmlError::runtime(format!("cftransaction: savepoint error: {}", e)))
+                .map_err(|e| CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
@@ -12895,7 +12895,7 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
                     if e.is_closed() {
                         pg.broken = true;
                     }
-                    Err(CfmlError::runtime(format!("cftransaction: savepoint error: {}", e)))
+                    Err(CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
                 }
             }
         }

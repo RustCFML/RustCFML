@@ -85,7 +85,7 @@ pub fn prepare_pg_statements(
                 let (rewritten, count) = rewrite_positional(&stmt);
                 let end = cursor + count;
                 if end > flat.len() {
-                    return Err(CfmlError::runtime(format!(
+                    return Err(CfmlError::database(format!(
                         "queryExecute: not enough positional parameters — a statement needs {} \
                          placeholder(s) but only {} of {} supplied remain",
                         count,
@@ -100,7 +100,7 @@ pub fn prepare_pg_statements(
                 cursor = end;
             }
             if cursor != flat.len() {
-                return Err(CfmlError::runtime(format!(
+                return Err(CfmlError::database(format!(
                     "queryExecute: {} positional parameter(s) supplied but the SQL only consumes {}",
                     flat.len(),
                     cursor
