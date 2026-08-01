@@ -1203,23 +1203,45 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // into the calling scope at runtime — `name` only when a
                 // resultset came back, matching Lucee (an INSERT leaves the
                 // name variable untouched and `result` gets the metadata).
+                //
+                // EVERY attribute is forwarded, not a whitelist: the tag must
+                // honour whatever queryExecute honours (columnKey/keyColumn,
+                // maxrows, timeout, …) — GH #294, where a whitelist of six
+                // silently dropped `columnkey`/`maxrows` so
+                // returntype="struct" fell into the single-row-map branch and
+                // came back keyed by column names. Options the engine doesn't
+                // recognise are simply ignored downstream, as in Lucee.
+                // `attr_order` (source order) drives emission so codegen stays
+                // deterministic — `attrs` is a HashMap.
                 let mut opts_parts = Vec::new();
-                for (key, target) in [
-                    ("datasource", "datasource"),
-                    ("name", "name"),
-                    ("result", "result"),
-                    ("returntype", "returnType"),
-                    ("dbtype", "dbtype"),
-                    ("attributecollection", "attributeCollection"),
-                ] {
-                    if let Some(raw) = attrs.get(key) {
-                        let val = strip_hashes(raw);
-                        if raw != &val {
-                            // Dynamic #expr# value — emit as expression
-                            opts_parts.push(format!("{}: {}", target, val));
-                        } else {
-                            opts_parts.push(format!("{}: \"{}\"", target, raw));
-                        }
+                for key in &attr_order {
+                    let Some(raw) = attrs.get(key) else { continue };
+                    // Canonical spellings for the keys the VM intercept and the
+                    // builtin look up; everything else rides through as written
+                    // (both sides match case-insensitively anyway).
+                    let target = match key.as_str() {
+                        "returntype" => "returnType",
+                        "attributecollection" => "attributeCollection",
+                        "columnkey" => "columnKey",
+                        "keycolumn" => "keyColumn",
+                        other => other,
+                    };
+                    // A key that isn't a bare identifier (hyphens etc.) has to
+                    // be quoted to stay a legal struct literal.
+                    let target = if !target.is_empty()
+                        && target.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !target.starts_with(|c: char| c.is_ascii_digit())
+                    {
+                        target.to_string()
+                    } else {
+                        format!("\"{}\"", target.replace('"', "\"\""))
+                    };
+                    let val = strip_hashes(raw);
+                    if raw != &val {
+                        // Dynamic #expr# value — emit as expression
+                        opts_parts.push(format!("{}: {}", target, val));
+                    } else {
+                        opts_parts.push(format!("{}: \"{}\"", target, raw));
                     }
                 }
                 if !attrs.contains_key("name") && !attrs.contains_key("attributecollection") {
