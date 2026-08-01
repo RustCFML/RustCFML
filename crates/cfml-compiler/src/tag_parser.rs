@@ -3233,8 +3233,10 @@ fn parse_cfloop_tag(
     } else if let (Some(list), Some(index)) =
         (attrs.get("list"), attrs.get("index").or_else(|| attrs.get("item")))
     {
-        // `item` is a Lucee alias for `index` on list loops: either names the
-        // current element binding, so accept whichever is present.
+        // With only ONE of `item`/`index`, that attribute names the current
+        // element binding (`item` is the modern spelling, bare `index` the
+        // legacy one). With BOTH present, Lucee splits them: `item` = the
+        // element, `index` = the 1-based position.
         // The `list` attribute is ALWAYS a literal string on Lucee/Adobe CF —
         // only `#expr#` interpolation makes it dynamic. Quote it verbatim so
         // values containing operators or spaces (e.g. date masks like
@@ -3245,18 +3247,44 @@ fn parse_cfloop_tag(
         } else {
             format!("\"{}\"", escape_for_string_literal(list))
         };
-        let index = strip_hashes(index);
         let delimiters = attrs
             .get("delimiters")
             .cloned()
             .unwrap_or(",".to_string());
-        (
-            format!(
-                "for (var {} in listToArray({}, \"{}\")) {{\n",
-                index, list, delimiters
-            ),
-            consumed,
-        )
+        if let (Some(item), Some(idx)) = (attrs.get("item"), attrs.get("index")) {
+            let item = strip_hashes(item);
+            let idx = strip_hashes(idx);
+            let list_var = format!("__cfloop_list_{}", consumed);
+            let counter = format!("__cfloop_listidx_{}", consumed);
+            (
+                format!(
+                    "var {} = listToArray({}, \"{}\");\nfor (var {} = 1; {} <= arrayLen({}); {} = {} + 1) {{\n{} = {};\n{} = {}[{}];\n",
+                    list_var,
+                    list,
+                    delimiters,
+                    counter,
+                    counter,
+                    list_var,
+                    counter,
+                    counter,
+                    idx,
+                    counter,
+                    item,
+                    list_var,
+                    counter
+                ),
+                consumed,
+            )
+        } else {
+            let index = strip_hashes(index);
+            (
+                format!(
+                    "for (var {} in listToArray({}, \"{}\")) {{\n",
+                    index, list, delimiters
+                ),
+                consumed,
+            )
+        }
     } else if let Some(query) = attrs.get("query") {
         let query = strip_hashes(query);
         if let Some(index) = attrs.get("index").or(attrs.get("item")) {

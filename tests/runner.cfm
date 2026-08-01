@@ -794,6 +794,7 @@ include "harness.cfm";
 <!--- the next body and a case without `break` falls through. Surfaced porting --->
 <!--- WireBox (Builder.cfc's `case "model": case "id":` DSL dispatch). --->
 <cf_runtest file="core/test_switch_fallthrough.cfm">
+<cf_runtest file="core/test_cfloop_list_item_with_index.cfm">
 <cf_runtest file="core/test_switch_continue_in_loop.cfm">
 <cf_runtest file="core/test_application_scope_persist.cfm">
 <cf_runtest file="core/test_application_name_implicit.cfm">

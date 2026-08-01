@@ -2106,14 +2106,44 @@ impl Parser {
 
         // 5) list="a,b,c" item|index="x" (+ optional delimiters).
         if let Some(list) = get("list") {
+            let delims_expr = || {
+                get("delimiters").unwrap_or_else(|| {
+                    Expression::Literal(Literal { value: LiteralValue::String(",".to_string()), location: loc })
+                })
+            };
+            // item + index together: item = element, index = 1-based position
+            // (Lucee). A single attribute — either spelling — names the element.
+            if let (Some(item), Some(index)) = (item.clone(), index.clone()) {
+                let item_n = var_name(&item).unwrap_or_else(|| "item".to_string());
+                let idx_n = var_name(&index).unwrap_or_else(|| "index".to_string());
+                let list_tmp = format!("__cfloop_list_{}", uniq);
+                let mut for_body = vec![assign(item_n, Expression::ArrayAccess(Box::new(ArrayAccess {
+                    array: Box::new(ident(&list_tmp)),
+                    index: Box::new(ident(&idx_n)),
+                    location: loc,
+                })))];
+                for_body.extend(body);
+                let init = Statement::Var(Var { name: idx_n.clone(), value: Some(int(1)), location: loc });
+                let cond = bin(ident(&idx_n), BinaryOpType::LessEqual, call("arrayLen", vec![ident(&list_tmp)]));
+                let increment = bin(ident(&idx_n), BinaryOpType::Assign, bin(ident(&idx_n), BinaryOpType::Add, int(1)));
+                // Hoist the split list into a temp so it is built once.
+                return Ok(self.wrap_with_preamble(
+                    vec![assign(list_tmp.clone(), call("listToArray", vec![list, delims_expr()]))],
+                    Statement::For(For {
+                        init: Some(Box::new(init)),
+                        condition: Some(cond),
+                        increment: Some(Box::new(increment)),
+                        body: for_body,
+                        location: loc,
+                    }),
+                    loc,
+                ));
+            }
             if let Some(binding) = index.clone().or(item.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
-                let delims = get("delimiters").unwrap_or_else(|| {
-                    Expression::Literal(Literal { value: LiteralValue::String(",".to_string()), location: loc })
-                });
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
                     variable: name,
-                    iterable: call("listToArray", vec![list, delims]),
+                    iterable: call("listToArray", vec![list, delims_expr()]),
                     body,
                     location: loc,
                 })));
