@@ -6481,6 +6481,21 @@ fn serde_json_to_cfml_strict(value: serde_json::Value, strict: bool) -> CfmlValu
 }
 
 fn fn_is_json(args: Vec<CfmlValue>) -> CfmlResult {
+    // Only a simple value can be JSON text. Lucee/ACF answer `false` for any
+    // complex argument rather than throwing — and crucially, never coerce it:
+    // our lenient `as_string` unwraps a one-member struct to that member's
+    // string form, so `isJSON({ msg = "true" })` used to be true (GH #289).
+    let arg = args.first().map(|v| v.query_column_scalar());
+    match arg {
+        Some(
+            CfmlValue::Bool(_)
+            | CfmlValue::Int(_)
+            | CfmlValue::Double(_)
+            | CfmlValue::TimeSpan(_)
+            | CfmlValue::String(_),
+        ) => {}
+        _ => return Ok(CfmlValue::Bool(false)),
+    }
     let s = get_str(&args, 0);
     // Match deserializeJSON's leniency: Lucee's isJSON also accepts unquoted
     // keys, single quotes, trailing commas and comments.

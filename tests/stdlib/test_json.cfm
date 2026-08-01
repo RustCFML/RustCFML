@@ -99,5 +99,23 @@ assertTrue("isJSON lenient: trailing comma", isJSON("[1,2,]"));
 assertTrue("isJSON lenient: top-level single-quoted string", isJSON("'single'"));
 assertFalse("isJSON still false on missing comma", isJSON("{a:1 b:2}"));
 
+// GH #289: a COMPLEX argument is never JSON text — Lucee/ACF answer false
+// rather than throwing, and must not coerce. Our lenient string cast unwraps a
+// one-member struct to that member's string form, which made the answer depend
+// on member count: isJSON({msg="true"}) was true.
+assertFalse("isJSON struct with one boolean member", isJSON({ success = true }));
+assertFalse("isJSON struct with one false member", isJSON({ success = false }));
+assertFalse("isJSON struct with one numeric member", isJSON({ n = 1 }));
+assertFalse("isJSON struct whose lone member value is JSON text", isJSON({ msg = "true" }));
+assertFalse("isJSON struct with a non-JSON member", isJSON({ msg = "hi" }));
+assertFalse("isJSON struct with one array member", isJSON({ arr = [1,2] }));
+assertFalse("isJSON multi-member struct", isJSON({ success = true, x = "y" }));
+assertFalse("isJSON array argument", isJSON([1,2]));
+assertFalse("isJSON empty struct", isJSON({}));
+assertFalse("isJSON query argument", isJSON(queryNew("a")));
+// Simple values still coerce to their string form and are tested as JSON text.
+assertTrue("isJSON boolean true coerces to valid JSON text", isJSON(true));
+assertTrue("isJSON number coerces to valid JSON text", isJSON(42));
+
 suiteEnd();
 </cfscript>
