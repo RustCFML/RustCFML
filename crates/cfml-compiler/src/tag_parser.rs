@@ -2470,7 +2470,10 @@ fn parse_tag_attributes_ordered(
                     }
                     i += 1;
                 }
-                let val: String = chars[val_start..i].iter().collect();
+                let raw_val: String = chars[val_start..i].iter().collect();
+                // Store the DECODED value — `""`/`''` are source escaping for
+                // the delimiting quote, not part of the value (GH #287).
+                let val = decode_attr_escapes(&raw_val, quote);
                 if i < len {
                     i += 1; // skip closing quote
                 }
@@ -2510,6 +2513,55 @@ fn parse_tag_attributes_ordered(
     // Find the actual end of the tag
     let tag_end = find_tag_end(chars, i, len);
     (attrs, quoted, order, tag_end)
+}
+
+/// Decode the CFML source escaping of a *quoted* tag attribute value (GH #287).
+///
+/// `parse_tag_attributes_ordered` scans past a doubled delimiter (`""` inside a
+/// double-quoted attribute, `''` inside a single-quoted one) as an escape but
+/// stores the raw source slice, so the stored value is still source-escaped.
+/// Every downstream consumer — `format_attr_value`'s `escape_literal_segment`,
+/// and the handful of tags that build their own string literal with
+/// `.replace('"', "\"\"")` — then escapes it a *second* time, so
+/// `<cflog text="p ""q"" r">` logged `p ""q"" r`. Decoding here, where the
+/// delimiting quote is still known, makes the stored value the real CFML value
+/// and leaves exactly one escaping pass downstream.
+///
+/// `#...#` interpolations are left untouched: quotes doubled inside an
+/// interpolated expression belong to a *nested* string literal
+/// (`text="#f("a""b")#"`) and are the expression parser's to decode. `##` stays
+/// doubled for the same reason — `format_attr_value` decodes it when it splits
+/// literal segments from expressions.
+fn decode_attr_escapes(raw: &str, quote: char) -> String {
+    if !raw.contains(quote) {
+        return raw.to_string();
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        if c == '#' {
+            if i + 1 < len && chars[i + 1] == '#' {
+                out.push_str("##"); // escaped literal hash — leave for format_attr_value
+                i += 2;
+                continue;
+            }
+            let end = skip_interpolation(&chars, i, len);
+            out.extend(&chars[i..end]);
+            i = end;
+            continue;
+        }
+        if c == quote && i + 1 < len && chars[i + 1] == quote {
+            out.push(quote);
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Format an attribute value for emission inside a script struct literal.
