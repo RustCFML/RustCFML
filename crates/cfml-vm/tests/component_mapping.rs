@@ -61,6 +61,7 @@ fn createobject_component_resolves_leading_slash_mapping_path() {
         name: "/lib/".to_string(),
         path: format!("{}/lib", VROOT),
     }];
+    vm.refresh_mappings_fingerprint();
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }

@@ -1056,10 +1056,13 @@ const EXISTS_ANY: u8 = 1 << 2;
 /// never collide with a real path.
 const COMPONENT_CACHE_NONE: &str = "\u{1f}<none>";
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 /// One entry of the component-path resolution caches
 /// (`ServerState::component_path_cache` and `Vm::request_component_cache`).
 ///
-/// The maps are keyed by a 64-bit hash of the three key parts
+/// The maps are keyed by a 64-bit hash of the four key parts
 /// ([`component_cache_hash`]) so the *hit* path allocates nothing — the old
 /// `format!("{lower}\x1f{source_file}\x1f{base_template}")` key built a fresh
 /// String on every single component resolution (13% of production CPU sat in
@@ -1080,34 +1083,57 @@ pub struct ComponentPathEntry {
     pub source_dir: Box<str>,
     /// `base_template_path` at resolution time (or [`COMPONENT_CACHE_NONE`]).
     pub base_template: Box<str>,
+    /// `Vm::mappings_fingerprint` at resolution time. Resolution consults the
+    /// live `Vm::mappings` table, which mutates WITHIN a request — empty →
+    /// cfconfig seed → `this.mappings` (see `load_application_cfc` /
+    /// `execute_with_lifecycle`) — and can even change across requests
+    /// (`application action="update"`). A result probed under one mapping set
+    /// must never answer a lookup made under another: GH #301 was exactly that
+    /// (the pre-`this.mappings` parent probe of an `extends` target cached its
+    /// failure and poisoned the post-mappings resolve, nulling `super` on every
+    /// production request).
+    pub mappings_fp: u64,
     /// The resolved `.cfc` path.
     pub path: Arc<str>,
 }
 
 impl ComponentPathEntry {
     /// Whether this entry was stored for exactly these key parts.
-    fn matches(&self, class_name: &str, source_dir: &str, base_template: &str) -> bool {
-        self.class_name.eq_ignore_ascii_case(class_name)
+    fn matches(
+        &self,
+        class_name: &str,
+        source_dir: &str,
+        base_template: &str,
+        mappings_fp: u64,
+    ) -> bool {
+        self.mappings_fp == mappings_fp
+            && self.class_name.eq_ignore_ascii_case(class_name)
             && &*self.source_dir == source_dir
             && &*self.base_template == base_template
     }
 }
 
-/// FNV-1a over the three component-cache key parts, with the class name folded
+/// FNV-1a over the four component-cache key parts, with the class name folded
 /// to ASCII lowercase as it is consumed (CFML class names are case-insensitive)
 /// so no lowercase String has to be materialised. Each part is length-prefixed,
 /// so no delimiter is needed and parts cannot bleed into one another.
 ///
 /// Collisions are *safe* here — [`ComponentPathEntry::matches`] verifies every
 /// hit — so a fast non-cryptographic hash is the right trade.
-fn component_cache_hash(class_name: &str, source_dir: &str, base_template: &str) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+fn component_cache_hash(
+    class_name: &str,
+    source_dir: &str,
+    base_template: &str,
+    mappings_fp: u64,
+) -> u64 {
     let mut h = FNV_OFFSET;
     let byte = |b: u8, h: &mut u64| {
         *h ^= b as u64;
         *h = h.wrapping_mul(FNV_PRIME);
     };
+    for b in mappings_fp.to_le_bytes() {
+        byte(b, &mut h);
+    }
     for (part, fold_case) in [
         (class_name, true),
         // Paths stay case-sensitive: `matches` compares them exactly, so folding
@@ -1121,6 +1147,35 @@ fn component_cache_hash(class_name: &str, source_dir: &str, base_template: &str)
         }
         for &b in part.as_bytes() {
             byte(if fold_case { b.to_ascii_lowercase() } else { b }, &mut h);
+        }
+    }
+    h
+}
+
+/// Content fingerprint of a mappings table, in stored (longest-prefix-first)
+/// order — the order resolution walks it, so two states that would resolve
+/// identically fingerprint identically and cross-request production cache hits
+/// are preserved. The empty table fingerprints to [`FNV_OFFSET`].
+///
+/// Recomputed by [`CfmlVirtualMachine::refresh_mappings_fingerprint`] at every
+/// site that mutates `Vm::mappings`; the resolver `debug_assert!`s the stored
+/// value against a fresh computation, so a future mutation site that forgets
+/// the refresh fails the (debug-built) test gate instead of silently reviving
+/// GH #301-class cache poisoning.
+fn compute_mappings_fingerprint(mappings: &[CfmlMapping]) -> u64 {
+    let mut h = FNV_OFFSET;
+    let byte = |b: u8, h: &mut u64| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(FNV_PRIME);
+    };
+    for m in mappings {
+        for part in [m.name.as_str(), m.path.as_str()] {
+            for b in (part.len() as u64).to_le_bytes() {
+                byte(b, &mut h);
+            }
+            for &b in part.as_bytes() {
+                byte(b, &mut h);
+            }
         }
     }
     h
@@ -1173,15 +1228,20 @@ pub struct ServerState {
     /// Production-mode cache of a component name → its resolved `.cfc` file path.
     /// `resolve_component_template` finds a component by `stat()`-ing many
     /// candidate paths (relative-to-caller, mappings, webroot); that probing is a
-    /// pure function of (class name, caller dir, base template) for an immutable
-    /// on-disk tree, which is exactly production mode's contract. Memoising it
-    /// lets repeated resolutions — WireBox rebuilding singletons, inheritance
-    /// chains re-resolved during boot — skip the filesystem entirely (the single
-    /// biggest slice of a Preside cold boot). Keyed by a non-allocating hash of
-    /// (class name case-insensitively, caller DIR, base template) — see
-    /// [`component_cache_hash`] and [`ComponentPathEntry`]; only populated when
-    /// `production_mode` and only for paths that actually exist (negatives
-    /// re-probe). Never populated in dev mode (the tree may change).
+    /// pure function of (class name, caller dir, base template, live mappings
+    /// table) for an immutable on-disk tree, which is exactly production mode's
+    /// contract. Memoising it lets repeated resolutions — WireBox rebuilding
+    /// singletons, inheritance chains re-resolved during boot — skip the
+    /// filesystem entirely (the single biggest slice of a Preside cold boot).
+    /// Keyed by a non-allocating hash of (class name case-insensitively, caller
+    /// DIR, base template, mappings fingerprint) — see [`component_cache_hash`]
+    /// and [`ComponentPathEntry`]. The fingerprint is load-bearing: mappings
+    /// mutate within a request (empty → cfconfig seed → `this.mappings`), so
+    /// without it a pre-mappings failed probe of an `extends` parent poisoned
+    /// the post-mappings resolve and nulled `super` on every request (GH #301).
+    /// Only populated when `production_mode` and only for paths that actually
+    /// exist (negatives re-probe — a miss is often transient state, not truth
+    /// about the tree). Never populated in dev mode (the tree may change).
     pub component_path_cache: Arc<parking_lot::RwLock<HashMap<u64, ComponentPathEntry>>>,
     /// Production-mode cache of a path → its `canonicalize()` (realpath) result.
     /// `canonicalize` is a syscall that resolves every symlink and normalizes
@@ -1619,6 +1679,12 @@ pub struct CfmlVirtualMachine {
     pub base_template_path: Option<String>,
     /// Component mappings: virtual prefix → physical directory (sorted longest-first)
     pub mappings: Vec<CfmlMapping>,
+    /// Content fingerprint of `mappings` (see [`compute_mappings_fingerprint`]),
+    /// folded into every component-resolution cache key so results probed under
+    /// different mapping states can never answer each other (GH #301). Any code
+    /// that mutates `mappings` MUST call `refresh_mappings_fingerprint()` when
+    /// done — the resolver debug-asserts the two are in sync.
+    pub mappings_fingerprint: u64,
     /// Captured locals from most recent execute_function_with_args call
     /// Used to capture component body variables (variables scope) after component loading
     captured_locals: Option<ValueMap>,
@@ -2321,6 +2387,7 @@ impl CfmlVirtualMachine {
             in_thread_body: 0,
             base_template_path: None,
             mappings: Vec::new(),
+            mappings_fingerprint: FNV_OFFSET,
             captured_locals: None,
             include_share_local_keys: None,
             dispatch_caller_variables: None,
@@ -3462,6 +3529,7 @@ impl CfmlVirtualMachine {
         self.base_template_path = seed.base_template_path;
         self.source_file = seed.source_file;
         self.mappings = seed.mappings;
+        self.refresh_mappings_fingerprint();
         self.custom_tag_paths = seed.custom_tag_paths;
         self.user_functions = seed.user_functions;
         self.app_local_mode_modern = seed.app_local_mode_modern;
@@ -17142,6 +17210,7 @@ impl CfmlVirtualMachine {
                             // Keep longest-prefix-first so the most specific
                             // mapping wins during resolution.
                             self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+                            self.refresh_mappings_fingerprint();
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -24555,6 +24624,13 @@ impl CfmlVirtualMachine {
 
     /// Resolve a dot-path class name to a .cfc file path using component mappings.
     /// Mappings are sorted longest-prefix-first for correct precedence.
+    /// Re-derive `mappings_fingerprint` from the current `mappings` table. Must
+    /// be called at the end of every batch of `mappings` mutations (see the
+    /// field docs); `resolve_component_template` debug-asserts the sync.
+    pub fn refresh_mappings_fingerprint(&mut self) {
+        self.mappings_fingerprint = compute_mappings_fingerprint(&self.mappings);
+    }
+
     fn resolve_path_with_mappings(&self, class_name: &str) -> Option<String> {
         // Convert dot-path to slash-path: "taffy.core.api" → "/taffy/core/api"
         let slash_path = format!("/{}", class_name.replace('.', "/"));
@@ -26132,8 +26208,10 @@ impl CfmlVirtualMachine {
         // 4. Try loading .cfc file — first relative, then via mappings.
         //
         // Two-layer resolution cache, both keyed by a non-allocating hash of
-        // (class name CI, calling template's DIRECTORY, base template) with the
-        // parts verified on every hit — see `ComponentPathEntry`. The dir (not
+        // (class name CI, calling template's DIRECTORY, base template, mappings
+        // fingerprint) with the parts verified on every hit — see
+        // `ComponentPathEntry`. The mappings fingerprint keys out every mapping
+        // state the resolution could depend on (GH #301). The dir (not
         // the file) is the key because every branch below uses only
         // `Path::parent()` of `source_file`; that collapses the key cardinality
         // so N caller files in one directory share one entry instead of each
@@ -26167,24 +26245,31 @@ impl CfmlVirtualMachine {
             });
         // Key parts + lookup, all borrowed from `self` — the hit path allocates
         // nothing (an `Arc<str>` clone is a refcount bump, not a copy).
+        debug_assert_eq!(
+            self.mappings_fingerprint,
+            compute_mappings_fingerprint(&self.mappings),
+            "Vm::mappings was mutated without refresh_mappings_fingerprint() — \
+             component-resolution cache keys would go stale (GH #301)"
+        );
+        let mappings_fp = self.mappings_fingerprint;
         let (cache_key, cached): (u64, Option<Arc<str>>) = {
             let source_dir = component_cache_source_dir(self.source_file.as_deref());
             let base_template = self
                 .base_template_path
                 .as_deref()
                 .unwrap_or(COMPONENT_CACHE_NONE);
-            let key = component_cache_hash(class_name, source_dir, base_template);
+            let key = component_cache_hash(class_name, source_dir, base_template, mappings_fp);
             let mut hit = self
                 .request_component_cache
                 .get(&key)
-                .filter(|e| e.matches(class_name, source_dir, base_template))
+                .filter(|e| e.matches(class_name, source_dir, base_template, mappings_fp))
                 .map(|e| e.path.clone());
             if hit.is_none() && prod_cache_ok {
                 hit = self.server_state.as_ref().and_then(|s| {
                     s.component_path_cache
                         .read()
                         .get(&key)
-                        .filter(|e| e.matches(class_name, source_dir, base_template))
+                        .filter(|e| e.matches(class_name, source_dir, base_template, mappings_fp))
                         .map(|e| e.path.clone())
                 });
             }
@@ -26336,13 +26421,16 @@ impl CfmlVirtualMachine {
                         .as_deref()
                         .unwrap_or(COMPONENT_CACHE_NONE),
                 ),
+                mappings_fp,
                 path: Arc::clone(&resolved),
             };
             // Cross-request production cache: repeat resolutions skip the probing
-            // above. Cached unconditionally (no verify-stat) — an immutable
-            // production tree means a not-found stays not-found, and in-memory
-            // definitions (steps 1-3) are always checked before this cache.
-            if prod_cache_ok {
+            // above. Only paths that EXIST are cached (matching the ServerState
+            // field contract — negatives re-probe): a failed resolution is often
+            // transient state, not truth about the tree — e.g. the pre-mappings
+            // probe of an Application.cfc `extends` parent (GH #301) — and a
+            // cached miss silently nulls `super` for every later request.
+            if prod_cache_ok && self.exists_cached_path(&resolved) {
                 if let Some(ss) = self.server_state.as_ref() {
                     ss.component_path_cache
                         .write()
@@ -29644,6 +29732,7 @@ impl CfmlVirtualMachine {
                 });
             }
             self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+            self.refresh_mappings_fingerprint();
         }
 
         // Save current program, swap in sub-program
@@ -30052,6 +30141,7 @@ impl CfmlVirtualMachine {
                 });
             }
             self.mappings = early_mappings;
+            self.refresh_mappings_fingerprint();
         }
 
         // Merge `this.*` members set by `super.setupApplication(...)` (or any
@@ -31126,6 +31216,7 @@ impl CfmlVirtualMachine {
             });
         }
         self.mappings = mappings;
+        self.refresh_mappings_fingerprint();
 
         // 3c. Expand customTagPaths relative to Application.cfc directory. Same
         // cache routing as 3b: `canonicalize_cached` makes these per-request

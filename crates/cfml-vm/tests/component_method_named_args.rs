@@ -50,6 +50,7 @@ fn build_vm(source: &str) -> CfmlVirtualMachine {
         name: "/lib/".to_string(),
         path: format!("{}/lib", VROOT),
     }];
+    vm.refresh_mappings_fingerprint();
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
