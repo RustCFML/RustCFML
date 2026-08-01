@@ -615,8 +615,13 @@ and shared bytecode-cache entry by canonical path identity (fixes the v0.511.0 r
 that broke Wheels' `?reload=true` / `$reincludeGlobals` hot-reload flow). Only rustcfml's
 own writes trigger the flush; external edits still defer to the next request as above.
 
-**Production mode is unaffected either way** — its contract is an immutable tree (restart to
-reload), so it neither re-stats nor flushes on write.
+**Production mode behaves the same way as of v0.545.0**: it still never re-stats (immutable
+tree, restart to reload), but rustcfml's *own* mid-request write does flush, exactly as in
+dev. v0.521.0 gated the flush on `!production_mode`, which left production silently serving
+the stale compiled unit after a `fileWrite` + re-`include` in the same request — and left
+the GH #284 regression test red in `--serve --production` for 23 releases, unnoticed because
+the release gate only ever served the runner in dev. The immutable-tree contract covers
+*external* edits; a template this process just rewrote is not one.
 
 ## 23. Custom tag `caller` — read of a key shadowed by the calling function's local 🌟 *(divergence)*
 

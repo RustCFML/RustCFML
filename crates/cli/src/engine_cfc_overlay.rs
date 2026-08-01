@@ -22,17 +22,28 @@ const RESULT_CFC: &str = include_str!("../assets/lucee/Result.cfc");
 
 /// The embedded source for a reserved compat-CFC path, keyed by basename
 /// (case-insensitive). `None` for any other path.
+/// Allocation-free: this now runs first on EVERY overlay call (see `overlaid`),
+/// so it splits the basename in place and compares case-insensitively rather
+/// than building a normalised lowercase copy of the path (GH #299).
 fn engine_cfc(path: &str) -> Option<&'static str> {
-    let base = path.replace('\\', "/");
-    let base = base.rsplit('/').next().unwrap_or(&base);
-    match base.to_ascii_lowercase().as_str() {
-        "socketioserver.cfc" => Some(SERVER_CFC),
-        "socketionamespace.cfc" => Some(NAMESPACE_CFC),
-        "socketiosocket.cfc" => Some(SOCKET_CFC),
-        "query.cfc" => Some(QUERY_CFC),
-        "result.cfc" => Some(RESULT_CFC),
-        _ => None,
+    let base = match path.rfind(['/', '\\']) {
+        Some(i) => &path[i + 1..],
+        None => path,
+    };
+    // `eq_ignore_ascii_case` length-checks first, so a non-matching basename
+    // costs a handful of length comparisons.
+    for (name, src) in [
+        ("SocketIoServer.cfc", SERVER_CFC),
+        ("SocketIoNamespace.cfc", NAMESPACE_CFC),
+        ("SocketIoSocket.cfc", SOCKET_CFC),
+        ("Query.cfc", QUERY_CFC),
+        ("Result.cfc", RESULT_CFC),
+    ] {
+        if base.eq_ignore_ascii_case(name) {
+            return Some(src);
+        }
     }
+    None
 }
 
 pub struct EngineCfcOverlay {
@@ -52,11 +63,17 @@ impl EngineCfcOverlay {
 
     /// Whether this path should be served from the overlay (reserved name AND
     /// the base FS doesn't have a real file there — real files always win).
+    ///
+    /// The reserved-name test comes FIRST because it is pure string work: for the
+    /// ~100% of paths that are ordinary application files it answers `None`
+    /// without touching the filesystem. Probing `base.exists()` first made every
+    /// overlay call a double-stat — 3.8% of production CPU (GH #299).
     fn overlaid(&self, path: &str) -> Option<&'static str> {
+        let src = engine_cfc(path)?;
         if self.base.exists(path) {
             return None;
         }
-        engine_cfc(path)
+        Some(src)
     }
 }
 
@@ -76,11 +93,22 @@ impl Vfs for EngineCfcOverlay {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.base.exists(path) || engine_cfc(path).is_some()
+        // Ordinary paths: one stat, straight through (see `overlaid`).
+        if engine_cfc(path).is_none() {
+            return self.base.exists(path);
+        }
+        // A reserved name always exists — the overlay backs it whether or not the
+        // base FS has a real file there.
+        true
     }
 
     fn is_file(&self, path: &str) -> bool {
-        self.base.is_file(path) || (!self.base.exists(path) && engine_cfc(path).is_some())
+        // Ordinary paths: one stat, straight through. Only a reserved *name* can
+        // reach the second (`exists`) probe — previously every miss paid it.
+        if engine_cfc(path).is_none() {
+            return self.base.is_file(path);
+        }
+        self.base.is_file(path) || !self.base.exists(path)
     }
 
     fn is_dir(&self, path: &str) -> bool {

@@ -30,7 +30,11 @@ wasm-pack build crates/wasm --target web
 > blocker, never a shrug.** A green `cargo build` + `tests/runner.cfm` is NOT
 > sufficient. Before tagging you MUST have all of these green: `cargo test
 > --workspace` (Rust + JIT integration tests), `cargo run -- tests/runner.cfm`
-> (CFML, CLI **and** serve-mode cold+warm — see "Validate in serve mode"), the
+> (CFML, CLI **and** serve-mode cold+warm — see "Validate in serve mode"), served
+> **both** `--serve` and `--serve --production` (production-only code paths exist:
+> the bytecode/freshness caches and the component-path cache all behave
+> differently there. Serving the runner in dev only is exactly how the GH #284
+> regression test stayed red in production for 23 releases, v0.521.0→v0.544.0), the
 > wasm build above, AND — when pushing to `main` — `wasm-pack build crates/wasm
 > --target web` (the demo-deploy path; a plain `cargo build --target
 > wasm32-unknown-unknown` does NOT run wasm-pack/wasm-bindgen, so it cannot catch

@@ -243,6 +243,9 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_json_query_roundtrip.cfm">
 <cf_runtest file="stdlib/test_arraysort_callback_reverse.cfm">
 <cf_runtest file="stdlib/test_file_io.cfm">
+<!--- Request-scoped fileExists()/directoryExists() memo: positives only, and --->
+<!--- every mutating file BIF drops it (GH #299). --->
+<cf_runtest file="stdlib/test_existence_cache.cfm">
 <!--- Relative file-BIF paths resolve against the BASE TEMPLATE dir (ExpandPath --->
 <!--- parity), verified on Lucee 7 — supersedes the CFC-dir behaviour of #171. --->
 <cf_runtest file="stdlib/test_file_relative_path.cfm">
@@ -875,6 +878,9 @@ include "harness.cfm";
 <cf_runtest file="oop/test_struct_get_vs_component_method.cfm">
 <cf_runtest file="oop/test_fluent_return_this_chain.cfm">
 <cf_runtest file="oop/test_super_ctor_this_writes.cfm">
+<!--- Component-path resolution cache keying: caller DIR, case-insensitive --->
+<!--- class name, verified hits (GH #298). --->
+<cf_runtest file="oop/test_component_resolution_cache.cfm">
 
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">

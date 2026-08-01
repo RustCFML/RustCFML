@@ -1044,6 +1044,104 @@ fn evict_idle_named_locks(
     }
 }
 
+/// `Vm::request_exists_cache` bit: the path was seen to be a regular file.
+const EXISTS_FILE: u8 = 1 << 0;
+/// `Vm::request_exists_cache` bit: the path was seen to be a directory.
+const EXISTS_DIR: u8 = 1 << 1;
+/// `Vm::request_exists_cache` bit: the path was seen to exist (either kind).
+const EXISTS_ANY: u8 = 1 << 2;
+
+/// Sentinel stood in for a `None` `source_file` / `base_template_path` when
+/// hashing a component-resolution cache key. Contains a control byte, so it can
+/// never collide with a real path.
+const COMPONENT_CACHE_NONE: &str = "\u{1f}<none>";
+
+/// One entry of the component-path resolution caches
+/// (`ServerState::component_path_cache` and `Vm::request_component_cache`).
+///
+/// The maps are keyed by a 64-bit hash of the three key parts
+/// ([`component_cache_hash`]) so the *hit* path allocates nothing — the old
+/// `format!("{lower}\x1f{source_file}\x1f{base_template}")` key built a fresh
+/// String on every single component resolution (13% of production CPU sat in
+/// malloc/realloc under `resolve_component_template`, see GH #298). The parts
+/// are retained here and re-checked on every hit, so a hash collision degrades
+/// to a re-resolve and can never hand back another component's path.
+///
+/// `path` is an `Arc<str>` so a hit clones a pointer, not the path bytes.
+#[derive(Clone, Debug)]
+pub struct ComponentPathEntry {
+    /// The requested class name, as given (compared case-insensitively).
+    pub class_name: Box<str>,
+    /// The calling template's *directory* — resolution only ever uses
+    /// `Path::parent()` of `source_file`, so keying on the dir instead of the
+    /// file collapses the key cardinality from (callers × classes) to
+    /// (caller dirs × classes) and turns most per-caller first-miss probe walks
+    /// into hits (the residual-miss half of GH #298).
+    pub source_dir: Box<str>,
+    /// `base_template_path` at resolution time (or [`COMPONENT_CACHE_NONE`]).
+    pub base_template: Box<str>,
+    /// The resolved `.cfc` path.
+    pub path: Arc<str>,
+}
+
+impl ComponentPathEntry {
+    /// Whether this entry was stored for exactly these key parts.
+    fn matches(&self, class_name: &str, source_dir: &str, base_template: &str) -> bool {
+        self.class_name.eq_ignore_ascii_case(class_name)
+            && &*self.source_dir == source_dir
+            && &*self.base_template == base_template
+    }
+}
+
+/// FNV-1a over the three component-cache key parts, with the class name folded
+/// to ASCII lowercase as it is consumed (CFML class names are case-insensitive)
+/// so no lowercase String has to be materialised. Each part is length-prefixed,
+/// so no delimiter is needed and parts cannot bleed into one another.
+///
+/// Collisions are *safe* here — [`ComponentPathEntry::matches`] verifies every
+/// hit — so a fast non-cryptographic hash is the right trade.
+fn component_cache_hash(class_name: &str, source_dir: &str, base_template: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    let byte = |b: u8, h: &mut u64| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(FNV_PRIME);
+    };
+    for (part, fold_case) in [
+        (class_name, true),
+        // Paths stay case-sensitive: `matches` compares them exactly, so folding
+        // them here would only make two differently-cased dirs collide and evict
+        // each other instead of coexisting.
+        (source_dir, false),
+        (base_template, false),
+    ] {
+        for b in (part.len() as u64).to_le_bytes() {
+            byte(b, &mut h);
+        }
+        for &b in part.as_bytes() {
+            byte(if fold_case { b.to_ascii_lowercase() } else { b }, &mut h);
+        }
+    }
+    h
+}
+
+/// The calling template's directory, borrowed from `source_file` (no
+/// allocation). `None` maps to [`COMPONENT_CACHE_NONE`] so "no caller" is a
+/// distinct key from any real directory — the two take different resolution
+/// branches.
+fn component_cache_source_dir(source_file: Option<&str>) -> &str {
+    match source_file {
+        Some(s) => std::path::Path::new(s)
+            .parent()
+            .and_then(|p| p.to_str())
+            // A source file with no parent component ("Foo.cfc") yields "",
+            // which is exactly what the resolution branch below joins against.
+            .unwrap_or(""),
+        None => COMPONENT_CACHE_NONE,
+    }
+}
+
 /// Server-level state, persists across requests in --serve mode.
 #[derive(Clone)]
 pub struct ServerState {
@@ -1079,11 +1177,12 @@ pub struct ServerState {
     /// on-disk tree, which is exactly production mode's contract. Memoising it
     /// lets repeated resolutions — WireBox rebuilding singletons, inheritance
     /// chains re-resolved during boot — skip the filesystem entirely (the single
-    /// biggest slice of a Preside cold boot). Keyed
-    /// `"<class_lower>\x1f<source_file>\x1f<base_template>"`; only populated when
+    /// biggest slice of a Preside cold boot). Keyed by a non-allocating hash of
+    /// (class name case-insensitively, caller DIR, base template) — see
+    /// [`component_cache_hash`] and [`ComponentPathEntry`]; only populated when
     /// `production_mode` and only for paths that actually exist (negatives
     /// re-probe). Never populated in dev mode (the tree may change).
-    pub component_path_cache: Arc<parking_lot::RwLock<HashMap<String, String>>>,
+    pub component_path_cache: Arc<parking_lot::RwLock<HashMap<u64, ComponentPathEntry>>>,
     /// Production-mode cache of a path → its `canonicalize()` (realpath) result.
     /// `canonicalize` is a syscall that resolves every symlink and normalizes
     /// `.`/`..`. The `expandPath`, `getCurrentTemplatePath` and
@@ -1892,7 +1991,8 @@ pub struct CfmlVirtualMachine {
     /// tree can't change within one request and it is dropped at request end, so
     /// dev still picks up new/edited files next request. Kills the candidate-path
     /// `exists()` storm when a request instantiates the same component many times.
-    pub request_component_cache: HashMap<String, String>,
+    /// Same key/value shape as the production layer (see [`ComponentPathEntry`]).
+    pub request_component_cache: HashMap<u64, ComponentPathEntry>,
     /// Phase C.3 (feature `component-instance`): per-`__source_file` cache of the
     /// class-invariant [`cfml_common::component::ClassBlueprint`], `Arc`-shared
     /// across every instance the producer builds. Request-scoped (rebuilt next
@@ -1920,6 +2020,19 @@ pub struct CfmlVirtualMachine {
     /// only for this request (same safety argument as `request_component_cache`:
     /// the tree can't change mid-request; dev sees edits next request).
     pub request_custom_tag_cache: parking_lot::RwLock<HashMap<(String, String), String>>,
+    /// Request-scoped memo of paths already observed to EXIST, as a bitmask of
+    /// [`EXISTS_FILE`] / [`EXISTS_DIR`] / [`EXISTS_ANY`]. Preside/ColdBox/Wheels
+    /// asset+view helpers call `fileExists()`/`directoryExists()` in hot
+    /// per-request paths — a live production profile put ~7% of ALL CPU in those
+    /// stats (GH #299).
+    ///
+    /// **Positives only.** A negative is never cached, deliberately: a file can
+    /// appear mid-request from something this cache cannot see (a `cfthread`
+    /// writing it, an external process, a `java.io` shim), and the classic
+    /// `while (!fileExists(f)) sleep(50)` poll must never spin forever. Positives
+    /// can only go stale via a *delete*, and every filesystem-mutating BIF clears
+    /// this cache (see `builtin_may_change_existence`). Dropped at request end.
+    pub request_exists_cache: parking_lot::RwLock<HashMap<String, u8>>,
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
@@ -2294,6 +2407,7 @@ impl CfmlVirtualMachine {
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
+            request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
             last_component_compile_error: None,
             #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
             jit: jit::JitEngine::maybe_new(),
@@ -12949,20 +13063,41 @@ impl CfmlVirtualMachine {
                         // cache — each include recompiles; production trusts the
                         // cache and never re-checks, contract = restart to reload).
                         // Skip the flush work everywhere else.
+                        // GH #299: a BIF that can remove a path invalidates the
+                        // request-scoped existence memo. Cleared wholesale — a
+                        // recursive directoryDelete/fileMove changes an unbounded
+                        // set of paths, and mutations are rare next to the probes
+                        // the memo exists to serve.
+                        let clears_existence = Self::builtin_may_change_existence(&name_lower);
                         let write_targets = Self::file_write_targets(&name_lower, &args);
-                        let needs_flush = !write_targets.is_empty()
-                            && self
-                                .server_state
-                                .as_ref()
-                                .map_or(false, |s| !s.production_mode);
+                        // Runs in EVERY serve mode, production included. v0.521.0
+                        // gated this on `!production_mode` and the GH #284
+                        // regression test has been red in `--serve --production`
+                        // ever since (unnoticed: the release gate only ever served
+                        // the runner in dev). The immutable-tree contract that
+                        // justifies the memo covers EXTERNAL edits — a template
+                        // this very process just rewrote is not an external edit,
+                        // and serving its stale compiled unit for the rest of the
+                        // request is a silent correctness bug (Wheels `?reload`,
+                        // Preside hot-reload). Still skipped in CLI mode
+                        // (`server_state.is_none()`), which holds no persistent
+                        // bytecode cache — each include recompiles there anyway.
+                        let needs_flush = !write_targets.is_empty() && self.server_state.is_some();
                         if !needs_flush {
-                            return builtin(args);
+                            let result = builtin(args);
+                            if clears_existence {
+                                self.request_exists_cache.write().clear();
+                            }
+                            return result;
                         }
                         let pre_canon: Vec<Option<String>> = write_targets
                             .iter()
                             .map(|p| self.vfs.canonicalize(p).ok())
                             .collect();
                         let result = builtin(args);
+                        if clears_existence {
+                            self.request_exists_cache.write().clear();
+                        }
                         if result.is_ok() {
                             for (raw, pre) in write_targets.iter().zip(pre_canon.iter()) {
                                 self.invalidate_written_file_caches(raw, pre.as_deref());
@@ -24458,7 +24593,7 @@ impl CfmlVirtualMachine {
                     path.trim_end_matches('/'),
                     remainder.replace('/', std::path::MAIN_SEPARATOR_STR)
                 );
-                if self.vfs.exists(&cfc_path) {
+                if self.exists_cached_path(&cfc_path) {
                     return Some(cfc_path);
                 }
             }
@@ -24480,7 +24615,7 @@ impl CfmlVirtualMachine {
         let stripped = include_path.trim_start_matches('/');
         if let Some(webroot) = self.server_state.as_ref().and_then(|s| s.webroot.as_ref()) {
             let candidate = webroot.join(stripped).to_string_lossy().to_string();
-            if self.vfs.exists(&candidate) {
+            if self.exists_cached_path(&candidate) {
                 return Some(candidate);
             }
         }
@@ -24489,7 +24624,7 @@ impl CfmlVirtualMachine {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
             let candidate = base_dir.join(stripped).to_string_lossy().to_string();
-            if self.vfs.exists(&candidate) {
+            if self.exists_cached_path(&candidate) {
                 return Some(candidate);
             }
         }
@@ -24513,7 +24648,7 @@ impl CfmlVirtualMachine {
                 };
                 let remainder = remainder.trim_start_matches('/');
                 let resolved = format!("{}/{}", mapping.path.trim_end_matches('/'), remainder);
-                if self.vfs.exists(&resolved) {
+                if self.exists_cached_path(&resolved) {
                     return Some(resolved);
                 }
             }
@@ -25980,12 +26115,14 @@ impl CfmlVirtualMachine {
                 return Some(val.clone());
             }
         }
-        // 3. Case-insensitive lookup in globals
-        let lower = class_name.to_lowercase();
+        // 3. Case-insensitive lookup in globals. Compared straight against
+        // `class_name` — an `eq_ignore_ascii_case` against a pre-lowercased copy
+        // is the same test, and building that copy cost an allocation on every
+        // single resolution (GH #298).
         if let Some(val) = self
             .globals
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+            .find(|(k, _)| k.eq_ignore_ascii_case(class_name))
             .map(|(_, v)| v.clone())
         {
             if matches!(val, CfmlValue::Struct(_)) {
@@ -25994,8 +26131,13 @@ impl CfmlVirtualMachine {
         }
         // 4. Try loading .cfc file — first relative, then via mappings.
         //
-        // Two-layer resolution cache, same key
-        // "<class_lower>\x1f<source_file>\x1f<base_template>":
+        // Two-layer resolution cache, both keyed by a non-allocating hash of
+        // (class name CI, calling template's DIRECTORY, base template) with the
+        // parts verified on every hit — see `ComponentPathEntry`. The dir (not
+        // the file) is the key because every branch below uses only
+        // `Path::parent()` of `source_file`; that collapses the key cardinality
+        // so N caller files in one directory share one entry instead of each
+        // paying its own first-miss probe walk (GH #298).
         //   * request_component_cache — on the per-request VM, so request-scoped
         //     and safe in ALL modes (incl. dev): the on-disk tree can't change
         //     within a single request, and the cache is dropped when the request
@@ -26007,12 +26149,6 @@ impl CfmlVirtualMachine {
         //     (immutable tree); RUSTCFML_NO_COMPONENT_CACHE disables this layer.
         // In-memory definitions (steps 1-3) are checked BEFORE both layers, so a
         // component defined later can never be shadowed.
-        let cache_key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            lower,
-            self.source_file.as_deref().unwrap_or(""),
-            self.base_template_path.as_deref().unwrap_or(""),
-        );
         // The cross-request production layer additionally requires production
         // mode (immutable tree) and honours the RUSTCFML_NO_COMPONENT_CACHE
         // escape hatch. `production_mode` short-circuits the env read in dev.
@@ -26029,15 +26165,33 @@ impl CfmlVirtualMachine {
                     .map(|v| v.is_empty() || v == "0")
                     .unwrap_or(true)
             });
-        let mut cached: Option<String> = self.request_component_cache.get(&cache_key).cloned();
-        if cached.is_none() && prod_cache_ok {
-            cached = self
-                .server_state
-                .as_ref()
-                .and_then(|s| s.component_path_cache.read().get(&cache_key).cloned());
-        }
+        // Key parts + lookup, all borrowed from `self` — the hit path allocates
+        // nothing (an `Arc<str>` clone is a refcount bump, not a copy).
+        let (cache_key, cached): (u64, Option<Arc<str>>) = {
+            let source_dir = component_cache_source_dir(self.source_file.as_deref());
+            let base_template = self
+                .base_template_path
+                .as_deref()
+                .unwrap_or(COMPONENT_CACHE_NONE);
+            let key = component_cache_hash(class_name, source_dir, base_template);
+            let mut hit = self
+                .request_component_cache
+                .get(&key)
+                .filter(|e| e.matches(class_name, source_dir, base_template))
+                .map(|e| e.path.clone());
+            if hit.is_none() && prod_cache_ok {
+                hit = self.server_state.as_ref().and_then(|s| {
+                    s.component_path_cache
+                        .read()
+                        .get(&key)
+                        .filter(|e| e.matches(class_name, source_dir, base_template))
+                        .map(|e| e.path.clone())
+                });
+            }
+            (key, hit)
+        };
 
-        let cfc_path = if let Some(hit) = cached {
+        let cfc_path: Arc<str> = if let Some(hit) = cached {
             hit
         } else {
             let resolved = {
@@ -26073,7 +26227,7 @@ impl CfmlVirtualMachine {
                 }
                 let mut resolved_path = None;
                 for cand in &candidates {
-                    if self.vfs.exists(cand) {
+                    if self.exists_cached_path(cand) {
                         resolved_path = Some(cand.clone());
                         break;
                     } else if let Some(resolved) = self.resolve_leading_slash_include(cand) {
@@ -26088,7 +26242,7 @@ impl CfmlVirtualMachine {
                 } else {
                     format!("{}.cfc", class_name)
                 };
-                if self.vfs.exists(&p) {
+                if self.exists_cached_path(&p) {
                     p
                 } else if let Some(ref source) = self.source_file {
                     // Try relative to source file
@@ -26116,7 +26270,7 @@ impl CfmlVirtualMachine {
                         class_name.replace('.', std::path::MAIN_SEPARATOR_STR)
                     )
                 };
-                if self.vfs.exists(&relative_path) {
+                if self.exists_cached_path(&relative_path) {
                     relative_path
                 } else if let Some(mapped) = self.resolve_path_with_mappings(class_name) {
                     mapped
@@ -26130,7 +26284,7 @@ impl CfmlVirtualMachine {
                         .join(format!("{}.cfc", file_name))
                         .to_string_lossy()
                         .to_string();
-                    if self.vfs.exists(&base_path) {
+                    if self.exists_cached_path(&base_path) {
                         base_path
                     } else if let Some(webroot_path) = self
                         .server_state
@@ -26142,7 +26296,7 @@ impl CfmlVirtualMachine {
                                 .to_string()
                         })
                     {
-                        if self.vfs.exists(&webroot_path) {
+                        if self.exists_cached_path(&webroot_path) {
                             webroot_path
                         } else {
                             relative_path
@@ -26161,7 +26315,7 @@ impl CfmlVirtualMachine {
                             .to_string()
                     })
                 {
-                    if self.vfs.exists(&webroot_path) {
+                    if self.exists_cached_path(&webroot_path) {
                         webroot_path
                     } else {
                         relative_path
@@ -26171,6 +26325,19 @@ impl CfmlVirtualMachine {
                 }
             }
             };
+            let resolved: Arc<str> = Arc::from(resolved);
+            // Entry-with-parts, built once here on the miss path (the only place
+            // this function allocates key material).
+            let entry = ComponentPathEntry {
+                class_name: Box::from(class_name),
+                source_dir: Box::from(component_cache_source_dir(self.source_file.as_deref())),
+                base_template: Box::from(
+                    self.base_template_path
+                        .as_deref()
+                        .unwrap_or(COMPONENT_CACHE_NONE),
+                ),
+                path: Arc::clone(&resolved),
+            };
             // Cross-request production cache: repeat resolutions skip the probing
             // above. Cached unconditionally (no verify-stat) — an immutable
             // production tree means a not-found stays not-found, and in-memory
@@ -26179,7 +26346,7 @@ impl CfmlVirtualMachine {
                 if let Some(ss) = self.server_state.as_ref() {
                     ss.component_path_cache
                         .write()
-                        .insert(cache_key.clone(), resolved.clone());
+                        .insert(cache_key, entry.clone());
                 }
             }
             // Request-scoped cache (all modes). Only cache paths that EXIST, so a
@@ -26187,9 +26354,8 @@ impl CfmlVirtualMachine {
             // by an earlier not-found fallback (unlike the production layer, dev
             // can create files mid-run — but never at a path already resolved as
             // existing within the same request).
-            if self.vfs.exists(&resolved) {
-                self.request_component_cache
-                    .insert(cache_key.clone(), resolved.clone());
+            if self.exists_cached_path(&resolved) {
+                self.request_component_cache.insert(cache_key, entry);
             }
             resolved
         };
@@ -26210,7 +26376,7 @@ impl CfmlVirtualMachine {
             let old_program = self.push_program_swap(sub_program);
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
-            self.source_file = Some(cfc_path.clone());
+            self.source_file = Some(cfc_path.to_string());
             let main_idx = self
                 .program
                 .functions
@@ -26308,9 +26474,9 @@ impl CfmlVirtualMachine {
             // capture its locals (minus engine internals), and freeze them into a
             // shared CfmlStruct handle. Done BEFORE the pseudo-constructor so the
             // body can read `static.X`.
-            let static_key = cfc_path.clone();
+            let static_key: &str = &cfc_path;
             let static_handle: Option<CfmlStruct> =
-                if let Some(h) = self.static_stores.get(&static_key) {
+                if let Some(h) = self.static_stores.get(static_key) {
                     Some(h.clone())
                 } else {
                     // Seed a fresh shared handle with the parent's static members
@@ -26359,7 +26525,7 @@ impl CfmlVirtualMachine {
                         false
                     };
                     if has_own || inherited {
-                        self.static_stores.insert(static_key.clone(), h.clone());
+                        self.static_stores.insert(static_key.to_string(), h.clone());
                         Some(h)
                     } else {
                         None
@@ -26608,7 +26774,7 @@ impl CfmlVirtualMachine {
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 s.insert(
                     "__source_file".to_string(),
-                    CfmlValue::string(cfc_path.clone()),
+                    CfmlValue::string(cfc_path.to_string()),
                 );
                 // Stable per-instance identity. Components have value semantics
                 // here (deep-copied above), and `return this` yields a copy on a
@@ -26769,7 +26935,7 @@ impl CfmlVirtualMachine {
                                     webroot = webroot.parent()?;
                                 }
                                 let defining_dir =
-                                    std::path::Path::new(&cfc_path).parent()?;
+                                    std::path::Path::new(&*cfc_path).parent()?;
                                 let rel = defining_dir.strip_prefix(webroot).ok()?;
                                 let parts: Vec<String> = rel
                                     .components()
@@ -26806,7 +26972,7 @@ impl CfmlVirtualMachine {
                                 .as_deref()
                                 .and_then(|src| std::path::Path::new(src).parent())
                                 .map(|d| {
-                                    std::path::Path::new(&cfc_path).parent() == Some(d)
+                                    std::path::Path::new(&*cfc_path).parent() == Some(d)
                                 })
                                 .unwrap_or(false);
                             if resolved_in_caller_dir {
@@ -28152,7 +28318,7 @@ impl CfmlVirtualMachine {
         // the base-template path (and its error message); only applied for
         // read/existing-file BIFs so a brand-new write is never silently
         // redirected into a component's directory.
-        if allow_current_template_fallback && !self.vfs.exists(&base_resolved) {
+        if allow_current_template_fallback && !self.exists_cached_path(&base_resolved) {
             if let Some(cur_dir) = self
                 .call_stack
                 .last()
@@ -28162,7 +28328,7 @@ impl CfmlVirtualMachine {
                 .filter(|d| !d.as_os_str().is_empty())
             {
                 let cur_resolved = cur_dir.join(raw).to_string_lossy().into_owned();
-                if self.vfs.exists(&cur_resolved) {
+                if self.exists_cached_path(&cur_resolved) {
                     return cur_resolved;
                 }
             }
@@ -28219,6 +28385,82 @@ impl CfmlVirtualMachine {
             return Some(normalized);
         }
         None
+    }
+
+    /// `vfs.is_file` behind the request-scoped positive existence memo.
+    fn is_file_cached(&self, path: &str) -> bool {
+        self.exists_cached(path, EXISTS_FILE, |vfs| vfs.is_file(path))
+    }
+
+    /// `vfs.is_dir` behind the request-scoped positive existence memo.
+    fn is_dir_cached(&self, path: &str) -> bool {
+        self.exists_cached(path, EXISTS_DIR, |vfs| vfs.is_dir(path))
+    }
+
+    /// `vfs.exists` behind the request-scoped positive existence memo.
+    fn exists_cached_path(&self, path: &str) -> bool {
+        self.exists_cached(path, EXISTS_ANY, |vfs| vfs.exists(path))
+    }
+
+    /// Shared body of the three memoised existence probes: answer `true` straight
+    /// from `request_exists_cache` when this path was already seen to exist under
+    /// `bit`, otherwise `probe` the VFS and remember only a `true` (see the field
+    /// docs for why negatives are never cached).
+    fn exists_cached(&self, path: &str, bit: u8, probe: impl Fn(&Arc<dyn Vfs>) -> bool) -> bool {
+        if self
+            .request_exists_cache
+            .read()
+            .get(path)
+            .map_or(false, |f| f & bit != 0)
+        {
+            return true;
+        }
+        let found = probe(&self.vfs);
+        if found {
+            *self
+                .request_exists_cache
+                .write()
+                .entry(path.to_string())
+                .or_insert(0) |= bit;
+        }
+        found
+    }
+
+    /// Whether dispatching this builtin could change what exists on disk, and so
+    /// must drop the request-scoped existence memo.
+    ///
+    /// Deliberately over-broad: every `file*`/`directory*` BIF that is not a known
+    /// read-only probe counts, plus the other known file-producing BIFs. A missed
+    /// invalidator would let a stale `fileExists()` survive a delete within the
+    /// same request, so anything uncertain is treated as mutating. (Creations need
+    /// no invalidation at all — negatives are never cached.)
+    fn builtin_may_change_existence(name_lower: &str) -> bool {
+        // Read-only file/directory BIFs — everything else under those prefixes is
+        // assumed to mutate.
+        const READ_ONLY: &[&str] = &[
+            "fileexists",
+            "fileread",
+            "filereadbinary",
+            "filereadline",
+            "fileisEOF",
+            "fileiseof",
+            "filegetmimetype",
+            "fileopen",
+            "directoryexists",
+            "directorylist",
+        ];
+        if name_lower.starts_with("file") || name_lower.starts_with("directory") {
+            return !READ_ONLY.contains(&name_lower);
+        }
+        matches!(
+            name_lower,
+            "imagewrite"
+                | "imagewritebase64"
+                | "spreadsheetwrite"
+                | "spreadsheetwritetocsv"
+                | "cfzip"
+                | "writelog"
+        )
     }
 
     /// Rebase the path argument(s) of a file/directory BIF against the current
@@ -28320,14 +28562,20 @@ impl CfmlVirtualMachine {
                 validated.remove(*k);
             }
             // Also drop any *other* validated spelling of the same file (a mapping
-            // alias, or a symlinked webroot) by canonical identity. The set is
-            // request-scoped and small, so the extra canonicalize calls are cheap.
+            // alias, or a symlinked webroot) by canonical identity. Routed through
+            // the memoised `canonicalize_cached`, not a raw syscall per entry:
+            // these paths were all canonicalised when they were validated, so this
+            // scan is hash lookups rather than one `realpath()` per validated
+            // template. That matters now the flush also runs in production, where a
+            // request can hold hundreds of validated templates and still write files
+            // (uploads, asset transforms).
             // This is the essential correctness step: once the path leaves the
             // freshness memo, the next load falls through to the mtime-checking
             // `compile_file_cached`, which re-reads the changed file.
             if let Some(target) = canon_keys.first() {
-                validated
-                    .retain(|k| self.vfs.canonicalize(k).ok().as_deref() != Some(target.as_str()));
+                validated.retain(|k| {
+                    self.canonicalize_cached(k).ok().as_deref() != Some(target.as_str())
+                });
             }
         }
         // Belt-and-braces: also evict the shared bytecode-cache entry so the
@@ -28374,11 +28622,11 @@ impl CfmlVirtualMachine {
             // answer false — `directoryExists()` is the directory test).
             "fileexists" => {
                 let path = get_str(0);
-                Some(Ok(CfmlValue::Bool(self.vfs.is_file(&path))))
+                Some(Ok(CfmlValue::Bool(self.is_file_cached(&path))))
             }
             "directoryexists" => {
                 let path = get_str(0);
-                Some(Ok(CfmlValue::Bool(self.vfs.is_dir(&path))))
+                Some(Ok(CfmlValue::Bool(self.is_dir_cached(&path))))
             }
             "directorylist" => {
                 let path = get_str(0);
