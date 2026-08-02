@@ -653,11 +653,13 @@ fn render_html(
     }
 
     // Scopes, in the canonical order set by `gather_debug_scopes`: url, form,
-    // cgi. The deploy-level blocks (cfconfig overrides, then the engine
-    // environment: process env vars + CLI flags) render directly under the cgi
-    // scope — the natural place to look for "what was this engine started with"
-    // while reading request context. Order: CFConfig, Environment, Runtime flags.
-    let mut env_rendered = false;
+    // cgi. The deploy-level blocks (cfconfig overrides, then the CLI runtime
+    // flags) render directly under the cgi scope — the natural place to look
+    // for "what was this engine started with" while reading request context.
+    // Process env vars are deliberately NOT rendered: they routinely hold
+    // credentials (DSN passwords, API keys) and the footer can be exposed to
+    // anyone holding the URL debug key. Order: CFConfig, Runtime flags.
+    let mut deploy_blocks_rendered = false;
     for (name, map) in scopes {
         if map.is_empty() {
             continue;
@@ -677,51 +679,24 @@ fn render_html(
         s.push_str("</table>\n");
         if name.eq_ignore_ascii_case("cgi") {
             render_cfconfig(&mut s, cfconfig);
-            render_env_and_flags(&mut s);
-            env_rendered = true;
+            render_runtime_flags(&mut s);
+            deploy_blocks_rendered = true;
         }
     }
-    if !env_rendered {
+    if !deploy_blocks_rendered {
         render_cfconfig(&mut s, cfconfig);
-        render_env_and_flags(&mut s);
+        render_runtime_flags(&mut s);
     }
 
     s.push_str("</div>\n");
     s
 }
 
-/// Render the engine's process environment variables and the runtime flags
-/// (CLI arguments) it was started with.
-fn render_env_and_flags(s: &mut String) {
-    let mut envs: Vec<(String, String)> = std::env::vars().collect();
-    envs.sort_by(|a, b| a.0.cmp(&b.0));
-    s.push_str(&format!(
-        "<h4 style=\"margin:6px 0 2px\">Environment variables ({})</h4>\n",
-        envs.len()
-    ));
-    if envs.is_empty() {
-        s.push_str("<div>(none)</div>\n");
-    } else {
-        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
-        for (k, v) in &envs {
-            let shown = if v.len() > 200 {
-                let mut end = 200;
-                while !v.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("{}…", &v[..end])
-            } else {
-                v.clone()
-            };
-            s.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td></tr>\n",
-                esc(k),
-                esc(&shown)
-            ));
-        }
-        s.push_str("</table>\n");
-    }
-
+/// Render the runtime flags (CLI arguments) the engine was started with.
+/// Process environment variables are intentionally never rendered — they
+/// routinely carry secrets (DSN passwords, API keys, signing keys), and the
+/// debug footer's only gate may be a URL key.
+fn render_runtime_flags(s: &mut String) {
     let flags: Vec<String> = std::env::args().skip(1).collect();
     s.push_str(&format!(
         "<h4 style=\"margin:6px 0 2px\">Runtime flags ({})</h4>\n",
@@ -963,8 +938,9 @@ mod tests {
         let c = sample_collector();
         let html = c.render(&[], Some("/index.cfm"), &[("runtime.reportAsLucee".to_string(), "false".to_string())]);
         assert!(html.contains(&format!("RustCFML v{} Debug", env!("CARGO_PKG_VERSION"))));
-        // engine environment renders even without a cgi scope in the snapshot
-        assert!(html.contains("Environment variables ("));
+        // deploy blocks render even without a cgi scope in the snapshot;
+        // process env vars must never render (they can carry credentials)
+        assert!(!html.contains("Environment variables"));
         assert!(html.contains("Runtime flags ("));
         assert!(html.contains("Queries (2)"));
         assert!(html.contains("SELECT * FROM users"));
@@ -985,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_env_blocks_render_in_canonical_order() {
+    fn scope_and_deploy_blocks_render_in_canonical_order() {
         let scope = |k: &str| {
             let mut m = ValueMap::default();
             m.insert(k.to_string(), CfmlValue::string("v".to_string()));
@@ -1010,13 +986,13 @@ mod tests {
             at("form scope"),
             at("cgi scope"),
             at("CFConfig ("),
-            at("Environment variables ("),
             at("Runtime flags ("),
         ];
         assert!(
             order.windows(2).all(|w| w[0] < w[1]),
-            "expected URL, FORM, CGI, CFConfig, Environment, Runtime flags — got offsets {order:?}"
+            "expected URL, FORM, CGI, CFConfig, Runtime flags — got offsets {order:?}"
         );
+        assert!(!html.contains("Environment variables"));
     }
 
     #[test]
