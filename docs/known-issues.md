@@ -34,10 +34,10 @@ Accepted but **ignored** (no error, no effect):
 |---|---|
 | `this.timezone` | Per-app timezone ignored. Only the server/cfconfig `runtime.timezone` is honoured. |
 | `this.locale` | Per-app locale ignored. Only cfconfig `runtime.locale` is honoured — which, as of GH #304, it genuinely is: it seeds request state read by `getLocale()` and the `ls*` family. (Before that fix this row was false: the key parsed but had no consumer, and every `ls*` function was pinned to `en_US`.) `setLocale()` overrides it for the rest of the request. |
-| `this.applicationTimeout` | Per-app value ignored. cfconfig `runtime.applicationTimeout` IS applied. |
+| `this.applicationTimeout` | Per-app value ignored — **and so is the cfconfig `runtime.applicationTimeout`**. The key parses and is seeded into thread contexts, but nothing ever reads it: applications do not time out. (This row previously claimed the cfconfig key "IS applied". It never was.) |
 | `this.scriptProtect` | No script-protection filtering of scopes. |
 | `this.secureJSON` / `this.secureJSONPrefix` | Per-app value ignored. cfconfig `security.secureJSON*` IS applied (process-global — see §4). |
-| `this.nullSupport` / `this.enableNullSupport` | Per-app value ignored. cfconfig `runtime.nullSupport` IS applied. |
+| `this.nullSupport` / `this.enableNullSupport` | Per-app value ignored — **and so is the cfconfig `runtime.nullSupport`**. The key parses and is seeded into thread contexts but has no consumer; with `"nullSupport": true` an unset variable still throws `expression` rather than returning null. (This row previously claimed the cfconfig key "IS applied". It never was.) |
 | `this.clientManagement`, `this.setClientCookies`, `this.setDomainCookies`, `this.clientStorage` | The **client scope is not implemented** at all. |
 | `this.invokeImplicitAccessor` | Ignored. |
 | `this.serialization`, `this.javaSettings`, `this.compileExtForCFCDirectory`, `this.blockedExtForFileUpload`, `this.triggerDataMember`, `this.sameFormFieldsAsArray`, `this.searchImplicitScopes`, `this.proxyServer`, `this.smtpServerSettings` | No references in the engine — accepted into the component, never consulted. |
@@ -66,7 +66,7 @@ These deserialize without error but have no runtime effect:
 | `server.http2` | Not wired to the HTTP server. |
 | `runtime.trustedCache` | Reserved; bytecode-cache trust is driven by `--production`, not this key. |
 | `debugging.showExecutionTime` | No timing output. |
-| `datasources[].connectionLimit` / `connectionTimeout` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. |
+| `datasources[].connectionLimit` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. (`connectionTimeout` **is** applied — it reaches the pool builder — so it is no longer listed here.) |
 | `mailServers[].timeout` | Carried but not applied during send. |
 | `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | In-memory cache capacity / TTL / eviction not enforced. |
 | `logging.format` | Only `"text"`; other values warn and fall back. |
@@ -123,8 +123,6 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 
 | Function | Ignored argument(s) | Reason |
 |---|---|---|
-| `csrfGenerateToken(key, forceNew)` | `key`, `forceNew` | No server-side per-key session token storage. |
-| `csrfVerifyToken(token, key)` | `key` | Same. |
 | `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
 | `fileUpload()` / `fileUploadAll()` | — | Stub: returns `fileWasSaved=false` (needs form-scope wiring). |
 | `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
@@ -144,7 +142,8 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cfzip>` | Not supported on `wasm32`. |
 | `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
 | `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
-| `runAsync` / `_schedule` delay+period | On `wasm32` (and other no-real-threads builds) the `delayMs`/`periodMs` args are ignored — the closure runs inline immediately rather than being scheduled. |
+| `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
+| `_schedule` — `everyMs` / `spacedMs` | 🔇 Ignored on **every** platform, not just wasm — `_schedule` is one-shot only. Periodic re-firing needs a respawn driver that can invoke a CFML closure, which the scheduler has no VM handle for. Compose with `runAsync` chains instead. (This row previously scoped the limitation to wasm32; the discard is unconditional.) |
 | `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
 
 ## 9. Query-of-Queries — RustCFML/BoxLang superset 🏗
@@ -733,9 +732,88 @@ to `en_US`. Locale-specific **date** formatting (month/day names, date field ord
 **not** yet driven by the locale — `lsDateFormat`/`lsTimeFormat`/`lsParseDateTime` still
 behave as `en_US`. Extend the table rather than letting a caller's locale be dropped.
 
+## 27. Tag attributes dropped at lowering — per-tag whitelists 🔇
+
+Several tags lower to a builtin by copying a **fixed list** of attributes. Anything
+outside that list is discarded at compile time: no error, no effect, and — because the
+attribute never reaches the runtime — no "unknown option" either. `<cfquery>`'s
+whitelist was removed in v0.543.0 (GH #294) in favour of forwarding every attribute;
+the tags below still have theirs.
+
+| Tag | Survives lowering | Silently dropped |
+|---|---|---|
+| `<cfhttp>` | `url`, `method`, `timeout`, `charset`, `username`, `password`, `useragent`, `proxyserver`, `multipart`, `getasbinary` (+ `result`, `attributecollection`) | `name` (**response is never parsed into a query and the variable is never created**), `file`+`path` (**the response body is never written to disk**), `throwOnError`, `redirect`, `port`, `proxyPort`, `encodeURL`. Note `fn_cfhttp` already *implements* the last five — they are lost in the lowering, not missing from the runtime, so forwarding them is nearly free. |
+| `<cfdump>` | `label`, `expand`, `top` | `output`, `abort`. `writeDump()` implements `output`, so `<cfdump output="console">` still writes into the HTTP response body instead of stdout. |
+| `<cffile>` | — | `charset` on `read`/`write`/`append` (wrong encoding, silently), `nameConflict` on `copy`/`move` (always overwrites instead of `makeunique`/`error`/`skip`). |
+| `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
+| `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
+| `<cfloop query=…>` | `query`, `index`/`item` | `startrow`, `endrow` (**all rows are iterated**), `group` (no control-break grouping). |
+| `<cflock>` | `name`, `type`, `timeout` | `throwOnTimeout` (always throws), and `scope` — **`scope="application"`/`"session"`/`"server"`/`"request"` all collapse onto one `"default"` lock name, so unrelated scopes serialize against each other.** That is a concurrency-correctness bug, not just a missing option. |
+| `<cfinvoke>` | `component`, `method`, `returnvariable`, args | `webservice` — it becomes a *method argument* and the component resolves to `""`. |
+| `cftransaction(…)` (script form) | `action` | `isolation`, `datasource` — the **tag** form forwards both; the script form does not, so a script-form transaction can silently use the wrong datasource. |
+
+## 28. Unclosed body tags are silently erased 🔇
+
+When a body-bearing tag has no closing tag, the preprocessor returns an empty string for
+it — **the tag *and its entire body* vanish from the compiled output**. Lucee/ACF reject
+this at compile time. Affects `<cfquery>`, `<cflock>`, `<cfthread>`, `<cfsilent>`,
+`<cfstatic>`, `<cfmodule>` and `<cfspreadsheet action="write">`. Only `<cfscript>`
+records a structural error today.
+
+This is the same failure mode as the `<cfloop>` fallback fixed in v0.550.0: a
+compile-time construct that quietly removes code rather than refusing to compile it. A
+missing `</cfquery>` should be an error, not a deletion.
+
+## 29. Declared types are parsed and never enforced 🔇
+
+`param_type` and `return_type` are carried through the parser and codegen into
+`BytecodeFunction`, but the only consumers are `getMetadata()` and a component-type
+check. Primitive types are neither validated nor coerced:
+
+```cfml
+function f( required numeric n ) { return n; }
+f( "notanumber" );                    // -> "notanumber", no error (Lucee throws)
+
+function g() returntype="numeric" { return "abc"; }
+g();                                  // -> "abc", no error
+```
+
+Covers `numeric`, `string`, `boolean`, `date`, `array`, `struct`, `uuid`, `email` and
+the rest of the primitive set, in both argument and return position. `cfparam`/`param`
+`type=` **is** enforced (§14) — this gap is specific to function signatures.
+
+## 30. Java shims — remaining gaps 🛑/🔇
+
+The shim dispatch contract was reworked in v0.551.0 so that "this shim does not
+implement that method" travels out-of-band instead of as `Ok(null)`. A shim's `null` is
+now believed, and the operations that used to be silent no-ops (StringBuilder mutators,
+`ConcurrentHashMap.replace`, `Collections.sort` on numbers, `TimeZone` offsets, `Date`
+comparisons, `File.renameTo`, `Files` I/O, `Optional.orElse*`, `GregorianCalendar`
+mutators, `Queue.contains`/`drainTo`, `InetAddress` resolution) do the work. What
+remains:
+
+| Shim | Status |
+|---|---|
+| `ConcurrentHashMap.compute` / `computeIfAbsent` / `computeIfPresent` / `merge` | 🛑 Throws. They take a remapping function, and these handlers are free functions with no VM handle, so a CFML closure cannot be invoked. Previously returned null and never wrote the entry — silently losing the computed value. Needs the VM-intercept treatment the higher-order builtins get. |
+| `Queue.take()` | 🛑 Throws. It blocks until an element is available; the shim backs both `ConcurrentLinkedQueue` (no `take()` in Java) and the blocking queues (where it must block) and cannot tell them apart. Use `poll()`. |
+| `ChronoUnit.X.between(a, b)` | 🛑 Throws. `ChronoUnit` constants are plain strings, so `.between()` dispatches on a String. Making it work means representing the tokens as shims, which would break code comparing them as strings. |
+| `ProcessBuilder` / `Runtime.exec` | 🔇 `directory()`, `environment()`, `redirectOutput()`, `redirectErrorStream()`, `inheritIO()` are ignored; `Process.getInputStream()`/`getErrorStream()` return null so child stdout is unreadable and leaks to the engine console; `Runtime.exec` never launches. Implementing these is a new capability (process spawning with redirected stdio), not a bug fix — deliberately not done. |
+| `new SimpleDateFormat(pattern)` | 🔇 The pattern argument is discarded; `.format()` emits the Java MEDIUM style (`Jan 1, 1970`) regardless. |
+| `HttpServletRequest.setAttribute` / `getAttribute` / `getSession` | 🔇 Attributes are silently discarded — there is no real servlet state behind the bridge (see §11). |
+| Unknown method on a **known** shim class | 🔇 Still returns null rather than throwing. The shim correctly reports "not mine" and falls through to generic dispatch — which must stay, so property access like `system.out` keeps working — but a `__java_shim` struct whose member resolves nowhere does not reach the undefined-member error a plain struct gets. Making that loud is the remaining half of the D2 work. |
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
-ignored tag attributes) should refresh it. The most recent such sweep
-(2026-08-02) is recorded in `NOOP_AUDIT_2026-08-02.md`.*
+ignored tag attributes) should refresh it. The most recent such sweep was 2026-08-02;
+its findings have been merged into the sections above, and everything it identified as
+already-fixed or since-fixed (v0.549.0–v0.551.0) has been dropped rather than carried
+forward.*
+
+> A caution learned from that sweep: an audit's "what Lucee does" column is a claim, not
+> a fact. Three of its entries were wrong (`System.arraycopy` — Lucee throws
+> `ArrayStoreException` rather than copying, because a CFML array is not a Java array;
+> `Optional.orElseGet` and `Files.write` — Lucee cannot express either call with CFML
+> types), and its largest section described work that had already shipped. Probe the
+> reference engine before acting on a compatibility claim.

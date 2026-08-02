@@ -27,8 +27,8 @@ writeOutput(dt.toString());
 
 - **Unsupported classes throw.** `createObject("java", "java.util.HashMap")` raises `createObject: Java class [java.util.HashMap] is not supported.` rather than silently returning null. (This changed from the old "returns null" behaviour — a missing class now fails loudly at construction.)
 - **Unsupported *methods* on a supported class usually return `null`** (no error), so subsequent calls can fail in confusing ways. See **Known gaps** below. A few classes are stricter and *throw* on an unknown method — the deferred class-loader tower, `java.net.URL` network methods, and the third-party library shims (BCrypt, SnakeYAML, JSON-schema, commons-imaging).
-- **Many values are hardcoded, not measured.** `Runtime.freeMemory()`/`totalMemory()`/`maxMemory()`, `TimeZone` offsets (always 0, DST always false), `Thread.getPriority()` (5), `UUID.getVersion()` (4), `Process.isAlive()` (false) and similar return fixed values — enough for framework boot, not for real introspection.
-- **`java.security.MessageDigest` does NOT actually hash.** `digest()` returns the raw bytes accumulated by `update()`, unchanged — it is interop plumbing, not a hash function. For real hashing use CFML's built-in `hash()`, `hmac()`, `bcryptHash()`. `MessageDigest.isEqual(a, b)` *does* do a correct constant-shape byte-array comparison.
+- **Many values are hardcoded, not measured.** `Runtime.freeMemory()`/`totalMemory()`/`maxMemory()`, `Thread.getPriority()` (5), `UUID.getVersion()` (4), `Process.isAlive()` (false) and similar return fixed values — enough for framework boot, not for real introspection. (`TimeZone` offsets were in this list; as of v0.551.0 they are real, chrono-tz-backed values including DST.)
+- **`java.security.MessageDigest` hashes correctly.** `getInstance(alg)` + `update(bytes)` + `digest()` produces a real digest — `SHA-256` of `"abc"` is `BA7816BF…15AD`, as it should be. An algorithm the shim does not implement raises `java.security.NoSuchAlgorithmException` rather than quietly substituting MD5 (v0.551.0). Supported: `MD5`, `SHA`/`SHA-1`, `SHA-256`, `SHA-384`, `SHA-512`. `MessageDigest.isEqual(a, b)` does a correct constant-shape byte-array comparison. *(This entry previously said `digest()` "does NOT actually hash" and steered callers away — that was wrong.)*
 - **Regex uses the Rust [`regex`](https://docs.rs/regex) crate**, whose syntax is a close superset of common Java `Pattern` usage but is **not identical** (no backreferences/lookaround). `\uXXXX` escapes are translated. Invalid patterns throw a clear `java.util.regex.Pattern: invalid pattern …` error.
 - **The Java `Thread` shim is a stub.** `Thread.sleep()` is a no-op and it offers no concurrency. This is **separate** from CFML's `<cfthread>`, which *does* run on real OS threads — see **[Threading](threads.md)**.
 - **`java.util.concurrent` executors run tasks, but simply.** `submit`/`execute`/`invokeAll`/`invokeAny` spawn work through RustCFML's async kernel, but the pool is not a real thread pool: statistics (`getActiveCount`, `getPoolSize`, …) are 0, `awaitTermination` always returns true, and **periodic scheduling (`scheduleAtFixedRate`/`scheduleWithFixedDelay`) fires only once**, not repeatedly.
@@ -46,7 +46,7 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 |---|---|
 | `java.lang.System` | static `currentTimeMillis()`, `nanoTime()`, `getProperty(key[, default])`, `setProperty(k, v)`, `clearProperty(k)`, `getenv([name])`, `identityHashCode(o)`, and `System.out`/`System.err` fields |
 | `java.lang.System.out` / `.err` *(indirect, via `System.out`/`System.err`)* | `println`, `print`, `write`, `append`, `printf`, `format`; `flush`/`close`/`checkError` are no-ops |
-| `java.lang.StringBuilder` / `java.lang.StringBuffer` | `init([s])`, `append(v)` (chainable), `toString()`, `length()`, `clear()` |
+| `java.lang.StringBuilder` / `java.lang.StringBuffer` | `init([s])`, `append(v)` (chainable), `toString()`, `length()`, `clear()`, `insert(i,v)`, `delete(from,to)`, `deleteCharAt(i)`, `setLength(n)`, `replace(from,to,s)`, `reverse()` — all mutate in place and return the builder, so a builder passed into a function is mutated for the caller |
 | `java.lang.Thread` | static `currentThread()`; `getName()`, `getThreadGroup()`, `getPriority()` (→ 5), `isDaemon()` (→ false), `sleep()` (no-op) |
 | `java.lang.ThreadGroup` *(indirect, via `Thread.getThreadGroup()`)* | `getName()` |
 | `java.lang.Runtime` | static `getRuntime()`; `availableProcessors()`, `freeMemory()`/`totalMemory()`/`maxMemory()` (hardcoded), `gc()`/`runFinalization()` (no-op) |
@@ -63,17 +63,17 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 | Class (and aliases) | Supported methods |
 |---|---|
 | `java.util.UUID` | static `randomUUID()`; `toString()`, `getVersion()` (→ 4), `getVariant()` (→ 2) |
-| `java.util.Date` *(also from `Calendar.getTime()`)* | `init([millis])`, `getTime()`, `setTime(millis)` |
-| `java.util.GregorianCalendar` / `java.util.Calendar` | `init()`, `getTime()` (→ `Date`), `getTimeInMillis()` |
+| `java.util.Date` *(also from `Calendar.getTime()`)* | `init([millis])`, `getTime()`, `setTime(millis)`, `before(d)`, `after(d)`, `equals(d)`, `compareTo(d)` |
+| `java.util.GregorianCalendar` / `java.util.Calendar` | `init([y,m,d[,h,mi,s]])` (month 0-based), `getTime()` (→ `Date`), `getTimeInMillis()`, `setTime(date)`, `setTimeInMillis(ms)`, `get(field)`, `set(field,v)` / `set(y,m,d,…)`, `add(field,n)`, `roll(field,n)`; the `YEAR`/`MONTH`/`DATE`/… field constants are exposed as properties. `add` carries into larger fields, `roll` wraps within the field |
 | `java.util.TreeMap` | `init([struct])`, `put(k, v)`, `get(k)`, `keySet()`/`keys()` (**sorted**), `size()`, `containsKey(k)`, `isEmpty()`, `remove(k)` |
 | `java.util.LinkedHashMap` | `init([struct])`, `put(k, v)`, `get(k)`, `keySet()`/`keys()` (insertion order), `size()`, `containsKey(k)`, `isEmpty()`, `remove(k)` |
-| `java.util.Optional` | static `empty()`, `of(v)`, `ofNullable(v)`; `isPresent()`, `isEmpty()`, `get()` (throws if empty), `ifPresent(fn)`, `map(fn)`, `filter(fn)`, `equals()`, `hashCode()`, `toString()` |
-| `java.util.Collections` | `list(e)`, `emptyList()`/`emptySet()`/`emptyMap()`, `sort(list)`, `reverse(list)`, and identity `unmodifiable*`/`synchronized*` wrappers |
+| `java.util.Optional` | static `empty()`, `of(v)`, `ofNullable(v)`; `isPresent()`, `isEmpty()`, `get()` (throws if empty), `ifPresent(fn)`, `map(fn)`, `filter(fn)`, `orElse(v)`, `orElseGet(supplier)` (lazy — only called when empty), `orElseThrow([supplier])`, `equals()`, `hashCode()`, `toString()`. Note a real JVM rejects a CFML closure for `orElseGet`/`orElseThrow`; the shim accepts one |
+| `java.util.Collections` | `list(e)`, `emptyList()`/`emptySet()`/`emptyMap()`, `sort(list)` (natural ordering — numeric for all-numeric lists, lexicographic otherwise), `reverse(list)`, and identity `unmodifiable*`/`synchronized*` wrappers |
 | `java.util.Iterator` *(indirect, via `array.iterator()` / queue `iterator()`)* | `hasNext()`, `next()` (throws past end) |
 | `java.util.Enumeration` *(indirect, via `ResourceBundle.getKeys()`)* | `hasMoreElements()`/`hasNext()`, `nextElement()`/`next()` |
 | `java.util.Map.Entry` *(indirect, via `ConcurrentHashMap.entrySet()`)* | `getKey()`, `getValue()`, `toString()` |
 | `java.util.Locale` | static `getDefault()`, `getAvailableLocales()`, `getISOLanguages()`, `getISOCountries()`; `getLanguage()`, `getCountry()`, `getVariant()`, `getDisplayLanguage()`, `getDisplayCountry()`, `getDisplayName()`, `getISO3Language()`, `getISO3Country()`, `toString()` |
-| `java.util.TimeZone` | static `getDefault()`, `getTimeZone(id)`, `getAvailableIDs()`; `getID()`, `getDisplayName()`, `getRawOffset()`/`getDSTSavings()`/`getOffset()` (→ 0), `useDaylightTime()`/`inDaylightTime()` (→ false) |
+| `java.util.TimeZone` | static `getDefault()`, `getTimeZone(id)`, `getAvailableIDs()`; `getID()`, `getDisplayName()`, `getRawOffset()`/`getDSTSavings()`/`getOffset(millis)`, `useDaylightTime()`/`inDaylightTime()` — real chrono-tz values, DST included (`America/New_York` is -18000000 in January and -14400000 in July) |
 | `java.util.PropertyResourceBundle` | `init(reader)` (parses a `.properties` file), `getKeys()`/`keySet()` (→ `Enumeration`), `getString(k)`/`getObject(k)`/`handleGetObject(k)`, `containsKey(k)` |
 
 ### java.util.concurrent
@@ -85,8 +85,8 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 | `java.util.concurrent.ExecutorCompletionService` | `init(executor)`, `submit(task)`, `poll()`/`take()` (FIFO completed futures) |
 | `java.util.concurrent.TimeUnit` | constant fields `NANOSECONDS`…`DAYS`; `toString()`/`name()` |
 | `java.util.concurrent.ThreadFactory` | `newThread(runnable)` |
-| `java.util.concurrent.ConcurrentHashMap` | `init()`, `put(k, v)`, `putIfAbsent(k, v)`, `get(k)`, `remove(k)`, `containsKey(k)`, `keys()`/`keySet()`/`values()`, `entrySet()` (→ `Map.Entry` array), `size()`, `isEmpty()`, `clear()` |
-| `java.util.concurrent.ConcurrentLinkedQueue` *(aliases `LinkedQueue`, `LinkedBlockingQueue`, `ArrayBlockingQueue`)* | `init()`, `add(v)`/`offer(v)`, `poll()`, `peek()`, `remove()`, `iterator()` (→ `Iterator`), `size()`, `isEmpty()`, `clear()` |
+| `java.util.concurrent.ConcurrentHashMap` | `init()`, `put(k, v)`, `putIfAbsent(k, v)`, `get(k)`, `getOrDefault(k, d)`, `replace(k, v)`, `remove(k)`, `containsKey(k)`, `keys()`/`keySet()`/`values()`, `entrySet()` (→ `Map.Entry` array), `size()`, `isEmpty()`, `clear()`. `compute`/`computeIfAbsent`/`computeIfPresent`/`merge` **throw** — they need a remapping function the shim cannot invoke |
+| `java.util.concurrent.ConcurrentLinkedQueue` *(aliases `LinkedQueue`, `LinkedBlockingQueue`, `ArrayBlockingQueue`)* | `init()`, `add(v)`/`offer(v)`, `poll()`, `peek()`, `remove()`, `contains(v)`, `drainTo(sink[, max])`, `iterator()` (→ `Iterator`), `size()`, `isEmpty()`, `clear()`. `take()` **throws** — it would have to block |
 
 ### java.io / java.nio.file / java.net
 
@@ -96,15 +96,15 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 | `java.io.FileInputStream` | `init(path\|File)`, `close()` (no-op) |
 | `java.io.InputStreamReader` | `init(FileInputStream[, charset])`, `close()` (no-op) |
 | `java.nio.file.Paths` / `java.nio.file.Path` *(also via `File.toPath()`)* | static `get(s)`; `getParent()`, `isAbsolute()`, `toString()`, `toAbsolutePath()` |
-| `java.nio.file.Files` | static `exists(p)`, `isDirectory(p)`, `isSymbolicLink(p)`, `delete(p)` |
-| `java.net.InetAddress` | static `getLocalHost()`, `getByName(host)`; `getHostName()`, `getHostAddress()`, `getCanonicalHostName()`, `isLoopbackAddress()`, `toString()` — *no DNS/network* |
+| `java.nio.file.Files` | static `exists(p)`, `isDirectory(p)`, `isSymbolicLink(p)`, `delete(p)`, `write(p, content)`, `copy(src,dst)`, `move(src,dst)`, `createDirectory(p)`/`createDirectories(p)`, `readAllBytes(p)` (→ byte array). Paths may be a `Path` shim or a plain string. I/O failure raises `java.io.IOException` |
+| `java.net.InetAddress` | static `getLocalHost()`, `getByName(host)`; `getHostName()`, `getHostAddress()`, `getCanonicalHostName()`, `isLoopbackAddress()`, `toString()`. `getByName` resolves through the system resolver and raises `java.net.UnknownHostException` when it cannot; IP literals and `localhost` short-circuit without a lookup |
 | `java.net.URL` | `init(spec)` (or protocol/host/port/file), `getProtocol()`, `getHost()`, `getPort()`, `getDefaultPort()`, `getPath()`, `getQuery()`, `getRef()`, `getFile()`, `getAuthority()`, `getUserInfo()`, `toString()`/`toExternalForm()`, `equals()`. **`openConnection`/`openStream`/`getContent`/`getInputStream` throw** — use `<cfhttp>` |
 
 ### java.security / java.util.regex / java.text
 
 | Class (and aliases) | Supported methods |
 |---|---|
-| `java.security.MessageDigest` | static `getInstance(algorithm)`, `isEqual(a, b)`; `update(data)`, `digest()`, `reset()`. **`digest()` returns accumulated bytes, not a hash** — see caveats |
+| `java.security.MessageDigest` | static `getInstance(algorithm)`, `isEqual(a, b)`; `update(data)`, `digest()`, `reset()`. Real hashing — `MD5`, `SHA`/`SHA-1`, `SHA-256`, `SHA-384`, `SHA-512`; an unknown algorithm throws `NoSuchAlgorithmException` |
 | `java.util.regex.Pattern` | static/instance `compile(regex)`, `pattern()`/`toString()`, `matcher(input)` |
 | `java.util.regex.Matcher` *(indirect, via `Pattern.matcher()`)* | `find()`, `matches()`, `lookingAt()`, `group([n])`, `groupCount()`, `start([n])`, `end([n])` |
 | `java.text.DateFormat` / `java.text.SimpleDateFormat` | static `getDateInstance()`, `getTimeInstance()`, `getDateTimeInstance()`, `getInstance()`; `format(date)`, `setTimeZone(tz)`; `setLenient`/`setCalendar`/`applyPattern` (no-op). **Only `en`/`en_US`/`en_GB` locales** — others throw |
@@ -153,8 +153,8 @@ These route real work to native Rust builtins; an unknown method **throws** rath
 
 Methods on otherwise-supported classes that are **not** implemented (they return `null`):
 
-- **`java.io.File`** — `canRead()`/`canWrite()`/`canExecute()`, `getParentFile()`, `renameTo()`, `listFiles()`.
-- **`java.lang.StringBuilder`** — `insert()`, `reverse()`, `delete()`, `substring()`, `replace()`.
+- **`java.io.File`** — `canRead()`/`canWrite()`/`canExecute()`, `getParentFile()`, `listFiles()`. (`renameTo()` is implemented as of v0.551.0.)
+- **`java.lang.StringBuilder`** — `substring()`. (`insert()`, `delete()`, `deleteCharAt()`, `setLength()`, `replace()` and `reverse()` are implemented as of v0.551.0.)
 - **`TreeMap` / `LinkedHashMap`** — `values()`, `entrySet()`, `clear()`.
 - **`java.nio.file.Paths`** — `getFileName()`, `getNameCount()`, `normalize()`, `relativize()`.
 - **`java.util.regex`** — `Matcher.replaceAll()`/`replaceFirst()`/`split()`, `Pattern.matches()` (static), `Pattern.quote()`.
