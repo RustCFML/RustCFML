@@ -832,14 +832,40 @@ pub fn handle_java_inetaddress(
                 "__hostname".to_string(),
                 CfmlValue::string(hostname.clone()),
             );
-            // Resolve the address. We do no DNS, so: an IP literal is stored as-is
-            // (the input was already an address); "localhost" resolves to the IPv4
-            // loopback like real Java; any other hostname round-trips the name as a
-            // best effort. isLoopbackAddress()/getHostAddress() read this back.
+            // Resolve the address. An IP literal is stored as-is; "localhost"
+            // short-circuits to the IPv4 loopback like real Java; anything else
+            // goes through the resolver.
+            //
+            // This used to round-trip the NAME as the address, so
+            // `getByName("example.com").getHostAddress()` handed back
+            // "example.com" as though it were an IP — a string that looks like a
+            // successful lookup and fails much later, wherever it is used as an
+            // address. Java resolves or throws UnknownHostException; do the same.
             let address = if hostname.eq_ignore_ascii_case("localhost") {
                 "127.0.0.1".to_string()
+            } else if hostname.parse::<std::net::IpAddr>().is_ok() {
+                hostname.clone()
             } else {
-                hostname
+                use std::net::ToSocketAddrs;
+                match (hostname.as_str(), 0u16).to_socket_addrs() {
+                    Ok(mut addrs) => match addrs.next() {
+                        Some(a) => a.ip().to_string(),
+                        None => {
+                            return Err(CfmlError::new(
+                                format!("{}: Name or service not known", hostname),
+                                CfmlErrorType::Custom(
+                                    "java.net.UnknownHostException".to_string(),
+                                ),
+                            ))
+                        }
+                    },
+                    Err(e) => {
+                        return Err(CfmlError::new(
+                            format!("{}: {}", hostname, e),
+                            CfmlErrorType::Custom("java.net.UnknownHostException".to_string()),
+                        ))
+                    }
+                }
             };
             shim.insert(
                 "__address".to_string(),
@@ -2564,6 +2590,67 @@ pub fn handle_java_concurrentlinkedqueue(
                 Ok(CfmlValue::Null)
             }
         }
+        // `contains` and `drainTo` returned null — falsy and empty respectively —
+        // so a membership test silently said "no" and a drain silently moved
+        // nothing while reporting success.
+        "contains" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let (Some(CfmlValue::Array(a)), Some(needle)) =
+                    (shim.get("__queue"), args.first())
+                {
+                    let want = needle.as_string();
+                    return Ok(CfmlValue::Bool(
+                        a.with_read(|v| v.iter().any(|x| x.as_string() == want)),
+                    ));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "drainto" => {
+            // Move every element into the supplied collection, returning the
+            // count moved (Java's contract). `maxElements` is honoured when given.
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::Array(src)) = shim.get("__queue") {
+                    let limit = args
+                        .get(1)
+                        .map(|v| v.as_string().trim().parse::<usize>().unwrap_or(usize::MAX))
+                        .unwrap_or(usize::MAX);
+                    // The sink is a CFML array, or another queue shim.
+                    let sink = match args.first() {
+                        Some(CfmlValue::Array(a)) => Some(a.clone()),
+                        Some(CfmlValue::Struct(s)) => match s.get("__queue") {
+                            Some(CfmlValue::Array(a)) => Some(a),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let Some(sink) = sink else {
+                        return Err(CfmlError::runtime(
+                            "Queue.drainTo: target must be an array or another queue".to_string(),
+                        ));
+                    };
+                    let moved = src.with_write(|v| {
+                        let n = v.len().min(limit);
+                        v.drain(..n).collect::<Vec<_>>()
+                    });
+                    let count = moved.len();
+                    sink.with_write(|d| d.extend(moved));
+                    return Ok(CfmlValue::Int(count as i64));
+                }
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        // `take()` blocks until an element is available. This shim backs both
+        // ConcurrentLinkedQueue (which has no take() in Java at all) and the
+        // blocking queues (where it must block), and it cannot tell them apart —
+        // they share one `__java_class`. Returning null silently dropped the work
+        // item the caller was waiting for; blocking here would risk the
+        // never-terminating failure mode instead. Fail loudly and point at poll().
+        "take" => Err(CfmlError::runtime(
+            "Queue.take() is not supported: it blocks until an element is available, \
+             which this shim cannot do. Use poll(), which returns null when empty."
+                .to_string(),
+        )),
         "iterator" => {
             // A weakly-consistent snapshot iterator (good enough for the queue's
             // documented use). Returns a java.util.iterator shim with hasNext/next.
@@ -4895,16 +4982,292 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Days in a given month, leap years included.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Absolute `Calendar.set(field, value)`. Returns `None` for a field this shim
+/// does not model, so the caller can fail loudly rather than no-op.
+fn set_calendar_field(
+    dt: chrono::NaiveDateTime,
+    field: i64,
+    value: i64,
+) -> Option<chrono::NaiveDateTime> {
+    use chrono::{Datelike, Timelike};
+    match field {
+        1 => dt.with_year(value as i32),
+        2 => dt.with_month0(value as u32), // MONTH is 0-based
+        5 => dt.with_day(value as u32),
+        6 => dt.with_ordinal(value as u32),
+        10 => dt.with_hour((value % 12) as u32),
+        11 => dt.with_hour(value as u32),
+        12 => dt.with_minute(value as u32),
+        13 => dt.with_second(value as u32),
+        14 => Some(dt), // millisecond precision is carried by the instant itself
+        _ => None,
+    }
+}
+
+/// Java `Calendar` field constants. MONTH is 0-based (JANUARY == 0) — the classic
+/// trap, and the reason `set`/`get` must not silently re-index it.
+const CALENDAR_FIELDS: &[(&str, i64)] = &[
+    ("ERA", 0),
+    ("YEAR", 1),
+    ("MONTH", 2),
+    ("WEEK_OF_YEAR", 3),
+    ("WEEK_OF_MONTH", 4),
+    ("DATE", 5),
+    ("DAY_OF_MONTH", 5),
+    ("DAY_OF_YEAR", 6),
+    ("DAY_OF_WEEK", 7),
+    ("DAY_OF_WEEK_IN_MONTH", 8),
+    ("AM_PM", 9),
+    ("HOUR", 10),
+    ("HOUR_OF_DAY", 11),
+    ("MINUTE", 12),
+    ("SECOND", 13),
+    ("MILLISECOND", 14),
+    ("ZONE_OFFSET", 15),
+    ("DST_OFFSET", 16),
+];
+
 pub fn handle_java_gregoriancalendar(
     method: &str,
-    _args: Vec<CfmlValue>,
+    args: Vec<CfmlValue>,
     object: &CfmlValue,
 ) -> CfmlResult {
+    use chrono::{Datelike, NaiveDateTime, TimeZone as _, Timelike};
+
+    // Read/write the instant this calendar carries.
+    let cur_millis = || -> i64 {
+        match object {
+            CfmlValue::Struct(s) => s
+                .get("__millis")
+                .map(|v| v.as_string().trim().parse::<i64>().unwrap_or(0))
+                .unwrap_or_else(now_millis),
+            _ => now_millis(),
+        }
+    };
+    // Calendar is a mutable object: set/add/roll change THIS instance in place
+    // (they return void), so write through the shared handle like StringBuilder.
+    let store = |ms: i64| {
+        if let CfmlValue::Struct(s) = object {
+            s.insert("__millis".to_string(), CfmlValue::Int(ms));
+        }
+    };
+    let to_dt = |ms: i64| -> NaiveDateTime {
+        chrono::Utc
+            .timestamp_millis_opt(ms)
+            .single()
+            .unwrap_or_else(chrono::Utc::now)
+            .naive_utc()
+    };
+    let to_ms = |dt: NaiveDateTime| -> i64 { dt.and_utc().timestamp_millis() };
+    let argi = |i: usize| -> i64 {
+        args.get(i)
+            .map(|v| v.as_string().trim().parse::<i64>().unwrap_or(0))
+            .unwrap_or(0)
+    };
+
     match method {
         "init" => {
             let mut shim = jshim("java.util.gregoriancalendar");
-            shim.insert("__millis".to_string(), CfmlValue::Int(now_millis()));
+            // Expose the field constants so `cal.YEAR` / `Calendar.MONTH` resolve
+            // as property reads.
+            for (name, v) in CALENDAR_FIELDS {
+                shim.insert(name.to_ascii_lowercase(), CfmlValue::Int(*v));
+            }
+            // `new GregorianCalendar(y, m, d[, h, mi, s])` — month 0-based.
+            let millis = if args.len() >= 3 {
+                chrono::NaiveDate::from_ymd_opt(
+                    argi(0) as i32,
+                    (argi(1) + 1) as u32,
+                    argi(2) as u32,
+                )
+                .and_then(|d| {
+                    d.and_hms_opt(argi(3) as u32, argi(4) as u32, argi(5) as u32)
+                })
+                .map(to_ms)
+                .unwrap_or_else(now_millis)
+            } else {
+                now_millis()
+            };
+            shim.insert("__millis".to_string(), CfmlValue::Int(millis));
             Ok(CfmlValue::strukt(shim))
+        }
+        // set/add/roll/get were all missing, so they fell through and did
+        // NOTHING: the calendar never moved and get() returned null, while the
+        // caller believed it had built a date.
+        "set" | "add" | "roll" | "get" => {
+            let dt = to_dt(cur_millis());
+            // `set(y, m, d[, h, mi, s])` — the multi-arg form, month 0-based.
+            if method == "set" && args.len() >= 3 {
+                let built = chrono::NaiveDate::from_ymd_opt(
+                    argi(0) as i32,
+                    (argi(1) + 1) as u32,
+                    argi(2) as u32,
+                )
+                .and_then(|d| d.and_hms_opt(argi(3) as u32, argi(4) as u32, argi(5) as u32));
+                return match built {
+                    Some(b) => {
+                        store(to_ms(b));
+                        Ok(CfmlValue::Null)
+                    }
+                    None => Err(CfmlError::runtime(
+                        "GregorianCalendar.set: invalid date components".to_string(),
+                    )),
+                };
+            }
+
+            let field = argi(0);
+            let amount = argi(1);
+            // Read a field.
+            if method == "get" {
+                let v: i64 = match field {
+                    0 => 1,                                    // ERA (AD)
+                    1 => dt.year() as i64,                     // YEAR
+                    2 => dt.month() as i64 - 1,                // MONTH (0-based)
+                    3 => dt.iso_week().week() as i64,          // WEEK_OF_YEAR
+                    4 => ((dt.day() as i64 - 1) / 7) + 1,      // WEEK_OF_MONTH
+                    5 => dt.day() as i64,                      // DATE/DAY_OF_MONTH
+                    6 => dt.ordinal() as i64,                  // DAY_OF_YEAR
+                    // DAY_OF_WEEK: Java is 1=Sunday..7=Saturday.
+                    7 => (dt.weekday().num_days_from_sunday() as i64) + 1,
+                    8 => ((dt.day() as i64 - 1) / 7) + 1,      // DAY_OF_WEEK_IN_MONTH
+                    9 => i64::from(dt.hour() >= 12),           // AM_PM
+                    10 => (dt.hour() % 12) as i64,             // HOUR (12h)
+                    11 => dt.hour() as i64,                    // HOUR_OF_DAY
+                    12 => dt.minute() as i64,
+                    13 => dt.second() as i64,
+                    14 => (cur_millis().rem_euclid(1000)) as i64,
+                    15 | 16 => 0, // ZONE_OFFSET / DST_OFFSET: this shim is UTC
+                    _ => {
+                        return Err(CfmlError::runtime(format!(
+                            "GregorianCalendar.get: unsupported field {}",
+                            field
+                        )))
+                    }
+                };
+                return Ok(CfmlValue::Int(v));
+            }
+
+            // add(field, amount) carries into larger fields; roll(field, amount)
+            // wraps WITHIN the field and leaves the others alone.
+            let rolling = method == "roll";
+            let new_dt = match field {
+                1 => {
+                    // YEAR
+                    let y = if rolling { dt.year() + amount as i32 } else { dt.year() + amount as i32 };
+                    dt.with_year(y)
+                }
+                2 => {
+                    // MONTH
+                    let total = dt.month0() as i64 + amount;
+                    if rolling {
+                        dt.with_month0(total.rem_euclid(12) as u32)
+                    } else {
+                        let y = dt.year() + (total.div_euclid(12)) as i32;
+                        dt.with_month0(total.rem_euclid(12) as u32)
+                            .and_then(|d| d.with_year(y))
+                    }
+                }
+                5 | 6 => {
+                    // DATE / DAY_OF_YEAR
+                    if rolling {
+                        let dim = days_in_month(dt.year(), dt.month());
+                        let d0 = dt.day0() as i64 + amount;
+                        dt.with_day0(d0.rem_euclid(dim as i64) as u32)
+                    } else {
+                        Some(dt + chrono::Duration::days(amount))
+                    }
+                }
+                10 | 11 => {
+                    if rolling {
+                        let h = dt.hour() as i64 + amount;
+                        dt.with_hour(h.rem_euclid(24) as u32)
+                    } else {
+                        Some(dt + chrono::Duration::hours(amount))
+                    }
+                }
+                12 => {
+                    if rolling {
+                        let m = dt.minute() as i64 + amount;
+                        dt.with_minute(m.rem_euclid(60) as u32)
+                    } else {
+                        Some(dt + chrono::Duration::minutes(amount))
+                    }
+                }
+                13 => {
+                    if rolling {
+                        let s = dt.second() as i64 + amount;
+                        dt.with_second(s.rem_euclid(60) as u32)
+                    } else {
+                        Some(dt + chrono::Duration::seconds(amount))
+                    }
+                }
+                14 => Some(dt + chrono::Duration::milliseconds(amount)),
+                3 => Some(dt + chrono::Duration::weeks(amount)),
+                _ => {
+                    return Err(CfmlError::runtime(format!(
+                        "GregorianCalendar.{}: unsupported field {}",
+                        method, field
+                    )))
+                }
+            };
+            // `set(field, value)` is absolute, not relative — handle it here
+            // because it shares the field decoding above.
+            let final_dt = if method == "set" {
+                match set_calendar_field(dt, field, amount) {
+                    Some(d) => Some(d),
+                    None => {
+                        return Err(CfmlError::runtime(format!(
+                            "GregorianCalendar.set: unsupported field {}",
+                            field
+                        )))
+                    }
+                }
+            } else {
+                new_dt
+            };
+            match final_dt {
+                Some(d) => {
+                    store(to_ms(d));
+                    Ok(CfmlValue::Null)
+                }
+                None => Err(CfmlError::runtime(format!(
+                    "GregorianCalendar.{}: result is not a valid date",
+                    method
+                ))),
+            }
+        }
+        "settime" => {
+            // Takes a java.util.Date shim (or bare epoch millis).
+            let ms = match args.first() {
+                Some(CfmlValue::Struct(s)) => s
+                    .get("__millis")
+                    .map(|v| v.as_string().trim().parse::<i64>().unwrap_or(0))
+                    .unwrap_or(0),
+                Some(other) => other.as_string().trim().parse::<i64>().unwrap_or(0),
+                None => now_millis(),
+            };
+            store(ms);
+            Ok(CfmlValue::Null)
+        }
+        "settimeinmillis" => {
+            store(argi(0));
+            Ok(CfmlValue::Null)
         }
         "gettime" => {
             // Returns a java.util.Date. Reuse the Date shim shape (`__millis`).

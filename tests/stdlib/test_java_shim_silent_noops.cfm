@@ -184,6 +184,64 @@ if (directoryExists(tdir & "rustcfml_nio_dir")) {
 	directoryDelete(tdir & "rustcfml_nio_dir", true);
 }
 
+// ---- GregorianCalendar (never moved; get() returned null) ----------------
+// Month is 0-based in Java, and add() vs roll() differ: add carries into larger
+// fields, roll wraps within the field. Both verified against Lucee 7.0.4.
+cal = createObject("java", "java.util.GregorianCalendar").init(2026, 0, 15, 10, 30, 0);
+assert("Calendar.get(YEAR)", cal.get(1), 2026);
+assert("Calendar.get(MONTH) is 0-based", cal.get(2), 0);
+assert("Calendar.get(DAY_OF_MONTH)", cal.get(5), 15);
+assert("Calendar.get(HOUR_OF_DAY)", cal.get(11), 10);
+assert("Calendar.get(MINUTE)", cal.get(12), 30);
+assert("Calendar.get(DAY_OF_WEEK) is 1=Sunday", cal.get(7), 5);
+
+cal.add(5, 20);
+assert("Calendar.add(DAY,20) carries into the next month",
+	cal.get(1) & "-" & (cal.get(2) + 1) & "-" & cal.get(5), "2026-2-4");
+
+cal.set(1, 2030);
+assert("Calendar.set(YEAR) is absolute", cal.get(1), 2030);
+
+// December + 1 month: roll stays in 2026, add carries to 2027.
+rollCal = createObject("java", "java.util.GregorianCalendar").init(2026, 11, 15, 0, 0, 0);
+rollCal.roll(2, 1);
+assert("Calendar.roll wraps within the field, no carry",
+	rollCal.get(1) & "/" & rollCal.get(2), "2026/0");
+
+addCal = createObject("java", "java.util.GregorianCalendar").init(2026, 11, 15, 0, 0, 0);
+addCal.add(2, 1);
+assert("Calendar.add carries into the year",
+	addCal.get(1) & "/" & addCal.get(2), "2027/0");
+
+// ---- Queue.contains / drainTo (said "no" and moved nothing) --------------
+q = createObject("java", "java.util.concurrent.ConcurrentLinkedQueue").init();
+q.add("a"); q.add("b"); q.add("c");
+assertTrue("Queue.contains finds a present element", q.contains("b"));
+assertTrue("Queue.contains rejects an absent element", !q.contains("z"));
+
+// drainTo is a BlockingQueue method — ConcurrentLinkedQueue does not have it in
+// Java, so exercise it on a LinkedBlockingQueue or the reference engine
+// (correctly) rejects the call.
+bq = createObject("java", "java.util.concurrent.LinkedBlockingQueue").init();
+bq.add("a"); bq.add("b"); bq.add("c");
+drained = [];
+assert("Queue.drainTo returns the number moved", bq.drainTo(drained), 3);
+assert("Queue.drainTo moves the elements", arrayToList(drained), "a,b,c");
+assert("Queue.drainTo empties the source", bq.size(), 0);
+
+bq.add("x"); bq.add("y"); bq.add("z");
+capped = [];
+assert("Queue.drainTo honours maxElements", bq.drainTo(capped, 2), 2);
+assert("Queue.drainTo(max) moves only that many", arrayToList(capped), "x,y");
+assert("Queue.drainTo(max) leaves the rest", bq.size(), 1);
+
+// ---- InetAddress.getHostAddress (returned the hostname as an "IP") -------
+IA = createObject("java", "java.net.InetAddress");
+assert("InetAddress resolves localhost to the loopback",
+	IA.getByName("localhost").getHostAddress(), "127.0.0.1");
+assert("InetAddress passes an IP literal through",
+	IA.getByName("192.0.2.7").getHostAddress(), "192.0.2.7");
+
 // ---- fileExists() must not go stale after a shim mutation ---------------
 // The engine keeps a request-scoped POSITIVE existence memo. The BIF write path
 // clears it (native fileDelete/fileMove were always correct), but java-shim
