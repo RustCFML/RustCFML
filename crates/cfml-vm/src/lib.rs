@@ -22161,74 +22161,30 @@ impl CfmlVirtualMachine {
                     }
                     _ => Ok(CfmlValue::Null),
                 };
-                // Map-like shims (ConcurrentHashMap / LinkedHashMap / TreeMap)
-                // have getters (`get` / `getOrDefault`) that legitimately return
-                // null when the key is absent. The generic `Ok(Null) => fall
-                // through` rule below conflates that real null with "method not
-                // recognized", which then re-resolves `pool.get(key)` against the
-                // CALLER component's method table — e.g. Preside CacheBox's
-                // `ConcurrentStore.getQuiet` (`return pool.get(arguments.objectKey)`)
-                // mis-dispatched to the sibling `ConcurrentStore.get` with zero
-                // args (the args were already consumed by `mem::take`), throwing
-                // "The parameter [objectKey] to function [get] is required". Treat
-                // the map shim's getter result as authoritative so a miss returns
-                // null instead of falling through.
-                let map_getter_owns_null = (matches!(
-                    java_class.as_str(),
-                    "java.util.concurrent.concurrenthashmap"
-                        | "java.util.linkedhashmap"
-                        | "java.util.treemap"
-                ) && matches!(method_lower.as_str(), "get" | "getordefault"))
-                    // SoftReference.get() and ReferenceQueue.poll() return null
-                    // by design (a cleared/empty reference). Treat that null as
-                    // authoritative, not "method unhandled". See #218.
-                    || (java_class == "java.lang.ref.softreference"
-                        && method_lower == "get")
-                    || (java_class == "java.lang.ref.weakreference"
-                        && method_lower == "get")
-                    || (java_class == "java.lang.ref.referencequeue"
-                        && matches!(method_lower.as_str(), "poll" | "remove"))
-                    // PropertyResourceBundle getters and the Enumeration cursor
-                    // may legitimately return null (absent key / past end-of-list);
-                    // treat that as authoritative, not "method unhandled".
-                    || (java_class == "java.util.propertyresourcebundle"
-                        && matches!(
-                            method_lower.as_str(),
-                            "handlegetobject" | "getobject" | "getstring"
-                        ))
-                    || (java_class == "java.util.enumeration"
-                        && matches!(method_lower.as_str(), "nextelement" | "next"))
-                    // System.setProperty/getProperty/clearProperty/getenv return
-                    // null authoritatively (no prior value / unset key). Falling
-                    // through would let the generic implicit-setter treat
-                    // setProperty(k,v) as `set`+`Property` and write the (null)
-                    // result over the receiver variable (GitHub #249).
-                    || (java_class == "java.lang.system"
-                        && matches!(
-                            method_lower.as_str(),
-                            "setproperty" | "getproperty" | "clearproperty" | "getenv"
-                        ))
-                    // Optional.ifPresent is `void` — its legitimate null return
-                    // must not be mistaken for "method unhandled" and fall
-                    // through to generic dispatch.
-                    || (java_class == "java.util.optional"
-                        && method_lower == "ifpresent")
-                    // ByteArrayOutputStream.write/reset/flush/close/writeTo are
-                    // `void` — their null return is a real result, not "method
-                    // unhandled". Falling through would let the generic implicit-
-                    // setter machinery mishandle write()/reset(). See #276.
-                    || (java_class == "java.io.bytearrayoutputstream"
-                        && matches!(
-                            method_lower.as_str(),
-                            "write" | "writebytes" | "reset" | "flush" | "close" | "writeto"
-                        ));
+                // NOTE: the former `map_getter_owns_null` allowlist lived here. It
+                // enumerated every shim method that legitimately returns null
+                // (map `get`/`getOrDefault`, SoftReference/WeakReference `get`,
+                // ReferenceQueue `poll`/`remove`, PropertyResourceBundle getters,
+                // Enumeration `nextElement`, System `getProperty`/`setProperty`/
+                // `clearProperty`/`getenv`, Optional `ifPresent`,
+                // ByteArrayOutputStream `write`/`reset`/...), because the old
+                // contract could not tell those apart from "method unhandled" and
+                // would otherwise re-dispatch them against the CALLER's method
+                // table. It grew one entry per bug report (GH #218, #239, #249,
+                // #276). Shims now signal "not mine" out-of-band via
+                // `CfmlError::shim_unhandled`, so every `Ok` they return —
+                // including `Ok(Null)` — is authoritative and the list is gone.
                 match result {
-                    Ok(CfmlValue::Null) if !map_getter_owns_null => {
+                    Err(ref e) if e.is_shim_unhandled() => {
                         // Shim didn't handle the method — fall through to the
                         // regular dispatch below so property access (e.g.
                         // system.out) still works. Restore the consumed args so
                         // the generic handler (struct HOFs, get(key), etc.) can
                         // see them (GH #239).
+                        //
+                        // "Unhandled" now arrives out-of-band instead of as
+                        // `Ok(Null)`, so a shim that genuinely returns null is
+                        // believed. That is what retires `map_getter_owns_null`.
                         *extra_args = fallthrough_args;
                     }
                     Ok(val) => return Ok(val),

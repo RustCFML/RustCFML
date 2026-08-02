@@ -188,6 +188,7 @@ include "harness.cfm";
 
 <!--- --- Standard Library --- --->
 <cf_runtest file="stdlib/test_hash_unknown_algorithm.cfm">
+<cf_runtest file="stdlib/test_java_shim_silent_noops.cfm">
 <cf_runtest file="stdlib/test_string_functions.cfm">
 <cf_runtest file="stdlib/test_string_functions_regex.cfm">
 <cf_runtest file="functions/test_string_position_unicode.cfm">

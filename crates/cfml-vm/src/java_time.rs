@@ -13,7 +13,7 @@
 //! DayOfWeek, Month) expose their constants as string-token keys for field reads.
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
-use cfml_common::vm::CfmlResult;
+use cfml_common::vm::{CfmlError, CfmlResult};
 use chrono::{Datelike, Months, NaiveDateTime, TimeZone, Timelike, Utc};
 
 pub const LOCALDATETIME_CLASS: &str = "java.time.localdatetime";
@@ -242,7 +242,7 @@ pub fn dispatch(class_lower: &str, method: &str, args: Vec<CfmlValue>, object: &
         CHRONOUNIT_CLASS => dispatch_chronounit(&m, args),
         DAYOFWEEK_CLASS => dispatch_dayofweek(&m, args, object),
         MONTH_CLASS => dispatch_month(&m, object),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -316,7 +316,7 @@ fn dispatch_datetime(class: &str, m: &str, args: Vec<CfmlValue>, object: &CfmlVa
             Ok(CfmlValue::strukt(dm))
         }
         "format" | "tostring" => Ok(CfmlValue::string(ndt.format("%Y-%m-%dT%H:%M:%S").to_string())),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(m)),
     }
 }
 
@@ -388,7 +388,7 @@ fn dispatch_duration(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlR
         "isnegative" => Ok(CfmlValue::Bool(ms < 0)),
         "iszero" => Ok(CfmlValue::Bool(ms == 0)),
         "tostring" => Ok(CfmlValue::string(format!("PT{}S", ms / 1000))),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(m)),
     }
 }
 
@@ -436,7 +436,7 @@ fn dispatch_zone(class: &str, m: &str, args: Vec<CfmlValue>, object: &CfmlValue)
                 Ok(CfmlValue::string(z))
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(m)),
     }
 }
 
@@ -447,7 +447,7 @@ fn dispatch_chronounit(m: &str, args: Vec<CfmlValue>) -> CfmlResult {
     // reach this via the token string, not here; kept for `valueOf`/`values`.
     match m {
         "valueof" => Ok(CfmlValue::string(args.first().map(|v| v.as_string().to_ascii_uppercase()).unwrap_or_default())),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(m)),
     }
 }
 
@@ -468,7 +468,7 @@ fn dispatch_dayofweek(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> Cfml
             };
             Ok(CfmlValue::Int(v))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(m)),
     }
 }
 

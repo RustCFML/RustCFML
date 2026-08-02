@@ -4,6 +4,11 @@ use crate::dynamic::{CfmlValue, ValueMap};
 
 pub type CfmlResult = Result<CfmlValue, CfmlError>;
 
+/// `error_type` marking [`CfmlError::shim_unhandled`]. Deliberately not a
+/// plausible CFML/Java exception name so it can never be caught by user code —
+/// it is consumed by the VM's java-shim dispatch and never escapes.
+const SHIM_UNHANDLED_TYPE: &str = "__rustcfml_shim_unhandled__";
+
 #[derive(Debug, Clone)]
 pub struct CfmlError {
     pub message: String,
@@ -80,6 +85,29 @@ impl CfmlError {
             message,
             CfmlErrorType::Custom("java.io.IOException".to_string()),
         )
+    }
+
+    /// Internal marker: a java shim was asked for a method it does not
+    /// implement. NOT a user-visible error — the VM's shim dispatch catches it
+    /// and falls through to generic dispatch.
+    ///
+    /// This exists because the old convention was "a shim returning `Ok(Null)`
+    /// means it didn't handle the method". That conflates *unhandled* with
+    /// *handled, returned null*, and every method that legitimately returns
+    /// null had to be enumerated in a hand-maintained allowlist
+    /// (`map_getter_owns_null`) that grew with each bug: GH #218, #239, #249,
+    /// #276. With unhandled carried out-of-band, `Ok(Null)` from a shim is
+    /// always authoritative and the allowlist disappears.
+    pub fn shim_unhandled(method: &str) -> Self {
+        Self::new(
+            format!("__shim_unhandled__:{}", method),
+            CfmlErrorType::Custom(SHIM_UNHANDLED_TYPE.to_string()),
+        )
+    }
+
+    /// Is this the internal "shim did not handle this method" marker?
+    pub fn is_shim_unhandled(&self) -> bool {
+        matches!(&self.error_type, CfmlErrorType::Custom(t) if t == SHIM_UNHANDLED_TYPE)
     }
 
     /// An unknown-hash-algorithm exception whose `type` matches Java's

@@ -1,7 +1,7 @@
 // Java shim handlers - to be inserted into lib.rs
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
 /// Process-global system-properties map, shared by every `java.lang.System`
@@ -551,7 +551,7 @@ pub fn handle_java_messagedigest(
                 Ok(CfmlValue::Null)
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -622,7 +622,7 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
         }
         "getversion" => Ok(CfmlValue::Int(4)),
         "getvariant" => Ok(CfmlValue::Int(2)),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -673,7 +673,33 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             }
             Ok(CfmlValue::Null)
         }
-        _ => Ok(CfmlValue::Null),
+        // These returned null, which is FALSY — so every `if (d1.before(d2))`
+        // silently took the else branch and no comparison ever fired.
+        "before" | "after" | "equals" | "compareto" => {
+            let mine = match object {
+                CfmlValue::Struct(shim) => shim.get("__millis").map(|v| to_millis(&v)).unwrap_or(0),
+                _ => 0,
+            };
+            // The argument is another Date shim (read its `__millis`), or a bare
+            // epoch-millis number.
+            let theirs = match args.first() {
+                Some(CfmlValue::Struct(s)) => s.get("__millis").map(|v| to_millis(&v)).unwrap_or(0),
+                Some(other) => to_millis(other),
+                None => 0,
+            };
+            Ok(match method {
+                "before" => CfmlValue::Bool(mine < theirs),
+                "after" => CfmlValue::Bool(mine > theirs),
+                "equals" => CfmlValue::Bool(mine == theirs),
+                // compareTo: negative / zero / positive, like Java.
+                _ => CfmlValue::Int(match mine.cmp(&theirs) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }),
+            })
+        }
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -728,7 +754,7 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
         "getpriority" => Ok(CfmlValue::Int(5)),
         "isdaemon" => Ok(CfmlValue::Bool(false)),
         "sleep" => Ok(CfmlValue::Null),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -845,7 +871,7 @@ pub fn handle_java_inetaddress(
                 Ok(CfmlValue::string("localhost".to_string()))
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1097,7 +1123,7 @@ pub fn handle_java_url(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -
                 method
             )))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1158,6 +1184,30 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
                         std::fs::remove_file(p)
                     };
                     return Ok(CfmlValue::Bool(res.is_ok()));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        // `renameTo(dest)` returned null and the file was never renamed — a
+        // failed move that reported nothing at all. The JDK contract is a
+        // boolean result with no throw, same as `delete` above.
+        "renameto" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    // The destination is another File shim, or a bare path string.
+                    let dest = match args.first() {
+                        Some(CfmlValue::Struct(d)) => {
+                            d.get("__path").map(|v| v.as_string()).unwrap_or_default()
+                        }
+                        Some(other) => other.as_string(),
+                        None => String::new(),
+                    };
+                    if dest.is_empty() {
+                        return Ok(CfmlValue::Bool(false));
+                    }
+                    return Ok(CfmlValue::Bool(
+                        std::fs::rename(path.as_str(), &dest).is_ok(),
+                    ));
                 }
             }
             Ok(CfmlValue::Bool(false))
@@ -1317,7 +1367,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             }
             Ok(CfmlValue::Null)
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1426,7 +1476,7 @@ pub fn handle_java_files(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue
             }
             Ok(CfmlValue::Bool(false))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1502,7 +1552,7 @@ pub fn handle_java_processbuilder(
             }
             Ok(CfmlValue::Null)
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1521,12 +1571,58 @@ pub fn handle_java_process(method: &str, _args: Vec<CfmlValue>, object: &CfmlVal
         }
         "isalive" => Ok(CfmlValue::Bool(false)),
         "destroy" | "destroyforcibly" => Ok(CfmlValue::Null),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
 pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue) -> CfmlResult {
     match method {
+        // `arraycopy(src, srcPos, dest, destPos, length)` returned null and
+        // copied NOTHING — a data-movement call that reported success while the
+        // destination stayed untouched. Copies in place through the shared
+        // handle, so the caller's `dest` array actually changes (Java's
+        // arraycopy mutates the destination; it returns void).
+        "arraycopy" => {
+            let (src, dest) = match (args.first(), args.get(2)) {
+                (Some(CfmlValue::Array(s)), Some(CfmlValue::Array(d))) => (s, d),
+                _ => {
+                    return Err(CfmlError::runtime(
+                        "System.arraycopy: src and dest must both be arrays".to_string(),
+                    ))
+                }
+            };
+            let num = |i: usize| -> i64 {
+                args.get(i)
+                    .map(|a| a.as_string().trim().parse::<i64>().unwrap_or(0))
+                    .unwrap_or(0)
+            };
+            let (src_pos, dest_pos, length) = (num(1), num(3), num(4));
+            let src_items = src.with_read(|v| v.clone());
+            let src_len = src_items.len() as i64;
+            let dest_len = dest.with_read(|v| v.len() as i64);
+            if src_pos < 0
+                || dest_pos < 0
+                || length < 0
+                || src_pos + length > src_len
+                || dest_pos + length > dest_len
+            {
+                return Err(CfmlError::new(
+                    format!(
+                        "System.arraycopy: out of bounds (srcPos={src_pos}, destPos={dest_pos}, \
+                         length={length}, src.length={src_len}, dest.length={dest_len})"
+                    ),
+                    CfmlErrorType::Custom(
+                        "java.lang.ArrayIndexOutOfBoundsException".to_string(),
+                    ),
+                ));
+            }
+            dest.with_write(|d| {
+                for i in 0..length as usize {
+                    d[dest_pos as usize + i] = src_items[src_pos as usize + i].clone();
+                }
+            });
+            Ok(CfmlValue::Null)
+        }
         "init" => {
             // java.lang.System is a static-only class in real Java, but we
             // return a shim struct so both init() and static-style access work.
@@ -1707,7 +1803,7 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 }
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1780,7 +1876,102 @@ pub fn handle_java_stringbuilder(
                 Ok(CfmlValue::Null)
             }
         }
-        _ => Ok(CfmlValue::Null),
+        // The mutators below used to fall through to the terminal arm, so the
+        // buffer was left SILENTLY INTACT: `sb.insert(0,"hello ")` followed by
+        // `sb.toString()` returned the original string with no error. All of
+        // them mutate in place and return the builder, matching `append`.
+        //
+        // Indices are CHARACTER offsets. Java's are UTF-16 code units; they
+        // agree for the BMP-and-ASCII text these shims actually see, and a char
+        // index is never a panic risk the way a byte index would be.
+        "insert" | "delete" | "deletecharat" | "setlength" | "replace" | "reverse" => {
+            let shim = match object {
+                CfmlValue::Struct(s) => s,
+                _ => return Ok(CfmlValue::Null),
+            };
+            let chars: Vec<char> = shim
+                .get("__buffer")
+                .map(|b| b.as_string())
+                .unwrap_or_default()
+                .chars()
+                .collect();
+            let len = chars.len() as i64;
+            let idx = |i: usize| -> i64 {
+                args.get(i).map(|a| a.as_string().parse::<i64>().unwrap_or(0)).unwrap_or(0)
+            };
+            let oob = |what: &str, i: i64| {
+                CfmlError::new(
+                    format!("StringBuilder.{}: index {} out of range 0..{}", what, i, len),
+                    CfmlErrorType::Custom("java.lang.StringIndexOutOfBoundsException".to_string()),
+                )
+            };
+
+            let updated: String = match method {
+                "insert" => {
+                    let at = idx(0);
+                    if at < 0 || at > len {
+                        return Err(oob("insert", at));
+                    }
+                    let ins = args.get(1).map(|a| a.as_string()).unwrap_or_default();
+                    let (a, b) = chars.split_at(at as usize);
+                    a.iter().collect::<String>() + &ins + &b.iter().collect::<String>()
+                }
+                "delete" => {
+                    // Java clamps `end` to length rather than throwing.
+                    let start = idx(0);
+                    let end = idx(1).min(len);
+                    if start < 0 || start > len || end < start {
+                        return Err(oob("delete", start));
+                    }
+                    chars[..start as usize]
+                        .iter()
+                        .chain(chars[end as usize..].iter())
+                        .collect()
+                }
+                "deletecharat" => {
+                    let at = idx(0);
+                    if at < 0 || at >= len {
+                        return Err(oob("deleteCharAt", at));
+                    }
+                    chars
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != at as usize)
+                        .map(|(_, c)| *c)
+                        .collect()
+                }
+                "setlength" => {
+                    let n = idx(0);
+                    if n < 0 {
+                        return Err(oob("setLength", n));
+                    }
+                    if n <= len {
+                        chars[..n as usize].iter().collect()
+                    } else {
+                        // Java pads with NUL to the requested length.
+                        chars.iter().collect::<String>()
+                            + &"\0".repeat((n - len) as usize)
+                    }
+                }
+                "replace" => {
+                    let start = idx(0);
+                    let end = idx(1).min(len);
+                    if start < 0 || start > len || end < start {
+                        return Err(oob("replace", start));
+                    }
+                    let rep = args.get(2).map(|a| a.as_string()).unwrap_or_default();
+                    chars[..start as usize].iter().collect::<String>()
+                        + &rep
+                        + &chars[end as usize..].iter().collect::<String>()
+                }
+                // "reverse"
+                _ => chars.iter().rev().collect(),
+            };
+
+            shim.insert("__buffer".to_string(), CfmlValue::string(updated));
+            Ok(object.clone())
+        }
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -1977,7 +2168,7 @@ pub fn handle_java_bytebuffer(
             commit(object, buf, pos);
             Ok(CfmlValue::Int(acc))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2059,7 +2250,7 @@ pub fn handle_java_bytearrayoutputstream(
         }
         // flush/close/writeto are no-ops on an in-memory stream (void).
         "flush" | "close" | "writeto" => Ok(CfmlValue::Null),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2144,7 +2335,7 @@ pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
                 Ok(CfmlValue::Bool(true))
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2228,7 +2419,7 @@ pub fn handle_java_linkedhashmap(
                 Ok(CfmlValue::Bool(true))
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2361,7 +2552,7 @@ pub fn handle_java_concurrentlinkedqueue(
             }
             Ok(CfmlValue::Null)
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2449,7 +2640,7 @@ fn handle_java_reference(
             }
             Ok(CfmlValue::Int(0))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2471,7 +2662,7 @@ pub fn handle_java_referencequeue(
         // Nothing is ever enqueued (no GC clears the soft refs), so the queue is
         // permanently empty: poll() returns null, remove(timeout) returns null.
         "poll" | "remove" => Ok(CfmlValue::Null),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2552,7 +2743,7 @@ pub fn handle_java_fileinputstream(
         // empty string rather than Null so it isn't treated as "unhandled" and
         // re-dispatched against the caller.
         "close" => Ok(CfmlValue::string(String::new())),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2663,7 +2854,7 @@ pub fn handle_java_fileoutputstream(
         // empty string rather than Null so it isn't treated as "unhandled" and
         // re-dispatched against the caller (same reasoning as FileInputStream).
         "flush" | "close" => Ok(CfmlValue::string(String::new())),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2698,7 +2889,7 @@ pub fn handle_java_inputstreamreader(
             Ok(CfmlValue::strukt(shim))
         }
         "close" => Ok(CfmlValue::string(String::new())),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2773,7 +2964,7 @@ pub fn handle_java_bufferedreader(
             Ok(CfmlValue::Bool(false))
         }
         "close" => Ok(CfmlValue::string(String::new())),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -2867,7 +3058,7 @@ pub fn handle_java_propertyresourcebundle(
             }
             Ok(CfmlValue::Bool(false))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3081,10 +3272,69 @@ pub fn handle_java_concurrenthashmap(
             }
             Ok(CfmlValue::Null)
         }
+        // `replace(k,v)` silently did nothing and the OLD value stayed in the
+        // map — a dropped write that looks like a successful one. Java replaces
+        // only when the key is present, and returns the previous value.
+        "replace" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some((k, v)) = args.first().zip(args.get(1)) {
+                    let key = k.as_string();
+                    return Ok(match shim.get(&key) {
+                        Some(prev) => {
+                            shim.insert(key, v.clone());
+                            prev
+                        }
+                        None => CfmlValue::Null,
+                    });
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        // `remove(k)` returns the removed value (null when absent).
+        "remove" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(k) = args.first() {
+                    let key = k.as_string();
+                    let prev = shim.get(&key).unwrap_or(CfmlValue::Null);
+                    shim.remove_ci(&key);
+                    return Ok(prev);
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        // compute/merge/computeIfAbsent/computeIfPresent take a remapping
+        // function. These shim handlers are free functions with no VM handle, so
+        // they cannot invoke a CFML closure — implementing them needs the
+        // VM-intercept treatment the higher-order builtins get.
+        //
+        // They previously returned null and never wrote the entry, so the
+        // computed value was silently lost. Fail loudly instead: a caller using
+        // these to populate a cache would otherwise read back an empty map and
+        // have no idea why. Tracked in docs/known-issues.md.
+        "compute" | "computeifabsent" | "computeifpresent" | "merge" => {
+            Err(CfmlError::runtime(format!(
+                "ConcurrentHashMap.{}() is not supported: it takes a remapping function, \
+                 which this shim cannot invoke. Use get()/put() explicitly instead.",
+                method
+            )))
+        }
         "get" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(k) = args.first() {
                     return Ok(shim.get(&k.as_string()).unwrap_or(CfmlValue::Null));
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        // `getOrDefault(key, default)` was never implemented: it fell to the
+        // terminal arm and returned null, and the old `map_getter_owns_null`
+        // allowlist then declared that null authoritative — so the caller's
+        // default was silently discarded and a miss looked like a stored null.
+        "getordefault" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(k) = args.first() {
+                    let default = args.get(1).cloned().unwrap_or(CfmlValue::Null);
+                    return Ok(shim.get(&k.as_string()).unwrap_or(default));
                 }
             }
             Ok(CfmlValue::Null)
@@ -3175,7 +3425,7 @@ pub fn handle_java_concurrenthashmap(
         }
         // remove is handled in the VM dispatch (needs return-and-mutate
         // semantics identical to Queue.poll); this arm is a no-op safety net.
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3219,7 +3469,7 @@ pub fn handle_java_class(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             Ok(CfmlValue::string(simple))
         }
         "tostring" => Ok(CfmlValue::string(format!("class {}", class_name))),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3314,7 +3564,7 @@ pub fn handle_java_reflect_array(
             }
             Ok(CfmlValue::Int(0))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3402,7 +3652,7 @@ pub fn handle_java_runtime(method: &str, _args: Vec<CfmlValue>, object: &CfmlVal
         "totalmemory" => Ok(CfmlValue::Double(536_870_912.0)),
         "maxmemory" => Ok(CfmlValue::Double(4_294_967_296.0)),
         "gc" | "runfinalization" => Ok(CfmlValue::Null),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3492,8 +3742,30 @@ pub fn handle_java_collections(
         },
         "sort" => {
             if let Some(CfmlValue::Array(a)) = args.into_iter().next() {
-                // Collections.sort mutates the list in place (reference semantics).
-                a.with_write(|v| v.sort_by(|x, y| x.as_string().cmp(&y.as_string())));
+                // Collections.sort mutates the list in place (reference semantics)
+                // and orders by the elements' NATURAL ordering (Comparable). This
+                // compared `as_string()` unconditionally, so a list of numbers
+                // sorted lexicographically — [10,9,2] came back [10,2,9], silently
+                // wrong with no error. Sort numerically when every element is a
+                // number, and fall back to string ordering otherwise (which is the
+                // natural ordering for String elements).
+                a.with_write(|v| {
+                    let all_numeric = v.iter().all(|x| {
+                        matches!(x, CfmlValue::Int(_) | CfmlValue::Double(_))
+                            || x.as_string().trim().parse::<f64>().is_ok()
+                    });
+                    if all_numeric && !v.is_empty() {
+                        v.sort_by(|x, y| {
+                            let (a, b) = (
+                                x.as_string().trim().parse::<f64>().unwrap_or(0.0),
+                                y.as_string().trim().parse::<f64>().unwrap_or(0.0),
+                            );
+                            a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    } else {
+                        v.sort_by(|x, y| x.as_string().cmp(&y.as_string()));
+                    }
+                });
                 return Ok(CfmlValue::Array(a));
             }
             Ok(CfmlValue::Null)
@@ -3505,7 +3777,7 @@ pub fn handle_java_collections(
             }
             Ok(CfmlValue::Null)
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3596,7 +3868,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
                 Ok(CfmlValue::Null)
             }
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -3848,7 +4120,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             }
             Ok(CfmlValue::Int(-1))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -4478,12 +4750,67 @@ pub fn handle_java_timezone(method: &str, args: Vec<CfmlValue>, object: &CfmlVal
         _ => return Ok(CfmlValue::Null),
     };
     let id = s.get("__tz_id").map(|v| v.as_string()).unwrap_or_else(|| "UTC".to_string());
+    // These offset accessors used to return a hardcoded 0 for EVERY zone, so any
+    // arithmetic built on them was silently wrong — `America/New_York` reported
+    // a raw offset of 0 just like UTC. chrono-tz already backs the rest of the
+    // engine's timezone support, so use it.
+    use chrono::{Offset, TimeZone as _};
+    use chrono_tz::OffsetComponents;
+    let zone = crate::tz::resolve_tz(&id);
+    // Instant to evaluate at: `getOffset(millis)` / `inDaylightTime(date)` take
+    // one, everything else uses "now" (Java's getRawOffset is instant-independent
+    // anyway, being the zone's STANDARD offset).
+    let at_millis = args
+        .first()
+        .map(|a| a.as_string())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
     Ok(match method {
         "getid" => CfmlValue::string(id),
         "getdisplayname" => CfmlValue::string(id),
-        "getrawoffset" | "getdstsavings" | "getoffset" => CfmlValue::Int(0),
-        "usedaylighttime" | "indaylighttime" => CfmlValue::Bool(false),
-        _ => CfmlValue::Null,
+        "getrawoffset" | "getdstsavings" | "getoffset" | "usedaylighttime"
+        | "indaylighttime" => {
+            let Some(tz) = zone else {
+                // Unknown id: Java's getTimeZone falls back to GMT, so 0 here is
+                // correct rather than a silent lie.
+                return Ok(match method {
+                    "usedaylighttime" | "indaylighttime" => CfmlValue::Bool(false),
+                    _ => CfmlValue::Int(0),
+                });
+            };
+            let dt = chrono::Utc
+                .timestamp_millis_opt(at_millis)
+                .single()
+                .unwrap_or_else(chrono::Utc::now);
+            let off = tz.offset_from_utc_datetime(&dt.naive_utc());
+            let base_ms = off.base_utc_offset().num_milliseconds();
+            let dst_ms = off.dst_offset().num_milliseconds();
+            match method {
+                // Standard offset, excluding any DST adjustment.
+                "getrawoffset" => CfmlValue::Int(base_ms),
+                // The DST saving this zone applies (0 when not in DST).
+                "getdstsavings" => CfmlValue::Int(dst_ms),
+                // Total offset at the instant, DST included.
+                "getoffset" => CfmlValue::Int(off.fix().local_minus_utc() as i64 * 1000),
+                // `inDaylightTime` is about THIS instant; `useDaylightTime` asks
+                // whether the zone observes DST at all — probe both solstices.
+                "indaylighttime" => CfmlValue::Bool(dst_ms != 0),
+                _ => {
+                    let year = dt.naive_utc().date().format("%Y").to_string();
+                    let probe = |md: &str| -> i64 {
+                        chrono::NaiveDateTime::parse_from_str(
+                            &format!("{year}-{md} 12:00:00"),
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        .map(|n| tz.offset_from_utc_datetime(&n).dst_offset().num_milliseconds())
+                        .unwrap_or(0)
+                    };
+                    CfmlValue::Bool(probe("01-15") != 0 || probe("07-15") != 0)
+                }
+            }
+        }
+        _ => return Err(CfmlError::shim_unhandled(method)),
     })
 }
 
@@ -4521,7 +4848,7 @@ pub fn handle_java_gregoriancalendar(
             CfmlValue::Struct(s) => Ok(s.get("__millis").unwrap_or(CfmlValue::Int(now_millis()))),
             _ => Ok(CfmlValue::Int(now_millis())),
         },
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -4550,7 +4877,7 @@ pub fn handle_java_dateformatsymbols(
         }
         "getampmstrings" => Ok(arr(&["AM", "PM"])),
         "geteras" => Ok(arr(&["BC", "AD"])),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -4576,7 +4903,7 @@ pub fn handle_java_decimalformatsymbols(
         "getzerodigit" => s("0"),
         "getinfinity" => s("\u{221e}"),
         "getnan" => s("NaN"),
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -4655,7 +4982,7 @@ pub fn handle_java_messageformat(
             };
             Ok(CfmlValue::string(format_message_pattern(&pattern, &arg_vec)))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
 
@@ -5329,6 +5656,6 @@ pub fn handle_java_dateformat(
             };
             Ok(CfmlValue::string(format_java_pattern(&dt, &pattern, Some(&zone_ctx))?))
         }
-        _ => Ok(CfmlValue::Null),
+        _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
