@@ -1443,6 +1443,80 @@ pub fn handle_java_files(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue
             }
             Ok(CfmlValue::Bool(false))
         }
+        // These returned null and performed NO I/O — a write path that appears
+        // to succeed while nothing reaches disk. Java signals failure by
+        // throwing IOException, so a real error surfaces rather than a bool.
+        "write" | "writestring" => {
+            let Some(path) = args.first().and_then(java_path_arg) else {
+                return Err(CfmlError::runtime(
+                    "Files.write: first argument must be a Path or path string".to_string(),
+                ));
+            };
+            // Content is a byte[] (CFML Array of ints), Binary, or a string.
+            let bytes: Vec<u8> = match args.get(1) {
+                Some(CfmlValue::Binary(b)) => b.clone(),
+                Some(v @ CfmlValue::Array(_)) => java_byte_array(v),
+                Some(other) => other.as_string().into_bytes(),
+                None => Vec::new(),
+            };
+            std::fs::write(&path, &bytes).map_err(|e| {
+                CfmlError::io_exception(format!("Files.write({}): {}", path, e))
+            })?;
+            // Java returns the Path it wrote to.
+            Ok(args.into_iter().next().unwrap_or(CfmlValue::Null))
+        }
+        "copy" | "move" => {
+            let (Some(src), Some(dst)) = (
+                args.first().and_then(java_path_arg),
+                args.get(1).and_then(java_path_arg),
+            ) else {
+                return Err(CfmlError::runtime(format!(
+                    "Files.{}: source and target must both be a Path or path string",
+                    method
+                )));
+            };
+            if method == "copy" {
+                std::fs::copy(&src, &dst).map_err(|e| {
+                    CfmlError::io_exception(format!("Files.copy({} -> {}): {}", src, dst, e))
+                })?;
+            } else {
+                std::fs::rename(&src, &dst).map_err(|e| {
+                    CfmlError::io_exception(format!("Files.move({} -> {}): {}", src, dst, e))
+                })?;
+            }
+            // Java returns the target Path.
+            Ok(args.into_iter().nth(1).unwrap_or(CfmlValue::Null))
+        }
+        "createdirectories" | "createdirectory" => {
+            let Some(path) = args.first().and_then(java_path_arg) else {
+                return Err(CfmlError::runtime(
+                    "Files.createDirectories: argument must be a Path or path string".to_string(),
+                ));
+            };
+            let res = if method == "createdirectories" {
+                std::fs::create_dir_all(&path)
+            } else {
+                std::fs::create_dir(&path)
+            };
+            res.map_err(|e| {
+                CfmlError::io_exception(format!("Files.{}({}): {}", method, path, e))
+            })?;
+            Ok(args.into_iter().next().unwrap_or(CfmlValue::Null))
+        }
+        "readallbytes" => {
+            let Some(path) = args.first().and_then(java_path_arg) else {
+                return Err(CfmlError::runtime(
+                    "Files.readAllBytes: argument must be a Path or path string".to_string(),
+                ));
+            };
+            let data = std::fs::read(&path).map_err(|e| {
+                CfmlError::io_exception(format!("Files.readAllBytes({}): {}", path, e))
+            })?;
+            // Same "native byte[]" shape as String.getBytes() — a CFML Array of
+            // signed ints — so arrayLen()/1-based indexing work on the result
+            // (GH #271). Returning Binary here made arrayLen() report 0.
+            Ok(bytes_to_signed_array(&data))
+        }
         "delete" => {
             // Files.delete removes the symlink/file itself and does NOT follow
             // links. On Unix std::fs::remove_file removes a symlink without

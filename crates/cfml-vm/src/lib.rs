@@ -3754,7 +3754,51 @@ impl CfmlVirtualMachine {
             } else {
                 "Optional.empty".to_string()
             })),
-            _ => Ok(CfmlValue::Null),
+            // These were missing entirely, so they fell through and returned
+            // null — the exact opposite of their contract. `orElse(fallback)`
+            // handed back null instead of the fallback, and `orElseThrow()`
+            // silently produced null instead of throwing, so the "absent" branch
+            // of every caller was skipped.
+            "orelse" => Ok(if present {
+                value
+            } else {
+                args.into_iter().next().unwrap_or(CfmlValue::Null)
+            }),
+            // orElseGet takes a supplier, invoked ONLY when empty (that laziness
+            // is the whole point of preferring it to orElse).
+            "orelseget" => {
+                if present {
+                    return Ok(value);
+                }
+                let proxy = args.into_iter().next().unwrap_or(CfmlValue::Null);
+                self.invoke_functional_proxy(&proxy, vec![], caller_locals)
+            }
+            // orElseThrow(): bare form throws NoSuchElementException; the
+            // supplier form throws whatever the supplier produces. Either way it
+            // MUST throw when empty.
+            "orelsethrow" => {
+                if present {
+                    return Ok(value);
+                }
+                match args.into_iter().next() {
+                    Some(proxy) if !matches!(proxy, CfmlValue::Null) => {
+                        let thrown =
+                            self.invoke_functional_proxy(&proxy, vec![], caller_locals)?;
+                        let msg = match &thrown {
+                            CfmlValue::Struct(s) => s
+                                .get("message")
+                                .map(|m| m.as_string())
+                                .unwrap_or_else(|| thrown.as_string()),
+                            other => other.as_string(),
+                        };
+                        Err(self.wrap_error(CfmlError::runtime(msg)))
+                    }
+                    _ => Err(self.wrap_error(CfmlError::runtime(
+                        "java.util.NoSuchElementException: No value present".to_string(),
+                    ))),
+                }
+            }
+            _ => Err(CfmlError::shim_unhandled(method)),
         }
     }
 

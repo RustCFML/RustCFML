@@ -126,5 +126,63 @@ assert("File.renameTo preserves content", fileRead(dstPath), "payload");
 if (fileExists(dstPath)) { fileDelete(dstPath); }
 if (fileExists(srcPath)) { fileDelete(srcPath); }
 
+// ---- Optional.orElse family (were missing, so they returned null) --------
+// NOTE: only `orElse` is comparable on Lucee — a CFML closure is not a
+// java.util.function.Supplier there, so Lucee throws NoSuchMethodException for
+// orElseGet/orElseThrow(supplier). Our shim accepts them, which is additive.
+Opt = createObject("java", "java.util.Optional");
+some = Opt.of("v");
+none = Opt.empty();
+assert("Optional.orElse returns the value when present", some.orElse("fb"), "v");
+assert("Optional.orElse returns the fallback when empty", none.orElse("fb"), "fb");
+
+// ---- java.nio.file.Files (returned null and performed no I/O) ------------
+Files = createObject("java", "java.nio.file.Files");
+tdir = getTempDirectory();
+fw = tdir & "rustcfml_nio_write.txt";
+fc = tdir & "rustcfml_nio_copy.txt";
+fdir = tdir & "rustcfml_nio_dir/sub/deep";
+if (fileExists(fw)) { fileDelete(fw); }
+if (fileExists(fc)) { fileDelete(fc); }
+
+// Capability guard: a real JVM's Files.write takes (Path, byte[]) and rejects
+// (string, string) with NoSuchMethodException — Lucee cannot express this call
+// with CFML types at all. Our shim accepts plain paths and strings, which is
+// additive, so probe first and skip rather than fail on the reference engine.
+nioTakesStrings = true;
+try { Files.write(fw, "nio-payload"); }
+catch (any e) { nioTakesStrings = false; }
+
+if (nioTakesStrings) {
+	assert("Files.write actually writes the file", fileRead(fw), "nio-payload");
+
+	Files.copy(fw, fc);
+	assert("Files.copy actually copies", fileRead(fc), "nio-payload");
+
+	Files.createDirectories(fdir);
+	assertTrue("Files.createDirectories creates the whole chain", directoryExists(fdir));
+
+	// readAllBytes returns the same "native byte[]" shape as String.getBytes():
+	// a CFML array of signed ints, so arrayLen() works on it (GH #271).
+	assert("Files.readAllBytes returns an indexable byte array",
+		arrayLen(Files.readAllBytes(fw)), 11);
+
+	// A failed write must throw, not silently do nothing.
+	caught = "";
+	try { Files.write(tdir & "rustcfml_no_such_dir_xyz/f.txt", "x"); }
+	catch (any e) { caught = e.type; }
+	assert("Files.write on an unwritable path throws IOException",
+		caught, "java.io.IOException");
+} else {
+	assertTrue("java.nio.file.Files skipped: engine requires real Path/byte[] args",
+		true);
+}
+
+if (fileExists(fw)) { fileDelete(fw); }
+if (fileExists(fc)) { fileDelete(fc); }
+if (directoryExists(tdir & "rustcfml_nio_dir")) {
+	directoryDelete(tdir & "rustcfml_nio_dir", true);
+}
+
 suiteEnd();
 </cfscript>
