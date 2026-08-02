@@ -184,5 +184,43 @@ if (directoryExists(tdir & "rustcfml_nio_dir")) {
 	directoryDelete(tdir & "rustcfml_nio_dir", true);
 }
 
+// ---- fileExists() must not go stale after a shim mutation ---------------
+// The engine keeps a request-scoped POSITIVE existence memo. The BIF write path
+// clears it (native fileDelete/fileMove were always correct), but java-shim
+// mutations bypassed that dispatch entirely — so after File.delete() or
+// Files.move(), fileExists() kept answering "true" for the rest of the request.
+// A silently wrong answer, not a crash, which is why it went unnoticed.
+// directoryList() is the ground truth here: it hits the filesystem directly.
+staleDir = getTempDirectory();
+staleFile = staleDir & "rustcfml_stale_probe.txt";
+fileWrite(staleFile, "x");
+
+// Prime the memo — this is what made the answer stick.
+assertTrue("the probe file exists before deletion", fileExists(staleFile));
+
+createObject("java", "java.io.File").init(staleFile).delete();
+
+assertTrue("directoryList confirms File.delete removed it",
+	arrayLen(directoryList(staleDir, false, "name", "rustcfml_stale_probe.txt")) EQ 0);
+assertTrue("fileExists agrees with the filesystem after File.delete",
+	NOT fileExists(staleFile));
+
+// Same again for a rename, where the memo must clear for BOTH paths.
+// File.renameTo (rather than Files.move) so this runs on the reference engine
+// too — Lucee cannot call Files.move with plain strings.
+moveFrom = staleDir & "rustcfml_stale_from.txt";
+moveTo   = staleDir & "rustcfml_stale_to.txt";
+fileWrite(moveFrom, "y");
+if (fileExists(moveTo)) { fileDelete(moveTo); }
+assertTrue("the move source exists before the move", fileExists(moveFrom));
+assertTrue("the move target does not exist before the move", NOT fileExists(moveTo));
+
+createObject("java", "java.io.File").init(moveFrom)
+	.renameTo(createObject("java", "java.io.File").init(moveTo));
+
+assertTrue("fileExists sees the move source is gone", NOT fileExists(moveFrom));
+assertTrue("fileExists sees the move target arrived", fileExists(moveTo));
+if (fileExists(moveTo)) { fileDelete(moveTo); }
+
 suiteEnd();
 </cfscript>

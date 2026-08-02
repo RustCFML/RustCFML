@@ -22205,6 +22205,28 @@ impl CfmlVirtualMachine {
                     }
                     _ => Ok(CfmlValue::Null),
                 };
+                // A shim that mutated the filesystem must invalidate the same
+                // caches the BIF write path does. Without this, the
+                // request-scoped positive existence memo kept answering "yes"
+                // for a file `File.delete()`/`Files.move()` had just removed,
+                // for the remainder of the request. Cleared wholesale for the
+                // same reason the BIF path clears it wholesale: a recursive
+                // delete or a move changes an unbounded set of paths, and
+                // mutations are rare next to the probes the memo serves.
+                if result.is_ok()
+                    && Self::java_shim_may_change_existence(&java_class, &method_lower)
+                {
+                    self.request_exists_cache.write().clear();
+                    // And flush the compiled-template caches for the touched
+                    // paths, so a shim that rewrites a .cfm is picked up by a
+                    // re-include in this request (the GH #284 contract).
+                    if self.server_state.is_some() {
+                        for p in Self::java_shim_touched_paths(object, &fallthrough_args) {
+                            self.invalidate_written_file_caches(&p, None);
+                        }
+                    }
+                }
+
                 // NOTE: the former `map_getter_owns_null` allowlist lived here. It
                 // enumerated every shim method that legitimately returns null
                 // (map `get`/`getOrDefault`, SoftReference/WeakReference `get`,
@@ -29074,6 +29096,68 @@ impl CfmlVirtualMachine {
     /// invalidator would let a stale `fileExists()` survive a delete within the
     /// same request, so anything uncertain is treated as mutating. (Creations need
     /// no invalidation at all — negatives are never cached.)
+    /// Does this java-shim method mutate the filesystem?
+    ///
+    /// The BIF path has `builtin_may_change_existence` for exactly this, but the
+    /// java shims dispatch through `call_member_function`, never reach it, and so
+    /// left `request_exists_cache` holding a pre-mutation answer: after
+    /// `File.delete()` or `Files.move()`, `fileExists()` still returned true for
+    /// the rest of the request (the memo caches positives). Native `fileDelete()`
+    /// / `fileMove()` were always correct — only the shims were not.
+    fn java_shim_may_change_existence(java_class: &str, method_lower: &str) -> bool {
+        match java_class {
+            "java.io.file" => matches!(
+                method_lower,
+                "delete" | "renameto" | "mkdir" | "mkdirs" | "createnewfile" | "deleteonexit"
+            ),
+            "java.nio.file.files" => matches!(
+                method_lower,
+                "write"
+                    | "writestring"
+                    | "copy"
+                    | "move"
+                    | "delete"
+                    | "deleteifexists"
+                    | "createdirectory"
+                    | "createdirectories"
+                    | "createfile"
+                    | "createtempfile"
+            ),
+            // Writing/closing a file stream creates or extends the target.
+            "java.io.fileoutputstream" => {
+                matches!(method_lower, "write" | "writebytes" | "close" | "flush")
+            }
+            _ => false,
+        }
+    }
+
+    /// Candidate filesystem paths a mutating shim call touched: the receiver's
+    /// own `__path`/`__spec` plus any path-like argument. Used to flush the
+    /// template read caches (GH #284) the same way the BIF write path does.
+    fn java_shim_touched_paths(object: &CfmlValue, args: &[CfmlValue]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |v: &CfmlValue| {
+            let p = match v {
+                CfmlValue::Struct(s) => s
+                    .get("__path")
+                    .or_else(|| s.get("__spec"))
+                    .map(|x| x.as_string()),
+                CfmlValue::String(s) => Some(s.to_string()),
+                _ => None,
+            };
+            if let Some(p) = p {
+                if !p.is_empty() && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        };
+        push(object);
+        for a in args {
+            push(a);
+        }
+        out
+    }
+
     fn builtin_may_change_existence(name_lower: &str) -> bool {
         // Read-only file/directory BIFs — everything else under those prefixes is
         // assumed to mutate.
