@@ -300,6 +300,8 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_cfhttp.cfm">
 <cf_runtest file="stdlib/test_cfhttp_binary_response.cfm">
 <cf_runtest file="stdlib/test_spreadsheet.cfm">
+<cf_runtest file="stdlib/test_member_function_coverage.cfm">
+<cf_runtest file="stdlib/test_locale_state.cfm">
 
 <!--- --- Function References --- --->
 <cf_runtest file="functions/test_function_references.cfm">

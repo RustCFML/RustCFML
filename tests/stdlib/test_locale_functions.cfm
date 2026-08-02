@@ -5,8 +5,17 @@
 
 // --- setLocale / getLocale ---
 suiteBegin("setLocale / getLocale");
+// GH #304: this used to read `assert(result, "en_US")` — asserting that setLocale
+// returns the locale it just SET. Lucee returns the PREVIOUS one (that is what
+// makes the return value useful for save-and-restore), and the previous locale
+// here is en_GB because tests/.cfconfig.json sets `runtime.locale: "en-GB"` — a
+// key that had no consumer until locale became real request state. Both halves of
+// this assertion is load-bearing. Set a known baseline first so the assertion does
+// not depend on the configured default, which differs by engine (RustCFML reads
+// tests/.cfconfig.json; Lucee uses its own server config).
+setLocale("en_GB");
 result = setLocale("English (US)");
-assert("setLocale returns locale", result, "en_US");
+assert("setLocale returns the PREVIOUS locale", result, "en_GB");
 assert("getLocale returns locale", lCase(getLocale()), "english (us)");
 suiteEnd();
 

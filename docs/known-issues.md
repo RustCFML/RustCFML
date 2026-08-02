@@ -33,7 +33,7 @@ Accepted but **ignored** (no error, no effect):
 | Setting | Notes |
 |---|---|
 | `this.timezone` | Per-app timezone ignored. Only the server/cfconfig `runtime.timezone` is honoured. |
-| `this.locale` | Per-app locale ignored. Only cfconfig `runtime.locale` is honoured. |
+| `this.locale` | Per-app locale ignored. Only cfconfig `runtime.locale` is honoured — which, as of GH #304, it genuinely is: it seeds request state read by `getLocale()` and the `ls*` family. (Before that fix this row was false: the key parsed but had no consumer, and every `ls*` function was pinned to `en_US`.) `setLocale()` overrides it for the rest of the request. |
 | `this.applicationTimeout` | Per-app value ignored. cfconfig `runtime.applicationTimeout` IS applied. |
 | `this.scriptProtect` | No script-protection filtering of scopes. |
 | `this.secureJSON` / `this.secureJSONPrefix` | Per-app value ignored. cfconfig `security.secureJSON*` IS applied (process-global — see §4). |
@@ -674,6 +674,68 @@ threshold Lucee's resource appender produces (confirmed by overflowing a log on 
 
 ---
 
+## 25. Member-function dispatch — unknown members now throw ✅ *(fixed in v0.549.0, GH [#307](https://github.com/RustCFML/RustCFML/issues/307))*
+
+`call_member_function` used to end in a bare `Ok(CfmlValue::Null)`. Components (GH #220)
+and plain structs (GH #285) had each been tightened to throw, but **Array, String, Query,
+numeric, Boolean, Binary and TimeSpan receivers stayed lenient** — so every gap in the
+member tables was a *silent* no-op rather than an error.
+
+That is what made GH #307 dangerous: `filtered.add(x)` appended nothing and threw nothing,
+so calling code took the success path with an empty array (Preside's
+`TaskManagerService.listTasks()` returned `[]` for every call). Assigning the resulting
+Null also trips the PR #112 null-delete guard, so the failure typically resurfaced far
+away as a misleading `Variable 'X' is undefined`.
+
+Unknown members on those receivers now throw
+`The function [x] does not exist in the <Type>.`, matching Lucee. The missing members
+themselves were also wired up: the `java.util.List` passthroughs on arrays
+(`add`/`get`/`remove`/`removeAll`/`retainAll`/`subList`/`containsAll`/`indexOf`/
+`lastIndexOf`), the `java.util.Map` passthroughs on structs
+(`put`/`putIfAbsent`/`remove`/`containsKey`/`containsValue`/`keySet`/`values`/`entrySet`),
+the `java.lang.String` passthroughs (`charAt`/`substring`/`concat`/`equals`/
+`equalsIgnoreCase`/`compareTo`/`hashCode`/`replaceAll`/`isBlank`), and the CFML array
+members whose BIFs already existed but were never mapped (`pop`/`shift`/`unshift`/`swap`/
+`resize`/`set`/`splice`/`mid`/`median`/`toStruct`/`removeDuplicates`/`indexExists`/…).
+
+**Behaviour changes to be aware of when upgrading:**
+
+- `indexOf`/`lastIndexOf` on **both arrays and strings** are the Java methods:
+  **0-based, returning −1 when absent**. They were previously aliased onto `find`
+  (1-based, `0` when absent), which silently made `if ( x.indexOf(v) >= 0 )` always true
+  and every hit off by one. `find()` itself is unchanged and still 1-based.
+- `arrayResize` fills with **null**, not empty strings (Lucee parity).
+- `arraySet`/`arraySwap` **throw** on an under-supplied call instead of returning `false`
+  and mutating nothing.
+
+Remaining divergences in this area (all minor, all verified against Lucee 7.0.4):
+
+| Member | RustCFML | Lucee |
+|---|---|---|
+| `struct.values()` / `.keySet()` / `.entrySet()` | CFML array (iterable, castable) | live `java.util.Collection` views; the `Values` view can be neither cast nor looped |
+| `array.deleteNoCase(v)` | returns boolean "was it found" | returns the array |
+| `array.unshift(v)` | returns the array | returns the new length |
+| `date.noSuchMember()` | reports type `String` | reports type `Datetime` (RustCFML dates are strings) |
+
+## 26. Locale is request state; the `ls*` locale table is hand-maintained 🏗 *(GH [#304](https://github.com/RustCFML/RustCFML/issues/304))*
+
+`getLocale()`/`setLocale()` were inert stubs and cfconfig `runtime.locale` had no
+consumer, so the whole `ls*` family behaved as US English regardless of what the
+application or config asked for. Locale is now per-request VM state, seeded from
+`runtime.locale`, mutated by `setLocale()` (which returns the **previous** locale, in
+code form — Lucee's save-and-restore contract) and read by `getLocale()` and the
+formatters. An unresolvable locale is an **error**, not a silent fall back to `en_US`.
+
+**Gap:** the number/currency conventions live in a hand-maintained table
+(`cfml-common/src/locale.rs`), not a full CLDR/ICU dataset. It covers the ~32 locales
+RustCFML names, and an unlisted locale falls back to its language's conventions and then
+to `en_US`. Locale-specific **date** formatting (month/day names, date field order) is
+**not** yet driven by the locale — `lsDateFormat`/`lsTimeFormat`/`lsParseDateTime` still
+behave as `en_US`. Extend the table rather than letting a caller's locale be dropped.
+
+---
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
-ignored tag attributes) should refresh it.*
+ignored tag attributes) should refresh it. The most recent such sweep
+(2026-08-02) is recorded in `NOOP_AUDIT_2026-08-02.md`.*

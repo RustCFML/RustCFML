@@ -2809,7 +2809,12 @@ impl CfmlVirtualMachine {
         self.null_support = r.null_support;
         self.dot_notation_upper = r.dot_notation_upper_case;
         if !r.locale.is_empty() {
-            self.locale = r.locale.clone();
+            // Canonicalise so `"en-GB"`, `"en_GB"` and `"English (UK)"` in a
+            // .cfconfig.json all reach the ls* formatters as the same code.
+            // GH #304: this assignment existed but nothing ever read `self.locale`.
+            self.locale = cfml_common::locale::canonical_locale(&r.locale)
+                .unwrap_or_else(|| r.locale.clone());
+            cfml_common::locale::set_current_locale(&self.locale);
         }
         if !r.timezone.is_empty() {
             self.timezone = r.timezone.clone();
@@ -3538,6 +3543,10 @@ impl CfmlVirtualMachine {
         self.null_support = seed.null_support;
         self.dot_notation_upper = seed.dot_notation_upper;
         self.locale = seed.locale;
+        // Republish to the thread-local the ls* formatters read: a serve-mode
+        // worker thread is reused across requests, so without this a locale set by
+        // `setLocale()` in one request would still be in force for the next.
+        cfml_common::locale::set_current_locale(&self.locale);
         self.timezone = seed.timezone;
         self.whitespace_compression = seed.whitespace_compression;
         self.session_timeout_secs = seed.session_timeout_secs;
@@ -10301,6 +10310,26 @@ impl CfmlVirtualMachine {
                                 && !s.contains_key("__is_super")
                                 && matches!(s.get_ci(method_name.as_str()), Some(CfmlValue::Function(_))));
 
+                    // GH #307: the java.util.Map passthroughs on a PLAIN struct
+                    // (`put`/`putIfAbsent`) return the affected VALUE, per Lucee —
+                    // not the receiver. They mutate the Arc-shared backing in place,
+                    // so the `is_mutating_method` value-writeback is not merely
+                    // redundant here: it would replace the struct variable with that
+                    // value, i.e. `s.put("k","v")` left `s` == "v". The java-SHIM
+                    // `put` (java_shims.rs:2053, TreeMap et al.) genuinely does
+                    // return a fresh struct and still needs the writeback, hence the
+                    // `__java_shim` exclusion.
+                    let plain_struct_map_passthrough = matches!(&object,
+                        CfmlValue::Struct(ref s)
+                            if !s.contains_key("__variables")
+                                && !s.contains_key("__name")
+                                && !s.contains_key("__java_shim")
+                                && !s.contains_key("__is_super")
+                                && matches!(
+                                    method_name.to_lowercase().as_str(),
+                                    "put" | "putifabsent"
+                                ));
+
                     // Record this frame's `__variables` so a method dispatched on
                     // a still-being-constructed receiver (no `__variables` of its
                     // own yet) can fall back to the caller's hoisted method table.
@@ -10589,6 +10618,9 @@ impl CfmlVirtualMachine {
                     // A shadowed plain-struct closure member never mutates its
                     // receiver — skip the value-writeback entirely (see above).
                     let write_back = if plain_struct_fn_member_shadows { &None } else { write_back };
+                    // Map passthroughs mutate in place and return a VALUE — writing
+                    // that value back would destroy the struct (see above).
+                    let write_back = if plain_struct_map_passthrough { &None } else { write_back };
                     if let Some(ref path) = write_back {
                         if path.len() == 1 {
                             // Direct variable write-back: var.method(args)
@@ -12997,6 +13029,8 @@ impl CfmlVirtualMachine {
                 | "getfunctioncalledname"
                 | "gettimezone"
                 | "settimezone"
+                | "getlocale"
+                | "setlocale"
                 | "gettimezoneinfo"
                 | "dateconvert"
                 | "expandpath"
@@ -15005,6 +15039,43 @@ impl CfmlVirtualMachine {
                     }
                     // Fallback: return UTC
                     return Ok(CfmlValue::string("UTC".to_string()));
+                }
+                // GH #304: locale is REQUEST STATE, exactly like the timezone above.
+                // `getLocale()` used to return a hardcoded "english (us)" and
+                // `setLocale()` computed a code and threw it away, so cfconfig's
+                // `runtime.locale` had no consumer and every ls* function was pinned
+                // to US English. `self.locale` was already plumbed through cfconfig
+                // and the request seed — it simply had no reader or writer.
+                "getlocale" => {
+                    let code = if self.locale.is_empty() {
+                        cfml_common::locale::DEFAULT_LOCALE.to_string()
+                    } else {
+                        self.locale.clone()
+                    };
+                    return Ok(CfmlValue::string(cfml_common::locale::friendly_name(&code)));
+                }
+                "setlocale" => {
+                    let requested = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    let code = cfml_common::locale::canonical_locale(&requested).ok_or_else(
+                        || {
+                            CfmlError::runtime(format!(
+                                "setLocale(): unknown locale [{}].",
+                                requested
+                            ))
+                        },
+                    )?;
+                    let previous = if self.locale.is_empty() {
+                        cfml_common::locale::DEFAULT_LOCALE.to_string()
+                    } else {
+                        self.locale.clone()
+                    };
+                    self.locale = code.clone();
+                    cfml_common::locale::set_current_locale(&code);
+                    // Lucee returns the PREVIOUS locale, not the new one — that is
+                    // what makes the return value useful for save-and-restore — and
+                    // it returns the CODE form (`en_US`), where getLocale() returns
+                    // the friendly name. Verified vs Lucee 7.0.4.
+                    return Ok(CfmlValue::string(previous));
                 }
                 "settimezone" => {
                     // Set the request/application timezone honored by
@@ -21225,7 +21296,13 @@ impl CfmlVirtualMachine {
                 }
                 CfmlValue::array(names)
             }
-            "getlocale" => CfmlValue::string("en_US".to_string()),
+            // ServletResponse.getLocale() — report the request's actual locale
+            // (GH #304), not a hardcoded en_US.
+            "getlocale" => CfmlValue::string(if self.locale.is_empty() {
+                cfml_common::locale::DEFAULT_LOCALE.to_string()
+            } else {
+                self.locale.clone()
+            }),
             "setlocale" | "setcharacterencoding" => receiver.clone(),
             "sendredirect" => {
                 let url = args.first().map(|a| a.as_string()).unwrap_or_default();
@@ -22189,6 +22266,165 @@ impl CfmlVirtualMachine {
                     // parsing — GitHub PR #166.)
                     return Ok(CfmlValue::string(object.as_string()));
                 }
+                // ---- java.lang.String passthroughs (GH #307 audit) -----------
+                // Lucee reflects unmatched string member calls onto java.lang.String.
+                // None of these had arms here, so each returned Null from the terminal
+                // fall-through — and because a Null assignment trips the PR #112
+                // null-delete guard, the symptom surfaced later as a bogus "Variable X
+                // is undefined" rather than at the call site. All are ZERO-based and
+                // case-SENSITIVE, matching Java (verified vs Lucee 7.0.4).
+                //
+                // `indexOf`/`lastIndexOf` were previously aliased onto `find`, which is
+                // 1-based and returns 0 when absent. Java returns -1 when absent, so
+                // the idiomatic `if ( s.indexOf(x) >= 0 )` was ALWAYS true and every
+                // hit was off by one. They are their own arms now.
+                "indexof" | "lastindexof" => {
+                    let hay = object.as_string();
+                    let needle = match extra_args.first() {
+                        Some(v) => v.as_string(),
+                        None => return Ok(CfmlValue::Int(-1)),
+                    };
+                    // Byte offsets would diverge from Java's UTF-16 indices on
+                    // non-ASCII input; count chars so the result is a char index.
+                    let byte_pos = if method_lower == "lastindexof" {
+                        hay.rfind(&needle)
+                    } else {
+                        let from = extra_args
+                            .get(1)
+                            .and_then(|v| v.as_string().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let start = hay
+                            .char_indices()
+                            .nth(from)
+                            .map(|(b, _)| b)
+                            .unwrap_or(hay.len());
+                        hay[start..].find(&needle).map(|p| p + start)
+                    };
+                    return Ok(CfmlValue::Int(match byte_pos {
+                        Some(b) => hay[..b].chars().count() as i64,
+                        None => -1,
+                    }));
+                }
+                "charat" => {
+                    let s = object.as_string();
+                    let idx = extra_args
+                        .first()
+                        .and_then(|v| v.as_string().parse::<i64>().ok())
+                        .unwrap_or(-1);
+                    let ch = if idx < 0 {
+                        None
+                    } else {
+                        s.chars().nth(idx as usize)
+                    };
+                    return match ch {
+                        Some(c) => Ok(CfmlValue::string(c.to_string())),
+                        None => Err(self.wrap_error(CfmlError::runtime(format!(
+                            "String index out of range: {}",
+                            idx
+                        )))),
+                    };
+                }
+                // `substring(begin[, end])` — 0-based, `end` exclusive.
+                "substring" => {
+                    let s = object.as_string();
+                    let chars: Vec<char> = s.chars().collect();
+                    let begin = extra_args
+                        .first()
+                        .and_then(|v| v.as_string().parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(chars.len());
+                    let end = extra_args
+                        .get(1)
+                        .and_then(|v| v.as_string().parse::<usize>().ok())
+                        .unwrap_or(chars.len())
+                        .clamp(begin, chars.len());
+                    return Ok(CfmlValue::string(
+                        chars[begin..end].iter().collect::<String>(),
+                    ));
+                }
+                "concat" => {
+                    let mut s = object.as_string();
+                    for a in extra_args.iter() {
+                        s.push_str(&a.as_string());
+                    }
+                    return Ok(CfmlValue::string(s));
+                }
+                "equals" | "equalsignorecase" => {
+                    let a = object.as_string();
+                    let b = extra_args
+                        .first()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    let eq = if method_lower == "equalsignorecase" {
+                        a.eq_ignore_ascii_case(&b)
+                    } else {
+                        a == b
+                    };
+                    return Ok(CfmlValue::Bool(eq));
+                }
+                // java.lang.String.compareTo returns the difference of the first
+                // differing chars (or of the lengths), NOT a clamped -1/0/1 — but
+                // callers only ever test the sign, and Lucee's own `compare` member
+                // is the clamped CFML one, so sign is what matters here.
+                "compareto" | "comparetoignorecase" => {
+                    let mut a = object.as_string();
+                    let mut b = extra_args
+                        .first()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    if method_lower == "comparetoignorecase" {
+                        a = a.to_lowercase();
+                        b = b.to_lowercase();
+                    }
+                    return Ok(CfmlValue::Int(match a.cmp(&b) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    }));
+                }
+                // java.lang.String.hashCode: s[0]*31^(n-1) + s[1]*31^(n-2) + …,
+                // wrapping in 32-bit two's complement. Reproduced exactly so a
+                // value hashed on Lucee and on RustCFML keys the same bucket.
+                "hashcode" => {
+                    let mut h: i32 = 0;
+                    for c in object.as_string().encode_utf16() {
+                        h = h.wrapping_mul(31).wrapping_add(c as i32);
+                    }
+                    return Ok(CfmlValue::Int(h as i64));
+                }
+                // `replaceAll`/`replaceFirst` take a REGEX (unlike CFML replace()).
+                "replaceall" | "replacefirst" => {
+                    let s = object.as_string();
+                    let pat = extra_args
+                        .first()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    let rep = extra_args
+                        .get(1)
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    let rust_pat = java_shims::java_regex_to_rust(&pat);
+                    return match regex::Regex::new(&rust_pat) {
+                        Ok(re) => {
+                            let out = if method_lower == "replacefirst" {
+                                re.replace(&s, rep.as_str())
+                            } else {
+                                re.replace_all(&s, rep.as_str())
+                            };
+                            Ok(CfmlValue::string(out.into_owned()))
+                        }
+                        Err(e) => Err(self.wrap_error(CfmlError::runtime(format!(
+                            "String.{}: invalid regex [{}]: {}",
+                            method_lower, pat, e
+                        )))),
+                    };
+                }
+                "isblank" => {
+                    return Ok(CfmlValue::Bool(object.as_string().trim().is_empty()));
+                }
+                "strip" => {
+                    return Ok(CfmlValue::string(object.as_string().trim().to_string()));
+                }
                 "len" | "length" => Some("len"),
                 // `"".isEmpty()` / `s.isEmpty()` — string member form of the
                 // isEmpty() builtin (Java String.isEmpty parity). Was absent, so
@@ -22253,7 +22489,9 @@ impl CfmlVirtualMachine {
                 "left" => Some("left"),
                 "right" => Some("right"),
                 "mid" => Some("mid"),
-                "find" | "indexof" => Some("find"),
+                // NB: `indexOf` is the 0-based java.lang.String method, handled
+                // above — it is deliberately NOT an alias of the 1-based `find`.
+                "find" => Some("find"),
                 "findnocase" => Some("findNoCase"),
                 "replace" => Some("replace"),
                 "replacenocase" => Some("replaceNoCase"),
@@ -22490,6 +22728,183 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::Bool(true));
                 }
+                // ---- java.util.List passthroughs (GH #307) -------------------
+                // Lucee reflects unmatched member calls onto the backing
+                // java.util.List, so `.add()`, `.get()`, `.remove()` and friends
+                // all work there. RustCFML had no arms for them and the terminal
+                // fall-through of this function returned Null — so `filtered.add(x)`
+                // silently appended NOTHING and threw nothing (Preside's
+                // TaskManagerService.listTasks() returned [] for every call).
+                // These are Java methods, so indices are ZERO-based and lookups
+                // are case-SENSITIVE — verified against Lucee 7.0.4.
+                //
+                // `add(elem)` appends and returns boolean true; `add(index, elem)`
+                // inserts at a 0-based index and returns void. Neither is in
+                // is_mutating_method: CfmlArray is Arc-shared, so the in-place
+                // mutation already reaches the variable, and writing the boolean
+                // back over the receiver would destroy the array.
+                "add" => {
+                    if extra_args.len() >= 2 {
+                        let idx = extra_args[0].as_string().parse::<usize>().unwrap_or(0);
+                        let elem = extra_args[1].clone();
+                        arr.with_write(|v| {
+                            let at = idx.min(v.len());
+                            v.insert(at, elem);
+                        });
+                        return Ok(CfmlValue::Null);
+                    }
+                    if let Some(first) = extra_args.first() {
+                        arr.push(first.clone());
+                    }
+                    return Ok(CfmlValue::Bool(true));
+                }
+                // `get(index)` — 0-based. Out of range throws, as java.util.List does.
+                "get" => {
+                    let idx = extra_args
+                        .first()
+                        .and_then(|v| v.as_string().parse::<i64>().ok())
+                        .unwrap_or(-1);
+                    let items = arr.snapshot();
+                    if idx < 0 || idx as usize >= items.len() {
+                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                            "Array index out of range: {} (size {})",
+                            idx,
+                            items.len()
+                        ))));
+                    }
+                    return Ok(items[idx as usize].clone());
+                }
+                // `remove(value)` removes the FIRST element equal to `value` and
+                // returns whether anything was removed. This is List.remove(Object),
+                // not remove(int): Lucee's reflection binds the boxed CFML value to
+                // the Object overload, so `[10,20,30].remove(1)` is false (no element
+                // equals 1) rather than deleting index 1. Verified vs Lucee 7.0.4.
+                "remove" => {
+                    let target = match extra_args.first() {
+                        Some(v) => v.as_string(),
+                        None => return Ok(CfmlValue::Bool(false)),
+                    };
+                    let removed = arr.with_write(|v| {
+                        match v.iter().position(|x| x.as_string() == target) {
+                            Some(pos) => {
+                                v.remove(pos);
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                    return Ok(CfmlValue::Bool(removed));
+                }
+                "removeall" | "retainall" => {
+                    let others: Vec<String> = match extra_args.first() {
+                        Some(CfmlValue::Array(o)) => {
+                            o.snapshot().iter().map(|v| v.as_string()).collect()
+                        }
+                        Some(v) => vec![v.as_string()],
+                        None => return Ok(CfmlValue::Bool(false)),
+                    };
+                    let retain = method_lower == "retainall";
+                    let changed = arr.with_write(|v| {
+                        let before = v.len();
+                        v.retain(|x| others.contains(&x.as_string()) == retain);
+                        v.len() != before
+                    });
+                    return Ok(CfmlValue::Bool(changed));
+                }
+                "containsall" => {
+                    let mine: Vec<String> =
+                        arr.snapshot().iter().map(|v| v.as_string()).collect();
+                    let all = match extra_args.first() {
+                        Some(CfmlValue::Array(o)) => o
+                            .snapshot()
+                            .iter()
+                            .all(|v| mine.contains(&v.as_string())),
+                        Some(v) => mine.contains(&v.as_string()),
+                        None => true,
+                    };
+                    return Ok(CfmlValue::Bool(all));
+                }
+                // `subList(fromInclusive, toExclusive)` — 0-based, like Java.
+                "sublist" => {
+                    let items = arr.snapshot();
+                    let from = extra_args
+                        .first()
+                        .and_then(|v| v.as_string().parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(items.len());
+                    let to = extra_args
+                        .get(1)
+                        .and_then(|v| v.as_string().parse::<usize>().ok())
+                        .unwrap_or(items.len())
+                        .clamp(from, items.len());
+                    return Ok(CfmlValue::array(items[from..to].to_vec()));
+                }
+                // `indexOf`/`lastIndexOf` are java.util.List methods: ZERO-based,
+                // and -1 when absent. They are NOT aliases of arrayFind (1-based,
+                // 0 when absent) — mapping indexOf onto arrayFind made every
+                // `if ( list.indexOf(x) >= 0 )` guard TRUE for a missing element
+                // and every hit off by one. Verified vs Lucee 7.0.4.
+                // The closure-PREDICATE form of `indexOf` is handled further down
+                // (shared with `find`), so only the value-needle form lands here.
+                "indexof" | "lastindexof"
+                    if !matches!(extra_args.first(), Some(CfmlValue::Function(_))) =>
+                {
+                    let target = match extra_args.first() {
+                        Some(v) => v.as_string(),
+                        None => return Ok(CfmlValue::Int(-1)),
+                    };
+                    let items = arr.snapshot();
+                    let found = if method_lower == "lastindexof" {
+                        items.iter().rposition(|x| x.as_string() == target)
+                    } else {
+                        items.iter().position(|x| x.as_string() == target)
+                    };
+                    return Ok(CfmlValue::Int(
+                        found.map(|i| i as i64).unwrap_or(-1),
+                    ));
+                }
+                // ---- CFML array member functions whose BIFs already existed but
+                // ---- were never wired into member dispatch, so each one was a
+                // ---- silent Null (GH #307 audit).
+                "pop" => Some("arrayPop"),
+                "shift" => Some("arrayShift"),
+                "unshift" => Some("arrayUnshift"),
+                "swap" => Some("arraySwap"),
+                "resize" => Some("arrayResize"),
+                "set" => Some("arraySet"),
+                "splice" => Some("arraySplice"),
+                "mid" => Some("arrayMid"),
+                "median" => Some("arrayMedian"),
+                "tostruct" => Some("arrayToStruct"),
+                "deletenocase" => Some("arrayDeleteNoCase"),
+                "indexexists" => Some("arrayIndexExists"),
+                "isdefined" => Some("arrayIsDefined"),
+                "reduceright" => Some("arrayReduceRight"),
+                "duplicate" | "copy" => Some("duplicate"),
+                "getmetadata" => Some("getMetadata"),
+                // `removeDuplicates([ignoreCase])` — no standalone arrayRemoveDuplicates
+                // BIF exists, so it is implemented here rather than registering a new
+                // builtin. Returns a NEW array (Lucee does not mutate the receiver).
+                "removeduplicates" => {
+                    let nocase = extra_args
+                        .first()
+                        .map(|v| v.is_true())
+                        .unwrap_or(false);
+                    let mut seen: Vec<String> = Vec::new();
+                    let mut out: Vec<CfmlValue> = Vec::new();
+                    for item in arr.snapshot() {
+                        let key = if nocase {
+                            item.as_string().to_lowercase()
+                        } else {
+                            item.as_string()
+                        };
+                        if !seen.contains(&key) {
+                            seen.push(key);
+                            out.push(item);
+                        }
+                    }
+                    return Ok(CfmlValue::array(out));
+                }
                 "deleteat" => Some("arrayDeleteAt"),
                 // `arr.delete(value)` deletes the element equal to `value`
                 // (Lucee member function). Missing here, it fell through to
@@ -22552,7 +22967,9 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::array(indices));
                 }
-                "find" | "indexof" => Some("arrayFind"),
+                // NB: `indexOf` is deliberately NOT an alias of arrayFind — it is
+                // the 0-based java.util.List method, handled above.
+                "find" => Some("arrayFind"),
                 "findnocase" => Some("arrayFindNoCase"),
                 "findall" => Some("arrayFindAll"),
                 "findallnocase" => Some("arrayFindAllNoCase"),
@@ -22809,6 +23226,100 @@ impl CfmlVirtualMachine {
                 // (overwrite). Lucee exposes it on structs; Preside's cfflow
                 // YamlParser.toCF() relies on `cfObj.putAll( javaMap )`.
                 "putall" => Some("structAppend"),
+                // ---- java.util.Map passthroughs (GH #307 audit) --------------
+                // Lucee exposes the backing Map's methods on plain structs. These
+                // had no arms, so they fell through to the plain-struct throw at
+                // the end of this function ("Variable 'put' is undefined") — loud
+                // rather than silent, but still wrong: Preside/ColdBox code that
+                // treats a struct as a Map failed outright.
+                //
+                // Return value follows LUCEE, not java.util.Map: Lucee hands back
+                // the value now AT the key — the new value for `put`, the retained
+                // existing one for `putIfAbsent` — where Map.put would return the
+                // DISPLACED previous value. Verified vs Lucee 7.0.4. The caller
+                // suppresses the is_mutating_method write-back for these two (see
+                // `plain_struct_map_passthrough`), since returning a value rather
+                // than the receiver would otherwise clobber the struct variable.
+                "put" | "putifabsent" => {
+                    let key = match extra_args.first() {
+                        Some(k) => k.as_string(),
+                        None => return Ok(CfmlValue::Null),
+                    };
+                    let prev = s.get_ci(&key);
+                    if method_lower == "putifabsent" {
+                        if let Some(existing) = prev {
+                            return Ok(existing);
+                        }
+                    }
+                    let val = extra_args.get(1).cloned().unwrap_or(CfmlValue::Null);
+                    // Write through the existing key's casing when present, so a
+                    // put() never duplicates a differently-cased entry.
+                    let stored_key = s
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                        .map(|(k, _)| k.clone())
+                        .unwrap_or(key);
+                    s.insert(stored_key, val.clone());
+                    return Ok(val);
+                }
+                // Map.remove(key) deletes the entry and returns the removed value
+                // (structDelete returns a boolean, so it can't be aliased here).
+                "remove" => {
+                    let key = match extra_args.first() {
+                        Some(k) => k.as_string(),
+                        None => return Ok(CfmlValue::Null),
+                    };
+                    let prev = s.get_ci(&key);
+                    if prev.is_some() {
+                        if let Some(stored) = s
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .map(|(k, _)| k.clone())
+                        {
+                            s.remove(&stored);
+                        }
+                    }
+                    return Ok(prev.unwrap_or(CfmlValue::Null));
+                }
+                "containskey" => {
+                    let key = extra_args
+                        .first()
+                        .map(|k| k.as_string())
+                        .unwrap_or_default();
+                    return Ok(CfmlValue::Bool(s.get_ci(&key).is_some()));
+                }
+                "containsvalue" => {
+                    let want = extra_args
+                        .first()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    return Ok(CfmlValue::Bool(
+                        s.iter().any(|(_, v)| v.as_string() == want),
+                    ));
+                }
+                // Map.keySet()/values()/entrySet(). Lucee hands back live Java
+                // collection views; RustCFML has no such type, so these return the
+                // CFML array a caller can actually iterate (the near-universal use
+                // is `for (k in m.keySet())` or a chained `.toArray()`, both of
+                // which work on an array).
+                "keyset" => Some("structKeyArray"),
+                "values" | "valuearray" if extra_args.is_empty() => {
+                    return Ok(CfmlValue::array(
+                        s.iter().map(|(_, v)| v.clone()).collect(),
+                    ));
+                }
+                "entryset" => {
+                    let entries: Vec<CfmlValue> = s
+                        .iter()
+                        .map(|(k, v)| {
+                            let mut e = ValueMap::default();
+                            e.insert("key".to_string(), CfmlValue::string(k.clone()));
+                            e.insert("value".to_string(), v.clone());
+                            CfmlValue::strukt(e)
+                        })
+                        .collect();
+                    return Ok(CfmlValue::array(entries));
+                }
                 // java.util.Map.get(key) passthrough. Lucee/ACF expose Map
                 // members on structs, so `someStruct.get("k")` returns the value
                 // for that key (case-insensitive) or null if absent — it is NOT
@@ -23945,6 +24456,41 @@ impl CfmlVirtualMachine {
                 err.stack_trace = self.build_stack_trace();
                 return Err(err);
             }
+        }
+
+        // GH #307 (systemic): an unmatched member call on a TYPED receiver used to
+        // fall out of here as `Ok(CfmlValue::Null)`. That single line is what turned
+        // every gap in the tables above into a SILENT no-op — `filtered.add(x)`
+        // appended nothing and threw nothing, `s.substring(1)` yielded null, and the
+        // caller took the success path with wrong data. Worse, assigning that Null
+        // trips the PR #112 null-delete guard, so the failure resurfaced far away as
+        // a misleading "Variable X is undefined".
+        //
+        // Lucee throws for every one of these ("The function [x] does not exist in
+        // the Array."), so throwing is both the safe and the compatible answer, and
+        // it makes the next missing member a loud bug report instead of silent data
+        // loss. Scoped to receivers whose member surface is fully enumerated above.
+        // Struct receivers are deliberately excluded here: plain structs already
+        // threw a few lines up, while java shims, in-construction `this`, `super`
+        // handles and flyweight flat scopes have their own resolution paths and must
+        // keep the lenient Null.
+        let type_name = match &object {
+            CfmlValue::Array(_) => Some("Array"),
+            CfmlValue::Query(_) => Some("Query"),
+            CfmlValue::Int(_) | CfmlValue::Double(_) => Some("Numeric"),
+            CfmlValue::Bool(_) => Some("Boolean"),
+            CfmlValue::Binary(_) => Some("Binary"),
+            CfmlValue::TimeSpan(_) => Some("TimeSpan"),
+            CfmlValue::String(_) => Some("String"),
+            _ => None,
+        };
+        if let Some(tn) = type_name {
+            let mut err = CfmlError::new(
+                format!("The function [{}] does not exist in the {}.", method, tn),
+                CfmlErrorType::Expression,
+            );
+            err.stack_trace = self.build_stack_trace();
+            return Err(err);
         }
 
         Ok(CfmlValue::Null)

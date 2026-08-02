@@ -2686,7 +2686,12 @@ fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
             return Ok(CfmlValue::Array(arr.clone()));
         }
     }
-    Ok(CfmlValue::Bool(false))
+    // Was `Ok(Bool(false))`: a too-short or non-array call mutated nothing and
+    // reported no failure, so `a.set(1,"z")` (3 args) silently did nothing. Lucee
+    // errors on the same call. (GH #307 no-op audit.)
+    Err(CfmlError::runtime(
+        "arraySet requires (array, startIndex, endIndex, value)".to_string(),
+    ))
 }
 
 fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
@@ -2702,7 +2707,10 @@ fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
             return Ok(CfmlValue::Array(arr.clone()));
         }
     }
-    Ok(CfmlValue::Bool(false))
+    // Was `Ok(Bool(false))` — a silent no-op on a bad call (GH #307 no-op audit).
+    Err(CfmlError::runtime(
+        "arraySwap requires (array, index1, index2)".to_string(),
+    ))
 }
 
 fn fn_array_min(args: Vec<CfmlValue>) -> CfmlResult {
@@ -15115,7 +15123,9 @@ fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
             // In-place grow on the shared handle.
             arr.with_write(|v| {
                 while v.len() < size {
-                    v.push(CfmlValue::string(String::new()));
+                    // Lucee grows with NULLs, not empty strings — `arr[i] ?: dflt`
+                    // and isNull() checks over a resized array depended on this.
+                    v.push(CfmlValue::Null);
                 }
             });
             Ok(CfmlValue::Array(arr.clone()))
@@ -15742,15 +15752,28 @@ fn locale_code_to_friendly(code: &str) -> String {
     }
 }
 
+// GH #304: both of these were inert — setLocale() computed a code and discarded
+// it, getLocale() answered a hardcoded "english (us)". They are VM-intercepted now
+// (the VM owns `locale` as request state, alongside `timezone`), but these
+// off-VM implementations must agree rather than lie: they read and write the same
+// thread-local the ls* formatters consult.
 fn fn_set_locale(args: Vec<CfmlValue>) -> CfmlResult {
-    let locale = get_str(&args, 0);
-    let code = cfml_locale_to_code(&locale);
-    Ok(CfmlValue::string(code))
+    let requested = get_str(&args, 0);
+    let code = cfml_common::locale::canonical_locale(&requested).ok_or_else(|| {
+        CfmlError::runtime(format!("setLocale(): unknown locale [{}].", requested))
+    })?;
+    let previous = cfml_common::locale::current_locale();
+    cfml_common::locale::set_current_locale(&code);
+    // Lucee returns the PREVIOUS locale (in CODE form), which is what makes
+    // save-and-restore work.
+    Ok(CfmlValue::string(previous))
 }
 
 fn fn_get_locale(_args: Vec<CfmlValue>) -> CfmlResult {
-    // Lucee returns lowercase friendly name by default
-    Ok(CfmlValue::string(locale_code_to_friendly("en_US")))
+    // Lucee returns the lowercase friendly name by default.
+    Ok(CfmlValue::string(cfml_common::locale::friendly_name(
+        &cfml_common::locale::current_locale(),
+    )))
 }
 
 fn fn_set_time_zone(_args: Vec<CfmlValue>) -> CfmlResult {
@@ -16474,46 +16497,105 @@ fn fn_ls_date_time_format(args: Vec<CfmlValue>) -> CfmlResult {
     fn_date_time_format(pass_args)
 }
 
+/// Resolve the locale an `ls*` call should format in: the explicit argument at
+/// `idx` when supplied, otherwise the request's active locale (GH #304).
+///
+/// An explicit locale that names nothing we recognise is an ERROR — silently
+/// falling back to `en_US` is exactly the failure mode this function exists to
+/// remove, since the caller would see plausible US-formatted output and never
+/// learn their locale was dropped.
+fn ls_locale_arg(args: &[CfmlValue], idx: usize) -> Result<String, CfmlError> {
+    match args.get(idx) {
+        Some(v) if !v.as_string().trim().is_empty() => {
+            let requested = v.as_string();
+            cfml_common::locale::canonical_locale(&requested).ok_or_else(|| {
+                CfmlError::runtime(format!("Unknown locale [{}].", requested))
+            })
+        }
+        _ => Ok(cfml_common::locale::current_locale()),
+    }
+}
+
+/// Group the integer part of `digits` with `sep`, or leave it alone when the
+/// locale does not group.
+fn group_digits(digits: &str, sep: char) -> String {
+    if sep == '\u{0}' {
+        return digits.to_string();
+    }
+    let grouped = add_thousands_separator(digits);
+    if sep == ',' {
+        grouped
+    } else {
+        grouped.replace(',', &sep.to_string())
+    }
+}
+
 fn fn_ls_currency_format(args: Vec<CfmlValue>) -> CfmlResult {
     let n = get_float(&args, 0);
-    let currency_type = if args.len() > 1 {
+    let currency_type = if args.len() > 1 && !get_str(&args, 1).trim().is_empty() {
         get_str(&args, 1).to_lowercase()
     } else {
         "local".to_string()
     };
+    // Third argument is the locale — it used to be read by nobody, so
+    // `lsCurrencyFormat(1234.5, "local", "de_DE")` returned "$1,234.50".
+    let locale = ls_locale_arg(&args, 2)?;
+    let fmt = cfml_common::locale::number_format_for(&locale);
 
     let negative = n < 0.0;
-    let abs_n = n.abs();
-    let formatted_num = format!("{:.2}", abs_n);
-    let parts: Vec<&str> = formatted_num.split('.').collect();
-    let int_with_commas = add_thousands_separator(parts[0]);
-    let decimal = parts.get(1).unwrap_or(&"00");
+    // Round HALF-UP like Java's currency formatter. Rust's `{:.N}` rounds half to
+    // EVEN, so a 0-decimal locale rendered ¥1234.5 as ¥1,234 where Lucee gives
+    // ¥1,235.
+    let scale = 10f64.powi(fmt.currency_decimals as i32);
+    let rounded = (n.abs() * scale + 0.5).floor() / scale;
+    let formatted_num = format!("{:.*}", fmt.currency_decimals, rounded);
+    let (int_part, frac_part) = match formatted_num.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (formatted_num.as_str(), ""),
+    };
+    let mut amount = group_digits(int_part, fmt.grouping);
+    if !frac_part.is_empty() {
+        amount.push(fmt.decimal);
+        amount.push_str(frac_part);
+    }
 
-    // Lucee format (en_US locale): "$1,234.56" local, "USD 1,234.56" international,
-    // "1,234.56" none. Negatives wrapped in parens: "($99.99)", "(USD 99.99)".
-    match currency_type.as_str() {
+    // Negative handling differs by form, and the difference is not cosmetic —
+    // verified byte-for-byte against Lucee 7.0.4:
+    //   local          -> the parens wrap symbol AND amount:  ($50.00) / (50,00 €)
+    //   international  -> the ISO code stays OUTSIDE:         USD (50.00)
+    //   none           -> a leading minus:                    -50.00
+    // Separators are plain ASCII spaces, not NBSP, in every form.
+    Ok(CfmlValue::string(match currency_type.as_str() {
+        // The ISO code always LEADS, even for locales that trail their symbol
+        // (de_DE renders "1.234,50 €" but "EUR 1.234,50").
         "international" => {
             if negative {
-                Ok(CfmlValue::string(format!("USD ({}.{})", int_with_commas, decimal)))
+                format!("{} ({})", fmt.currency_code, amount)
             } else {
-                Ok(CfmlValue::string(format!("USD {}.{}", int_with_commas, decimal)))
+                format!("{} {}", fmt.currency_code, amount)
             }
         }
         "none" => {
             if negative {
-                Ok(CfmlValue::string(format!("-{}.{}", int_with_commas, decimal)))
+                format!("-{}", amount)
             } else {
-                Ok(CfmlValue::string(format!("{}.{}", int_with_commas, decimal)))
+                amount
             }
         }
         _ => {
-            if negative {
-                Ok(CfmlValue::string(format!("(${}.{})", int_with_commas, decimal)))
+            let gap = if fmt.space_before_symbol { " " } else { "" };
+            let body = if fmt.symbol_after {
+                format!("{}{}{}", amount, gap, fmt.currency_symbol)
             } else {
-                Ok(CfmlValue::string(format!("${}.{}", int_with_commas, decimal)))
+                format!("{}{}{}", fmt.currency_symbol, gap, amount)
+            };
+            if negative {
+                format!("({})", body)
+            } else {
+                body
             }
         }
-    }
+    }))
 }
 
 fn fn_ls_euro_currency_format(args: Vec<CfmlValue>) -> CfmlResult {
@@ -16571,12 +16653,33 @@ fn fn_ls_parse_date_time(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_ls_number_format(args: Vec<CfmlValue>) -> CfmlResult {
-    let pass_args = if args.len() >= 2 {
+    let pass_args = if args.len() >= 2 && !get_str(&args, 1).trim().is_empty() {
         vec![args[0].clone(), args[1].clone()]
     } else {
         vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))]
     };
-    fn_number_format(pass_args)
+    let formatted = fn_number_format(pass_args)?.as_string();
+
+    // GH #304: the locale argument (and the request locale) were dropped entirely,
+    // so this was numberFormat() under another name. numberFormat produces en_US
+    // punctuation, so re-punctuate for locales that differ. Swap through a
+    // placeholder — a naive two-step replace would clobber the separators it had
+    // just written when the locale's decimal is the other locale's grouping char
+    // (de_DE: "1,234.5" -> "1.234,5").
+    let locale = ls_locale_arg(&args, 2)?;
+    let fmt = cfml_common::locale::number_format_for(&locale);
+    if fmt.decimal == '.' && fmt.grouping == ',' {
+        return Ok(CfmlValue::string(formatted));
+    }
+    let swapped: String = formatted
+        .chars()
+        .map(|c| match c {
+            ',' => fmt.grouping,
+            '.' => fmt.decimal,
+            other => other,
+        })
+        .collect();
+    Ok(CfmlValue::string(swapped))
 }
 
 fn fn_ls_week(args: Vec<CfmlValue>) -> CfmlResult {
