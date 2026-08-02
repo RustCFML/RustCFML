@@ -10,7 +10,8 @@
 //!     embedded-VFS path for `--build` binaries)
 //!
 //! After parse, [`RustCfmlConfig::expand_env`] walks every string field and
-//! resolves `${env.VAR:default}` placeholders against the process environment.
+//! resolves Lucee-compatible `${VAR:default}` placeholders against the process
+//! environment.
 
 pub mod env;
 pub mod resolve;

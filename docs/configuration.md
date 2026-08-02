@@ -45,15 +45,39 @@ to pick up baseline changes. Per-application overlays are re-read per request
 
 ## Environment variable substitution
 
-Every string value supports `${env.VAR:default}` placeholders, expanded once
-after parse:
+Every string value supports `${VAR:default}` placeholders, expanded once after
+parse. The syntax matches Lucee's `.CFConfig.json` importer, so one file can
+serve both engines:
 
 ```jsonc
-"host":     "${env.DB_HOST:localhost}"     // env var with fallback
-"password": "${env.DB_PASSWORD}"           // empty string if unset
+"host":     "${DB_HOST:localhost}"     // env var with fallback
+"password": "${DB_PASSWORD}"           // empty string if unset
 ```
 
-Unknown namespaces (e.g. `${other.X}`) are left verbatim.
+A name is resolved in this order:
+
+1. environment variable with that exact name
+2. environment variable with `.` → `_` and upper-cased, so `${my.setting}` also
+   finds `MY_SETTING` (Lucee does the same)
+3. the fallback after the first `:`, or an empty string if there is none
+
+Lucee's extra step — a Java system property between (1) and (2) — has no
+equivalent here and is skipped. Only the first `}` closes a placeholder, an
+unterminated `${` is left verbatim, and expansion is single-pass: a value that
+itself contains `${...}` is not re-scanned.
+
+A placeholder that resolves to nothing and has no fallback becomes an empty
+string; it is not left verbatim.
+
+### Legacy `${env.VAR}` form
+
+Before v0.548.0 RustCFML required an `env.` namespace prefix
+(`${env.DB_HOST:localhost}`). Those configs still work — an unresolved name
+beginning with `env.` falls back to looking up the remainder — but the prefix is
+deprecated and should be dropped, because **Lucee reads it wrongly rather than
+loudly**: Lucee treats `env.DB_HOST` as the whole variable name, never finds it,
+and silently uses the default. `${env.DB_HOST:localhost}` therefore connects to
+`localhost` on Lucee in every environment. Write `${DB_HOST:localhost}` instead.
 
 ## HTTP protection
 
@@ -78,20 +102,20 @@ A realistic production file:
   "datasources": {
     "myapp": {
       "driver":   "mysql",
-      "host":     "${env.DB_HOST:localhost}",
-      "port":     "${env.DB_PORT:3306}",
-      "database": "${env.DB_NAME:myapp}",
-      "username": "${env.DB_USER:root}",
-      "password": "${env.DB_PASS}",
+      "host":     "${DB_HOST:localhost}",
+      "port":     "${DB_PORT:3306}",
+      "database": "${DB_NAME:myapp}",
+      "username": "${DB_USER:root}",
+      "password": "${DB_PASS}",
       "default":  true
     }
   },
   "mailServers": [
     {
-      "smtp":     "${env.SMTP_HOST}",
+      "smtp":     "${SMTP_HOST}",
       "port":     587,
-      "username": "${env.SMTP_USER}",
-      "password": "${env.SMTP_PASS}",
+      "username": "${SMTP_USER}",
+      "password": "${SMTP_PASS}",
       "tls":      true
     }
   ],

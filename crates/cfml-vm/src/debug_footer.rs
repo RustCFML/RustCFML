@@ -371,7 +371,7 @@ pub fn render_footer(
 }
 
 /// Flatten the difference between the EFFECTIVE cfconfig (server baseline +
-/// app overlay, post `${env.*}` expansion) and the engine's built-in defaults
+/// app overlay, post `${VAR:default}` expansion) and the engine's built-in defaults
 /// into sorted `(dotted.path, value)` rows — i.e. exactly what this deploy's
 /// `.cfconfig.json` picked up. Values whose key smells like a credential
 /// (`password`/`secret`/`token`) are redacted.

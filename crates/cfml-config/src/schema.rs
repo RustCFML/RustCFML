@@ -4,8 +4,9 @@
 //! config file authored for Lucee/BoxLang loads cleanly even when it carries
 //! engine-specific sections RustCFML cannot use.
 //!
-//! All string fields support `${env.VAR:default}` placeholders, expanded in a
-//! single pass by [`RustCfmlConfig::expand_env`] right after parse.
+//! All string fields support Lucee-compatible `${VAR:default}` placeholders,
+//! expanded in a single pass by [`RustCfmlConfig::expand_env`] right after
+//! parse. See [`crate::env`] for the exact resolution order.
 
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -1057,7 +1058,7 @@ impl Default for UrlRewritingCfg {
 // ─────────────────────────────────────────────
 
 impl RustCfmlConfig {
-    /// Walk every string field and expand `${env.VAR:default}` placeholders
+    /// Walk every string field and expand `${VAR:default}` placeholders
     /// in place. Called automatically after parse.
     pub fn expand_env(&mut self) {
         // server
@@ -1384,12 +1385,14 @@ mod tests {
     #[test]
     fn env_expansion_runs_after_parse() {
         std::env::set_var("RUSTCFML_TEST_HOST_VAL", "db.internal");
+        std::env::set_var("RUSTCFML_TEST_USER_VAL", "app");
         let json = r#"{
             "datasources": {
                 "x": {
                     "driver": "mysql",
-                    "host": "${env.RUSTCFML_TEST_HOST_VAL}",
-                    "database": "${env.RUSTCFML_MISSING_DB:fallback_db}"
+                    "host": "${RUSTCFML_TEST_HOST_VAL}",
+                    "database": "${RUSTCFML_MISSING_DB:fallback_db}",
+                    "username": "${env.RUSTCFML_TEST_USER_VAL}"
                 }
             }
         }"#;
@@ -1398,6 +1401,9 @@ mod tests {
         let ds = cfg.datasources.get("x").unwrap();
         assert_eq!(ds.host, "db.internal");
         assert_eq!(ds.database, "fallback_db");
+        // Legacy `env.` prefix from pre-v0.548 configs still resolves.
+        assert_eq!(ds.username, "app");
         std::env::remove_var("RUSTCFML_TEST_HOST_VAL");
+        std::env::remove_var("RUSTCFML_TEST_USER_VAL");
     }
 }
