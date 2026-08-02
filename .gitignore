@@ -28,6 +28,24 @@ Thumbs.db
 # Temporary test files
 whitebackground.png
 
+# Profiling output (`--features obs-pprof`) — raw pprof + flamegraph renders.
+# These reached ~145MB of stale baselines in the repo root; always re-profile fresh.
+/rustcfml-profile*.pb
+/rustcfml-profile*.svg
+
+# Screen grabs / accessibility snapshots from browser-driven debugging sessions
+/*.png
+/snap*.md
+
+# Python bytecode cache (from the pprof_*.py parsers in the repo root)
+__pycache__/
+*.pyc
+
+# CommandBox per-experiment server definitions (server.json + the tracked
+# server-rcfml-lucee.json are the real ones; the rest are throwaway)
+/server-*.json
+!/server-rcfml-lucee.json
+
 # Node tooling (Claude Code CLI install, not project deps)
 /node_modules/
 /package.json
