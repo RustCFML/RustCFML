@@ -7435,10 +7435,12 @@ fn fn_hash(args: Vec<CfmlValue>) -> CfmlResult {
             format!("{:X}", hasher.finalize())
         }
         _ => {
-            // Fallback to MD5
-            let mut hasher = Md5::new();
-            hasher.update(input.as_bytes());
-            format!("{:X}", hasher.finalize())
+            // Lucee throws java.security.NoSuchAlgorithmException here
+            // ("bogus-alg MessageDigest not available", verified on 7.0.4). This
+            // used to fall back to MD5, so `hash(secret, "SHA-3")` — a typo, or
+            // an algorithm we simply don't implement — silently produced a
+            // plausible-looking MD5 digest instead of failing.
+            return Err(CfmlError::no_such_algorithm(&algorithm.to_lowercase()));
         }
     };
     Ok(CfmlValue::string(hex))
@@ -16119,6 +16121,20 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
             .map(|d| d.password.clone())
             .filter(|s| !s.is_empty())
     });
+    // <cfmail useSSL/useTLS>, falling back to the configured mailServers[] entry.
+    // Both were parsed and then dropped on the floor: the transport was always
+    // built with `builder_dangerous`, so a server configured with `"tls": true`
+    // still sent AUTH credentials over an unencrypted connection.
+    #[cfg(feature = "smtp")]
+    let as_bool = |s: &str| s.eq_ignore_ascii_case("true") || s == "1" || s.eq_ignore_ascii_case("yes");
+    #[cfg(feature = "smtp")]
+    let use_ssl = get_opt("usessl")
+        .map(|v| as_bool(&v))
+        .unwrap_or_else(|| cfg_default.as_ref().map(|d| d.ssl).unwrap_or(false));
+    #[cfg(feature = "smtp")]
+    let use_tls = get_opt("usetls")
+        .map(|v| as_bool(&v))
+        .unwrap_or_else(|| cfg_default.as_ref().map(|d| d.tls).unwrap_or(false));
 
     // Log to stderr for debugging visibility
     eprintln!("[CFMAIL] To: {} | From: {} | Subject: {} | Type: {}", to, from, subject, mail_type);
@@ -16338,8 +16354,31 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
             .and_then(|p| p.parse().ok())
             .unwrap_or(25);
 
-        let mut transport_builder = SmtpTransport::builder_dangerous(smtp_server)
-            .port(port);
+        // Encryption. `useSSL` = implicit TLS (SMTPS, the whole connection is
+        // wrapped, conventionally port 465). `useTLS` = STARTTLS (plaintext
+        // connect, then upgrade, conventionally port 587). Neither was applied
+        // before — every message went over `builder_dangerous`, so AUTH LOGIN
+        // credentials were readable on the wire even with tls/ssl configured.
+        // If TLS was explicitly asked for and cannot be established, fail: a
+        // silent downgrade to plaintext is the exact bug being fixed here.
+        let mut transport_builder = if use_ssl {
+            SmtpTransport::relay(smtp_server).map_err(|e| {
+                CfmlError::runtime(format!(
+                    "cfmail: could not establish an implicit-TLS (useSSL) connection to {}: {}",
+                    smtp_server, e
+                ))
+            })?
+        } else if use_tls {
+            SmtpTransport::starttls_relay(smtp_server).map_err(|e| {
+                CfmlError::runtime(format!(
+                    "cfmail: could not establish a STARTTLS (useTLS) connection to {}: {}",
+                    smtp_server, e
+                ))
+            })?
+        } else {
+            SmtpTransport::builder_dangerous(smtp_server)
+        }
+        .port(port);
 
         if let (Some(ref user), Some(ref pass)) = (&username, &password) {
             transport_builder = transport_builder.credentials(
@@ -16349,7 +16388,17 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
 
         let mailer = transport_builder.build();
         match mailer.send(&email) {
-            Ok(_) => eprintln!("[CFMAIL] Sent successfully via {}", smtp_server),
+            Ok(_) => eprintln!(
+                "[CFMAIL] Sent successfully via {} ({})",
+                smtp_server,
+                if use_ssl {
+                    "implicit TLS"
+                } else if use_tls {
+                    "STARTTLS"
+                } else {
+                    "no encryption"
+                }
+            ),
             Err(e) => return Err(CfmlError::runtime(format!("cfmail: SMTP send failed: {}", e))),
         }
     }

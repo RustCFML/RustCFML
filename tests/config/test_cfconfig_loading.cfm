@@ -33,7 +33,12 @@ assert("runtime.timezone", cfg.runtime.timezone, "Europe/London");
 assert("runtime.sessionTimeout", cfg.runtime.sessionTimeout, "0,0,15,0");
 
 // Defaults filled in where the fixture is silent
-assert("server.host default", cfg.server.host, "127.0.0.1");
+// "0.0.0.0", not "127.0.0.1": the listener always bound all interfaces and
+// never read this key, so the old loopback default documented behaviour the
+// engine did not have. The key IS now honoured by the TCP listener, so the
+// default was changed to match what the server actually does; set it to
+// "127.0.0.1" to restrict the server to the local machine.
+assert("server.host default", cfg.server.host, "0.0.0.0");
 assert("runtime.dotNotationUpperCase default", cfg.runtime.dotNotationUpperCase, true);
 
 // Datasource declared

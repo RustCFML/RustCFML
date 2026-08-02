@@ -187,6 +187,7 @@ include "harness.cfm";
 <cf_runtest file="comments/test_tags_in_block_comments.cfm">
 
 <!--- --- Standard Library --- --->
+<cf_runtest file="stdlib/test_hash_unknown_algorithm.cfm">
 <cf_runtest file="stdlib/test_string_functions.cfm">
 <cf_runtest file="stdlib/test_string_functions_regex.cfm">
 <cf_runtest file="functions/test_string_position_unicode.cfm">
@@ -887,6 +888,8 @@ include "harness.cfm";
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">
 <cf_runtest file="tags/test_cfloop_list_literal.cfm">
+<cf_runtest file="tags/test_cfloop_times.cfm">
+<cf_runtest file="tags/test_cfoutput_encodefor.cfm">
 <cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_cfloop_query_currentrow.cfm">
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm">

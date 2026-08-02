@@ -206,6 +206,46 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// Active `<cfoutput encodeFor="...">` encodings, innermost last.
+    ///
+    /// `encodeFor` is an XSS control: every `#expr#` interpolated inside the tag
+    /// body is passed through `encodeFor(type, value)`. It was parsed and then
+    /// dropped — the attribute appeared nowhere in the workspace — so pages that
+    /// asked for auto-encoding emitted raw, unescaped markup and the protection
+    /// silently did not exist.
+    ///
+    /// A stack rather than a single value so nested tags inherit the enclosing
+    /// encoding (verified on Lucee 7.0.4: `#x#` inside a `<cfif>` nested in an
+    /// `encodeFor` body IS encoded), and so an inner `<cfoutput>` restores the
+    /// outer encoding when it closes.
+    static ENCODE_FOR: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The innermost active `encodeFor` type, if any.
+fn current_encode_for() -> Option<String> {
+    ENCODE_FOR.with(|e| e.borrow().last().cloned())
+}
+
+/// Pops the `ENCODE_FOR` stack when a `<cfoutput encodeFor=…>` arm goes out of
+/// scope. A guard rather than an explicit pop because that arm has several
+/// early returns (the `query=` and `group=` forms), and a missed pop would leak
+/// the encoding onto sibling output later in the same file.
+struct EncodeForGuard {
+    active: bool,
+}
+
+impl Drop for EncodeForGuard {
+    fn drop(&mut self) {
+        if self.active {
+            ENCODE_FOR.with(|e| {
+                e.borrow_mut().pop();
+            });
+        }
+    }
+}
+
 /// Record the first structural preprocess error of the current pass.
 fn record_preprocess_error(msg: impl Into<String>) {
     PREPROCESS_ERROR.with(|e| {
@@ -324,7 +364,16 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
             // outputs CSS verbatim, including hex colors like `#f3f4f6;`).
             if let Some(end) = find_closing_hash(&chars, i + 1, len) {
                 let expr: String = chars[i + 1..end].iter().collect();
-                result.push_str(&format!("writeOutput({});", expr));
+                // Under `<cfoutput encodeFor="…">` every interpolated value is
+                // encoded; literal body text is NOT (matching Lucee — literal
+                // `<b>` in the body stays markup, only `#expr#` is escaped).
+                match current_encode_for() {
+                    Some(kind) => result.push_str(&format!(
+                        "writeOutput(encodeFor(\"{}\", {}));",
+                        kind, expr
+                    )),
+                    None => result.push_str(&format!("writeOutput({});", expr)),
+                }
                 i = end + 1;
             } else {
                 result.push(chars[i]);
@@ -600,6 +649,20 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let body: String = chars[tag_end..len].iter().collect();
                 (body, len - start)
             };
+            // `encodeFor="html|javascript|url|css|xml|htmlattribute|xmlattribute"`
+            // auto-encodes every `#expr#` in the body. Push it for the duration
+            // of the body walk so nested tags inherit it and the previous
+            // encoding (if any) is restored on the way out.
+            let encode_for = attrs
+                .get("encodefor")
+                .map(|v| strip_hashes(v).trim_matches(|c| c == '"' || c == '\'').to_lowercase())
+                .filter(|v| !v.is_empty());
+            if let Some(ref kind) = encode_for {
+                ENCODE_FOR.with(|e| e.borrow_mut().push(kind.clone()));
+            }
+            let _encode_for_guard = EncodeForGuard {
+                active: encode_for.is_some(),
+            };
             match attrs.get("query") {
                 None => (tags_to_script_inner(&body, imports, true), consumed),
                 Some(query_raw) => {
@@ -731,7 +794,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     consumed,
                 )
             } else {
-                parse_cfloop_tag(&attrs, tag_end - start)
+                parse_cfloop_tag(&attrs, tag_end - start, start)
             }
         }
         "cfscript" => {
@@ -3153,9 +3216,19 @@ fn emit_grouped_cfoutput(
     )
 }
 
+/// Lower a `<cfloop>` opening tag to its CFScript equivalent.
+///
+/// `consumed` is the tag's byte length (returned verbatim to the caller).
+/// `uniq` is the tag's **start offset**, used to name the `__cfloop_*` temps.
+/// These must be separate: `consumed` is a length, so two nested loops written
+/// with the same-length opening tag (`<cfloop times="2">` inside
+/// `<cfloop times="3">`) produced *identical* temp names, and the inner loop
+/// clobbered the outer loop's counter — the outer body ran once instead of N
+/// times. The start offset is unique per tag occurrence.
 fn parse_cfloop_tag(
     attrs: &std::collections::HashMap<String, String>,
     consumed: usize,
+    uniq: usize,
 ) -> (String, usize) {
     // Different loop types based on attributes
     if let (Some(from), Some(to), Some(index)) = (
@@ -3170,7 +3243,7 @@ fn parse_cfloop_tag(
         // Decide loop direction at runtime from the sign of the (possibly
         // dynamic) step, matching Lucee. Hoist step into a temp so it is
         // evaluated once rather than per-iteration.
-        let step_var = format!("__cfloop_step_{}", consumed);
+        let step_var = format!("__cfloop_step_{}", uniq);
         // A C-style `for (var X = …; …)` declaration only accepts a SIMPLE
         // name. When the index is scope-qualified (e.g. `index="local.i"`,
         // common in Wheels), emitting `var local.i = 1` mis-parses — the
@@ -3193,6 +3266,43 @@ fn parse_cfloop_tag(
             ),
             consumed,
         )
+    } else if let Some(times) = attrs.get("times") {
+        // <cfloop times="N"> repeats the body N times (Lucee 5+). Mirrors the
+        // script-tag lowering in `parser.rs` (branch "2) times=N"); the two
+        // lowerings must agree — this one was missing, so the tag form fell
+        // through to the `while (true)` fallback at the bottom of this function
+        // and HUNG, appending to the output buffer until the process died
+        // (12 GB observed on `<cfloop times="3">X</cfloop>`).
+        // Lucee rejects `times` combined with anything else: "Wrong Context,
+        // when you use attribute times, no other attributes are allowed"
+        // (verified against Lucee 7.0.4). In particular there is no `index`
+        // binding — `<cfloop times="3" index="i">` is a compile error, not a
+        // counted loop. Mirror that rather than inventing a superset.
+        if attrs.len() > 1 {
+            let mut others: Vec<&str> =
+                attrs.keys().map(|k| k.as_str()).filter(|k| *k != "times").collect();
+            others.sort_unstable();
+            return cfloop_form_error(&format!(
+                "Wrong Context, when you use attribute times, no other attributes are allowed (found: {})",
+                others.join(", ")
+            ), consumed);
+        }
+        let times = strip_hashes(times);
+        let counter = format!("__cfloop_times_{}", uniq);
+        let limit = format!("__cfloop_timesmax_{}", uniq);
+        // Hoist the bound into a temp so a dynamic expression is evaluated once
+        // rather than on every iteration (mirrors `step` in the from/to branch,
+        // and matches Lucee — mutating the source variable inside the body does
+        // not change the trip count there either).
+        (
+            format!(
+                "var {lim} = {times};\nfor (var {c} = 1; {c} <= {lim}; {c} = {c} + 1) {{\n",
+                lim = limit,
+                times = times,
+                c = counter
+            ),
+            consumed,
+        )
     } else if let Some(condition) = attrs.get("condition") {
         let condition = strip_hashes(condition);
         (format!("while ({}) {{\n", condition), consumed)
@@ -3201,8 +3311,8 @@ fn parse_cfloop_tag(
         if let (Some(item), Some(index)) = (attrs.get("item"), attrs.get("index")) {
             let item = strip_hashes(item);
             let index = strip_hashes(index);
-            let array_var = format!("__cfloop_array_{}", consumed);
-            let index_var = format!("__cfloop_index_{}", consumed);
+            let array_var = format!("__cfloop_array_{}", uniq);
+            let index_var = format!("__cfloop_index_{}", uniq);
             (
                 format!(
                     "var {} = {};\nfor (var {} = 1; {} <= arrayLen({}); {} = {} + 1) {{\n{} = {};\n{} = {}[{}];\n",
@@ -3254,8 +3364,8 @@ fn parse_cfloop_tag(
         if let (Some(item), Some(idx)) = (attrs.get("item"), attrs.get("index")) {
             let item = strip_hashes(item);
             let idx = strip_hashes(idx);
-            let list_var = format!("__cfloop_list_{}", consumed);
-            let counter = format!("__cfloop_listidx_{}", consumed);
+            let list_var = format!("__cfloop_list_{}", uniq);
+            let counter = format!("__cfloop_listidx_{}", uniq);
             (
                 format!(
                     "var {} = listToArray({}, \"{}\");\nfor (var {} = 1; {} <= arrayLen({}); {} = {} + 1) {{\n{} = {};\n{} = {}[{}];\n",
@@ -3332,9 +3442,51 @@ fn parse_cfloop_tag(
             consumed,
         )
     } else {
-        // Infinite loop? Just use while(true)
-        ("while (true) {\n".to_string(), consumed)
+        // No recognised loop form. This used to emit `while (true) {`, which
+        // turned every unimplemented `<cfloop>` attribute into a silent hang —
+        // strictly worse than a no-op, because the output buffer grows without
+        // bound until the process is killed (issue #158 hit it via `file=`,
+        // `times=` hit it again). Fail loudly instead.
+        //
+        // Two layers, because `tags_to_script` is the tolerant entry point and
+        // must still return balanced script: record a structural error so
+        // `tags_to_script_checked` reports it at compile time, AND emit a block
+        // that throws at runtime so the tolerant path can never hang either.
+        // The emitted block is still a `{`-opener — `</cfloop>` unconditionally
+        // emits the matching `}`.
+        let form = {
+            let mut keys: Vec<&str> = attrs.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            keys.join(", ")
+        };
+        let msg = if form.is_empty() {
+            "<cfloop> requires a loop form (from/to, times, condition, array, list, query, collection or file); none was given".to_string()
+        } else {
+            format!(
+                "<cfloop> has no recognised loop form for attribute(s): {}. Expected one of from/to, times, condition, array, list, query, collection or file",
+                form
+            )
+        };
+        cfloop_form_error(&msg, consumed)
     }
+}
+
+/// Emit a `<cfloop>` that fails loudly instead of looping.
+///
+/// Two layers, because [`tags_to_script`] is the tolerant entry point and must
+/// still return balanced script: record a structural error so
+/// [`tags_to_script_checked`] reports it at compile time, AND emit a block that
+/// throws at runtime so the tolerant path can never hang either. The emitted
+/// block is a `{`-opener — `</cfloop>` unconditionally emits the matching `}`.
+fn cfloop_form_error(msg: &str, consumed: usize) -> (String, usize) {
+    record_preprocess_error(msg.to_string());
+    (
+        format!(
+            "if (true) {{ throw(type=\"expression\", message=\"{}\");\n",
+            msg.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        consumed,
+    )
 }
 
 /// Parse the body of a <cfswitch> tag, scanning for <cfcase> and <cfdefaultcase>
@@ -4150,6 +4302,49 @@ mod tests {
         assert!(has_cfml_tags(input));
         let result = tags_to_script(input);
         assert!(result.contains("x = 5"));
+    }
+
+    /// `<cfloop times=N>` must lower to a counted `for`, never to the
+    /// `while (true)` fallback that used to hang the request.
+    #[test]
+    fn test_cfloop_times_is_a_counted_loop() {
+        let result = tags_to_script(r#"<cfloop times="3">X</cfloop>"#);
+        assert!(
+            !result.contains("while (true)"),
+            "times= fell through to the infinite-loop fallback: {result}"
+        );
+        assert!(result.contains("<= __cfloop_timesmax_"), "unexpected lowering: {result}");
+    }
+
+    /// Lucee 7.0.4: "Wrong Context, when you use attribute times, no other
+    /// attributes are allowed". There is no `index` binding for this form.
+    #[test]
+    fn test_cfloop_times_rejects_other_attributes() {
+        let err = tags_to_script_checked(r#"<cfloop times="3" index="i">X</cfloop>"#)
+            .expect_err("times= with index= must be a compile error");
+        assert!(err.contains("no other attributes are allowed"), "unexpected error: {err}");
+    }
+
+    /// An unrecognised loop form must fail loudly. Emitting `while (true)` for
+    /// it turned every unimplemented attribute into an unbounded hang.
+    #[test]
+    fn test_cfloop_unknown_form_is_an_error_not_an_infinite_loop() {
+        let err = tags_to_script_checked(r#"<cfloop wibble="3">X</cfloop>"#)
+            .expect_err("an unrecognised <cfloop> form must be a compile error");
+        assert!(err.contains("no recognised loop form"), "unexpected error: {err}");
+
+        // Even on the tolerant path the emitted script must throw rather than
+        // loop, and must stay brace-balanced for the `</cfloop>` that follows.
+        let tolerant = tags_to_script(r#"<cfloop wibble="3">X</cfloop>"#);
+        assert!(!tolerant.contains("while (true)"), "still hangs: {tolerant}");
+        assert!(tolerant.contains("throw("), "does not fail loudly: {tolerant}");
+    }
+
+    #[test]
+    fn test_cfloop_no_attributes_is_an_error() {
+        let err = tags_to_script_checked("<cfloop>X</cfloop>")
+            .expect_err("<cfloop> with no attributes must be a compile error");
+        assert!(err.contains("requires a loop form"), "unexpected error: {err}");
     }
 
     #[test]

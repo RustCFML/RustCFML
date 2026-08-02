@@ -142,7 +142,7 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `host` | string | `127.0.0.1` | Bind address. `0.0.0.0` = all interfaces |
+| `host` | string | `0.0.0.0` | Bind address. `0.0.0.0` = all interfaces; set `127.0.0.1` to accept connections from this machine only |
 | `webroot` | string | `""` | Document root. Overridden by `--serve <path>` |
 | `welcomeFiles` | string[] | `["index.cfm", "index.htm", "index.html"]` | Tried in order for directory requests |
 | `cfmlExtensions` | string[] | `["cfm", "cfc"]` | Extensions dispatched through the interpreter |
@@ -235,6 +235,12 @@ Searched after `Application.cfc this.customTagPaths`.
 ### `mailServers`
 
 First entry becomes cfmail's default when its tag attributes omit `server`.
+
+`tls` selects STARTTLS (connect in the clear on the submission port, then
+upgrade) and `ssl` selects implicit TLS/SMTPS (the whole connection is wrapped,
+conventionally port 465). `<cfmail useTLS=/useSSL=>` overrides them per message.
+If encryption is requested and cannot be established the send fails — it never
+falls back to an unencrypted connection.
 
 ```jsonc
 "mailServers": [

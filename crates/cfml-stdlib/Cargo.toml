@@ -122,7 +122,12 @@ calamine = { version = "0.36", optional = true }
 # raw bytes by supplying width/height to umya's new_image_with_dimensions.
 imagesize = { version = "0.14", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"], optional = true }
+# `rustls-tls` (as distinct from `tokio1-rustls-tls`) is what enables TLS on the
+# BLOCKING `SmtpTransport` we actually use for <cfmail>. Without it the only
+# constructor available is `builder_dangerous`, i.e. no STARTTLS and no implicit
+# TLS — SMTP credentials went out in plaintext even when tls/ssl were requested.
+# It pulls no new crates: rustls/webpki-roots are already in lettre's tree.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls", "rustls-tls"], optional = true }
 # Use the modern HTTPS connector (aws-lc-rs + rustls 0.23) rather than the
 # legacy `rustls` feature, which resolves to aws-smithy's `legacy-rustls-ring`
 # (rustls 0.21 + hyper-rustls 0.24 — flagged by RUSTSEC/rustls-webpki 0.101).

@@ -1799,6 +1799,14 @@ async fn async_run_server(
         });
     }
 
+    // Bind address from cfconfig `server.host`. Captured here because
+    // `cfconfig` is moved into `AppState` just below and `app_state` is itself
+    // moved into the router before the listener is created.
+    let bind_host = {
+        let h = cfconfig.server.host.trim();
+        if h.is_empty() { "0.0.0.0".to_string() } else { h.to_string() }
+    };
+
     let app_state = Arc::new(AppState {
         doc_root: doc_root.to_path_buf(),
         port,
@@ -1877,8 +1885,14 @@ async fn async_run_server(
         }
         // Default: TCP listener on the configured port.
         None => {
-            let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|e| {
-                eprintln!("Failed to start server on 0.0.0.0:{}: {}", port, e);
+            // `server.host` from cfconfig. This key existed but was never read —
+            // the listener hardcoded "0.0.0.0", so a config asking to bind
+            // loopback-only was silently ignored and the server was reachable
+            // from every interface regardless. The default is "0.0.0.0" (what
+            // the engine has always done); set the key to restrict it.
+            let host = bind_host;
+            let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.unwrap_or_else(|e| {
+                eprintln!("Failed to start server on {}:{}: {}", host, port, e);
                 exit(1);
             });
             // Disable Nagle's algorithm on accepted connections. For a request/response

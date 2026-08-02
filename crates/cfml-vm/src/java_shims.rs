@@ -462,6 +462,18 @@ pub fn handle_java_messagedigest(
                 .first()
                 .map(|a| a.as_string().to_lowercase())
                 .unwrap_or_else(|| "sha-256".to_string());
+            // Java validates the algorithm name at getInstance() time and throws
+            // NoSuchAlgorithmException; it does NOT silently substitute another
+            // digest. We used to fall through to MD5 inside message_digest_hash,
+            // so a caller asking for an unsupported algorithm got an MD5 hash
+            // that looked entirely plausible.
+            if canonical_digest_algorithm(&algorithm).is_none() {
+                let requested = args
+                    .first()
+                    .map(|a| a.as_string())
+                    .unwrap_or_else(|| algorithm.clone());
+                return Err(CfmlError::no_such_algorithm(&requested));
+            }
             let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
@@ -513,7 +525,7 @@ pub fn handle_java_messagedigest(
                     .get("__algorithm")
                     .map(|a| a.as_string())
                     .unwrap_or_else(|| "sha-256".to_string());
-                Ok(CfmlValue::Binary(message_digest_hash(&algorithm, &data)))
+                message_digest_hash(&algorithm, &data)
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -543,20 +555,38 @@ pub fn handle_java_messagedigest(
     }
 }
 
-/// Compute a raw byte[] hash of `data` under a Java `MessageDigest` algorithm
-/// name (case-insensitive; `-` optional, e.g. "SHA-256"/"sha256"). Mirrors the
-/// algorithm set of cfml-stdlib's `hash()`. Unknown algorithms fall back to
-/// MD5, matching that builtin's behaviour.
-fn message_digest_hash(algorithm: &str, data: &[u8]) -> Vec<u8> {
-    use sha2::Digest;
-    let normalized = algorithm.to_ascii_uppercase().replace('-', "");
-    match normalized.as_str() {
-        "SHA1" => sha1::Sha1::digest(data).to_vec(),
-        "SHA256" => sha2::Sha256::digest(data).to_vec(),
-        "SHA384" => sha2::Sha384::digest(data).to_vec(),
-        "SHA512" => sha2::Sha512::digest(data).to_vec(),
-        _ => md5::Md5::digest(data).to_vec(),
+/// Resolve a Java `MessageDigest` algorithm name (case-insensitive, `-`
+/// optional, e.g. "SHA-256"/"sha256") to its canonical form, or `None` if it is
+/// not one we implement. `getInstance` uses this to reject unknown algorithms
+/// the way Java does, instead of silently hashing with something else.
+///
+/// `"SHA"` is Java's documented alias for SHA-1.
+fn canonical_digest_algorithm(algorithm: &str) -> Option<&'static str> {
+    match algorithm.to_ascii_uppercase().replace('-', "").as_str() {
+        "MD5" => Some("MD5"),
+        "SHA" | "SHA1" => Some("SHA1"),
+        "SHA256" => Some("SHA256"),
+        "SHA384" => Some("SHA384"),
+        "SHA512" => Some("SHA512"),
+        _ => None,
     }
+}
+
+/// Compute a raw byte[] hash of `data` under a Java `MessageDigest` algorithm
+/// name. The algorithm is validated by `canonical_digest_algorithm` at
+/// `getInstance` time, so an unknown name cannot reach here; if one somehow
+/// does, fail loudly rather than substituting a different digest.
+fn message_digest_hash(algorithm: &str, data: &[u8]) -> CfmlResult {
+    use sha2::Digest;
+    let bytes = match canonical_digest_algorithm(algorithm) {
+        Some("MD5") => md5::Md5::digest(data).to_vec(),
+        Some("SHA1") => sha1::Sha1::digest(data).to_vec(),
+        Some("SHA256") => sha2::Sha256::digest(data).to_vec(),
+        Some("SHA384") => sha2::Sha384::digest(data).to_vec(),
+        Some("SHA512") => sha2::Sha512::digest(data).to_vec(),
+        _ => return Err(CfmlError::no_such_algorithm(algorithm)),
+    };
+    Ok(CfmlValue::Binary(bytes))
 }
 
 pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {

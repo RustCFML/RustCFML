@@ -184,7 +184,13 @@ pub struct ServerCfg {
 impl Default for ServerCfg {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".into(),
+            // All interfaces. This documents what the server has always
+            // actually done — the listener hardcoded `0.0.0.0` and never read
+            // this key, so a `127.0.0.1` default here was a promise the engine
+            // did not keep. The key IS now honoured (see the TCP listener in
+            // `rustcfml-cli`), so set it to "127.0.0.1" to restrict the server
+            // to this machine.
+            host: "0.0.0.0".into(),
             webroot: String::new(),
             welcome_files: vec!["index.cfm".into(), "index.htm".into(), "index.html".into()],
             cfml_extensions: vec!["cfm".into(), "cfc".into()],
@@ -1164,7 +1170,11 @@ mod tests {
     #[test]
     fn empty_object_uses_defaults() {
         let cfg: RustCfmlConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.server.host, "127.0.0.1");
+        // All interfaces — the listener has always bound 0.0.0.0. The old
+        // "127.0.0.1" default described behaviour the engine never had, because
+        // nothing read this key; now that the listener honours it, the default
+        // states what actually happens.
+        assert_eq!(cfg.server.host, "0.0.0.0");
         assert_eq!(cfg.runtime.session_timeout, "0,0,30,0");
         assert!(cfg.security.csrf_enabled);
         assert!(cfg.url_rewriting.enabled);

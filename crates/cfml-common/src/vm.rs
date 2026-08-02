@@ -81,6 +81,20 @@ impl CfmlError {
             CfmlErrorType::Custom("java.io.IOException".to_string()),
         )
     }
+
+    /// An unknown-hash-algorithm exception whose `type` matches Java's
+    /// `java.security.NoSuchAlgorithmException` — what Lucee reports from both
+    /// `hash(input, "<unknown>")` and
+    /// `MessageDigest.getInstance("<unknown>")` (verified on Lucee 7.0.4:
+    /// `bogus-alg MessageDigest not available`). Both used to fall back to MD5
+    /// silently, which downgrades a caller who asked for SHA-512 to a broken
+    /// digest without a word.
+    pub fn no_such_algorithm(algorithm: &str) -> Self {
+        Self::new(
+            format!("{} MessageDigest not available", algorithm),
+            CfmlErrorType::Custom("java.security.NoSuchAlgorithmException".to_string()),
+        )
+    }
 }
 
 impl CfmlErrorType {
