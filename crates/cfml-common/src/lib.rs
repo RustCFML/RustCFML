@@ -4,6 +4,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod cfhttp;
+pub mod charset;
 pub mod clock;
 pub mod component;
 pub mod cycle_gc;

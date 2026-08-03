@@ -745,17 +745,6 @@ the tags below still have theirs.
 | `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
 | `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
 
-`<cffile>`'s `charset` (on `read`/`write`/`append`) is **not** just a lowering gap and is
-tracked separately below: the `fileRead`/`fileWrite`/`fileAppend` BIFs the tag lowers to
-ignore a charset argument too, and `charsetEncode`/`charsetDecode` are themselves
-pass-through no-ops — the engine has no character-encoding layer at all, so every file
-is written and read as UTF-8. Lucee 7.0.4, probed: `<cffile action="write"
-charset="utf-16">` writes a BOM + UTF-16BE, and a subsequent `charset="utf-16"` read
-returns the BOM as a leading character (so Lucee itself does not round-trip). Fixing
-this means adding an encoding layer (UTF-16/BE/LE, ISO-8859-1, windows-1252, US-ASCII)
-and threading it through those BIFs plus `charsetEncode`/`charsetDecode` — a new
-capability rather than an attribute-plumbing fix, so it is deliberately not folded in
-here. 🔇
 
 Fixed so far, in the order they were taken. Every expectation was probed against
 Lucee 7.0.4 before being implemented, and the regression tests
@@ -818,6 +807,28 @@ Lucee 7.0.4 before being implemented, and the regression tests
   component resolving to `""`. There is no SOAP client in RustCFML, so it now throws
   and says that. Deliberately a **runtime** throw: Lucee compiles the tag happily, so
   an app that merely contains an unreached SOAP call must still start.
+- **`<cffile charset=>`** — this one was never only a lowering gap: the
+  `fileRead`/`fileWrite`/`fileAppend` BIFs ignored a charset argument too, and
+  `charsetEncode`/`charsetDecode` were pass-through no-ops, so *everything* was UTF-8
+  whatever the caller asked for. There is now a real encoding layer
+  (`cfml-common/src/charset.rs`) covering UTF-8, UTF-16 (BOM), UTF-16BE/LE,
+  ISO-8859-1, windows-1252 and US-ASCII, wired through all three file BIFs, the tag,
+  and `charsetEncode`/`charsetDecode`. Byte-for-byte Lucee 7.0.4 parity: `utf-16`
+  writes an `FE FF` BOM then big-endian units; the BE/LE forms write none; an
+  unmappable character becomes `?` on the single-byte encodings; a **BOM wins over the
+  requested charset** on read (which is what lets a `utf-16` file be read by a caller
+  who asks for `utf-8`, or for nothing); undecodable bytes become U+FFFD rather than
+  raising; `fileAppend` appends the full encoding, second BOM included. An
+  **unrecognised charset name is now an error** rather than a silent UTF-8 fallback.
+  Two things this surfaced along the way:
+    - `<cffile action="write"/"append">` appends the platform line separator **by
+      default** and takes `addNewLine="false"` to suppress it (Lucee writes 4 bytes for
+      `abc` from the tag, 3 from the `fileWrite()` BIF). RustCFML did neither — it wrote
+      3 from both and ignored `addNewLine` — so every file written through the tag was
+      a separator short of Lucee's. Fixed; the BIFs still write exact bytes.
+    - `fileReadBinary()` returns a `Binary`, where Lucee returns a byte **array**. So
+      `len()` agrees on both engines but `arrayLen()`/`b[1]` only work on Lucee. Not
+      touched here — it is a value-model difference, not an encoding one. 🌟
 
 `<cflock>` used to head this list — with `scope=` and `throwOnTimeout=` both discarded,
 every scope lock collapsed onto the single name `"default"` (unrelated scopes, and

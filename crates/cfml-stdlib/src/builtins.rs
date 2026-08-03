@@ -7623,10 +7623,67 @@ fn fn_get_profile_sections(args: Vec<CfmlValue>) -> CfmlResult {
 // FILE I/O FUNCTIONS
 // ===============================================
 
+/// Resolve an optional `charset` argument. An absent or empty one means UTF-8
+/// (with BOM sniffing — see `cfml_common::charset`); an unrecognised name is an
+/// `application` error naming the operation, because silently falling back to
+/// UTF-8 is exactly the no-op this charset support exists to remove.
+fn charset_arg(
+    args: &[CfmlValue],
+    index: usize,
+    op: &str,
+    path: &str,
+) -> Result<cfml_common::charset::Charset, CfmlError> {
+    let name = get_str(args, index);
+    if name.trim().is_empty() {
+        return Ok(cfml_common::charset::Charset::Utf8);
+    }
+    cfml_common::charset::resolve(&name).ok_or_else(|| {
+        CfmlError::new(
+            format!(
+                "Failed to {} file [{}], because [{}] is not a supported character encoding",
+                op, path, name
+            ),
+            cfml_common::vm::CfmlErrorType::Application,
+        )
+    })
+}
+
+/// The text to write, with a trailing line separator when the caller asked for
+/// one. `<cffile action="write"/"append">` appends the platform line separator
+/// **by default** and takes `addNewLine="false"` to suppress it (Lucee 7.0.4,
+/// probed: the tag writes 4 bytes for `abc`, the `fileWrite()` BIF writes 3).
+/// RustCFML honoured neither, so the tag's output was a byte short of Lucee's
+/// and `addNewLine` was silently ignored. Only the tag lowering passes this
+/// flag, so a direct `fileWrite(path, data[, charset])` is unchanged. Binary
+/// data never gets a separator — that would corrupt the payload.
+fn with_optional_newline(args: &[CfmlValue], data_index: usize, flag_index: usize) -> String {
+    let text = get_str(args, data_index);
+    let wants_newline = args
+        .get(flag_index)
+        .map(|v| match v {
+            CfmlValue::Bool(b) => *b,
+            CfmlValue::String(s) => {
+                !s.is_empty() && !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no")
+            }
+            CfmlValue::Null => false,
+            other => other.is_true(),
+        })
+        .unwrap_or(false);
+    if wants_newline {
+        format!("{}{}", text, if cfg!(windows) { "\r\n" } else { "\n" })
+    } else {
+        text
+    }
+}
+
 fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => Ok(CfmlValue::string(contents)),
+    // Optional second argument: the charset to decode with (`fileRead(path,
+    // charset)` / `<cffile action="read" charset=…>`). It used to be ignored, so
+    // a UTF-16 file came back as mojibake.
+    let cs = charset_arg(&args, 1, "read", &path)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(CfmlValue::string(cfml_common::charset::decode(&bytes, cs))),
         // Lucee surfaces a missing file from fileRead() as an `expression` error
         // (only fileReadBinary uses FileNotFoundException) — match that asymmetry.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -7645,9 +7702,15 @@ fn fn_file_write(args: Vec<CfmlValue>) -> CfmlResult {
     // Otherwise a CfmlValue::Binary would serialize to the placeholder
     // "<Binary>" (as_string), corrupting every file written from a binary
     // (Preside's FileSystemStorageProvider.putObject → FileWrite(path, binary)).
+    // Optional third argument: the charset to encode text with. Binary data is
+    // already bytes and is written untouched whatever the charset says.
+    let cs = charset_arg(&args, 2, "write to", &path)?;
     let result = match args.get(1) {
         Some(CfmlValue::Binary(bytes)) => std::fs::write(&path, bytes),
-        _ => std::fs::write(&path, get_str(&args, 1).as_bytes()),
+        _ => std::fs::write(
+            &path,
+            cfml_common::charset::encode(&with_optional_newline(&args, 1, 3), cs),
+        ),
     };
     match result {
         Ok(_) => Ok(CfmlValue::Null),
@@ -7660,6 +7723,10 @@ fn fn_file_append(args: Vec<CfmlValue>) -> CfmlResult {
         return Err(CfmlError::runtime("fileAppend requires path and data".to_string()));
     }
     let path = get_str(&args, 0);
+    // Optional third argument: the charset. Lucee appends the full encoding,
+    // BOM included — it does not suppress a second BOM (probed on 7.0.4), and
+    // neither does this.
+    let cs = charset_arg(&args, 2, "append to", &path)?;
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -7669,7 +7736,10 @@ fn fn_file_append(args: Vec<CfmlValue>) -> CfmlResult {
     // Append raw bytes for binary data; stringify simple values (see fileWrite).
     let write_result = match args.get(1) {
         Some(CfmlValue::Binary(bytes)) => file.write_all(bytes),
-        _ => file.write_all(get_str(&args, 1).as_bytes()),
+        _ => file.write_all(&cfml_common::charset::encode(
+            &with_optional_newline(&args, 1, 3),
+            cs,
+        )),
     };
     write_result.map_err(|e| CfmlError::runtime(format!("fileAppend: {}", e)))?;
     Ok(CfmlValue::Null)
@@ -8194,10 +8264,31 @@ fn fn_encode_for_javascript(args: Vec<CfmlValue>) -> CfmlResult {
 // ENCODING/DECODING FUNCTIONS
 // ===============================================
 
+/// Resolve a charset name for `charsetEncode`/`charsetDecode`. Unlike the file
+/// BIFs an empty name is not a valid default here — Lucee requires the argument —
+/// but an empty one is treated as UTF-8 rather than erroring, since that is what
+/// these functions used to do for EVERY name.
+fn charset_name_arg(args: &[CfmlValue], index: usize, fn_name: &str) -> Result<cfml_common::charset::Charset, CfmlError> {
+    let name = get_str(args, index);
+    if name.trim().is_empty() {
+        return Ok(cfml_common::charset::Charset::Utf8);
+    }
+    cfml_common::charset::resolve(&name).ok_or_else(|| {
+        CfmlError::new(
+            format!("{}: [{}] is not a supported character encoding", fn_name, name),
+            cfml_common::vm::CfmlErrorType::Application,
+        )
+    })
+}
+
+/// `charsetDecode(string, encoding)` — the STRING's bytes in that encoding.
+/// (CFML's naming is backwards from the usual sense: decode produces bytes.)
+/// The encoding argument used to be ignored entirely, so this always returned
+/// UTF-8 bytes — a caller asking for UTF-16 silently got UTF-8.
 fn fn_charset_decode(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let _encoding = get_str(&args, 1).to_lowercase();
-    Ok(CfmlValue::Binary(s.as_bytes().to_vec()))
+    let cs = charset_name_arg(&args, 1, "charsetDecode")?;
+    Ok(CfmlValue::Binary(cfml_common::charset::encode(&s, cs)))
 }
 
 fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8230,11 +8321,9 @@ fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
         Some(other) => other.as_string().into_bytes(),
         None => Vec::new(),
     };
-    let _encoding = get_str(&args, 1).to_lowercase();
-    match String::from_utf8(bytes.clone()) {
-        Ok(s) => Ok(CfmlValue::string(s)),
-        Err(_) => Ok(CfmlValue::string(String::from_utf8_lossy(&bytes).to_string())),
-    }
+    // The encoding used to be ignored, so bytes were always read as UTF-8.
+    let cs = charset_name_arg(&args, 1, "charsetEncode")?;
+    Ok(CfmlValue::string(cfml_common::charset::decode(&bytes, cs)))
 }
 
 fn fn_encode_for_html_attribute(args: Vec<CfmlValue>) -> CfmlResult {

@@ -3758,20 +3758,45 @@ fn parse_cffile_tag(
         }
     };
 
+    // `charset` names the encoding for read/write/append. It used to be dropped
+    // here — and the BIFs ignored it too — so every file was UTF-8 whatever the
+    // tag asked for (docs known-issues §27). Only emitted when supplied, so a
+    // charset-less tag keeps the shorter call.
+    let charset_arg = attrs
+        .get("charset")
+        .map(|_| format!(", {}", attr_expr("charset")))
+        .unwrap_or_default();
+    // `<cffile action="write"/"append">` appends the platform line separator
+    // unless `addNewLine="false"` — Lucee 7.0.4 writes 4 bytes for `abc` from the
+    // TAG and 3 from the `fileWrite()` BIF (probed). RustCFML wrote 3 from both
+    // and ignored `addNewLine` entirely, so a file written through the tag was a
+    // separator short of Lucee's. The flag rides as a fourth argument, which only
+    // this lowering passes, so a direct `fileWrite(path, data[, charset])` keeps
+    // its exact-bytes behaviour. Charset must be present for the flag to sit in
+    // the right slot, hence the explicit `""` charset when none was given.
+    let add_newline = attrs
+        .get("addnewline")
+        .map(|v| !matches!(strip_hashes(v).to_lowercase().as_str(), "false" | "no" | "0"))
+        .unwrap_or(true);
+    let write_extra_args = format!(
+        "{}, {}",
+        if charset_arg.is_empty() { ", \"\"".to_string() } else { charset_arg.clone() },
+        if add_newline { "true" } else { "false" }
+    );
     match action.as_str() {
         "read" => {
             let variable = attrs.get("variable").cloned().unwrap_or("cffile".to_string());
-            (format!("{} = fileRead({});\n", variable, attr_expr("file")), consumed)
+            (format!("{} = fileRead({}{});\n", variable, attr_expr("file"), charset_arg), consumed)
         }
         "readbinary" => {
             let variable = attrs.get("variable").cloned().unwrap_or("cffile".to_string());
             (format!("{} = fileReadBinary({});\n", variable, attr_expr("file")), consumed)
         }
         "write" => {
-            (format!("fileWrite({}, {});\n", attr_expr("file"), attr_expr("output")), consumed)
+            (format!("fileWrite({}, {}{});\n", attr_expr("file"), attr_expr("output"), write_extra_args), consumed)
         }
         "append" => {
-            (format!("fileAppend({}, {});\n", attr_expr("file"), attr_expr("output")), consumed)
+            (format!("fileAppend({}, {}{});\n", attr_expr("file"), attr_expr("output"), write_extra_args), consumed)
         }
         // `nameConflict` rides as a third argument: overwrite (the default),
         // skip, error, or makeunique. It used to be dropped here, so every
