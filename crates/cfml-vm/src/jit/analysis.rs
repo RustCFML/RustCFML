@@ -1250,6 +1250,7 @@ mod tests {
             is_component_method: false,
             access: cfml_common::dynamic::CfmlAccess::Public,
             metadata: Vec::new(),
+            is_generated_accessor: false,
         }
     }
 

@@ -928,4 +928,7 @@ include "harness.cfm";
 <cf_runtest file="observe/test_debug_footer.cfm">
 <cf_runtest file="observe/test_profiler.cfm">
 
+<!--- Declared parameter/return types are enforced (docs/known-issues.md §29). --->
+<cf_runtest file="functions/test_fn_type_enforcement.cfm">
+
 <cfscript> printSummary(); </cfscript>

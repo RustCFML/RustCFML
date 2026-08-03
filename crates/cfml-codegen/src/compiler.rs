@@ -195,6 +195,16 @@ pub struct BytecodeFunction {
     /// as flat top-level keys in getMetadata() on a function reference, matching
     /// Lucee/ACF.
     pub metadata: Vec<(String, String)>,
+    /// True for an engine-SYNTHESIZED property accessor (`accessors="true"` /
+    /// `property name="x" type="numeric"` → `getX`/`setX`).
+    ///
+    /// Such a function carries a declared return type for metadata purposes but
+    /// must NOT have it enforced (docs/known-issues.md §29): Lucee reports
+    /// `numeric` on a generated `getNum()` and still returns `""` from it
+    /// happily, and reports `void` on a generated `setX()` that in fact returns
+    /// `this` for chaining. Enforcing either would break CFCs that are
+    /// perfectly legal on the reference engine.
+    pub is_generated_accessor: bool,
 }
 
 impl BytecodeFunction {
@@ -220,6 +230,21 @@ impl BytecodeFunction {
             a.shrink_to_fit();
         }
         self.metadata.shrink_to_fit();
+    }
+}
+
+/// Is a declared parameter type worth emitting a runtime check for? Only the
+/// trivially-unconstrained forms are skipped (undeclared and `any`); every
+/// other name — including ones Lucee has no cast target for and therefore
+/// always rejects — reaches the VM, which owns the actual rules
+/// (`cfml-vm/src/type_check.rs`, docs/known-issues.md §29).
+pub fn declared_type_is_checkable(param_type: Option<&str>) -> bool {
+    match param_type {
+        None => false,
+        Some(t) => {
+            let t = t.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("any")
+        }
     }
 }
 
@@ -509,6 +534,14 @@ pub enum BytecodeOp {
     // shadowed by its own not-yet-initialized slot (GitHub #240). No stack traffic.
     JumpIfArgPresent(String, usize),
 
+    /// Enforce the declared type of param `N` (index into the function's
+    /// `params`/`param_types`) against its CURRENT local value — emitted only
+    /// inside the default-argument preamble, where the value came from the
+    /// declared default rather than from the caller (a caller-supplied argument
+    /// is checked by the VM at bind time). docs/known-issues.md §29. No stack
+    /// traffic.
+    ValidateParamType(usize),
+
     // Output
     Print,
     Halt,
@@ -560,6 +593,7 @@ impl CfmlCompiler {
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
+                    is_generated_accessor: false,
                 })],
             },
             loop_stack: Vec::new(),
@@ -2907,7 +2941,7 @@ impl CfmlCompiler {
         // the VM no longer pre-seeds an omitted param as Null, so a default that
         // references a same-named outer variable (`function f(x = x)`) resolves to
         // that outer variable instead of the param's own empty slot (GitHub #240).
-        for param in &func.params {
+        for (idx, param) in func.params.iter().enumerate() {
             if let Some(ref default_expr) = param.default {
                 let jump_idx = func_instructions.len();
                 func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0)); // placeholder
@@ -2919,6 +2953,14 @@ impl CfmlCompiler {
                 func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
                 func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                 func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
+                // A DEFAULT is type-checked exactly like a supplied argument
+                // (Lucee: `function f( numeric n = "abc" )` throws on `f()`).
+                // A supplied argument is checked by the VM at bind time, which
+                // is why this only guards the default-applied branch — the op
+                // sits INSIDE the JumpIfArgPresent-skipped region.
+                if declared_type_is_checkable(param.param_type.as_deref()) {
+                    func_instructions.push(BytecodeOp::ValidateParamType(idx));
+                }
                 func_instructions[jump_idx] =
                     BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
             }
@@ -2948,7 +2990,19 @@ impl CfmlCompiler {
             global_id: next_global_fn_id(),
             declared_local_mode: declared_mode,
             param_types: func.params.iter().map(|p| p.param_type.clone()).collect(),
-            return_type: func.return_type.clone(),
+            // A return type reaches us two ways: as the prefix form
+            // (`numeric function f()`, which the parser puts in `return_type`,
+            // and which `<cffunction returntype=…>` also lowers to) or as a
+            // post-paren attribute (`function f() returntype="numeric" {}`,
+            // which lands in `metadata`). Only the first was carried, so the
+            // attribute form was invisible to both getMetadata() and the §29
+            // return-type check.
+            return_type: func.return_type.clone().or_else(|| {
+                func.metadata
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
+                    .map(|(_, v)| v.clone())
+            }),
             param_annotations: func.params.iter().map(|p| p.annotations.clone()).collect(),
             is_component_method: self.in_component_method,
             access: match func.access {
@@ -2957,7 +3011,17 @@ impl CfmlCompiler {
                 AccessModifier::Remote => cfml_common::dynamic::CfmlAccess::Remote,
                 AccessModifier::Public => cfml_common::dynamic::CfmlAccess::Public,
             },
-            metadata: func.metadata.clone(),
+            // `returntype` is dropped from the free-form attribute list because it
+            // is now carried in `return_type` above, and the flat attribute keys
+            // land in getMetadata() alongside the canonical `returnType` — one
+            // declaration must not surface as two keys.
+            metadata: func
+                .metadata
+                .iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("returntype"))
+                .cloned()
+                .collect(),
+            is_generated_accessor: false,
         };
 
         let global_id = bc_func.global_id as usize;
@@ -3209,6 +3273,8 @@ impl CfmlCompiler {
                     is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
+                    // Declared for metadata, NOT enforced — see the field docs.
+                    is_generated_accessor: true,
                 };
                 self.push_function(getter_func);
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3290,6 +3356,12 @@ impl CfmlCompiler {
                     is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
+                    // Declared for metadata, NOT enforced. Doubly so here: at
+                    // codegen time an unnamed `component {}` is still called
+                    // "Anonymous" (the real class name is stamped at runtime),
+                    // so this declaration names a type the returned `this` could
+                    // never satisfy.
+                    is_generated_accessor: true,
                 };
                 self.push_function(setter_func);
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3459,8 +3531,9 @@ impl CfmlCompiler {
                 return_type: None,
                 param_annotations: Vec::new(),
                 is_component_method: true,
-                    access: cfml_common::dynamic::CfmlAccess::Public,
-                    metadata: Vec::new(),
+                access: cfml_common::dynamic::CfmlAccess::Public,
+                metadata: Vec::new(),
+                is_generated_accessor: false,
             };
             self.push_function(static_func);
         }
@@ -4407,7 +4480,7 @@ impl CfmlCompiler {
                 // absent param now THROWS `Variable 'X' is undefined` (post-v0.408
                 // strict undefined reads). Named functions were switched to this
                 // pattern for GitHub #240; closures/arrows must match (GitHub #255).
-                for param in &closure.params {
+                for (idx, param) in closure.params.iter().enumerate() {
                     if let Some(ref default_expr) = param.default {
                         let jump_idx = func_instructions.len();
                         func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
@@ -4418,6 +4491,10 @@ impl CfmlCompiler {
                         func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
                         func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                         func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
+                        // Type-check the applied default (see compile_function_decl).
+                        if declared_type_is_checkable(param.param_type.as_deref()) {
+                            func_instructions.push(BytecodeOp::ValidateParamType(idx));
+                        }
                         func_instructions[jump_idx] =
                             BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
                     }
@@ -4442,11 +4519,20 @@ impl CfmlCompiler {
                     global_id: next_global_fn_id(),
                     declared_local_mode: effective_declared,
                     param_types: closure.params.iter().map(|p| p.param_type.clone()).collect(),
-                    return_type: None,
+                    // `function( x ) returntype="numeric" { … }` — the attribute
+                    // parses into the closure's metadata list, so a closure's
+                    // declared return type is enforceable (and reportable) just
+                    // like a named function's. Was hardcoded `None`.
+                    return_type: closure
+                        .metadata
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
+                        .map(|(_, v)| v.clone()),
                     param_annotations: closure.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
+                    is_generated_accessor: false,
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -4468,7 +4554,7 @@ impl CfmlCompiler {
                 // Emit default parameter value preamble for arrow functions.
                 // Uses JumpIfArgPresent (arguments-scope presence) for the same
                 // reason as closures/named functions — see GitHub #255 / #240.
-                for param in &arrow.params {
+                for (idx, param) in arrow.params.iter().enumerate() {
                     if let Some(ref default_expr) = param.default {
                         let jump_idx = func_instructions.len();
                         func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
@@ -4479,6 +4565,10 @@ impl CfmlCompiler {
                         func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
                         func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                         func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
+                        // Type-check the applied default (see compile_function_decl).
+                        if declared_type_is_checkable(param.param_type.as_deref()) {
+                            func_instructions.push(BytecodeOp::ValidateParamType(idx));
+                        }
                         func_instructions[jump_idx] =
                             BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
                     }
@@ -4505,6 +4595,7 @@ impl CfmlCompiler {
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
+                    is_generated_accessor: false,
                 };
 
                 let global_id = bc_func.global_id as usize;

@@ -331,12 +331,29 @@ impl Parser {
                 lookahead += 2;
             }
             if matches!(self.peek(lookahead), Token::Function) {
+                // Keep the annotation: it was consumed and thrown away here, so
+                // `numeric function f()` at page scope reported no returnType in
+                // getMetadata() and had its return type unenforced — while the
+                // same declaration inside a component, and the `public numeric
+                // function f()` form, both carried it. (§29)
+                let mut captured_rt = String::new();
                 for _ in 0..lookahead {
+                    // peek(0) each time — see the note in
+                    // capture_dotted_return_type_before_function.
+                    match self.peek(0).clone() {
+                        Token::Dot => captured_rt.push('.'),
+                        Token::Identifier(s) => captured_rt.push_str(&s),
+                        _ => {}
+                    }
                     self.advance();
                 }
                 self.advance(); // consume `function`
+                let mut func = self.parse_function()?;
+                if func.return_type.is_none() && !captured_rt.is_empty() {
+                    func.return_type = Some(captured_rt);
+                }
                 return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
-                    func: self.parse_function()?,
+                    func,
                 })));
             }
         }
@@ -4610,6 +4627,19 @@ impl Parser {
                 .extract_param_word()
                 .unwrap_or_else(|_| "arg".to_string());
 
+            // A type may also be a typed-array annotation — `string[] names`,
+            // `pkg.Widget[][] grid` (Lucee validates such a parameter
+            // element-by-element; see docs/known-issues.md §29). Consume any
+            // run of `[]` pairs directly after the first word and keep them on
+            // the type string; the name still follows.
+            let mut first = first;
+            while matches!(self.peek(0), Token::LBracket) && matches!(self.peek(1), Token::RBracket)
+            {
+                self.advance();
+                self.advance();
+                first.push_str("[]");
+            }
+
             // If next is also a word (identifier, soft keyword, or reserved
             // word), then first was the type annotation and next is the name.
             let name = if self.is_param_word_at(0) {
@@ -4768,8 +4798,15 @@ impl Parser {
         }
         if matches!(self.peek(lookahead), Token::Function) {
             let mut parts = String::new();
-            for i in 0..lookahead {
-                let tok = self.peek(i).clone();
+            for _ in 0..lookahead {
+                // peek(0), NOT peek(i): the cursor moves with every advance(),
+                // so an index-based peek walked away from the annotation and
+                // spliced the function name and its first parameter type into
+                // the captured string — `pkg.sub.Res function make( any a )`
+                // came out as `pkgsubResmakeany`. Harmless while the value only
+                // reached getMetadata(); fatal once the declared return type is
+                // enforced (§29), because no value can satisfy that name.
+                let tok = self.peek(0).clone();
                 self.advance();
                 match tok {
                     Token::Dot => parts.push('.'),

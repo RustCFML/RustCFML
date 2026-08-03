@@ -36,6 +36,7 @@ pub mod profiler;
 mod java_shims;
 mod java_time;
 pub mod tz;
+pub mod type_check;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
 /// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
@@ -1542,6 +1543,11 @@ pub struct CfmlVirtualMachine {
     pub program: BytecodeProgram,
     pub globals: ValueMap,
     pub builtins: HashMap<String, BuiltinFunction>,
+    /// Memoized `isValid` builtin, for the §29 declared-type checks (which need
+    /// the format predicates but must not pay a case-insensitive scan of the
+    /// whole builtin table on every typed call). `Some(None)` = looked up and
+    /// absent; `None` = not looked up yet.
+    type_check_is_valid: Option<Option<BuiltinFunction>>,
     pub output_buffer: String,
     /// Virtual filesystem for source file I/O (real disk or embedded archive)
     pub vfs: Arc<dyn Vfs>,
@@ -2429,6 +2435,7 @@ impl CfmlVirtualMachine {
             program,
             globals: ValueMap::default(),
             builtins: HashMap::new(),
+            type_check_is_valid: None,
             output_buffer: String::new(),
             vfs: Arc::new(RealFs),
             user_functions: HashMap::new(),
@@ -5078,6 +5085,15 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // §29 — a declared `returntype` is enforced on the way out. Done here,
+        // in the call WRAPPER, because the body has many `return Ok(…)` exits
+        // (explicit Return, falling off the end, template-frame paths) and this
+        // is the single point every one of them passes through.
+        let result = match result {
+            Ok(value) => self.check_declared_return_type(func, value),
+            err => err,
+        };
+
         #[cfg(feature = "observability")]
         if fn_hook {
             if let Some(o) = &self.observer {
@@ -5609,21 +5625,14 @@ impl CfmlVirtualMachine {
             };
             match supplied {
                 Some(value) => {
-                    // Argument type validation for COMPONENT/INTERFACE-typed params
-                    // (Lucee parity): passing an object that isn't an instance of
-                    // the declared CFC/interface throws `expression`. Scoped to
-                    // non-primitive types — primitives stay leniently coerced as
-                    // before. cfflow's WorkflowImplementationFactory relies on this
-                    // (`registerScheduler(required IWorkflowScheduler impl)` etc.).
+                    // §29 — declared parameter types are enforced here, for
+                    // EVERY declared type (they used to be enforced only for
+                    // COMPONENT/INTERFACE types, with primitives silently
+                    // ignored — so `function f( numeric n )` accepted "abc").
+                    // Validation only, never coercion: the value goes into the
+                    // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                        if Self::is_validatable_component_type(ptype)
-                            && !Self::value_satisfies_component_type(&value, ptype)
-                        {
-                            return Err(self.wrap_error(CfmlError::expression(format!(
-                                "The argument [{}] passed to function [{}] is not of type [{}].",
-                                param_name, func.name, ptype
-                            ))));
-                        }
+                        self.check_declared_param_type(func, i, param_name, ptype, &value)?;
                     }
                     locals.insert(param_name.clone(), value.clone());
                     if build_arguments_eager {
@@ -11708,6 +11717,22 @@ impl CfmlVirtualMachine {
                     };
                     if supplied {
                         ip = *target;
+                    }
+                }
+
+                BytecodeOp::ValidateParamType(index) => {
+                    // §29 — the default-argument preamble just filled this param
+                    // from its declared default; Lucee type-checks that value the
+                    // same as a caller-supplied one (`numeric n = "abc"` throws on
+                    // an omitted argument). Only reached when the default WAS
+                    // applied — the op sits inside the JumpIfArgPresent-skipped
+                    // region — so a supplied argument is never checked twice.
+                    if let (Some(name), Some(Some(ptype))) =
+                        (func.params.get(*index), func.param_types.get(*index))
+                    {
+                        let value = locals.get(name).cloned().unwrap_or(CfmlValue::Null);
+                        let ptype = ptype.clone();
+                        self.check_declared_param_type(func, *index, name, &ptype, &value)?;
                     }
                 }
 
@@ -20992,34 +21017,148 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Whether a declared parameter/return type is a COMPONENT/INTERFACE type
-    /// worth argument-type-validating (vs a primitive/builtin RustCFML coerces or
-    /// ignores). Returns false for the primitive/loose set (Lucee coerces those;
-    /// RustCFML stays lenient) and true for anything else — a CFC or interface
-    /// name (`IWorkflowScheduler`, `pkg.Widget`, …). Case-insensitive.
-    fn is_validatable_component_type(type_name: &str) -> bool {
-        let t = type_name.trim().to_lowercase();
-        if t.is_empty() {
-            return false;
+    /// The callbacks `type_check` needs for the checks it can't answer alone:
+    /// component identity (this VM's metadata walk) and the `isValid`-family
+    /// format predicates (cfml-stdlib). Built per call site because `Env` holds
+    /// borrows; the closures capture nothing, so this is free.
+    /// `isValid` is reached through the REGISTERED builtin rather than by
+    /// calling into cfml-stdlib directly: cfml-vm does not depend on
+    /// cfml-stdlib (it takes a builtin table at construction), and a direct
+    /// call compiles on the host only to break the wasm targets. Absent from
+    /// the table — a minimal embedding — the format predicates answer false.
+    /// The registered `isValid`, resolved once. The builtin table is keyed as
+    /// registered (`"isValid"`), so an exact lookup is tried first and the
+    /// case-insensitive scan only ever runs once per VM.
+    fn is_valid_builtin(&mut self) -> Option<BuiltinFunction> {
+        if let Some(memo) = self.type_check_is_valid {
+            return memo;
         }
-        // An array-of / typed-collection annotation (`Widget[]`) is a collection,
-        // not a single-instance check.
-        if t.ends_with("[]") {
-            return false;
+        let resolved = self.builtins.get("isValid").copied().or_else(|| {
+            self.builtins
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("isvalid"))
+                .map(|(_, v)| *v)
+        });
+        self.type_check_is_valid = Some(resolved);
+        resolved
+    }
+
+    fn type_check_env(is_valid: Option<BuiltinFunction>) -> type_check::Env<'static> {
+        type_check::Env {
+            satisfies_component: &|v: &CfmlValue, t: &str| {
+                Self::value_satisfies_component_type(v, t)
+            },
+            is_component: &Self::value_is_component_instance,
+            is_valid,
         }
-        !matches!(
-            t.as_str(),
-            "any" | "string" | "numeric" | "number" | "boolean" | "bool" | "struct"
-                | "array" | "query" | "date" | "datetime" | "time" | "timespan" | "binary"
-                | "uuid" | "guid" | "function" | "closure" | "udf" | "void"
-                | "xml" | "component" | "object" | "node" | "variablename"
-                | "range" | "regex" | "regular_expression" | "email" | "url"
-                | "creditcard" | "ssn" | "social_security_number" | "telephone"
-                | "phone" | "zipcode" | "float" | "double" | "int" | "integer"
-                | "long" | "short" | "bigdecimal" | "biginteger" | "char"
-                | "byte" | "void" | "null" | "usdate" | "eurodate" | "boolean_"
-                | "hex" | "base64" | "path" | "string_" | "lambda"
-        )
+    }
+
+    /// Is `value` a component instance of any kind (CFC, flyweight instance,
+    /// Java shim struct, or native/Rust object)? Mirrors `isObject()`.
+    fn value_is_component_instance(value: &CfmlValue) -> bool {
+        match value {
+            CfmlValue::Component(_) | CfmlValue::NativeObject(_) => true,
+            CfmlValue::Struct(s) => s.contains_key("__name") || s.contains_key("__java_shim"),
+            other => other.is_component(),
+        }
+    }
+
+    /// The name of a component instance, for the `Object type [Component X]`
+    /// form in a type-mismatch message. `None` for anything that isn't one.
+    fn component_type_label(value: &CfmlValue) -> Option<String> {
+        #[cfg(feature = "component-instance")]
+        if let CfmlValue::Instance(inst) = value {
+            return cfml_common::component::CompRef::for_instance(inst)
+                .type_identifiers()
+                .first()
+                .map(|s| s.to_string());
+        }
+        match value {
+            CfmlValue::Component(c) => Some(c.name.clone()),
+            CfmlValue::NativeObject(o) => {
+                Some(o.read().ok()?.class_name().to_string())
+            }
+            CfmlValue::Struct(s) => match s.get("__name") {
+                Some(CfmlValue::String(n)) => Some(n.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// §29 — enforce a declared PARAMETER type. Lucee validates without
+    /// coercing, so a pass leaves the value exactly as the caller passed it;
+    /// see `type_check` for the rules and the Lucee-probed edges.
+    ///
+    /// `Null` is "not supplied" in CFML and is never checked: an omitted
+    /// optional argument keeps its old behaviour of simply being absent.
+    fn check_declared_param_type(
+        &mut self,
+        func: &BytecodeFunction,
+        index: usize,
+        param_name: &str,
+        declared: &str,
+        value: &CfmlValue,
+    ) -> Result<(), CfmlError> {
+        if matches!(value, CfmlValue::Null) || type_check::is_unchecked(declared) {
+            return Ok(());
+        }
+        let env = Self::type_check_env(self.is_valid_builtin());
+        if type_check::satisfies(value, declared, &env) {
+            return Ok(());
+        }
+        Err(self.wrap_error(CfmlError::expression(format!(
+            "Invalid call of the function [{}], {} Argument [{}] is of invalid type, Cannot cast {} to a value of type [{}]",
+            func.name,
+            type_check::ordinal(index),
+            param_name,
+            type_check::value_label(value, &Self::component_type_label),
+            declared.trim()
+        ))))
+    }
+
+    /// §29 — enforce a declared RETURN type, on the way out of a call.
+    ///
+    /// A function that returns nothing yields `Null`, which is never a
+    /// violation — including for `returntype="void"`, whose whole point is
+    /// that nothing comes back.
+    ///
+    /// Lucee has two message forms here and the discriminator is the VALUE, not
+    /// the type: a String gets the bare `Cannot cast …`, everything else gets it
+    /// wrapped in `The function [f] has an invalid return value , [ … ]` (that
+    /// space before the comma is Lucee's). The type is named canonically in
+    /// return position — `date`/`time`/`datetime` all report as `datetime` —
+    /// unlike argument position, which echoes the declaration verbatim.
+    fn check_declared_return_type(&mut self, func: &BytecodeFunction, value: CfmlValue) -> CfmlResult {
+        let Some(declared) = func.return_type.as_deref() else {
+            return Ok(value);
+        };
+        // An engine-generated accessor declares a type it does not honour, on
+        // Lucee too — see `is_generated_accessor`.
+        if func.is_generated_accessor {
+            return Ok(value);
+        }
+        if matches!(value, CfmlValue::Null) || type_check::is_unchecked(declared) {
+            return Ok(value);
+        }
+        let env = Self::type_check_env(self.is_valid_builtin());
+        if type_check::satisfies(&value, declared, &env) {
+            return Ok(value);
+        }
+        let cast = format!(
+            "Cannot cast {} to a value of type [{}]",
+            type_check::value_label(&value, &Self::component_type_label),
+            type_check::return_type_label(declared)
+        );
+        let message = if matches!(value, CfmlValue::String(_)) {
+            cast
+        } else {
+            format!(
+                "The function [{}] has an invalid return value , [{}]",
+                func.name, cast
+            )
+        };
+        Err(self.wrap_error(CfmlError::expression(message)))
     }
 
     /// isInstanceOf-style check: does `value` satisfy a COMPONENT/INTERFACE type
@@ -21032,7 +21171,18 @@ impl CfmlVirtualMachine {
         let want = type_name.trim().to_lowercase();
         let matches_name = |candidate: &str| -> bool {
             let c = candidate.to_lowercase();
-            c == want || c.rsplit('.').next().map(|s| s == want).unwrap_or(false)
+            // Full name, or the same leaf name. The leaf comparison has to work
+            // in BOTH directions — it used to only accept an unqualified
+            // instance name against an unqualified declaration, so a method
+            // declared `testbox.system.TestResult function runRaw()` rejected
+            // the instance it had just built, which resolution had named
+            // `system.TestResult` (webroot-relative) rather than
+            // mapping-qualified. Lucee compares loaded classes, where both
+            // paths are the same file; the closest we get with a name-based
+            // model is to treat equal leaf names as the same type.
+            c == want
+                || c.rsplit('.').next() == want.rsplit('.').next()
+                || c.rsplit('.').next().map(|s| s == want).unwrap_or(false)
         };
         match value {
             // Rust/native parents can't carry CFC metadata — accept leniently.
@@ -33328,6 +33478,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::IsNull => (1, 1),
         BytecodeOp::JumpIfNotNull(_) => (1, 1), // pops, pushes back if not null
         BytecodeOp::JumpIfArgPresent(_, _) => (0, 0), // pure control flow, no stack traffic
+        BytecodeOp::ValidateParamType(_) => (0, 0),   // reads a local, throws or nothing
         // Output
         BytecodeOp::Print => (0, 1),
         BytecodeOp::Halt => (0, 0),

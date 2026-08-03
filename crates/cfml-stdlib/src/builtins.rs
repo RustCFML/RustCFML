@@ -4244,6 +4244,27 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// `isValid( type_name, value )` as a plain predicate, for the declared
+/// parameter/return-type enforcement in `cfml-vm/src/type_check.rs` (§29). That
+/// check needs the format predicates (`date`, `xml`, `uuid`, `guid`,
+/// `variablename`) which live here with their regexes and date parser; the
+/// container/simple-value rules it owns itself, because a declared type is not
+/// `isValid()` (`isValid("string", [])` and `string`-typed arguments disagree
+/// on more than one cell).
+pub fn value_is_valid_type(type_name: &str, value: &CfmlValue) -> bool {
+    matches!(
+        fn_is_valid(vec![CfmlValue::string(type_name.to_string()), value.clone()]),
+        Ok(CfmlValue::Bool(true))
+    )
+}
+
+/// Is `value` a component instance of any class (including a Java-shim struct
+/// or a native/Rust object)? `isObject()` as a plain predicate — see
+/// `value_is_valid_type` for why cfml-vm needs these.
+pub fn value_is_component_instance(value: &CfmlValue) -> bool {
+    matches!(fn_is_object(vec![value.clone()]), Ok(CfmlValue::Bool(true)))
+}
+
 /// Runtime helper emitted by the `cfparam`/`param` lowering to enforce the
 /// `type` (and `min`/`max`/`pattern`) attribute. CFML validates the resulting
 /// value's type and throws on mismatch — previously `type` was silently
@@ -4641,6 +4662,13 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M",
+        // Slash-separated ISO order — `2020/1/2`, which Lucee parses (and
+        // `isDate()`/`isValid("date",…)` accept) but we used to reject while
+        // accepting the dashed form. Unambiguous against `%m/%d/%Y` below: a
+        // leading 4-digit year can't be a month, and a leading month can't be
+        // a year with a valid day left over.
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
         "%m/%d/%Y %H:%M:%S",
         "%m/%d/%Y %I:%M:%S %p",
         "%m/%d/%Y %I:%M %p",
@@ -4664,6 +4692,7 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
     // Date-only formats → midnight
     for fmt in &[
         "%Y-%m-%d",
+        "%Y/%m/%d",
         "%m/%d/%Y",
         "%m-%d-%Y",
         "%d %b %Y",
@@ -14838,15 +14867,34 @@ fn fn_is_xml(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
     let mut reader = Reader::from_str(&s);
     let mut found_element = false;
+    // Well-formedness, not just "contains a tag": an unclosed element is NOT
+    // XML (Lucee: `isXml("<a>")` is false, `isXml("<a/>")` and
+    // `isXml("<a>x</a>")` are true). quick_xml reports no error for a start tag
+    // that never closes, so track the depth and require it back to zero at EOF.
+    // This is load-bearing for `xml`-typed function parameters (§29), which
+    // must reject a string that isn't a document.
+    let mut depth: i32 = 0;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(_)) | Ok(Event::Empty(_)) => { found_element = true; }
+            Ok(Event::Start(_)) => {
+                found_element = true;
+                depth += 1;
+            }
+            Ok(Event::Empty(_)) => {
+                found_element = true;
+            }
+            Ok(Event::End(_)) => {
+                depth -= 1;
+                if depth < 0 {
+                    return Ok(CfmlValue::Bool(false));
+                }
+            }
             Ok(Event::Eof) => break,
             Err(_) => return Ok(CfmlValue::Bool(false)),
             _ => {}
         }
     }
-    Ok(CfmlValue::Bool(found_element))
+    Ok(CfmlValue::Bool(found_element && depth == 0))
 }
 
 #[cfg(feature = "xml")]

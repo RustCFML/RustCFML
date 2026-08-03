@@ -867,11 +867,11 @@ Two things still outstanding:
   spreadsheet extension installed (`undefined tag [cfspreadsheet]`). RustCFML currently
   treats an unclosed one as attribute-only, like the `<cfhttp>` family. 🏗
 
-## 29. Declared types are parsed and never enforced 🔇
+## 29. Declared function types — now enforced ✅ *(fixed in v0.557.0)*
 
-`param_type` and `return_type` are carried through the parser and codegen into
-`BytecodeFunction`, but the only consumers are `getMetadata()` and a component-type
-check. Primitive types are neither validated nor coerced:
+`param_type` and `return_type` used to be carried through the parser and codegen into
+`BytecodeFunction` and then read by nothing but `getMetadata()` (plus a component-type
+check on arguments), so a declared primitive type was a comment:
 
 ```cfml
 function f( required numeric n ) { return n; }
@@ -881,9 +881,69 @@ function g() returntype="numeric" { return "abc"; }
 g();                                  // -> "abc", no error
 ```
 
-Covers `numeric`, `string`, `boolean`, `date`, `array`, `struct`, `uuid`, `email` and
-the rest of the primitive set, in both argument and return position. `cfparam`/`param`
-`type=` **is** enforced (§14) — this gap is specific to function signatures.
+Both are now `expression` errors, with Lucee's own wording, in argument and return
+position, for script and tag declarations, for closures and arrow functions, for
+named / positional / `argumentCollection` calls, and for an applied default. The
+rules live in `crates/cfml-vm/src/type_check.rs`; every one was probed against Lucee
+7.0.4 first and `tests/functions/test_fn_type_enforcement.cfm` (95 assertions) passes
+on both engines. Two properties of the reference behaviour are worth knowing:
+
+- **Validation, not coercion.** A `numeric` parameter given `"123"` receives the
+  *string* `"123"`. Nothing is converted, in either direction, ever.
+- **A type name with no cast target is treated as a component path**, so it rejects
+  *every* value: `integer`, `int`, `long`, `short`, `byte`, `char`, `float`, `double`,
+  `decimal`, `email`, `creditcard`, `url`, `base64`, `usdate`, `eurodate`, `hex`,
+  `path`, `node`, `closure`, `lambda` and `udf` all throw unconditionally —
+  `function f( integer i )` throws on `f( 5 )`, and `email` throws on `"a@b.com"` —
+  while Lucee's own `isValid( "integer", 5 )` says true. This is mirrored
+  deliberately: on Lucee such a call is unconditionally fatal, so no Lucee-tested app
+  can contain a reachable one, and diverging would mean accepting code the reference
+  engine rejects. The names that DO have a cast target: `any`, `string`, `numeric`,
+  `number`, `boolean`, `bool`, `date`/`datetime`/`time`, `timespan`, `array`,
+  `struct`, `query`, `binary`, `xml`, `function`, `uuid`, `guid`, `variablename`,
+  `component`, `object`, `void`, a CFC/interface path, and `T[]` (validated
+  element-by-element, recursively).
+
+Some acceptance cells are surprising and are Lucee's, not ours: a boolean satisfies
+`numeric`; any number satisfies `boolean`; a numerically-keyed (or empty) struct
+satisfies `array` while `{ a : 1 }` does not; a component satisfies `struct`; binary
+satisfies both `string` and `array`; and a numeric *string* satisfies `date`.
+
+Three things this surfaced on the way, all fixed here:
+
+- **Dotted return types were mangled.** `pkg.sub.Res function make( any a )` captured
+  its return type as `pkgsubResmakeany` — the capture loop peeked by index while
+  advancing the cursor, so it spliced in the function name and its first parameter
+  type. Invisible while the value only reached `getMetadata()`; fatal the moment the
+  type is enforced. A method declaring a package-qualified return type of its own
+  package now also accepts the instance it built (resolution may name that instance
+  webroot-relative rather than mapping-qualified; leaf names are compared in both
+  directions).
+- **Two declaration forms were being dropped.** `numeric function f()` at page scope
+  (the prefix form *without* an access modifier) lost its return type entirely, as did
+  `function f() returntype="numeric" {}` (the post-paren attribute form) and any
+  closure's `returntype=`. All three now carry it — so all three also report it in
+  `getMetadata()`, which they did not before.
+- **`isXml()` accepted an unclosed element** (`isXml("<a>")` was true, Lucee says
+  false) and **`isDate()` rejected slash-separated ISO order** (`2020/1/2`, which
+  Lucee accepts). Both are load-bearing for `xml`- and `date`-typed parameters.
+
+Remaining divergences, both consequences of the value model rather than of the check
+🌟:
+
+- RustCFML dates are **strings**, so a date value satisfies `string` and `binary`
+  (Lucee's DateTime does not) but not `numeric` (Lucee's does), and a date named in a
+  mismatch message reads `String [2026-08-03 22:36:31]` where Lucee reads
+  `Object type [DateTime]`.
+- A query column reached by dot notation is an **Array** here and a scalar there, so
+  `q.name` passed to a typed parameter is described as `Object type [Array]` rather
+  than by its single value.
+
+Engine-**generated** property accessors are exempt, as they are on Lucee: a generated
+`getNum()` on `property name="num" type="numeric"` reports `numeric` in metadata and
+still returns `""` happily, and a generated `setX()` reports `void` while returning
+`this` for chaining. Enforcing either would break CFCs that are legal on the reference
+engine. `cfparam`/`param` `type=` enforcement is separate — see §14.
 
 ## 30. Java shims — remaining gaps 🛑/🔇
 
