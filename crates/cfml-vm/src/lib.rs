@@ -690,6 +690,30 @@ fn function_output_suppressed(func: &BytecodeFunction) -> bool {
     })
 }
 
+/// Build the baseline `server` scope.
+///
+/// Every nested struct here is created **untracked** (outside the cycle-GC
+/// allocation log), and that is load-bearing rather than a micro-optimisation.
+///
+/// This baseline is seeded lazily on the first `server` read (`live_server_scope`),
+/// which means it is normally allocated *inside a request* and so lands in that
+/// request's cycle-GC survivor set. The collector disposes of a struct by
+/// blanking it **in place** (`cycle_gc.rs`: `a.write().map.clear()`), not by
+/// freeing it — and it runs at request boundaries including the error path. If it
+/// ever judged `system`/`environment` collectable, those maps would be emptied
+/// while the root survived, and because re-seeding is gated only on the root key
+/// `separator` (with `entry().or_insert()`), nothing would ever repopulate them:
+/// `server.system.environment` would read empty for the rest of the process. That
+/// is the mechanism behind GitHub #302's otherwise-inexplicable "APP_NAME is
+/// required" — an env read appearing to depend on database state.
+///
+/// `new_untracked`'s contract is written for the common case (a struct confined to
+/// its creating frame), but its soundness argument is what applies here: unlogged
+/// allocations read as external roots and can never be over-collected. A
+/// process-lifetime singleton is exactly that — a root — so marking it untracked
+/// states the truth. The contract's failure mode, a bounded per-request leak,
+/// cannot apply to something allocated once per process and intended to live
+/// forever.
 fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     let mut info = ValueMap::default();
 
@@ -749,7 +773,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
                 .to_string(),
         ),
     );
-    info.insert("coldfusion".to_string(), CfmlValue::strukt(cf));
+    info.insert("coldfusion".to_string(), CfmlValue::strukt_untracked(cf));
 
     // Advertise Lucee compatibility. RustCFML targets the Lucee dialect, and
     // frameworks (Wheels, ColdBox, Preside, …) sniff the engine via
@@ -773,13 +797,13 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         "versionLevel".to_string(),
         CfmlValue::string("Stable".to_string()),
     );
-    info.insert("lucee".to_string(), CfmlValue::strukt(lucee.clone()));
+    info.insert("lucee".to_string(), CfmlValue::strukt_untracked(lucee.clone()));
 
     // `server.railo` is Lucee's back-compat alias for `server.lucee` (Railo was
     // Lucee's predecessor; the old key survives the rename). Preside's Lucee
     // error template (system/services/errors/errorTemplate.cfm) reads
     // `server.railo.version`, so mirror the struct here to match Lucee.
-    info.insert("railo".to_string(), CfmlValue::strukt(lucee));
+    info.insert("railo".to_string(), CfmlValue::strukt_untracked(lucee));
 
     let mut os = ValueMap::default();
     os.insert(
@@ -800,7 +824,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
         os.insert("hostname".to_string(), CfmlValue::string(host));
     }
-    info.insert("os".to_string(), CfmlValue::strukt(os));
+    info.insert("os".to_string(), CfmlValue::strukt_untracked(os));
 
     let file_sep = std::path::MAIN_SEPARATOR.to_string();
     let path_sep = if cfg!(windows) { ";" } else { ":" }.to_string();
@@ -810,7 +834,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     sep.insert("file".to_string(), CfmlValue::string(file_sep.clone()));
     sep.insert("path".to_string(), CfmlValue::string(path_sep.clone()));
     sep.insert("line".to_string(), CfmlValue::string(line_sep.clone()));
-    info.insert("separator".to_string(), CfmlValue::strukt(sep));
+    info.insert("separator".to_string(), CfmlValue::strukt_untracked(sep));
 
     let mut java = ValueMap::default();
     java.insert(
@@ -827,7 +851,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
             if cfg!(target_pointer_width = "64") { "64" } else { "32" }.to_string(),
         ),
     );
-    info.insert("java".to_string(), CfmlValue::strukt(java));
+    info.insert("java".to_string(), CfmlValue::strukt_untracked(java));
 
     let mut system = ValueMap::default();
 
@@ -835,7 +859,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     for (k, v) in std::env::vars() {
         env.insert(k, CfmlValue::string(v));
     }
-    system.insert("environment".to_string(), CfmlValue::strukt(env));
+    system.insert("environment".to_string(), CfmlValue::strukt_untracked(env));
 
     let mut props = ValueMap::default();
     let cwd = std::env::current_dir()
@@ -871,7 +895,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         "file.encoding".to_string(),
         CfmlValue::string("UTF-8".to_string()),
     );
-    system.insert("properties".to_string(), CfmlValue::strukt(props));
+    system.insert("properties".to_string(), CfmlValue::strukt_untracked(props));
 
     let args: Vec<CfmlValue> = std::env::args()
         .skip(1)
@@ -879,7 +903,7 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
         .collect();
     system.insert("arguments".to_string(), CfmlValue::array(args));
 
-    info.insert("system".to_string(), CfmlValue::strukt(system));
+    info.insert("system".to_string(), CfmlValue::strukt_untracked(system));
 
     info
 }
@@ -31959,6 +31983,35 @@ impl CfmlVirtualMachine {
                 if let Err(e) =
                     self.call_lifecycle_method(&mut template, "onApplicationStart", vec![])
                 {
+                    // Roll the flag back so the NEXT request retries the boot.
+                    //
+                    // Without this, a single failed start — a database that was
+                    // slow or black-holed for one request, a transient upstream
+                    // blip — left `started = true` forever. The only other reset
+                    // is an explicit `applicationStop()`, so the process served
+                    // every subsequent request against an application that had
+                    // never run its start handler: empty application scope, empty
+                    // function table, permanently. That is GitHub #302's "the
+                    // worker's failed application boot is cached for its
+                    // lifetime", and it is why the reported symptom survived
+                    // every engine-version change the reporter tried.
+                    //
+                    // Deliberately NOT persisting the partial application scope
+                    // here: a retry must start clean, or a half-populated scope
+                    // would make the next run's guard-once blocks skip the
+                    // initialisation they exist to do. `persist_application_state`
+                    // is the only writer of `app.variables`, so skipping it leaves
+                    // the stored scope untouched for the retry.
+                    //
+                    // The cost is that a *permanently* failing start now re-runs
+                    // on every request instead of failing fast. That is the
+                    // correct trade: whether to keep retrying an app that cannot
+                    // boot is the application's call, not the engine's.
+                    server_state
+                        .applications
+                        .modify(&app_name, &mut |app| {
+                            app.started = false;
+                        });
                     let _ = self.call_lifecycle_method(
                         &mut template,
                         "onError",

@@ -197,6 +197,32 @@ pub struct BytecodeFunction {
     pub metadata: Vec<(String, String)>,
 }
 
+impl BytecodeFunction {
+    /// Release the spare capacity every `Vec` here accumulated while being built.
+    ///
+    /// Bytecode is produced by repeated `push`, so each vector grows by amortized
+    /// doubling and ends up holding up to 2x the capacity it needs — and, unlike a
+    /// transient buffer, a compiled function is then retained in the bytecode cache
+    /// for the life of the process, so that slack is permanent. On a live Preside
+    /// install this was measurable: ~126 MiB of the live heap had arrived via
+    /// `RawVec::grow_amortized`, most of it under `compile_file_cached`.
+    ///
+    /// Safe to do unconditionally because a compiled function is immutable once
+    /// built: nothing pushes to these vectors after the compiler hands them over.
+    pub fn shrink_to_fit(&mut self) {
+        self.instructions.shrink_to_fit();
+        self.params.shrink_to_fit();
+        self.required_params.shrink_to_fit();
+        self.has_default.shrink_to_fit();
+        self.param_types.shrink_to_fit();
+        self.param_annotations.shrink_to_fit();
+        for a in &mut self.param_annotations {
+            a.shrink_to_fit();
+        }
+        self.metadata.shrink_to_fit();
+    }
+}
+
 /// Inspect a function/closure metadata attribute list for `localMode`.
 /// Returns `Some(true)` for modern aliases (`modern`/`always`/`true`),
 /// `Some(false)` for classic aliases (`classic`/`update`/`false`),
@@ -641,6 +667,15 @@ impl CfmlCompiler {
         }
     }
 
+    /// Register a finished function on the program, trimming its allocation
+    /// slack first. Every site that adds a compiled function goes through here
+    /// so a new one can't silently reintroduce the untrimmed path.
+    fn push_function(&mut self, mut func: BytecodeFunction) -> usize {
+        func.shrink_to_fit();
+        self.program.functions.push(Arc::new(func));
+        self.program.functions.len() - 1
+    }
+
     pub fn compile(mut self, ast: Program) -> BytecodeProgram {
         let mut instructions = Vec::new();
 
@@ -682,7 +717,13 @@ impl CfmlCompiler {
 
         instructions.push(BytecodeOp::Halt);
 
-        Arc::get_mut(&mut self.program.functions[0]).unwrap().instructions = instructions;
+        // functions[0] is the template body itself; its instruction vector is
+        // assigned here rather than via `push_function`, so trim it explicitly.
+        instructions.shrink_to_fit();
+        let main = Arc::get_mut(&mut self.program.functions[0]).unwrap();
+        main.instructions = instructions;
+        main.shrink_to_fit();
+        self.program.functions.shrink_to_fit();
 
         self.program
     }
@@ -2920,7 +2961,7 @@ impl CfmlCompiler {
         };
 
         let global_id = bc_func.global_id as usize;
-        self.program.functions.push(Arc::new(bc_func));
+        self.push_function(bc_func);
 
         // Define the function in current scope. The op carries the function's
         // process-stable global_id, resolved by the VM through its registry.
@@ -3169,7 +3210,7 @@ impl CfmlCompiler {
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
                 };
-                self.program.functions.push(Arc::new(getter_func));
+                self.push_function(getter_func);
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
                 instructions.push(BytecodeOp::DefineFunction(getter_gid));
                 // Stack: [getter_func]
@@ -3250,7 +3291,7 @@ impl CfmlCompiler {
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
                 };
-                self.program.functions.push(Arc::new(setter_func));
+                self.push_function(setter_func);
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
                 instructions.push(BytecodeOp::DefineFunction(setter_gid));
                 // Stack: [setter_func]
@@ -3421,7 +3462,7 @@ impl CfmlCompiler {
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
             };
-            self.program.functions.push(Arc::new(static_func));
+            self.push_function(static_func);
         }
     }
 
@@ -4409,7 +4450,7 @@ impl CfmlCompiler {
                 };
 
                 let global_id = bc_func.global_id as usize;
-                self.program.functions.push(Arc::new(bc_func));
+                self.push_function(bc_func);
                 instructions.push(BytecodeOp::DefineFunction(global_id));
                 self.current_fn_local_mode = prev_fn_local_mode;
             }
@@ -4467,7 +4508,7 @@ impl CfmlCompiler {
                 };
 
                 let global_id = bc_func.global_id as usize;
-                self.program.functions.push(Arc::new(bc_func));
+                self.push_function(bc_func);
                 instructions.push(BytecodeOp::DefineFunction(global_id));
                 self.current_fn_local_mode = prev_fn_local_mode;
             }

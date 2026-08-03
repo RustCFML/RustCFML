@@ -12,6 +12,12 @@ mod otel;
 #[cfg(all(feature = "obs-pprof", unix))]
 mod pprof_profile;
 
+/// Sampling heap profiler (`--memprofile`) — runtime-armed global allocator,
+/// behind the `memprofile` feature. Public because the binary crate has to
+/// install `SamplingAlloc` as `#[global_allocator]`.
+#[cfg(all(feature = "memprofile", unix))]
+pub mod memprofile;
+
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
@@ -225,6 +231,17 @@ struct Args {
     /// `--features obs-pprof`; Unix-only.
     #[arg(long)]
     profile: bool,
+
+    /// Sampling heap profiler. Arms a global allocator that samples roughly one
+    /// allocation per 256 KiB (override with `RUSTCFML_MEMPROFILE_RATE`) and
+    /// attributes live bytes to the Rust stack that allocated them. Writes
+    /// `rustcfml-memprofile-N-inuse.{pb,folded}` (where the RSS is) and
+    /// `-alloc.{pb,folded}` (what is churning), both loadable in `go tool pprof`.
+    /// In `--serve` mode, `kill -USR2 <pid>` dumps on demand without stopping the
+    /// server; a final dump is written on graceful Ctrl+C shutdown. Requires a
+    /// build with `--features memprofile`; Unix-only.
+    #[arg(long)]
+    memprofile: bool,
 }
 
 /// Process-global flag set by the `--jit-stats` CLI option. Polled after
@@ -497,6 +514,7 @@ fn real_main() {
             production,
             Arc::new(cfconfig),
             args.profile,
+            args.memprofile,
         );
         return;
     }
@@ -541,7 +559,22 @@ fn real_main() {
         eprintln!("--profile requires a build with `--features obs-pprof` (Unix only)");
     }
 
+    // Sampling heap profiler: arm around the run, dump once it completes.
+    #[cfg(all(feature = "memprofile", unix))]
+    if args.memprofile {
+        memprofile::arm("rustcfml-memprofile");
+    }
+    #[cfg(not(all(feature = "memprofile", unix)))]
+    if args.memprofile {
+        eprintln!("--memprofile requires a build with `--features memprofile` (Unix only)");
+    }
+
     execute_file(&path, args.debug);
+
+    #[cfg(all(feature = "memprofile", unix))]
+    if args.memprofile {
+        memprofile::finish("rustcfml-memprofile");
+    }
 
     #[cfg(all(feature = "obs-pprof", unix))]
     if let Some(session) = _profiler {
@@ -1198,7 +1231,19 @@ fn run_server(
     production: bool,
     cfconfig: Arc<RustCfmlConfig>,
     profile: bool,
+    memprofile_on: bool,
 ) {
+    // Sampling heap profiler. Armed for the life of the server; dumps on
+    // SIGUSR2 (no restart needed) and once more on graceful shutdown.
+    #[cfg(all(feature = "memprofile", unix))]
+    if memprofile_on {
+        memprofile::arm("rustcfml-memprofile");
+    }
+    #[cfg(not(all(feature = "memprofile", unix)))]
+    if memprofile_on {
+        eprintln!("--memprofile requires a build with `--features memprofile` (Unix only)");
+    }
+
     // Native sampling profiler (Phase 6) in serve mode. Sampling is process-wide
     // (a SIGPROF timer over all worker threads), so it captures aggregate CPU
     // across every request served — profile under load, then Ctrl+C to write the
@@ -1243,6 +1288,11 @@ fn run_server(
     #[cfg(all(feature = "obs-pprof", unix))]
     if let Some(session) = profiler {
         session.finish();
+    }
+
+    #[cfg(all(feature = "memprofile", unix))]
+    if memprofile_on {
+        memprofile::finish("rustcfml-memprofile");
     }
 }
 
@@ -1977,6 +2027,24 @@ async fn handle_request(
     response
 }
 
+/// Did this body-read failure come from the size cap, or from the transport?
+///
+/// `axum::body::to_bytes` wraps both in the same opaque `axum::Error`, so the
+/// only honest way to tell them apart is to walk the source chain looking for
+/// `http_body_util::LengthLimitError`. Anything else (client aborted mid-POST,
+/// truncated body, connection reset) is NOT a size problem and must not be
+/// reported as one.
+fn body_read_error_is_length_limit(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 async fn handle_request_inner(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -2002,9 +2070,14 @@ async fn handle_request_inner(
     // `.unwrap_or_default()`, which silently substituted an EMPTY body: the
     // request then ran with no form scope at all (not just a missing file), so
     // a too-large upload surfaced as a baffling downstream "variable is
-    // undefined". Preside's asset upload hit exactly that. Note the error can
-    // fire before the whole body is read, so the declared content-length is
-    // logged for context rather than a byte count we measured.
+    // undefined". Preside's asset upload hit exactly that.
+    //
+    // `to_bytes` fails for two unrelated reasons and they MUST NOT be conflated:
+    // an actual `LengthLimitError`, or a transport error (client aborted, body
+    // truncated, connection reset). Reporting the latter as 413 sends the
+    // uploader chasing a size limit it never came close to — we shipped exactly
+    // that, logging "exceeds maxRequestBodySize (209715200 bytes)" for a request
+    // whose declared content-length was 23282.
     let body_bytes = match axum::body::to_bytes(body, body_limit).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -2013,18 +2086,36 @@ async fn handle_request_inner(
                 .get(axum::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
+            if body_read_error_is_length_limit(&e) {
+                // Note the limit can trip before the whole body is read, so the
+                // declared content-length is logged for context rather than a
+                // byte count we measured.
+                log::error!(
+                    "413 {method} {url}: request body exceeds server.maxRequestBodySize ({} bytes); \
+                     declared content-length {declared}: {e}",
+                    state.cfconfig.server.max_request_body_size
+                );
+                return axum::response::Response::builder()
+                    .status(413)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body(axum::body::Body::from(format!(
+                        "Request body too large. The server limit is {} bytes \
+                         (server.maxRequestBodySize in cfconfig; 0 = unlimited).",
+                        state.cfconfig.server.max_request_body_size
+                    )))
+                    .unwrap();
+            }
             log::error!(
-                "413 {method} {url}: request body exceeds server.maxRequestBodySize ({} bytes); \
-                 declared content-length {declared}: {e}",
+                "400 {method} {url}: could not read the request body \
+                 (declared content-length {declared}, server.maxRequestBodySize {} bytes \
+                 was NOT reached): {e}",
                 state.cfconfig.server.max_request_body_size
             );
             return axum::response::Response::builder()
-                .status(413)
+                .status(400)
                 .header("Content-Type", "text/plain; charset=utf-8")
                 .body(axum::body::Body::from(format!(
-                    "Request body too large. The server limit is {} bytes \
-                     (server.maxRequestBodySize in cfconfig; 0 = unlimited).",
-                    state.cfconfig.server.max_request_body_size
+                    "Could not read the request body: {e}"
                 )))
                 .unwrap();
         }
@@ -3662,7 +3753,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false, false);
         }
         _ => {
             // Foreground mode (default: just run)
@@ -3687,7 +3778,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false, false);
         }
     }
 }

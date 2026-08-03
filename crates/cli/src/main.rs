@@ -19,6 +19,14 @@ use cfml_common::vm::{CfmlError, CfmlResult};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// Sampling heap profiler (feature `memprofile`). Unlike DHAT above, this
+// allocator is inert until `--memprofile` arms it at runtime, so a build with
+// the feature on is still a usable server binary. Only one global allocator can
+// exist, hence the `not(dhat-heap)` guard.
+#[cfg(all(feature = "memprofile", unix, not(feature = "dhat-heap")))]
+#[global_allocator]
+static ALLOC: rustcfml_cli::memprofile::SamplingAlloc = rustcfml_cli::memprofile::SamplingAlloc;
+
 fn main() {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();

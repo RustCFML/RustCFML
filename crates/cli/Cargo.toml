@@ -40,6 +40,9 @@ env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
+# Only for `LengthLimitError`: lets a body-read failure be classified as a real
+# over-limit (413) rather than lumping every transport error in with it.
+http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
@@ -65,6 +68,9 @@ socketioxide = "0.16.3"
 # Heap profiler (leak hunting). Off by default; build with `--features dhat-heap`
 # to swap in DHAT's global allocator and dump `dhat-heap.json` on clean shutdown.
 dhat = { version = "0.3", optional = true }
+# Stack capture for the `memprofile` sampling heap profiler. Already in the tree
+# transitively (pprof, dhat); declared explicitly so the feature owns it.
+backtrace = { version = "0.3", optional = true }
 
 # ── OpenTelemetry (observability Phase 3) — host-only, behind `obs-otel` ──
 # Pinned as a compatible set (all track the opentelemetry 0.32 line). OTLP export
@@ -93,6 +99,13 @@ obs-pprof = ["dep:pprof"]
 # Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
 # whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
 dhat-heap = ["dep:dhat"]
+# Sampling heap profiler (`--memprofile`). Unlike `dhat-heap` this installs a
+# global allocator that is INERT until armed at runtime (one relaxed atomic load
+# per allocator call when off), so one binary can serve normally and be asked for
+# a heap profile on demand via SIGUSR2. Emits pprof protobuf + collapsed stacks
+# for both inuse_space and alloc_space. Unix-only (SIGUSR2). Mutually exclusive
+# with `dhat-heap` — only one global allocator can be installed.
+memprofile = ["dep:backtrace"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # Passthrough to the VM's Cranelift JIT (native only). **On by default** via

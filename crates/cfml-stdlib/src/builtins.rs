@@ -50,10 +50,17 @@ static SSN_REGEX: Lazy<Regex> = Lazy::new(|| {
 // every call — profiling stock Wheels (`/posts`) showed regex NFA/DFA
 // construction (`regex_automata` compiler/onepass) at ~3.5% of request CPU,
 // because Wheels routing / pluralization / view helpers lean on reReplace &
-// reFind with fixed patterns. A compiled `Regex` is cheap to clone (internally
-// `Arc`-shared), so caching it turns the second-and-later call into a hashmap
-// hit + refcount bump instead of a full recompile.
-static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, CfRegex>>> =
+// reFind with fixed patterns.
+//
+// Entries are handed out as `Arc<CfRegex>` and never deep-cloned. That detail is
+// load-bearing, and the comment here used to claim the opposite: `regex::Regex`'s
+// `Clone` shares the compiled program via `Arc` but deliberately builds a
+// BRAND-NEW, EMPTY scratch `Pool`. A cloned regex therefore starts with a cold
+// lazy-DFA cache and re-determinizes states on its first match, which made every
+// cache *hit* nearly as expensive as a miss. On a live Preside request that was
+// ~1.6 GiB of allocation churn (`SparseSet::resize`, `Lazy::add_state`,
+// `Pool::new`). Sharing one `Arc` keeps the warm pool alive across calls.
+static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, std::sync::Arc<CfRegex>>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
 const REGEX_CACHE_CAP: usize = 4096;
 
@@ -260,9 +267,11 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-fn cached_regex(pat: &str) -> Result<CfRegex, ()> {
+fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
     if let Some(re) = REGEX_CACHE.read().unwrap().get(pat) {
-        return Ok(re.clone());
+        // Refcount bump only — see REGEX_CACHE's note on why this must not be a
+        // deep clone.
+        return Ok(std::sync::Arc::clone(re));
     }
     let translated = translate_cfml_regex(pat);
     // Fast path: the `regex` crate. On a compile error, retry with `fancy-regex`,
@@ -275,12 +284,19 @@ fn cached_regex(pat: &str) -> Result<CfRegex, ()> {
             Err(_) => return Err(()),
         },
     };
+    let re = std::sync::Arc::new(re);
     let mut cache = REGEX_CACHE.write().unwrap();
     if cache.len() >= REGEX_CACHE_CAP {
         cache.clear();
     }
-    cache.entry(pat.to_string()).or_insert_with(|| re.clone());
-    Ok(re)
+    // Return the entry actually stored, not our local one: a racing thread may
+    // have inserted first, and both callers should end up sharing that single
+    // warm pool rather than each holding a private cold one.
+    Ok(std::sync::Arc::clone(
+        cache
+            .entry(pat.to_string())
+            .or_insert_with(|| std::sync::Arc::clone(&re)),
+    ))
 }
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
@@ -7753,10 +7769,24 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // a filtered scan of a 1000-file dir do ~1000 regex compilations — Preside's
     // Sticker re-scans a FontAwesome icon dir hundreds of times per request, so
     // the old code cost ~500K compilations and pinned /admin at ~100s of CPU.
+    // …but `compile_filter` still ran on every directoryList CALL, so a repeated
+    // scan recompiled the same glob each time — 187 MiB of allocation churn on a
+    // live Preside request. The derived regex depends only on the glob text, so
+    // memoize it. Keyed by the glob (not the derived pattern) to skip rebuilding
+    // the translation too. Deliberately a separate cache from REGEX_CACHE: these
+    // patterns are already Rust-syntax, and must NOT go through
+    // `translate_cfml_regex`, whose CFML/Java rewrites would change their meaning.
+    static GLOB_RX_CACHE: Lazy<std::sync::RwLock<HashMap<String, std::sync::Arc<Regex>>>> =
+        Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+    // Same bound and wholesale-clear policy as REGEX_CACHE: globs come from
+    // application code, so the set is small in practice, but it must not be
+    // unbounded.
+    const GLOB_RX_CACHE_CAP: usize = 1024;
+
     enum PatMatcher {
-        Exact(String),   // lowercased literal — case-insensitive equality
-        Rx(Regex),       // compiled glob
-        Contains(String),// lowercased fallback for a malformed glob
+        Exact(String),              // lowercased literal — case-insensitive equality
+        Rx(std::sync::Arc<Regex>),  // compiled glob, shared so the scratch pool stays warm
+        Contains(String),           // lowercased fallback for a malformed glob
     }
     fn compile_filter(filter: &str) -> Vec<PatMatcher> {
         if filter.is_empty() {
@@ -7768,6 +7798,9 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
             .map(|pattern| {
                 if !pattern.contains('*') && !pattern.contains('?') {
                     return PatMatcher::Exact(pattern.to_lowercase());
+                }
+                if let Some(rx) = GLOB_RX_CACHE.read().unwrap().get(pattern) {
+                    return PatMatcher::Rx(std::sync::Arc::clone(rx));
                 }
                 let mut re = String::with_capacity(pattern.len() + 8);
                 re.push_str("(?i)^");
@@ -7784,7 +7817,18 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 }
                 re.push('$');
                 match Regex::new(&re) {
-                    Ok(r) => PatMatcher::Rx(r),
+                    Ok(r) => {
+                        let r = std::sync::Arc::new(r);
+                        let mut cache = GLOB_RX_CACHE.write().unwrap();
+                        if cache.len() >= GLOB_RX_CACHE_CAP {
+                            cache.clear();
+                        }
+                        PatMatcher::Rx(std::sync::Arc::clone(
+                            cache
+                                .entry(pattern.to_string())
+                                .or_insert_with(|| std::sync::Arc::clone(&r)),
+                        ))
+                    }
                     Err(_) => PatMatcher::Contains(pattern.replace('*', "").to_lowercase()),
                 }
             })
@@ -9313,6 +9357,60 @@ fn datasource_timeout(url: &str) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Socket-level network timeouts for pooled DB connections (GitHub #302).
+///
+/// These are DISTINCT from [`datasource_timeout`], which is the *pool checkout*
+/// timeout — how long to wait for a free connection from the pool. Nothing here
+/// previously bounded the socket itself, so a connection that had been silently
+/// black-holed (NAT/pooler dropping an idle TCP session without sending a RST,
+/// or a database wedged by host contention) would block a request until the OS
+/// TCP timeout — minutes — with the process sitting at 0% CPU. That is the
+/// latency source behind the #302 boot race, and it is reproducible locally just
+/// by loading the machine the database runs on.
+///
+/// Defaults are chosen so they cannot break a legitimately slow query:
+///
+/// * **connect timeout** (default 10s) bounds only connection establishment.
+/// * **keepalive** (default 30s idle) is what actually detects a black-holed
+///   peer — probes fail and the socket errors out instead of hanging forever.
+/// * **read/write timeout** is **off by default**, deliberately. It bounds an
+///   individual socket read, and a long-running statement (a Preside schema
+///   migration, a big report query) sends nothing until it finishes — so any
+///   non-zero value would abort exactly those queries. Enable it only when you
+///   know your workload's ceiling.
+///
+/// Each is overridable by env var; `0` disables that individual timeout.
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_net_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Bounds TCP connection establishment only. Safe to default on.
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_connect_timeout() -> Option<std::time::Duration> {
+    let s = db_net_secs("RUSTCFML_DB_CONNECT_TIMEOUT_SECS", 10);
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
+/// Idle time before TCP keepalive probing starts. The main defence against a
+/// silently-dropped connection; does not affect in-flight queries.
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_keepalive() -> Option<std::time::Duration> {
+    let s = db_net_secs("RUSTCFML_DB_KEEPALIVE_SECS", 30);
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
+/// Per-read/per-write socket timeout. OFF by default — see the note above about
+/// long-running statements.
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_socket_timeout() -> Option<std::time::Duration> {
+    let s = db_net_secs("RUSTCFML_DB_SOCKET_TIMEOUT_SECS", 0);
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
 /// Resolve a datasource identifier to a connection URL. If `name` matches a
 /// registered datasource, return its URL; otherwise return `name` unchanged
 /// so callers can still pass raw `mysql://...` strings.
@@ -9552,6 +9650,13 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         // profile. 256 comfortably covers a request's working set; JDBC pools
         // on Lucee ship a per-connection statement cache the same way.
         .stmt_cache_size(256)
+        // Socket-level bounds — see `db_net_secs` for why keepalive is the one
+        // that matters and why read/write default to off. Without these, a
+        // black-holed connection hangs a request until the OS TCP timeout.
+        .tcp_connect_timeout(db_connect_timeout())
+        .tcp_keepalive_time_ms(db_keepalive().map(|d| d.as_millis() as u32))
+        .read_timeout(db_socket_timeout())
+        .write_timeout(db_socket_timeout())
         // Report rows MATCHED (not rows CHANGED) as the affected-row count, matching
         // Lucee/ACF — MySQL Connector/J negotiates CLIENT_FOUND_ROWS by default
         // (`useAffectedRows=false`), so an UPDATE whose new values equal the current
@@ -9873,6 +9978,19 @@ fn connect_postgres(url: &str) -> Result<postgres::Client, PgConnError> {
     let sanitized = pg_sanitize_url_sslmode(url);
     let mut config = postgres::Config::from_str(&sanitized)
         .map_err(|e| PgConnError(format!("invalid PostgreSQL connection string: {e}")))?;
+
+    // Socket-level bounds (GitHub #302) — see `db_net_secs`. Only applied when
+    // the connection string didn't already specify them, so an explicit
+    // `?connect_timeout=` / `?keepalives_idle=` in the DSN still wins.
+    if config.get_connect_timeout().is_none() {
+        if let Some(d) = db_connect_timeout() {
+            config.connect_timeout(d);
+        }
+    }
+    if let Some(d) = db_keepalive() {
+        config.keepalives(true);
+        config.keepalives_idle(d);
+    }
 
     if mode == "disable" {
         config.ssl_mode(tokio_postgres::config::SslMode::Disable);

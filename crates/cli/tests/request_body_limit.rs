@@ -14,7 +14,7 @@
 //! envelope and lost `uuid`/`chunkNumber` along with the data.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -101,6 +101,61 @@ fn post_chunk(port: u16, payload_len: usize) -> String {
     let mut out = Vec::new();
     stream.read_to_end(&mut out).expect("read response");
     String::from_utf8_lossy(&out).to_string()
+}
+
+/// POST a *truncated* body: declare a Content-Length, then send fewer bytes and
+/// close the write side. The body read fails for a transport reason that has
+/// nothing to do with the size cap. Returns the full raw response.
+fn post_truncated(port: u16, declared_len: usize, actually_sent: usize) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    let head = format!(
+        "POST /up.cfm HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: multipart/form-data; boundary=xyz\r\n\
+         Content-Length: {declared_len}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream
+        .write_all(&vec![b'A'; actually_sent])
+        .unwrap();
+    stream.flush().unwrap();
+    // EOF mid-body: hyper reports an incomplete message, NOT a length limit.
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// A body-read failure that is NOT a size violation must not be reported as one.
+///
+/// We shipped a handler that returned 413 for *every* `to_bytes` error, so a
+/// truncated 23 KB upload was logged as "exceeds server.maxRequestBodySize
+/// (209715200 bytes)" — sending anyone debugging it after a limit that was four
+/// orders of magnitude away from being reached.
+#[test]
+fn truncated_body_is_not_reported_as_over_limit() {
+    let server = start_server();
+
+    // Tiny compared to the fixture's 1 MiB cap: nothing here is over-limit.
+    let resp = post_truncated(server.port, 23_282, 512);
+
+    assert!(
+        !resp.contains("413"),
+        "a truncated body is a transport failure, not an over-limit body; \
+         must not return 413. Got:\n{resp}"
+    );
+    assert!(
+        !resp.to_lowercase().contains("too large"),
+        "a truncated body must not be described as too large. Got:\n{resp}"
+    );
+    // Either a 400 from our handler, or hyper dropping the connection outright
+    // (empty response) — both are honest. What matters is that it is not a 413.
+    assert!(
+        resp.is_empty() || resp.contains("400"),
+        "expected a 400 (or a dropped connection) for a truncated body; got:\n{resp}"
+    );
 }
 
 #[test]
