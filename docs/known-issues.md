@@ -1005,6 +1005,97 @@ Two things to know:
   means the guarded work silently does not happen — the acquire result is not surfaced
   to CFML, so there is no way to branch on it. Lucee has the same shape.
 
+---
+
+## 32. A page-scope variable holding a FUNCTION is invisible inside any function 🛑
+
+A page-level variable whose value is a closure/function reference cannot be reached from
+inside another function body — not bare, not as `variables.x`, from a named function or
+from a closure:
+
+```cfml
+cl = function( x ) { return "called:" & x; };
+
+outer = function()      { return cl( "v" ); };            // Variable 'cl' is undefined
+function reader()       { return cl( "n" ); }             // Variable 'cl' is undefined
+function scopedReader() { return variables.cl( "n" ); }   // Variable 'cl' is undefined
+```
+
+All three work on Lucee 7.0.4 (`called:v` / `called:n` / `called:n`), including the case
+where the callee closure is declared *after* the function that calls it — the read
+happens at call time, by which point the page variable exists.
+
+The gap is specific to **function-valued** page variables. A plain one is fine on both
+engines:
+
+```cfml
+pv = "plain";
+function reader() { return pv; }   // "plain" on both
+```
+
+So this is not the scope chain in general — something drops `CfmlValue::Function`
+entries specifically on the way from a template frame's locals into the `variables`
+scope that a function body sees. (A template frame does deliberately clear
+`captured_scope` on function values when handing its locals over, to avoid capture
+cycles; that path is the obvious place to look.)
+
+Consequences: the very common "define helpers as closures at the top of a `.cfm`, use
+them lower down inside other functions" style does not work. It also makes tests awkward
+to write naturally — `tests/functions/test_fn_type_enforcement.cfm` re-creates its
+fixture inside each callback instead of capturing one page-level variable, because of
+this and nothing else.
+
+## 33. Java `Object` methods on simple values — only `toString()` 🛑
+
+Lucee boxes a CFML simple value as a Java object, so the `java.lang.Object` /
+`Comparable` methods are callable on it. RustCFML implements `toString()` and
+`equals()`-on-a-String, and throws for the rest:
+
+| Call | Lucee 7.0.4 | RustCFML |
+|---|---|---|
+| `n.equals( 1 )` (numeric) | `true` | 🛑 `The function [equals] does not exist in the Numeric.` |
+| `d.equals( 1.5 )` (double) | `true` | 🛑 same, `Numeric` |
+| `b.equals( true )` (boolean) | `true` | 🛑 same, `Boolean` |
+| `[1].equals( [1] )` | `true` | 🛑 same, `Array` |
+| `{a:1}.equals( {a:1} )` | `true` | 🛑 `Variable 'equals' is undefined` |
+| `n.hashCode()` | `1` | 🛑 `The function [hashCode] does not exist in the Numeric.` |
+| `n.compareTo( 2 )` | `-1` | 🛑 `The function [compareTo] does not exist in the Numeric.` |
+| `s.equals( "a" )` (string) | `true` | ✅ `true` |
+| `n.toString()` | `1` | ✅ `1` |
+
+This became **loud** in v0.549.0, when unknown member functions started throwing instead
+of returning null (§25) — a correct change that exposed the missing methods rather than
+causing them.
+
+It costs real coverage: TestBox's own suite is 402 pass / 2 fail / 6 error / 22 skipped,
+and **all eight** non-passes are this one message, reached through TestBox's
+`isNotEqual`/`equals` assertion paths. That suite was 410/0/0/22 at v0.493.0, so this is
+a regression against a known-good baseline — verified as pre-existing (an unmodified
+v0.556.0 binary produces the identical 402/2/6/22), not caused by the §29 work that
+found it. A bisect between v0.493.0 and v0.549.0 would pin the exact commit.
+
+## 34. `createUUID()` — the first one in a process is half zeroed 🌟 *(divergence)*
+
+The first call in a process always returns a UUID whose first block is `00000000`;
+every later call is random:
+
+```
+first:   00000000-CFC5-A584-879E7B7161971634
+second:  A8F2F4DB-DDBB-2087-2CABB96B88DF8E07
+```
+
+Lucee's are random from the first call (`5E6F26D8-FF5F-4A0F-ADBD678B6B7AC91F`). The
+shape is right — 8-4-4-16, so `isValid("uuid",…)` and a `uuid`-typed argument (§29)
+accept it — but a caller that treats the value as unique-per-process gets a collision
+between two processes that each generate exactly one, and a caller that uses the leading
+block as a shard/prefix key gets a hotspot.
+
+Note also that Lucee's third block always begins `4` (`4A0F`, `444E`, `4FE4` — the
+RFC 4122 version nibble) and RustCFML's does not (`A584`, `2087`), so RustCFML's UUIDs
+are not v4-shaped even once past the first call.
+
+---
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it. The most recent such sweep was 2026-08-02;
