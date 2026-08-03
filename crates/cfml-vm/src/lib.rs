@@ -1455,6 +1455,72 @@ enum HeldLock {
     Reentrant,
 }
 
+/// A `<cflock>` / `lock {}` attribute set, resolved to what the runtime needs.
+struct LockOpts {
+    /// The key in `ServerState::named_locks`. For `name="x"` it is `x` verbatim; for
+    /// `scope="…"` it is a synthetic key built by `scope_lock_key` that cannot
+    /// collide with a user-chosen name.
+    name: String,
+    ltype: String,
+    timeout_ms: u64,
+    throw_on_timeout: bool,
+    /// How Lucee names this lock in a timeout message: `lock with name [x]` for the
+    /// `name=` form, `[application] scope lock` for the `scope=` form.
+    label: String,
+}
+
+/// The Lucee wording for a lock-acquisition timeout, e.g.
+/// `a timeout occurred after 2 seconds trying to acquire a exclusive lock with
+/// name [probeI].` / `… a read-only [application] scope lock.` A timeout that is
+/// not a whole number of seconds is expressed in milliseconds
+/// (`timeout="0.5"` → `after 500 milliseconds`). Verified against Lucee 7.0.4;
+/// the "a exclusive" article is Lucee's, not a typo here.
+fn lock_timeout_message(timeout_ms: u64, exclusive: bool, label: &str) -> String {
+    let duration = if timeout_ms % 1000 == 0 {
+        let secs = timeout_ms / 1000;
+        format!("{} second{}", secs, if secs == 1 { "" } else { "s" })
+    } else {
+        format!("{} milliseconds", timeout_ms)
+    };
+    format!(
+        "a timeout occurred after {} trying to acquire a {} {}.",
+        duration,
+        if exclusive { "exclusive" } else { "read-only" },
+        label
+    )
+}
+
+/// Build the `named_locks` key for a `scope=`-form lock. The `\u{1f}` prefix is a
+/// control byte, so the key can never collide with a `name="…"` lock: CFML lock
+/// names come from source text or interpolation, never from a control character.
+///
+/// Each scope gets its OWN key, and the app/session/request scopes are additionally
+/// discriminated by *which* application / session / request they belong to — that is
+/// the whole point of `scope=`. Before v0.553.0 the attribute was read by neither
+/// lowering nor runtime, so every scope lock fell back to the literal name
+/// `"default"` and unrelated scopes (and unrelated applications) serialized against
+/// each other.
+fn scope_lock_key(scope: &str, app: &str, session: Option<&str>, request_id: usize) -> String {
+    match scope {
+        // Server-wide: one lock for the whole process, shared by every application.
+        "server" => "\u{1f}lock:server".to_string(),
+        // Per-application. Two apps locking `scope="application"` do not contend.
+        "application" => format!("\u{1f}lock:app:{}", app),
+        // Per-session, within the application. With session management off there is
+        // no session id, so it degrades to the application lock rather than
+        // silently becoming process-global.
+        "session" => match session {
+            Some(sid) => format!("\u{1f}lock:sess:{}:{}", app, sid),
+            None => format!("\u{1f}lock:app:{}", app),
+        },
+        // Per-request. Only meaningful against `<cfthread>` children, which share the
+        // parent's request scope — hence keying on that scope's backing store.
+        "request" => format!("\u{1f}lock:req:{}", request_id),
+        // Unknown scope: keep it distinct from every real scope, and from `"default"`.
+        other => format!("\u{1f}lock:scope:{}", other),
+    }
+}
+
 /// Turn an inclusive (wall-clock) call duration into EXCLUSIVE (self) time using
 /// a stack of per-frame child-time accumulators. The top of `stack` is the
 /// currently-finishing frame's accumulated child time; we pop it, credit this
@@ -12342,6 +12408,96 @@ impl CfmlVirtualMachine {
         Ok(stack.pop().unwrap_or(CfmlValue::Null))
     }
 
+    /// Resolve a `<cflock>` / `lock {}` attribute set into the key, mode, deadline and
+    /// timeout policy the runtime needs. Shared by `__cflock_start` and `__cflock_end`
+    /// so both derive the *same* key for a `scope=` lock, which carries no `name`.
+    ///
+    /// `name` and `scope` are mutually exclusive (Lucee/ACF both reject the pair).
+    /// The positional form (`name, type, timeout`) is accepted for the script
+    /// lowering's benefit and has no `scope`.
+    fn parse_lock_opts(&self, args: &[CfmlValue]) -> Result<LockOpts, CfmlError> {
+        fn to_ms(v: &CfmlValue) -> Option<u64> {
+            match v {
+                CfmlValue::Int(i) => Some((*i).max(0) as u64 * 1000),
+                CfmlValue::Double(d) => Some((d * 1000.0).max(0.0) as u64),
+                CfmlValue::String(s) => s.parse::<f64>().ok().map(|d| (d * 1000.0).max(0.0) as u64),
+                _ => None,
+            }
+        }
+        fn to_bool(v: &CfmlValue) -> Option<bool> {
+            match v {
+                CfmlValue::Bool(b) => Some(*b),
+                CfmlValue::Int(i) => Some(*i != 0),
+                CfmlValue::String(s) => match s.trim().to_lowercase().as_str() {
+                    "true" | "yes" | "1" => Some(true),
+                    "false" | "no" | "0" => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
+        if let Some(CfmlValue::Struct(opts)) = args.first() {
+            let get = |key: &str| -> Option<CfmlValue> {
+                opts.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v)
+            };
+            let name = get("name").map(|v| v.as_string()).filter(|s| !s.is_empty());
+            let scope = get("scope")
+                .map(|v| v.as_string().trim().to_lowercase())
+                .filter(|s| !s.is_empty());
+            if name.is_some() && scope.is_some() {
+                // Lucee's own wording and `lock` type for this combination.
+                return Err(CfmlError::lock("invalid attribute combination".to_string()));
+            }
+            let (key, label) = match (name, scope) {
+                (Some(n), _) => (n.clone(), format!("lock with name [{}]", n)),
+                (None, Some(s)) => (
+                    scope_lock_key(
+                        &s,
+                        self.current_application_name.as_deref().unwrap_or(""),
+                        self.session_id.as_deref(),
+                        self.request_scope.backing_ptr(),
+                    ),
+                    format!("[{}] scope lock", s),
+                ),
+                // Neither given: a single process-wide lock, as before. Lucee also
+                // treats this as its own lock, distinct from every scope lock.
+                (None, None) => ("default".to_string(), "lock with name [default]".to_string()),
+            };
+            Ok(LockOpts {
+                name: key,
+                label,
+                ltype: get("type")
+                    .map(|v| v.as_string().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "exclusive".to_string()),
+                timeout_ms: get("timeout").as_ref().and_then(to_ms).unwrap_or(5000),
+                throw_on_timeout: get("throwontimeout")
+                    .as_ref()
+                    .and_then(to_bool)
+                    .unwrap_or(true),
+            })
+        } else {
+            let name = args
+                .first()
+                .map(|v| v.as_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".to_string());
+            Ok(LockOpts {
+                label: format!("lock with name [{}]", name),
+                name,
+                ltype: args
+                    .get(1)
+                    .map(|v| v.as_string().to_lowercase())
+                    .unwrap_or_else(|| "exclusive".to_string()),
+                timeout_ms: args.get(2).and_then(to_ms).unwrap_or(5000),
+                throw_on_timeout: args.get(3).and_then(to_bool).unwrap_or(true),
+            })
+        }
+    }
+
     fn call_function(
         &mut self,
         func_ref: &CfmlValue,
@@ -17401,55 +17557,13 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cflock_start" => {
-                    // Extract lock attributes from struct argument
-                    let (lock_name, lock_type, timeout_ms) =
-                        if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                            let name = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "name")
-                                .map(|(_, v)| v.as_string())
-                                .unwrap_or_else(|| "default".to_string());
-                            let ltype = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "type")
-                                .map(|(_, v)| v.as_string().to_lowercase())
-                                .unwrap_or_else(|| "exclusive".to_string());
-                            let timeout = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "timeout")
-                                .and_then(|(_, v)| match v {
-                                    CfmlValue::Int(i) => Some(i as u64 * 1000),
-                                    CfmlValue::Double(d) => Some((d * 1000.0) as u64),
-                                    CfmlValue::String(s) => {
-                                        s.parse::<f64>().ok().map(|d| (d * 1000.0) as u64)
-                                    }
-                                    _ => None,
-                                })
-                                .unwrap_or(5000);
-                            (name, ltype, timeout)
-                        } else {
-                            // Positional args: name, type, timeout
-                            let name = args
-                                .get(0)
-                                .map(|v| v.as_string())
-                                .unwrap_or_else(|| "default".to_string());
-                            let ltype = args
-                                .get(1)
-                                .map(|v| v.as_string().to_lowercase())
-                                .unwrap_or_else(|| "exclusive".to_string());
-                            let timeout = args
-                                .get(2)
-                                .and_then(|v| match v {
-                                    CfmlValue::Int(i) => Some(*i as u64 * 1000),
-                                    CfmlValue::Double(d) => Some((*d * 1000.0) as u64),
-                                    CfmlValue::String(s) => {
-                                        s.parse::<f64>().ok().map(|d| (d * 1000.0) as u64)
-                                    }
-                                    _ => None,
-                                })
-                                .unwrap_or(5000);
-                            (name, ltype, timeout)
-                        };
+                    let LockOpts {
+                        name: lock_name,
+                        ltype: lock_type,
+                        timeout_ms,
+                        throw_on_timeout,
+                        label: lock_label,
+                    } = self.parse_lock_opts(&args)?;
 
                     if let Some(ref server_state) = self.server_state {
                         // Named locks are reentrant within the same request/thread:
@@ -17460,7 +17574,7 @@ impl CfmlVirtualMachine {
                         // order without releasing the real guard.
                         if self.held_locks.iter().any(|(n, _)| *n == lock_name) {
                             self.held_locks.push((lock_name, HeldLock::Reentrant));
-                            return Ok(CfmlValue::Null);
+                            return Ok(CfmlValue::Bool(true));
                         }
                         // Get or create the named lock
                         let lock = {
@@ -17494,9 +17608,17 @@ impl CfmlVirtualMachine {
                                     break;
                                 }
                                 if cfml_common::clock::Monotonic::now() >= deadline {
-                                    return Err(CfmlError::runtime(
-                                        format!("cflock timeout: could not acquire exclusive lock within {}ms", timeout_ms)
-                                    ));
+                                    if !throw_on_timeout {
+                                        // throwOnTimeout="false": the body is skipped and
+                                        // execution continues. The lowering guards the body
+                                        // on this return value.
+                                        return Ok(CfmlValue::Bool(false));
+                                    }
+                                    return Err(CfmlError::lock(lock_timeout_message(
+                                        timeout_ms,
+                                        true,
+                                        &lock_label,
+                                    )));
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
@@ -17513,36 +17635,34 @@ impl CfmlVirtualMachine {
                                     break;
                                 }
                                 if cfml_common::clock::Monotonic::now() >= deadline {
-                                    return Err(CfmlError::runtime(
-                                        format!("cflock timeout: could not acquire readonly lock within {}ms", timeout_ms)
-                                    ));
+                                    if !throw_on_timeout {
+                                        return Ok(CfmlValue::Bool(false));
+                                    }
+                                    return Err(CfmlError::lock(lock_timeout_message(
+                                        timeout_ms,
+                                        false,
+                                        &lock_label,
+                                    )));
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
                         }
                     }
-                    // Without server_state (CLI mode), locks are a no-op
-                    return Ok(CfmlValue::Null);
+                    // Without server_state (CLI mode), locks are a no-op — but the
+                    // body must still run, so report "acquired".
+                    return Ok(CfmlValue::Bool(true));
                 }
                 "__cflock_end" => {
-                    // Release the most recently acquired lock
-                    // Args may contain the lock name for matching
-                    let lock_name = if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        opts.iter()
-                            .find(|(k, _)| k.to_lowercase() == "name")
-                            .map(|(_, v)| v.as_string())
+                    // Release the most recently acquired lock. The argument is the same
+                    // attribute set `__cflock_start` was given, so the effective name is
+                    // derived identically (a `scope=` lock has no `name` attribute).
+                    if args.is_empty() {
+                        self.held_locks.pop();
                     } else {
-                        args.get(0).map(|v| v.as_string())
-                    };
-
-                    if let Some(name) = lock_name {
-                        // Find and remove the matching lock guard
+                        let name = self.parse_lock_opts(&args)?.name;
                         if let Some(pos) = self.held_locks.iter().rposition(|(n, _)| *n == name) {
                             self.held_locks.remove(pos);
                         }
-                    } else {
-                        // Pop the most recent lock
-                        self.held_locks.pop();
                     }
                     return Ok(CfmlValue::Null);
                 }

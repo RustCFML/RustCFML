@@ -1783,8 +1783,12 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     }
                 }
                 let lock_args = format!("{{ {} }}", lock_parts.join(", "));
+                // The body is guarded on the acquire result: with
+                // throwOnTimeout="false" a lock that times out skips the body and
+                // execution continues (and __cflock_end must not run, since nothing
+                // was acquired). Any other outcome returns true.
                 (format!(
-                    "__cflock_start({});\ntry {{\n{}\n__cflock_end({});\n}} catch(any __lock_e) {{\n__cflock_end({});\nthrow __lock_e;\n}}\n",
+                    "if (__cflock_start({})) {{\ntry {{\n{}\n__cflock_end({});\n}} catch(any __lock_e) {{\n__cflock_end({});\nthrow __lock_e;\n}}\n}}\n",
                     lock_args, body_script, lock_args, lock_args
                 ), close_end - start)
             } else {

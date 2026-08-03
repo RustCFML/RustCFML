@@ -3274,29 +3274,21 @@ impl Parser {
                     ordered: false,
                     location: loc,
                 });
-                let lock_name_expr = attrs.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Expression::Literal(Literal {
-                        value: LiteralValue::String("default".to_string()),
-                        location: loc,
-                    }));
-                let lock_start = Statement::Expression(ExpressionStatement {
-                    expr: Expression::FunctionCall(Box::new(FunctionCall {
-                        name: Box::new(Expression::Identifier(Identifier {
-                            name: "__cflock_start".to_string(), location: loc,
-                        })),
-                        arguments: vec![attrs_struct],
-                        location: loc,
+                // __cflock_end gets the same attribute set as __cflock_start, so a
+                // scope= lock (which has no name=) resolves to the same key.
+                let lock_start_call = Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier {
+                        name: "__cflock_start".to_string(), location: loc,
                     })),
+                    arguments: vec![attrs_struct.clone()],
                     location: loc,
-                });
+                }));
                 let lock_end = Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
                             name: "__cflock_end".to_string(), location: loc,
                         })),
-                        arguments: vec![lock_name_expr],
+                        arguments: vec![attrs_struct],
                         location: loc,
                     })),
                     location: loc,
@@ -3307,8 +3299,17 @@ impl Parser {
                     finally_body: Some(vec![lock_end]),
                     location: loc,
                 });
+                // if (__cflock_start(attrs)) { try { body } finally { __cflock_end } } —
+                // a throwOnTimeout="false" timeout skips the body.
+                let lock_stmt = Statement::If(If {
+                    condition: lock_start_call,
+                    then_branch: vec![try_stmt],
+                    else_if: vec![],
+                    else_branch: None,
+                    location: loc,
+                });
                 CfmlNode::Statement(Statement::Output(Output {
-                    body: vec![lock_start, try_stmt],
+                    body: vec![lock_stmt],
                     location: loc,
                 }))
             }
@@ -3575,15 +3576,6 @@ impl Parser {
         // Parse the block body
         let body = self.parse_block()?;
 
-        // Extract lock name for __cflock_end
-        let lock_name_expr = attrs.iter()
-            .find(|(k, _)| k.to_lowercase() == "name")
-            .map(|(_, v)| v.clone())
-            .unwrap_or(Expression::Literal(Literal {
-                value: LiteralValue::String("default".to_string()),
-                location: loc,
-            }));
-
         // Build struct literal for __cflock_start argument
         let struct_pairs: Vec<(Expression, Expression)> = attrs.iter().map(|(k, v)| {
             (Expression::Literal(Literal {
@@ -3599,10 +3591,21 @@ impl Parser {
         });
 
         // __cflock_start(attrs)
-        let lock_start = Statement::Expression(ExpressionStatement {
+        let lock_start_call = Expression::FunctionCall(Box::new(FunctionCall {
+            name: Box::new(Expression::Identifier(Identifier {
+                name: "__cflock_start".to_string(),
+                location: loc,
+            })),
+            arguments: vec![attrs_struct.clone()],
+            location: loc,
+        }));
+
+        // __cflock_end(attrs) — the same attribute set, so a scope= lock (which has
+        // no name=) resolves to the same key the acquire used.
+        let lock_end = Statement::Expression(ExpressionStatement {
             expr: Expression::FunctionCall(Box::new(FunctionCall {
                 name: Box::new(Expression::Identifier(Identifier {
-                    name: "__cflock_start".to_string(),
+                    name: "__cflock_end".to_string(),
                     location: loc,
                 })),
                 arguments: vec![attrs_struct],
@@ -3611,20 +3614,7 @@ impl Parser {
             location: loc,
         });
 
-        // __cflock_end(name)
-        let lock_end = Statement::Expression(ExpressionStatement {
-            expr: Expression::FunctionCall(Box::new(FunctionCall {
-                name: Box::new(Expression::Identifier(Identifier {
-                    name: "__cflock_end".to_string(),
-                    location: loc,
-                })),
-                arguments: vec![lock_name_expr],
-                location: loc,
-            })),
-            location: loc,
-        });
-
-        // try { body } finally { __cflock_end(name) }
+        // try { body } finally { __cflock_end(attrs) }
         let try_stmt = Statement::Try(Try {
             body,
             catches: vec![],
@@ -3632,9 +3622,16 @@ impl Parser {
             location: loc,
         });
 
-        // Wrap as Output block: __cflock_start; try { ... } finally { __cflock_end }
+        // if (__cflock_start(attrs)) { try { ... } finally { __cflock_end } } — a
+        // throwOnTimeout="false" timeout skips the body and continues.
         let output = Statement::Output(Output {
-            body: vec![lock_start, try_stmt],
+            body: vec![Statement::If(If {
+                condition: lock_start_call,
+                then_branch: vec![try_stmt],
+                else_if: vec![],
+                else_branch: None,
+                location: loc,
+            })],
             location: loc,
         });
 

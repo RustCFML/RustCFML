@@ -748,9 +748,16 @@ the tags below still have theirs.
 | `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
 | `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
 | `<cfloop query=…>` | `query`, `index`/`item` | `startrow`, `endrow` (**all rows are iterated**), `group` (no control-break grouping). |
-| `<cflock>` | `name`, `type`, `timeout` | `throwOnTimeout` (always throws), and `scope` — **`scope="application"`/`"session"`/`"server"`/`"request"` all collapse onto one `"default"` lock name, so unrelated scopes serialize against each other.** That is a concurrency-correctness bug, not just a missing option. |
 | `<cfinvoke>` | `component`, `method`, `returnvariable`, args | `webservice` — it becomes a *method argument* and the component resolves to `""`. |
 | `cftransaction(…)` (script form) | `action` | `isolation`, `datasource` — the **tag** form forwards both; the script form does not, so a script-form transaction can silently use the wrong datasource. |
+
+`<cflock>` used to head this list — with `scope=` and `throwOnTimeout=` both discarded,
+every scope lock collapsed onto the single name `"default"` (unrelated scopes, and
+unrelated applications, serializing against each other) and a contended lock always
+threw. Fixed in v0.553.0: see §31. Note that the loss was in the **runtime**, not the
+lowering — all three `cflock` lowerings already forwarded every attribute, and
+`__cflock_start` simply never read them. Attribute plumbing is worth checking at both
+ends.
 
 ## 28. Unclosed body tags are silently erased 🔇
 
@@ -803,6 +810,44 @@ remains:
 | Unknown method on a **known** shim class | 🔇 Still returns null rather than throwing. The shim correctly reports "not mine" and falls through to generic dispatch — which must stay, so property access like `system.out` keeps working — but a `__java_shim` struct whose member resolves nowhere does not reach the undefined-member error a plain struct gets. Making that loud is the remaining half of the D2 work. |
 
 ---
+
+## 31. `<cflock>` `scope=` and `throwOnTimeout=` ✅ *(fixed in v0.553.0)*
+
+Both attributes reached the compiler and were then dropped by the runtime, which read
+only `name`, `type` and `timeout`. Consequences: every `scope=` lock fell back to the
+literal lock name `"default"`, so `scope="application"` in one app serialized against
+`scope="session"` in another (a concurrency-correctness bug, not a missing option), and
+`throwOnTimeout="false"` still threw on contention.
+
+Now each scope gets its own lock, discriminated by *which* application / session /
+request it belongs to:
+
+| Form | Lock identity |
+|---|---|
+| `name="x"` | The name verbatim, process-wide (unchanged). |
+| `scope="server"` | One lock for the whole process, shared by every application. |
+| `scope="application"` | Per application — two apps do not contend. |
+| `scope="session"` | Per session, within the application. |
+| `scope="request"` | Per request — keyed on the request scope's backing store, so `<cfthread>` children (which share that scope) contend with their parent, and separate requests do not. |
+| neither | A single lock named `"default"`, distinct from every scope lock. Lucee also treats the bare form as its own lock. |
+
+`name=` and `scope=` are mutually exclusive and now raise Lucee's own error
+(`type="lock"`, "invalid attribute combination"), and a timeout raises a `lock`-typed
+exception with Lucee's wording — `a timeout occurred after 1 second trying to acquire a
+exclusive lock with name [x].` / `… a read-only [application] scope lock.` A sub-second
+timeout is expressed in milliseconds, as Lucee expresses it. Previously both were
+generic `runtime` errors, so `catch( lock e )` could not see them.
+
+Every one of those behaviours was probed against Lucee 7.0.4 before being implemented;
+`tests/tags/test_tags_cflock_scope.cfm` passes 7/7 on both engines.
+
+Two things to know:
+
+- **`scope="session"` with session management off** has no session to key on, so it
+  degrades to the application lock rather than silently becoming process-global. 🏗
+- **`throwOnTimeout="false"` skips the body.** That is the reference behaviour, but it
+  means the guarded work silently does not happen — the acquire result is not surfaced
+  to CFML, so there is no way to branch on it. Lucee has the same shape.
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /

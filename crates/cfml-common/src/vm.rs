@@ -55,6 +55,14 @@ impl CfmlError {
         Self::new(message, CfmlErrorType::Custom("database".to_string()))
     }
 
+    /// A catchable `lock`-typed exception, matching how Lucee surfaces `<cflock>`
+    /// failures (a timeout, or an invalid attribute combination). CFML code does
+    /// `catch( lock e )` to distinguish contention from a genuine error inside the
+    /// locked body, so these must not arrive as generic `runtime` errors.
+    pub fn lock(message: String) -> Self {
+        Self::new(message, CfmlErrorType::Custom("lock".to_string()))
+    }
+
     /// A catchable `expression`-typed exception, matching how Lucee/ACF surface
     /// expression-evaluation errors (e.g. an invalid datepart passed to
     /// `dateAdd`/`dateDiff`). CFML code does `catch( expression e )` and many
