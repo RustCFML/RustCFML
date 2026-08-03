@@ -12958,6 +12958,7 @@ impl CfmlVirtualMachine {
                 let mut opts = dump::DumpOptions::default();
                 let mut var: Option<CfmlValue> = None;
                 let mut output: Option<String> = None;
+                let mut abort_after = false;
                 if let Some(pairs) = &named {
                     for (k, v) in pairs {
                         match k.to_lowercase().as_str() {
@@ -12971,6 +12972,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             "output" => output = Some(v.as_string()),
+                            "abort" => abort_after = v.is_true(),
                             _ => {}
                         }
                     }
@@ -12989,7 +12991,47 @@ impl CfmlVirtualMachine {
                     print!("{}", rendered);
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
-                    return Ok(CfmlValue::Null);
+                    return self.finish_dump(abort_after);
+                }
+                // `output="<path>"` writes the dump to a FILE and keeps the
+                // response clean. Lucee uses the plain-text rendering (the same
+                // one `output="console"` emits), APPENDS to an existing file, and
+                // resolves the path the way ExpandPath does — leading slash =
+                // web root, otherwise relative to the calling template (all
+                // probed on 7.0.4). A missing parent directory is an
+                // `application` error with Lucee's wording, not a silent skip.
+                if let Some(path) = output
+                    .as_deref()
+                    .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("browser"))
+                {
+                    let resolved = self.resolve_template_relative(path, false);
+                    let target = std::path::Path::new(&resolved);
+                    match target.parent() {
+                        Some(dir) if !dir.as_os_str().is_empty() && !dir.is_dir() => {
+                            return Err(CfmlError::new(
+                                format!(
+                                    "Parent directory for [{}] doesn't exist",
+                                    target.display()
+                                ),
+                                CfmlErrorType::Application,
+                            ));
+                        }
+                        _ => {}
+                    }
+                    let rendered = dump::render(&value, &opts, false, false);
+                    use std::io::Write;
+                    let appended = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(target)
+                        .and_then(|mut f| f.write_all(rendered.as_bytes()));
+                    if let Err(e) = appended {
+                        return Err(CfmlError::new(
+                            format!("cannot write dump to [{}]: {}", target.display(), e),
+                            CfmlErrorType::Application,
+                        ));
+                    }
+                    return self.finish_dump(abort_after);
                 }
                 let include_assets = self.web_context && !self.dump_assets_emitted;
                 let rendered = dump::render(&value, &opts, self.web_context, include_assets);
@@ -12997,7 +13039,7 @@ impl CfmlVirtualMachine {
                     self.dump_assets_emitted = true;
                 }
                 self.output_buffer.push_str(&rendered);
-                return Ok(CfmlValue::Null);
+                return self.finish_dump(abort_after);
             }
 
             if matches!(name_lower.as_str(), "cfdirectory" | "__cfdirectory") {
@@ -25558,6 +25600,19 @@ impl CfmlVirtualMachine {
     /// merge those entries into a new attribute struct with explicit attrs
     /// winning. The source `attributeCollection` struct is not mutated.
     /// Returns the input unchanged when there is no collection to expand.
+    /// Finish a `writeDump`/`<cfdump>` call: `abort="true"` ends the request the
+    /// way `<cfabort>` does (the dump itself has already been emitted), which the
+    /// `<cfdump>` lowering used to drop entirely.
+    fn finish_dump(&self, abort_after: bool) -> CfmlResult {
+        if abort_after {
+            return Err(CfmlError::new(
+                "__cfabort".to_string(),
+                CfmlErrorType::Custom("abort".to_string()),
+            ));
+        }
+        Ok(CfmlValue::Null)
+    }
+
     fn merge_attribute_collection(attrs: CfmlValue) -> CfmlValue {
         let s = match &attrs {
             CfmlValue::Struct(s) => s.clone(),

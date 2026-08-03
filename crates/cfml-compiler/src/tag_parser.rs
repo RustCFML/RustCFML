@@ -965,7 +965,16 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // that failed to parse.
             let var = attr_expr("var").unwrap_or_else(|| "\"\"".to_string());
             let mut call_args = format!("var={}", var);
-            for key in ["label", "expand", "top"] {
+            // Every attribute other than `var` rides through as a named arg.
+            // This was a three-key list (label/expand/top), so `output=` (console
+            // / a file path) and `abort=` were discarded at compile time —
+            // `<cfdump output="console">` wrote into the HTTP response anyway and
+            // `abort="true"` never stopped the request (docs known-issues §27).
+            // Source order keeps codegen deterministic (`attrs` is a HashMap).
+            for key in &attr_order {
+                if key == "var" {
+                    continue;
+                }
                 if let Some(expr) = attr_expr(key) {
                     call_args.push_str(&format!(", {}={}", key, expr));
                 }
@@ -1975,6 +1984,22 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 extra_parts.extend(child_parts);
                 format!("{{ {} }}", extra_parts.join(", "))
             };
+
+            // `webservice=` invokes a SOAP endpoint. RustCFML has no web-service
+            // client, and because `webservice` was not a reserved attribute it
+            // used to ride along as a METHOD ARGUMENT while `component` resolved
+            // to `""` — a confusing "component not found" at best, a silent call
+            // on the wrong object at worst (docs known-issues §27). Fail with the
+            // reason instead. Deliberately a runtime throw, not a compile error:
+            // Lucee compiles the tag happily, so an app that merely *contains* an
+            // unreached SOAP call must still start.
+            if attrs.contains_key("webservice") {
+                return (
+                    "throw(type=\"Application\", message=\"cfinvoke webservice= is not supported: RustCFML has no SOAP web-service client. Call the endpoint with cfhttp instead.\");\n"
+                        .to_string(),
+                    consumed,
+                );
+            }
 
             let call = format!("__cfinvoke({}, {}, {})", comp_expr, method_expr, third_arg);
             if let Some(rv) = return_var {
@@ -3748,11 +3773,14 @@ fn parse_cffile_tag(
         "append" => {
             (format!("fileAppend({}, {});\n", attr_expr("file"), attr_expr("output")), consumed)
         }
+        // `nameConflict` rides as a third argument: overwrite (the default),
+        // skip, error, or makeunique. It used to be dropped here, so every
+        // conflicting copy/move silently overwrote (docs known-issues §27).
         "copy" => {
-            (format!("fileCopy({}, {});\n", attr_expr("source"), attr_expr("destination")), consumed)
+            (format!("fileCopy({}, {}, {});\n", attr_expr("source"), attr_expr("destination"), attr_expr("nameconflict")), consumed)
         }
         "move" | "rename" => {
-            (format!("fileMove({}, {});\n", attr_expr("source"), attr_expr("destination")), consumed)
+            (format!("fileMove({}, {}, {});\n", attr_expr("source"), attr_expr("destination"), attr_expr("nameconflict")), consumed)
         }
         "delete" => {
             (format!("fileDelete({});\n", attr_expr("file")), consumed)
@@ -4433,6 +4461,45 @@ mod tests {
     /// used to copy a fixed ten-key whitelist, so `name=`/`file=`/`path=` (and
     /// throwOnError/redirect/port/proxyPort/encodeURL, all implemented in the
     /// runtime) were discarded at compile time — docs known-issues §27.
+    /// `<cfdump>` forwarded only var/label/expand/top, so `output=` (console or
+    /// a file) and `abort=` were discarded — docs known-issues §27.
+    #[test]
+    fn test_cfdump_forwards_output_and_abort() {
+        let result = tags_to_script(
+            r##"<cfdump var="#x#" label="L" output="console" abort="true" top="3">"##,
+        );
+        for key in ["label=", "output=", "abort=", "top="] {
+            assert!(result.contains(key), "cfdump dropped `{}`: {}", key, result);
+        }
+    }
+
+    /// `<cffile action="copy"/"move">` dropped `nameConflict=`, so every
+    /// conflicting copy silently overwrote — docs known-issues §27.
+    #[test]
+    fn test_cffile_forwards_nameconflict() {
+        let copied = tags_to_script(
+            r#"<cffile action="copy" source="a.txt" destination="b.txt" nameConflict="makeunique">"#,
+        );
+        assert!(copied.contains(r#"fileCopy("a.txt", "b.txt", "makeunique")"#), "unexpected: {copied}");
+        let moved = tags_to_script(
+            r#"<cffile action="move" source="a.txt" destination="b.txt" nameConflict="error">"#,
+        );
+        assert!(moved.contains(r#"fileMove("a.txt", "b.txt", "error")"#), "unexpected: {moved}");
+    }
+
+    /// `<cfinvoke webservice=…>` used to pass the WSDL URL as a method ARGUMENT
+    /// with an empty component. There is no SOAP client, so say so — at runtime,
+    /// not compile time, so an app containing an unreached SOAP call still starts.
+    #[test]
+    fn test_cfinvoke_webservice_throws_at_runtime() {
+        let result = tags_to_script(
+            r#"<cfinvoke webservice="http://x/y?wsdl" method="m" returnvariable="r">"#,
+        );
+        assert!(result.starts_with("throw("), "unexpected lowering: {result}");
+        assert!(result.contains("webservice= is not supported"), "unexpected message: {result}");
+        assert!(!result.contains("__cfinvoke("), "still invokes a component: {result}");
+    }
+
     #[test]
     fn test_cfhttp_forwards_every_attribute() {
         let result = tags_to_script(

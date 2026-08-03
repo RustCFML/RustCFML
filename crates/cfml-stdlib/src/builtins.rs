@@ -7699,12 +7699,84 @@ fn fn_file_delete(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// Apply `<cffile action="copy"/"move">`'s `nameConflict` to a destination that
+/// already exists. Returns the destination to use, or `None` when the operation
+/// must be skipped. Semantics probed on Lucee 7.0.4:
+///
+/// | nameConflict | behaviour |
+/// |---|---|
+/// | `overwrite` (and the DEFAULT) | replace the destination |
+/// | `skip` | leave the destination alone, no error |
+/// | `error` | throw `application`: `Destination file [x] already exists` |
+/// | `makeunique` | leave the destination alone and write `name-<unique>.ext` |
+///
+/// `nameConflict` used to be dropped by the `<cffile>` lowering, so every
+/// conflict silently overwrote (docs known-issues §27).
+fn resolve_name_conflict(dest: &str, mode: &str) -> Result<Option<String>, CfmlError> {
+    let path = std::path::Path::new(dest);
+    if !path.exists() {
+        return Ok(Some(dest.to_string()));
+    }
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "overwrite" => Ok(Some(dest.to_string())),
+        "skip" => Ok(None),
+        "error" => Err(CfmlError::new(
+            format!("Destination file [{}] already exists", dest),
+            cfml_common::vm::CfmlErrorType::Application,
+        )),
+        "makeunique" => {
+            // `name-<unique>.ext`, the shape Lucee produces. The suffix only has
+            // to be unique, so it comes from a per-process counter mixed with the
+            // path length rather than pulling in `rand`.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ext = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let dir = path.parent();
+            for _ in 0..1000 {
+                let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+                let candidate_name = format!("{}-{:x}{:x}{}", stem, seq, dest.len(), ext);
+                let candidate = match dir {
+                    Some(d) if !d.as_os_str().is_empty() => d.join(&candidate_name),
+                    _ => std::path::PathBuf::from(&candidate_name),
+                };
+                if !candidate.exists() {
+                    return Ok(Some(candidate.to_string_lossy().into_owned()));
+                }
+            }
+            Err(CfmlError::runtime(format!(
+                "nameConflict=\"makeunique\": could not find a free name next to [{}]",
+                dest
+            )))
+        }
+        other => Err(CfmlError::new(
+            format!(
+                "invalid value [{}] for attribute nameConflict, valid values are [error, skip, overwrite, makeunique]",
+                other
+            ),
+            cfml_common::vm::CfmlErrorType::Application,
+        )),
+    }
+}
+
 fn fn_file_move(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() < 2 {
         return Err(CfmlError::runtime("fileMove requires source and destination".to_string()));
     }
     let src = get_str(&args, 0);
     let dest = get_str(&args, 1);
+    // Optional third argument: `<cffile action="move">`'s nameConflict. Absent
+    // (plain `fileMove(src, dest)`) keeps the overwrite behaviour.
+    let dest = match resolve_name_conflict(&dest, &get_str(&args, 2))? {
+        Some(d) => d,
+        None => return Ok(CfmlValue::Null),
+    };
     match std::fs::rename(&src, &dest) {
         Ok(_) => Ok(CfmlValue::Null),
         Err(e) => Err(CfmlError::runtime(format!("fileMove: {}", e))),
@@ -7717,6 +7789,10 @@ fn fn_file_copy(args: Vec<CfmlValue>) -> CfmlResult {
     }
     let src = get_str(&args, 0);
     let dest = get_str(&args, 1);
+    let dest = match resolve_name_conflict(&dest, &get_str(&args, 2))? {
+        Some(d) => d,
+        None => return Ok(CfmlValue::Null),
+    };
     match std::fs::copy(&src, &dest) {
         Ok(_) => Ok(CfmlValue::Null),
         Err(e) => Err(CfmlError::runtime(format!("fileCopy: {}", e))),

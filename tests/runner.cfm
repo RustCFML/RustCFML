@@ -522,6 +522,9 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfhttp_interpolation.cfm">
 <cf_runtest file="tags/test_cfhttp_attribute_collection.cfm">
 <cf_runtest file="tags/test_tags_cfhttp_name_file.cfm">
+<cf_runtest file="tags/test_tags_cfdump_output_abort.cfm">
+<cf_runtest file="tags/test_tags_cffile_nameconflict.cfm">
+<cf_runtest file="tags/test_tags_cfinvoke_webservice.cfm">
 <cf_runtest file="tags/test_throw_object_rootcause.cfm">
 <cf_runtest file="tags/test_cfloop_file_and_includes.cfm">
 <cf_runtest file="tags/test_tags_cfhttp_multipart.cfm">

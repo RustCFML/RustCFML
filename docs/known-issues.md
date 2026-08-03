@@ -742,11 +742,20 @@ the tags below still have theirs.
 
 | Tag | Survives lowering | Silently dropped |
 |---|---|---|
-| `<cfdump>` | `label`, `expand`, `top` | `output`, `abort`. `writeDump()` implements `output`, so `<cfdump output="console">` still writes into the HTTP response body instead of stdout. |
-| `<cffile>` | — | `charset` on `read`/`write`/`append` (wrong encoding, silently), `nameConflict` on `copy`/`move` (always overwrites instead of `makeunique`/`error`/`skip`). |
 | `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
 | `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
-| `<cfinvoke>` | `component`, `method`, `returnvariable`, args | `webservice` — it becomes a *method argument* and the component resolves to `""`. |
+
+`<cffile>`'s `charset` (on `read`/`write`/`append`) is **not** just a lowering gap and is
+tracked separately below: the `fileRead`/`fileWrite`/`fileAppend` BIFs the tag lowers to
+ignore a charset argument too, and `charsetEncode`/`charsetDecode` are themselves
+pass-through no-ops — the engine has no character-encoding layer at all, so every file
+is written and read as UTF-8. Lucee 7.0.4, probed: `<cffile action="write"
+charset="utf-16">` writes a BOM + UTF-16BE, and a subsequent `charset="utf-16"` read
+returns the BOM as a leading character (so Lucee itself does not round-trip). Fixing
+this means adding an encoding layer (UTF-16/BE/LE, ISO-8859-1, windows-1252, US-ASCII)
+and threading it through those BIFs plus `charsetEncode`/`charsetDecode` — a new
+capability rather than an attribute-plumbing fix, so it is deliberately not folded in
+here. 🔇
 
 Fixed so far, in the order they were taken. Every expectation was probed against
 Lucee 7.0.4 before being implemented, and the regression tests
@@ -790,6 +799,25 @@ Lucee 7.0.4 before being implemented, and the regression tests
   Lucee rejects it at compile time on both forms (`valid attribute names are
   [isolation, savepoint, action]`) — and Lucee's `savepoint=` is accepted-and-ignored
   here, as `isolation` still is (§7).
+- **`<cfdump>`** — every attribute now reaches `writeDump`, not just
+  var/label/expand/top. `output="console"` keeps the dump out of the HTTP response
+  (only the script form did), `output="<path>"` writes the plain-text rendering to a
+  file and **appends** to an existing one (path resolved like ExpandPath — a relative
+  one against the *base* request template's directory, which is what Lucee does even
+  when the tag sits in an included file), a missing parent directory is Lucee's
+  `application`-typed `Parent directory for [x] doesn't exist`, and `abort="true"`
+  emits the dump and then ends the request. The plain-text dump *layout* still differs
+  from Lucee's (`Struct (2) / a = 1` vs `Struct / A number 1`) — a renderer
+  difference, not a dropped attribute.
+- **`<cffile action="copy"/"move">`** — `nameConflict=` is honoured: `overwrite` (also
+  the default), `skip` (destination untouched, no error), `error` (Lucee's
+  `application`-typed `Destination file [x] already exists`), and `makeunique` (leaves
+  the destination and writes `name-<unique>.ext` beside it). It rides as a third
+  argument to `fileCopy`/`fileMove`; a plain two-argument call still overwrites.
+- **`<cfinvoke webservice=…>`** — used to travel as a *method argument* with the
+  component resolving to `""`. There is no SOAP client in RustCFML, so it now throws
+  and says that. Deliberately a **runtime** throw: Lucee compiles the tag happily, so
+  an app that merely contains an unreached SOAP call must still start.
 
 `<cflock>` used to head this list — with `scope=` and `throwOnTimeout=` both discarded,
 every scope lock collapsed onto the single name `"default"` (unrelated scopes, and
