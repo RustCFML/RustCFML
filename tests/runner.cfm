@@ -525,6 +525,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfdump_output_abort.cfm">
 <cf_runtest file="tags/test_tags_cffile_nameconflict.cfm">
 <cf_runtest file="tags/test_tags_cffile_charset.cfm">
+<cf_runtest file="tags/test_tags_unclosed_body_tags.cfm">
 <cf_runtest file="tags/test_tags_cfinvoke_webservice.cfm">
 <cf_runtest file="tags/test_throw_object_rootcause.cfm">
 <cf_runtest file="tags/test_cfloop_file_and_includes.cfm">

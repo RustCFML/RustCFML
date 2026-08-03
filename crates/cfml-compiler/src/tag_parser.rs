@@ -256,6 +256,20 @@ fn record_preprocess_error(msg: impl Into<String>) {
     });
 }
 
+/// Record Lucee's own compile error for a body-bearing tag with no closing tag.
+///
+/// The preprocessor used to return an empty string for these, so the tag **and
+/// its entire body vanished from the compiled output** — a compile-time construct
+/// that quietly deleted code (docs known-issues §28). Lucee 7.0.4 refuses to
+/// compile them: `No matching end tag found for tag [cflock]`, a template error.
+/// Probed per tag: NOT every body tag requires closing — `<cfhttp>`,
+/// `<cfexecute>`, `<cfmodule>` and `<cfthread>` are all legal unclosed on Lucee,
+/// which runs them attribute-only and leaves the body as page content — so only
+/// the tags Lucee actually refuses are recorded here.
+fn record_missing_end_tag(tag: &str) {
+    record_preprocess_error(format!("No matching end tag found for tag [{}]", tag));
+}
+
 /// Convert CFML tag-based source code to equivalent CFScript.
 ///
 /// Tolerant: structural errors (e.g. an unclosed `<cfscript>`) degrade rather
@@ -645,7 +659,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 (body, close_end - start)
             } else {
-                // No closing tag — treat remaining content as inside cfoutput
+                // No closing tag — Lucee refuses to compile this. The body is
+                // still walked so the tolerant path degrades instead of deleting
+                // it; the strict path (every real compile) surfaces the error.
+                record_missing_end_tag("cfoutput");
                 let body: String = chars[tag_end..len].iter().collect();
                 (body, len - start)
             };
@@ -770,6 +787,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     let close_end = find_tag_end(chars, end_tag_pos, len);
                     (body, close_end - start)
                 } else {
+                    record_missing_end_tag("cfloop");
                     let body: String = chars[tag_end..len].iter().collect();
                     (body, len - start)
                 };
@@ -1435,7 +1453,20 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
                 (format!("queryExecute({}, {}, {});\n", sql, params_str, opts_str), close_end - start)
             } else {
-                (String::new(), tag_end - start)
+                // No `</cfquery>`. Lucee does NOT reject this at compile time —
+                // it treats the tag as attribute-only and then fails at RUNTIME,
+                // because a cfquery without a body has no SQL (probed on 7.0.4:
+                // "You need to define the attribute [SQL] or define the SQL in
+                // the body of the tag."). RustCFML erased the tag and emitted its
+                // SQL into the PAGE instead, so a missing close tag silently
+                // leaked the query text to the browser and ran nothing. Mirror
+                // Lucee's error rather than inventing a compile error, so a
+                // template that only *contains* the mistake still compiles.
+                (
+                    "throw(type=\"Application\", message=\"You need to define the attribute [SQL] or define the SQL in the body of the tag.\");\n"
+                        .to_string(),
+                    tag_end - start,
+                )
             }
         }
         "cfheader" => {
@@ -1591,6 +1622,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
                 (format!("__cfsavecontent_start();\n{}{} = __cfsavecontent_end();\n", body_script, variable), close_end - start)
             } else {
+                // This one erased the tag AND its body, so the page silently lost
+                // content and `variable=` was never set.
+                record_missing_end_tag("cfsavecontent");
                 (format!("__cfsavecontent_start();\n"), tag_end - start)
             }
         }
@@ -1648,6 +1682,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                             txn_args.join(", "), body_script
                         ), close_end - start)
                     } else {
+                        record_missing_end_tag("cftransaction");
                         (format!("__cftransaction_start(\"begin\");\n"), tag_end - start)
                     }
                 }
@@ -1662,6 +1697,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let switch_body = parse_cfswitch_body(&body, imports, in_cfoutput);
                 (format!("switch ({}) {{\n{}}}\n", expression, switch_body), close_end - start)
             } else {
+                record_missing_end_tag("cfswitch");
                 (format!("switch ({}) {{\n", expression), tag_end - start)
             }
         }
@@ -1780,6 +1816,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let body_script = tags_to_script_impl(&body, imports);
                 (format!("__cfsavecontent_start();\n{}__cfsavecontent_end();\n", body_script), close_end - start)
             } else {
+                record_missing_end_tag("cfsilent");
                 (String::new(), tag_end - start)
             }
         }
@@ -1793,6 +1830,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let body_script = tags_to_script_impl(&body, imports);
                 (format!("static {{\n{}}}\n", body_script), close_end - start)
             } else {
+                record_missing_end_tag("cfstatic");
                 (String::new(), tag_end - start)
             }
         }
@@ -1896,6 +1934,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     lock_args, body_script, lock_args, lock_args
                 ), close_end - start)
             } else {
+                record_missing_end_tag("cflock");
                 (String::new(), tag_end - start)
             }
         }
@@ -2176,7 +2215,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
                 (format!("__cfmail({{ {} }});\n", opts.join(", ")), close_end - start)
             } else {
-                // Self-closing cfmail
+                // No `</cfmail>`: Lucee refuses to compile it. Without this the
+                // mail was SENT with an empty body (and, with no SMTP configured,
+                // failed for a completely unrelated reason).
+                record_missing_end_tag("cfmail");
                 (format!("__cfmail({{ {} }});\n", opts.join(", ")), tag_end - start)
             }
         }

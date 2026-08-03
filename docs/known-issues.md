@@ -838,17 +838,34 @@ lowering — all three `cflock` lowerings already forwarded every attribute, and
 `__cflock_start` simply never read them. Attribute plumbing is worth checking at both
 ends.
 
-## 28. Unclosed body tags are silently erased 🔇
+## 28. Unclosed body tags — refused, not erased ✅ *(fixed)*
 
-When a body-bearing tag has no closing tag, the preprocessor returns an empty string for
-it — **the tag *and its entire body* vanish from the compiled output**. Lucee/ACF reject
-this at compile time. Affects `<cfquery>`, `<cflock>`, `<cfthread>`, `<cfsilent>`,
-`<cfstatic>`, `<cfmodule>` and `<cfspreadsheet action="write">`. Only `<cfscript>`
-records a structural error today.
+A body-bearing tag with no closing tag used to make the preprocessor return an empty
+string for it, so **the tag *and its entire body* vanished from the compiled output** —
+a compile-time construct that quietly deleted code (the same failure mode as the
+`<cfloop>` fallback fixed in v0.550.0). `<cfsavecontent>` with a missing
+`</cfsavecontent>` dropped the content and never set its variable; `<cfmail>` sent an
+empty message; `<cfquery>` leaked its SQL into the *page* and ran nothing.
 
-This is the same failure mode as the `<cfloop>` fallback fixed in v0.550.0: a
-compile-time construct that quietly removes code rather than refusing to compile it. A
-missing `</cfquery>` should be an error, not a deletion.
+Which tags require closing was probed per tag on Lucee 7.0.4 — the original inventory
+here was wrong in both directions:
+
+| Tag | Lucee | RustCFML now |
+|---|---|---|
+| `<cfoutput>`, `<cfsilent>`, `<cfstatic>`, `<cflock>`, `<cftransaction>`, `<cfsavecontent>`, `<cfmail>`, `<cfswitch>`, `<cfloop query=…>` | compile error: `No matching end tag found for tag [X]` | the same error, same wording |
+| `<cfquery>` | **compiles**, then fails at runtime — a cfquery with no body has no SQL: `You need to define the attribute [SQL] or define the SQL in the body of the tag.` | the same runtime error (so a template that merely *contains* the mistake still compiles) |
+| `<cfhttp>`, `<cfexecute>`, `<cfmodule>`, `<cfthread>` | **legal unclosed** — the tag runs attribute-only and the body stays page content | unchanged; already matched. These were wrongly listed as broken here |
+| `<cfscript>` | `invalid construct` | `Unclosed <cfscript> tag: missing </cfscript>` — errors, wording differs |
+
+Two things still outstanding:
+
+- `<cfif>`, `<cfloop>` (the non-query forms), `<cffunction>` and `<cftry>` lower to a
+  bare `{` opener, so an unclosed one surfaces as the script parser's generic
+  `Parse error` rather than Lucee's `No matching end tag found for tag [cfif]`. It
+  fails loudly either way — the message is just less useful. 🏗
+- `<cfspreadsheet action="write">` could not be probed: the reference Lucee here has no
+  spreadsheet extension installed (`undefined tag [cfspreadsheet]`). RustCFML currently
+  treats an unclosed one as attribute-only, like the `<cfhttp>` family. 🏗
 
 ## 29. Declared types are parsed and never enforced 🔇
 
