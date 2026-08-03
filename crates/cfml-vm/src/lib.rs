@@ -1828,8 +1828,15 @@ pub struct CfmlVirtualMachine {
     pending_exit: Option<String>,
     /// The `cfexit` method carried out of the most recently unwound template
     /// frame. Consumed by the custom-tag handlers to decide exittag (skip body +
-    /// end) vs exittemplate (run body + end normally).
+    /// end) vs exittemplate (run body + end normally) vs loop (re-run the body).
+    /// Taken with a single `.take()` per phase boundary: a method fired in an end
+    /// phase must not leak into an unrelated later tag.
     last_exit_method: Option<String>,
+    /// Set by `__cfcustomtag_start`: the execution loop (which owns `ip`) records
+    /// the body's instruction index into the tag state just pushed.
+    pending_tag_body_start: bool,
+    /// Set by `__cfcustomtag_end` on `cfexit method="loop"`: rewind target.
+    pending_tag_loop: Option<usize>,
     /// Buffered `<cfhtmlhead>` / `<cfhtmlbody>` content, injected into the
     /// response `<head>` / `<body>` (or appended) at output finalization.
     html_head_buffer: String,
@@ -2331,6 +2338,10 @@ struct CustomTagState {
     /// end phase must be skipped, but partial start-phase caller writes still
     /// propagate.
     exit_tag: bool,
+    /// Instruction index of the tag BODY in the *calling* frame — the rewind
+    /// target for `cfexit method="loop"`. The body stays inline bytecode (a jump
+    /// re-runs it) so `cfbreak`/`cfcontinue` in a body keep binding as before.
+    body_start_ip: Option<usize>,
 }
 
 impl CfmlVirtualMachine {
@@ -2424,6 +2435,8 @@ impl CfmlVirtualMachine {
             custom_tag_stack: Vec::new(),
             pending_exit: None,
             last_exit_method: None,
+            pending_tag_body_start: false,
+            pending_tag_loop: None,
             html_head_buffer: String::new(),
             html_body_buffer: String::new(),
             app_function_table: Vec::new(),
@@ -4741,6 +4754,9 @@ impl CfmlVirtualMachine {
         if self.custom_tag_stack.len() > handler.custom_tag_depth {
             self.custom_tag_stack.truncate(handler.custom_tag_depth);
         }
+        // A throw in a tag body must not leave a rewind target for an abandoned tag.
+        self.pending_tag_loop = None;
+        self.pending_tag_body_start = false;
     }
 
     /// Lucee/ACF parity for the `arguments` scope: reading a declared-but-unpassed
@@ -7745,6 +7761,44 @@ impl CfmlVirtualMachine {
                                 // CallMethod arm / reconcile_closure_env_into_locals).
                                 Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                                 stack.push(result);
+
+                                // Record where the tag BODY begins. An expression
+                                // statement compiles to `… Call; Pop` and `ip` was
+                                // advanced before this match, so `ip` is that Pop and
+                                // `ip + 1` is the body's first instruction.
+                                if self.pending_tag_body_start {
+                                    self.pending_tag_body_start = false;
+                                    let pop_ok = ip < func.instructions.len()
+                                        && matches!(func.instructions[ip], BytecodeOp::Pop);
+                                    if !pop_ok {
+                                        // Fail loudly rather than degrade into silent
+                                        // wrong output. Unwind the start handler's
+                                        // pushes first — `output_buffer` is the body
+                                        // capture, the page output is on the stack.
+                                        let _discarded_body =
+                                            std::mem::take(&mut self.output_buffer);
+                                        self.output_buffer =
+                                            self.saved_output_buffers.pop().unwrap_or_default();
+                                        self.custom_tag_stack.pop();
+                                        self.pending_tag_loop = None;
+                                        return Err(self.wrap_error(CfmlError::runtime(
+                                            "internal error: custom-tag start call is not followed by Pop"
+                                                .to_string(),
+                                        )));
+                                    }
+                                    if let Some(state) = self.custom_tag_stack.last_mut() {
+                                        state.body_start_ip = Some(ip + 1);
+                                    }
+                                }
+
+                                // Another iteration: discard this call's result
+                                // explicitly (we jump over the Pop that would have
+                                // consumed it), then rewind to the body.
+                                if let Some(target) = self.pending_tag_loop.take() {
+                                    stack.pop();
+                                    ip = target;
+                                    continue;
+                                }
                             }
                             Err(e) => {
                                 if Self::is_control_flow_error(&e) {
@@ -19065,47 +19119,84 @@ impl CfmlVirtualMachine {
 
                     self.execute_custom_tag_template(&resolved, &frame)?;
 
-                    // `cfexit method="exittag"` in the start phase skips the end
-                    // phase entirely (partial start-phase caller writes still
-                    // propagate below).
-                    let exit_tag = matches!(
-                        self.last_exit_method.take().as_deref(),
-                        Some("exittag")
-                    );
+                    // Consume the start phase's `cfexit` signal exactly once.
+                    let exit_tag = match self.last_exit_method.take().as_deref() {
+                        // exittag: skip the end phase (caller writes still propagate).
+                        Some("exittag") => true,
+                        // Lucee rejects a loop request outside the end phase.
+                        Some("loop") => {
+                            return Err(self.wrap_error(CfmlError::runtime(
+                                "invalid context for the tag exit, method loop can only be used in the end tag of a custom tag"
+                                    .to_string(),
+                            )));
+                        }
+                        Some("exittemplate") | None => false,
+                        Some(_other) => false,
+                    };
 
                     if run_end_phase && !exit_tag {
                         // The end phase runs in the SAME tag variables scope
                         // (Lucee semantics: state set during start is visible at
                         // end) — just flip thistag over to the end phase. No
                         // start-locals clone, no caller re-snapshot.
-                        let mut this_tag = ValueMap::default();
-                        this_tag.insert(
-                            "executionmode".to_string(),
-                            CfmlValue::string("end".to_string()),
-                        );
-                        this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(true));
-                        this_tag.insert(
-                            "generatedcontent".to_string(),
-                            CfmlValue::string(String::new()),
-                        );
+                        // No body to re-run here, so a loop request just repeats the
+                        // end phase (Lucee-measured).
                         if !tag_vars.contains_key_ci("attributes") {
                             tag_vars.insert("attributes".to_string(), attrs_val);
                         }
-                        tag_vars.insert("thistag".to_string(), CfmlValue::strukt(this_tag));
+                        loop {
+                            // Refresh thisTag IN PLACE: replacing the struct would
+                            // drop members the tag set and stale out any alias it kept.
+                            match tag_vars.get("thistag") {
+                                Some(CfmlValue::Struct(existing)) => {
+                                    existing.insert(
+                                        "executionmode".to_string(),
+                                        CfmlValue::string("end".to_string()),
+                                    );
+                                    existing
+                                        .insert("hasendtag".to_string(), CfmlValue::Bool(true));
+                                    existing.insert(
+                                        "generatedcontent".to_string(),
+                                        CfmlValue::string(String::new()),
+                                    );
+                                }
+                                // Missing or wrong type: create it once.
+                                _ => {
+                                    let mut m = ValueMap::default();
+                                    m.insert(
+                                        "executionmode".to_string(),
+                                        CfmlValue::string("end".to_string()),
+                                    );
+                                    m.insert("hasendtag".to_string(), CfmlValue::Bool(true));
+                                    m.insert(
+                                        "generatedcontent".to_string(),
+                                        CfmlValue::string(String::new()),
+                                    );
+                                    tag_vars
+                                        .insert("thistag".to_string(), CfmlValue::strukt(m));
+                                }
+                            }
 
-                        let outer_output = std::mem::take(&mut self.output_buffer);
-                        self.execute_custom_tag_template(&resolved, &frame)?;
-                        let end_output = std::mem::take(&mut self.output_buffer);
-                        self.output_buffer = outer_output;
+                            let outer_output = std::mem::take(&mut self.output_buffer);
+                            self.execute_custom_tag_template(&resolved, &frame)?;
+                            let end_output = std::mem::take(&mut self.output_buffer);
+                            self.output_buffer = outer_output;
 
-                        if let Some(CfmlValue::Struct(tag_info)) = tag_vars.get("thistag") {
-                            if let Some(CfmlValue::String(content)) =
-                                tag_info.get("generatedcontent")
-                            {
-                                self.output_buffer.push_str(&content);
+                            if let Some(CfmlValue::Struct(tag_info)) = tag_vars.get("thistag") {
+                                if let Some(CfmlValue::String(content)) =
+                                    tag_info.get("generatedcontent")
+                                {
+                                    self.output_buffer.push_str(&content);
+                                }
+                            }
+                            self.output_buffer.push_str(&end_output);
+
+                            // Consume this end phase's signal exactly once.
+                            match self.last_exit_method.take().as_deref() {
+                                Some("loop") => continue,
+                                _ => break,
                             }
                         }
-                        self.output_buffer.push_str(&end_output);
                     }
 
                     self.apply_tag_caller_writeback(
@@ -19155,13 +19246,21 @@ impl CfmlVirtualMachine {
 
                     self.execute_custom_tag_template(&resolved, &frame)?;
 
-                    // `cfexit method="exittag"` in the start phase: the body and
-                    // the end phase are skipped, but partial start-phase caller
-                    // writes still propagate (below).
-                    let exit_tag = matches!(
-                        self.last_exit_method.take().as_deref(),
-                        Some("exittag")
-                    );
+                    // Consume the start phase's `cfexit` signal exactly once.
+                    let exit_tag = match self.last_exit_method.take().as_deref() {
+                        // exittag: skip body + end phase (caller writes still propagate).
+                        Some("exittag") => true,
+                        // Lucee rejects a loop request outside the end phase.
+                        Some("loop") => {
+                            return Err(self.wrap_error(CfmlError::runtime(
+                                "invalid context for the tag exit, method loop can only be used in the end tag of a custom tag"
+                                    .to_string(),
+                            )));
+                        }
+                        // exittemplate / none / unrecognised: proceed as before.
+                        Some("exittemplate") | None => false,
+                        Some(_other) => false,
+                    };
 
                     // Caller write-back from start execution
                     self.apply_tag_caller_writeback(
@@ -19177,7 +19276,11 @@ impl CfmlVirtualMachine {
                         attributes: attrs_val,
                         tag_vars,
                         exit_tag,
+                        body_start_ip: None,
                     });
+
+                    // Ask the execution loop to record where the body starts.
+                    self.pending_tag_body_start = true;
 
                     // Push output buffer to capture body content (like savecontent)
                     self.saved_output_buffers
@@ -19207,23 +19310,44 @@ impl CfmlVirtualMachine {
                         return Ok(CfmlValue::Null);
                     }
 
-                    let mut this_tag = ValueMap::default();
-                    this_tag.insert(
-                        "executionmode".to_string(),
-                        CfmlValue::string("end".to_string()),
-                    );
-                    this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(true));
-                    this_tag.insert(
-                        "generatedcontent".to_string(),
-                        CfmlValue::string(body_content),
-                    );
-
                     let CustomTagState {
                         template_path,
                         attributes,
                         tag_vars,
                         exit_tag: _,
+                        body_start_ip,
                     } = state;
+
+                    // Refresh `thisTag` IN PLACE: replacing the struct would drop
+                    // members the tag set and stale out any alias it kept. Only the
+                    // engine-owned keys change; `generatedContent` is per-iteration.
+                    match tag_vars.get("thistag") {
+                        Some(CfmlValue::Struct(existing)) => {
+                            existing.insert(
+                                "executionmode".to_string(),
+                                CfmlValue::string("end".to_string()),
+                            );
+                            existing.insert("hasendtag".to_string(), CfmlValue::Bool(true));
+                            existing.insert(
+                                "generatedcontent".to_string(),
+                                CfmlValue::string(body_content),
+                            );
+                        }
+                        // Missing or wrong type: create it once.
+                        _ => {
+                            let mut m = ValueMap::default();
+                            m.insert(
+                                "executionmode".to_string(),
+                                CfmlValue::string("end".to_string()),
+                            );
+                            m.insert("hasendtag".to_string(), CfmlValue::Bool(true));
+                            m.insert(
+                                "generatedcontent".to_string(),
+                                CfmlValue::string(body_content),
+                            );
+                            tag_vars.insert("thistag".to_string(), CfmlValue::strukt(m));
+                        }
+                    }
 
                     // The end phase runs in the start phase's tag variables
                     // scope (Lucee semantics). Re-derive the caller context —
@@ -19231,6 +19355,8 @@ impl CfmlVirtualMachine {
                     // parent frame, so the snapshot path needs a fresh baseline.
                     let (live_caller, shadow_prevals, caller_snapshot) =
                         Self::tag_caller_ctx(parent_locals);
+                    // Kept for the loop re-push below (the original is moved into tag_vars).
+                    let attributes_for_loop = attributes.clone();
                     if !tag_vars.contains_key_ci("attributes") {
                         tag_vars.insert("attributes".to_string(), attributes);
                     }
@@ -19241,7 +19367,6 @@ impl CfmlVirtualMachine {
                             None => CfmlValue::strukt(caller_snapshot.clone()),
                         },
                     );
-                    tag_vars.insert("thistag".to_string(), CfmlValue::strukt(this_tag));
                     let frame = Self::custom_tag_frame(parent_locals, &tag_vars);
 
                     let outer_output = std::mem::take(&mut self.output_buffer);
@@ -19265,6 +19390,40 @@ impl CfmlVirtualMachine {
                         &caller_snapshot,
                         &tag_vars,
                     );
+
+                    // Consume this phase's signal exactly once — leaving it set is how
+                    // an end-phase exit used to leak into the next tag.
+                    match self.last_exit_method.take().as_deref() {
+                        // Re-execute the BODY: keep the tag state alive (so `thisTag`
+                        // persists) and push a fresh capture buffer (so each
+                        // iteration's `generatedContent` is its own), then rewind.
+                        Some("loop") => {
+                            // Always recorded right after the matching start call, so
+                            // a missing target is a broken invariant — fail loudly
+                            // rather than silently dropping the loop.
+                            let body_ip = match body_start_ip {
+                                Some(ip) => ip,
+                                None => {
+                                    return Err(self.wrap_error(CfmlError::runtime(
+                                        "internal error: custom-tag loop requested but no body start was recorded"
+                                            .to_string(),
+                                    )));
+                                }
+                            };
+                            self.custom_tag_stack.push(CustomTagState {
+                                template_path,
+                                attributes: attributes_for_loop,
+                                tag_vars,
+                                exit_tag: false,
+                                body_start_ip: Some(body_ip),
+                            });
+                            self.saved_output_buffers
+                                .push(std::mem::take(&mut self.output_buffer));
+                            self.pending_tag_loop = Some(body_ip);
+                        }
+                        // Anything else: the end phase has already run.
+                        _ => {}
+                    }
 
                     return Ok(CfmlValue::Null);
                 }
