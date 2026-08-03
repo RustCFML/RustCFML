@@ -13264,6 +13264,10 @@ impl CfmlVirtualMachine {
                 | "queryexecute"
                 | "cfdbinfo"
                 | "dbinfo"
+                // cfhttp is intercepted for `name=` (body → query, delivered
+                // into the caller's scope) and `file=`/`path=` (body → disk,
+                // with a relative path resolved against the calling template).
+                | "cfhttp"
                 | "queryregisterfunction"
                 | "__cftransaction_start"
                 | "__cftransaction_commit"
@@ -17210,6 +17214,96 @@ impl CfmlVirtualMachine {
                     self.pending_result_writeback = Some(vec![(name_attr, result)]);
                     return Ok(CfmlValue::Null);
                 }
+                "cfhttp" => {
+                    // `name=` (parse the response body into a query) and
+                    // `file=`/`path=` (write the body to disk) are honoured HERE
+                    // rather than inside `fn_cfhttp` because both need caller
+                    // context the builtin doesn't have: a scope to deliver the
+                    // query into, and the calling template's directory to
+                    // resolve a relative `path=` against. Everything else stays
+                    // in the builtin. Both attributes used to be dropped by the
+                    // tag lowering's attribute whitelist — silently, so the
+                    // query variable was never created and nothing was ever
+                    // written (docs known-issues §27). Semantics probed against
+                    // Lucee 7.0.4; see `cfhttp_body_to_query`.
+                    let arg = Self::merge_attribute_collection(
+                        args.into_iter().next().unwrap_or(CfmlValue::Null),
+                    );
+                    let opts: ValueMap = match &arg {
+                        CfmlValue::Struct(s) => s.snapshot(),
+                        // `cfhttp("url")` — no attributes to act on.
+                        _ => ValueMap::default(),
+                    };
+                    let attr = |key: &str| -> Option<String> {
+                        opts.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                            .map(|(_, v)| v.as_string())
+                            .filter(|s| !s.is_empty())
+                    };
+                    let name_attr = attr("name");
+                    let file_attr = attr("file");
+                    let path_attr = attr("path");
+                    // Where `file=`/`path=` writes. `path=` names the directory
+                    // and `file=` the leaf; with only `path=` Lucee derives the
+                    // leaf from the URL's last segment, and with only `file=` it
+                    // writes next to the calling template (both probed). A
+                    // relative directory is resolved the way ExpandPath and the
+                    // file BIFs resolve one, so all three agree.
+                    let write_target: Option<(String, String)> = match (&path_attr, &file_attr) {
+                        (Some(dir), file) => {
+                            let name = match file {
+                                Some(f) => f.clone(),
+                                None => cfml_common::cfhttp::cfhttp_file_name_from_url(
+                                    &attr("url").unwrap_or_default(),
+                                ),
+                            };
+                            Some((self.resolve_template_relative(dir, false), name))
+                        }
+                        (None, Some(file)) => {
+                            let resolved = self.resolve_template_relative(file, false);
+                            let p = std::path::Path::new(&resolved);
+                            let dir = p
+                                .parent()
+                                .map(|d| d.to_string_lossy().into_owned())
+                                .filter(|d| !d.is_empty())
+                                .unwrap_or_else(|| ".".to_string());
+                            let leaf = p
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| file.clone());
+                            Some((dir, leaf))
+                        }
+                        (None, None) => None,
+                    };
+                    let builtin = self
+                        .builtins
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("cfhttp"))
+                        .map(|(_, v)| *v)
+                        .ok_or_else(|| {
+                            CfmlError::runtime(
+                                "cfhttp: HTTP support is not enabled in this build".to_string(),
+                            )
+                        })?;
+                    let result = builtin(vec![arg])?;
+                    if write_target.is_some() || name_attr.is_some() {
+                        let body = result
+                            .get_ci("fileContent")
+                            .unwrap_or_else(|| CfmlValue::string(String::new()));
+                        if let Some((dir, leaf)) = write_target {
+                            cfml_common::cfhttp::cfhttp_write_body_to_file(&dir, &leaf, &body)?;
+                        }
+                        if let Some(target) = name_attr {
+                            // Lucee parses the body whatever the status code —
+                            // a 404 body becomes a (usually headers-only) query
+                            // rather than leaving the variable untouched.
+                            let query =
+                                cfml_common::cfhttp::cfhttp_body_to_query(&body.as_string(), &opts)?;
+                            self.pending_result_writeback = Some(vec![(target, query)]);
+                        }
+                    }
+                    return Ok(result);
+                }
                 "__cftransaction_start" => {
                     // A `transaction { }` block nested inside another one becomes a
                     // SAVEPOINT on the already-open outer transaction
@@ -17236,17 +17330,23 @@ impl CfmlVirtualMachine {
                         }
                         return Ok(CfmlValue::Null);
                     }
-                    // Args: __cftransaction_start("begin", [isolation], [datasource])
-                    // Try arg[2] first (datasource after isolation), then arg[1] (datasource without isolation)
+                    // Args: __cftransaction_start("begin", isolation, datasource).
+                    // The three positions are FIXED — every lowering emits an
+                    // empty string for an absent attribute. This used to guess
+                    // ("arg 2, else arg 1 if it isn't 'begin'"), which read an
+                    // `isolation="serializable"` with no datasource as the
+                    // datasource NAME and opened the transaction against it.
+                    // `isolation` itself is still not applied — see
+                    // docs/known-issues.md §7.
+                    // An INLINE datasource struct (`datasource="#{class:…,
+                    // connectionString:…}#"`) is read the way queryExecute reads
+                    // one — plain `as_string()` on a struct produced a
+                    // `{class: …, connectionString: …}` blob that
+                    // `parse_datasource` then treated as a SQLite FILE NAME.
                     let datasource = args
                         .get(2)
-                        .map(|v| v.as_string())
+                        .map(Self::datasource_arg_to_name)
                         .filter(|s| !s.is_empty())
-                        .or_else(|| {
-                            args.get(1)
-                                .map(|v| v.as_string())
-                                .filter(|s| !s.is_empty() && s != "begin")
-                        })
                         .unwrap_or_else(|| self.get_default_datasource(parent_locals));
                     // Resolve a per-application datasource name to its URL so
                     // transactions honour this.datasources too (same as queries).

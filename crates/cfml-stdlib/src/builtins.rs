@@ -8999,7 +8999,14 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let (mime, charset) = parse_content_type(&content_type);
 
             if throw_on_error && status >= 400 {
-                return Err(CfmlError::runtime(format!("cfhttp request failed: {} {}", status, status_text)));
+                // Lucee reports throwOnError failures as an `application`-typed
+                // exception whose message is just "<code> <text>" (probed on
+                // 7.0.4: type=[application] msg=[404 Not Found]). A generic
+                // `runtime` error meant `catch( application e )` never saw it.
+                return Err(CfmlError::new(
+                    format!("{} {}", status, status_text),
+                    cfml_common::vm::CfmlErrorType::Application,
+                ));
             }
 
             result_struct.insert("statusCode".to_string(), CfmlValue::string(format!("{} {}", status, status_text)));
@@ -9017,7 +9024,10 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let status_text = resp.status_text().to_string();
 
             if throw_on_error {
-                return Err(CfmlError::runtime(format!("cfhttp request failed: {} {}", code, status_text)));
+                return Err(CfmlError::new(
+                    format!("{} {}", code, status_text),
+                    cfml_common::vm::CfmlErrorType::Application,
+                ));
             }
 
             let http_version = resp.http_version().to_string();
@@ -9061,7 +9071,10 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             result_struct.insert("HTTP_Version".to_string(), CfmlValue::string(String::new()));
 
             if throw_on_error {
-                return Err(CfmlError::runtime(format!("cfhttp connection failed: {}", e)));
+                return Err(CfmlError::new(
+                    format!("cfhttp connection failed: {}", e),
+                    cfml_common::vm::CfmlErrorType::Application,
+                ));
             }
         }
     }

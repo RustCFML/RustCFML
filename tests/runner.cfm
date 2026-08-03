@@ -521,6 +521,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfcookie_inrequest_readback.cfm">
 <cf_runtest file="tags/test_tags_cfhttp_interpolation.cfm">
 <cf_runtest file="tags/test_cfhttp_attribute_collection.cfm">
+<cf_runtest file="tags/test_tags_cfhttp_name_file.cfm">
 <cf_runtest file="tags/test_throw_object_rootcause.cfm">
 <cf_runtest file="tags/test_cfloop_file_and_includes.cfm">
 <cf_runtest file="tags/test_tags_cfhttp_multipart.cfm">
@@ -894,6 +895,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfoutput_encodefor.cfm">
 <cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_cfloop_query_currentrow.cfm">
+<cf_runtest file="tags/test_tags_cfloop_query_window_group.cfm">
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_quotes.cfm">

@@ -1259,16 +1259,30 @@ impl Parser {
                             value: LiteralValue::String("begin".to_string()),
                             location: stmt_loc,
                         }));
-                        if let Some((_, iso)) =
-                            attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("isolation"))
-                        {
-                            arguments.push(iso.clone());
-                        }
-                        if let Some((_, ds)) =
-                            attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-                        {
-                            arguments.push(ds.clone());
-                        }
+                        // Positions are fixed: (action, isolation, datasource).
+                        // An absent attribute emits an empty string rather than
+                        // being skipped — skipping shifted `isolation` into the
+                        // datasource slot (see tag_parser.rs).
+                        let empty = || {
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(String::new()),
+                                location: stmt_loc,
+                            })
+                        };
+                        arguments.push(
+                            attrs
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("isolation"))
+                                .map(|(_, iso)| iso.clone())
+                                .unwrap_or_else(empty),
+                        );
+                        arguments.push(
+                            attrs
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+                                .map(|(_, ds)| ds.clone())
+                                .unwrap_or_else(empty),
+                        );
                     }
                     return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
                         expr: Expression::FunctionCall(Box::new(FunctionCall {
@@ -3323,12 +3337,31 @@ impl Parser {
                         value: LiteralValue::String("begin".to_string()),
                         location: loc,
                     }));
+                // `isolation` and `datasource` used to be dropped here — the
+                // BLOCK form `transaction datasource="other" { … }` silently ran
+                // on the DEFAULT datasource while the tag form honoured the
+                // attribute (docs known-issues §27). Emitted in fixed positions
+                // (action, isolation, datasource) with empty-string placeholders.
+                let attr_or_empty = |name: &str| {
+                    attrs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Expression::Literal(Literal {
+                            value: LiteralValue::String(String::new()),
+                            location: loc,
+                        }))
+                };
                 let start = Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
                             name: "__cftransaction_start".to_string(), location: loc,
                         })),
-                        arguments: vec![action_expr],
+                        arguments: vec![
+                            action_expr,
+                            attr_or_empty("isolation"),
+                            attr_or_empty("datasource"),
+                        ],
                         location: loc,
                     })),
                     location: loc,

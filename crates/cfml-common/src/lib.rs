@@ -3,6 +3,7 @@
 /// RustCFML workspace version (cfml-common inherits `version.workspace = true`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod cfhttp;
 pub mod clock;
 pub mod component;
 pub mod cycle_gc;

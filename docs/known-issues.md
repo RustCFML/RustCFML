@@ -742,14 +742,54 @@ the tags below still have theirs.
 
 | Tag | Survives lowering | Silently dropped |
 |---|---|---|
-| `<cfhttp>` | `url`, `method`, `timeout`, `charset`, `username`, `password`, `useragent`, `proxyserver`, `multipart`, `getasbinary` (+ `result`, `attributecollection`) | `name` (**response is never parsed into a query and the variable is never created**), `file`+`path` (**the response body is never written to disk**), `throwOnError`, `redirect`, `port`, `proxyPort`, `encodeURL`. Note `fn_cfhttp` already *implements* the last five — they are lost in the lowering, not missing from the runtime, so forwarding them is nearly free. |
 | `<cfdump>` | `label`, `expand`, `top` | `output`, `abort`. `writeDump()` implements `output`, so `<cfdump output="console">` still writes into the HTTP response body instead of stdout. |
 | `<cffile>` | — | `charset` on `read`/`write`/`append` (wrong encoding, silently), `nameConflict` on `copy`/`move` (always overwrites instead of `makeunique`/`error`/`skip`). |
 | `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
 | `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
-| `<cfloop query=…>` | `query`, `index`/`item` | `startrow`, `endrow` (**all rows are iterated**), `group` (no control-break grouping). |
 | `<cfinvoke>` | `component`, `method`, `returnvariable`, args | `webservice` — it becomes a *method argument* and the component resolves to `""`. |
-| `cftransaction(…)` (script form) | `action` | `isolation`, `datasource` — the **tag** form forwards both; the script form does not, so a script-form transaction can silently use the wrong datasource. |
+
+Fixed so far, in the order they were taken. Every expectation was probed against
+Lucee 7.0.4 before being implemented, and the regression tests
+(`tests/tags/test_tags_cfhttp_name_file.cfm`,
+`tests/tags/test_tags_cfloop_query_window_group.cfm`,
+`tests/tags/test_script_transaction_attrs.cfm`, plus the lowering tests in
+`tag_parser.rs`) pass on **both** engines:
+
+- **`<cfhttp>`** — the ten-key whitelist is gone; every attribute is forwarded, as
+  `<cfquery>` already does. `name=` now parses the response body into a query
+  (`delimiter`, `textQualifier`, `firstRowAsHeaders`, `columns`; blank lines skipped,
+  a doubled qualifier is a literal one, a row whose field count differs from the
+  column count raises Lucee's own `Invalid CSV line size…` `application` error, and
+  cells stay strings so `007` survives). `file=`/`path=` write the body to disk —
+  filename derived from the URL when only `path=` is given, next to the calling
+  template when only `file=` is, an existing file overwritten, and a missing parent
+  directory reported as Lucee's `java.io.IOException`. `throwOnError` now raises the
+  `application`-typed `404 Not Found` Lucee raises instead of a generic `runtime`
+  error. `redirect`/`port`/`proxyPort`/`encodeURL` were already implemented and now
+  simply arrive. **One divergence remains:** `getMetadata(q).typeName` reports
+  `VARCHAR` for a numeric-looking column where Lucee reports `DOUBLE` — RustCFML
+  infers column types from cell values and has nowhere to record a declared type.
+  The cells themselves match Lucee exactly (strings).
+- **`<cfloop query=…>`** — `startrow`/`endrow` (and `maxrows`, which Lucee honours here
+  too) bound the iteration; a window past the end of the recordset yields nothing
+  rather than everything. `group=` does a real control break, with a **bare** nested
+  `<cfloop>` as the per-group detail block, recursing for multi-level grouping.
+  Grouping applies *after* the row window. This also corrected `groupCaseSensitive`,
+  which RustCFML defaulted to `true` (ACF's documented default) for `<cfoutput
+  group=>`: Lucee 7.0.4 merges `eng` with `ENG` unless `groupCaseSensitive="true"` is
+  given, so the default is now case-**in**sensitive on both tags.
+- **script-form `transaction`** — the block form (`transaction datasource="x" { … }`)
+  dropped `isolation` and `datasource` while the statement and tag forms forwarded
+  them. All three now emit `__cftransaction_start(action, isolation, datasource)` with
+  every position filled: they used to emit only the attributes present, which shifted
+  `isolation` into the datasource slot, so `<cftransaction isolation="serializable">`
+  with no datasource tried to open a connection to a datasource named *serializable*.
+  An inline datasource **struct** is also read properly now (as `queryExecute` reads
+  one) rather than stringified into a `{class: …}` blob that `parse_datasource` then
+  treated as a SQLite file name. Two notes: `datasource=` is a RustCFML **extension** —
+  Lucee rejects it at compile time on both forms (`valid attribute names are
+  [isolation, savepoint, action]`) — and Lucee's `savepoint=` is accepted-and-ignored
+  here, as `isolation` still is (§7).
 
 `<cflock>` used to head this list — with `scope=` and `throwOnTimeout=` both discarded,
 every scope lock collapsed onto the single name `"default"` (unrelated scopes, and

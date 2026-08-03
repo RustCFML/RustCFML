@@ -681,8 +681,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                         let cl = format!("__cfg_cl_{}", start);
                         let ci = format!("__cfg_ci_{}", start);
                         let r = format!("__cfg_r_{}", start);
-                        let group_loop = emit_grouped_cfoutput(
-                            &rows, &query, &body, &group_col, case_sensitive, imports, start, 0,
+                        let group_loop = emit_grouped_query_body(
+                            &rows, &query, &body, &group_col, case_sensitive, "cfoutput", true,
+                            imports, start, 0,
                         );
                         (
                             format!(
@@ -772,6 +773,76 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     let body: String = chars[tag_end..len].iter().collect();
                     (body, len - start)
                 };
+                // Row-window attributes. `startrow`/`endrow` are cfloop's own;
+                // Lucee also honours `maxrows` here (probed on 7.0.4), and an
+                // out-of-range window simply yields no iterations rather than an
+                // error. All three used to be discarded by this lowering, so
+                // EVERY row was iterated — silently (docs known-issues §27).
+                let startrow = attrs
+                    .get("startrow")
+                    .map(|s| strip_hashes(s))
+                    .unwrap_or_else(|| "1".to_string());
+                let endrow = attrs
+                    .get("endrow")
+                    .map(|s| strip_hashes(s))
+                    .unwrap_or_else(|| "-1".to_string());
+                let maxrows = attrs
+                    .get("maxrows")
+                    .map(|s| strip_hashes(s))
+                    .unwrap_or_else(|| "-1".to_string());
+                let sr = format!("__cfloopq_sr_{}", start);
+                let er = format!("__cfloopq_er_{}", start);
+                let q = format!("__cfloopq_q_{}", start);
+                let rc = format!("__cfloopq_rc_{}", start);
+                let i = format!("__cfloopq_i_{}", start);
+                // The window preamble is shared by the plain and grouped forms:
+                // `sr`..`er` is the 1-based row range to visit, clamped to the
+                // recordset. Grouping applies AFTER the window (Lucee-probed:
+                // `group="dept" startrow="3"` groups only rows 3+).
+                let window = format!(
+                    "var {q} = {query};\nvar {rc} = {q}.recordcount;\nvar {sr} = {startrow};\nif ({sr} < 1) {{ {sr} = 1; }}\nvar {er} = {endrow};\nif ({er} < 0 || {er} > {rc}) {{ {er} = {rc}; }}\nvar {mrv} = {maxrows};\nif ({mrv} >= 0 && {sr} + {mrv} - 1 < {er}) {{ {er} = {sr} + {mrv} - 1; }}\n",
+                    q = q,
+                    query = query,
+                    rc = rc,
+                    sr = sr,
+                    er = er,
+                    startrow = startrow,
+                    endrow = endrow,
+                    mrv = format!("__cfloopq_mr_{}", start),
+                    maxrows = maxrows,
+                );
+                if let Some(group_raw) = attrs.get("group") {
+                    // Grouped (control-break) iteration, the same model the
+                    // grouped `<cfoutput query>` uses: materialise the windowed
+                    // rows, then break on the group column. A BARE nested
+                    // `<cfloop>` is the detail block over the current group.
+                    let group_col = strip_hashes(group_raw);
+                    let case_sensitive = group_case_sensitive(&attrs);
+                    let rows = format!("__cfloopq_rows_{}", start);
+                    let cl = format!("__cfloopq_cl_{}", start);
+                    let r = format!("__cfloopq_r_{}", start);
+                    let group_loop = emit_grouped_query_body(
+                        &rows, &query, &body, &group_col, case_sensitive, "cfloop", in_cfoutput,
+                        imports, start, 0,
+                    );
+                    return (
+                        format!(
+                            "{window}var {cl} = {q}.columnlist;\nvar {rows} = [];\nvar {i} = 0;\nfor (var {r} in {q}) {{\n{i} = {i} + 1;\nif ({i} < {sr}) {{ continue; }}\nif ({i} > {er}) {{ break; }}\n{r}.currentRow = {i};\n{r}.recordCount = {rc};\n{r}.columnList = {cl};\narrayAppend({rows}, {r});\n}}\n{loop}{query} = {q};\n",
+                            window = window,
+                            cl = cl,
+                            q = q,
+                            rows = rows,
+                            i = i,
+                            r = r,
+                            sr = sr,
+                            er = er,
+                            rc = rc,
+                            loop = group_loop,
+                            query = query,
+                        ),
+                        consumed,
+                    );
+                }
                 let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
                 // Cursor model (Lucee/ACF): the query variable STAYS the query;
                 // each iteration moves the query's current-row cursor via the
@@ -779,14 +850,13 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // row, `q.currentRow` reports the position, and `q` can still be
                 // passed to functions that expect the whole query. The cursor is
                 // reset to row 1 after the loop.
-                let q = format!("__cfloopq_q_{}", start);
-                let rc = format!("__cfloopq_rc_{}", start);
-                let i = format!("__cfloopq_i_{}", start);
                 (
                     format!(
-                        "var {q} = {query};\nvar {rc} = {q}.recordcount;\nfor (var {i} = 1; {i} <= {rc}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
+                        "{window}for (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
+                        window = window,
                         q = q,
-                        rc = rc,
+                        sr = sr,
+                        er = er,
                         i = i,
                         query = query,
                         body = body_script,
@@ -1197,10 +1267,25 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // format_attr_value emits literal segments quoted and only evaluates
             // the #...# parts; strip_hashes would collapse the whole value into a
             // bare (mis-parsed) expression like `baseUrlpath`.
-            for key in ["url", "method", "timeout", "charset", "username", "password", "useragent", "proxyserver", "multipart", "getasbinary"] {
-                if let Some(v) = attrs.get(key) {
-                    opts.push(format!("{}: {}", key, format_attr_value(v, quoted.contains(key))));
+            //
+            // EVERY attribute is forwarded, not a whitelist — same lesson as
+            // cfquery (GH #294) and cflock (v0.553.0): a fixed list drops
+            // whatever it doesn't know about at COMPILE time, so the attribute
+            // never reaches the runtime and there is no "unknown option" either.
+            // The ten-key list here silently discarded `name` (response never
+            // parsed into a query, variable never created), `file`/`path` (body
+            // never written to disk) and `throwOnError`/`redirect`/`port`/
+            // `proxyPort`/`encodeURL` — the last five already implemented in
+            // fn_cfhttp and lost purely in the lowering. `result` is excluded
+            // because it is the assignment target below, not an option.
+            // `attr_order` (source order) drives emission so codegen stays
+            // deterministic — `attrs` is a HashMap.
+            for key in &attr_order {
+                if key == "result" || key == "attributecollection" {
+                    continue;
                 }
+                let Some(v) = attrs.get(key) else { continue };
+                opts.push(format!("{}: {}", key, format_attr_value(v, quoted.contains(key))));
             }
 
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
@@ -1519,25 +1604,35 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                         let close_end = find_tag_end(chars, end_tag_pos, len);
                         let body_script = tags_to_script_impl(&body, imports);
 
-                        // Build args for __cftransaction_start
-                        let mut txn_args = vec!["\"begin\"".to_string()];
-                        if let Some(ref iso) = isolation {
-                            txn_args.push(format!("\"{}\"", iso));
-                        }
-                        if let Some(ref ds) = datasource {
-                            let ds_val = strip_hashes(ds);
-                            if ds != &ds_val {
-                                txn_args.push(ds_val);
-                            } else {
-                                txn_args.push(format!("\"{}\"", ds));
+                        // Build args for __cftransaction_start. All THREE
+                        // positions are always emitted — action, isolation,
+                        // datasource — with an empty string standing in for an
+                        // absent attribute. Omitting them shifted the arguments
+                        // left, so `<cftransaction isolation="serializable">`
+                        // with no datasource delivered "serializable" INTO the
+                        // datasource slot and the block tried to open a
+                        // connection to a datasource by that name.
+                        let iso_arg = match isolation {
+                            Some(ref iso) => format!("\"{}\"", iso),
+                            None => "\"\"".to_string(),
+                        };
+                        let ds_arg = match datasource {
+                            Some(ref ds) => {
+                                let ds_val = strip_hashes(ds);
+                                if ds != &ds_val {
+                                    ds_val
+                                } else {
+                                    format!("\"{}\"", ds)
+                                }
                             }
-                        } else {
-                            // Try to extract datasource from the first cfquery inside
-                            let ds_from_body = extract_datasource_from_body(&body);
-                            if let Some(ds) = ds_from_body {
-                                txn_args.push(format!("\"{}\"", ds));
-                            }
-                        }
+                            // No datasource attribute: fall back to the one the
+                            // first <cfquery> in the body names, as before.
+                            None => match extract_datasource_from_body(&body) {
+                                Some(ds) => format!("\"{}\"", ds),
+                                None => "\"\"".to_string(),
+                            },
+                        };
+                        let txn_args = vec!["\"begin\"".to_string(), iso_arg, ds_arg];
 
                         (format!(
                             "__cftransaction_start({});\ntry {{\n{}\n__cftransaction_commit();\n}} catch(any __txn_e) {{\n__cftransaction_rollback();\nthrow __txn_e;\n}}\n",
@@ -3091,8 +3186,11 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
     names
 }
 
-/// Read the `groupCaseSensitive` attribute. CFML's documented default is
-/// `Yes` (case-sensitive group breaks).
+/// Read the `groupCaseSensitive` attribute. ACF documents the default as `Yes`,
+/// but the reference engine disagrees: on Lucee 7.0.4 a `group=` break with no
+/// `groupCaseSensitive` merges `eng` and `ENG` into one group, and only
+/// `groupCaseSensitive="true"` splits them (probed). Defaulting to `true` here
+/// split groups Lucee merges.
 fn group_case_sensitive(attrs: &std::collections::HashMap<String, String>) -> bool {
     attrs
         .get("groupcasesensitive")
@@ -3102,21 +3200,22 @@ fn group_case_sensitive(attrs: &std::collections::HashMap<String, String>) -> bo
                 "false" | "no" | "0"
             )
         })
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
-/// Index of the opening `<` of the first `<cfoutput ...>` (word-bounded) at or
-/// after `from`. Locates the nested detail block inside a grouped cfoutput.
-fn find_nested_cfoutput(chars: &[char], from: usize, len: usize) -> Option<usize> {
-    const NEEDLE: [char; 8] = ['c', 'f', 'o', 'u', 't', 'p', 'u', 't'];
+/// Index of the opening `<` of the first `<cfoutput ...>`/`<cfloop ...>`
+/// (word-bounded) at or after `from`. Locates the nested detail block inside a
+/// grouped `<cfoutput query group=>` / `<cfloop query group=>`.
+fn find_nested_tag(chars: &[char], from: usize, len: usize, tag: &str) -> Option<usize> {
+    let needle: Vec<char> = tag.chars().collect();
     let mut i = from;
     while i < len {
         if chars[i] == '<' {
             let name_start = i + 1;
-            if name_start + NEEDLE.len() <= len
-                && (0..NEEDLE.len()).all(|k| chars[name_start + k].eq_ignore_ascii_case(&NEEDLE[k]))
+            if name_start + needle.len() <= len
+                && (0..needle.len()).all(|k| chars[name_start + k].eq_ignore_ascii_case(&needle[k]))
             {
-                let after = name_start + NEEDLE.len();
+                let after = name_start + needle.len();
                 let boundary = after >= len
                     || chars[after].is_whitespace()
                     || chars[after] == '>'
@@ -3131,18 +3230,26 @@ fn find_nested_cfoutput(chars: &[char], from: usize, len: usize) -> Option<usize
     None
 }
 
-/// Emit the control-break loop for a grouped `<cfoutput>` over `rows_var` (a
-/// CFML array of row structs). The per-group body (everything outside the
-/// nested detail `<cfoutput>`) runs once per distinct consecutive value of
-/// `group_col`; the nested block iterates that group's rows, recursing for
-/// further `group=` levels. `uid`/`depth` keep generated temp names unique.
+/// Emit the control-break loop for a grouped `<cfoutput query group=>` /
+/// `<cfloop query group=>` over `rows_var` (a CFML array of row structs). The
+/// per-group body (everything outside the nested detail block) runs once per
+/// distinct consecutive value of `group_col`; the nested block iterates that
+/// group's rows, recursing for further `group=` levels. `uid`/`depth` keep
+/// generated temp names unique.
+///
+/// `inner_tag` names the detail block: `<cfoutput>` nested in a grouped
+/// cfoutput, `<cfloop>` nested in a grouped cfloop. `in_cfoutput` carries the
+/// caller's interpolation context — a cfoutput body always interpolates `#…#`,
+/// a cfloop body only does so inside an enclosing `<cfoutput>`.
 #[allow(clippy::too_many_arguments)]
-fn emit_grouped_cfoutput(
+fn emit_grouped_query_body(
     rows_var: &str,
     query_var: &str,
     body: &str,
     group_col: &str,
     case_sensitive: bool,
+    inner_tag: &str,
+    in_cfoutput: bool,
     imports: &mut std::collections::HashMap<String, String>,
     uid: usize,
     depth: usize,
@@ -3150,27 +3257,48 @@ fn emit_grouped_cfoutput(
     let chars: Vec<char> = body.chars().collect();
     let len = chars.len();
 
-    // Split the body into (pre, nested-cfoutput attrs, nested inner body, post).
-    let (pre, nested_attrs, nested_inner, post) =
-        if let Some(open) = find_nested_cfoutput(&chars, 0, len) {
-            let name_end = open + 1 + "cfoutput".len();
-            let (attrs, _quoted, tag_end) = parse_tag_attributes(&chars, name_end, len);
-            let pre: String = chars[..open].iter().collect();
-            if let Some(close) = find_closing_tag(&chars, tag_end, len, "cfoutput") {
-                let inner: String = chars[tag_end..close].iter().collect();
-                let close_end = find_tag_end(&chars, close, len);
-                let post: String = chars[close_end..].iter().collect();
-                (pre, Some(attrs), inner, post)
-            } else {
-                let inner: String = chars[tag_end..].iter().collect();
-                (pre, Some(attrs), inner, String::new())
+    // Split the body into (pre, detail-block attrs, detail inner body, post).
+    // For cfloop the detail block is a BARE `<cfloop>` (or one carrying only
+    // `group=`/`groupCaseSensitive=` for a further level) — any other nested
+    // `<cfloop from=…/query=…>` is an unrelated loop and must stay in the body.
+    let detail_open = {
+        let mut at = 0;
+        loop {
+            match find_nested_tag(&chars, at, len, inner_tag) {
+                None => break None,
+                Some(open) => {
+                    let name_end = open + 1 + inner_tag.len();
+                    let (attrs, _q, _end) = parse_tag_attributes(&chars, name_end, len);
+                    let group_only = attrs.keys().all(|k| {
+                        k == "group" || k == "groupcasesensitive"
+                    });
+                    if inner_tag != "cfloop" || group_only {
+                        break Some(open);
+                    }
+                    at = open + 1;
+                }
             }
+        }
+    };
+    let (pre, nested_attrs, nested_inner, post) = if let Some(open) = detail_open {
+        let name_end = open + 1 + inner_tag.len();
+        let (attrs, _quoted, tag_end) = parse_tag_attributes(&chars, name_end, len);
+        let pre: String = chars[..open].iter().collect();
+        if let Some(close) = find_closing_tag(&chars, tag_end, len, inner_tag) {
+            let inner: String = chars[tag_end..close].iter().collect();
+            let close_end = find_tag_end(&chars, close, len);
+            let post: String = chars[close_end..].iter().collect();
+            (pre, Some(attrs), inner, post)
         } else {
-            (body.to_string(), None, String::new(), String::new())
-        };
+            let inner: String = chars[tag_end..].iter().collect();
+            (pre, Some(attrs), inner, String::new())
+        }
+    } else {
+        (body.to_string(), None, String::new(), String::new())
+    };
 
-    let pre_script = tags_to_script_inner(&pre, imports, true);
-    let post_script = tags_to_script_inner(&post, imports, true);
+    let pre_script = tags_to_script_inner(&pre, imports, in_cfoutput);
+    let post_script = tags_to_script_inner(&post, imports, in_cfoutput);
 
     let sfx = format!("{}_{}", uid, depth);
     let i = format!("__cfg_i_{}", sfx);
@@ -3186,12 +3314,13 @@ fn emit_grouped_cfoutput(
             if let Some(g2) = attrs.get("group") {
                 let g2 = strip_hashes(g2);
                 let cs2 = group_case_sensitive(&attrs);
-                emit_grouped_cfoutput(
-                    &sub, query_var, &nested_inner, &g2, cs2, imports, uid, depth + 1,
+                emit_grouped_query_body(
+                    &sub, query_var, &nested_inner, &g2, cs2, inner_tag, in_cfoutput, imports,
+                    uid, depth + 1,
                 )
             } else {
                 // Innermost block: iterate every row in the current group.
-                let nested_body = tags_to_script_inner(&nested_inner, imports, true);
+                let nested_body = tags_to_script_inner(&nested_inner, imports, in_cfoutput);
                 let ri = format!("__cfg_ri_{}", sfx);
                 format!(
                     "var {ri} = 1;\nwhile ({ri} <= arrayLen({sub})) {{\nstructAppend(variables, {sub}[{ri}], true);\n{q} = {sub}[{ri}];\n{body}\n{ri} = {ri} + 1;\n}}\n",
@@ -4299,6 +4428,76 @@ fn parse_cfprocresult_tags(body: &str) -> Vec<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `<cfhttp>` attribute must reach the options struct. The lowering
+    /// used to copy a fixed ten-key whitelist, so `name=`/`file=`/`path=` (and
+    /// throwOnError/redirect/port/proxyPort/encodeURL, all implemented in the
+    /// runtime) were discarded at compile time — docs known-issues §27.
+    #[test]
+    fn test_cfhttp_forwards_every_attribute() {
+        let result = tags_to_script(
+            r#"<cfhttp url="http://x/y" name="q" file="a.txt" path="/tmp" throwOnError="true" redirect="false" port="8080" encodeURL="false" delimiter="|" firstRowAsHeaders="false" columns="a,b" result="r">"#,
+        );
+        for key in [
+            "name", "file", "path", "throwonerror", "redirect", "port", "encodeurl",
+            "delimiter", "firstrowasheaders", "columns",
+        ] {
+            assert!(
+                result.contains(&format!("{}: ", key)),
+                "cfhttp dropped `{}` at lowering: {}",
+                key,
+                result
+            );
+        }
+        // `result` is the assignment target, not an option.
+        assert!(result.starts_with("r = cfhttp("), "unexpected target: {result}");
+    }
+
+    /// `<cfloop query>`'s row window (`startrow`/`endrow`/`maxrows`) and
+    /// `group=` reached the lowering and were dropped, so every row was
+    /// iterated and a grouped loop had no control break — docs known-issues §27.
+    #[test]
+    fn test_cfloop_query_window_and_group_are_lowered() {
+        let windowed = tags_to_script(
+            r#"<cfloop query="q" startrow="2" endrow="4">X</cfloop>"#,
+        );
+        assert!(windowed.contains("__cfloopq_sr_"), "startrow dropped: {windowed}");
+        assert!(windowed.contains("__cfloopq_er_"), "endrow dropped: {windowed}");
+        assert!(
+            !windowed.contains("for (var __cfloopq_i_0 = 1;"),
+            "window ignored, loop still starts at row 1: {windowed}"
+        );
+
+        let grouped = tags_to_script(
+            r#"<cfloop query="q" group="dept">A<cfloop>B</cfloop></cfloop>"#,
+        );
+        // Control break: compareNoCase is the default (Lucee-probed), and the
+        // bare inner <cfloop> becomes the per-group detail iteration.
+        assert!(grouped.contains("compareNoCase("), "group break missing: {grouped}");
+        assert!(grouped.contains("__cfg_sub_"), "detail block missing: {grouped}");
+    }
+
+    /// `__cftransaction_start` takes (action, isolation, datasource) in FIXED
+    /// positions. Emitting only the attributes present shifted `isolation` into
+    /// the datasource slot, so `<cftransaction isolation="serializable">` tried
+    /// to open a connection to a datasource named "serializable".
+    #[test]
+    fn test_cftransaction_emits_all_three_argument_positions() {
+        let iso_only = tags_to_script(
+            r#"<cftransaction isolation="serializable">X</cftransaction>"#,
+        );
+        assert!(
+            iso_only.contains(r#"__cftransaction_start("begin", "serializable", "")"#),
+            "isolation-only lowering has the wrong argument shape: {iso_only}"
+        );
+        let ds_only = tags_to_script(
+            r#"<cftransaction datasource="ds1">X</cftransaction>"#,
+        );
+        assert!(
+            ds_only.contains(r#"__cftransaction_start("begin", "", "ds1")"#),
+            "datasource-only lowering has the wrong argument shape: {ds_only}"
+        );
+    }
 
     #[test]
     fn test_cfset() {
