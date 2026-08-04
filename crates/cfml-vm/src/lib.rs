@@ -5972,17 +5972,39 @@ impl CfmlVirtualMachine {
                     } else {
                         name.as_str()
                     };
-                    // A declared parameter — or a genuine frame-local (`var x`) —
-                    // named after a built-in scope SHADOWS that scope: the CFML
-                    // cascade resolves `local`/`arguments` before `variables`,
-                    // `cgi`, `url`, `form`, `cookie`, `request`, `application`,
-                    // `server`, `session`. Without this, the scope-name arms below
-                    // returned the live scope struct unconditionally, so
-                    // `function f(cookie="x")` read the request's cookie scope
-                    // instead of the argument value (GitHub #256). `url`/`form`/
-                    // `cgi` were already correct precisely because they have no
-                    // dedicated arm and fall through to lookup_name_in_scopes.
-                    let scope_shadowed_by_local = (is_inside_function
+                    // GH #312: a built-in scope name is RESERVED for a bare read.
+                    // A same-named parameter or `var` local does NOT shadow it —
+                    // `request` is always the request scope, and the shadowing
+                    // value stays reachable through its explicit qualifier
+                    // (`arguments.request`, `local.request`). Verified against
+                    // Lucee 7.0.4 for `request`, `cookie`, `url`, `form`, `cgi`,
+                    // `session`, `application`, `server` and `variables`, and for a
+                    // `var`/`local.` declaration as well as a parameter: the rule is
+                    // uniform, with no per-scope exception.
+                    //
+                    // This used to go the other way (for #256) — which is ACF's
+                    // behaviour, not Lucee's. Two costs. Wheels' middleware pipeline
+                    // hands handlers a `required struct request`, so every
+                    // `request.*` read inside a handler silently retargeted the
+                    // argument (7 specs). And `isDefined()` never consulted the
+                    // flag, so `isDefined("request.x")` answered true from the SCOPE
+                    // while the read threw from the ARGUMENT — a correctly guarded
+                    // read that still blew up. Making the scope always win removes
+                    // the divergence AND that self-contradiction.
+                    //
+                    // #256 is unaffected: it is about `arguments.<name>` binding an
+                    // omitted parameter's declared default — a different path, and
+                    // already correct on both engines. Its store-side half also
+                    // stays: `var cookie = …` writes to `local`, not into the live
+                    // scope, which is what Lucee does too (it stores to `local` and
+                    // still reads the scope for a bare `cookie`).
+                    //
+                    // Kept as a flag rather than deleted because the host-provided
+                    // scopes (`url`/`form`/`cgi`/`client`) have no dedicated arm
+                    // below: they are redirected to the scope ONLY when something
+                    // would otherwise shadow them, leaving the unshadowed path
+                    // byte-for-byte unchanged.
+                    let scope_name_shadow_attempt = (is_inside_function
                         && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
                         || declared_locals.contains(name.as_str())
                         || declared_locals.contains(name_lower);
@@ -5995,7 +6017,7 @@ impl CfmlVirtualMachine {
                             &locals,
                             &inherited_or_param_keys,
                         ))
-                    } else if name_lower == "variables" && !scope_shadowed_by_local
+                    } else if name_lower == "variables"
                     {
                         // Return a struct representing the variables scope.
                         // A `__variables` key means we're running in a component
@@ -6051,7 +6073,7 @@ impl CfmlVirtualMachine {
                         } else {
                             CfmlValue::strukt(locals.clone())
                         }
-                    } else if name_lower == "request" && !scope_shadowed_by_local {
+                    } else if name_lower == "request" {
                         CfmlValue::Struct(self.request_scope.clone())
                     } else if name_lower == "static" {
                         // The shared per-type static scope (see find_static_scope).
@@ -6119,7 +6141,7 @@ impl CfmlVirtualMachine {
                         // inherited) still wins, so a custom tag's own body reads its
                         // own attributes normally (this arm is skipped for it).
                         self.globals.get("attributes").cloned().unwrap()
-                    } else if name_lower == "application" && !scope_shadowed_by_local {
+                    } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             // Live handle clone, not a snapshot, so `var p =
                             // application; p.x = 1` writes through (Lucee semantics).
@@ -6127,7 +6149,7 @@ impl CfmlVirtualMachine {
                         } else {
                             CfmlValue::strukt(ValueMap::default())
                         }
-                    } else if name_lower == "session" && !scope_shadowed_by_local {
+                    } else if name_lower == "session" {
                         // Attach the live session scope before returning it, so a
                         // bare `session` READ hands back the same Arc-backed
                         // handle on every read (Lucee scope-reference semantics).
@@ -6136,13 +6158,28 @@ impl CfmlVirtualMachine {
                         // the read-first scope-pointer caching pattern.
                         self.attach_session_scope();
                         self.get_session_scope()
-                    } else if name_lower == "cookie" && !scope_shadowed_by_local {
+                    } else if name_lower == "cookie" {
                         self.globals
                             .get("cookie")
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(ValueMap::default()))
-                    } else if name_lower == "server" && !scope_shadowed_by_local {
+                    } else if name_lower == "server" {
                         CfmlValue::Struct(self.live_server_scope())
+                    } else if scope_name_shadow_attempt
+                        && matches!(name_lower, "url" | "form" | "cgi" | "client")
+                    {
+                        // The host-provided scopes have no dedicated arm above —
+                        // unshadowed, they resolve out of `globals` via
+                        // `lookup_name_in_scopes` below, and that path is left
+                        // exactly as it was. But that lookup checks `locals`
+                        // FIRST, so a same-named parameter/`var` would win, which
+                        // is the #312 divergence (Lucee returns the scope for a
+                        // bare `url`/`form`/`cgi` too). Redirect to the scope only
+                        // in that shadowed case.
+                        self.globals
+                            .get(name_lower)
+                            .cloned()
+                            .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()))
                     } else if let Some(val) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
                     {

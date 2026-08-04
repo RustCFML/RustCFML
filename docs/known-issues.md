@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.560.0**.
+What RustCFML **does not fully do**, as of **v0.561.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
@@ -93,6 +93,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [33](#33) | Java `Object` methods on simple values | ✅ v0.558.0 |
 | [34](#34) | `createUUID()` random from the first call, v4-shaped | ✅ v0.558.0 |
 | [35](#35) | §29 type enforcement rejected two legitimate values (Preside boot) | ✅ v0.560.0 |
+| [36](#36) | Built-in scope names were shadowable (ACF behaviour) — GH [#312](https://github.com/RustCFML/RustCFML/issues/312) | ✅ v0.561.0 |
 
 ### Is it getting better?
 
@@ -1405,6 +1406,58 @@ engine's internal value model is honest, and an internal representation that *be
 like a scalar everywhere else has to satisfy a scalar declaration too. A representation
 that leaks through the checker will present as a Lucee incompatibility even though the
 declaration is being read correctly.
+
+<a id="36"></a>
+
+## 36. Built-in scope names are reserved for a bare read ✅ *(fixed in v0.561.0, GH [#312](https://github.com/RustCFML/RustCFML/issues/312))*
+
+A bare read of a built-in scope name inside a function resolved to a same-named
+parameter or `var` local instead of the scope. On Lucee 7 the scope names are **fully
+reserved**: bare `request` is always the request scope, and the shadowing value is
+reachable only through its explicit qualifier (`arguments.request`). Verified uniform
+across `request`, `cookie`, `url`, `form`, `cgi`, `session`, `application`, `server`
+and `variables`, and for a `var` / `local.` declaration as well as a parameter — there
+is no per-scope exception.
+
+This was an **ACF-vs-Lucee fork where RustCFML had taken the ACF route**, and it left
+two internal resolvers contradicting each other, which is worse than either answer:
+
+```cfml
+request.wheels = { tenant = { id = "FROM-SCOPE" } };
+
+function handler( required struct request ) {          // shadows the request scope
+    isDefined( "request.wheels.tenant" )              // true   — answered from the SCOPE
+    request.wheels.tenant.id                          // THROWS — answered from the ARGUMENT
+}
+```
+
+So a correctly guarded read still blew up. That is the Wheels middleware pipeline
+exactly — it hands core handlers a `required struct request` — and it accounted for
+**all 7** remaining non-passing Wheels specs (5 × `Variable 'tenant' is undefined`,
+2 × a cleanup `StructDelete` operating on the wrong object). Wheels is now **2740 pass
+/ 0 fail / 0 error**.
+
+Two things the fix had to keep intact:
+
+- **§256's `arguments.<name>` behaviour.** That issue — an omitted defaulted parameter
+  binding the live scope instead of its default — is a *different* path, and both
+  engines already agreed on it. Its store-side half stays too: `var cookie = …` writes
+  to `local`, never into the live scope, which is also what Lucee does. Note §256's
+  stated premise ("a scope name has no special meaning in a parameter list") is only
+  half true for Lucee 7 — true for `arguments.<name>`, false for a bare read. The
+  reporter was describing ACF, which is how the wrong fork got taken.
+- **The default-argument preamble.** Codegen seeded `arguments.<name>` from an applied
+  default by storing the value and then reading it back with `LoadLocal(param.name)`.
+  Once a bare scope name resolved to the scope, that read-back handed
+  `arguments.cookie` the live cookie scope. Now the freshly-evaluated value is kept on
+  the stack (`Dup`/`Swap`) instead of being re-read — fixed at all three sites that
+  emit the preamble (declared functions, closures, arrow functions).
+
+`tests/core/test_scope_named_default_param.cfm` was rewritten: it had asserted the ACF
+behaviour, and it **passed here while erroring on Lucee 7** (`Can't cast Complex Object
+Type [COOKIE scope] to String`). It now covers both rules and passes 33/33 on both
+engines — a test that fails on the reference engine being the clearest possible signal
+that the wrong fork was taken.
 
 ---
 

@@ -2947,10 +2947,17 @@ impl CfmlCompiler {
                 func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0)); // placeholder
                 // Set the local variable
                 self.compile_expression(default_expr, &mut func_instructions);
+                // Seed the local AND the `arguments` key from the default, WITHOUT reading
+                // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
+                // wrong for a parameter named after a built-in scope: since GH #312 a bare
+                // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
+                // seeded `arguments.cookie` with the live cookie scope instead of "D".
+                // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
+                // documented "Load s, Swap, SetProperty -> modified s" pattern.
+                func_instructions.push(BytecodeOp::Dup);
                 func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
-                // Also update the arguments scope
                 func_instructions.push(BytecodeOp::LoadLocal("arguments".to_string()));
-                func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
+                func_instructions.push(BytecodeOp::Swap);
                 func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                 func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
                 // A DEFAULT is type-checked exactly like a supplied argument
@@ -4485,10 +4492,17 @@ impl CfmlCompiler {
                         let jump_idx = func_instructions.len();
                         func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
                         self.compile_expression(default_expr, &mut func_instructions);
+                        // Seed the local AND the `arguments` key from the default, WITHOUT reading
+                        // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
+                        // wrong for a parameter named after a built-in scope: since GH #312 a bare
+                        // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
+                        // seeded `arguments.cookie` with the live cookie scope instead of "D".
+                        // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
+                        // documented "Load s, Swap, SetProperty -> modified s" pattern.
+                        func_instructions.push(BytecodeOp::Dup);
                         func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
-                        // Also update the arguments scope
                         func_instructions.push(BytecodeOp::LoadLocal("arguments".to_string()));
-                        func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
+                        func_instructions.push(BytecodeOp::Swap);
                         func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                         func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
                         // Type-check the applied default (see compile_function_decl).
@@ -4559,10 +4573,17 @@ impl CfmlCompiler {
                         let jump_idx = func_instructions.len();
                         func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
                         self.compile_expression(default_expr, &mut func_instructions);
+                        // Seed the local AND the `arguments` key from the default, WITHOUT reading
+                        // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
+                        // wrong for a parameter named after a built-in scope: since GH #312 a bare
+                        // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
+                        // seeded `arguments.cookie` with the live cookie scope instead of "D".
+                        // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
+                        // documented "Load s, Swap, SetProperty -> modified s" pattern.
+                        func_instructions.push(BytecodeOp::Dup);
                         func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
-                        // Also update the arguments scope
                         func_instructions.push(BytecodeOp::LoadLocal("arguments".to_string()));
-                        func_instructions.push(BytecodeOp::LoadLocal(param.name.clone()));
+                        func_instructions.push(BytecodeOp::Swap);
                         func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
                         func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
                         // Type-check the applied default (see compile_function_decl).
