@@ -6096,3 +6096,195 @@ pub fn handle_java_dateformat(
         _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
+
+// ---------------------------------------------------------------------------
+// java.lang.Object / Comparable on simple values (docs/known-issues.md §33)
+//
+// Lucee boxes a CFML simple value as a Java object, so `equals`, `hashCode` and
+// `compareTo` are callable on it. These reproduce the JVM's exact answers over
+// RustCFML's own value model, so a value hashed on Lucee and on RustCFML keys
+// the same bucket. Verified against Lucee 7.0.4 — see
+// tests/functions/test_java_object_methods.cfm for the pinned table.
+// ---------------------------------------------------------------------------
+
+/// `java.lang.String.hashCode()`: s[0]*31^(n-1) + … + s[n-1], wrapping in
+/// 32-bit two's complement, over UTF-16 code units.
+pub fn java_string_hash(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for c in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(c as i32);
+    }
+    h
+}
+
+/// The JVM `hashCode()` for a CFML value.
+///
+/// `Int` hashes as `java.lang.Long` and `Double` as `java.lang.Double` —
+/// matching how Lucee boxes the corresponding CFML values. `Array` follows
+/// `java.util.List` (`31*h + elem`), `Struct` follows `java.util.Map` (the SUM
+/// of per-entry `keyHash ^ valueHash`), and struct keys hash in UPPER case
+/// because that is the casing Lucee's case-insensitive `Struct` stores them in
+/// — `{a:1}.hashCode()` is 64 (`"A"`=65 ^ 1), not 96 (`"a"`=97 ^ 1).
+pub fn java_hash_code(v: &CfmlValue) -> i32 {
+    match v {
+        CfmlValue::Int(i) => {
+            // java.lang.Long.hashCode: (int)(value ^ (value >>> 32))
+            let u = *i as u64;
+            (u ^ (u >> 32)) as i32
+        }
+        CfmlValue::Double(d) => {
+            // java.lang.Double.hashCode: bits ^ (bits >>> 32), where `bits` is
+            // doubleToLongBits — so every NaN hashes alike and -0.0 differs
+            // from 0.0, exactly as on the JVM.
+            let bits = if d.is_nan() {
+                0x7ff8_0000_0000_0000u64
+            } else {
+                d.to_bits()
+            };
+            (bits ^ (bits >> 32)) as i32
+        }
+        CfmlValue::Bool(b) => {
+            // java.lang.Boolean.hashCode's two magic constants.
+            if *b {
+                1231
+            } else {
+                1237
+            }
+        }
+        CfmlValue::String(s) => java_string_hash(s),
+        CfmlValue::Array(a) => {
+            let mut h: i32 = 1;
+            for e in a.snapshot().iter() {
+                h = h.wrapping_mul(31).wrapping_add(java_hash_code(e));
+            }
+            h
+        }
+        CfmlValue::Struct(s) => {
+            let mut h: i32 = 0;
+            for (k, val) in s.snapshot().iter() {
+                h = h.wrapping_add(java_string_hash(&k.to_uppercase()) ^ java_hash_code(val));
+            }
+            h
+        }
+        CfmlValue::Binary(b) => {
+            // java.util.Arrays.hashCode(byte[]) — Java's byte[] is an Object, so
+            // `.hashCode()` is really identity; this stable value-based hash is
+            // the same trade-off §20 already makes for binary `.equals()`.
+            let mut h: i32 = 1;
+            for byte in b.iter() {
+                h = h.wrapping_mul(31).wrapping_add(*byte as i8 as i32);
+            }
+            h
+        }
+        // Null hashes as 0 (Java's convention for a null element inside a
+        // collection); anything else falls back to its string form.
+        CfmlValue::Null => 0,
+        other => java_string_hash(&other.as_string()),
+    }
+}
+
+/// The JVM `equals()` for a CFML value: TYPE-STRICT, with no CFML coercion.
+///
+/// Lucee's answer here is `java.lang.Object.equals` on the boxed value, so
+/// `1.equals("1")` and `true.equals(1)` are both false, and a Long never equals
+/// a Double. `Array` follows `java.util.List.equals` (element-wise) and
+/// `Struct` follows Lucee's case-INSENSITIVE `Struct.equals`.
+///
+/// Residual divergence: which of `Int`/`Double` a numeric LITERAL lands in is
+/// each engine's own boxing choice, and the two disagree on negative and
+/// large-magnitude integer literals (`-1` is a `Long`-like `Int` here but a
+/// `Double` on Lucee). So `x = -1; x.equals( -1.0 )` is false here and true on
+/// Lucee. Same-spelling comparisons — the ones code actually writes — agree.
+pub fn java_equals(a: &CfmlValue, b: &CfmlValue) -> bool {
+    match (a, b) {
+        (CfmlValue::Int(x), CfmlValue::Int(y)) => x == y,
+        // Double.equals compares doubleToLongBits, so NaN equals NaN and
+        // 0.0 does NOT equal -0.0 — deliberately not `x == y`.
+        (CfmlValue::Double(x), CfmlValue::Double(y)) => {
+            (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+        }
+        (CfmlValue::Bool(x), CfmlValue::Bool(y)) => x == y,
+        (CfmlValue::String(x), CfmlValue::String(y)) => x == y,
+        (CfmlValue::Binary(x), CfmlValue::Binary(y)) => x == y, // §20: by value
+        (CfmlValue::Array(x), CfmlValue::Array(y)) => {
+            let (xs, ys) = (x.snapshot(), y.snapshot());
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|(ex, ey)| java_equals(ex, ey))
+        }
+        (CfmlValue::Struct(x), CfmlValue::Struct(y)) => {
+            let (xs, ys) = (x.snapshot(), y.snapshot());
+            xs.len() == ys.len()
+                && xs.iter().all(|(k, xv)| {
+                    ys.iter()
+                        .find(|(yk, _)| yk.eq_ignore_ascii_case(k))
+                        .is_some_and(|(_, yv)| java_equals(xv, yv))
+                })
+        }
+        (CfmlValue::Null, CfmlValue::Null) => true,
+        _ => false,
+    }
+}
+
+/// The JVM `Comparable.compareTo` for a CFML value, as a sign (-1/0/1).
+///
+/// `None` means the receiver is not `Comparable` (an `Array`/`Struct`/`Query`),
+/// which Lucee reports as "The function [compareTo] does not exist in the …".
+///
+/// Divergence, deliberately: Lucee compares only within one boxed numeric type,
+/// so `x = 1.5; x.compareTo( 2 )` throws a raw JVM ClassCastException ("class
+/// java.lang.Long cannot be cast to class java.lang.Double"). Mixed numerics
+/// are compared NUMERICALLY here. That is a strict superset — code that works on
+/// Lucee gets Lucee's answer, and the only affected inputs are ones Lucee
+/// refuses outright — and the alternative is reproducing a JVM cast failure
+/// that carries no CFML meaning.
+fn cmp_as_f64(v: &CfmlValue) -> f64 {
+    match v {
+        CfmlValue::Int(n) => *n as f64,
+        CfmlValue::Double(d) => *d,
+        other => other.as_string().trim().parse::<f64>().unwrap_or(f64::NAN),
+    }
+}
+
+fn cmp_as_bool(v: &CfmlValue) -> bool {
+    match v {
+        CfmlValue::Bool(b) => *b,
+        CfmlValue::Int(n) => *n != 0,
+        CfmlValue::Double(d) => *d != 0.0,
+        other => matches!(
+            other.as_string().trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1"
+        ),
+    }
+}
+
+pub fn java_compare_to(a: &CfmlValue, b: &CfmlValue) -> Option<i32> {
+    let sign = |o: std::cmp::Ordering| match o {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    match a {
+        CfmlValue::Int(x) => match b {
+            CfmlValue::Int(y) => Some(sign(x.cmp(y))),
+            _ => {
+                let y = cmp_as_f64(b);
+                Some(sign(
+                    (*x as f64).partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                ))
+            }
+        },
+        CfmlValue::Double(x) => {
+            let y = cmp_as_f64(b);
+            // Double.compareTo orders NaN above everything and -0.0 below 0.0;
+            // total_cmp is exactly that ordering.
+            Some(sign(x.total_cmp(&y)))
+        }
+        // Boolean.compareTo: false < true.
+        CfmlValue::Bool(x) => Some(sign(x.cmp(&cmp_as_bool(b)))),
+        CfmlValue::String(x) => Some(sign(x.as_str().cmp(b.as_string().as_str()))),
+        _ => None,
+    }
+}

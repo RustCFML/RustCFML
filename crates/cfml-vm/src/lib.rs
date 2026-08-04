@@ -24932,6 +24932,63 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // §33: Lucee boxes a CFML simple value as a Java object, so the
+        // java.lang.Object / Comparable trio is callable on one. Only `toString`
+        // (and `equals`/`hashCode`/`compareTo` on a String, handled in the String
+        // member table above) used to resolve; everything else fell through to
+        // the "does not exist in the Numeric." throw below. That cost 8 tests in
+        // TestBox's own suite: `equalize` compares numerics itself and only
+        // reaches `actual.equals( expected )` once they have already differed —
+        // i.e. exactly the `isNotEqual` path — so a throw where Lucee returns
+        // `false` failed the assertion instead of passing it.
+        //
+        // Scoped to the receivers whose answers were verified against Lucee
+        // 7.0.4 (see tests/functions/test_java_object_methods.cfm). Query and
+        // TimeSpan are deliberately NOT included — nothing here is guessed.
+        // Components are excluded too: they resolved above with Java IDENTITY
+        // semantics, which is what Lucee gives them and what ColdBox's
+        // BaseProxy relies on.
+        if matches!(
+            object,
+            CfmlValue::Int(_)
+                | CfmlValue::Double(_)
+                | CfmlValue::Bool(_)
+                | CfmlValue::String(_)
+                | CfmlValue::Array(_)
+                | CfmlValue::Binary(_)
+        ) || matches!(&object, CfmlValue::Struct(s)
+                if !s.contains_key("__variables")
+                    && !s.contains_key("__name")
+                    && !s.contains_key("__is_component")
+                    && !s.contains_key("__java_shim")
+                    && !s.contains_key("__java_class")
+                    && !s.contains_key("__is_super")
+                    && s.method_table().is_none())
+        {
+            match method_lower.as_str() {
+                "equals" => {
+                    let other = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
+                    return Ok(CfmlValue::Bool(java_shims::java_equals(&object, &other)));
+                }
+                "hashcode" => {
+                    return Ok(CfmlValue::Int(java_shims::java_hash_code(&object) as i64));
+                }
+                // `compareTo` is only defined on the Comparable receivers; an
+                // Array/Struct returns None here and falls through to the throw,
+                // matching Lucee ("The function [compareTo] does not exist in
+                // the Array.").
+                "compareto" => {
+                    if let Some(sign) = java_shims::java_compare_to(
+                        &object,
+                        extra_args.first().unwrap_or(&CfmlValue::Null),
+                    ) {
+                        return Ok(CfmlValue::Int(sign as i64));
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // GH #285 (secondary): a member CALL on a PLAIN struct whose key does not
         // exist throws, mirroring the rvalue READ of the same missing member
         // (`x = core.pluralize` already throws `Variable 'pluralize' is

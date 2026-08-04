@@ -934,4 +934,7 @@ include "harness.cfm";
 <!--- Page-scope variables holding a function (docs/known-issues.md §32). --->
 <cf_runtest file="functions/test_page_function_vars.cfm">
 
+<!--- java.lang.Object methods on simple values (docs/known-issues.md §33). --->
+<cf_runtest file="functions/test_java_object_methods.cfm">
+
 <cfscript> printSummary(); </cfscript>
