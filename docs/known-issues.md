@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.558.0**.
+What RustCFML **does not fully do**, as of **v0.559.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
@@ -128,14 +128,25 @@ on them looks like it works. This is the priority list.
 Read today: `this.name`, `this.mappings`, `this.sessionManagement`, `this.sessionTimeout`,
 `this.customTagPaths`, `this.localMode`, `this.sessionStorage`, `this.cache`,
 `this.lazySessionCreation`, `this.datasources`, `this.datasource`,
-`this.sessioncookie` (secure/httponly/samesite/domain/path — see §12e).
+`this.sessioncookie` (secure/httponly/samesite/domain/path — see §12e),
+`this.timezone`, `this.locale`.
+
+`this.timezone` and `this.locale` were fixed in **v0.559.0** — they had been parsed
+into the application's settings struct and read by nothing, so
+`getApplicationSettings()` reported the declared value while every date and every
+`ls*` number stayed on the SERVER's zone and locale. Both now seed the same request
+state the cfconfig `runtime.*` keys use; Application.cfc overrides the server
+baseline, and `setTimeZone()`/`setLocale()` still override Application.cfc later in
+the request. An unusable id is ignored rather than fatal, which is Lucee's verified
+behaviour. Pinned in `tests/lifecycle/test_application_timezone_locale.cfm`
+(12 assertions, green on both engines).
 
 Accepted but **ignored** (no error, no effect):
 
 | Setting | Notes |
 |---|---|
-| `this.timezone` | Per-app timezone ignored. Only the server/cfconfig `runtime.timezone` is honoured — and `setTimeZone()` overrides *that* for the rest of the request (it resolves the id, sets request state read by `getTimeZone()`/`getTimeZoneInfo()`/`dateConvert()`, and throws on an unknown id). Same shape as the `this.locale` row below. |
-| `this.locale` | Per-app locale ignored. Only cfconfig `runtime.locale` is honoured — which, as of GH #304, it genuinely is: it seeds request state read by `getLocale()` and the `ls*` family. (Before that fix this row was false: the key parsed but had no consumer, and every `ls*` function was pinned to `en_US`.) `setLocale()` overrides it for the rest of the request. |
+
+
 | `this.applicationTimeout` | Per-app value ignored — **and so is the cfconfig `runtime.applicationTimeout`**. The key parses and is seeded into thread contexts, but nothing ever reads it: applications do not time out. (This row previously claimed the cfconfig key "IS applied". It never was.) |
 | `this.scriptProtect` | No script-protection filtering of scopes. |
 | `this.secureJSON` / `this.secureJSONPrefix` | Per-app value ignored. cfconfig `security.secureJSON*` IS applied (process-global — see §4). |
@@ -168,15 +179,41 @@ These deserialize without error but have no runtime effect:
 | Key | Notes |
 |---|---|
 | `server.maxConcurrentRequests` | No concurrency limiting. |
-| `server.requestTimeout` | No per-request timeout enforcement — **and neither has any other route to it**: `<cfsetting requestTimeout=N>` and `getPageContext().setRequestTimeout()` both store the value (`getRequestTimeout()` reads it back in ms, Lucee-style) but nothing ever compares elapsed time against it, so no request is ever aborted. A page that raises its own timeout expecting protection has none. |
 | `server.http2` | Not wired to the HTTP server. |
 | `runtime.trustedCache` | Reserved; bytecode-cache trust is driven by `--production`, not this key. |
 | `debugging.showExecutionTime` | No timing output. |
 | `datasources[].connectionLimit` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. (`connectionTimeout` **is** applied — it reaches the pool builder — so it is no longer listed here.) |
 | `mailServers[].timeout` | Carried but not applied during send. |
-| `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | In-memory cache capacity / TTL / eviction not enforced. |
+| `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | Region **defaults** not applied: a cache has no capacity bound and no eviction policy, and an entry stored with no explicit TTL never expires. A per-entry TTL — `cachePut( id, value, timespan )` — **is** honoured and does expire the entry, so this is narrower than it reads: it bites code that relies on the region's `defaultTimeout`/`maxObjects` instead of passing a TTL per put. |
 | `logging.format` | Only `"text"`; other values warn and fall back. |
 | `logging.loggers[].appender` | Logger name used; appender ignored. |
+
+**`server.requestTimeout` is enforced as of v0.559.0.** It, `<cfsetting
+requestTimeout=N>` and `getPageContext().setRequestTimeout()` all stored a value that
+nothing ever compared elapsed time against, so no request was ever aborted — a page
+that raised its own timeout expecting protection had none. An overrunning request now
+aborts with Lucee's own wording (`Request [<path>] has run into a timeout (timeout: N
+seconds) and has been stopped. The thread started Nms ago.`) and, like Lucee's
+`RequestTimeoutException`, is **not catchable** by `try { … } catch( any e )` — a
+framework catch-all must not be able to swallow the timeout and let the request it was
+meant to stop keep running. The limit is re-read on every check, so `<cfsetting>` can
+raise or lower it part-way through a request. Pinned in
+`crates/cli/tests/request_timeout.rs`. Three things to know: 🏗
+
+- **It fires at blocking points, not from the bytecode loop** — so a tight CPU-bound
+  CFML loop still runs to completion. That is deliberate Lucee parity, not an
+  oversight: on Lucee 7.0.4 a `while` loop spinning for 8s under a 1-second timeout
+  finishes normally, because its watchdog can only interrupt a blocked thread. A
+  `sleep()` is interrupted mid-call on both engines; `cfhttp` and `queryExecute` abort
+  at the boundary rather than mid-flight (interrupting those needs the remaining budget
+  pushed into the client's own timeout).
+- **The default is 0 = no timeout**, where Lucee defaults to 50 seconds. 🌟 Enforcement
+  only ever applies to a deployment that asked for it, so nothing that runs today
+  starts aborting on upgrade — but a deployment expecting Lucee's implicit 50s net has
+  to set the key.
+- **`server.*` is server-level** (§5), so this cannot be set from an app-level
+  `.cfconfig.json` — only from the server config / `--cfconfig`. A `<cfthread>` child
+  starts with no deadline of its own and is never killed by its parent's.
 
 <a id="4"></a>
 

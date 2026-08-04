@@ -1,0 +1,4 @@
+{
+  "server":    { "requestTimeout": 2 },
+  "debugging": { "enabled": true }
+}

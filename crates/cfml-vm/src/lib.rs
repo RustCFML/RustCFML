@@ -66,6 +66,12 @@ pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 /// immediately.
 const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 
+/// `CfmlErrorType::Custom` tag marking the `requestTimeout` abort. Custom rather
+/// than a new `CfmlErrorType` variant so no exhaustive match anywhere else has
+/// to change, and it doubles as the uncatchable marker — see
+/// `is_request_timeout_error`.
+const REQUEST_TIMEOUT_ERROR_TYPE: &str = "requesttimeout";
+
 /// Reserved `locals` key under which a frame's `arguments` scope is stored.
 /// CFML keeps `local` and `arguments` as fully independent scopes (Lucee and
 /// BoxLang both back them with separate scope objects), so the scope must NOT
@@ -2013,6 +2019,13 @@ pub struct CfmlVirtualMachine {
     pub cache_misses: u64,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
     pub enable_cfoutput_only: i32,
+    /// Wall-clock ms (unix epoch) at which the current request began — the
+    /// baseline `requestTimeout` is measured from. 0 = no request in flight
+    /// (so no deadline can ever fire).
+    pub request_start_ms: i64,
+    /// Set once this request has blown its `requestTimeout`. Latched, so a
+    /// `catch` cannot resume a request that is already over.
+    pub request_timed_out: bool,
     /// cfsetting requesttimeout (seconds), stored as milliseconds. 0 = unset.
     /// getPageContext().getRequestTimeout() reads it back (in ms, Lucee-style).
     pub request_timeout_ms: i64,
@@ -2535,6 +2548,8 @@ impl CfmlVirtualMachine {
             cache_hits: 0,
             cache_misses: 0,
             enable_cfoutput_only: 0,
+            request_start_ms: 0,
+            request_timed_out: false,
             request_timeout_ms: 0,
             #[cfg(feature = "observability")]
             show_debug_output: true,
@@ -4504,6 +4519,11 @@ impl CfmlVirtualMachine {
         ) {
             Ok(true) => Ok(CfmlValue::Null),
             Ok(false) => Err(e),
+            // An abort/redirect inside onError means onError deliberately took
+            // over the response, so it counts as handled. A requestTimeout does
+            // NOT — the request is over, and reporting it as handled would let
+            // the remaining lifecycle run on past its own deadline (§3).
+            Err(oe) if Self::is_request_timeout_error(&oe) => Err(oe),
             Err(oe) if Self::is_control_flow_error(&oe) => Ok(CfmlValue::Null),
             Err(oe) => Err(oe),
         }
@@ -4517,7 +4537,111 @@ impl CfmlVirtualMachine {
     /// outer `try` swallows it).
     #[inline]
     fn is_control_flow_error(e: &CfmlError) -> bool {
-        e.message == "__cfabort" || e.message == "__cflocation_redirect"
+        e.message == "__cfabort"
+            || e.message == "__cflocation_redirect"
+            || Self::is_request_timeout_error(e)
+    }
+
+    /// The `requestTimeout` abort (docs/known-issues.md §3).
+    ///
+    /// Grouped with the control-flow sentinels above so it is **not catchable**
+    /// by `try { … } catch( any e )`, matching Lucee — whose
+    /// `RequestTimeoutException` escapes `catch( any )` too (verified: a
+    /// `catch( any )` around a `sleep()` that overran never ran). That is not
+    /// pedantry: a framework's broad catch-all would otherwise swallow the
+    /// timeout and let the request it was meant to stop keep running.
+    #[inline]
+    fn is_request_timeout_error(e: &CfmlError) -> bool {
+        matches!(&e.error_type, CfmlErrorType::Custom(t) if t == REQUEST_TIMEOUT_ERROR_TYPE)
+    }
+
+    /// Start this request's `requestTimeout` clock and adopt the configured
+    /// limit. Called once per request, before any user code runs.
+    ///
+    /// The cfconfig `server.requestTimeout` is the baseline; `<cfsetting
+    /// requestTimeout=N>` / `getPageContext().setRequestTimeout()` still
+    /// override it later in the request, exactly as they did before — they wrote
+    /// `request_timeout_ms` all along, it simply had no reader.
+    ///
+    /// A limit of 0 means NO timeout, which is RustCFML's default (Lucee
+    /// defaults to 50s). Enforcement therefore only ever applies to a
+    /// deployment that asked for it — nothing that runs today starts aborting.
+    fn begin_request_timeout_clock(&mut self) {
+        self.request_timed_out = false;
+        self.request_start_ms = cfml_common::clock::now_unix_millis() as i64;
+        let configured = self
+            .server_state
+            .as_ref()
+            .map(|ss| ss.cfconfig.server.request_timeout)
+            .unwrap_or(0);
+        self.request_timeout_ms = (configured as i64).saturating_mul(1000);
+    }
+
+    /// Adopt `server.requestTimeout` from whatever cfconfig is currently in
+    /// effect, without disturbing the request's start instant.
+    fn adopt_configured_request_timeout(&mut self) {
+        let configured = self
+            .server_state
+            .as_ref()
+            .map(|ss| ss.cfconfig.server.request_timeout)
+            .unwrap_or(0);
+        self.request_timeout_ms = (configured as i64).saturating_mul(1000);
+    }
+
+    /// Has this request exceeded its `requestTimeout`? Returns the elapsed ms.
+    ///
+    /// Deliberately re-derived from `request_timeout_ms` on every call rather
+    /// than cached as a deadline, because `<cfsetting requestTimeout=…>` can
+    /// raise or lower the limit part-way through a request.
+    #[inline]
+    fn request_timeout_exceeded(&self) -> Option<i64> {
+        if self.request_timeout_ms <= 0 || self.request_start_ms == 0 {
+            return None;
+        }
+        let elapsed = cfml_common::clock::now_unix_millis() as i64 - self.request_start_ms;
+        (elapsed > self.request_timeout_ms).then_some(elapsed)
+    }
+
+    /// Build the abort for an overrun request, in Lucee's wording:
+    /// `Request [<path>] has run into a timeout (timeout: N seconds) and has
+    /// been stopped. The thread started Nms ago.`
+    fn request_timeout_error(&self, elapsed_ms: i64) -> CfmlError {
+        let template = self
+            .source_file
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut err = CfmlError::new(
+            format!(
+                "Request [{}] has run into a timeout (timeout: {} seconds) and has been \
+                 stopped. The thread started {}ms ago.",
+                template,
+                self.request_timeout_ms / 1000,
+                elapsed_ms
+            ),
+            CfmlErrorType::Custom(REQUEST_TIMEOUT_ERROR_TYPE.to_string()),
+        );
+        err.stack_trace = self.build_stack_trace();
+        err
+    }
+
+    /// Abort if this request has overrun. Called from the points where the
+    /// engine is about to block — Lucee enforces the timeout by interrupting a
+    /// blocked thread, so those are exactly the points it can fire at too.
+    ///
+    /// Note what this deliberately does NOT do: it is not a check in the
+    /// bytecode dispatch loop, so a tight CPU-bound CFML loop still runs to
+    /// completion. That mirrors Lucee, where a `while` loop spinning for 8s
+    /// under a 1-second timeout finishes normally (verified) because its
+    /// watchdog can only interrupt at a blocking call.
+    #[inline]
+    fn check_request_timeout(&mut self) -> Result<(), CfmlError> {
+        match self.request_timeout_exceeded() {
+            Some(elapsed) => {
+                self.request_timed_out = true;
+                Err(self.request_timeout_error(elapsed))
+            }
+            None => Ok(()),
+        }
     }
 
     fn wrap_error(&self, mut err: CfmlError) -> CfmlError {
@@ -13335,6 +13459,7 @@ impl CfmlVirtualMachine {
                 | "getbasetemplatepath"
                 | "getfunctioncalledname"
                 | "gettimezone"
+                | "sleep"
                 | "settimezone"
                 | "getlocale"
                 | "setlocale"
@@ -15323,6 +15448,40 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::Null);
                 }
+                // sleep() is intercepted (rather than left as the plain stdlib
+                // blocking sleep) so a `requestTimeout` can interrupt it — the
+                // one thing Lucee's watchdog reliably CAN interrupt (§3). Slept
+                // in short slices, checking the deadline between them, so the
+                // abort lands mid-sleep the way Lucee's does instead of after
+                // the full duration.
+                "sleep" => {
+                    let total_ms = args
+                        .first()
+                        .map(|v| match v {
+                            CfmlValue::Int(i) => *i,
+                            CfmlValue::Double(d) => *d as i64,
+                            other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+                        })
+                        .unwrap_or(0)
+                        .max(0);
+                    // No deadline in play: one plain sleep, no slicing overhead.
+                    if self.request_timeout_ms <= 0 || self.request_start_ms == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(total_ms as u64));
+                        return Ok(CfmlValue::Null);
+                    }
+                    const SLICE_MS: i64 = 25;
+                    let mut slept = 0i64;
+                    while slept < total_ms {
+                        self.check_request_timeout()?;
+                        let slice = SLICE_MS.min(total_ms - slept);
+                        std::thread::sleep(std::time::Duration::from_millis(slice as u64));
+                        slept += slice;
+                    }
+                    // A sleep that exactly consumed the remaining budget must
+                    // still abort rather than returning successfully.
+                    self.check_request_timeout()?;
+                    return Ok(CfmlValue::Null);
+                }
                 "gettimezone" => {
                     // A timezone set via setTimeZone() (or cfconfig
                     // runtime.timezone) wins over the system zone.
@@ -16863,6 +17022,8 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "queryexecute" => {
+                    // Blocking boundary — see the cfhttp note above (§3).
+                    self.check_request_timeout()?;
                     let mut args = args;
                     // cfquery routes its name=/result= attributes through the
                     // options struct — they can only be known at runtime
@@ -17298,6 +17459,12 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "cfhttp" => {
+                    // A blocking boundary: if the request has already blown its
+                    // deadline, stop here rather than starting another network
+                    // round-trip (§3). Unlike sleep() this cannot interrupt a
+                    // call already in flight — that would need the remaining
+                    // budget pushed into the HTTP client's own timeout.
+                    self.check_request_timeout()?;
                     // `name=` (parse the response body into a query) and
                     // `file=`/`path=` (write the body to disk) are honoured HERE
                     // rather than inside `fn_cfhttp` because both need caller
@@ -32200,6 +32367,9 @@ impl CfmlVirtualMachine {
 
     /// Execute with Application.cfc lifecycle
     pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
+        // Start the requestTimeout clock before any user code — including the
+        // no-Application.cfc early return below (§3).
+        self.begin_request_timeout_clock();
         self.application_stopped = false;
         self.current_application_name = None;
         // No function defined yet this request; the re-homing walk is skipped
@@ -32231,6 +32401,12 @@ impl CfmlVirtualMachine {
         // Application.cfc overlays the server baseline for this request. Applied
         // before Application.cfc `this.*` settings so those still win on conflict.
         self.discover_app_cfconfig(&app_cfc_path);
+        // Re-read `server.requestTimeout` now the app-level `.cfconfig.json`
+        // overlay is in place — the clock was started from the server baseline
+        // before this point, because the no-Application.cfc path returns early
+        // and never gets here. Only the LIMIT is re-read; the start instant
+        // stays where it was so the overlay can't quietly extend the deadline.
+        self.adopt_configured_request_timeout();
 
         // 1c. Seed the writable application scope for the Application.cfc
         // pseudo-constructor. The PC (e.g. Preside's `super.setupApplication(...)`)
