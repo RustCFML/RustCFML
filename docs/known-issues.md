@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.561.0**.
+What RustCFML **does not fully do**, as of **v0.562.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
@@ -94,6 +94,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [34](#34) | `createUUID()` random from the first call, v4-shaped | ✅ v0.558.0 |
 | [35](#35) | §29 type enforcement rejected two legitimate values (Preside boot) | ✅ v0.560.0 |
 | [36](#36) | Built-in scope names were shadowable (ACF behaviour) — GH [#312](https://github.com/RustCFML/RustCFML/issues/312) | ✅ v0.561.0 |
+| [37](#37) | A non-SELECT statement returned metadata instead of an empty query | ✅ v0.562.0 |
 
 ### Is it getting better?
 
@@ -1458,6 +1459,47 @@ behaviour, and it **passed here while erroring on Lucee 7** (`Can't cast Complex
 Type [COOKIE scope] to String`). It now covers both rules and passes 33/33 on both
 engines — a test that fails on the reference engine being the clearest possible signal
 that the wrong fork was taken.
+
+<a id="37"></a>
+
+## 37. A non-SELECT statement returns an empty query ✅ *(fixed in v0.562.0)*
+
+`queryExecute()` on an INSERT / UPDATE / DELETE returned the **mutation-metadata
+struct** (`{recordCount, cached, sql, executionTime [, generatedKey]}`) as its value.
+Lucee returns an **empty query** — verified on Lucee 7.0.4 over MySQL, where all three
+statement kinds hand back `QUERY(recordCount=0)` and the affected-row count and
+generated key are exposed *only* through the `result=` struct.
+
+So a `query`-declared function wrapping a mutation failed §29 type enforcement:
+
+```cfml
+private query function _deleteSessionRecord( required string sessionId ) {
+    return sqlRunner.runSql(
+          sql = "delete from psys_session_storage where id = :id"
+        , dsn = _getSessionStorageDsn()
+        , params = [ { type="cf_sql_varchar", value=arguments.sessionId, name="id" } ]
+    );
+}
+```
+
+→ `The function [_deleteSessionRecord] has an invalid return value , [Cannot cast Object
+type [Struct] to a value of type [query]]`. That is Preside's `SessionStorage`, and it
+broke the admin route — the third §29 casualty after §35's two, and the same root shape:
+an internal representation that no declaration had ever been able to see.
+
+The conversion happens at the `queryExecute` return boundary rather than in the four
+drivers, because that struct is the internal carrier the `result=` / `name=` delivery
+reads `recordCount` and `generatedKey` out of — it has to survive until those are built.
+A `returntype="struct"` SELECT is also a struct and is deliberately *not* caught: the
+discriminator is the `executionTime` + `recordCount` + `cached` triple, which only the
+mutation metadata carries.
+
+`result=` is unchanged and still reports rows affected, which
+`tests/database/test_dml_returns_empty_query.cfm` pins alongside the return shapes
+(16 assertions). It runs on SQLite so no server is needed; Lucee ships no SQLite JDBC
+driver, so it skips there with a single informational pass rather than spraying false
+reds — the cross-engine evidence was taken on MySQL, where the two engines agree
+exactly, including `result.recordCount`.
 
 ---
 

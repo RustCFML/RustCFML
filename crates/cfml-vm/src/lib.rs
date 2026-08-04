@@ -17425,6 +17425,40 @@ impl CfmlVirtualMachine {
                             params: &params,
                         });
                     }
+                    // §37: a non-SELECT statement RETURNS an empty query on
+                    // Lucee, not the mutation-metadata struct. Verified against
+                    // Lucee 7.0.4 on MySQL: INSERT / UPDATE / DELETE each hand back
+                    // `QUERY(recordCount=0)`, and the affected-row count / generated
+                    // key are exposed only through the `result=` struct.
+                    //
+                    // RustCFML returned that metadata struct directly, so a
+                    // `query`-declared function wrapping a DELETE failed §29 type
+                    // enforcement — Preside's SessionStorage._deleteSessionRecord
+                    // (`private query function`, returning `runSql( "delete …" )`),
+                    // which broke the admin route.
+                    //
+                    // Converted HERE rather than in the drivers on purpose: the
+                    // struct is the internal carrier that the `result=` / `name=`
+                    // delivery above reads recordCount and generatedKey out of, so
+                    // it has to survive until those are built. The discriminator is
+                    // the same three-key shape used further up — a
+                    // `returntype="struct"` SELECT has no `executionTime`/`cached`
+                    // pair, so it is not caught by this.
+                    let ret = match &ret {
+                        CfmlValue::Struct(s)
+                            if s.get_ci("executionTime").is_some()
+                                && s.get_ci("recordCount").is_some()
+                                && s.get_ci("cached").is_some() =>
+                        {
+                            let empty = cfml_common::dynamic::CfmlQuery::new(Vec::new());
+                            if !sql_text.is_empty() {
+                                empty.set_sql(Some(sql_text.clone()));
+                            }
+                            empty.set_execution_time(Some(exec_ms));
+                            CfmlValue::Query(empty)
+                        }
+                        _ => ret,
+                    };
                     return Ok(ret);
                 }
                 "cfdbinfo" | "dbinfo" => {

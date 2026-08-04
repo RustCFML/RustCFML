@@ -273,6 +273,9 @@ include "harness.cfm";
 <cf_runtest file="database/test_cfquery_tag_forwards_columnkey_maxrows.cfm">
 <cf_runtest file="database/test_duplicate_result_columns.cfm">
 <cf_runtest file="database/test_update_affected_rows_matched.cfm">
+
+<!--- A non-SELECT statement returns an empty query (docs/known-issues.md §37). --->
+<cf_runtest file="database/test_dml_returns_empty_query.cfm">
 <cf_runtest file="database/test_query_error_catch_type_database.cfm">
 <cf_runtest file="stdlib/test_date_functions_extra.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
