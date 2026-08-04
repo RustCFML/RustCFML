@@ -1,25 +1,127 @@
 # Known Issues & Unsupported Behaviour
 
-This document inventories behaviours that RustCFML **does not fully implement**, with
-an emphasis on **silent no-ops** — settings or attributes that are accepted without
-error but have no effect. Those are the dangerous ones: code relying on them appears
-to work but silently doesn't.
+What RustCFML **does not fully do**, as of **v0.558.0**.
 
-Each item is tagged:
+Sections are grouped by *what it means for you*, not by when they were found. Section
+numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
+they are never renumbered or reused, which is why the numbering inside each group is not
+sequential.
 
-- 🔇 **silent** — accepted, no error, no effect (the priority list to make overt)
-- 🛑 **errors** — fails loudly with a clear message (safe, just unsupported)
-- 🌍 **environment** — unsupported only on a specific target (e.g. wasm)
-- 🏗 **by design** — intentional scoping decision (documented for clarity)
+| Tag | Meaning |
+|---|---|
+| 🔇 **silent** | accepted, no error, no effect — the dangerous class, and the priority list |
+| 🛑 **loud** | not implemented, but throws a clear message |
+| 🌟 **divergence** | works, but deliberately differs from Lucee |
+| 🏗 **by design / edges** | implemented; the note records a scoping decision or a known corner |
+| 🌍 **environment** | restricted on a specific target (wasm, CLI) |
+| ✅ **resolved** | fixed; kept only as an upgrade note |
 
-Compatibility target is Lucee/BoxLang. Items below are gaps against that target unless
-marked *by design*.
+Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything not marked
+*by design* is a gap against that target.
 
-> Maintenance: when you implement around a gap or skip an attribute/setting, add it
-> here in the same change. See `docs/configuration.md` and `docs/status.md` for the
-> positive "what's supported" view.
+> Maintenance: when you implement around a gap, or skip an attribute or setting, add it
+> here **in the same change**, in the group that matches its status — and move it to
+> Part F when it is fixed rather than editing the open entry in place. For the positive
+> "what *is* supported" view see `docs/configuration.md` and `docs/status.md`.
 
 ---
+
+## At a glance
+
+**Part A — Silent no-ops (open) 🔇**
+
+| § | Item | Status |
+|---|---|---|
+| [1](#1) | Application.cfc `this.*` settings | 🔇 open |
+| [2](#2) | Application.cfc lifecycle — `onCFCRequest` | 🔇 open |
+| [3](#3) | `.cfconfig.json` keys not enforced | 🔇 open |
+| [4](#4) | Per-application isolation (security flags, mail) | 🔇 open |
+| [7](#7) | Partially-ignored function/tag parameters | 🔇 open |
+| [27](#27) | Tag attributes dropped at lowering (`cfqueryparam`, `cfstoredproc`) | 🔇 open |
+| [30](#30) | Java shims — remaining gaps | 🔇/🛑 open |
+
+**Part B — Unsupported, fails loudly (open) 🛑**
+
+| § | Item | Status |
+|---|---|---|
+| [6](#6) | Functions / tags that throw when unsupported | 🛑 open |
+
+**Part C — Deliberate divergences from Lucee 🌟**
+
+| § | Item | Status |
+|---|---|---|
+| [15](#15) | Struct iteration order (insertion, not HashMap) | 🌟 won't-fix |
+| [17](#17) | `objectSave()`/`objectLoad()` binary format | 🌟 by design |
+| [20](#20) | `binary.equals()` compares by value | 🌟 by design |
+| [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
+| [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
+
+**Part D — Implemented, with documented edges 🏗**
+
+| § | Item | Status |
+|---|---|---|
+| [5](#5) | Server-level cfconfig keys aren't app-level | 🏗 by design |
+| [9](#9) | Query-of-Queries superset | 🏗 by design |
+| [10](#10) | Query result metadata + `cfdbinfo` | 🏗 edges |
+| [11](#11) | `getPageContext()` servlet bridge | 🏗 edges |
+| [12](#12) | Session storage, lazy sessions, expiry, cookies | 🏗/🌟 edges |
+| [13](#13) | `<cfoutput query>` / grouped output | 🏗 edges |
+| [14](#14) | `cfparam` `type=` validation | 🏗 edges |
+| [16](#16) | Sampling profiler vs JIT'd numeric leaves | 🏗 by design |
+| [18](#18) | Image functions — not pixel-identical to Java2D | 🏗 edges |
+| [22](#22) | Within-request template freshness (GH #284) | 🏗 by design |
+| [26](#26) | Locale table is hand-maintained (GH #304) | 🏗 edges |
+
+**Part E — Environment-specific 🌍**
+
+| § | Item | Status |
+|---|---|---|
+| [8](#8) | wasm / CLI restrictions | 🌍 |
+
+**Part F — Resolved (upgrade notes only) ✅**
+
+| § | Item | Status |
+|---|---|---|
+| [19](#19) | Mixed-in view helper vs host implicit accessors (GH #259) | ✅ v0.440.0 |
+| [27b](#27b) | Tag-attribute whitelists removed (`cfhttp`, `cfloop`, `cfdump`, …) | ✅ v0.543–0.555 |
+| [24](#24) | `writeLog`/`<cflog>` file logging (GH #286) | ✅ v0.528.0 |
+| [25](#25) | Member-function dispatch throws on unknown members (GH #307) | ✅ v0.549.0 |
+| [28](#28) | Unclosed body tags refused, not erased | ✅ v0.556.0 |
+| [29](#29) | Declared parameter / return types enforced | ✅ v0.557.0 |
+| [31](#31) | `<cflock>` `scope=` / `throwOnTimeout=` | ✅ v0.553.0 |
+| [32](#32) | Page-scope **function** variable visible inside functions | ✅ v0.558.0 |
+| [33](#33) | Java `Object` methods on simple values | ✅ v0.558.0 |
+| [34](#34) | `createUUID()` random from the first call, v4-shaped | ✅ v0.558.0 |
+
+### Is it getting better?
+
+Yes, and the trend is visible in the table above: Part F has grown by nine sections while
+Parts A, B and C shrank — §27's whitelists, §28's erased tag bodies, §29's unenforced
+types, §31's collapsed locks, §32's unreachable helpers, §33's missing `Object` methods
+and §34's half-zeroed UUIDs were all silent-or-destructive and are now gone. Part B is
+down to a single section, and §33's regression against a known-good baseline is closed:
+TestBox's own suite is back to 410 pass / 0 fail / 0 error.
+
+Two honest caveats, so the direction isn't oversold:
+
+- **New sections are usually old bugs being *found*, not new breakage.** §32, §33 and
+  §34 were all discovered while enforcing declared types (§29); none was caused by it,
+  and each was verified as pre-existing against an unmodified earlier binary before being
+  fixed. Doing the work is what surfaces them, so expect the list to keep growing at the
+  same time as it shrinks.
+- **Stale entries flatter the list too.** §19 sat in the open column for ~117 releases
+  after being fixed in v0.440.0, because nobody moved it when the issue was closed. If an
+  entry looks like it contradicts a workload you know runs, re-probe it before believing
+  it — that is what Part F's "move it, don't edit it" rule exists to prevent.
+
+---
+
+# Part A — Silent no-ops (open) 🔇
+
+Accepted without error, no effect. **These are the dangerous ones** — code that relies
+on them looks like it works. This is the priority list.
+
+<a id="1"></a>
 
 ## 1. Application.cfc `this.*` settings — silently ignored 🔇
 
@@ -32,7 +134,7 @@ Accepted but **ignored** (no error, no effect):
 
 | Setting | Notes |
 |---|---|
-| `this.timezone` | Per-app timezone ignored. Only the server/cfconfig `runtime.timezone` is honoured. |
+| `this.timezone` | Per-app timezone ignored. Only the server/cfconfig `runtime.timezone` is honoured — and `setTimeZone()` overrides *that* for the rest of the request (it resolves the id, sets request state read by `getTimeZone()`/`getTimeZoneInfo()`/`dateConvert()`, and throws on an unknown id). Same shape as the `this.locale` row below. |
 | `this.locale` | Per-app locale ignored. Only cfconfig `runtime.locale` is honoured — which, as of GH #304, it genuinely is: it seeds request state read by `getLocale()` and the `ls*` family. (Before that fix this row was false: the key parsed but had no consumer, and every `ls*` function was pinned to `en_US`.) `setLocale()` overrides it for the rest of the request. |
 | `this.applicationTimeout` | Per-app value ignored — **and so is the cfconfig `runtime.applicationTimeout`**. The key parses and is seeded into thread contexts, but nothing ever reads it: applications do not time out. (This row previously claimed the cfconfig key "IS applied". It never was.) |
 | `this.scriptProtect` | No script-protection filtering of scopes. |
@@ -45,6 +147,8 @@ Accepted but **ignored** (no error, no effect):
 Note: any unrecognised `this.X` is captured into an internal `config` map that is then
 never read — so nothing throws, but nothing happens either.
 
+<a id="2"></a>
+
 ## 2. Application.cfc lifecycle methods — mostly invoked; one gap remains 🔇
 
 | Method | Status |
@@ -55,6 +159,8 @@ never read — so nothing throws, but nothing happens either.
 | `onAbort` | ✅ invoked on `<cfabort>` / `abort` — fired in place of `onRequestEnd`. `<cfabort showError="msg">` is a *catchable* error and is routed to `onError` instead (Adobe/Lucee parity), not `onAbort`. *(fixed v0.173.0)* |
 | `onCFCRequest` | 🔇 Not invoked (no CFC-over-HTTP / remote method dispatch). |
 
+<a id="3"></a>
+
 ## 3. `.cfconfig.json` keys — accepted but not enforced 🔇
 
 These deserialize without error but have no runtime effect:
@@ -62,7 +168,7 @@ These deserialize without error but have no runtime effect:
 | Key | Notes |
 |---|---|
 | `server.maxConcurrentRequests` | No concurrency limiting. |
-| `server.requestTimeout` | No per-request timeout enforcement. |
+| `server.requestTimeout` | No per-request timeout enforcement — **and neither has any other route to it**: `<cfsetting requestTimeout=N>` and `getPageContext().setRequestTimeout()` both store the value (`getRequestTimeout()` reads it back in ms, Lucee-style) but nothing ever compares elapsed time against it, so no request is ever aborted. A page that raises its own timeout expecting protection has none. |
 | `server.http2` | Not wired to the HTTP server. |
 | `runtime.trustedCache` | Reserved; bytecode-cache trust is driven by `--production`, not this key. |
 | `debugging.showExecutionTime` | No timing output. |
@@ -71,6 +177,8 @@ These deserialize without error but have no runtime effect:
 | `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | In-memory cache capacity / TTL / eviction not enforced. |
 | `logging.format` | Only `"text"`; other values warn and fall back. |
 | `logging.loggers[].appender` | Logger name used; appender ignored. |
+
+<a id="4"></a>
 
 ## 4. Per-application isolation gaps 🏗/🔇
 
@@ -87,12 +195,71 @@ server baseline — see `docs/configuration.md`). But some runtime registries ar
 Making security flags and the default mail server per-application is a planned
 follow-up (mirrors the datasource work).
 
-## 5. Server-level keys are not application-level 🏗
+<a id="7"></a>
 
-The entire cfconfig `server.*` section (host, welcomeFiles, maxRequestBodySize, …) is a
-**server/environment** concern and is intentionally **not** overlaid from a per-app
-`.cfconfig.json`. There is deliberately **no `port` key** — the listening port is set
-via `--port`; pages read `cgi.server_port`. (This is by design, not a gap.)
+## 7. Partially-ignored parameters 🔇
+
+| Function | Ignored argument(s) | Reason |
+|---|---|---|
+| `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
+| `fileUpload()` / `fileUploadAll()` | `accept` | **No longer a stub** — VM-intercepted, it reads the form scope's `tempFilePath`/`clientFile`, creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. The remaining gap is `accept`: the MIME/extension allow-list is parsed and discarded, so an upload is never rejected on content type. |
+| `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
+| `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
+| `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
+| `queryExecute(…, {timeout=N})` / `<cfquery timeout>` | `timeout` (partial) | Enforced for the **MySQL/MariaDB** driver only (a `KILL QUERY` watchdog aborts an overrunning statement server-side, the JDBC `setQueryTimeout` equivalent). The Postgres, MSSQL and SQLite drivers currently accept the option but do not enforce it. |
+| `s3Write` / `s3Upload` / `s3Copy` / `s3Move` | `acl`, `location` | Accepted but not sent to the backend. (`s3CreateBucket` *does* apply both — it is only the object-level calls that drop them.) |
+| `s3Read` / `s3Download` | `charset` | Accepted but ignored. |
+
+<a id="27"></a>
+
+## 27. Tag attributes dropped at lowering — per-tag whitelists 🔇
+
+Several tags lower to a builtin by copying a **fixed list** of attributes. Anything
+outside that list is discarded at compile time: no error, no effect, and — because the
+attribute never reaches the runtime — no "unknown option" either. `<cfquery>`'s
+whitelist was removed in v0.543.0 (GH #294) in favour of forwarding every attribute;
+the tags below still have theirs.
+
+| Tag | Survives lowering | Silently dropped |
+|---|---|---|
+| `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
+| `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
+
+These two are the **only** rows left; the rest of the original inventory has shipped —
+see §27b. Both remaining rows are blocked on the same thing: a database the reference
+Lucee can also reach, so the expected precision/OUT-param behaviour can be probed rather
+than guessed.
+
+<a id="30"></a>
+
+## 30. Java shims — remaining gaps 🛑/🔇
+
+The shim dispatch contract was reworked in v0.551.0 so that "this shim does not
+implement that method" travels out-of-band instead of as `Ok(null)`. A shim's `null` is
+now believed, and the operations that used to be silent no-ops (StringBuilder mutators,
+`ConcurrentHashMap.replace`, `Collections.sort` on numbers, `TimeZone` offsets, `Date`
+comparisons, `File.renameTo`, `Files` I/O, `Optional.orElse*`, `GregorianCalendar`
+mutators, `Queue.contains`/`drainTo`, `InetAddress` resolution) do the work. What
+remains:
+
+| Shim | Status |
+|---|---|
+| `ConcurrentHashMap.compute` / `computeIfAbsent` / `computeIfPresent` / `merge` | 🛑 Throws. They take a remapping function, and these handlers are free functions with no VM handle, so a CFML closure cannot be invoked. Previously returned null and never wrote the entry — silently losing the computed value. Needs the VM-intercept treatment the higher-order builtins get. |
+| `Queue.take()` | 🛑 Throws. It blocks until an element is available; the shim backs both `ConcurrentLinkedQueue` (no `take()` in Java) and the blocking queues (where it must block) and cannot tell them apart. Use `poll()`. |
+| `ChronoUnit.X.between(a, b)` | 🛑 Throws. `ChronoUnit` constants are plain strings, so `.between()` dispatches on a String. Making it work means representing the tokens as shims, which would break code comparing them as strings. |
+| `ProcessBuilder` / `Runtime.exec` | 🔇 `directory()`, `environment()`, `redirectOutput()`, `redirectErrorStream()`, `inheritIO()` are ignored; `Process.getInputStream()`/`getErrorStream()` return null so child stdout is unreadable and leaks to the engine console; `Runtime.exec` never launches. Implementing these is a new capability (process spawning with redirected stdio), not a bug fix — deliberately not done. |
+| `new SimpleDateFormat(pattern)` | 🔇 The pattern argument is discarded; `.format()` emits the Java MEDIUM style (`Jan 1, 1970`) regardless. |
+| `HttpServletRequest.setAttribute` / `getAttribute` / `getSession` | 🔇 Attributes are silently discarded — there is no real servlet state behind the bridge (see §11). |
+| Unknown method on a **known** shim class | 🔇 Still returns null rather than throwing. The shim correctly reports "not mine" and falls through to generic dispatch — which must stay, so property access like `system.out` keeps working — but a `__java_shim` struct whose member resolves nowhere does not reach the undefined-member error a plain struct gets. Making that loud is the remaining half of the D2 work. |
+
+---
+
+# Part B — Unsupported, fails loudly (open) 🛑
+
+Genuinely not implemented, but it throws a clear message. Safe to ship against — you
+find out at the call site, not in production data.
+
+<a id="6"></a>
 
 ## 6. Functions / tags that error loudly when unsupported 🛑
 
@@ -119,32 +286,141 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 > block opens a SAVEPOINT on the outer transaction; a nested commit releases it
 > and a nested rollback rolls back to it (Lucee/ACF/BoxLang semantics).
 
-## 7. Partially-ignored parameters 🔇
+---
 
-| Function | Ignored argument(s) | Reason |
-|---|---|---|
-| `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
-| `fileUpload()` / `fileUploadAll()` | — | Stub: returns `fileWasSaved=false` (needs form-scope wiring). |
-| `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
-| `setTimeZone(tz)` | `tz` | No-op: the argument is ignored (only cfconfig `runtime.timezone` is honoured — see §1). |
-| `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
-| `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
-| `queryExecute(…, {timeout=N})` / `<cfquery timeout>` | `timeout` (partial) | Enforced for the **MySQL/MariaDB** driver only (a `KILL QUERY` watchdog aborts an overrunning statement server-side, the JDBC `setQueryTimeout` equivalent). The Postgres, MSSQL and SQLite drivers currently accept the option but do not enforce it. |
-| `s3Write` / `s3Upload` / `s3Copy` / `s3Move` | `acl`, `location` | Accepted but not sent to the backend. |
-| `s3Read` / `s3Download` | `charset` | Accepted but ignored. |
-| `writeDump(output=…)` | a filename path | `output="console"` (→ server stdout) and `output="browser"`/default (→ page) are honoured; a filename value (Lucee writes the dump to that file) is not — it falls back to page output. |
+# Part C — Deliberate divergences from Lucee 🌟
 
-## 8. Environment-specific 🌍
+Implemented and working, but the behaviour differs from the reference engine on purpose —
+usually because RustCFML has no JVM. Each one records why, and what breaks if you depend
+on Lucee's exact answer.
 
-| Feature | Restriction |
-|---|---|
-| `<cfdirectory>` | Not supported on `wasm32` (no filesystem). |
-| `<cfzip>` | Not supported on `wasm32`. |
-| `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
-| `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
-| `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
-| `_schedule` — `everyMs` / `spacedMs` | 🔇 Ignored on **every** platform, not just wasm — `_schedule` is one-shot only. Periodic re-firing needs a respawn driver that can invoke a CFML closure, which the scheduler has no VM handle for. Compose with `runAsync` chains instead. (This row previously scoped the limitation to wasm32; the discard is unconditional.) |
-| `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
+<a id="15"></a>
+
+## 15. Struct iteration order — insertion order, not Lucee's HashMap order 🌟 *(divergence)*
+
+RustCFML structs are insertion-ordered (`IndexMap`), so `serializeJSON()`, `for( k in
+struct )`, `structKeyList()`, `structKeyArray()` and friends all visit keys in the order
+they were added — i.e. RustCFML's default `{}` behaves like Lucee's `structNew("ordered")`.
+Lucee/ACF's **default** `{}` (and component metadata + many internal structs) is instead
+backed by a Java `HashMap`, whose iteration order is hash-bucket order — neither insertion
+nor alphabetical, but deterministic for a given key set (Java `String.hashCode()` is
+spec-defined). RustCFML's `structNew("ordered")` and Lucee's `structNew("ordered")` agree;
+it is only the *default* struct where Lucee is unordered and RustCFML is ordered.
+
+This is normally invisible and arguably an improvement (stable, predictable output).
+It only bites code that **hashes a serialized struct as an identity key** and expects
+byte-for-byte parity with Lucee. The known case is **Preside's foreign-key constraint
+names**: `RelationshipGuidance.cfc` computes `fk_#Hash( SerializeJson( property ) )#`
+over the normalised property struct. RustCFML produces *deterministic, self-consistent*
+FK names (so its own dbSync/diffing works), but they will **not equal the values Lucee
+generated**. Preside's `PresideObjectServiceTest` `test011`/`test012` assert the exact
+Lucee-generated `fk_<md5>` strings and therefore fail on RustCFML even though the
+relationships, columns and referential rules are correct.
+
+Reproducing Lucee's exact hash would require emulating `java.util.HashMap` iteration
+order (bucket index + resize thresholds) plus its attribute-name case preservation and
+`required="true"`→`"yes"` metadata coercion — brittle and not worth it. Treated as a
+**won't-fix divergence**. (FK *rule* reporting via `dbinfo type="foreignkeys"` — the
+JDBC numeric `UPDATE_RULE`/`DELETE_RULE` codes — *is* matched; see §10.)
+
+<a id="17"></a>
+
+## 17. `objectSave()` / `objectLoad()` — internal binary format, not JVM-compatible 🌟 *(divergence)*
+
+ACF/Lucee implement `objectSave()` / `objectLoad()` via **Java object serialization**
+(a JVM-native binary blob). RustCFML has no JVM, so it uses its own **self-describing
+internal format**: a magic header (`RCFMLOBJ\x01`) followed by the value serialized
+as JSON via `CfmlValue`'s serde impl (Binary/Query are tagged with `_cftype` markers
+so they reconstruct exactly). Consequences:
+
+- **Not wire-compatible with the JVM engines.** A blob produced by ACF/Lucee cannot
+  be `objectLoad()`ed here, and vice-versa. This is fine for the common use case —
+  the pair is only ever round-tripped on the same engine (e.g. ColdBox's cache
+  `DiskStore` marshaller saves then loads). `objectLoad()` on a foreign/JVM blob
+  throws a clear error rather than corrupting silently.
+- **Components / closures / functions serialize to `null`.** They cannot be
+  reconstituted without their defining program. Scalars, structs, arrays, and
+  queries round-trip with full fidelity. (Lucee can serialize a live CFC instance's
+  state; RustCFML does not.)
+- Struct key **insertion order** is preserved (see also §15), and whole-number
+  doubles collapse to `Int` on load — the same normalisation the JSON path applies
+  everywhere else.
+
+<a id="20"></a>
+
+## 20. `binary.equals(other)` compares by value, not Java reference identity 🌟 *(divergence)*
+
+On Lucee/ACF a binary value is a Java `byte[]`, so `.equals()` is `java.lang.Object`
+**reference identity**: two independently-created binaries with identical bytes compare
+`false`, and only the *same* array object compares `true`. Consumers rely on this
+transitively — a CFC that stores a binary and returns it later hands back the *same*
+reference, so `stored.equals(returned)` is `true`.
+
+RustCFML has no JVM and clones `CfmlValue`s freely, so a binary cannot preserve a stable
+"reference" through a set/get round-trip. `binary.equals(other)` therefore compares **by
+value** (byte-for-byte). This produces the same answer as Lucee for the case consumers
+actually depend on (`stored.equals(returned)` → `true`), and only diverges for two
+separately-constructed-but-equal binaries: Lucee returns `false`, RustCFML returns `true`
+(the intuitive answer). TestBox's `Assertion.equalize()` falls through to `.equals()` for
+binary values, so this is what lets binary `expect().toBe()` assertions pass (e.g. Taffy's
+`BaseSerializerSpec` / `ResponseHandlingSpec`). The bare `eq` operator on two binaries
+still differs too — Lucee throws "can't compare complex object types"; RustCFML currently
+returns `false` — but no exercised consumer depends on that edge.
+
+<a id="21"></a>
+
+## 21. `server.coldfusion.supportedLocales` — ACF list, not Lucee's JVM locale set 🌟 *(divergence)*
+
+`server.coldfusion.supportedLocales` is a comma-delimited locale list. It originated as an
+Adobe ColdFusion field; Lucee emulates it by returning the JVM's full
+`Locale.getAvailableLocales()` set — ~900 entries, and the exact contents vary by the JVM
+version Lucee runs on (locale display names plus `en_US_#Latn`-style tags).
+
+RustCFML has no JVM, so replicating that list exactly is infeasible and would be unstable
+across builds. Instead it exposes the **ACF-documented supported-locale set** (~47 entries:
+`English (US)`, `French (Standard)`, `Japanese`, …) — which is what this field historically
+meant and what locale-dropdown consumers were designed around (e.g. Mura/Masa admin
+`csettings/editsite.cfm`, whose `isSupportedLocale()` flags anything outside its own set as
+deprecated regardless). Apps that enumerate this list get a sensible, stable locale menu;
+apps that assume a *specific* JVM locale tag string will see fewer entries than on Lucee.
+
+<a id="23"></a>
+
+## 23. Custom tag `caller` — read of a key shadowed by the calling function's local 🌟 *(divergence)*
+
+The custom-tag `caller` scope is a **live handle** onto the calling frame's variables
+scope (Lucee `CallerImpl` / BoxLang `Component.caller` design; replaced the old
+snapshot+diff in the caller-scope rework that also fixed lost `structDelete(caller, …)`
+and lost new-key writes into CFC callers). **Write** routing is Lucee-faithful, verified
+against Lucee 7: a `caller.x` write where `x` exists in the calling method's
+`local`/`arguments` scope lands on that scope only (shadow reconciliation), everything
+else lands live on `variables`. The one divergence is the **read** of such a shadowed
+key: Lucee's caller view reads the method local first; RustCFML's live handle reads the
+variables scope. Pinned (tolerantly, green on both engines) in
+`tests/tags/test_customtag_caller_semantics.cfm`. Full read-fidelity needs an
+intercepting scope value type — deferred.
+
+Related pre-existing (unchanged) page-frame edges, pinned in the same test: a
+caller-write of a UDF-local-shadowed key from a page-level UDF also updates variables,
+and a caller-write of an `arguments`-shadowed key misses the arguments scope.
+
+---
+
+# Part D — Implemented, with documented edges 🏗
+
+The feature works. What follows are the known corners, scoping decisions and "by design"
+boundaries — not gaps to fix.
+
+<a id="5"></a>
+
+## 5. Server-level keys are not application-level 🏗
+
+The entire cfconfig `server.*` section (host, welcomeFiles, maxRequestBodySize, …) is a
+**server/environment** concern and is intentionally **not** overlaid from a per-app
+`.cfconfig.json`. There is deliberately **no `port` key** — the listening port is set
+via `--port`; pages read `cgi.server_port`. (This is by design, not a gap.)
+
+<a id="9"></a>
 
 ## 9. Query-of-Queries — RustCFML/BoxLang superset 🏗
 
@@ -169,6 +445,7 @@ Cross-engine tests live in `tests/qoq/test_qoq_{select,aggregates,joins,subqueri
 are executed once (uncorrelated); this matches typical QoQ usage. Errors loudly if a referenced
 table/column is missing.
 
+<a id="10"></a>
 
 ## 10. cfquery / queryExecute result metadata + cfdbinfo 🏗
 
@@ -195,6 +472,8 @@ RustCFML, with Lucee's message text. Live-server dbinfo tests are env-gated:
 `RUSTCFML_TEST_MYSQL_DS` / `RUSTCFML_TEST_PG_DS` / `RUSTCFML_TEST_MSSQL_DS` in
 `tests/tags/test_cfdbinfo.cfm`.
 
+<a id="11"></a>
+
 ## 11. `getPageContext()` servlet bridge 🏗
 
 `getPageContext().getRequest()` / `.getResponse()` return method-faithful servlet shims
@@ -216,6 +495,8 @@ is a superset of both.
 | `getPathInfo()` for a plain script request | `null` | `null` |
 | Unknown servlet method (e.g. `getLocale`) | returns `null` (non-null receiver keeps chains alive) | full servlet API |
 | `getMetaData(getRequest()).getName()` | a struct (no real Java class) | `...HTTPServletRequestWrap` |
+
+<a id="12"></a>
 
 ## 12. Session storage — datasource store, lazy default, data-only rule 🏗/🌟
 
@@ -385,6 +666,8 @@ Lucee's spec default is `secure:false` everywhere, so the Worker-on default is a
 `this.sessioncookie.secure = false` is honoured verbatim on both runtimes.
 `SameSite=None` forces `Secure` on (browsers reject it otherwise).
 
+<a id="13"></a>
+
 ## 13. `<cfoutput query>` / grouped output — implemented, with edges 🏗
 
 `<cfoutput query="q">` now drives row iteration (previously the `query` attribute
@@ -405,6 +688,8 @@ Known edges:
 | `group` + `startrow`/`maxrows` | `startrow`/`maxrows` apply to the **non-grouped** form only; the grouped form ignores them. |
 | Bare column scope | Columns are merged into `variables`, so a page variable sharing a column's name is shadowed for the duration of the loop. |
 
+<a id="14"></a>
+
 ## 14. `cfparam` / `param` `type` validation — enforced, with edges 🏗
 
 The `type` attribute (and `min`/`max`/`pattern`) was **silently dropped** —
@@ -419,32 +704,7 @@ Edges:
 | Non-literal `type` | A `type` given as an expression (not a string literal) is not validated. |
 | "required" semantics | A typed param with no default whose value is absent is defaulted to `""` then type-checked, so the error names the type rather than "parameter required". |
 
-## 15. Struct iteration order — insertion order, not Lucee's HashMap order 🌟 *(divergence)*
-
-RustCFML structs are insertion-ordered (`IndexMap`), so `serializeJSON()`, `for( k in
-struct )`, `structKeyList()`, `structKeyArray()` and friends all visit keys in the order
-they were added — i.e. RustCFML's default `{}` behaves like Lucee's `structNew("ordered")`.
-Lucee/ACF's **default** `{}` (and component metadata + many internal structs) is instead
-backed by a Java `HashMap`, whose iteration order is hash-bucket order — neither insertion
-nor alphabetical, but deterministic for a given key set (Java `String.hashCode()` is
-spec-defined). RustCFML's `structNew("ordered")` and Lucee's `structNew("ordered")` agree;
-it is only the *default* struct where Lucee is unordered and RustCFML is ordered.
-
-This is normally invisible and arguably an improvement (stable, predictable output).
-It only bites code that **hashes a serialized struct as an identity key** and expects
-byte-for-byte parity with Lucee. The known case is **Preside's foreign-key constraint
-names**: `RelationshipGuidance.cfc` computes `fk_#Hash( SerializeJson( property ) )#`
-over the normalised property struct. RustCFML produces *deterministic, self-consistent*
-FK names (so its own dbSync/diffing works), but they will **not equal the values Lucee
-generated**. Preside's `PresideObjectServiceTest` `test011`/`test012` assert the exact
-Lucee-generated `fk_<md5>` strings and therefore fail on RustCFML even though the
-relationships, columns and referential rules are correct.
-
-Reproducing Lucee's exact hash would require emulating `java.util.HashMap` iteration
-order (bucket index + resize thresholds) plus its attribute-name case preservation and
-`required="true"`→`"yes"` metadata coercion — brittle and not worth it. Treated as a
-**won't-fix divergence**. (FK *rule* reporting via `dbinfo type="foreignkeys"` — the
-JDBC numeric `UPDATE_RULE`/`DELETE_RULE` codes — *is* matched; see §10.)
+<a id="16"></a>
 
 ## 16. Sampling profiler — JIT-compiled numeric leaves not attributed 🏗
 
@@ -462,26 +722,7 @@ all (see the JIT-in-serve-mode notes), so interpreted frames — the overwhelmin
 majority of a real request — are attributed correctly. Breaking JIT'd leaves out
 separately would require the JIT to push frames it currently elides for speed.
 
-## 17. `objectSave()` / `objectLoad()` — internal binary format, not JVM-compatible 🌟 *(divergence)*
-
-ACF/Lucee implement `objectSave()` / `objectLoad()` via **Java object serialization**
-(a JVM-native binary blob). RustCFML has no JVM, so it uses its own **self-describing
-internal format**: a magic header (`RCFMLOBJ\x01`) followed by the value serialized
-as JSON via `CfmlValue`'s serde impl (Binary/Query are tagged with `_cftype` markers
-so they reconstruct exactly). Consequences:
-
-- **Not wire-compatible with the JVM engines.** A blob produced by ACF/Lucee cannot
-  be `objectLoad()`ed here, and vice-versa. This is fine for the common use case —
-  the pair is only ever round-tripped on the same engine (e.g. ColdBox's cache
-  `DiskStore` marshaller saves then loads). `objectLoad()` on a foreign/JVM blob
-  throws a clear error rather than corrupting silently.
-- **Components / closures / functions serialize to `null`.** They cannot be
-  reconstituted without their defining program. Scalars, structs, arrays, and
-  queries round-trip with full fidelity. (Lucee can serialize a live CFC instance's
-  state; RustCFML does not.)
-- Struct key **insertion order** is preserved (see also §15), and whole-number
-  doubles collapse to `Int` on load — the same normalisation the JSON path applies
-  everywhere else.
+<a id="18"></a>
 
 ## 18. Image functions — Tiers 1–3 implemented; rasterisation is not pixel-identical to Java2D 🏗
 
@@ -530,66 +771,7 @@ angle), `imageFlip`, `isImage`, `isImageFile`, `getReadableImageFormats`/
 - **HEIC/AVIF/JXL** decode is intentionally unsupported (their codecs need C libraries
   that don't build for wasm); Lucee treats those as optional codecs too.
 
-## 19. Mixed-in view helper cannot resolve the host Renderer's implicit accessors 🛑 *(GH [#259](https://github.com/RustCFML/RustCFML/issues/259))*
-
-A ColdBox/Preside **view helper** that is *mixed into* the Renderer and then calls one
-of the Renderer's **implicit accessors** (e.g. `getController()`) gets `null` back,
-because the mixed-in helper runs with the Renderer's `variables` scope but **without
-`this`** — so the implicit accessor can't bind to the component instance and returns
-the property's empty default instead of `variables.controller`.
-
-Symptom (Preside admin dashboard, `admin.sitetree.index`):
-
-```
-cannot call method [renderViewlet] on a null value
-```
-
-from `system/helpers/presideProxies.cfm` (`getController().renderViewlet(...)`).
-Debug at the call site: `getController() isNull=true`, `variables.controller` exists,
-`this` absent.
-
-- Reproduces only for a **mixed-in helper invoked without `this`** calling a host
-  implicit accessor. Implicit accessors called from a normal sibling method, or from a
-  UDF injected as a member and invoked as a method (both have `this`), resolve
-  correctly.
-- Likely area: how the engine includes a ColdBox view and mixes in the helper library
-  — the mixed-in functions do not retain the Renderer's `this`.
-- Impact: blocks rendering ColdBox admin UIs whose view helpers call the Renderer's
-  implicit accessors. (Preside boot + admin login/session work as of v0.430–v0.433.)
-
-## 20. `binary.equals(other)` compares by value, not Java reference identity 🌟 *(divergence)*
-
-On Lucee/ACF a binary value is a Java `byte[]`, so `.equals()` is `java.lang.Object`
-**reference identity**: two independently-created binaries with identical bytes compare
-`false`, and only the *same* array object compares `true`. Consumers rely on this
-transitively — a CFC that stores a binary and returns it later hands back the *same*
-reference, so `stored.equals(returned)` is `true`.
-
-RustCFML has no JVM and clones `CfmlValue`s freely, so a binary cannot preserve a stable
-"reference" through a set/get round-trip. `binary.equals(other)` therefore compares **by
-value** (byte-for-byte). This produces the same answer as Lucee for the case consumers
-actually depend on (`stored.equals(returned)` → `true`), and only diverges for two
-separately-constructed-but-equal binaries: Lucee returns `false`, RustCFML returns `true`
-(the intuitive answer). TestBox's `Assertion.equalize()` falls through to `.equals()` for
-binary values, so this is what lets binary `expect().toBe()` assertions pass (e.g. Taffy's
-`BaseSerializerSpec` / `ResponseHandlingSpec`). The bare `eq` operator on two binaries
-still differs too — Lucee throws "can't compare complex object types"; RustCFML currently
-returns `false` — but no exercised consumer depends on that edge.
-
-## 21. `server.coldfusion.supportedLocales` — ACF list, not Lucee's JVM locale set 🌟 *(divergence)*
-
-`server.coldfusion.supportedLocales` is a comma-delimited locale list. It originated as an
-Adobe ColdFusion field; Lucee emulates it by returning the JVM's full
-`Locale.getAvailableLocales()` set — ~900 entries, and the exact contents vary by the JVM
-version Lucee runs on (locale display names plus `en_US_#Latn`-style tags).
-
-RustCFML has no JVM, so replicating that list exactly is infeasible and would be unstable
-across builds. Instead it exposes the **ACF-documented supported-locale set** (~47 entries:
-`English (US)`, `French (Standard)`, `Japanese`, …) — which is what this field historically
-meant and what locale-dropdown consumers were designed around (e.g. Mura/Masa admin
-`csettings/editsite.cfm`, whose `isSupportedLocale()` flags anything outside its own set as
-deprecated regardless). Apps that enumerate this list get a sensible, stable locale menu;
-apps that assume a *specific* JVM locale tag string will see fewer entries than on Lucee.
+<a id="22"></a>
 
 ## 22. Within-request template freshness — the process's own writes are picked up, external mid-request edits are not 🏗 *(GH [#284](https://github.com/RustCFML/RustCFML/issues/284))*
 
@@ -622,99 +804,7 @@ the GH #284 regression test red in `--serve --production` for 23 releases, unnot
 the release gate only ever served the runner in dev. The immutable-tree contract covers
 *external* edits; a template this process just rewrote is not one.
 
-## 23. Custom tag `caller` — read of a key shadowed by the calling function's local 🌟 *(divergence)*
-
-The custom-tag `caller` scope is a **live handle** onto the calling frame's variables
-scope (Lucee `CallerImpl` / BoxLang `Component.caller` design; replaced the old
-snapshot+diff in the caller-scope rework that also fixed lost `structDelete(caller, …)`
-and lost new-key writes into CFC callers). **Write** routing is Lucee-faithful, verified
-against Lucee 7: a `caller.x` write where `x` exists in the calling method's
-`local`/`arguments` scope lands on that scope only (shadow reconciliation), everything
-else lands live on `variables`. The one divergence is the **read** of such a shadowed
-key: Lucee's caller view reads the method local first; RustCFML's live handle reads the
-variables scope. Pinned (tolerantly, green on both engines) in
-`tests/tags/test_customtag_caller_semantics.cfm`. Full read-fidelity needs an
-intercepting scope value type — deferred.
-
-Related pre-existing (unchanged) page-frame edges, pinned in the same test: a
-caller-write of a UDF-local-shadowed key from a page-level UDF also updates variables,
-and a caller-write of an `arguments`-shadowed key misses the arguments scope.
-
-## 24. `writeLog` / `<cflog>` — file logging ✅ *(fixed in v0.528.0, GH [#286](https://github.com/RustCFML/RustCFML/issues/286))*
-
-Resolved. `<cflog>` / `writeLog()` now write to `<log-dir>/<name>.log` through cached,
-rotating file appenders, in Lucee 7's exact line layout:
-
-```
-"Severity","ThreadID","Date","Time","Context","Application","Message"
-"ERROR","tokio-rt-worker","07/26/2026","22:56:48","http://127.0.0.1:8500","MyApp","boom"
-```
-
-Log directory: `logging.logsDirectory` from `.cfconfig.json`, else `<webroot>/logs`
-under `--serve`, else `./logs` under the CLI. The resolved path is readable from CFML as
-`server.cfconfig.logging.logsDirectory`.
-
-Semantics verified against Lucee 7.0.4 and pinned in
-`tests/tags/test_cflog_file_logging.cfm`: `type=` → log4j2 severity (an unknown type is
-an error); no `file=`/`log=` targets the `application` log; `log=` names a *configured*
-logger and falls back to `application` when unknown, whereas `file=` creates the file; a
-path separator in `file=` is an error; `application="false"` blanks the Application
-column (the attribute defaults to true).
-
-Config knobs (all under `logging`): `logsDirectory`, `cfmlLevel` (default threshold),
-`loggers.<name>.level` (per-log threshold, `off` to mute), `maxFileSize` (default 10 MB),
-`maxFiles` (default 10 rotated generations), `flushEachLine` (default `true`, log4j2's
-`immediateFlush`; `false` batches until request end), `echoToStderr` (default `false` —
-Lucee doesn't echo to the console either; the `RUSTCFML_LOG_STDERR` env var forces it on).
-
-Rotation is size-based, rolling to `<name>.log.<n>.bak` at 10 MB — the naming and
-threshold Lucee's resource appender produces (confirmed by overflowing a log on Lucee
-7.0.4). Remaining gap: no time-based (daily) rolling policy.
-
----
-
-## 25. Member-function dispatch — unknown members now throw ✅ *(fixed in v0.549.0, GH [#307](https://github.com/RustCFML/RustCFML/issues/307))*
-
-`call_member_function` used to end in a bare `Ok(CfmlValue::Null)`. Components (GH #220)
-and plain structs (GH #285) had each been tightened to throw, but **Array, String, Query,
-numeric, Boolean, Binary and TimeSpan receivers stayed lenient** — so every gap in the
-member tables was a *silent* no-op rather than an error.
-
-That is what made GH #307 dangerous: `filtered.add(x)` appended nothing and threw nothing,
-so calling code took the success path with an empty array (Preside's
-`TaskManagerService.listTasks()` returned `[]` for every call). Assigning the resulting
-Null also trips the PR #112 null-delete guard, so the failure typically resurfaced far
-away as a misleading `Variable 'X' is undefined`.
-
-Unknown members on those receivers now throw
-`The function [x] does not exist in the <Type>.`, matching Lucee. The missing members
-themselves were also wired up: the `java.util.List` passthroughs on arrays
-(`add`/`get`/`remove`/`removeAll`/`retainAll`/`subList`/`containsAll`/`indexOf`/
-`lastIndexOf`), the `java.util.Map` passthroughs on structs
-(`put`/`putIfAbsent`/`remove`/`containsKey`/`containsValue`/`keySet`/`values`/`entrySet`),
-the `java.lang.String` passthroughs (`charAt`/`substring`/`concat`/`equals`/
-`equalsIgnoreCase`/`compareTo`/`hashCode`/`replaceAll`/`isBlank`), and the CFML array
-members whose BIFs already existed but were never mapped (`pop`/`shift`/`unshift`/`swap`/
-`resize`/`set`/`splice`/`mid`/`median`/`toStruct`/`removeDuplicates`/`indexExists`/…).
-
-**Behaviour changes to be aware of when upgrading:**
-
-- `indexOf`/`lastIndexOf` on **both arrays and strings** are the Java methods:
-  **0-based, returning −1 when absent**. They were previously aliased onto `find`
-  (1-based, `0` when absent), which silently made `if ( x.indexOf(v) >= 0 )` always true
-  and every hit off by one. `find()` itself is unchanged and still 1-based.
-- `arrayResize` fills with **null**, not empty strings (Lucee parity).
-- `arraySet`/`arraySwap` **throw** on an under-supplied call instead of returning `false`
-  and mutating nothing.
-
-Remaining divergences in this area (all minor, all verified against Lucee 7.0.4):
-
-| Member | RustCFML | Lucee |
-|---|---|---|
-| `struct.values()` / `.keySet()` / `.entrySet()` | CFML array (iterable, castable) | live `java.util.Collection` views; the `Values` view can be neither cast nor looped |
-| `array.deleteNoCase(v)` | returns boolean "was it found" | returns the array |
-| `array.unshift(v)` | returns the array | returns the new length |
-| `date.noSuchMember()` | reports type `String` | reports type `Datetime` (RustCFML dates are strings) |
+<a id="26"></a>
 
 ## 26. Locale is request state; the `ls*` locale table is hand-maintained 🏗 *(GH [#304](https://github.com/RustCFML/RustCFML/issues/304))*
 
@@ -732,21 +822,72 @@ to `en_US`. Locale-specific **date** formatting (month/day names, date field ord
 **not** yet driven by the locale — `lsDateFormat`/`lsTimeFormat`/`lsParseDateTime` still
 behave as `en_US`. Extend the table rather than letting a caller's locale be dropped.
 
-## 27. Tag attributes dropped at lowering — per-tag whitelists 🔇
+---
 
-Several tags lower to a builtin by copying a **fixed list** of attributes. Anything
-outside that list is discarded at compile time: no error, no effect, and — because the
-attribute never reaches the runtime — no "unknown option" either. `<cfquery>`'s
-whitelist was removed in v0.543.0 (GH #294) in favour of forwarding every attribute;
-the tags below still have theirs.
+# Part E — Environment-specific 🌍
 
-| Tag | Survives lowering | Silently dropped |
-|---|---|---|
-| `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
-| `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
+Restrictions that apply only on a particular target (wasm, CLI vs serve).
 
+<a id="8"></a>
 
-Fixed so far, in the order they were taken. Every expectation was probed against
+## 8. Environment-specific 🌍
+
+| Feature | Restriction |
+|---|---|
+| `<cfdirectory>` | Not supported on `wasm32` (no filesystem). |
+| `<cfzip>` | Not supported on `wasm32`. |
+| `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
+| `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
+| `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
+| `_schedule` — `everyMs` / `spacedMs` | 🔇 Ignored on **every** platform, not just wasm — `_schedule` is one-shot only. Periodic re-firing needs a respawn driver that can invoke a CFML closure, which the scheduler has no VM handle for. Compose with `runAsync` chains instead. (This row previously scoped the limitation to wasm32; the discard is unconditional.) |
+| `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
+
+---
+
+# Part F — Resolved (upgrade notes only) ✅
+
+Fixed and shipped. Retained because each one changed behaviour an application could have
+been relying on, and because the numbers are cited from commits and issues. **Nothing in
+this part is an open problem.**
+
+<a id="19"></a>
+
+## 19. Mixed-in view helper could not resolve the host Renderer's implicit accessors ✅ *(fixed in v0.440.0, GH [#259](https://github.com/RustCFML/RustCFML/issues/259))*
+
+A ColdBox/Preside **view helper** mixed into the Renderer and then calling one of the
+Renderer's **implicit accessors** (e.g. `getController()`) got `null` back, so Preside's
+admin sitetree page died with `cannot call method [renderViewlet] on a null value` from
+`system/helpers/presideProxies.cfm`. The original diagnosis here blamed a missing `this`;
+the real cause was narrower and had nothing to do with `this`:
+
+1. **A bare call from an included template dropped page variables.**
+   `build_call_parent_scope` picked its inherited-key filter from the nearest *pushed*
+   function frame (`call_stack.last()`) — but `__main__`/template frames are never
+   pushed, so a bare call from inside an `include`d view (ColdBox's
+   `RendererEncapsulator.includeWrapper`) adopted an *outer* method's inherited set
+   (`renderViewComposite`) and discarded page vars the template legitimately held,
+   `controller` among them. So the mixed-in `getController()` read null. Fixed with a
+   `frame_ctx` stack recording the inherited set + is-template flag for **every** frame,
+   templates included, so a bare call filters against its true immediate caller. This
+   matches Railo's `UDFImpl._call` (never swaps the variables scope) and BoxLang's
+   `FunctionBoxContext` (see-through when not `isInClass()`).
+2. **`return x = expr` returned null** — a cascade blocker that only surfaced once (1)
+   was fixed. The return-value position never requested the assignment's value, so
+   Preside's `return alerts = obj.selectData( … )` in `getCriticalAlerts` returned null
+   and `criticalAlerts.recordCount` then threw undefined. Fixed in codegen.
+
+Regression tests, both cross-engine verified against Lucee 7:
+`tests/tags/test_seethrough_udf_variables.cfm` and
+`tests/core/test_return_assignment_expression.cfm`. Re-probed at v0.557.0: the minimal
+repro (helper `include`d into a component, called without `this`, reading an implicit
+accessor) returns the controller, and the GH #259 suite passes 2/2.
+
+<a id="27b"></a>
+
+## 27b. Tag-attribute whitelists already removed ✅ *(v0.543.0–v0.555.0)*
+
+The counterpart to §27 — the tags whose whitelist has been deleted, in the order they
+were taken. Every expectation was probed against
 Lucee 7.0.4 before being implemented, and the regression tests
 (`tests/tags/test_tags_cfhttp_name_file.cfm`,
 `tests/tags/test_tags_cfloop_query_window_group.cfm`,
@@ -838,7 +979,87 @@ lowering — all three `cflock` lowerings already forwarded every attribute, and
 `__cflock_start` simply never read them. Attribute plumbing is worth checking at both
 ends.
 
-## 28. Unclosed body tags — refused, not erased ✅ *(fixed)*
+<a id="24"></a>
+
+## 24. `writeLog` / `<cflog>` — file logging ✅ *(fixed in v0.528.0, GH [#286](https://github.com/RustCFML/RustCFML/issues/286))*
+
+Resolved. `<cflog>` / `writeLog()` now write to `<log-dir>/<name>.log` through cached,
+rotating file appenders, in Lucee 7's exact line layout:
+
+```
+"Severity","ThreadID","Date","Time","Context","Application","Message"
+"ERROR","tokio-rt-worker","07/26/2026","22:56:48","http://127.0.0.1:8500","MyApp","boom"
+```
+
+Log directory: `logging.logsDirectory` from `.cfconfig.json`, else `<webroot>/logs`
+under `--serve`, else `./logs` under the CLI. The resolved path is readable from CFML as
+`server.cfconfig.logging.logsDirectory`.
+
+Semantics verified against Lucee 7.0.4 and pinned in
+`tests/tags/test_cflog_file_logging.cfm`: `type=` → log4j2 severity (an unknown type is
+an error); no `file=`/`log=` targets the `application` log; `log=` names a *configured*
+logger and falls back to `application` when unknown, whereas `file=` creates the file; a
+path separator in `file=` is an error; `application="false"` blanks the Application
+column (the attribute defaults to true).
+
+Config knobs (all under `logging`): `logsDirectory`, `cfmlLevel` (default threshold),
+`loggers.<name>.level` (per-log threshold, `off` to mute), `maxFileSize` (default 10 MB),
+`maxFiles` (default 10 rotated generations), `flushEachLine` (default `true`, log4j2's
+`immediateFlush`; `false` batches until request end), `echoToStderr` (default `false` —
+Lucee doesn't echo to the console either; the `RUSTCFML_LOG_STDERR` env var forces it on).
+
+Rotation is size-based, rolling to `<name>.log.<n>.bak` at 10 MB — the naming and
+threshold Lucee's resource appender produces (confirmed by overflowing a log on Lucee
+7.0.4). Remaining gap: no time-based (daily) rolling policy.
+
+<a id="25"></a>
+
+## 25. Member-function dispatch — unknown members now throw ✅ *(fixed in v0.549.0, GH [#307](https://github.com/RustCFML/RustCFML/issues/307))*
+
+`call_member_function` used to end in a bare `Ok(CfmlValue::Null)`. Components (GH #220)
+and plain structs (GH #285) had each been tightened to throw, but **Array, String, Query,
+numeric, Boolean, Binary and TimeSpan receivers stayed lenient** — so every gap in the
+member tables was a *silent* no-op rather than an error.
+
+That is what made GH #307 dangerous: `filtered.add(x)` appended nothing and threw nothing,
+so calling code took the success path with an empty array (Preside's
+`TaskManagerService.listTasks()` returned `[]` for every call). Assigning the resulting
+Null also trips the PR #112 null-delete guard, so the failure typically resurfaced far
+away as a misleading `Variable 'X' is undefined`.
+
+Unknown members on those receivers now throw
+`The function [x] does not exist in the <Type>.`, matching Lucee. The missing members
+themselves were also wired up: the `java.util.List` passthroughs on arrays
+(`add`/`get`/`remove`/`removeAll`/`retainAll`/`subList`/`containsAll`/`indexOf`/
+`lastIndexOf`), the `java.util.Map` passthroughs on structs
+(`put`/`putIfAbsent`/`remove`/`containsKey`/`containsValue`/`keySet`/`values`/`entrySet`),
+the `java.lang.String` passthroughs (`charAt`/`substring`/`concat`/`equals`/
+`equalsIgnoreCase`/`compareTo`/`hashCode`/`replaceAll`/`isBlank`), and the CFML array
+members whose BIFs already existed but were never mapped (`pop`/`shift`/`unshift`/`swap`/
+`resize`/`set`/`splice`/`mid`/`median`/`toStruct`/`removeDuplicates`/`indexExists`/…).
+
+**Behaviour changes to be aware of when upgrading:**
+
+- `indexOf`/`lastIndexOf` on **both arrays and strings** are the Java methods:
+  **0-based, returning −1 when absent**. They were previously aliased onto `find`
+  (1-based, `0` when absent), which silently made `if ( x.indexOf(v) >= 0 )` always true
+  and every hit off by one. `find()` itself is unchanged and still 1-based.
+- `arrayResize` fills with **null**, not empty strings (Lucee parity).
+- `arraySet`/`arraySwap` **throw** on an under-supplied call instead of returning `false`
+  and mutating nothing.
+
+Remaining divergences in this area (all minor, all verified against Lucee 7.0.4):
+
+| Member | RustCFML | Lucee |
+|---|---|---|
+| `struct.values()` / `.keySet()` / `.entrySet()` | CFML array (iterable, castable) | live `java.util.Collection` views; the `Values` view can be neither cast nor looped |
+| `array.deleteNoCase(v)` | returns boolean "was it found" | returns the array |
+| `array.unshift(v)` | returns the array | returns the new length |
+| `date.noSuchMember()` | reports type `String` | reports type `Datetime` (RustCFML dates are strings) |
+
+<a id="28"></a>
+
+## 28. Unclosed body tags — refused, not erased ✅ *(fixed in v0.556.0)*
 
 A body-bearing tag with no closing tag used to make the preprocessor return an empty
 string for it, so **the tag *and its entire body* vanished from the compiled output** —
@@ -866,6 +1087,8 @@ Two things still outstanding:
 - `<cfspreadsheet action="write">` could not be probed: the reference Lucee here has no
   spreadsheet extension installed (`undefined tag [cfspreadsheet]`). RustCFML currently
   treats an unclosed one as attribute-only, like the `<cfhttp>` family. 🏗
+
+<a id="29"></a>
 
 ## 29. Declared function types — now enforced ✅ *(fixed in v0.557.0)*
 
@@ -945,27 +1168,7 @@ still returns `""` happily, and a generated `setX()` reports `void` while return
 `this` for chaining. Enforcing either would break CFCs that are legal on the reference
 engine. `cfparam`/`param` `type=` enforcement is separate — see §14.
 
-## 30. Java shims — remaining gaps 🛑/🔇
-
-The shim dispatch contract was reworked in v0.551.0 so that "this shim does not
-implement that method" travels out-of-band instead of as `Ok(null)`. A shim's `null` is
-now believed, and the operations that used to be silent no-ops (StringBuilder mutators,
-`ConcurrentHashMap.replace`, `Collections.sort` on numbers, `TimeZone` offsets, `Date`
-comparisons, `File.renameTo`, `Files` I/O, `Optional.orElse*`, `GregorianCalendar`
-mutators, `Queue.contains`/`drainTo`, `InetAddress` resolution) do the work. What
-remains:
-
-| Shim | Status |
-|---|---|
-| `ConcurrentHashMap.compute` / `computeIfAbsent` / `computeIfPresent` / `merge` | 🛑 Throws. They take a remapping function, and these handlers are free functions with no VM handle, so a CFML closure cannot be invoked. Previously returned null and never wrote the entry — silently losing the computed value. Needs the VM-intercept treatment the higher-order builtins get. |
-| `Queue.take()` | 🛑 Throws. It blocks until an element is available; the shim backs both `ConcurrentLinkedQueue` (no `take()` in Java) and the blocking queues (where it must block) and cannot tell them apart. Use `poll()`. |
-| `ChronoUnit.X.between(a, b)` | 🛑 Throws. `ChronoUnit` constants are plain strings, so `.between()` dispatches on a String. Making it work means representing the tokens as shims, which would break code comparing them as strings. |
-| `ProcessBuilder` / `Runtime.exec` | 🔇 `directory()`, `environment()`, `redirectOutput()`, `redirectErrorStream()`, `inheritIO()` are ignored; `Process.getInputStream()`/`getErrorStream()` return null so child stdout is unreadable and leaks to the engine console; `Runtime.exec` never launches. Implementing these is a new capability (process spawning with redirected stdio), not a bug fix — deliberately not done. |
-| `new SimpleDateFormat(pattern)` | 🔇 The pattern argument is discarded; `.format()` emits the Java MEDIUM style (`Jan 1, 1970`) regardless. |
-| `HttpServletRequest.setAttribute` / `getAttribute` / `getSession` | 🔇 Attributes are silently discarded — there is no real servlet state behind the bridge (see §11). |
-| Unknown method on a **known** shim class | 🔇 Still returns null rather than throwing. The shim correctly reports "not mine" and falls through to generic dispatch — which must stay, so property access like `system.out` keeps working — but a `__java_shim` struct whose member resolves nowhere does not reach the undefined-member error a plain struct gets. Making that loud is the remaining half of the D2 work. |
-
----
+<a id="31"></a>
 
 ## 31. `<cflock>` `scope=` and `throwOnTimeout=` ✅ *(fixed in v0.553.0)*
 
@@ -1005,13 +1208,13 @@ Two things to know:
   means the guarded work silently does not happen — the acquire result is not surfaced
   to CFML, so there is no way to branch on it. Lucee has the same shape.
 
----
+<a id="32"></a>
 
-## 32. A page-scope variable holding a FUNCTION is invisible inside any function 🛑
+## 32. Page-scope variables holding a function ✅ *(fixed in v0.558.0)*
 
-A page-level variable whose value is a closure/function reference cannot be reached from
-inside another function body — not bare, not as `variables.x`, from a named function or
-from a closure:
+A page-level variable whose value was a function EXPRESSION could not be reached from
+inside any function body — not bare, not as `variables.x`, from a named function or from
+a closure:
 
 ```cfml
 cl = function( x ) { return "called:" & x; };
@@ -1021,78 +1224,94 @@ function reader()       { return cl( "n" ); }             // Variable 'cl' is un
 function scopedReader() { return variables.cl( "n" ); }   // Variable 'cl' is undefined
 ```
 
-All three work on Lucee 7.0.4 (`called:v` / `called:n` / `called:n`), including the case
-where the callee closure is declared *after* the function that calls it — the read
-happens at call time, by which point the page variable exists.
+All three now resolve, as they always did on Lucee 7, including when the callee closure
+is declared *after* the function that calls it (the read happens at call time). So the
+very common "define helpers as closures at the top of a `.cfm`, use them lower down
+inside other functions" style works.
 
-The gap is specific to **function-valued** page variables. A plain one is fine on both
-engines:
+The frame seed in `execute_function_body` skipped every `CfmlValue::Function` that
+carried a captured scope, reasoning that it was already reachable through
+`user_functions`. That is true of a *declared* function, but a function expression is
+registered under its synthetic `__closure_N` name rather than the variable it was
+assigned to, so it was simply dropped. Declared functions are still skipped, so a
+component with many methods does not re-seed them into every method frame.
 
-```cfml
-pv = "plain";
-function reader() { return pv; }   // "plain" on both
-```
+Carrying them exposed a second, opposite bug in `build_call_parent_scope`: its
+helper-function carve-out let a caller's OWN `var`-scoped function local past the
+caller-locals filter, which is dynamic scoping — Lucee reports `isDefined` false in the
+callee and throws on a bare call. It is now limited to the captured-scope-stripped
+values `closure_env_capture_value` produces (PR #198), which are genuinely unreachable
+otherwise. `tests/functions/test_page_function_vars.cfm` passes 13/13 on both engines.
 
-So this is not the scope chain in general — something drops `CfmlValue::Function`
-entries specifically on the way from a template frame's locals into the `variables`
-scope that a function body sees. (A template frame does deliberately clear
-`captured_scope` on function values when handing its locals over, to avoid capture
-cycles; that path is the obvious place to look.)
+<a id="33"></a>
 
-Consequences: the very common "define helpers as closures at the top of a `.cfm`, use
-them lower down inside other functions" style does not work. It also makes tests awkward
-to write naturally — `tests/functions/test_fn_type_enforcement.cfm` re-creates its
-fixture inside each callback instead of capturing one page-level variable, because of
-this and nothing else.
-
-## 33. Java `Object` methods on simple values — only `toString()` 🛑
+## 33. Java `Object` methods on simple values ✅ *(fixed in v0.558.0)*
 
 Lucee boxes a CFML simple value as a Java object, so the `java.lang.Object` /
-`Comparable` methods are callable on it. RustCFML implements `toString()` and
-`equals()`-on-a-String, and throws for the rest:
+`Comparable` methods are callable on it. RustCFML implemented them for `String` only;
+on every other receiver `equals`, `hashCode` and `compareTo` threw ("The function
+[equals] does not exist in the Numeric."). The methods were always missing — v0.549.0
+(§25) only made the gap loud by making unknown members throw instead of returning null.
 
-| Call | Lucee 7.0.4 | RustCFML |
-|---|---|---|
-| `n.equals( 1 )` (numeric) | `true` | 🛑 `The function [equals] does not exist in the Numeric.` |
-| `d.equals( 1.5 )` (double) | `true` | 🛑 same, `Numeric` |
-| `b.equals( true )` (boolean) | `true` | 🛑 same, `Boolean` |
-| `[1].equals( [1] )` | `true` | 🛑 same, `Array` |
-| `{a:1}.equals( {a:1} )` | `true` | 🛑 `Variable 'equals' is undefined` |
-| `n.hashCode()` | `1` | 🛑 `The function [hashCode] does not exist in the Numeric.` |
-| `n.compareTo( 2 )` | `-1` | 🛑 `The function [compareTo] does not exist in the Numeric.` |
-| `s.equals( "a" )` (string) | `true` | ✅ `true` |
-| `n.toString()` | `1` | ✅ `1` |
+That cost **8 tests in TestBox's own suite**. `equalize()` compares numerics, arrays and
+structs itself and only falls through to `actual.equals( expected )` once the two have
+already differed — i.e. exactly the `isNotEqual` path — so a throw where Lucee returns
+`false` failed the assertion instead of passing it. TestBox's own suite is back to
+**410 pass / 0 fail / 0 error / 22 intentional skips**, its v0.493.0 baseline.
 
-This became **loud** in v0.549.0, when unknown member functions started throwing instead
-of returning null (§25) — a correct change that exposed the missing methods rather than
-causing them.
+`crates/cfml-vm/src/java_shims.rs` now carries Java-exact `java_equals` /
+`java_hash_code` / `java_compare_to`: type-strict equality with no CFML coercion (so
+`1.equals("1")` and `true.equals(1)` are both false, and a whole-number double is not an
+int), `Long`/`Double`/`Boolean`/`String` hashing, `java.util.List` hashing for `Array`,
+and `java.util.Map` hashing for `Struct` — the sum of per-entry `keyHash ^ valueHash`
+with keys hashed UPPER-cased, the casing Lucee's case-insensitive `Struct` stores them
+in, so `{a:1}.hashCode()` is 64 and not 96. Every value was read off Lucee 7.0.4 first;
+`Query` and `TimeSpan` are deliberately excluded rather than guessed, and components keep
+the Java IDENTITY semantics they already had (§25, ColdBox's `BaseProxy`).
+`tests/functions/test_java_object_methods.cfm` passes 48/48 on both engines.
 
-It costs real coverage: TestBox's own suite is 402 pass / 2 fail / 6 error / 22 skipped,
-and **all eight** non-passes are this one message, reached through TestBox's
-`isNotEqual`/`equals` assertion paths. That suite was 410/0/0/22 at v0.493.0, so this is
-a regression against a known-good baseline — verified as pre-existing (an unmodified
-v0.556.0 binary produces the identical 402/2/6/22), not caused by the §29 work that
-found it. A bisect between v0.493.0 and v0.549.0 would pin the exact commit.
+Two residual divergences, both deliberate: 🌟
 
-## 34. `createUUID()` — the first one in a process is half zeroed 🌟 *(divergence)*
+- **`compareTo` on mixed numerics compares numerically.** Lucee throws a raw JVM
+  `ClassCastException` ("class java.lang.Long cannot be cast to class java.lang.Double")
+  for `x = 1.5; x.compareTo( 2 )`, so this only affects inputs Lucee refuses outright.
+- **`hashCode` of a negative or large-magnitude integer literal differs**, because Lucee
+  boxes `-1` and `4294967296` as `Double`s while boxing `1` as a `Long`; RustCFML keeps
+  them integral. Each engine is self-consistent and Java-correct for its own boxing, so
+  only a hash compared *across* engines sees this.
 
-The first call in a process always returns a UUID whose first block is `00000000`;
-every later call is random:
+<a id="34"></a>
 
-```
-first:   00000000-CFC5-A584-879E7B7161971634
-second:  A8F2F4DB-DDBB-2087-2CABB96B88DF8E07
-```
+## 34. `createUUID()` — random from the first call, and v4-shaped ✅ *(fixed in v0.558.0)*
 
-Lucee's are random from the first call (`5E6F26D8-FF5F-4A0F-ADBD678B6B7AC91F`). The
-shape is right — 8-4-4-16, so `isValid("uuid",…)` and a `uuid`-typed argument (§29)
-accept it — but a caller that treats the value as unique-per-process gets a collision
-between two processes that each generate exactly one, and a caller that uses the leading
-block as a shard/prefix key gets a hotspot.
+The first `createUUID()` in a process always returned a UUID whose first block was
+`00000000` (`00000000-CFC5-A584-879E7B7161971634`); every later call was random. So two
+processes that each generated exactly one could collide, and a caller using the leading
+block as a shard/prefix key got a hotspot. Separately, no UUID carried the RFC 4122
+version-4 nibble that Lucee's do, so nothing inspecting the version saw a v4 UUID.
 
-Note also that Lucee's third block always begins `4` (`4A0F`, `444E`, `4FE4` — the
-RFC 4122 version nibble) and RustCFML's does not (`A584`, `2087`), so RustCFML's UUIDs
-are not v4-shaped even once past the first call.
+The zeroed block was a self-cancelling XOR, not weak entropy. `cfml_random()` lazily
+seeded from `now_unix_nanos()` and returned the raw seed as `(next >> 11) / 2^53`, so the
+first value of the stream multiplied by `u32::MAX` came out to exactly `nanos >> 32` —
+precisely the word `fn_create_uuid` XORed it against. Later calls were unaffected because
+`xorshift64` had already advanced the state off the clock.
+
+Seeding now mixes the clock through splitmix64, together with a per-thread distinguisher
+and a process-global counter so threads and processes starting inside the same tick still
+diverge, and advances once before first use. `createUUID` draws two full 64-bit words and
+stamps the version and variant bits, so its output is v4-shaped like Lucee's.
+`createUniqueID` shared the construction — its first four bytes collapsed the same way,
+showing up as a leading `AAAAA` — and now shares the generator. `randomize( seed )`
+reproducibility is untouched; only the lazy path changed.
+
+`tests/stdlib/test_uuid_shape.cfm` passes 14/14 on both engines. The
+first-call-in-a-process property cannot be observed from a suite that has already drawn
+from the PRNG, so it is pinned in `cfml-stdlib`'s `uuid_tests`, which spawns a fresh
+thread to get a fresh thread-local PRNG.
+
+One unrelated divergence this surfaced: `createUniqueID( "counter" )` advances on both
+engines but is **encoded** differently — Lucee base-36s the counter (`2q`, `2r`) where
+RustCFML emits decimal (`1`, `2`). 🌟
 
 ---
 
@@ -1102,6 +1321,18 @@ ignored tag attributes) should refresh it. The most recent such sweep was 2026-0
 its findings have been merged into the sections above, and everything it identified as
 already-fixed or since-fixed (v0.549.0–v0.551.0) has been dropped rather than carried
 forward.*
+
+**Last re-probe: 2026-08-04 (v0.557.0)** — §2, §3 and §4 re-verified against the code
+and all rows still hold (`maxConcurrentRequests`, `http2`, `trustedCache`,
+`showExecutionTime`, `connectionLimit`, `idleTimeout`, `evictionPolicy` and
+`loggers[].appender` have no consumer outside the schema; the SMTP transport sets port
+and credentials but never a timeout; `security_flags()` is still a process-wide
+`OnceLock`; `onCFCRequest` is attached as a lifecycle name and never dispatched). Four
+corrections came out of it: §19 had been fixed for 117 releases (moved to Part F),
+`setTimeZone()` and `fileUpload()`/`fileUploadAll()` are no longer no-ops, and
+`writeDump(output="<path>")` writes the file (all three rows corrected or dropped from
+§7). One previously undocumented no-op was added to §3 — nothing enforces a request
+timeout by any route.
 
 > A caution learned from that sweep: an audit's "what Lucee does" column is a claim, not
 > a fact. Three of its entries were wrong (`System.arraycopy` — Lucee throws
