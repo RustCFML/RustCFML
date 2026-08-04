@@ -32359,6 +32359,54 @@ impl CfmlVirtualMachine {
             self.app_local_mode_modern = modern;
         }
 
+        // 3a-bis. Apply `this.timezone` / `this.locale` (docs/known-issues.md §1).
+        //
+        // Both were captured into `config` — so `getApplicationSettings()` reported
+        // them faithfully — and then read by nothing, which made them the worst kind
+        // of no-op: an app declaring `this.timezone = "Asia/Tokyo"` formatted every
+        // date in the SERVER's zone while its own settings struct claimed Tokyo.
+        // The request state they need to land in (`self.timezone` / `self.locale`)
+        // already existed for the cfconfig `runtime.*` keys and for
+        // setTimeZone()/setLocale(); it simply had no Application.cfc writer.
+        //
+        // Precedence follows Lucee: Application.cfc overrides the server/cfconfig
+        // baseline, and because this runs before the target page, a later
+        // setTimeZone()/setLocale() in the request still overrides Application.cfc.
+        //
+        // An UNRESOLVABLE id is silently ignored, falling back to the server
+        // default. That is Lucee 7's behaviour, verified — `this.timezone =
+        // "Not/AZone"` yields the server zone with no error — and it is also the
+        // safe choice, since throwing here would fail application startup rather
+        // than one date call.
+        if let Some(tz_id) = config
+            .get("timezone")
+            .map(|v| v.as_string())
+            .filter(|s| !s.trim().is_empty())
+        {
+            if let Some(zone) = tz::resolve_tz(tz_id.trim()) {
+                self.timezone = tz::canonical_name(&zone);
+            }
+        }
+        if let Some(loc) = config
+            .get("locale")
+            .map(|v| v.as_string())
+            .filter(|s| !s.trim().is_empty())
+        {
+            // `canonical_locale` alone is too lenient here: it accepts any
+            // well-formed `ll_CC`, so `this.locale = "xx_YY"` would be adopted
+            // and then behave as en_US while reporting itself as `xx_yy`. Lucee
+            // ignores a locale it has no data for, so require a KNOWN one.
+            if let Some(code) = cfml_common::locale::canonical_locale(loc.trim())
+                .filter(|c| cfml_common::locale::is_known_locale(c))
+            {
+                self.locale = code.clone();
+                // The ls* family reads the process/thread-local current locale,
+                // not `self.locale` — setLocale() sets both, so this must too or
+                // lsNumberFormat/lsDateFormat stay on the default.
+                cfml_common::locale::set_current_locale(&code);
+            }
+        }
+
         // 3b. Expand mapping paths relative to Application.cfc directory.
         // Route through `canonicalize_cached` (not `vfs.canonicalize`) so these
         // per-request expansions of the immutable Application.cfc/cfconfig mapping

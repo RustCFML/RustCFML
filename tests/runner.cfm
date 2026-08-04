@@ -553,6 +553,9 @@ include "harness.cfm";
 <!--- --- Lifecycle / server request fixtures --- --->
 <cf_runtest file="lifecycle/test_session_app_namespace.cfm">
 <cf_runtest file="lifecycle/test_application_mapping_coverage.cfm">
+
+<!--- Application.cfc this.timezone / this.locale (docs/known-issues.md §1). --->
+<cf_runtest file="lifecycle/test_application_timezone_locale.cfm">
 <cf_runtest file="lifecycle/test_application_pseudo_include.cfm">
 <cf_runtest file="lifecycle/test_application_shared_variables.cfm">
 <cf_runtest file="lifecycle/test_application_lifecycle_case_override.cfm">

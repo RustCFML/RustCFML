@@ -137,6 +137,20 @@ fn default_region_for(lang: &str) -> String {
     format!("{}_{}", lang, region)
 }
 
+/// Is `code` a locale this engine actually has data for — i.e. one named in
+/// [`friendly_name`]?
+///
+/// [`canonical_locale`] is deliberately lenient: it accepts any structurally
+/// valid `ll_CC`, so `xx_YY` canonicalises happily and then behaves as `en_US`.
+/// That leniency is right for `setLocale()` (an explicit call should not be
+/// silently dropped) but wrong for `this.locale` in Application.cfc, where
+/// Lucee 7 IGNORES a locale it cannot use and falls back to the server default
+/// — verified. Callers that must distinguish "known" from "merely well-formed"
+/// use this (docs/known-issues.md §1).
+pub fn is_known_locale(code: &str) -> bool {
+    friendly_name(code) != code.to_lowercase()
+}
+
 /// The ColdFusion "friendly" display name for a canonical code — what
 /// `getLocale()` returns. Unknown codes echo back lowercased, as Lucee does.
 pub fn friendly_name(code: &str) -> String {
