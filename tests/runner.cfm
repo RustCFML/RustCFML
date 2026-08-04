@@ -937,4 +937,7 @@ include "harness.cfm";
 <!--- java.lang.Object methods on simple values (docs/known-issues.md §33). --->
 <cf_runtest file="functions/test_java_object_methods.cfm">
 
+<!--- createUUID / createUniqueID shape (docs/known-issues.md §34). --->
+<cf_runtest file="stdlib/test_uuid_shape.cfm">
+
 <cfscript> printSummary(); </cfscript>

@@ -1225,20 +1225,56 @@ fn xorshift64(state: u64) -> u64 {
     x
 }
 
-fn cfml_random() -> f64 {
+/// SplitMix64's finalizer — an avalanche mix, used to turn a low-entropy seed
+/// (a clock reading) into something with no exploitable structure.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Advance the thread's PRNG and return the raw 64-bit state.
+///
+/// The lazy seed is MIXED, not the bare clock reading. It used to be
+/// `now_unix_nanos()` returned verbatim, which made the first value of the
+/// stream a linear function of the clock: `cfml_random() * u32::MAX` came out to
+/// exactly `nanos >> 32`, so `fn_create_uuid`'s `nanos ^ random_bits` cancelled
+/// its own high word and every process's FIRST `createUUID()` began `00000000`
+/// (docs/known-issues.md §34). Mixing the clock through splitmix64 — together
+/// with a per-thread distinguisher and a process-global counter, so two threads
+/// (or two processes) that start inside the same clock tick still diverge — and
+/// advancing once before use removes that correlation.
+fn cfml_random_bits() -> u64 {
     PRNG_SEEDED.with(|_seeded| {
         PRNG_STATE.with(|state| {
             let current = state.get();
             let next = if current == 0 {
-                // Lazy initialization: seed from nanosecond clock on first use
-                cfml_common::clock::now_unix_nanos() as u64
+                static SEED_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let nth = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The address of this thread's own cell distinguishes threads
+                // without needing a thread-id API (wasm-safe).
+                let thread_tag = state as *const _ as u64;
+                let seed = splitmix64(
+                    (cfml_common::clock::now_unix_nanos() as u64)
+                        ^ splitmix64(thread_tag)
+                        ^ splitmix64(nth.wrapping_add(0xA5A5_A5A5)),
+                );
+                // xorshift64 is absorbing at 0, so never let the state be 0.
+                let seed = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+                xorshift64(seed)
             } else {
                 xorshift64(current)
             };
             state.set(next);
-            (next >> 11) as f64 / (1u64 << 53) as f64
+            next
         })
     })
+}
+
+fn cfml_random() -> f64 {
+    (cfml_random_bits() >> 11) as f64 / (1u64 << 53) as f64
 }
 
 // ===============================================
@@ -7369,18 +7405,34 @@ fn fn_create_object(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Null)
 }
 
+/// 122 random bits laid out as an RFC 4122 **version 4** UUID: the version
+/// nibble is forced to `4` and the variant bits to `10`.
+///
+/// Lucee's `createUUID()` is v4-shaped (`5E6F26D8-FF5F-4A0F-ADBD678B6B7AC91F` —
+/// note the `4` opening the third block and the `A` opening the fourth), and
+/// RustCFML's was not: its blocks were raw clock/PRNG mixes, so nothing
+/// inspecting the version nibble saw a v4 UUID (§34). Returned in CFML's 8-4-4-16
+/// grouping, which is the standard 8-4-4-4-12 with the last two groups joined.
+fn v4_uuid_bytes() -> [u8; 16] {
+    let (hi, lo) = (cfml_random_bits(), cfml_random_bits());
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&lo.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 10xx
+    bytes
+}
+
 fn fn_create_uuid(_args: Vec<CfmlValue>) -> CfmlResult {
-    let nanos = cfml_common::clock::now_unix_nanos() as u64;
-    let random_bits = ((cfml_random() * u32::MAX as f64) as u64) << 32
-                    | (cfml_random() * u32::MAX as f64) as u64;
-    let mixed = nanos ^ random_bits;
+    let b = v4_uuid_bytes();
+    let hex = |s: &[u8]| s.iter().map(|x| format!("{:02X}", x)).collect::<String>();
     // CFML UUID format: 8-4-4-16
     Ok(CfmlValue::string(format!(
-        "{:08X}-{:04X}-{:04X}-{:016X}",
-        ((mixed >> 32) as u32),
-        ((mixed >> 16) as u16),
-        (mixed as u16),
-        (nanos.wrapping_mul(6364136223846793005).wrapping_add(random_bits)),
+        "{}-{}-{}-{}",
+        hex(&b[0..4]),
+        hex(&b[4..6]),
+        hex(&b[6..8]),
+        hex(&b[8..16]),
     )))
 }
 
@@ -7401,14 +7453,11 @@ fn fn_create_unique_id(args: Vec<CfmlValue>) -> CfmlResult {
     }
 
     // Default: a 16-byte UUID encoded as URL-safe Base64 without padding (22 chars).
-    let nanos = cfml_common::clock::now_unix_nanos() as u64;
-    let random_bits = ((cfml_random() * u32::MAX as f64) as u64) << 32
-                    | (cfml_random() * u32::MAX as f64) as u64;
-    let hi = nanos ^ random_bits;
-    let lo = nanos.wrapping_mul(6364136223846793005).wrapping_add(random_bits);
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&lo.to_be_bytes());
+    // Shares v4_uuid_bytes with createUUID: this had the same `nanos ^
+    // random_bits` construction, so its first four bytes in a process collapsed
+    // to zero for the same reason (§34) — which, base64'd, made every process's
+    // first id start "AAAAA".
+    let bytes = v4_uuid_bytes();
 
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -18435,5 +18484,92 @@ mod cfhttp_connection_reuse_tests {
 
     fn find_double_crlf(buf: &[u8]) -> Option<usize> {
         buf.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+}
+
+#[cfg(test)]
+mod uuid_tests {
+    use super::*;
+
+    /// The PRNG state is thread-local, so a freshly-spawned thread reproduces
+    /// exactly the condition a fresh PROCESS is in: an unseeded stream. That is
+    /// the case §34 was about — the first `createUUID()` after seeding used to
+    /// come out with a zeroed first block, because the lazy seed was the bare
+    /// clock reading and `cfml_random() * u32::MAX` then equalled the very
+    /// `nanos >> 32` it was XORed against.
+    #[test]
+    fn first_uuid_on_a_fresh_thread_is_not_half_zeroed() {
+        for _ in 0..64 {
+            let first = std::thread::spawn(|| match fn_create_uuid(vec![]).unwrap() {
+                CfmlValue::String(s) => s,
+                other => panic!("expected a string, got {:?}", other),
+            })
+            .join()
+            .unwrap();
+            assert_ne!(
+                &first[..8], "00000000",
+                "first UUID of a fresh thread was half zeroed: {first}"
+            );
+        }
+    }
+
+    /// Every UUID must carry the RFC 4122 version-4 nibble and variant bits, in
+    /// CFML's 8-4-4-16 grouping — the shape Lucee produces.
+    #[test]
+    fn uuids_are_v4_shaped_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5_000 {
+            let u = match fn_create_uuid(vec![]).unwrap() {
+                CfmlValue::String(s) => s,
+                other => panic!("expected a string, got {:?}", other),
+            };
+            let blocks: Vec<&str> = u.split('-').collect();
+            assert_eq!(blocks.len(), 4, "not 8-4-4-16: {u}");
+            assert_eq!(
+                [blocks[0].len(), blocks[1].len(), blocks[2].len(), blocks[3].len()],
+                [8, 4, 4, 16],
+                "not 8-4-4-16: {u}"
+            );
+            assert!(
+                u.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+                "non-hex character: {u}"
+            );
+            assert!(blocks[2].starts_with('4'), "version nibble is not 4: {u}");
+            assert!(
+                matches!(blocks[3].as_bytes()[0], b'8' | b'9' | b'A' | b'B'),
+                "variant bits are not 10xx: {u}"
+            );
+            assert!(seen.insert(u.clone()), "duplicate UUID: {u}");
+        }
+    }
+
+    /// createUniqueID shared the same construction, so its first four bytes
+    /// collapsed to zero too — which base64'd to a leading "AAAAA".
+    #[test]
+    fn first_unique_id_on_a_fresh_thread_is_not_zero_prefixed() {
+        for _ in 0..64 {
+            let first = std::thread::spawn(|| match fn_create_unique_id(vec![]).unwrap() {
+                CfmlValue::String(s) => s,
+                other => panic!("expected a string, got {:?}", other),
+            })
+            .join()
+            .unwrap();
+            assert_eq!(first.len(), 22, "expected 22 base64 chars: {first}");
+            assert!(
+                !first.starts_with("AAAAA"),
+                "first createUniqueID of a fresh thread was zero-prefixed: {first}"
+            );
+        }
+    }
+
+    /// randomize(seed) must still produce a reproducible stream — the seeding
+    /// change only touches the LAZY (unseeded) path.
+    #[test]
+    fn randomize_is_still_reproducible() {
+        let draw = || {
+            fn_randomize(vec![CfmlValue::Int(42)]).unwrap();
+            (0..5).map(|_| cfml_random_bits()).collect::<Vec<_>>()
+        };
+        assert_eq!(draw(), draw());
     }
 }
