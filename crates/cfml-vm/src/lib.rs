@@ -5517,8 +5517,24 @@ impl CfmlVirtualMachine {
                 // helper by bare name (PR #198). Named functions and real
                 // closures keep `captured_scope: Some(env)`, so this copies only
                 // the stripped helpers — no waste and no cycle reintroduced.
+                //
+                // §32: the "already reachable via user_functions" half of that
+                // reasoning only holds for a function that IS registered there —
+                // i.e. one DECLARED with a name (`function foo(){}` / a CFC
+                // method). A function EXPRESSION assigned to a variable
+                // (`cl = function(x){...}`) is registered under its synthetic
+                // `__closure_N` name, NOT under `cl`, so dropping it here made
+                // the page variable unreachable from inside every function body:
+                // bare `cl(...)`, `variables.cl(...)`, and reads from a sibling
+                // closure all threw "Variable 'cl' is undefined" while Lucee 7
+                // resolves all three. Carry those (an `Arc` clone — the captured
+                // scope is shared, not deep-copied), and keep skipping the
+                // genuinely-redundant declared ones so a component with many
+                // methods still doesn't re-seed them into every method frame.
                 let carry = match v {
-                    CfmlValue::Function(f) => f.captured_scope.is_none(),
+                    CfmlValue::Function(f) => {
+                        f.captured_scope.is_none() || !self.is_declared_user_function(k)
+                    }
                     _ => true,
                 };
                 if carry {
@@ -19895,6 +19911,23 @@ impl CfmlVirtualMachine {
     /// `name_lower` MUST be the lowercase form of `name`; the caller
     /// already computes it once for special-scope dispatch so we reuse it
     /// instead of re-allocating per scope.
+    /// Is `key` the name a user function was DECLARED under, so that a
+    /// `Function` value sitting in a parent scope at that key is redundant
+    /// (bare-name reads reach it via `user_functions` anyway)?
+    ///
+    /// `user_functions` is keyed by the declared spelling, and `DefineFunction`
+    /// seeds the parent-scope key from that same spelling, so the exact probe
+    /// hits in practice; the lowercase probe covers the host-seeded lowercase
+    /// entries. Deliberately NOT a case-insensitive scan of the whole map —
+    /// this runs per parent-scope function key on every call, and a linear scan
+    /// over a large app's function table would be a real per-call cost.
+    fn is_declared_user_function(&self, key: &str) -> bool {
+        self.user_functions.contains_key(key)
+            || self
+                .user_functions
+                .contains_key(key.to_lowercase().as_str())
+    }
+
     /// Build the parent scope for a by-name user-function/method call.
     ///
     /// A CFML function's *data* scope is strictly its lexical/defining scope —
@@ -19949,8 +19982,18 @@ impl CfmlVirtualMachine {
             let carry = match &caller_inherited {
                 None => true,
                 Some(inh) => {
+                    // The helper-function carve-out is limited to the
+                    // captured-scope-STRIPPED values `closure_env_capture_value`
+                    // produces (PR #198) — those are not reachable any other
+                    // way. A caller's own `var f = function(){…}` keeps its
+                    // captured scope, and carrying THAT would be dynamic
+                    // scoping: Lucee 7 reports `isDefined("f")` false in the
+                    // callee and throws "No matching function [F] found" on a
+                    // bare call. It only became reachable once the §32 fix
+                    // stopped the frame seed from dropping scope-bearing
+                    // functions, so the filter has to reject it here instead.
                     inh.contains(k.as_str())
-                        || matches!(v, CfmlValue::Function(_))
+                        || matches!(v, CfmlValue::Function(f) if f.captured_scope.is_none())
                         || matches!(k.as_str(), "this" | "__variables" | "variables" | "super")
                 }
             };

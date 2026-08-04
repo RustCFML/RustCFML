@@ -931,4 +931,7 @@ include "harness.cfm";
 <!--- Declared parameter/return types are enforced (docs/known-issues.md §29). --->
 <cf_runtest file="functions/test_fn_type_enforcement.cfm">
 
+<!--- Page-scope variables holding a function (docs/known-issues.md §32). --->
+<cf_runtest file="functions/test_page_function_vars.cfm">
+
 <cfscript> printSummary(); </cfscript>
