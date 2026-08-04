@@ -136,7 +136,10 @@ pub fn value_label(value: &CfmlValue, component_name: &dyn Fn(&CfmlValue) -> Opt
             "Object type [Number]".to_string()
         }
         CfmlValue::Bool(_) => "Object type [Boolean]".to_string(),
-        CfmlValue::Array(_) | CfmlValue::QueryColumn(..) => "Object type [Array]".to_string(),
+        CfmlValue::Array(_) => "Object type [Array]".to_string(),
+        // Named by the cell it proxies, not as an Array — otherwise a mismatch
+        // on `q.col` reported a type the value does not actually have.
+        CfmlValue::QueryColumn(..) => value_label(value.query_column_scalar(), component_name),
         CfmlValue::Query(_) => "Object type [Query]".to_string(),
         CfmlValue::Binary(_) => "Object type [Binary]".to_string(),
         CfmlValue::Function(f) => format!("Object type [user defined function ({})]", f.name),
@@ -255,6 +258,20 @@ impl Env<'_> {
 /// filters those out before asking (an omitted argument, or a function that
 /// falls off its end without returning).
 pub fn satisfies(value: &CfmlValue, declared: &str, env: &Env<'_>) -> bool {
+    // `q.col` is a `QueryColumn` — a PROXY that stands in for its current row's
+    // value, not a collection. Lucee agrees: `isArray(q.col)` is false, and
+    // every scalar context here (comparison, coercion, `Len`) already treats it
+    // as that one cell. The type checker was the one place that didn't, so
+    // `string function f() { return q.col; }` was rejected as "Object type
+    // [Array]" — which is how Preside's `SqlSchemaVersioning.getDbVersion`
+    // (`return versionRecord.version_hash`) stopped its boot under §29.
+    //
+    // Resolved for every target EXCEPT `array`, which keeps accepting the raw
+    // QueryColumn as it always did, so nothing that passed before now fails.
+    let value = match resolve(declared) {
+        Target::Array => value,
+        _ => value.query_column_scalar(),
+    };
     match resolve(declared) {
         Target::Any => true,
         // Simple values only. Binary is accepted (Lucee casts bytes to a

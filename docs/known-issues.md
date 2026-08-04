@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.559.0**.
+What RustCFML **does not fully do**, as of **v0.560.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
@@ -92,6 +92,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [32](#32) | Page-scope **function** variable visible inside functions | ✅ v0.558.0 |
 | [33](#33) | Java `Object` methods on simple values | ✅ v0.558.0 |
 | [34](#34) | `createUUID()` random from the first call, v4-shaped | ✅ v0.558.0 |
+| [35](#35) | §29 type enforcement rejected two legitimate values (Preside boot) | ✅ v0.560.0 |
 
 ### Is it getting better?
 
@@ -1349,6 +1350,61 @@ thread to get a fresh thread-local PRNG.
 One unrelated divergence this surfaced: `createUniqueID( "counter" )` advances on both
 engines but is **encoded** differently — Lucee base-36s the counter (`2q`, `2r`) where
 RustCFML emits decimal (`1`, `2`). 🌟
+
+<a id="35"></a>
+
+## 35. §29 type enforcement rejected two legitimate values ✅ *(fixed in v0.560.0)*
+
+Enforcing declared types (§29, v0.557.0) turned two long-standing internal
+representations into hard errors. Neither was a new bug — both had been invisible for
+as long as declared types were comments — and together they stopped **Preside booting**
+on the first release where a user actually ran an enforced build.
+
+**A self-typed method called from a pseudo-constructor.** A component's `this` carries
+the parser's `Anonymous` placeholder for as long as its pseudo-constructor body runs;
+the real name is stamped onto the finished instance afterwards. So a method declared to
+return its own type, *called from the pseudo-constructor*, returned an instance that
+could not name itself:
+
+```cfml
+component {
+    reset();                                      // called during construction
+    LogBoxConfig function reset() { return this; }
+}
+```
+
+→ `The function [reset] has an invalid return value , [Cannot cast Object type
+[Component Anonymous] to a value of type [LogBoxConfig]]`. That is ColdBox's
+`LogBoxConfig` verbatim. `getMetadata()` already compensated from the in-construction
+name stack (GH #212); the type checker now consults it too, and only for a value that
+cannot name itself — a component that *can* is matched normally, so an unrelated type
+still cannot slip through.
+
+**A query column against a simple declared type.** `q.col` is a `QueryColumn` — a proxy
+standing in for its current row's cell, not a collection. `isArray( q.col )` is false on
+Lucee 7 and here, and every scalar context (comparison, coercion, `Len`) already treated
+it as that one cell. The type checker was the one place that did not, so:
+
+```cfml
+string function getDbVersion() {
+    return versionRecord.version_hash;            // -> Object type [Array]
+}
+```
+
+was refused — Preside's `SqlSchemaVersioning.getDbVersion`. The checker now resolves a
+`QueryColumn` to the cell it proxies for every target except `array`, which keeps
+accepting the raw column exactly as before, so nothing that passed previously fails now.
+The mismatch *message* was wrong too: it named a `QueryColumn` "Object type [Array]", a
+type the value does not have. It is now named by the cell it stands for.
+
+Pinned in `tests/functions/test_pc_self_type.cfm` and
+`tests/types/test_querycolumn_declared_types.cfm` (11 assertions, green on both engines).
+
+The lesson for the remaining §29 surface: type enforcement is only as correct as the
+engine's internal value model is honest, and an internal representation that *behaves*
+like a scalar everywhere else has to satisfy a scalar declaration too. A representation
+that leaks through the checker will present as a Lucee incompatibility even though the
+declaration is being read correctly.
 
 ---
 

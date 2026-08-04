@@ -937,6 +937,12 @@ include "harness.cfm";
 <!--- Page-scope variables holding a function (docs/known-issues.md §32). --->
 <cf_runtest file="functions/test_page_function_vars.cfm">
 
+<!--- Self-typed method called from a pseudo-constructor (docs/known-issues.md §35). --->
+<cf_runtest file="functions/test_pc_self_type.cfm">
+
+<!--- Query columns vs declared types (docs/known-issues.md §35). --->
+<cf_runtest file="types/test_querycolumn_declared_types.cfm">
+
 <!--- java.lang.Object methods on simple values (docs/known-issues.md §33). --->
 <cf_runtest file="functions/test_java_object_methods.cfm">
 

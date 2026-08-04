@@ -21253,11 +21253,38 @@ impl CfmlVirtualMachine {
         resolved
     }
 
-    fn type_check_env(is_valid: Option<BuiltinFunction>) -> type_check::Env<'static> {
+    /// The names of the components whose pseudo-constructors are currently
+    /// running, innermost last.
+    ///
+    /// A component's `this` carries `__name = "Anonymous"` (the parser
+    /// placeholder) for the whole time its pseudo-constructor body runs — the
+    /// real name is only stamped onto the finished instance afterwards. So a
+    /// method CALLED FROM the pseudo-constructor that is declared to return its
+    /// own type sees an instance that cannot name itself, and the §29 return
+    /// check rejected it:
+    ///
+    /// ```cfml
+    /// component {
+    ///     reset();                                     // called from the PC
+    ///     LogBoxConfig function reset() { return this; }
+    /// }
+    /// ```
+    ///
+    /// → `The function [reset] has an invalid return value , [Cannot cast Object
+    /// type [Component Anonymous] to a value of type [LogBoxConfig]]`. That is
+    /// ColdBox's `LogBoxConfig`, verbatim, and it stopped Preside booting.
+    /// `getMetadata()` already compensates from this same stack (GH #212); the
+    /// type checker now does too.
+    fn constructing_type_names(&self) -> Vec<String> {
+        self.constructing_component_names.clone()
+    }
+
+    fn type_check_env<'a>(
+        is_valid: Option<BuiltinFunction>,
+        satisfies: &'a dyn Fn(&CfmlValue, &str) -> bool,
+    ) -> type_check::Env<'a> {
         type_check::Env {
-            satisfies_component: &|v: &CfmlValue, t: &str| {
-                Self::value_satisfies_component_type(v, t)
-            },
+            satisfies_component: satisfies,
             is_component: &Self::value_is_component_instance,
             is_valid,
         }
@@ -21313,7 +21340,11 @@ impl CfmlVirtualMachine {
         if matches!(value, CfmlValue::Null) || type_check::is_unchecked(declared) {
             return Ok(());
         }
-        let env = Self::type_check_env(self.is_valid_builtin());
+        let constructing = self.constructing_type_names();
+        let satisfies = |v: &CfmlValue, t: &str| {
+            Self::value_satisfies_component_type_in_ctor(v, t, &constructing)
+        };
+        let env = Self::type_check_env(self.is_valid_builtin(), &satisfies);
         if type_check::satisfies(value, declared, &env) {
             return Ok(());
         }
@@ -21351,7 +21382,11 @@ impl CfmlVirtualMachine {
         if matches!(value, CfmlValue::Null) || type_check::is_unchecked(declared) {
             return Ok(value);
         }
-        let env = Self::type_check_env(self.is_valid_builtin());
+        let constructing = self.constructing_type_names();
+        let satisfies = |v: &CfmlValue, t: &str| {
+            Self::value_satisfies_component_type_in_ctor(v, t, &constructing)
+        };
+        let env = Self::type_check_env(self.is_valid_builtin(), &satisfies);
         if type_check::satisfies(&value, declared, &env) {
             return Ok(value);
         }
@@ -21377,6 +21412,48 @@ impl CfmlVirtualMachine {
     /// `__implements_fqns`), matching either the full name or last dotted segment.
     /// A NativeObject (rust class) is accepted leniently. A non-component value
     /// (string/number/plain struct/…) never satisfies a component/interface type.
+    /// `value_satisfies_component_type`, plus the in-construction compensation
+    /// described on `constructing_type_names`.
+    ///
+    /// An instance that still names itself `Anonymous` is matched against the
+    /// pseudo-constructors currently on the stack instead. Scoped to exactly that
+    /// case: a component that CAN name itself is matched normally, so this cannot
+    /// make an unrelated type pass. Innermost-first, because the innermost
+    /// constructor is the one whose `this` is in play.
+    fn value_satisfies_component_type_in_ctor(
+        value: &CfmlValue,
+        type_name: &str,
+        constructing: &[String],
+    ) -> bool {
+        if Self::value_satisfies_component_type(value, type_name) {
+            return true;
+        }
+        if constructing.is_empty() || !Self::names_itself_anonymous(value) {
+            return false;
+        }
+        let want = type_name.trim().to_lowercase();
+        constructing.iter().rev().any(|n| {
+            let c = n.to_lowercase();
+            c == want || c.rsplit('.').next() == want.rsplit('.').next()
+        })
+    }
+
+    /// Is this a component instance still carrying the parser's `Anonymous`
+    /// placeholder — i.e. one whose pseudo-constructor has not finished?
+    fn names_itself_anonymous(value: &CfmlValue) -> bool {
+        match value {
+            CfmlValue::Struct(s) => cfml_common::component::type_identifiers(s)
+                .iter()
+                .all(|id| id.eq_ignore_ascii_case("Anonymous")),
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => cfml_common::component::CompRef::for_instance(inst)
+                .type_identifiers()
+                .iter()
+                .all(|id| id.eq_ignore_ascii_case("Anonymous")),
+            _ => false,
+        }
+    }
+
     fn value_satisfies_component_type(value: &CfmlValue, type_name: &str) -> bool {
         let want = type_name.trim().to_lowercase();
         let matches_name = |candidate: &str| -> bool {
