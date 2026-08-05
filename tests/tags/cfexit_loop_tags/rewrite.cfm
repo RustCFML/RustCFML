@@ -1,0 +1,1 @@
+<cfif thisTag.executionMode eq "end"><cfoutput>{e}</cfoutput><cfset thisTag.generatedContent = "<" & thisTag.generatedContent & ">"><cfset request.cel_g = request.cel_g + 1><cfif request.cel_g lt 2><cfexit method="loop"></cfif></cfif>

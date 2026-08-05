@@ -1,0 +1,1 @@
+<cfif thisTag.executionMode eq "start"><cfset thisTag.mine = "S0"><cfset variables.aliased = thisTag><cfelse><cfset request.cel_mine = structKeyExists(thisTag, "mine") ? thisTag.mine : "GONE"><cfset request.cel_alias = variables.aliased.executionMode></cfif>

@@ -1,0 +1,1 @@
+<cfif thisTag.executionMode eq "start"><cfset request.cel_sloop = "startphase"><cfexit method="loop"></cfif>

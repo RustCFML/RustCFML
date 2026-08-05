@@ -1,0 +1,1 @@
+<cfif thisTag.executionMode eq "end"><cfset request.cel_brkend = request.cel_brkend & "E"></cfif>

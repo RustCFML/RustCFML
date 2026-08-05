@@ -63,6 +63,14 @@ impl CfmlError {
         Self::new(message, CfmlErrorType::Custom("lock".to_string()))
     }
 
+    /// A catchable `template`-typed exception, matching Lucee's
+    /// `lucee.runtime.exp.TemplateException` — raised when a tag is used in a
+    /// context that cannot support it (e.g. `<cfexit method="loop">` outside a
+    /// custom tag's end phase).
+    pub fn template(message: String) -> Self {
+        Self::new(message, CfmlErrorType::Template)
+    }
+
     /// A catchable `expression`-typed exception, matching how Lucee/ACF surface
     /// expression-evaluation errors (e.g. an invalid datepart passed to
     /// `dateAdd`/`dateDiff`). CFML code does `catch( expression e )` and many

@@ -907,6 +907,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_cfloop_query_currentrow.cfm">
 <cf_runtest file="tags/test_tags_cfloop_query_window_group.cfm">
+<cf_runtest file="tags/test_tags_cfexit_loop.cfm">
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_quotes.cfm">
