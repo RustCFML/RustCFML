@@ -1115,6 +1115,12 @@ fn compile_and_run(
         }
     }
 
+    // A transaction still open here was never closed by its block — `abort`, a
+    // fatal error or a request timeout can all leave one behind. Roll it back
+    // and drop the connection rather than handing it back to the pool
+    // mid-transaction, where the next request picks it up dirty (GH #308).
+    vm.rollback_open_transaction();
+
     // Take the response out of the VM via `mem::take` (leaving every field a
     // valid default) so the VM can then be DROPPED — releasing all of this
     // request's transient roots (page `variables`, request/thread scopes, call

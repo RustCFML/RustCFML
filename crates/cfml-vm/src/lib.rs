@@ -1837,6 +1837,16 @@ pub struct CfmlVirtualMachine {
     /// commit/rollback releases/rolls-back-to it); `None` means the block was
     /// still pending (no live connection) so there is no savepoint to manage.
     pub transaction_savepoints: Vec<Option<String>>,
+    /// One entry per `transaction { }` BLOCK currently being executed, holding
+    /// the `transaction_depth` that block established. Pushed by
+    /// `__cftransaction_start` when the block form calls it and popped by the
+    /// `__cftransaction_end` its `finally` runs. If the depth is still >= the
+    /// mark when the block ends, control left the block without reaching either
+    /// the commit or the rollback (a `return`/`break` out of the body), so
+    /// `end` commits it — Lucee/ACF end the block whichever way control leaves
+    /// it. Without this the depth stayed raised and the still-open connection
+    /// leaked into the rest of the request (GH #308).
+    pub transaction_block_marks: Vec<usize>,
     /// Function pointer: begin transaction (datasource) -> conn
     pub txn_begin: Option<fn(&str) -> Result<Box<dyn std::any::Any>, CfmlError>>,
     /// Function pointer: commit transaction (conn)
@@ -2521,6 +2531,7 @@ impl CfmlVirtualMachine {
             transaction_pending: false,
             transaction_depth: 0,
             transaction_savepoints: Vec::new(),
+            transaction_block_marks: Vec::new(),
             txn_begin: None,
             txn_commit: None,
             txn_rollback: None,
@@ -13641,6 +13652,7 @@ impl CfmlVirtualMachine {
                 | "__cftransaction_start"
                 | "__cftransaction_commit"
                 | "__cftransaction_rollback"
+                | "__cftransaction_end"
                 | "__writetext"
                 | "__cflog"
                 | "writelog"
@@ -17761,142 +17773,40 @@ impl CfmlVirtualMachine {
                     return Ok(result);
                 }
                 "__cftransaction_start" => {
-                    // A `transaction { }` block nested inside another one becomes a
-                    // SAVEPOINT on the already-open outer transaction
-                    // (Lucee/ACF/BoxLang semantics), not a new transaction.
-                    if self.transaction_depth >= 1 {
-                        self.transaction_depth += 1;
-                        let depth = self.transaction_depth;
-                        // Only issue a real savepoint when the outer transaction
-                        // actually has a live connection. A still-pending block
-                        // (no resolvable datasource yet) records None so the
-                        // matching commit/rollback knows there is nothing to do.
-                        if self.transaction_conn.is_some() {
-                            let name = format!("cftxn_sp{}", depth);
-                            if let (Some(savepoint), Some(conn)) =
-                                (self.txn_savepoint, self.transaction_conn.as_mut())
-                            {
-                                savepoint(conn, &name)?;
-                                self.transaction_savepoints.push(Some(name));
-                            } else {
-                                self.transaction_savepoints.push(None);
-                            }
-                        } else {
-                            self.transaction_savepoints.push(None);
-                        }
-                        return Ok(CfmlValue::Null);
+                    // A 4th argument marks the BLOCK form (`transaction { … }` /
+                    // `<cftransaction>…</cftransaction>`), whose lowering pairs
+                    // this call with an `__cftransaction_end()` in a `finally`.
+                    // The bare statement form (`transaction action="begin";`)
+                    // has no such partner, so it records no mark.
+                    let is_block = args.len() >= 4 && !args[3].as_string().is_empty();
+                    let result = self.cftransaction_start(&args, parent_locals);
+                    if is_block {
+                        // Record the mark even when the begin FAILED: the
+                        // `finally` still runs, and its `end` must find its own
+                        // mark rather than pop an enclosing block's.
+                        self.transaction_block_marks.push(self.transaction_depth);
                     }
-                    // Args: __cftransaction_start("begin", isolation, datasource).
-                    // The three positions are FIXED — every lowering emits an
-                    // empty string for an absent attribute. This used to guess
-                    // ("arg 2, else arg 1 if it isn't 'begin'"), which read an
-                    // `isolation="serializable"` with no datasource as the
-                    // datasource NAME and opened the transaction against it.
-                    // `isolation` itself is still not applied — see
-                    // docs/known-issues.md §7.
-                    // An INLINE datasource struct (`datasource="#{class:…,
-                    // connectionString:…}#"`) is read the way queryExecute reads
-                    // one — plain `as_string()` on a struct produced a
-                    // `{class: …, connectionString: …}` blob that
-                    // `parse_datasource` then treated as a SQLite FILE NAME.
-                    let datasource = args
-                        .get(2)
-                        .map(Self::datasource_arg_to_name)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| self.get_default_datasource(parent_locals));
-                    // Resolve a per-application datasource name to its URL so
-                    // transactions honour this.datasources too (same as queries).
-                    let datasource = self
-                        .resolve_app_datasource(&datasource)
-                        .unwrap_or(datasource);
-                    if datasource.is_empty() {
-                        // Lucee/ACF defer transaction-connection setup until a query
-                        // actually runs — `transaction { ... }` around non-query code
-                        // is allowed, and a query inside the block begins the
-                        // transaction lazily on its own datasource. Mark the block
-                        // pending so the queryExecute path performs that lazy begin.
-                        self.transaction_pending = true;
-                        self.transaction_depth = 1;
-                        return Ok(CfmlValue::Null);
-                    }
-                    if let Some(txn_begin) = self.txn_begin {
-                        let conn = txn_begin(&datasource)?;
-                        self.transaction_conn = Some(conn);
-                        self.transaction_datasource = Some(datasource);
-                        self.transaction_depth = 1;
-                        return Ok(CfmlValue::Null);
-                    }
-                    return Err(CfmlError::runtime(
-                        "cftransaction: transaction support not initialized".to_string(),
-                    ));
+                    return result;
                 }
-                "__cftransaction_commit" => {
-                    // Committing a nested block releases its savepoint and leaves
-                    // the outer transaction open (Lucee/ACF/BoxLang semantics).
-                    if self.transaction_depth >= 2 {
-                        // Pop the savepoint and drop the depth BEFORE issuing the
-                        // driver call so that a failing RELEASE SAVEPOINT can't
-                        // leave the nesting depth stuck — otherwise the next
-                        // sibling block would keep climbing (cftxn_sp6, sp7 …).
-                        let popped = self.transaction_savepoints.pop();
-                        self.transaction_depth -= 1;
-                        if let Some(Some(name)) = popped {
-                            if let (Some(release), Some(conn)) =
-                                (self.txn_release_savepoint, self.transaction_conn.as_mut())
-                            {
-                                release(conn, &name)?;
-                            }
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    // Top-level commit. The block is definitively over once we get
-                    // here, so ALL transaction state must reset even if the driver
-                    // commit itself errors — otherwise a stale depth/conn leaks
-                    // into the next transaction, which then behaves as nested and
-                    // issues a SAVEPOINT on a connection that has none (GH #224:
-                    // "SAVEPOINT cftxn_spN does not exist", counter climbing across
-                    // specs).
-                    let commit_result = match (self.transaction_conn.as_mut(), self.txn_commit) {
-                        (Some(conn), Some(txn_commit)) => txn_commit(conn),
-                        _ => Ok(()),
+                "__cftransaction_end" => {
+                    // The `finally` partner of a block-form `__cftransaction_start`.
+                    // Normally a no-op: the body's own commit (or the catch arm's
+                    // rollback) has already dropped the depth below the mark. It
+                    // only does work when control left the block WITHOUT running
+                    // either — `return`/`break` out of a `transaction { }` — in
+                    // which case the block is over and must be committed, exactly
+                    // as if the closing brace had been reached (GH #308).
+                    let mark = match self.transaction_block_marks.pop() {
+                        Some(m) => m,
+                        None => return Ok(CfmlValue::Null),
                     };
-                    self.transaction_conn = None;
-                    self.transaction_datasource = None;
-                    self.transaction_pending = false;
-                    self.transaction_depth = 0;
-                    self.transaction_savepoints.clear();
-                    commit_result?;
+                    while self.transaction_depth >= mark && self.transaction_depth > 0 {
+                        self.cftransaction_commit()?;
+                    }
                     return Ok(CfmlValue::Null);
                 }
-                "__cftransaction_rollback" => {
-                    // Rolling back a nested block rolls back to its savepoint and
-                    // leaves the outer transaction open.
-                    if self.transaction_depth >= 2 {
-                        let popped = self.transaction_savepoints.pop();
-                        self.transaction_depth -= 1;
-                        if let Some(Some(name)) = popped {
-                            if let (Some(rollback_to), Some(conn)) =
-                                (self.txn_rollback_to_savepoint, self.transaction_conn.as_mut())
-                            {
-                                rollback_to(conn, &name)?;
-                            }
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    // Top-level rollback — reset all state unconditionally (see the
-                    // commit handler above for why). GH #224.
-                    let rollback_result = match (self.transaction_conn.as_mut(), self.txn_rollback) {
-                        (Some(conn), Some(txn_rollback)) => txn_rollback(conn),
-                        _ => Ok(()),
-                    };
-                    self.transaction_conn = None;
-                    self.transaction_datasource = None;
-                    self.transaction_pending = false;
-                    self.transaction_depth = 0;
-                    self.transaction_savepoints.clear();
-                    rollback_result?;
-                    return Ok(CfmlValue::Null);
-                }
+                "__cftransaction_commit" => return self.cftransaction_commit(),
+                "__cftransaction_rollback" => return self.cftransaction_rollback(),
                 "__cflog" => {
                     // `<cflog text=".." file=".." log=".." type=".." application="..">`
                     // — the tag preprocessor bundles every attribute into one struct.
@@ -26882,6 +26792,172 @@ impl CfmlVirtualMachine {
             }
         }
         ids.into_iter().filter_map(|gid| self.resolve_fn(gid)).collect()
+    }
+
+    /// `__cftransaction_start` — open a transaction, or turn a nested
+    /// `transaction { }` into a SAVEPOINT on the already-open outer one
+    /// (Lucee/ACF/BoxLang semantics).
+    fn cftransaction_start(&mut self, args: &[CfmlValue], parent_locals: &ValueMap) -> CfmlResult {
+        if self.transaction_depth >= 1 {
+            self.transaction_depth += 1;
+            let depth = self.transaction_depth;
+            // Only issue a real savepoint when the outer transaction
+            // actually has a live connection. A still-pending block
+            // (no resolvable datasource yet) records None so the
+            // matching commit/rollback knows there is nothing to do.
+            if self.transaction_conn.is_some() {
+                let name = format!("cftxn_sp{}", depth);
+                if let (Some(savepoint), Some(conn)) =
+                    (self.txn_savepoint, self.transaction_conn.as_mut())
+                {
+                    savepoint(conn, &name)?;
+                    self.transaction_savepoints.push(Some(name));
+                } else {
+                    self.transaction_savepoints.push(None);
+                }
+            } else {
+                self.transaction_savepoints.push(None);
+            }
+            return Ok(CfmlValue::Null);
+        }
+        // Args: __cftransaction_start("begin", isolation, datasource).
+        // The three positions are FIXED — every lowering emits an
+        // empty string for an absent attribute. This used to guess
+        // ("arg 2, else arg 1 if it isn't 'begin'"), which read an
+        // `isolation="serializable"` with no datasource as the
+        // datasource NAME and opened the transaction against it.
+        // `isolation` itself is still not applied — see
+        // docs/known-issues.md §7.
+        // An INLINE datasource struct (`datasource="#{class:…,
+        // connectionString:…}#"`) is read the way queryExecute reads
+        // one — plain `as_string()` on a struct produced a
+        // `{class: …, connectionString: …}` blob that
+        // `parse_datasource` then treated as a SQLite FILE NAME.
+        let datasource = args
+            .get(2)
+            .map(Self::datasource_arg_to_name)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.get_default_datasource(parent_locals));
+        // Resolve a per-application datasource name to its URL so
+        // transactions honour this.datasources too (same as queries).
+        let datasource = self
+            .resolve_app_datasource(&datasource)
+            .unwrap_or(datasource);
+        if datasource.is_empty() {
+            // Lucee/ACF defer transaction-connection setup until a query
+            // actually runs — `transaction { ... }` around non-query code
+            // is allowed, and a query inside the block begins the
+            // transaction lazily on its own datasource. Mark the block
+            // pending so the queryExecute path performs that lazy begin.
+            self.transaction_pending = true;
+            self.transaction_depth = 1;
+            return Ok(CfmlValue::Null);
+        }
+        if let Some(txn_begin) = self.txn_begin {
+            let conn = txn_begin(&datasource)?;
+            self.transaction_conn = Some(conn);
+            self.transaction_datasource = Some(datasource);
+            self.transaction_depth = 1;
+            return Ok(CfmlValue::Null);
+        }
+        Err(CfmlError::runtime(
+            "cftransaction: transaction support not initialized".to_string(),
+        ))
+    }
+
+    /// `__cftransaction_commit` — close the innermost open level.
+    fn cftransaction_commit(&mut self) -> CfmlResult {
+        // Committing a nested block releases its savepoint and leaves
+        // the outer transaction open (Lucee/ACF/BoxLang semantics).
+        if self.transaction_depth >= 2 {
+            // Pop the savepoint and drop the depth BEFORE issuing the
+            // driver call so that a failing RELEASE SAVEPOINT can't
+            // leave the nesting depth stuck — otherwise the next
+            // sibling block would keep climbing (cftxn_sp6, sp7 …).
+            let popped = self.transaction_savepoints.pop();
+            self.transaction_depth -= 1;
+            if let Some(Some(name)) = popped {
+                if let (Some(release), Some(conn)) =
+                    (self.txn_release_savepoint, self.transaction_conn.as_mut())
+                {
+                    release(conn, &name)?;
+                }
+            }
+            return Ok(CfmlValue::Null);
+        }
+        // Top-level commit. The block is definitively over once we get
+        // here, so ALL transaction state must reset even if the driver
+        // commit itself errors — otherwise a stale depth/conn leaks
+        // into the next transaction, which then behaves as nested and
+        // issues a SAVEPOINT on a connection that has none (GH #224:
+        // "SAVEPOINT cftxn_spN does not exist", counter climbing across
+        // specs).
+        let commit_result = match (self.transaction_conn.as_mut(), self.txn_commit) {
+            (Some(conn), Some(txn_commit)) => txn_commit(conn),
+            _ => Ok(()),
+        };
+        self.transaction_conn = None;
+        self.transaction_datasource = None;
+        self.transaction_pending = false;
+        self.transaction_depth = 0;
+        self.transaction_savepoints.clear();
+        commit_result?;
+        Ok(CfmlValue::Null)
+    }
+
+    /// `__cftransaction_rollback` — undo the innermost open level.
+    fn cftransaction_rollback(&mut self) -> CfmlResult {
+        // Rolling back a nested block rolls back to its savepoint and
+        // leaves the outer transaction open.
+        if self.transaction_depth >= 2 {
+            let popped = self.transaction_savepoints.pop();
+            self.transaction_depth -= 1;
+            if let Some(Some(name)) = popped {
+                if let (Some(rollback_to), Some(conn)) =
+                    (self.txn_rollback_to_savepoint, self.transaction_conn.as_mut())
+                {
+                    rollback_to(conn, &name)?;
+                }
+            }
+            return Ok(CfmlValue::Null);
+        }
+        // Top-level rollback — reset all state unconditionally (see the
+        // commit handler above for why). GH #224.
+        let rollback_result = match (self.transaction_conn.as_mut(), self.txn_rollback) {
+            (Some(conn), Some(txn_rollback)) => txn_rollback(conn),
+            _ => Ok(()),
+        };
+        self.transaction_conn = None;
+        self.transaction_datasource = None;
+        self.transaction_pending = false;
+        self.transaction_depth = 0;
+        self.transaction_savepoints.clear();
+        rollback_result?;
+        Ok(CfmlValue::Null)
+    }
+
+    /// Roll back and discard any transaction still open when a request ends.
+    /// A block that was left without commit or rollback would otherwise hand
+    /// its connection back to the pool mid-transaction, where the next request
+    /// picks it up dirty — MySQL's `BEGIN` then implicitly commits and drops
+    /// every savepoint, so the next nested block's `RELEASE cftxn_spN` fails
+    /// with "SAVEPOINT cftxn_spN does not exist" (GH #308/#224). The lowering's
+    /// `finally` should mean this never fires; it is the backstop for the paths
+    /// that bypass it (`abort`, a fatal error, a request timeout).
+    pub fn rollback_open_transaction(&mut self) {
+        self.transaction_block_marks.clear();
+        if self.transaction_depth == 0 && self.transaction_conn.is_none() {
+            return;
+        }
+        if let (Some(conn), Some(txn_rollback)) = (self.transaction_conn.as_mut(), self.txn_rollback)
+        {
+            let _ = txn_rollback(conn);
+        }
+        self.transaction_conn = None;
+        self.transaction_datasource = None;
+        self.transaction_pending = false;
+        self.transaction_depth = 0;
+        self.transaction_savepoints.clear();
     }
 
     /// Get default datasource from application scope or request scope

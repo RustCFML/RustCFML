@@ -1675,10 +1675,23 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                                 None => "\"\"".to_string(),
                             },
                         };
-                        let txn_args = vec!["\"begin\"".to_string(), iso_arg, ds_arg];
+                        // A 4th "block" argument tells the runtime this start
+                        // is paired with the `__cftransaction_end()` below.
+                        let txn_args = vec![
+                            "\"begin\"".to_string(),
+                            iso_arg,
+                            ds_arg,
+                            "\"block\"".to_string(),
+                        ];
 
+                        // The `finally` is what makes the block end however
+                        // control leaves it. Without it a `return`/`break` out
+                        // of the body skipped BOTH the commit and the rollback,
+                        // so the work was never committed and the raised nesting
+                        // depth plus the still-open connection poisoned every
+                        // later transaction in the request (GH #308).
                         (format!(
-                            "__cftransaction_start({});\ntry {{\n{}\n__cftransaction_commit();\n}} catch(any __txn_e) {{\n__cftransaction_rollback();\nthrow __txn_e;\n}}\n",
+                            "__cftransaction_start({});\ntry {{\n{}\n__cftransaction_commit();\n}} catch(any __txn_e) {{\n__cftransaction_rollback();\nthrow __txn_e;\n}} finally {{\n__cftransaction_end();\n}}\n",
                             txn_args.join(", "), body_script
                         ), close_end - start)
                     } else {
@@ -4611,6 +4624,18 @@ mod tests {
         assert!(grouped.contains("__cfg_sub_"), "detail block missing: {grouped}");
     }
 
+    /// The block form must be wrapped in a `finally` that ends the transaction
+    /// however control leaves the body — a `return`/`break` out of it otherwise
+    /// ran neither the commit nor the rollback (GH #308).
+    #[test]
+    fn test_cftransaction_block_ends_in_a_finally() {
+        let lowered = tags_to_script(r#"<cftransaction>X</cftransaction>"#);
+        assert!(
+            lowered.contains("finally") && lowered.contains("__cftransaction_end()"),
+            "block lowering has no finally: {lowered}"
+        );
+    }
+
     /// `__cftransaction_start` takes (action, isolation, datasource) in FIXED
     /// positions. Emitting only the attributes present shifted `isolation` into
     /// the datasource slot, so `<cftransaction isolation="serializable">` tried
@@ -4621,14 +4646,14 @@ mod tests {
             r#"<cftransaction isolation="serializable">X</cftransaction>"#,
         );
         assert!(
-            iso_only.contains(r#"__cftransaction_start("begin", "serializable", "")"#),
+            iso_only.contains(r#"__cftransaction_start("begin", "serializable", "", "block")"#),
             "isolation-only lowering has the wrong argument shape: {iso_only}"
         );
         let ds_only = tags_to_script(
             r#"<cftransaction datasource="ds1">X</cftransaction>"#,
         );
         assert!(
-            ds_only.contains(r#"__cftransaction_start("begin", "", "ds1")"#),
+            ds_only.contains(r#"__cftransaction_start("begin", "", "ds1", "block")"#),
             "datasource-only lowering has the wrong argument shape: {ds_only}"
         );
     }

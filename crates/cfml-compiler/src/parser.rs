@@ -3378,7 +3378,28 @@ impl Parser {
                             action_expr,
                             attr_or_empty("isolation"),
                             attr_or_empty("datasource"),
+                            // Marks the BLOCK form, whose start is paired with
+                            // the `__cftransaction_end()` in the finally below.
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String("block".to_string()),
+                                location: loc,
+                            }),
                         ],
+                        location: loc,
+                    })),
+                    location: loc,
+                });
+                // Ends the block however control leaves it. Without this a
+                // `return`/`break` out of the body ran neither the commit nor
+                // the rollback: the work was never committed and the raised
+                // depth plus the still-open connection poisoned every later
+                // transaction in the request (GH #308).
+                let end = Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cftransaction_end".to_string(), location: loc,
+                        })),
+                        arguments: vec![],
                         location: loc,
                     })),
                     location: loc,
@@ -3419,7 +3440,7 @@ impl Parser {
                         var_name: "__txn_e".to_string(),
                         body: vec![rollback, rethrow],
                     }],
-                    finally_body: None,
+                    finally_body: Some(vec![end]),
                     location: loc,
                 });
                 CfmlNode::Statement(Statement::Output(Output {

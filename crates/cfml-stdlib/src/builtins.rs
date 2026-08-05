@@ -868,6 +868,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cftransaction_start".into(), fn_cftransaction_start_stub);
     f.insert("__cftransaction_commit".into(), fn_cftransaction_commit_stub);
     f.insert("__cftransaction_rollback".into(), fn_cftransaction_rollback_stub);
+    f.insert("__cftransaction_end".into(), fn_cftransaction_end_stub);
     f.insert("cfdirectory".into(), fn_cfdirectory);
     f.insert("cffile".into(), fn_cffile);
     f.insert("cfdbinfo".into(), fn_cfdbinfo_stub);
@@ -13666,6 +13667,10 @@ fn fn_cftransaction_commit_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cftransaction_rollback_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cftransaction_rollback requires VM intercept".into()))
+}
+
+fn fn_cftransaction_end_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__cftransaction_end requires VM intercept".into()))
 }
 
 // -----------------------------------------------

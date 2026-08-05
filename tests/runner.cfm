@@ -743,6 +743,7 @@ include "harness.cfm";
 <!--- model save()/create() inside an outer app transaction hits this (84 specs --->
 <!--- in the core suite). --->
 <cf_runtest file="tags/test_nested_transaction.cfm">
+<cf_runtest file="tags/test_transaction_block_exit.cfm">
 <!--- - component_declaration_attributes: follow-on to component_soft_keyword. --->
 <!--- Component-header metadata attributes are order-independent and may be --->
 <!--- written quoted or unquoted on Lucee/ACF/BoxLang. Two shapes the Wheels --->
@@ -851,6 +852,7 @@ include "harness.cfm";
 <!--- - lock_finally_semantics: try/finally + lock { } must run the finally on a --->
 <!--- `return` (release the lock) and re-propagate exceptions thrown inside. --->
 <cf_runtest file="core/test_lock_finally_semantics.cfm">
+<cf_runtest file="core/test_finally_on_break_continue.cfm">
 <!--- - hof_member_writeback: a higher-order struct member fn (some/every/...) --->
 <!--- run inside a CFC method must not leak the closure's captured `this` onto --->
 <!--- the receiver variable (the WireBox `binder.hasAspects()` bug). --->
