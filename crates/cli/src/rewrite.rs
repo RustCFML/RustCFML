@@ -7,6 +7,40 @@
 use regex::Regex;
 use std::collections::HashMap;
 
+/// Max distinct patterns held by [`cached_rule_regex`].
+const REWRITE_REGEX_CACHE_CAP: usize = 1024;
+
+/// Compile `pattern`, memoized process-wide.
+///
+/// Every rule (and every regex-valued condition) used to be recompiled on
+/// EVERY request — a site with 7 rules in `urlrewrite.xml` paid up to 7 regex
+/// compilations per hit. On a warm Preside profile that made
+/// `apply_rewrite_rules` ~11.7% of all allocation, second only to the VM's
+/// own `execute_function_body`.
+///
+/// Pure memoization: same pattern string in, same `Regex` out. Compile errors
+/// stay uncached and keep their existing "warn and skip the rule" behavior.
+/// Bounded like the other regex caches in the tree — cleared wholesale past the
+/// cap so it can't grow without limit. Rule patterns come from a config file
+/// and are effectively a fixed small set, so the cap should never be reached.
+fn cached_rule_regex(pattern: &str) -> Result<std::sync::Arc<Regex>, regex::Error> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<HashMap<String, std::sync::Arc<Regex>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+
+    if let Some(re) = cache.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
+        return Ok(std::sync::Arc::clone(re)); // refcount bump, not a recompile
+    }
+    let re = std::sync::Arc::new(Regex::new(pattern)?);
+    let mut w = cache.write().unwrap_or_else(|e| e.into_inner());
+    if w.len() >= REWRITE_REGEX_CACHE_CAP {
+        w.clear();
+    }
+    w.insert(pattern.to_string(), std::sync::Arc::clone(&re));
+    Ok(re)
+}
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -391,9 +425,9 @@ fn check_condition(
                 _ => request_uri,
             };
             let pattern = if cond.case_sensitive {
-                Regex::new(&cond.value)
+                cached_rule_regex(&cond.value)
             } else {
-                Regex::new(&format!("(?i){}", cond.value))
+                cached_rule_regex(&format!("(?i){}", cond.value))
             };
             let found = pattern.map(|re| re.is_match(actual)).unwrap_or(false);
             return match cond.operator {
@@ -471,9 +505,9 @@ pub fn apply_rewrite_rules(
         };
 
         let regex = if rule.case_sensitive {
-            Regex::new(&pattern_str)
+            cached_rule_regex(&pattern_str)
         } else {
-            Regex::new(&format!("(?i){}", pattern_str))
+            cached_rule_regex(&format!("(?i){}", pattern_str))
         };
 
         let regex = match regex {

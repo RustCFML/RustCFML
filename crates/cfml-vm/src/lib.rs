@@ -21871,19 +21871,26 @@ impl CfmlVirtualMachine {
             let value = arg_values.get(i).cloned().unwrap_or(CfmlValue::Null);
             if name.eq_ignore_ascii_case("argumentcollection") {
                 if let CfmlValue::Struct(s) = &value {
-                    for (k, v) in s.iter() {
-                        if let Ok(pos) = k.parse::<usize>() {
-                            if pos >= 1 {
-                                numeric_positional.push((pos - 1, v.clone()));
-                                continue;
+                    // Lock-held read: the body only parses/compares keys and clones
+                    // out, so it can't re-enter `s`. `iter()` here cloned the whole
+                    // argumentCollection map on every spread — hot in Preside/
+                    // ColdBox/Wheels, which forward `argumentCollection=arguments`
+                    // constantly. See `CfmlStruct::with_map`'s re-entrancy caveat.
+                    s.with_map(|m| {
+                        for (k, v) in m.iter() {
+                            if let Ok(pos) = k.parse::<usize>() {
+                                if pos >= 1 {
+                                    numeric_positional.push((pos - 1, v.clone()));
+                                    continue;
+                                }
                             }
+                            if explicit_named.contains(&k.to_lowercase()) {
+                                continue; // explicit named arg wins
+                            }
+                            expanded_names.push(k.clone());
+                            expanded_values.push(v.clone());
                         }
-                        if explicit_named.contains(&k.to_lowercase()) {
-                            continue; // explicit named arg wins
-                        }
-                        expanded_names.push(k.clone());
-                        expanded_values.push(v.clone());
-                    }
+                    });
                     continue;
                 }
                 // An ARRAY argumentCollection spreads as POSITIONAL args by index
@@ -33049,12 +33056,21 @@ impl CfmlVirtualMachine {
                 .filter(|c| cfml_common::locale::is_known_locale(c))
             {
                 self.locale = code.clone();
-                // The ls* family reads the process/thread-local current locale,
-                // not `self.locale` — setLocale() sets both, so this must too or
-                // lsNumberFormat/lsDateFormat stay on the default.
-                cfml_common::locale::set_current_locale(&code);
             }
         }
+        // Republish UNCONDITIONALLY, so the ls* family always agrees with
+        // getLocale() for this request.
+        //
+        // The ls* formatters read a thread-local, not `self.locale`. Only
+        // publishing it on the success arm above left the thread-local holding
+        // whatever the PREVIOUS application on this reused serve-mode worker
+        // thread had set: an app declaring an unusable `this.locale = "xx_YY"`
+        // correctly reported `getLocale() == english (us)` while
+        // `lsNumberFormat(1234.5)` still grouped as German, because the de_DE
+        // fixture had run on that thread first. Same hazard for an app that
+        // declares no locale at all. A later setTimeZone()/setLocale() in the
+        // request still overrides this, as before.
+        cfml_common::locale::set_current_locale(&self.locale);
 
         // 3b. Expand mapping paths relative to Application.cfc directory.
         // Route through `canonicalize_cached` (not `vfs.canonicalize`) so these

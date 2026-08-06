@@ -16,6 +16,41 @@ fn system_property_store(
     PROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Max distinct patterns held by [`java_cached_regex`].
+const JAVA_REGEX_CACHE_CAP: usize = 4096;
+
+/// Compile `pattern`, memoized process-wide.
+///
+/// `java.util.regex` shims used to call `Regex::new` on every operation —
+/// including `java_matcher_step`, which runs once per `while (m.find())`
+/// iteration, so a loop over N matches recompiled the same pattern N times.
+/// On a warm Preside profile that made the Java regex shims ~19% of ALL
+/// allocation (`java_matcher_step` 14.3% + `handle_java_pattern` 5.0%), with
+/// `regex_automata`'s NFA compiler visible in the allocation shapes.
+///
+/// This is a pure memoization: same input, same `Regex`, same compile errors
+/// (which stay uncached — they're cheap and vanishingly rare). Bounded exactly
+/// like `cfml-stdlib`'s `REGEX_CACHE`: on exceeding the cap the map is cleared
+/// wholesale, trading a rare cold rebuild for a hard memory ceiling so an
+/// adversarial workload minting unique patterns can't grow it without limit.
+fn java_cached_regex(pattern: &str) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<regex::Regex>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+    if let Some(re) = cache.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
+        return Ok(std::sync::Arc::clone(re)); // refcount bump, not a recompile
+    }
+    let re = std::sync::Arc::new(regex::Regex::new(pattern)?);
+    let mut w = cache.write().unwrap_or_else(|e| e.into_inner());
+    if w.len() >= JAVA_REGEX_CACHE_CAP {
+        w.clear();
+    }
+    w.insert(pattern.to_string(), std::sync::Arc::clone(&re));
+    Ok(re)
+}
+
 /// Coerce a CFML value used as a Java `byte[]` into raw bytes. Accepts:
 /// - `Binary` (from `toBinary`, `binaryDecode`, …) verbatim;
 /// - an `Array` of signed-byte ints (what `String.getBytes()` returns — see
@@ -4127,8 +4162,8 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             String::new()
         }
     };
-    let compile = |pattern: &str| -> Result<Regex, CfmlError> {
-        Regex::new(pattern).map_err(|e| {
+    let compile = |pattern: &str| -> Result<std::sync::Arc<Regex>, CfmlError> {
+        java_cached_regex(pattern).map_err(|e| {
             CfmlError::runtime(format!(
                 "java.util.regex.Pattern: invalid pattern [{}]: {}",
                 pattern, e
@@ -4309,7 +4344,7 @@ pub fn java_matcher_step(
     use regex::Regex;
     let regex_str = s.get("__regex").map(|v| v.as_string()).unwrap_or_default();
     let input = s.get("__input").map(|v| v.as_string()).unwrap_or_default();
-    let re = Regex::new(&regex_str).map_err(|e| {
+    let re = java_cached_regex(&regex_str).map_err(|e| {
         CfmlError::runtime(format!(
             "java.util.regex.Matcher: invalid pattern [{}]: {}",
             regex_str, e
