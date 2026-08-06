@@ -56,6 +56,7 @@ impl CfmlEngine {
         for (name, func) in get_builtin_functions() {
             vm.builtins.insert(name, func);
         }
+        vm.refresh_builtin_index();
 
         match vm.execute() {
             Ok(_) => {

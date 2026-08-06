@@ -317,6 +317,7 @@ pub(crate) fn run_cfml(
     for (name, func) in get_builtin_functions() {
         vm.builtins.insert(name, func);
     }
+    vm.refresh_builtin_index();
 
     // Wire queryExecute to the dynamic-driver-only variant. The worker
     // build of cfml-stdlib intentionally compiles without any per-engine

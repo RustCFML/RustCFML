@@ -1549,6 +1549,24 @@ pub struct CfmlVirtualMachine {
     pub program: BytecodeProgram,
     pub globals: ValueMap,
     pub builtins: HashMap<String, BuiltinFunction>,
+    /// ASCII-lowercased index of `builtins`' keys, for the case-insensitive
+    /// "is this name a builtin?" probe on the `LoadLocalKey`/`LoadVariablesKey`
+    /// peephole — the hottest path in the engine.
+    ///
+    /// Builtins are registered MIXED-case (`writeOutput`, `writeDump`), so the
+    /// old exact-match `contains_key` missed for most call sites and fell into a
+    /// linear `eq_ignore_ascii_case` scan of all ~400 keys. On a live Preside
+    /// admin profile (v0.565.0) that probe was ~7% of total CPU in `make_hash`
+    /// alone — `builtins` is a std `HashMap`, i.e. SipHash — plus ~2.7% more in
+    /// the scan itself (`Iterator::find` + `SlicePartialEq::equal`).
+    ///
+    /// `builtins` is a public field that embedders (cli/wasm/worker) insert into
+    /// directly, so the index carries the `builtins.len()` it was built from and
+    /// is only trusted while those agree; otherwise the probe falls back to the
+    /// original correct-but-slow path. Call `refresh_builtin_index()` after bulk
+    /// registration to arm it.
+    builtin_names_lc: std::collections::HashSet<String, cfml_common::dynamic::ValueBuildHasher>,
+    builtin_lc_src_len: usize,
     /// Memoized `isValid` builtin, for the §29 declared-type checks (which need
     /// the format predicates but must not pay a case-insensitive scan of the
     /// whole builtin table on every typed call). `Some(None)` = looked up and
@@ -2471,6 +2489,8 @@ impl CfmlVirtualMachine {
             program,
             globals: ValueMap::default(),
             builtins: HashMap::new(),
+            builtin_names_lc: std::collections::HashSet::default(),
+            builtin_lc_src_len: usize::MAX, // no index yet — probe takes the slow path
             type_check_is_valid: None,
             output_buffer: String::new(),
             vfs: Arc::new(RealFs),
@@ -4054,8 +4074,42 @@ impl CfmlVirtualMachine {
     ///
     /// `name` is stored as-provided; CFML's call dispatcher already does a
     /// case-insensitive fallback on builtin lookup.
+    /// Rebuild the lowercased builtin-name index. Cheap (one pass over ~400
+    /// keys) and idempotent. Embedders that bulk-insert into the public
+    /// `builtins` field MUST call this afterwards, otherwise the hot-path probe
+    /// silently falls back to the O(n) scan it exists to replace.
+    pub fn refresh_builtin_index(&mut self) {
+        self.builtin_names_lc = self
+            .builtins
+            .keys()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
+        self.builtin_lc_src_len = self.builtins.len();
+    }
+
+    /// Case-insensitive "is `name` a builtin?" — equivalent to
+    /// `builtins.contains_key(name) || builtins.keys().any(|k| k.eq_ignore_ascii_case(name_lower))`
+    /// but a single Fx-hashed probe when the index is current.
+    ///
+    /// `name_lower` must be `name.to_lowercase()`. Unicode-lowercasing never
+    /// produces ASCII uppercase, so for the ASCII-only builtin names this matches
+    /// `eq_ignore_ascii_case` exactly.
+    #[inline]
+    fn is_builtin_name_ci(&self, name: &str, name_lower: &str) -> bool {
+        if self.builtin_lc_src_len == self.builtins.len() {
+            return self.builtin_names_lc.contains(name_lower);
+        }
+        self.builtins.contains_key(name)
+            || self
+                .builtins
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(name_lower))
+    }
+
     pub fn register_native_fn(&mut self, name: &str, f: BuiltinFunction) {
         self.builtins.insert(name.to_string(), f);
+        // Keep the hot-path index in step with the map it indexes.
+        self.refresh_builtin_index();
         self.globals.insert(
             name.to_string(),
             CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
@@ -6560,9 +6614,13 @@ impl CfmlVirtualMachine {
                             if let CfmlValue::Struct(s) = val {
                                 // Preserve __variables if present; merge everything else.
                                 let saved_vars = locals.get("__variables").cloned();
-                                for (k, v) in s.iter() {
-                                    locals.insert(k.clone(), v.clone());
-                                }
+                                // `locals` is a plain ValueMap, so it can't alias `s` —
+                                // merge under the read lock instead of cloning `s` whole.
+                                s.with_map(|m| {
+                                    for (k, v) in m.iter() {
+                                        locals.insert(k.clone(), v.clone());
+                                    }
+                                });
                                 if let Some(v) = saved_vars {
                                     locals.insert("__variables".to_string(), v);
                                 }
@@ -7056,11 +7114,7 @@ impl CfmlVirtualMachine {
                     // visible (`variables.log` must return the variable, not the
                     // log() builtin).
                     let is_read_position = matches!(op, BytecodeOp::LoadVariablesKey(_));
-                    let is_builtin_name = self.builtins.contains_key(name.as_str())
-                        || self
-                            .builtins
-                            .keys()
-                            .any(|b| b.eq_ignore_ascii_case(&name_lower));
+                    let is_builtin_name = self.is_builtin_name_ci(name.as_str(), &name_lower);
                     let local_hit_visible = match &local_hit {
                         None => false,
                         _ if is_read_position => true,
@@ -9659,11 +9713,15 @@ impl CfmlVirtualMachine {
                                     .or_else(|| s.get(&name.to_uppercase()))
                                     .or_else(|| s.get(&name.to_lowercase()))
                                     .or_else(|| {
-                                        // Full case-insensitive scan for mixed-case keys
+                                        // Full case-insensitive scan for mixed-case keys.
+                                        // Pure key compare + one value clone, so read under
+                                        // the lock instead of cloning the whole struct.
                                         let name_lower = name.to_lowercase();
-                                        s.iter()
-                                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                                            .map(|(_, v)| v)
+                                        s.with_map(|m| {
+                                            m.iter()
+                                                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
+                                                .map(|(_, v)| v.clone())
+                                        })
                                     })
                                     .or_else(|| {
                                         // Fall back to __variables for component properties
@@ -20366,10 +20424,16 @@ impl CfmlVirtualMachine {
                 if let Some(v) = args.get(name) {
                     return Some(v.clone());
                 }
-                if let Some((_, v)) = args.iter().find(|(k, _)| {
-                    !k.starts_with("__arguments_") && k.eq_ignore_ascii_case(name_lower)
+                // Pure key comparison + one value clone — no need to copy the
+                // whole arguments scope just to find a case-insensitive match.
+                if let Some(v) = args.with_map(|m| {
+                    m.iter()
+                        .find(|(k, _)| {
+                            !k.starts_with("__arguments_") && k.eq_ignore_ascii_case(name_lower)
+                        })
+                        .map(|(_, v)| v.clone())
                 }) {
-                    return Some(v.clone());
+                    return Some(v);
                 }
             }
         }
@@ -21063,8 +21127,10 @@ impl CfmlVirtualMachine {
     /// positional keys are irrelevant here and harmlessly included.
     fn argument_scope_key_set(locals: &ValueMap) -> std::collections::HashSet<String> {
         match locals.get(ARGUMENTS_SCOPE_KEY) {
+            // Pure key read — no CFML runs in the closure, so take the lock
+            // rather than cloning the whole arguments scope to read its names.
             Some(CfmlValue::Struct(args)) => {
-                args.iter().map(|(k, _)| k.to_lowercase()).collect()
+                args.with_map(|m| m.keys().map(|k| k.to_lowercase()).collect())
             }
             _ => std::collections::HashSet::new(),
         }

@@ -773,6 +773,7 @@ fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
     for (name, func) in get_builtin_functions() {
         vm.builtins.insert(name, func);
     }
+    vm.refresh_builtin_index();
     apply_native_modules(vm);
     vm.txn_begin = Some(cfml_stdlib::builtins::txn_begin_boxed);
     vm.txn_commit = Some(cfml_stdlib::builtins::txn_commit_boxed);

@@ -1147,6 +1147,23 @@ impl CfmlStruct {
         self.0.read().map.clone()
     }
 
+    /// Read the map UNDER THE LOCK, without copying it.
+    ///
+    /// `iter()`/`snapshot()` clone the whole `IndexMap` on every call, which on a
+    /// live Preside admin profile was ~10% of total CPU (v0.565.0) — scope scans
+    /// that only ever compare keys and clone one value were deep-copying the
+    /// entire scope to do it. Use this instead when the closure is a PURE read.
+    ///
+    /// 🚨 The closure runs while the read lock is HELD. It must NOT call back into
+    /// anything that can touch this same struct (no CFML execution, no builtin
+    /// dispatch, no `write()`/`insert()`/`clear()` on `self`) or it will deadlock.
+    /// That re-entrancy hazard is exactly why `snapshot()` exists — when in doubt,
+    /// or when the loop body runs user code, keep using `snapshot()`/`iter()`.
+    #[inline]
+    pub fn with_map<R>(&self, f: impl FnOnce(&ValueMap) -> R) -> R {
+        f(&self.0.read().map)
+    }
+
     /// A `snapshot()` UNIONED with the shared method table (component flyweight):
     /// a `ValueMap` containing the per-instance data + the class methods. Used by
     /// component-metadata builders that consume a flat `ValueMap` and must still
