@@ -68,5 +68,31 @@ fileDelete(kf);
 directoryDelete(kd);
 assertFalse("cleanup: kind dir removed", directoryExists(kd));
 
+// The SCRIPT form of the file/directory tags reaches the dispatcher under the
+// TAG's own name, so it misses the file*/directory* prefix test that covers
+// fileDelete()/directoryDelete() — a path deleted this way used to stay
+// memoised as present. (The tag forms lower to those BIFs, covered above.)
+tf = tmp & "rustcfml_exists_tag_" & createUUID() & ".txt";
+cffile( action="write", file=tf, output="tagged" );
+assertTrue("script-form cffile write: file exists (memoised)", fileExists(tf));
+cffile( action="delete", file=tf );
+assertFalse("script-form cffile delete invalidates the memoised positive", fileExists(tf));
+
+td = tmp & "rustcfml_exists_tagdir_" & createUUID();
+cfdirectory( action="create", directory=td );
+assertTrue("script-form cfdirectory create: dir exists (memoised)", directoryExists(td));
+cfdirectory( action="delete", directory=td );
+assertFalse("script-form cfdirectory delete invalidates the memoised positive", directoryExists(td));
+
+// An external program invoked by cfexecute can delete a memoised path behind
+// the engine's back, so the whole memo has to go across the call.
+xf = tmp & "rustcfml_exists_exec_" & createUUID() & ".txt";
+fileWrite(xf, "bye");
+assertTrue("cfexecute target exists (memoised)", fileExists(xf));
+</cfscript>
+<cfexecute name="/bin/rm" arguments="#xf#" timeout="10" />
+<cfscript>
+assertFalse("cfexecute invalidates the memoised positive", fileExists(xf));
+
 suiteEnd();
 </cfscript>

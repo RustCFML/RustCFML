@@ -19093,6 +19093,17 @@ impl CfmlVirtualMachine {
 
                 // ---- cfexecute tag handler ----
                 "__cfexecute" => {
+                    // An external program can delete or move anything, so the
+                    // request existence memo cannot be trusted across it.
+                    // VM-intercepted, so the BIF dispatcher's
+                    // `builtin_may_change_existence` check never sees it.
+                    //
+                    // Dropped on the way IN rather than out, which is equivalent
+                    // and survives the handler's many early returns: this thread
+                    // is blocked in the child process for the duration, so no
+                    // CFML runs and nothing can repopulate the memo before the
+                    // first post-`cfexecute` probe re-stats.
+                    self.request_exists_cache.write().clear();
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         let cmd_name = opts
                             .iter()
@@ -30286,6 +30297,16 @@ impl CfmlVirtualMachine {
                 | "spreadsheetwritetocsv"
                 | "cfzip"
                 | "writelog"
+                // Script-form tag builtins — `cffile( action="delete", … )`,
+                // `cfdirectory( action="delete", … )`. These reach the
+                // dispatcher under the TAG's name, so the `file`/`directory`
+                // prefix test above never matched them and a path they deleted
+                // stayed memoised as present for the rest of the request. (The
+                // tag forms are safe already: `<cffile action="delete">` lowers
+                // to `fileDelete()`, which the prefix test does cover.)
+                | "cffile"
+                | "cfdirectory"
+                | "__cfdirectory"
         )
     }
 
