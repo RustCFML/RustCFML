@@ -8019,6 +8019,13 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
         }
         filter
             .split('|')
+            // Lucee trims each sub-pattern, so a stray space in application code
+            // ("*.css | *.min.js", or a hand-typed exact filename with a trailing
+            // space) still matches. We used to compare the raw slice, which made
+            // such a filter silently match nothing — Preside's Sticker turns
+            // `addAsset( path="/js/lib/x.min.js " )` into an exact-name filter and
+            // threw Sticker.missingAsset for a file that was right there on disk.
+            .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .map(|pattern| {
                 if !pattern.contains('*') && !pattern.contains('?') {

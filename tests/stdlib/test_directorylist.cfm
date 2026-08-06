@@ -90,6 +90,24 @@ assert("? matched correct file", qmark[1], "ab1.log");
 multi = directoryList(tmpDir, false, "name", "*.min.js|ab?.log");
 assert("pipe-delimited filter matches union", arrayLen(multi), 3);
 
+// Each sub-pattern is TRIMMED before matching (Lucee parity). Regression: a
+// stray space made the filter silently match nothing — Preside's Sticker passes
+// an exact filename straight from an extension's StickerBundle.cfc, and a
+// trailing space there ("/js/lib/x.min.js ") threw Sticker.missingAsset for a
+// file that existed on disk.
+exactTrail = directoryList(tmpDir, false, "name", "file2.cfm ");
+assert("exact filter with trailing space trims", arrayLen(exactTrail), 1);
+assert("exact filter with trailing space matched", exactTrail[1], "file2.cfm");
+
+exactLead = directoryList(tmpDir, false, "name", " file2.cfm");
+assert("exact filter with leading space trims", arrayLen(exactLead), 1);
+
+globTrail = directoryList(tmpDir, false, "name", "*.cfm ");
+assert("glob filter with trailing space trims", arrayLen(globTrail), 1);
+
+pipeSpaced = directoryList(tmpDir, false, "name", "*.min.js | ab?.log ");
+assert("pipe-delimited filter trims each sub-pattern", arrayLen(pipeSpaced), 3);
+
 // Cleanup
 directoryDelete(tmpDir, true);
 
