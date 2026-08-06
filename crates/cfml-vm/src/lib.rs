@@ -9078,10 +9078,21 @@ impl CfmlVirtualMachine {
                                 .or_else(|| s.get(&key.to_uppercase()))
                                 .or_else(|| s.get(&key.to_lowercase()))
                                 .or_else(|| {
+                                    // Pure key compare + one value clone, so read
+                                    // UNDER the lock. `iter()` here is `snapshot()`:
+                                    // it cloned the whole struct to find one key, and
+                                    // on a warm Preside page this single site copied
+                                    // ~half of all snapshotted entries (mean map ~222
+                                    // entries, ~67 calls/request) — the largest
+                                    // allocation owner in the VM. `GetProperty`'s
+                                    // sibling CI scan was fixed this way in v0.566.0;
+                                    // the bracket-access path was missed.
                                     let key_lower = key.to_lowercase();
-                                    s.iter()
-                                        .find(|(k, _)| k.eq_ignore_ascii_case(&key_lower))
-                                        .map(|(_, v)| v)
+                                    s.with_map(|m| {
+                                        m.iter()
+                                            .find(|(k, _)| k.eq_ignore_ascii_case(&key_lower))
+                                            .map(|(_, v)| v.clone())
+                                    })
                                 });
                             // Arguments-scope positional fallback: when the
                             // index is numeric N (1-based) and there's no
@@ -9116,14 +9127,19 @@ impl CfmlVirtualMachine {
                                         // first bound arg even when the callee declares
                                         // no params (the Wheels $set() shape).
                                         by_param.unwrap_or_else(|| {
-                                            s.iter()
-                                                .filter(|(k, _)| {
-                                                    k.as_str() != "__arguments_scope"
-                                                        && k.as_str() != "__arguments_params"
-                                                })
-                                                .nth(idx)
-                                                .map(|(_, v)| v)
-                                                .unwrap_or(CfmlValue::Null)
+                                            // Same pure read as above — positional
+                                            // scan, one value cloned out. Was another
+                                            // whole-struct `snapshot()` per lookup.
+                                            s.with_map(|m| {
+                                                m.iter()
+                                                    .filter(|(k, _)| {
+                                                        k.as_str() != "__arguments_scope"
+                                                            && k.as_str() != "__arguments_params"
+                                                    })
+                                                    .nth(idx)
+                                                    .map(|(_, v)| v.clone())
+                                                    .unwrap_or(CfmlValue::Null)
+                                            })
                                         })
                                     } else {
                                         CfmlValue::Null
