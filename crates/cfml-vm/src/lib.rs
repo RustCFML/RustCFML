@@ -6751,7 +6751,15 @@ impl CfmlVirtualMachine {
                             // via `arguments.param.prop = val` are visible to the
                             // pass-by-reference writeback mechanism.
                             if let CfmlValue::Struct(ref args) = val {
-                                for (k, v) in args.iter() {
+                                // Read UNDER the lock. `iter()` is `snapshot()`, so this
+                                // cloned the whole arguments scope on every `arguments = …`
+                                // store — ~881 calls/request over ~7-entry maps on a warm
+                                // Preside page, the largest remaining snapshot site (33% of
+                                // all entries copied). The body only compares keys and
+                                // writes into `locals`, which is the frame's own ValueMap
+                                // and a different object from `args`, so it cannot re-enter.
+                                args.with_map(|m| {
+                                for (k, v) in m.iter() {
                                     // Never sync internal markers (__variables, __name,
                                     // this, super) from the arguments scope back into the
                                     // frame's locals: they are not real parameters, and a
@@ -6792,6 +6800,7 @@ impl CfmlVirtualMachine {
                                     // `++arguments.closureIndex`).
                                     locals.insert(k.clone(), v.clone());
                                 }
+                                });
                             }
                             // The arguments scope lives under the reserved key, not
                             // the literal "arguments" (which is a user local var).
@@ -20466,14 +20475,14 @@ impl CfmlVirtualMachine {
             }
         }
         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
-            if let Some(v) = vars.get(name) {
-                return Some(v.clone());
-            }
-            if let Some((_, v)) = vars
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
-            {
-                return Some(v.clone());
+            // `get_ci` is exact-then-case-insensitive under ONE read lock, cloning
+            // only the matched value. It subsumes the exact probe plus the CI scan
+            // that used to follow it — and that scan was `iter()`, i.e. `snapshot()`,
+            // cloning the whole `__variables` map on every miss. ~677 calls/request
+            // on a warm Preside page: 25% of all entries copied engine-wide, the
+            // second-largest snapshot site.
+            if let Some(v) = vars.get_ci(name) {
+                return Some(v);
             }
         }
         if let Some(v) = self.globals.get(name) {
