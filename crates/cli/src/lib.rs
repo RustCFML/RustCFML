@@ -1712,6 +1712,24 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The serve-mode startup banner. Called ONLY after a listener has been bound,
+/// so its appearance is proof the server is accepting — it previously printed
+/// during setup and could be immediately followed by a fatal bind error.
+///
+/// Carries the binary's version so a running server can be identified at a
+/// glance (which build is this? did my install actually take?) without having
+/// to stop it and run `--version`.
+fn print_ready_banner(what: &str, mode: &str, doc_root: &Path) {
+    println!(
+        "RustCFML server v{} {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        what,
+        mode
+    );
+    println!("Document root: {}", doc_root.display());
+    println!("Press Ctrl+C to stop\n");
+}
+
 async fn async_run_server(
     doc_root: &Path,
     port: u16,
@@ -1825,12 +1843,14 @@ async fn async_run_server(
     };
 
     let mode = if single_threaded { "single-threaded" } else { "multi-threaded" };
-    match &socket {
-        Some(path) => println!("RustCFML server listening on Unix socket: {} ({})", path.display(), mode),
-        None => println!("RustCFML server running on http://0.0.0.0:{} ({})", port, mode),
-    }
-    println!("Document root: {}", fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()).display());
-    println!("Press Ctrl+C to stop\n");
+    // The banner is NOT printed here. It used to be, ~120 lines before the
+    // listener was actually created, so a failed bind printed "RustCFML server
+    // running on ..." and only then "Failed to start server: Address already in
+    // use" — the success line arriving before the fatal error that contradicted
+    // it. It is now emitted by `print_ready_banner` at each bind site, once the
+    // listener exists, and reports the address actually bound rather than a
+    // hardcoded 0.0.0.0 (which was wrong whenever `server.host` was set).
+    let banner_root = fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf());
 
     // Spawn the background session reaper (serve mode only). It drains expired
     // session data off the request path on a timer and queues `onSessionEnd`
@@ -1907,6 +1927,11 @@ async fn async_run_server(
                     eprintln!("Failed to bind Unix socket {}: {}", sock_path.display(), e);
                     exit(1);
                 });
+                print_ready_banner(
+                    &format!("listening on Unix socket: {}", sock_path.display()),
+                    mode,
+                    &banner_root,
+                );
                 // Unix-socket peers have no IP address, so the
                 // ConnectInfo<SocketAddr> extractor in `handle_request` would
                 // fail at runtime under `into_make_service()`. Inject a synthetic
@@ -1952,6 +1977,13 @@ async fn async_run_server(
                 eprintln!("Failed to start server on {}:{}: {}", host, port, e);
                 exit(1);
             });
+            // Report the address the OS actually gave us — with `--port 0` that
+            // is the assigned ephemeral port, not the literal 0 that was asked for.
+            let bound = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| format!("{host}:{port}"));
+            print_ready_banner(&format!("running on http://{bound}"), mode, &banner_root);
             // Disable Nagle's algorithm on accepted connections. For a request/response
             // HTTP server, Nagle adds latency by holding small writes, and can stall on
             // the classic Nagle + delayed-ACK interaction. axum::serve does not set this

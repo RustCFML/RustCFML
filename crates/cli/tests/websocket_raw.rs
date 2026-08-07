@@ -20,8 +20,31 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Ask the OS for an unused port, then release it so the child can bind it.
+///
+/// The release is unavoidable — the child binds the port itself — so there is
+/// always a window in which another process can take it. With 11 tests starting
+/// servers at once that window loses often enough to matter, so callers MUST
+/// handle the child failing to bind; `start_server` retries on a fresh port.
+///
+/// Ports already handed out by this process are skipped: two tests drawing the
+/// same port from the OS is the common case when many bind/close in a burst.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    use std::sync::Mutex;
+    static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    for _ in 0..50 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut seen = HANDED_OUT.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&port) {
+            seen.push(port);
+            return port;
+        }
+    }
+    panic!("could not find an unused port in 50 attempts");
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -41,23 +64,119 @@ impl Drop for Server {
     }
 }
 
+/// Spawn a serve-mode server and return only once it is genuinely accepting.
+///
+/// This used to poll for up to 5s and then return the `Server` REGARDLESS of
+/// whether anything was listening. When it lost the `free_port` race the child
+/// died with "Address already in use (os error 48)" and exit code 1, but the
+/// harness ignored that and handed back a dead server — so the test failed far
+/// away at `connect_async` with a misleading `Connection refused`. Running the
+/// 11 tests in parallel, that cost roughly one spurious failure per run, on a
+/// different test each time.
+///
+/// Now: a child that exits is detected and retried on a fresh port, and a
+/// server that never accepts panics with the child's own output instead of
+/// being passed off as healthy.
 async fn start_server() -> Server {
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
-        .arg("--serve")
-        .arg(fixtures_dir())
-        .arg("--port")
-        .arg(port.to_string())
-        .spawn()
-        .expect("spawn rustcfml --serve");
-    // Wait for the port to accept connections.
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
+    const ATTEMPTS: usize = 5;
+    const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let mut last_failure = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let port = free_port();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
+            .arg("--serve")
+            .arg(fixtures_dir())
+            .arg("--port")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn rustcfml --serve");
+
+        let deadline = std::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match child.try_wait().expect("poll server child") {
+                // Exited before accepting — lost the port race, or a real
+                // startup failure. Either way its own stderr says which.
+                Some(status) => {
+                    last_failure = format!(
+                        "attempt {attempt}: server exited ({status}) before accepting on port \
+                         {port}{}",
+                        child_output(&mut child)
+                    );
+                    break;
+                }
+                None => {}
+            }
+            if serves_http(port) {
+                return Server { child, port };
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                last_failure = format!(
+                    "attempt {attempt}: server never accepted on port {port} within \
+                     {READY_TIMEOUT:?}{}",
+                    child_output(&mut child)
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Server { child, port }
+    panic!("could not start `rustcfml --serve` in {ATTEMPTS} attempts. Last: {last_failure}");
+}
+
+/// Is the server actually SERVING, not merely bound?
+///
+/// A bare `TcpStream::connect` only proves the listener exists. The bind happens
+/// before the CFML application has booted and registered its WS channels, so a
+/// connect-only probe let tests fire an upgrade into that window — where it is
+/// answered with a 404/failure and the test dies on `connect_async(..).expect()`
+/// somewhere far from the cause. One full HTTP round-trip forces the app through
+/// boot, so by the time this returns true the channels are registered.
+fn serves_http(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    if s.write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 12];
+    let mut got = 0;
+    while got < buf.len() {
+        match s.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => return false,
+        }
+    }
+    buf[..got].starts_with(b"HTTP/")
+}
+
+/// Drain whatever the child managed to say, for panic messages.
+fn child_output(child: &mut Child) -> String {
+    use std::io::Read;
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let mut buf = String::new();
+        let _ = s.read_to_string(&mut buf);
+        out.push_str(&buf);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let mut buf = String::new();
+        let _ = s.read_to_string(&mut buf);
+        out.push_str(&buf);
+    }
+    if out.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n--- server output ---\n{}", out.trim())
+    }
 }
 
 /// Receive the next text frame, parsed as JSON, within a timeout.
@@ -383,18 +502,26 @@ async fn onconnect_rejection_closes_handshake() {
     // The upgrade itself succeeds (HTTP 101), but onConnect returns false so
     // the server immediately closes. The client sees the stream end with a
     // close, not a welcome.
-    let (mut ws, _) = connect_async(&url).await.expect("upgrade ok");
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Close(_))) | None => return true,
-                Some(Ok(_)) => return false, // any data frame = not rejected
-                Some(Err(_)) => return true,
+    // The close races the handshake: usually the upgrade completes (HTTP 101)
+    // and the close frame lands just after, but the server is entitled to drop
+    // the connection before the client has read the 101, in which case
+    // `connect_async` itself errors. Both are the same rejection, so accept
+    // either — insisting on the first ordering made this test fail sporadically.
+    // What must NOT happen is the connection being fed data, and that still fails.
+    let closed = match connect_async(&url).await {
+        Err(_) => true,
+        Ok((mut ws, _)) => tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | None => return true,
+                    Some(Ok(_)) => return false, // any data frame = not rejected
+                    Some(Err(_)) => return true,
+                }
             }
-        }
-    })
-    .await
-    .expect("timed out");
+        })
+        .await
+        .expect("timed out"),
+    };
     assert!(closed, "rejected connection should be closed, not fed data");
     drop(server);
 }
