@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.562.0**.
+What RustCFML **does not fully do**, as of **v0.574.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
@@ -55,6 +55,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [20](#20) | `binary.equals()` compares by value | 🌟 by design |
 | [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
+| [39](#39) | `.cfconfig.json` placeholders expand single-pass (GH #306) | 🌟 won't-fix |
 
 **Part D — Implemented, with documented edges 🏗**
 
@@ -71,6 +72,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [18](#18) | Image functions — not pixel-identical to Java2D | 🏗 edges |
 | [22](#22) | Within-request template freshness (GH #284) | 🏗 by design |
 | [26](#26) | Locale table is hand-maintained (GH #304) | 🏗 edges |
+| [38](#38) | Database exception `sqlState` is driver-dependent (GH #295) | 🏗 edges |
 
 **Part E — Environment-specific 🌍**
 
@@ -443,6 +445,47 @@ intercepting scope value type — deferred.
 Related pre-existing (unchanged) page-frame edges, pinned in the same test: a
 caller-write of a UDF-local-shadowed key from a page-level UDF also updates variables,
 and a caller-write of an `arguments`-shadowed key misses the arguments scope.
+
+<a id="39"></a>
+
+## 39. `.cfconfig.json` placeholder expansion is single-pass 🌟 *(divergence, GH [#306](https://github.com/RustCFML/RustCFML/issues/306))*
+
+`${VAR:default}` substitution in `.cfconfig.json` runs **exactly once** over each string
+value. If a resolved value itself contains `${...}`, that text is left verbatim — it is
+never re-scanned, at any offset, to any depth. This is deliberate and will not change.
+
+Lucee is inconsistent here rather than recursive. Its importer
+(`lucee.runtime.config.CFConfigImport#replacePlaceHolder`) splices the substituted text
+in at `startIndex` but resumes scanning at `startIndex + 1`, so with `A="y${B}"` and
+`B="zzz"`:
+
+| Input | Lucee | RustCFML |
+|---|---|---|
+| `${A}` where `A="y${B}"` | `yzzz` — the nested `${` sits at offset 1, so it is re-scanned | `y${B}` |
+| `${A}` where `A="${B}"` | `${B}` — the nested `${` lands on `startIndex` and is skipped | `${B}` |
+
+The two engines already agree on the second row. Only the first diverges, and Lucee's
+result there is a boundary artifact of the resume index, not a documented rule: the same
+value expands differently depending on whether the nested `${` happens to be the first
+character.
+
+**Why we don't match it, in either direction:**
+
+- Reproducing the off-by-one bug-for-bug gives a rule nobody can state, let alone rely on.
+- Implementing *full* recursive expansion would be a different divergence, not a fix — it
+  changes the meaning of a value that today survives verbatim, and it disagrees with
+  Lucee on the second row, which currently matches.
+- Recursive expansion of environment-supplied text is also the abuse surface. Config
+  values come from the deployment environment; letting one env var inject a placeholder
+  that expands another turns "set `DB_PASSWORD`" into "set `DB_PASSWORD` and thereby read
+  any other variable the process can see", with cycles and expansion blow-ups to bound on
+  top. Single-pass makes the value you set the value you get.
+
+Nothing needs it: a config value containing a literal `${` is unusual, and one containing
+a nested reference *expected to resolve* more so. If a real dual-engine config turns up
+that depends on the nested form, reopen #306 — but the fix would be to flatten the config,
+not to add a second pass. Pinned by `env_value_with_dollar_brace_is_not_recursed` in
+`crates/cfml-config/src/env.rs`. See also `docs/configuration.md`.
 
 ---
 

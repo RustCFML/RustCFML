@@ -66,6 +66,17 @@ equivalent here and is skipped. Only the first `}` closes a placeholder, an
 unterminated `${` is left verbatim, and expansion is single-pass: a value that
 itself contains `${...}` is not re-scanned.
 
+**Nested placeholders are deliberately not supported.** A resolved value that
+contains `${...}` is left exactly as it is, at any offset and to any depth.
+Recursive expansion of environment-supplied text is an abuse surface — it lets
+one env var inject a reference that pulls in another, so "set `DB_PASSWORD`"
+quietly becomes "set `DB_PASSWORD` and thereby read anything else in the
+process's environment" — and it buys nothing a flatter config doesn't. Lucee is
+inconsistent rather than recursive here (it re-expands a nested `${` at offset
+≥ 1 and skips one at offset 0, an artifact of its scan loop); we match it in the
+skip case and refuse in the other. See §39 of `docs/known-issues.md` and
+GH [#306](https://github.com/RustCFML/RustCFML/issues/306).
+
 A placeholder that resolves to nothing and has no fallback becomes an empty
 string; it is not left verbatim.
 
