@@ -7,7 +7,12 @@ f = runAsync(function() {
 });
 assert("runAsync returns a value via get()", f.get(), 42);
 assertTrue("future.isDone after get()", f.isDone());
-assert("future.status COMPLETED", f.status(), "COMPLETED");
+// `status()` / `error()` are RustCFML extensions to the Future surface; Lucee's
+// Future exposes only cancel/isCancelled/isDone/error/get/then, so calling
+// status() there is a hard error rather than a failed assertion.
+if (isRustCFML()) {
+    assert("future.status COMPLETED", f.status(), "COMPLETED");
+}
 
 // ---- Closure can return any CFML value
 fStr = runAsync(function() { return "hello"; });
@@ -31,7 +36,10 @@ try {
     assertTrue("error message preserved", findNoCase("async boom", e.message) gt 0);
 }
 assertTrue("get() rethrows closure error", errCaught);
-assert("future.error populated", findNoCase("async boom", fErr.error()) gt 0, true);
+// Lucee's `error` is the error-CALLBACK registrar (error(fn)), not a getter.
+if (isRustCFML()) {
+    assert("future.error populated", findNoCase("async boom", fErr.error()) gt 0, true);
+}
 
 // ---- isDone is false before get() resolves (cant fully guarantee w/o timing
 // but a long-sleeping closure is reliable enough for a smoke check)
@@ -43,13 +51,19 @@ fSleep = runAsync(function() {
 assert("get() on long task returns value", fSleep.get(), "done");
 assertTrue("isDone after wait", fSleep.isDone());
 
-// ---- get(timeoutMs) — Null on timeout
+// ---- get(timeoutMs) — Null on timeout.
+// RustCFML-only: Lucee THROWS on a timed-out get() rather than returning null,
+// and a get() after cancel() raises CancellationException instead of returning
+// the completed body's value. Both are real divergences, recorded here rather
+// than asserted cross-engine.
 fNeverInTime = runAsync(function() {
     sleep(500);
     return "late";
 });
-peek = fNeverInTime.get(10);
-assertTrue("get(timeout) returns null on timeout", isNull(peek) || peek eq "");
+if (isRustCFML()) {
+    peek = fNeverInTime.get(10);
+    assertTrue("get(timeout) returns null on timeout", isNull(peek) || peek eq "");
+}
 // Then wait properly
 final = fNeverInTime.get();
 assert("subsequent get() returns the value", final, "late");
@@ -64,7 +78,11 @@ fCancel = runAsync(function() {
 didCancel = fCancel.cancel();
 assertTrue("cancel() returns true on a live future", didCancel);
 // Wait for the body to finish (cancel doesnt kill; documented Lucee divergence).
-fCancel.get();
+// Lucee raises CancellationException from this get(); RustCFML returns the
+// value the body produced anyway.
+if (isRustCFML()) {
+    fCancel.get();
+}
 
 writeOutput("[async_kernel] runAsync + Future tests OK" & chr(10));
 suiteEnd();

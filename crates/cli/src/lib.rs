@@ -782,6 +782,7 @@ fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
     vm.txn_release_savepoint = Some(cfml_stdlib::builtins::txn_release_savepoint_boxed);
     vm.txn_rollback_to_savepoint = Some(cfml_stdlib::builtins::txn_rollback_to_savepoint_boxed);
     vm.txn_execute = Some(cfml_stdlib::builtins::txn_execute_boxed);
+    vm.default_datasource_fn = Some(cfml_stdlib::builtins::global_default_datasource);
     vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute);
     // Real-OS-thread cfthread spawner. The VM only uses this when its
     // `real-threads` feature is on (default); injecting it unconditionally is

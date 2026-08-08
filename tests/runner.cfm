@@ -253,6 +253,12 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_file_relative_path.cfm">
 <!--- java.util.concurrent shim + createDynamicProxy (ColdBox/Preside async). --->
 <cf_runtest file="stdlib/test_java_concurrent.cfm">
+<!--- Async kernel: runAsync/Future and _schedule (one-shot + periodic). These --->
+<!--- two suites existed but were never wired into the runner, so the GH #314 --->
+<!--- periodic-schedule no-op had no coverage. test_schedule self-skips on --->
+<!--- engines without `_schedule` (Lucee). --->
+<cf_runtest file="async_kernel/test_run_async.cfm">
+<cf_runtest file="async_kernel/test_schedule.cfm">
 <!--- Engine fixes surfaced by booting ColdBox (case-insensitive locals, --->
 <!--- structAppend-from-component, component hashCode, java.time shim). --->
 <cf_runtest file="stdlib/test_coldbox_engine_fixes.cfm">
@@ -883,6 +889,11 @@ include "harness.cfm";
 <!--- leaks them into JSON; breaks Wheels helpers that serialize copied arg structs. --->
 <cf_runtest file="core/test_serializejson_arguments_sentinels.cfm">
 <cf_runtest file="core/test_closure_finally_isolation.cfm">
+<!--- - closures read the LIVE variables scope: a SCOPED write (variables.x = …) --->
+<!--- must reach closures created earlier, exactly as the unscoped form already --->
+<!--- did, and a closure must be able to call itself by the name it was assigned --->
+<!--- to (the scheduling idiom). GitHub #316. --->
+<cf_runtest file="core/test_closure_live_variables_scope.cfm">
 <!--- - delegate annotation metadata: bare + arbitrary-named property annotations --->
 <!--- are captured, and component-level annotations surface top-level in --->
 <!--- getComponentMetadata (Lucee parity) — the surface WireBox delegation reads. --->

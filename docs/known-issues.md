@@ -879,7 +879,7 @@ Restrictions that apply only on a particular target (wasm, CLI vs serve).
 | `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
 | `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
 | `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
-| `_schedule` — `everyMs` / `spacedMs` | 🔇 Ignored on **every** platform, not just wasm — `_schedule` is one-shot only. Periodic re-firing needs a respawn driver that can invoke a CFML closure, which the scheduler has no VM handle for. Compose with `runAsync` chains instead. (This row previously scoped the limitation to wasm32; the discard is unconditional.) |
+| `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads since v0.572.0 (GitHub #314): `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
 | `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
 
 ---

@@ -9692,6 +9692,16 @@ pub fn resolve_datasource(name: &str) -> String {
 /// it, no-DB builds (e.g. wasm32 cfml-worker) flag this as dead code.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub(crate) fn default_datasource() -> Option<String> {
+    global_default_datasource()
+}
+
+/// Public view of the same lookup, for the VM's `default_datasource_fn` hook.
+/// The VM resolves an unqualified `transaction { }` datasource through the
+/// per-app config first; without this last-resort fallback a process-global
+/// default (a cfconfig `default: true` datasource, no `this.datasource`) left
+/// the block with nothing to begin on, so the queries inside it silently ran
+/// OUTSIDE the transaction and rollback was a no-op (GH #315).
+pub fn global_default_datasource() -> Option<String> {
     DATASOURCE_REGISTRY
         .get()
         .and_then(|m| m.lock().unwrap().get("").cloned())
@@ -13044,7 +13054,14 @@ pub fn txn_begin_boxed(datasource: &str) -> Result<Box<dyn std::any::Any>, CfmlE
     if crate::db_driver::has_dynamic_datasource(datasource) {
         return Err(crate::db_driver::dynamic_tx_unsupported(datasource));
     }
-    let conn = transaction_begin(datasource)?;
+    // Resolve the NAME the same way the query path does. `parse_datasource`
+    // treats an unregistered bare name as a SQLite FILE, so a transaction on a
+    // typo'd or not-yet-registered datasource used to silently open (and
+    // create!) `./thatname` and report success — the exact silent-SQLite
+    // fallback GH #173 removed from queries, still live here (GH #315).
+    // An already-resolved connection string passes through unchanged.
+    let resolved = resolve_query_datasource(datasource)?;
+    let conn = transaction_begin(&resolved)?;
     Ok(Box::new(conn))
 }
 

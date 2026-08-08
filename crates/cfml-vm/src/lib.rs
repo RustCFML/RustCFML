@@ -1879,6 +1879,12 @@ pub struct CfmlVirtualMachine {
     pub txn_rollback_to_savepoint: Option<fn(&mut Box<dyn std::any::Any>, &str) -> Result<(), CfmlError>>,
     /// Function pointer: execute query with transaction conn (conn, sql, params, return_type) -> result
     pub txn_execute: Option<fn(&mut Box<dyn std::any::Any>, &str, &CfmlValue, &str) -> CfmlResult>,
+    /// Function pointer: the process-global default datasource URL, if one was
+    /// registered (cfconfig `default: true`). Last resort for
+    /// `get_default_datasource` — the query builtin already falls back to it,
+    /// so without the same fallback here a `transaction { }` over an app with
+    /// only a global default never began and ran its queries unwrapped.
+    pub default_datasource_fn: Option<fn() -> Option<String>>,
     /// Function pointer: execute query normally (args) -> result
     pub query_execute_fn: Option<fn(Vec<CfmlValue>) -> CfmlResult>,
     /// Session ID for current request
@@ -2331,6 +2337,12 @@ pub struct ThreadResult {
 /// real OS thread. `Send` by construction (asserted below): it carries only
 /// shareable state — `Arc`-backed program/functions/scopes plus `CfmlValue`
 /// (which is `Send + Sync`). The parent VM itself never crosses the boundary.
+///
+/// `Clone` so a periodic `_schedule` can hand a fresh copy to every tick: each
+/// run gets its own child VM seeded from the same spawn-time state. The
+/// `cancel_flag` is deliberately shared across clones — one `cancel()` stops
+/// the schedule and the run currently in flight.
+#[derive(Clone)]
 pub struct ThreadSeed {
     pub program: BytecodeProgram,
     pub user_functions: HashMap<String, Arc<BytecodeFunction>>,
@@ -2365,6 +2377,15 @@ pub struct ThreadSeed {
     pub csrf_enabled: bool,
     pub disallowed_functions: std::collections::HashSet<String>,
     pub disallowed_imports: Vec<regex::Regex>,
+    /// Per-application datasources (`this.datasources` / per-app cfconfig),
+    /// lowercased name → resolved connection URL. A spawned thread runs on a
+    /// FRESH VM that never loads Application.cfc or the per-app cfconfig, so
+    /// without these the child resolves every unqualified datasource through
+    /// the process-global registry — and `this.datasource` (the default) not at
+    /// all, silently landing on the `:memory:` SQLite fallback (GH #315).
+    pub app_datasources: IndexMap<String, String>,
+    /// Per-application default datasource URL (`this.datasource`). See above.
+    pub app_default_datasource: Option<String>,
     /// Snapshot of the parent's page-level `thread` soft-scope at spawn. Holds
     /// any `thread.x = ...` values seeded BEFORE the cfthread (the standard CFML
     /// idiom for passing data into a thread). Restored into the child's
@@ -2559,6 +2580,7 @@ impl CfmlVirtualMachine {
             txn_release_savepoint: None,
             txn_rollback_to_savepoint: None,
             txn_execute: None,
+            default_datasource_fn: None,
             session_id: None,
             missing_template: None,
             missing_template_handled: false,
@@ -3670,6 +3692,8 @@ impl CfmlVirtualMachine {
             csrf_enabled: self.csrf_enabled,
             disallowed_functions: self.disallowed_functions.clone(),
             disallowed_imports: self.disallowed_imports.clone(),
+            app_datasources: self.app_datasources.clone(),
+            app_default_datasource: self.app_default_datasource.clone(),
             closure: body,
             attributes,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3713,6 +3737,8 @@ impl CfmlVirtualMachine {
         self.csrf_enabled = seed.csrf_enabled;
         self.disallowed_functions = seed.disallowed_functions;
         self.disallowed_imports = seed.disallowed_imports;
+        self.app_datasources = seed.app_datasources;
+        self.app_default_datasource = seed.app_default_datasource;
         self.cancel_flag = Some(seed.cancel_flag);
         for (k, v) in seed.variables_snapshot {
             self.globals.insert(k, v);
@@ -6671,6 +6697,56 @@ impl CfmlVirtualMachine {
                                     // Non-CFC: merge keys back into locals
                                     for (k, v) in s.iter() {
                                         locals.insert(k.clone(), v.clone());
+                                    }
+                                    // Forward-sync into the shared closure env, exactly
+                                    // like the `local.x = …` branch above and the plain
+                                    // `x = …` store below. A SCOPED write (`variables.x
+                                    // = …`) round-trips the whole scope struct through
+                                    // here instead of hitting StoreLocal's plain-name
+                                    // path, so without this the env's copy went stale
+                                    // and every closure defined earlier kept reading the
+                                    // value the scope held at capture time — while the
+                                    // identical UNSCOPED write updated them correctly
+                                    // (GH #316). Only keys the env already holds, so a
+                                    // scope write can't pollute it with new names.
+                                    if let Some(ref env) = closure_env {
+                                        let mut m = env.write().unwrap();
+                                        s.with_map(|sm| {
+                                            for (k, v) in sm.iter() {
+                                                if k == "__variables" {
+                                                    continue;
+                                                }
+                                                if m.contains_key(k.as_str()) {
+                                                    m.insert(k.clone(), v.clone());
+                                                    continue;
+                                                }
+                                                // Self-binding, mirroring the
+                                                // `is_own_closure` case on the plain-name
+                                                // store: `variables.tick = function(){ …
+                                                // variables.tick( … ) }` binds the name in
+                                                // the same statement that creates the
+                                                // closure, so the env was seeded without
+                                                // it and the body couldn't resolve its own
+                                                // name. Only a function whose captured
+                                                // scope IS this env qualifies, and it goes
+                                                // in with `captured_scope` stripped to
+                                                // avoid the env→fn→env Arc cycle.
+                                                if let CfmlValue::Function(f) = v {
+                                                    if f
+                                                        .captured_scope
+                                                        .as_ref()
+                                                        .is_some_and(|c| Arc::ptr_eq(c, env))
+                                                    {
+                                                        let mut stripped = (**f).clone();
+                                                        stripped.captured_scope = None;
+                                                        m.insert(
+                                                            k.clone(),
+                                                            CfmlValue::Function(Arc::new(stripped)),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -19464,19 +19540,23 @@ impl CfmlVirtualMachine {
                     #[cfg(not(feature = "real-threads"))]
                     let spawn: Option<ThreadSpawnFn> = None;
 
-                    // v1 supports ONE-SHOT scheduling (delayMs then run once).
-                    // Periodic `everyMs`/`spacedMs` is deferred to v2 — would
-                    // need a respawn driver that can't run a CFML closure
-                    // without VM access. v1 ignores those params with a doc'd
-                    // caveat; callers can compose via runAsync chains.
-                    let _ = (every_ms, spaced_ms);
+                    // Periodic mode. `everyMs` is FIXED-RATE (next run measured
+                    // from the previous run's START, like
+                    // ScheduledExecutorService.scheduleAtFixedRate); `spacedMs`
+                    // is FIXED-DELAY (measured from the previous run's END, like
+                    // scheduleWithFixedDelay). If both are supplied `everyMs`
+                    // wins. Non-positive values mean "not periodic".
+                    let period = every_ms
+                        .filter(|v| *v > 0)
+                        .map(|v| (v, true))
+                        .or_else(|| spaced_ms.filter(|v| *v > 0).map(|v| (v, false)));
 
                     #[cfg(feature = "real-threads")]
                     if let Some(spawn_fn) = spawn {
                         let seed = self.build_thread_seed(callback, None);
                         let outer_cancel = seed.cancel_flag.clone();
 
-                        if delay_ms <= 0 {
+                        if delay_ms <= 0 && period.is_none() {
                             let handle = spawn_fn(seed);
                             let fut = async_kernel::FutureNative::from_handle(handle);
                             return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
@@ -19486,7 +19566,10 @@ impl CfmlVirtualMachine {
                         // cfthread worker via spawn_fn, then forward its
                         // ThreadResult out our own channel. The Future holds
                         // our channel's rx side so .get() blocks until the
-                        // relay forwards.
+                        // relay forwards. When a period is set the relay keeps
+                        // re-spawning instead of returning after the first run;
+                        // the Future still resolves on the FIRST run's result
+                        // (a periodic schedule has no single "final" outcome).
                         let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
                         let cancel_for_relay = outer_cancel.clone();
                         let join = std::thread::Builder::new()
@@ -19494,37 +19577,93 @@ impl CfmlVirtualMachine {
                             .spawn(move || {
                                 // Cooperative-cancellable sleep: poll every
                                 // 50ms so cancel() takes effect promptly.
-                                let start = std::time::Instant::now();
-                                let total =
-                                    std::time::Duration::from_millis(delay_ms as u64);
+                                // Returns false if cancelled while waiting.
                                 let step = std::time::Duration::from_millis(50);
+                                let sleep_until = |deadline: std::time::Instant| -> bool {
+                                    loop {
+                                        if cancel_for_relay
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            return false;
+                                        }
+                                        let now = std::time::Instant::now();
+                                        if now >= deadline {
+                                            return true;
+                                        }
+                                        std::thread::sleep((deadline - now).min(step));
+                                    }
+                                };
+
+                                let epoch = std::time::Instant::now();
+                                let first_at = epoch
+                                    + std::time::Duration::from_millis(delay_ms.max(0) as u64);
+                                if !sleep_until(first_at) {
+                                    let _ = tx.send(ThreadResult {
+                                        status: "TERMINATED".to_string(),
+                                        ..Default::default()
+                                    });
+                                    return;
+                                }
+
+                                let mut first = true;
+                                let mut run_at = first_at;
                                 loop {
-                                    if cancel_for_relay
-                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    let inner = spawn_fn(seed.clone());
+                                    // Wait for the inner cfthread to publish.
+                                    let res = inner.rx.recv().ok();
+                                    if let Some(j) = {
+                                        let mut h = inner;
+                                        h.join.take()
+                                    } {
+                                        let _ = j.join();
+                                    }
+                                    let terminated = res
+                                        .as_ref()
+                                        .map(|r| r.status == "TERMINATED")
+                                        .unwrap_or(true);
+                                    if first {
+                                        if let Some(r) = res {
+                                            let _ = tx.send(r);
+                                        }
+                                        first = false;
+                                    }
+                                    // One-shot, or a run that threw: a periodic
+                                    // task that fails is NOT rescheduled (same
+                                    // as ScheduledExecutorService — otherwise a
+                                    // permanently-broken body spins forever).
+                                    let Some((period_ms, fixed_rate)) = period else {
+                                        return;
+                                    };
+                                    if terminated
+                                        || cancel_for_relay
+                                            .load(std::sync::atomic::Ordering::Relaxed)
                                     {
-                                        let _ = tx.send(ThreadResult {
-                                            status: "TERMINATED".to_string(),
-                                            ..Default::default()
-                                        });
                                         return;
                                     }
-                                    let elapsed = start.elapsed();
-                                    if elapsed >= total {
-                                        break;
+                                    let period_dur =
+                                        std::time::Duration::from_millis(period_ms as u64);
+                                    let next = if fixed_rate {
+                                        // Fixed-rate: advance from the previous
+                                        // run's start. If the body overran its
+                                        // period, SKIP the missed ticks rather
+                                        // than firing a catch-up burst (the
+                                        // classic scheduleAtFixedRate surprise);
+                                        // the schedule stays on its phase.
+                                        let mut n = run_at + period_dur;
+                                        let now = std::time::Instant::now();
+                                        while n <= now {
+                                            n += period_dur;
+                                        }
+                                        n
+                                    } else {
+                                        // Fixed-delay: measured from the end of
+                                        // the run that just finished.
+                                        std::time::Instant::now() + period_dur
+                                    };
+                                    if !sleep_until(next) {
+                                        return;
                                     }
-                                    let remaining = total - elapsed;
-                                    std::thread::sleep(remaining.min(step));
-                                }
-                                let inner = spawn_fn(seed);
-                                // Wait for the inner cfthread to publish.
-                                if let Ok(res) = inner.rx.recv() {
-                                    let _ = tx.send(res);
-                                }
-                                if let Some(j) = {
-                                    let mut h = inner;
-                                    h.join.take()
-                                } {
-                                    let _ = j.join();
+                                    run_at = next;
                                 }
                             })
                             .map_err(|e| {
@@ -19546,10 +19685,11 @@ impl CfmlVirtualMachine {
                     }
 
                     // Inline fallback (wasm / real-threads off): no real
-                    // scheduling — run immediately and return a resolved
-                    // Future. delay/period args ignored (no thread to park).
+                    // scheduling — run immediately ONCE and return a resolved
+                    // Future. There is no thread to park, so delay/period can't
+                    // be honoured here (documented in docs/known-issues.md).
                     let _ = spawn;
-                    let _ = delay_ms;
+                    let _ = (delay_ms, period);
                     let r = self.run_thread_body(&callback, None, parent_locals);
                     let fut = async_kernel::FutureNative::resolved(r);
                     return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
@@ -27095,6 +27235,17 @@ impl CfmlVirtualMachine {
             let s = ds.as_string();
             if !s.is_empty() {
                 return s;
+            }
+        }
+        // Last resort: the process-global default (cfconfig `default: true`).
+        // The query builtin already falls back to this, so a transaction that
+        // stopped here reported no datasource and quietly ran its queries
+        // outside the block — rollback then silently did nothing (GH #315).
+        if let Some(f) = self.default_datasource_fn {
+            if let Some(url) = f() {
+                if !url.is_empty() {
+                    return url;
+                }
             }
         }
         String::new()
