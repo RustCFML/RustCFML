@@ -2235,6 +2235,12 @@ pub struct CfmlVirtualMachine {
     /// mid-request when `load_application_cfc` runs) so the overlay switch
     /// invalidates it.
     request_cfconfig_scope_memo: parking_lot::RwLock<Option<(bool, CfmlValue)>>,
+    /// Memo of `global_id` → the `CfmlValue::Function` wrapper LoadGlobal pushes
+    /// for a user function. The wrapper is fully determined by the definition
+    /// (body is the stable global_id, no captured scope), so after the first
+    /// load every subsequent bare-name load of that UDF is a refcount bump
+    /// instead of a params rebuild + fresh Arc.
+    resolved_fn_memo: HashMap<u32, CfmlValue>,
     /// Request-scoped set of file paths whose bytecode-cache freshness (mtime)
     /// has already been validated this request. In dev the shared `BytecodeCache`
     /// re-`stat`s a file on every load to detect edits; within one request a file
@@ -2662,6 +2668,7 @@ impl CfmlVirtualMachine {
             component_blueprints: HashMap::new(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
             request_cfconfig_scope_memo: parking_lot::RwLock::new(None),
+            resolved_fn_memo: HashMap::new(),
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -7221,12 +7228,6 @@ impl CfmlVirtualMachine {
                     } else {
                         name.as_str()
                     };
-                    // Resolve from this frame's locals (exact, then CI), keeping the
-                    // matched key so we can ask whether it was inherited.
-                    let local_hit = locals
-                        .get_key_value(name.as_str())
-                        .or_else(|| locals.iter().find(|(k, _)| k.eq_ignore_ascii_case(&name_lower)))
-                        .map(|(k, v)| (k.clone(), v.clone()));
                     // PR #97: CFML is lexically scoped — a non-Function value that
                     // leaked in from an ANCESTOR frame (the parent-scope copy above)
                     // must stay invisible to bare-name call resolution; only data
@@ -7243,7 +7244,29 @@ impl CfmlVirtualMachine {
                     // log() builtin).
                     let is_read_position = matches!(op, BytecodeOp::LoadVariablesKey(_));
                     let is_builtin_name = self.is_builtin_name_ci(name.as_str(), &name_lower);
-                    let local_hit_visible = match &local_hit {
+                    // Resolve from this frame's locals (exact, then CI), keeping the
+                    // matched key so we can ask whether it was inherited. For a bare
+                    // read of a BUILTIN name, a CI data hit is provably discarded
+                    // (invisible below, and the builtin always resolves at step 3,
+                    // so the restore-the-data else is unreachable) — only a
+                    // Function-valued CI hit can be visible. Restricting the scan
+                    // matters because every template text chunk lowers to
+                    // `writeOutput("…")`, whose exact probe always misses: the
+                    // unrestricted version linear-scanned the whole page scope per
+                    // chunk.
+                    let local_hit_ref = locals.get_key_value(name.as_str()).or_else(|| {
+                        if is_builtin_name && !is_read_position {
+                            locals.iter().find(|(k, v)| {
+                                matches!(v, CfmlValue::Function(_))
+                                    && k.eq_ignore_ascii_case(name_lower)
+                            })
+                        } else {
+                            locals
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
+                        }
+                    });
+                    let local_hit_visible = match &local_hit_ref {
                         None => false,
                         _ if is_read_position => true,
                         Some((_, CfmlValue::Function(_))) => true,
@@ -7254,6 +7277,16 @@ impl CfmlVirtualMachine {
                                 inherited_or_param_keys.contains(k.as_str()) && !is_own_param;
                             !inherited_data && !is_builtin_name
                         }
+                    };
+                    // Clone key+value only when a later branch actually consumes
+                    // them (the visible step-1 push, or the final restore-the-data
+                    // else) — never for the invisible-hit fall-through to a builtin.
+                    let local_hit: Option<(String, CfmlValue)> = if local_hit_visible
+                        || (local_hit_ref.is_some() && !is_builtin_name)
+                    {
+                        local_hit_ref.map(|(k, v)| (k.clone(), v.clone()))
+                    } else {
+                        None
                     };
                     // A CFC method shadowing a builtin must NOT win a bare-call
                     // resolution: Lucee binds builtin functions at compile time, so
@@ -7405,56 +7438,62 @@ impl CfmlVirtualMachine {
                         .map(|(_, v)| v.clone())
                     {
                         stack.push(val);
-                    // 3. Check builtins/user_functions (exact, then CI)
-                    } else if self.builtins.contains_key(name.as_str())
-                        || self.user_functions.contains_key(name.as_str())
-                    {
-                        let params = self
-                            .user_functions
-                            .get(name.as_str())
-                            .map(|uf| {
-                                uf.params
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, p)| cfml_common::dynamic::CfmlParam {
-                                        name: p.clone(),
-                                        param_type: uf.param_types.get(i).cloned().flatten(),
-                                        default: None,
-                                        required: uf
-                                            .required_params
-                                            .get(i)
-                                            .copied()
-                                            .unwrap_or(false),
-                                        annotations: uf
-                                            .param_annotations
-                                            .get(i)
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        // For user functions, find the bytecode index and capture the
-                        // current scope so the function retains access to its defining
-                        // scope's variables when stored in a struct and called later.
-                        let (body_val, scope, ret_type) = if let Some(uf) =
-                            self.user_functions.get(name.as_str())
-                        {
-                            // Reference the function by its stable global_id.
-                            (CfmlValue::Int(uf.global_id as i64), None, uf.return_type.clone())
+                    // 3. Check builtins/user_functions (exact, then CI). The
+                    // resolved CfmlFunction is fully determined by the function
+                    // definition (stable global_id body reference, no captured
+                    // scope), so it is memoised — this used to rebuild the params
+                    // Vec and allocate a fresh Arc<CfmlFunction> on EVERY load,
+                    // i.e. on every call of every UDF and every builtin.
+                    } else if let Some(uf) = self.user_functions.get(name.as_str()) {
+                        let gid = uf.global_id;
+                        // Guard the memo hit on the name: one function object can
+                        // be registered under alias keys sharing a global_id, and
+                        // the wrapper's name must be the key it resolved under.
+                        let memo_hit = self.resolved_fn_memo.get(&gid).filter(
+                            |v| matches!(v, CfmlValue::Function(f) if f.name == *name),
+                        );
+                        if let Some(v) = memo_hit {
+                            stack.push(v.clone());
                         } else {
-                            (CfmlValue::Null, None, None)
-                        };
-                        stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
-                            name: name.clone(),
-                            params,
-                            body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                                body_val,
-                            )),
-                            return_type: ret_type,
-                            access: cfml_common::dynamic::CfmlAccess::Public,
-                            captured_scope: scope,
-                        })));
+                            let params = uf
+                                .params
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| cfml_common::dynamic::CfmlParam {
+                                    name: p.clone(),
+                                    param_type: uf.param_types.get(i).cloned().flatten(),
+                                    default: None,
+                                    required: uf
+                                        .required_params
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(false),
+                                    annotations: uf
+                                        .param_annotations
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                })
+                                .collect();
+                            let ret_type = uf.return_type.clone();
+                            let val = CfmlValue::Function(Arc::new(
+                                cfml_common::dynamic::CfmlFunction {
+                                    name: name.clone(),
+                                    params,
+                                    // Reference the function by its stable global_id.
+                                    body: cfml_common::dynamic::CfmlClosureBody::Expression(
+                                        Box::new(CfmlValue::Int(gid as i64)),
+                                    ),
+                                    return_type: ret_type,
+                                    access: cfml_common::dynamic::CfmlAccess::Public,
+                                    captured_scope: None,
+                                },
+                            ));
+                            self.resolved_fn_memo.insert(gid, val.clone());
+                            stack.push(val);
+                        }
+                    } else if self.builtins.contains_key(name.as_str()) {
+                        stack.push(Self::builtin_fn_value(name));
                     } else if self.builtins.keys().any(|k| k.eq_ignore_ascii_case(&name_lower))
                         || self
                             .user_functions
@@ -20224,6 +20263,35 @@ impl CfmlVirtualMachine {
     /// front-controller infinite redirect loop: `contentServer.parseURLRoot`
     /// accumulates `url.path` on the singleton). Likewise a bare read must
     /// resolve to `self.globals`, never a stale `__variables` shadow.
+    /// The `CfmlValue::Function` wrapper LoadGlobal pushes for a builtin,
+    /// memoised process-wide. A builtin's wrapper is a pure constant (empty
+    /// params, Null body, no captured scope, the exact registered name), and
+    /// LoadGlobal("writeOutput") runs once per template text chunk — the memo
+    /// turns a fresh Arc<CfmlFunction> per chunk into a refcount bump. Bounded
+    /// by the builtin registry: callers only reach this after an exact
+    /// `builtins.contains_key(name)` hit.
+    fn builtin_fn_value(name: &str) -> CfmlValue {
+        static MEMO: std::sync::OnceLock<
+            std::sync::RwLock<HashMap<String, CfmlValue>>,
+        > = std::sync::OnceLock::new();
+        let memo = MEMO.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+        if let Some(v) = memo.read().unwrap_or_else(|e| e.into_inner()).get(name) {
+            return v.clone();
+        }
+        let val = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+            name: name.to_string(),
+            params: Vec::new(),
+            body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
+            return_type: None,
+            access: cfml_common::dynamic::CfmlAccess::Public,
+            captured_scope: None,
+        }));
+        memo.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), val.clone());
+        val
+    }
+
     fn is_web_request_scope(name: &str) -> bool {
         // Zero-alloc: a 3-6 char fixed alphabet doesn't warrant a lowercase String.
         ["url", "form", "cgi", "cookie"]
