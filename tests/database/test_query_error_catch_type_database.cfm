@@ -3,16 +3,28 @@
 // `catch (database e)` / `<cfcatch type="database">` matches — Lucee/ACF parity.
 //
 // The SQLite and MySQL adapters already raise CfmlError::database, but the
-// PostgreSQL adapter funnels every query failure through
-// PgRunError::from_postgres (crates/cfml-stdlib/src/builtins.rs), which wraps
-// them as CfmlError::runtime — so a database-typed catch never matches and the
-// error falls through to `catch (any)`. (pg_sql.rs's two param-rewrite errors
-// have the same blind spot.)
+// PostgreSQL adapter funnelled every query failure through
+// PgRunError::from_postgres (crates/cfml-stdlib/src/builtins.rs), which wrapped
+// them as CfmlError::runtime — so a database-typed catch never matched and the
+// error fell through to `catch (any)`. (pg_sql.rs's two param-rewrite errors
+// had the same blind spot.) Fixed in v0.542.0, GitHub #293.
 //
 // Repro class: framework first-run fallbacks wrap "table may not exist yet"
 // probes in <cfcatch type="database">. On RustCFML + Postgres the catch never
-// matches, so booting against an empty database throws instead of falling back
+// matched, so booting against an empty database threw instead of falling back
 // (moopa route_registry_store.cfc / core.cfc had to widen to type="any").
+//
+// CROSS-ENGINE (GitHub #317): this file could not run on Lucee at all until the
+// two structural gates below were added, so from v0.542.0 it was only ever
+// verified on RustCFML.
+//   1. The SQLite leg is gated on the driver being present. Lucee bundles no
+//      SQLite JDBC driver, so `jdbc:sqlite:` raises java.io.IOException
+//      ("cannot load class … org.sqlite.JDBC") rather than a database error —
+//      which describes the missing driver, not our behaviour.
+//   2. The cftransaction legs use `transaction datasource="…"`, a RustCFML
+//      extension Lucee rejects at COMPILE time. Inline, that killed the whole
+//      template — every assertion in it — uncatchably. They now live in a
+//      sibling template reached by include, where the rejection is catchable.
 //
 // The PostgreSQL leg is live-gated (same convention as
 // test_db_null_column_empty_string.cfm) and skips when the env var is unset:
@@ -39,11 +51,19 @@ function catchClauseFor(required any ds) {
 	}
 }
 
-// ---- SQLite (control: already lands in the database-typed catch) ----
+// ---- SQLite (control, gated on the driver being available) ----
 memDs = { class: "org.sqlite.JDBC", connectionString: "jdbc:sqlite::memory:" };
-assert("SQLite: missing-table error lands in catch (database e)", catchClauseFor(memDs), "database");
+sqliteAvailable = true;
+try { queryExecute("SELECT 1", [], {datasource: memDs}); }
+catch (any e) { sqliteAvailable = false; }
 
-// ---- PostgreSQL (currently lands in catch (any) as a generic runtime error) ----
+if ( !sqliteAvailable ) {
+	assertTrue("SQLite database-typed catch skipped (no SQLite driver on this engine)", true);
+} else {
+	assert("SQLite: missing-table error lands in catch (database e)", catchClauseFor(memDs), "database");
+}
+
+// ---- PostgreSQL (was the bug: landed in catch (any) as a generic runtime error) ----
 pgDs = envDs("RUSTCFML_TEST_PG_DS");
 if ( len(pgDs) == 0 ) {
 	assertTrue("PostgreSQL database-typed catch skipped (RUSTCFML_TEST_PG_DS not set)", true);
@@ -60,34 +80,26 @@ if ( len(pgDs) == 0 ) {
 	assert("PostgreSQL: cfcatch.type is database", caughtType, "database");
 }
 
-// ---- cftransaction: pool checkout / BEGIN / COMMIT / ROLLBACK / savepoint
-// failures are database failures too, so they must arrive database-typed. ----
-function txnCatchClauseFor(required any ds, required string sql) {
+// ---- cftransaction: see transaction_datasource_ext.cfm for why these are
+// isolated. Both legs need the SQLite driver as well as the `datasource`
+// attribute, so the whole include is skipped when SQLite is absent. ----
+txnLegRan = false;
+if ( sqliteAvailable ) {
 	try {
-		transaction datasource="#arguments.ds#" {
-			queryExecute(arguments.sql, [], {datasource: arguments.ds});
-		}
-		return "no-error-raised";
-	} catch (database e) {
-		return "database";
+		include "transaction_datasource_ext.cfm";
+		txnLegRan = true;
 	} catch (any e) {
-		return "any (cfcatch.type=" & (e.type ?: "") & ")";
+		// Only an engine REJECTING the extension is an acceptable skip. Anything
+		// else is a genuine failure and must not be swallowed — rethrow it so the
+		// runner reports it rather than silently degrading to a pass.
+		if ( !( (e.message ?: "") contains "not allowed" ) ) {
+			rethrow;
+		}
 	}
 }
-
-assert(
-	"cftransaction: a failing statement is database-typed",
-	txnCatchClauseFor(memDs, "SELECT 1 FROM rcfml_missing_table_f362"),
-	"database"
-);
-assert(
-	"cftransaction: an unopenable datasource is database-typed",
-	txnCatchClauseFor(
-		{ class: "org.sqlite.JDBC", connectionString: "jdbc:sqlite:/rcfml-no-such-dir-f362/t.db" },
-		"SELECT 1"
-	),
-	"database"
-);
+if ( !txnLegRan ) {
+	assertTrue("cftransaction datasource= legs skipped (engine lacks SQLite or rejects the attribute)", true);
+}
 
 suiteEnd();
 </cfscript>
