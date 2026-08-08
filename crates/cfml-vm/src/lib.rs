@@ -2241,6 +2241,12 @@ pub struct CfmlVirtualMachine {
     /// load every subsequent bare-name load of that UDF is a refcount bump
     /// instead of a params rebuild + fresh Arc.
     resolved_fn_memo: HashMap<u32, CfmlValue>,
+    /// Memo of `(global_id, call ip)` → the call site's argument source names.
+    /// `find_arg_sources` walks the bytecode BACKWARDS from the call site on
+    /// every `Call`/`CallNamed` dispatch, computing `stack_effect` per op — but
+    /// its inputs are compile-time static and `global_id`s never rebind, so the
+    /// walk is done once per call site instead of once per call.
+    arg_sources_memo: HashMap<(u32, usize), Arc<Vec<Option<String>>>>,
     /// Request-scoped set of file paths whose bytecode-cache freshness (mtime)
     /// has already been validated this request. In dev the shared `BytecodeCache`
     /// re-`stat`s a file on every load to detect edits; within one request a file
@@ -2669,6 +2675,7 @@ impl CfmlVirtualMachine {
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
             request_cfconfig_scope_memo: parking_lot::RwLock::new(None),
             resolved_fn_memo: HashMap::new(),
+            arg_sources_memo: HashMap::new(),
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -8221,7 +8228,7 @@ impl CfmlVirtualMachine {
                     // Identify which local variables are being passed as args
                     // (for pass-by-reference writeback of complex types)
                     // ip was already incremented past this Call op, so use ip-1
-                    let arg_sources = find_arg_sources(&func.instructions, ip - 1, *arg_count);
+                    let arg_sources = self.arg_sources_cached(&func, ip - 1, *arg_count);
 
                     let mut args = Vec::with_capacity(*arg_count);
                     for _ in 0..*arg_count {
@@ -8383,8 +8390,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::CallNamed(names, arg_count) => {
                     // Identify arg sources for pass-by-reference writeback
                     // ip was already incremented past this op, so use ip-1
-                    let named_arg_sources =
-                        find_arg_sources(&func.instructions, ip - 1, *arg_count);
+                    let named_arg_sources = self.arg_sources_cached(&func, ip - 1, *arg_count);
 
                     let mut named_values = Vec::with_capacity(*arg_count);
                     for _ in 0..*arg_count {
@@ -20270,6 +20276,22 @@ impl CfmlVirtualMachine {
     /// turns a fresh Arc<CfmlFunction> per chunk into a refcount bump. Bounded
     /// by the builtin registry: callers only reach this after an exact
     /// `builtins.contains_key(name)` hit.
+    /// Memoised wrapper over [`find_arg_sources`] (see `arg_sources_memo`).
+    fn arg_sources_cached(
+        &mut self,
+        func: &BytecodeFunction,
+        call_ip: usize,
+        arg_count: usize,
+    ) -> Arc<Vec<Option<String>>> {
+        let key = (func.global_id, call_ip);
+        if let Some(v) = self.arg_sources_memo.get(&key) {
+            return v.clone();
+        }
+        let v = Arc::new(find_arg_sources(&func.instructions, call_ip, arg_count));
+        self.arg_sources_memo.insert(key, v.clone());
+        v
+    }
+
     fn builtin_fn_value(name: &str) -> CfmlValue {
         static MEMO: std::sync::OnceLock<
             std::sync::RwLock<HashMap<String, CfmlValue>>,
