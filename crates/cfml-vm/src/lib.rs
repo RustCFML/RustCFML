@@ -31691,6 +31691,85 @@ impl CfmlVirtualMachine {
         args
     }
 
+    /// Seed the effective `.cfconfig.json` `mappings` + `customTagPaths` for a
+    /// request that resolved NO `Application.cfc` (GH #305).
+    ///
+    /// The Application.cfc path seeds these twice (once early in
+    /// `load_application_cfc` so a framework Bootstrap's body-level
+    /// `expandPath("/x")` sees them, then authoritatively at step 3.0 of
+    /// `execute_with_lifecycle` under any `this.mappings` /
+    /// `this.customTagPaths`). Neither runs without an Application.cfc, so this is
+    /// the third seeding site — the only one for that case.
+    ///
+    /// Relative mapping/tag paths expand against the serve-mode webroot when
+    /// there is one, else the entry template's directory — the same anchor the
+    /// Application.cfc path uses (its own directory), applied to the only
+    /// directory a no-Application.cfc request has. Existing mappings win, so an
+    /// embedder that pre-seeded a mapping is never overwritten. No `/` mapping is
+    /// synthesised here: `expandPath` deliberately skips the root mapping and
+    /// falls back to the webroot/base template itself.
+    fn seed_cfconfig_context_paths(&mut self) {
+        let Some(cfg) = self.server_state.as_ref().map(|ss| ss.cfconfig.clone()) else {
+            return;
+        };
+        if cfg.mappings.is_empty() && cfg.custom_tag_paths.is_empty() {
+            return;
+        }
+        let base = self
+            .server_state
+            .as_ref()
+            .and_then(|ss| ss.webroot.clone())
+            .or_else(|| {
+                self.base_template_path
+                    .as_ref()
+                    .or(self.source_file.as_ref())
+                    .and_then(|s| std::path::Path::new(s).parent())
+                    .map(|p| p.to_path_buf())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let mut existing: Vec<String> =
+            self.mappings.iter().map(|m| m.name.to_lowercase()).collect();
+        for (raw_name, raw_path) in cfg.mappings.iter() {
+            // Same normalisation as extract_app_config / step 3.0.
+            let mut name = raw_name.clone();
+            if !name.starts_with('/') {
+                name = format!("/{}", name);
+            }
+            if !name.ends_with('/') {
+                name = format!("{}/", name);
+            }
+            if existing.contains(&name.to_lowercase()) {
+                continue;
+            }
+            existing.push(name.to_lowercase());
+            let path = self.expand_context_path(&base, raw_path);
+            self.mappings.push(CfmlMapping { name, path });
+        }
+        // Longest prefix first, matching every other mapping-set writer.
+        self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+        self.refresh_mappings_fingerprint();
+
+        for p in cfg.custom_tag_paths.iter() {
+            let expanded = self.expand_context_path(&base, p);
+            if !self.custom_tag_paths.iter().any(|e| e == &expanded) {
+                self.custom_tag_paths.push(expanded);
+            }
+        }
+    }
+
+    /// Expand one cfconfig mapping/customTagPath target against `base`.
+    /// Absolute paths pass through; relative ones join `base` and route through
+    /// `canonicalize_cached` so repeated requests hit the cache rather than
+    /// re-`stat`ing the target directory.
+    fn expand_context_path(&mut self, base: &std::path::Path, raw: &str) -> String {
+        if std::path::Path::new(raw).is_absolute() {
+            return raw.to_string();
+        }
+        let joined = base.join(raw).to_string_lossy().to_string();
+        self.canonicalize_cached(&joined).unwrap_or(joined)
+    }
+
     /// Load and execute Application.cfc, returning the component struct
     ///
     /// Returns `Ok(Some(template))` on success, `Ok(None)` when no usable
@@ -33064,6 +33143,17 @@ impl CfmlVirtualMachine {
                 if self.application_scope.is_none() {
                     self.application_scope = Some(CfmlStruct::empty());
                 }
+                // cfconfig `mappings` / `customTagPaths` are CONTEXT-level, not
+                // application-level: Lucee applies its config mappings whether or
+                // not the request resolves an Application.cfc. Both used to be
+                // seeded only inside `load_application_cfc` / the step-3.0 layering
+                // below, so a request with no Application.cfc silently dropped them
+                // — `/lib` resolved against the webroot and `<cf_greet>` reported
+                // "custom tag not found", while the very same `.cfconfig.json` had
+                // been read and its other keys (e.g. `runtime.timezone`) applied.
+                // Dropping an Application.cfc into the directory "fixed" it, which
+                // made the config look intermittent (GH #305).
+                self.seed_cfconfig_context_paths();
                 return self.execute(); // No Application.cfc, just execute directly
             }
         };
