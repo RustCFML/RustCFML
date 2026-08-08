@@ -840,9 +840,16 @@ fn dump_jit_stats(vm: &CfmlVirtualMachine) {
 /// engine without a rebuild.
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
 fn jit_persist_enabled() -> bool {
-    std::env::var("RUSTCFML_JIT_PERSIST")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
-        .unwrap_or(true)
+    // Read once: this is consulted per request and `env::var` takes the
+    // process-wide environment lock.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RUSTCFML_JIT_PERSIST")
+            .map(|v| {
+                !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+            })
+            .unwrap_or(true)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1174,7 +1181,8 @@ fn compile_and_run(
             })
             .collect();
         let any_running = !running_joins.is_empty();
-        if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        static GC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *GC_DEBUG.get_or_init(|| std::env::var("RUSTCFML_GC_DEBUG").is_ok()) {
             let (s, a, q, sc) = cfml_common::cycle_gc::log_type_breakdown();
             eprintln!(
                 "[cycle_gc] request end: live_threads={} running={} log_len={:?} \

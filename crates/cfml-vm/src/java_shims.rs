@@ -33,7 +33,9 @@ const JAVA_REGEX_CACHE_CAP: usize = 4096;
 /// like `cfml-stdlib`'s `REGEX_CACHE`: on exceeding the cap the map is cleared
 /// wholesale, trading a rare cold rebuild for a hard memory ceiling so an
 /// adversarial workload minting unique patterns can't grow it without limit.
-fn java_cached_regex(pattern: &str) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+pub(crate) fn java_cached_regex(
+    pattern: &str,
+) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
     static CACHE: std::sync::OnceLock<
         std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<regex::Regex>>>,
     > = std::sync::OnceLock::new();
@@ -4341,7 +4343,6 @@ pub fn java_matcher_step(
     s: &cfml_common::dynamic::CfmlStruct,
     mode: MatchMode,
 ) -> Result<(bool, CfmlValue), CfmlError> {
-    use regex::Regex;
     let regex_str = s.get("__regex").map(|v| v.as_string()).unwrap_or_default();
     let input = s.get("__input").map(|v| v.as_string()).unwrap_or_default();
     let re = java_cached_regex(&regex_str).map_err(|e| {

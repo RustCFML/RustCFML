@@ -128,22 +128,30 @@ pub fn offset_info_for_local(tz: &Tz, local: NaiveDateTime) -> OffsetInfo {
 
 /// The host system timezone id (`TZ` env var, then `/etc/localtime`, else UTC).
 /// Mirrors the JVM's `TimeZone.getDefault()` for the no-`setTimeZone` case.
+/// Resolved once per process (the JVM likewise caches its default): this is
+/// consulted per tz-BIF call when no timezone is configured, and the fallback
+/// path is an env read plus a `readlink` syscall.
 pub fn system_tz_id() -> String {
-    if let Ok(tz) = std::env::var("TZ") {
-        if !tz.is_empty() {
-            return tz;
-        }
-    }
-    #[cfg(unix)]
-    {
-        if let Ok(link) = std::fs::read_link("/etc/localtime") {
-            let link_str = link.to_string_lossy().to_string();
-            if let Some(pos) = link_str.find("zoneinfo/") {
-                return link_str[pos + 9..].to_string();
+    static SYSTEM_TZ: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SYSTEM_TZ
+        .get_or_init(|| {
+            if let Ok(tz) = std::env::var("TZ") {
+                if !tz.is_empty() {
+                    return tz;
+                }
             }
-        }
-    }
-    "UTC".to_string()
+            #[cfg(unix)]
+            {
+                if let Ok(link) = std::fs::read_link("/etc/localtime") {
+                    let link_str = link.to_string_lossy().to_string();
+                    if let Some(pos) = link_str.find("zoneinfo/") {
+                        return link_str[pos + 9..].to_string();
+                    }
+                }
+            }
+            "UTC".to_string()
+        })
+        .clone()
 }
 
 /// Verified display names for a zone, or `None` if it is not tabulated.

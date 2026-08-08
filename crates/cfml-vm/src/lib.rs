@@ -2227,6 +2227,14 @@ pub struct CfmlVirtualMachine {
     /// Request-lifetime sibling of `ServerState::canonicalize_cache`; safe in all
     /// modes for the same reason. `RwLock` because `canonicalize_cached` is `&self`.
     pub request_canon_cache: parking_lot::RwLock<HashMap<String, Option<String>>>,
+    /// Request-scoped memo of the `server.cfconfig` CFML tree. Building it goes
+    /// through `serde_json::to_value` + a recursive CFML conversion of the whole
+    /// config, and `live_server_scope()` runs on EVERY `server` scope read — the
+    /// config cannot change within a request, so build once. The `bool` records
+    /// whether the memo was built from the app-level config (which can appear
+    /// mid-request when `load_application_cfc` runs) so the overlay switch
+    /// invalidates it.
+    request_cfconfig_scope_memo: parking_lot::RwLock<Option<(bool, CfmlValue)>>,
     /// Request-scoped set of file paths whose bytecode-cache freshness (mtime)
     /// has already been validated this request. In dev the shared `BytecodeCache`
     /// re-`stat`s a file on every load to detect edits; within one request a file
@@ -2653,6 +2661,7 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             component_blueprints: HashMap::new(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
+            request_cfconfig_scope_memo: parking_lot::RwLock::new(None),
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -3027,13 +3036,16 @@ impl CfmlVirtualMachine {
             .map(|n| n.to_lowercase())
             .collect();
         // security.disallowedImports: compile each regex. Invalid patterns
-        // are logged and skipped — a typo shouldn't take down the VM.
+        // are logged and skipped — a typo shouldn't take down the VM. Routed
+        // through the process-wide regex memo: apply_cfconfig runs per request
+        // and the pattern set is fixed, so this is a lookup + cheap handle
+        // clone (regex::Regex is internally shared) after the first request.
         self.disallowed_imports = cfg
             .security
             .disallowed_imports
             .iter()
-            .filter_map(|p| match regex::Regex::new(p) {
-                Ok(re) => Some(re),
+            .filter_map(|p| match java_shims::java_cached_regex(p) {
+                Ok(re) => Some((*re).clone()),
                 Err(e) => {
                     log::warn!(
                         "cfconfig security.disallowedImports: invalid regex '{}': {}",
@@ -6564,7 +6576,14 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::TryLoadLocal(name) => {
                     // Safe load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
-                    let name_lower = name.to_lowercase();
+                    // Same zero-alloc lowercase guard as LoadLocal.
+                    let name_lower_owned: String;
+                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                        name_lower_owned = name.to_lowercase();
+                        &name_lower_owned
+                    } else {
+                        name.as_str()
+                    };
                     let val = if name_lower == "local" {
                         // PR #93: per-frame `local` — only keys established here.
                         CfmlValue::strukt(Self::build_local_scope_view(
@@ -6605,7 +6624,9 @@ impl CfmlVirtualMachine {
                     // original-case entry keeps the `local`-view visibility filter
                     // (which checks `contains(k)` with the key's own casing) intact.
                     declared_locals.insert(name.clone());
-                    declared_locals.insert(name.to_lowercase());
+                    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                        declared_locals.insert(name.to_lowercase());
+                    }
                     // PR #93: a `var x` / `local.x` declaration RECLAIMS the
                     // name into THIS frame's `local` scope, shadowing any
                     // same-named key inherited from the caller. Removing it
@@ -6622,12 +6643,19 @@ impl CfmlVirtualMachine {
                     // filtered the write straight back out — the local assignment
                     // was silently lost. Drop every CI-matching entry.
                     inherited_or_param_keys.remove(name);
-                    let name_lower = name.to_lowercase();
-                    inherited_or_param_keys.retain(|k| !k.eq_ignore_ascii_case(&name_lower));
+                    // eq_ignore_ascii_case doesn't need a pre-lowered operand.
+                    inherited_or_param_keys.retain(|k| !k.eq_ignore_ascii_case(name));
                 }
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
-                        let name_lower = name.to_lowercase();
+                        // Same zero-alloc lowercase guard as LoadLocal.
+                        let name_lower_owned: String;
+                        let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                            name_lower_owned = name.to_lowercase();
+                            &name_lower_owned
+                        } else {
+                            name.as_str()
+                        };
                         // Subclass pseudo-constructor: the body's `this`-binding
                         // (LoadLocal(name) → StoreLocal("this"), emitted before any
                         // body statement). Merge the parent's explicit `this.*` data
@@ -6684,7 +6712,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "variables"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             // A declared param named after a scope is inherently
                             // local (see the twin guards in the __variables and
                             // LoadLocal arms) — its default-value store must NOT
@@ -6767,7 +6795,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "request"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Same declared-local guard as `variables`: a user
@@ -6784,7 +6812,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "application"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
@@ -6798,7 +6826,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "session"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
@@ -6828,7 +6856,7 @@ impl CfmlVirtualMachine {
                         } else if name_lower == "arguments"
                             && is_inside_function
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                         {
                             // Storing the `arguments` SCOPE (bare `arguments = …`
                             // or an `arguments.x = …` round-trip). A user
@@ -6898,7 +6926,7 @@ impl CfmlVirtualMachine {
                             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
                         } else if Self::is_web_request_scope(&name_lower)
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Web request scopes (url/form/cgi/cookie) are always
@@ -6911,9 +6939,9 @@ impl CfmlVirtualMachine {
                             // front-controller infinite redirect loop:
                             // contentServer.parseURLRoot accumulates url.path). A
                             // genuine `var url` frame-local is guarded out above.
-                            self.globals.insert(name_lower.clone(), val);
+                            self.globals.insert(name_lower.to_string(), val);
                         } else if !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             && !locals.contains_key(name.as_str())
                             && name_lower != "arguments"
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
@@ -6944,7 +6972,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if locals.contains_key("__variables")
                             && !declared_locals.contains(name)
-                            && !declared_locals.contains(&name_lower)
+                            && !declared_locals.contains(name_lower)
                             && !locals.contains_key(name.as_str())
                             && name_lower != "arguments"
                             && name_lower != "cfcatch"
@@ -7014,7 +7042,7 @@ impl CfmlVirtualMachine {
                             // resolving to the passed value / declared default.
                             if is_inside_function
                                 && !declared_locals.contains(name.as_str())
-                                && !declared_locals.contains(&name_lower)
+                                && !declared_locals.contains(name_lower)
                                 && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                             {
                                 if let Some(args) =
@@ -7045,7 +7073,7 @@ impl CfmlVirtualMachine {
                                 // into the env would break its `variables`-scope capture when
                                 // read back (regressed test_include_scope_capture).
                                 let is_own_closure = (declared_locals.contains(name.as_str())
-                                    || declared_locals.contains(&name_lower))
+                                    || declared_locals.contains(name_lower))
                                     && matches!(
                                         &val,
                                         CfmlValue::Function(f)
@@ -12229,8 +12257,9 @@ impl CfmlVirtualMachine {
                     // Leading-slash includes are webroot-relative in CFML, not
                     // OS-absolute. Try in order: configured mappings,
                     // serve-mode webroot, then CLI-mode base_template_path's
-                    // parent.
-                    let resolved = if !self.vfs.exists(&resolved) && path.starts_with('/') {
+                    // parent. The prefix check MUST come first: relative
+                    // includes never need the existence probe.
+                    let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
                         self.resolve_leading_slash_include(&path)
                             .unwrap_or(resolved)
                     } else {
@@ -12430,7 +12459,7 @@ impl CfmlVirtualMachine {
                         path.clone()
                     };
 
-                    let resolved = if !self.vfs.exists(&resolved) && path.starts_with('/') {
+                    let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
                         self.resolve_leading_slash_include(&path)
                             .unwrap_or(resolved)
                     } else {
@@ -20196,17 +20225,30 @@ impl CfmlVirtualMachine {
     /// accumulates `url.path` on the singleton). Likewise a bare read must
     /// resolve to `self.globals`, never a stale `__variables` shadow.
     fn is_web_request_scope(name: &str) -> bool {
-        matches!(name.to_lowercase().as_str(), "url" | "form" | "cgi" | "cookie")
+        // Zero-alloc: a 3-6 char fixed alphabet doesn't warrant a lowercase String.
+        ["url", "form", "cgi", "cookie"]
+            .iter()
+            .any(|s| name.eq_ignore_ascii_case(s))
     }
 
     fn is_mutating_method(method: &str) -> bool {
-        let lower = method.to_lowercase();
         // Implicit property setters (setXxx) are mutating
-        if lower.starts_with("set") && lower.len() > 3 {
+        if method.len() > 3
+            && method
+                .get(..3)
+                .is_some_and(|p| p.eq_ignore_ascii_case("set"))
+        {
             return true;
         }
+        let lower_owned: String;
+        let lower: &str = if method.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower_owned = method.to_lowercase();
+            &lower_owned
+        } else {
+            method
+        };
         matches!(
-            lower.as_str(),
+            lower,
             // Array mutators
             "append" | "push" | "prepend" | "deleteat" | "insertat" |
             "sort" | "reverse" | "clear" |
@@ -20712,10 +20754,29 @@ impl CfmlVirtualMachine {
         }
         // Refresh the per-request cfconfig overlay (application-level
         // `.cfconfig.json` beside the Application.cfc wins over the server one).
-        let cfg = if let Some(ref app_cfg) = self.app_cfconfig {
-            Some(cfconfig_to_cfml(app_cfg))
-        } else {
-            self.server_state.as_ref().map(|ss| cfconfig_to_cfml(&ss.cfconfig))
+        // Built at most twice per request (once from the server config, once
+        // more if the app-level overlay appears when load_application_cfc runs);
+        // every other `server` read is a memo hit.
+        let is_app = self.app_cfconfig.is_some();
+        let memo_hit = self
+            .request_cfconfig_scope_memo
+            .read()
+            .as_ref()
+            .filter(|(from_app, _)| *from_app == is_app)
+            .map(|(_, v)| v.clone());
+        let cfg = match memo_hit {
+            Some(v) => Some(v),
+            None => {
+                let built = if let Some(ref app_cfg) = self.app_cfconfig {
+                    Some(cfconfig_to_cfml(app_cfg))
+                } else {
+                    self.server_state.as_ref().map(|ss| cfconfig_to_cfml(&ss.cfconfig))
+                };
+                if let Some(ref v) = built {
+                    *self.request_cfconfig_scope_memo.write() = Some((is_app, v.clone()));
+                }
+                built
+            }
         };
         if let Some(cfg) = cfg {
             handle.insert("cfconfig".to_string(), cfg);
@@ -21317,8 +21378,17 @@ impl CfmlVirtualMachine {
     }
 
     fn is_tag_call_builtin(name: &str) -> bool {
+        // Zero-alloc lowercase guard: tag-builtin names are almost always
+        // already lowercase in emitted bytecode.
+        let lower_owned: String;
+        let lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower_owned = name.to_lowercase();
+            &lower_owned
+        } else {
+            name
+        };
         matches!(
-            name.to_lowercase().as_str(),
+            lower,
             "cfdirectory"
                 | "__cfdirectory"
                 | "cffile"
@@ -23556,7 +23626,7 @@ impl CfmlVirtualMachine {
                         .map(|v| v.as_string())
                         .unwrap_or_default();
                     let rust_pat = java_shims::java_regex_to_rust(&pat);
-                    return match regex::Regex::new(&rust_pat) {
+                    return match java_shims::java_cached_regex(&rust_pat) {
                         Ok(re) => {
                             let out = if method_lower == "replacefirst" {
                                 re.replace(&s, rep.as_str())
@@ -23688,7 +23758,7 @@ impl CfmlVirtualMachine {
                         let pattern =
                             java_shims::java_regex_to_rust(&pat.as_string());
                         let anchored = format!("^(?:{})$", pattern);
-                        match regex::Regex::new(&anchored) {
+                        match java_shims::java_cached_regex(&anchored) {
                             Ok(re) => return Ok(CfmlValue::Bool(re.is_match(&src))),
                             Err(e) => {
                                 // A pattern referencing UTF-16 surrogate code
@@ -23732,7 +23802,7 @@ impl CfmlVirtualMachine {
                         .get(1)
                         .and_then(|v| v.as_string().trim().parse::<i64>().ok())
                         .unwrap_or(0);
-                    let parts: Vec<String> = match regex::Regex::new(&pattern) {
+                    let parts: Vec<String> = match java_shims::java_cached_regex(&pattern) {
                         Ok(re) => {
                             let mut v: Vec<String> = if limit > 0 {
                                 re.splitn(&src, limit as usize).map(|s| s.to_string()).collect()
@@ -30420,7 +30490,7 @@ impl CfmlVirtualMachine {
             // doubled component path. canonicalize only resolves existing paths;
             // fall back to the raw join (matching expandPath's own fallback) so
             // not-yet-created write targets are unaffected.
-            let normalized = self.vfs.canonicalize(&candidate).unwrap_or(candidate);
+            let normalized = self.canonicalize_cached(&candidate).unwrap_or(candidate);
             return Some(normalized);
         }
         None
@@ -30687,6 +30757,22 @@ impl CfmlVirtualMachine {
                 validated.retain(|k| {
                     self.canonicalize_cached(k).ok().as_deref() != Some(target.as_str())
                 });
+            }
+        }
+        // Drop any memoised canonicalize outcome for the written path: a cached
+        // NEGATIVE (path didn't exist before this write created it) would
+        // otherwise keep answering NotFound, leaving later resolutions on the
+        // un-collapsed fallback spelling.
+        {
+            let mut canon = self.request_canon_cache.write();
+            for k in &exact {
+                canon.remove(*k);
+            }
+        }
+        if let Some(ss) = self.server_state.as_ref() {
+            let mut canon = ss.canonicalize_cache.write();
+            for k in &exact {
+                canon.remove(*k);
             }
         }
         // Belt-and-braces: also evict the shared bytecode-cache entry so the
@@ -31299,7 +31385,6 @@ impl CfmlVirtualMachine {
     }
 
     fn find_application_cfc(&self) -> Option<String> {
-        let cwd = std::env::current_dir().unwrap_or_default();
         // Prefer the resolved `base_template_path` (absolute under the VFS root in
         // serve/embedded mode) over the raw `source_file` (which may be a bare,
         // VFS-relative filename) so the walk-up starts from a directory the VFS
@@ -31308,6 +31393,19 @@ impl CfmlVirtualMachine {
             .base_template_path
             .as_deref()
             .or(self.source_file.as_deref());
+        // `cwd` only matters for a bare/absent entry path (CLI). In serve mode
+        // the path is absolute, so skip the per-request `getcwd` syscall — it
+        // used to run unconditionally, before the production cache check.
+        let needs_cwd = discovery_path.map_or(true, |src| {
+            std::path::Path::new(src)
+                .parent()
+                .map_or(true, |p| p.as_os_str().is_empty())
+        });
+        let cwd = if needs_cwd {
+            std::env::current_dir().unwrap_or_default()
+        } else {
+            std::path::PathBuf::new()
+        };
         let start_dir = Self::app_cfc_start_dir(discovery_path, &cwd);
 
         // Production-mode cache hit
@@ -32229,7 +32327,7 @@ impl CfmlVirtualMachine {
                     .join(&mapping.path)
                     .to_string_lossy()
                     .to_string();
-                self.vfs.canonicalize(&joined).unwrap_or(joined)
+                self.canonicalize_cached(&joined).unwrap_or(joined)
             };
             mapping.path = expanded;
         }
@@ -33056,7 +33154,7 @@ impl CfmlVirtualMachine {
     /// such as `/_moopa.cfm` to onRequestStart/onRequest/onRequestEnd.
     fn lifecycle_target_page(&self) -> String {
         let source = self.source_file.clone().unwrap_or_default();
-        let canonical_source = self.vfs.canonicalize(&source).unwrap_or(source.clone());
+        let canonical_source = self.canonicalize_cached(&source).unwrap_or(source.clone());
         let source_path = std::path::Path::new(&canonical_source);
 
         if let Some(ref server_state) = self.server_state {
