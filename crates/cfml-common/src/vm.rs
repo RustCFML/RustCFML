@@ -14,6 +14,17 @@ pub struct CfmlError {
     pub message: String,
     pub error_type: CfmlErrorType,
     pub stack_trace: Vec<StackFrame>,
+    /// Extra members to merge onto the `cfcatch` struct the VM synthesises for
+    /// this error, beyond the standard `message`/`type`/`detail`/`stackTrace`
+    /// set. This is how structured driver detail reaches CFML — a database
+    /// failure carries `SQLState`/`NativeErrorCode`/`Sql`/`DataSource` here so
+    /// `catch( database e )` can branch on `e.sqlState` instead of
+    /// substring-sniffing `e.message` (GitHub #295).
+    ///
+    /// Boxed and `None` by default: nearly every error carries no extras, and
+    /// `CfmlError` is moved through every `?` on the hot path, so the field
+    /// must cost one null pointer rather than an inline map.
+    pub extras: Option<Box<ValueMap>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +50,23 @@ impl CfmlError {
             message,
             error_type,
             stack_trace: Vec::new(),
+            extras: None,
         }
+    }
+
+    /// Attach (or merge into) the structured `cfcatch` extras — see
+    /// [`CfmlError::extras`]. Later inserts win, so a driver-level call can set
+    /// `SQLState` and a later call-site-level call can add `Sql`/`DataSource`
+    /// without either clobbering the other's keys.
+    pub fn with_extras<I>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = (String, CfmlValue)>,
+    {
+        let map = self.extras.get_or_insert_with(Default::default);
+        for (k, v) in entries {
+            map.insert(k, v);
+        }
+        self
     }
 
     pub fn runtime(message: String) -> Self {

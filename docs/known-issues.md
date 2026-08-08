@@ -864,6 +864,45 @@ behave as `en_US`. Extend the table rather than letting a caller's locale be dro
 
 ---
 
+<a id="38"></a>
+
+## 38. Database exception members — `sqlState` is driver-dependent 🏗 *(GH [#295](https://github.com/RustCFML/RustCFML/issues/295))*
+
+Database failures now carry the structured detail Lucee/ACF attach, so
+`catch( database e )` can branch on **why** a query failed instead of
+substring-matching the driver's message: `sqlState`, `nativeErrorCode`,
+`errorCode`, `sql`, `queryError`, `datasource`, `where`, and the `additional`
+struct. Every member always exists (empty string when unknown), so an unguarded
+`e.sqlState` read can never raise a secondary "variable is undefined" the way it
+could before GH #250.
+
+Reference behaviour was captured from Lucee 7.0.4 driving pgjdbc, MariaDB
+Connector/J and mssql-jdbc. Two things there are worth knowing, because both
+contradict the intuitive reading: Lucee's **`errorCode` is a literal `0`** for
+every driver — the vendor number lives in **`nativeErrorCode`** — and Lucee's
+**`detail` is empty** for database errors on every driver, so ours is too.
+
+**Gaps:**
+
+| Gap | Detail |
+|---|---|
+| `sqlState` is empty on **SQL Server** | SQL Server's TDS protocol carries no SQLSTATE; `TokenError`'s `state` byte is the TDS error state, an unrelated field. Lucee reports one (`S0002`) only because mssql-jdbc synthesises legacy ODBC states no other driver produces. `nativeErrorCode` carries the real vendor number (`208`, `2627`, …) and is what SQL Server code should branch on. |
+| `sqlState` is empty on **SQLite** | SQLite defines no SQLSTATE at any layer. `nativeErrorCode` carries the extended result code (`1555` = `SQLITE_CONSTRAINT_PRIMARYKEY`, `787` = `…_FOREIGNKEY`, …), which is finer-grained than a SQLSTATE would be. Lucee bundles no SQLite driver, so there is no reference behaviour to match. |
+| `additional.DatabaseVersion` / `additional.DriverVersion` are empty | Both would need a live round-trip to the server, and this is the error path — the connection that would answer is frequently the thing that just failed. The other four `additional` members (`SQL`, `Datasource`, `DriverName`, `DatabaseName`) are populated. |
+| `cfcatch.message` keeps its `queryExecute: ` prefix | Lucee reports the driver's message verbatim. Ours is prefixed with the operation, which is more useful in a log but is a textual divergence. Anything matching on message text was already engine-specific; that is the reason `sqlState` exists. |
+| Connection failures are `database`-typed | Lucee surfaces an unreachable server as `java.io.IOException`, not `database`, and attaches none of these members. We deliberately keep the `database` typing from GH #293 (frameworks catch `database` around first-run connectivity probes); such errors carry empty `sqlState`/`nativeErrorCode`, since no server ever answered. |
+
+`datasource` reports the datasource **name**; a datasource passed as an inline
+struct reports Lucee's `__temp__` sentinel, and one passed as a raw URL has its
+`user:pass@` userinfo stripped — an exception struct routinely ends up in a log
+or on an error page and must not carry a password there.
+
+Covered by `tests/database/test_query_error_sqlstate_members.cfm` (SQLite
+control gated on driver availability so it skips on Lucee; PostgreSQL, MySQL and
+SQL Server legs gated on `RUSTCFML_TEST_PG_DS` / `_MYSQL_DS` / `_MSSQL_DS`).
+
+---
+
 # Part E — Environment-specific 🌍
 
 Restrictions that apply only on a particular target (wasm, CLI vs serve).

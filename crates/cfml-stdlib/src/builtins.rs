@@ -11084,6 +11084,141 @@ fn normalize_positional_params(sql: String, raw_params: &CfmlValue) -> (String, 
     (sql, raw_params.clone())
 }
 
+/// Driver-level `cfcatch` members for a database failure (GitHub #295).
+///
+/// Verified against Lucee 7.0.4 (pgjdbc / MariaDB Connector/J / mssql-jdbc):
+/// Lucee puts the driver's SQLSTATE in `SQLState`, the **vendor** error number
+/// in `NativeErrorCode`, and a literal `0` in `ErrorCode` — for every one of the
+/// three drivers. `Detail` and `where` come back empty. We mirror that split
+/// exactly rather than folding the vendor code into `ErrorCode`, so code written
+/// against Lucee reads the same member here.
+///
+/// `sqlstate` is `""` for drivers that genuinely have none to report (see
+/// callers); an empty string is a truthful "unknown", whereas synthesising a
+/// plausible-looking SQLSTATE would silently lie to a caller branching on it.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_error_extras(sqlstate: &str, native_code: i64, where_: &str) -> Vec<(String, CfmlValue)> {
+    vec![
+        ("SQLState".to_string(), CfmlValue::string(sqlstate.to_string())),
+        ("NativeErrorCode".to_string(), CfmlValue::string(native_code.to_string())),
+        // Lucee reports 0 here for every driver; the vendor number lives in
+        // NativeErrorCode. Set at the driver level (not in `decorate_db_error`)
+        // so cftransaction BEGIN/COMMIT/ROLLBACK failures — which never pass
+        // through the queryExecute call site — carry it too.
+        ("ErrorCode".to_string(), CfmlValue::string("0".to_string())),
+        ("where".to_string(), CfmlValue::string(where_.to_string())),
+    ]
+}
+
+/// `cfcatch` extras for a MySQL/MariaDB failure (GitHub #295). Only a
+/// `MySqlError` — an actual ERR packet from the server — carries a SQLSTATE and
+/// vendor code; every other variant is a client-side failure with neither.
+#[cfg(feature = "mysql_db")]
+fn mysql_error_extras(e: &mysql::Error) -> Vec<(String, CfmlValue)> {
+    match e {
+        mysql::Error::MySqlError(se) => db_error_extras(&se.state, se.code as i64, ""),
+        _ => db_error_extras("", 0, ""),
+    }
+}
+
+/// Call-site decoration shared by every driver: the statement that failed and
+/// the datasource it ran against. Lucee exposes the SQL twice — as `Sql` and as
+/// `queryError` — and both are read in the wild, so both are set.
+///
+/// Applied once, at the single point where `fn_query_execute` dispatches to a
+/// driver, rather than at the ~20 individual `map_err` sites. Only touches
+/// `database`-typed errors, so an unrelated error propagating out of the query
+/// path (a param-coercion `expression` error, say) is left alone.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn decorate_db_error(e: CfmlError, sql: &str, label: &str, resolved: &str) -> CfmlError {
+    use cfml_common::vm::CfmlErrorType;
+    if !matches!(&e.error_type, CfmlErrorType::Custom(t) if t.eq_ignore_ascii_case("database")) {
+        return e;
+    }
+    let datasource = label;
+    // Lucee's `additional` struct. `DatabaseVersion`/`DriverVersion` are left
+    // empty: both would need a live round-trip to the server, and this is the
+    // error path — the connection that would answer is frequently the thing
+    // that just failed. Recorded in docs/known-issues.md.
+    let mut additional = ValueMap::default();
+    additional.insert("SQL".to_string(), CfmlValue::string(sql.to_string()));
+    additional.insert("Datasource".to_string(), CfmlValue::string(datasource.to_string()));
+    additional.insert("DriverName".to_string(), CfmlValue::string(db_driver_display_name(resolved)));
+    additional.insert("DatabaseName".to_string(), CfmlValue::string(db_database_name(resolved)));
+    additional.insert("DatabaseVersion".to_string(), CfmlValue::string(String::new()));
+    additional.insert("DriverVersion".to_string(), CfmlValue::string(String::new()));
+
+    e.with_extras([
+        ("Sql".to_string(), CfmlValue::string(sql.to_string())),
+        ("queryError".to_string(), CfmlValue::string(sql.to_string())),
+        ("DataSource".to_string(), CfmlValue::string(datasource.to_string())),
+        ("additional".to_string(), CfmlValue::strukt(additional)),
+    ])
+}
+
+/// Human-readable driver name for `cfcatch.additional.DriverName`.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_driver_display_name(datasource: &str) -> String {
+    match parse_datasource(datasource) {
+        #[cfg(feature = "sqlite")]
+        DbDriver::Sqlite(_) => "SQLite".to_string(),
+        #[cfg(feature = "mysql_db")]
+        DbDriver::Mysql(_) => "MySQL".to_string(),
+        #[cfg(feature = "postgres_db")]
+        DbDriver::Postgres(_) => "PostgreSQL".to_string(),
+        #[cfg(feature = "mssql_db")]
+        DbDriver::Mssql(_) => "Microsoft SQL Server".to_string(),
+        #[allow(unreachable_patterns)]
+        _ => String::new(),
+    }
+}
+
+/// Database name for `cfcatch.additional.DatabaseName` — the trailing path
+/// segment of the datasource URL (for SQLite, the file path itself).
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn db_database_name(datasource: &str) -> String {
+    match parse_datasource(datasource) {
+        #[cfg(feature = "sqlite")]
+        DbDriver::Sqlite(path) => path,
+        #[cfg(feature = "mysql_db")]
+        DbDriver::Mysql(url) => url_trailing_db_name(&url),
+        #[cfg(feature = "postgres_db")]
+        DbDriver::Postgres(url) => url_trailing_db_name(&url),
+        #[cfg(feature = "mssql_db")]
+        DbDriver::Mssql(url) => url_trailing_db_name(&url),
+        #[allow(unreachable_patterns)]
+        _ => String::new(),
+    }
+}
+
+/// Strip `user:pass@` userinfo from a datasource that was given as a raw URL,
+/// so a credential never travels on an exception struct into a log or an error
+/// page. Anything that isn't a URL (a plain datasource name, a SQLite path) is
+/// returned unchanged.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn redact_datasource_credentials(ds: &str) -> String {
+    let Some((scheme, rest)) = ds.split_once("://") else {
+        return ds.to_string();
+    };
+    // Only userinfo counts — an `@` after the first `/` is part of the path.
+    let host_part = rest.split('/').next().unwrap_or(rest);
+    match host_part.rfind('@') {
+        Some(i) => format!("{}://{}", scheme, &rest[i + 1..]),
+        None => ds.to_string(),
+    }
+}
+
+/// The database name from a `scheme://user:pass@host:port/name?query` URL.
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn url_trailing_db_name(url: &str) -> String {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let path = match after_scheme.find('/') {
+        Some(i) => &after_scheme[i + 1..],
+        None => return String::new(),
+    };
+    path.split(['?', '#']).next().unwrap_or("").to_string()
+}
+
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     let sql = get_str(&args, 0);
@@ -11108,6 +11243,25 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
             .map(|(_, v)| datasource_attr_string(&v)),
         _ => None,
+    };
+
+    // The name reported as `cfcatch.datasource` (GitHub #295). A named
+    // datasource reports its name; an inline struct datasource reports Lucee's
+    // `__temp__` sentinel rather than the connection string it was built from.
+    // A raw URL passed as the datasource (which Lucee has no equivalent for)
+    // has any `user:pass@` userinfo stripped — an exception struct routinely
+    // ends up in a log or an error page, and must not carry a password there.
+    let datasource_label: String = match &options_arg {
+        CfmlValue::Struct(opts) => match opts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+            .map(|(_, v)| v)
+        {
+            Some(CfmlValue::Struct(_)) => "__temp__".to_string(),
+            Some(v) => redact_datasource_credentials(&v.as_string()),
+            None => String::new(),
+        },
+        _ => String::new(),
     };
 
     // Dynamic-driver fast path: if the literal datasource name is registered
@@ -11195,7 +11349,20 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
             "queryExecute: database driver not available for datasource '{}'. Enable the appropriate feature (sqlite, mysql_db, postgres_db, mssql_db).",
             datasource
         ))),
-    }?;
+    }
+    // GitHub #295: attach the statement and datasource to any database error on
+    // its way out, so `catch( database e )` sees `e.sql` / `e.datasource` the
+    // way it does on Lucee.
+    .map_err(|e| {
+        // No `datasource` option at all → the request fell back to the default
+        // datasource, so report that (redacted) rather than an empty name.
+        let label = if datasource_label.is_empty() {
+            redact_datasource_credentials(&datasource)
+        } else {
+            datasource_label.clone()
+        };
+        decorate_db_error(e, &sql, &label, &datasource)
+    })?;
     Ok(apply_query_maxrows(result, max_rows))
 }
 
@@ -11227,6 +11394,25 @@ fn apply_query_maxrows(result: CfmlValue, max_rows: Option<usize>) -> CfmlValue 
 // SQLite driver
 // -----------------------------------------------
 
+/// A `database`-typed error from a rusqlite failure, carrying #295 extras.
+///
+/// SQLite has no SQLSTATE — neither the C API nor the file format defines one —
+/// so `SQLState` is left empty rather than mapped onto a plausible-looking ANSI
+/// state we would then have to keep consistent with three other drivers. The
+/// extended result code (`SQLITE_CONSTRAINT_UNIQUE` = 2067,
+/// `SQLITE_CONSTRAINT_FOREIGNKEY` = 787, …) goes to `NativeErrorCode`, which is
+/// the most precise "why" SQLite offers. Lucee ships no SQLite driver, so there
+/// is no reference behaviour to match here. See docs/known-issues.md.
+#[cfg(feature = "sqlite")]
+fn sqlite_db_error(ctx: &str, e: rusqlite::Error) -> CfmlError {
+    let native = match &e {
+        rusqlite::Error::SqliteFailure(ffi, _) => ffi.extended_code as i64,
+        _ => 0,
+    };
+    CfmlError::database(format!("queryExecute: {}: {}", ctx, e))
+        .with_extras(db_error_extras("", native, ""))
+}
+
 #[cfg(feature = "sqlite")]
 fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     use rusqlite::types::Value as SqlValue;
@@ -11243,7 +11429,7 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
 
     if is_select_query(sql) {
         let mut stmt = conn.prepare(&exec_sql)
-            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| sqlite_db_error("SQL error", e))?;
 
         let column_count = stmt.column_count();
         let raw_columns: Vec<String> = (0..column_count)
@@ -11260,15 +11446,15 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
                 }
                 Ok(row_map)
             })
-            .map_err(|e| CfmlError::database(format!("queryExecute: query error: {}", e)))?
+            .map_err(|e| sqlite_db_error("query error", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CfmlError::database(format!("queryExecute: row error: {}", e)));
+            .map_err(|e| sqlite_db_error("row error", e));
 
         let rows = rows_result?;
         build_query_result(columns, rows, sql, return_type)
     } else {
         let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
-            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| sqlite_db_error("SQL error", e))?;
 
         let last_id = conn.last_insert_rowid();
         build_mutation_result(affected as i64, last_id, sql)
@@ -11775,15 +11961,22 @@ fn execute_mysql_on_conn(
     // Map a query error to a timeout error when the watchdog fired (so callers
     // catching `database` errors see "timeout" in the message), else pass through.
     let map_err = |e: mysql::Error, ctx: &str| -> CfmlError {
+        // GitHub #295: a server-side failure carries a SQLSTATE and the vendor
+        // error number (1146 "table doesn't exist", 1062 "duplicate entry", …).
+        // Client-side failures (I/O, TLS, URL) have neither — they get empty
+        // extras rather than a fabricated state. Computed before the timeout
+        // branch so a killed query still reports its state (1317/70100).
+        let extras = mysql_error_extras(&e);
         if let (Some(w), Some(secs)) = (watchdog.as_ref(), timeout_secs) {
             if w.fired() {
                 return CfmlError::database(format!(
                     "queryExecute: MySQL query exceeded timeout of {} second(s) and was cancelled: {}",
                     secs, e
-                ));
+                ))
+                .with_extras(extras);
             }
         }
-        CfmlError::database(format!("queryExecute: MySQL {}: {}", ctx, e))
+        CfmlError::database(format!("queryExecute: MySQL {}: {}", ctx, e)).with_extras(extras)
     };
 
     if mysql_returns_rows(sql) {
@@ -12008,8 +12201,20 @@ impl PgRunError {
 
     fn from_postgres(context: &str, e: postgres::Error, retry_safe: bool) -> Self {
         let connection_broken = pg_error_is_connection_fatal(&e);
+        // GitHub #295: carry the SQLSTATE out to CFML. PostgreSQL has no vendor
+        // error number distinct from the SQLSTATE, and Lucee/pgjdbc report 0 for
+        // `NativeErrorCode` here, so we do too. `where` is the server's error
+        // context (the PL/pgSQL frame trail on a function/trigger failure) —
+        // the member Lucee names after PostgreSQL's WHERE field.
+        let sqlstate = e.code().map(|c| c.code().to_string()).unwrap_or_default();
+        let where_ = e
+            .as_db_error()
+            .and_then(|d| d.where_())
+            .unwrap_or("")
+            .to_string();
         Self {
-            error: CfmlError::database(format_pg_error(context, &e)),
+            error: CfmlError::database(format_pg_error(context, &e))
+                .with_extras(db_error_extras(&sqlstate, 0, &where_)),
             connection_broken,
             retry_safe: connection_broken && retry_safe,
         }
@@ -12806,8 +13011,20 @@ impl MssqlRunError {
 
     fn from_tiberius(ctx: &str, e: tiberius::error::Error, retry_safe: bool) -> Self {
         let connection_broken = is_mssql_connection_error(&e);
+        // GitHub #295: SQL Server's wire protocol carries a vendor error number
+        // (208 "invalid object name", 2627 "violation of PRIMARY KEY", …) but no
+        // SQLSTATE — TokenError's `state` byte is the TDS error state, a
+        // different thing entirely. Lucee gets a SQLSTATE here only because
+        // mssql-jdbc synthesises legacy ODBC states ("S0002") that no other
+        // driver produces; we report the vendor number and leave `SQLState`
+        // empty rather than invent a third convention. See docs/known-issues.md.
+        let native = match &e {
+            tiberius::error::Error::Server(te) => te.code() as i64,
+            _ => 0,
+        };
         Self {
-            error: CfmlError::database(format!("queryExecute: MSSQL {}: {}", ctx, e)),
+            error: CfmlError::database(format!("queryExecute: MSSQL {}: {}", ctx, e))
+                .with_extras(db_error_extras("", native, "")),
             connection_broken,
             // Only retry connection-level failures, and only when the caller says
             // the statement is replayable. SELECTs are side-effect free, so they
@@ -13374,7 +13591,7 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
 
     if is_select_query(sql) {
         let mut stmt = conn.prepare(&exec_sql)
-            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| sqlite_db_error("SQL error", e))?;
         let column_count = stmt.column_count();
         let raw_columns: Vec<String> = (0..column_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
@@ -13389,14 +13606,14 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
                 }
                 Ok(row_map)
             })
-            .map_err(|e| CfmlError::database(format!("queryExecute: query error: {}", e)))?
+            .map_err(|e| sqlite_db_error("query error", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CfmlError::database(format!("queryExecute: row error: {}", e)));
+            .map_err(|e| sqlite_db_error("row error", e));
         let rows = rows_result?;
         build_query_result(columns, rows, sql, return_type)
     } else {
         let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
-            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| sqlite_db_error("SQL error", e))?;
         let last_id = conn.last_insert_rowid();
         build_mutation_result(affected as i64, last_id, sql)
     }

@@ -4461,6 +4461,21 @@ impl CfmlVirtualMachine {
             CfmlValue::string(e.error_type.type_name()),
         );
         err_struct.insert("detail".to_string(), CfmlValue::string(String::new()));
+        // Structured extras carried by the raiser (GitHub #295): a database
+        // failure arrives with `SQLState`/`NativeErrorCode`/`Sql`/`DataSource`
+        // attached, so `catch( database e )` can branch on the SQLSTATE rather
+        // than substring-matching the driver's message. Merged BEFORE the
+        // guaranteed-member backfill in `add_root_cause`, so an extra-supplied
+        // `errorCode` wins over that function's empty-string default (the #250
+        // guards there are "don't clobber what's already set", and extras count
+        // as already set). Keys are inserted with the raiser's casing, matching
+        // Lucee's mixed-case `SQLState`/`DataSource`/`NativeErrorCode`; CFML
+        // struct access is case-insensitive so the casing is cosmetic.
+        if let Some(extras) = &e.extras {
+            for (k, v) in extras.iter() {
+                err_struct.insert(k.clone(), v.clone());
+            }
+        }
         // `stackTrace` (Lucee/ACF parity): a multiline "message @ template:line"
         // string synthesised from the tag context. Frameworks read it directly
         // (ColdBox's ModuleService logs `e.stackTrace`; a missing member would
