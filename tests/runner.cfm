@@ -35,6 +35,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_cfcatch_standard_members.cfm">
 <cf_runtest file="core/test_bare_call_shadowing_semantics.cfm">
 <cf_runtest file="core/test_closure_env_leak.cfm">
+<cf_runtest file="functions/test_closure_env_writeback_leak.cfm">
 <!--- - closure_captures_local_function (PR #198): a closure captures its --->
 <!--- enclosing fn's var-scoped values AND var-scoped FUNCTION expressions. --->
 <!--- RustCFML captured plain values but not a `var fn = function(){}` helper --->

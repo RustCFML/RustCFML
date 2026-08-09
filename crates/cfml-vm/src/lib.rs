@@ -5673,6 +5673,16 @@ impl CfmlVirtualMachine {
         // locals and the frame seed below merges (env ∪ filtered caller)
         // straight into `locals` (perf plan 3.2 stage 1).
         let fused_plan = self.pending_fused_parent.take();
+        // The captured env is ALSO part of the return-writeback baseline. The
+        // old shape diffed the callee's final locals against `effective_parent`
+        // (env ∪ filtered caller), so an env-seeded key with an unchanged value
+        // compared EQUAL and produced no writeback. On the fused path
+        // `parent_scope` is the raw caller locals, which do NOT contain the env
+        // keys — without this handle the diff would see every env-seeded key as
+        // "new" and spray the callee's captured page env into the caller's
+        // frame after every bare helper call (the Preside sitetree regression:
+        // a helper's env `args` clobbered the rendering frame's `args`).
+        let fused_env_baseline = fused_plan.as_ref().and_then(|p| p.env.clone());
         // Tier-1 JIT fast path. Returns `Some` only when a compiled native body
         // ran to completion for these exact (all-Int) arguments; otherwise this
         // falls through to the interpreter unchanged. `func`/`args` are the
@@ -9113,6 +9123,8 @@ impl CfmlVirtualMachine {
                     if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
                         if !effective_local_mode_modern {
                             let arg_scope_keys = Self::argument_scope_key_set(&locals);
+                            let fused_env_guard =
+                                fused_env_baseline.as_ref().and_then(|e| e.read().ok());
                             let mut writeback = ValueMap::default();
                             for (k, v) in &locals {
                                 // See the matching note on the normal-exit epilogue
@@ -9128,7 +9140,11 @@ impl CfmlVirtualMachine {
                                 {
                                     continue;
                                 }
-                                if let Some(parent_val) = parent.get(k) {
+                                // Baseline: the captured env first (fused path — env values
+                                // won the effective-parent composition for data keys), then
+                                // the caller's locals. See fused_env_baseline.
+                                let env_val = fused_env_guard.as_deref().and_then(|e| e.get(k));
+                                if let Some(parent_val) = env_val.or_else(|| parent.get(k)) {
                                     if !Self::values_equal_shallow(v, parent_val) {
                                         writeback.insert(k.clone(), v.clone());
                                     }
@@ -12897,6 +12913,8 @@ impl CfmlVirtualMachine {
         if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
             if !effective_local_mode_modern {
                 let arg_scope_keys = Self::argument_scope_key_set(&locals);
+                let fused_env_guard =
+                    fused_env_baseline.as_ref().and_then(|e| e.read().ok());
                 let mut writeback = ValueMap::default();
                 for (k, v) in &locals {
                     // Skip function params, arguments scope, 'this', var-declared
@@ -12917,7 +12935,11 @@ impl CfmlVirtualMachine {
                     {
                         continue;
                     }
-                    if let Some(parent_val) = parent.get(k) {
+                    // Baseline: the captured env first (fused path — env values
+                    // won the effective-parent composition for data keys), then
+                    // the caller's locals. See fused_env_baseline.
+                    let env_val = fused_env_guard.as_deref().and_then(|e| e.get(k));
+                    if let Some(parent_val) = env_val.or_else(|| parent.get(k)) {
                         if !Self::values_equal_shallow(v, parent_val) {
                             writeback.insert(k.clone(), v.clone());
                         }
