@@ -9404,7 +9404,9 @@ impl CfmlVirtualMachine {
                     for _ in 0..*count {
                         let value = stack.pop().unwrap_or(CfmlValue::Null);
                         let key = stack.pop().unwrap_or(CfmlValue::string(String::new()));
-                        pairs.push((key.as_string(), value));
+                        // §3.5: the map key must be owned, but `key` was just popped
+                        // off the stack — move its String out instead of copying.
+                        pairs.push((key.into_string(), value));
                     }
                     let mut map = ValueMap::default();
                     for (k, v) in pairs.into_iter().rev() {
@@ -9465,7 +9467,12 @@ impl CfmlVirtualMachine {
                             }
                         }
                         CfmlValue::Struct(s) => {
-                            let key = index.as_string();
+                            // §3.5: the key is only ever READ here (lookup, case
+                            // folds, numeric parse), so borrow it when `index` is
+                            // already a string instead of deep-copying the contents.
+                            // Hottest `as_string` site on a warm Preside page
+                            // (3,764 calls/request).
+                            let key = index.as_str_cow();
                             let direct = s
                                 .get(&key)
                                 .or_else(|| s.get(&key.to_uppercase()))
@@ -9567,7 +9574,7 @@ impl CfmlVirtualMachine {
                         // private DATA (tolerant — Null on miss, like struct index).
                         #[cfg(feature = "component-instance")]
                         CfmlValue::Instance(inst) => {
-                            let key = index.as_string();
+                            let key = index.as_str_cow();
                             stack.push(
                                 inst.read().get_member(&key).unwrap_or(CfmlValue::Null),
                             );
@@ -9635,7 +9642,10 @@ impl CfmlVirtualMachine {
                             }
                         }
                         CfmlValue::Struct(s) => {
-                            let key = index.as_string();
+                            // §3.5: the key is inserted (owned is genuinely needed),
+                            // but `index` was just popped off the stack, so move the
+                            // backing String out rather than copying its contents.
+                            let key = index.into_string();
                             // Propagate to __variables for declared CFC properties
                             if s.contains_key("__variables") && s.contains_key("__properties") {
                                 let key_lower = key.to_lowercase();
@@ -13737,7 +13747,9 @@ impl CfmlVirtualMachine {
             if name_lower == "__writetext" {
                 if self.enable_cfoutput_only <= 0 {
                     for arg in &args {
-                        self.output_buffer.push_str(&arg.as_string());
+                        // §3.5: the copy was pure waste — the text is immediately
+                        // pushed into the output buffer and dropped.
+                        self.output_buffer.push_str(&arg.as_str_cow());
                     }
                 }
                 return Ok(CfmlValue::Null);
@@ -23512,9 +23524,11 @@ impl CfmlVirtualMachine {
         // would otherwise never reach the shim handler.
         if let CfmlValue::Struct(ref s) = object {
             if s.contains_key("__java_shim") {
+                // §3.5: `as_string().to_lowercase()` allocated twice; the first copy
+                // is discarded immediately by the fold.
                 let java_class = s
                     .get("__java_class")
-                    .map(|v| v.as_string().to_lowercase())
+                    .map(|v| v.as_str_cow().to_lowercase())
                     .unwrap_or_default();
 
                 // Servlet bridge: getPageContext() and its request/response

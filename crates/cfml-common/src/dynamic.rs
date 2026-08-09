@@ -1600,6 +1600,45 @@ impl CfmlValue {
         }
     }
 
+    /// Borrowing counterpart of [`as_string`](Self::as_string) — perf plan §3.5.
+    ///
+    /// `as_string()` on a `CfmlValue::String` is `(**s).clone()`: one heap
+    /// allocation plus a full memcpy of the contents, every call, at ~576 call
+    /// sites. The overwhelming majority of those sites only ever *read* the
+    /// result — as a map lookup key, a comparison operand, or something pushed
+    /// straight into an output buffer — so the copy is pure waste.
+    ///
+    /// This returns `Cow::Borrowed` for the already-a-string case (zero
+    /// allocation) and falls back to `Cow::Owned(self.as_string())` for
+    /// everything else, so the produced text is byte-identical to `as_string()`
+    /// for every variant. Use it anywhere a `&str` would do; keep `as_string()`
+    /// where an owned `String` is genuinely needed.
+    #[inline]
+    pub fn as_str_cow(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            CfmlValue::String(s) => std::borrow::Cow::Borrowed(&**s),
+            _ => std::borrow::Cow::Owned(self.as_string()),
+        }
+    }
+
+    /// Consuming counterpart of [`as_string`](Self::as_string) — perf plan §3.5.
+    ///
+    /// When the receiver is a `String` whose `Arc` is uniquely owned (the common
+    /// case for a value just popped off the operand stack), this MOVES the
+    /// backing `String` out instead of copying it. A shared `Arc` still has to
+    /// clone. Use at sites that need an owned `String` and already own the
+    /// value — e.g. building a struct key from a popped stack operand.
+    #[inline]
+    pub fn into_string(self) -> String {
+        match self {
+            CfmlValue::String(s) => match Arc::try_unwrap(s) {
+                Ok(owned) => owned,
+                Err(shared) => (*shared).clone(),
+            },
+            other => other.as_string(),
+        }
+    }
+
     pub fn as_string(&self) -> String {
         let mut path: Vec<usize> = Vec::new();
         let mut memo: HashMap<usize, String> = HashMap::new();

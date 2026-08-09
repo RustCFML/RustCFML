@@ -3082,7 +3082,10 @@ fn fn_struct_count(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        let key = args[1].as_string();
+        // §3.5: the key is only compared and used as a lookup argument, never
+        // stored — borrow it instead of deep-copying (2,437 calls on a warm
+        // Preside page, the second-hottest `as_string` site).
+        let key = args[1].as_str_cow();
         // Phase C.3 — Slice 4: flyweight instance — check public members directly.
         if let Some(comp) = args[0].as_component() {
             if comp.is_instance_backed() {
