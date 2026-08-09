@@ -2113,6 +2113,18 @@ pub struct CfmlVirtualMachine {
     /// sibling `beforeEach` reassignment is visible to the deferred `it`. Without
     /// it the inner closure captured a point-in-time COPY that never re-synced.
     pending_closure_env: Option<Arc<RwLock<ValueMap>>>,
+    /// Fused call-parent merge plan (perf plan 3.2 stage 1). Set by the bare
+    /// named-call dispatch sites immediately before `execute_function_with_args`
+    /// and consumed at the top of `execute_function_body`. When present, the
+    /// callee's frame seed merges (captured env ∪ filtered caller locals)
+    /// STRAIGHT into `locals` in one pass, instead of the old shape — build an
+    /// owned `effective_parent` map (`build_call_parent_scope`), pass it down,
+    /// and copy every entry AGAIN into `locals` — which cloned each carried
+    /// key+value twice per call and allocated/dropped a whole intermediate
+    /// IndexMap. `parent_scope` carries the borrowed RAW caller locals on this
+    /// path. Semantics are `build_call_parent_scope` + the copy-in loop, fused;
+    /// see `fused_parent_merge` for the per-key decision table.
+    pending_fused_parent: Option<FusedParentPlan>,
     /// The name a member method was invoked under at its call site. Set by
     /// `call_member_function` just before dispatching, and drained by the next
     /// `execute_function_with_args` into the new frame's `called_name`. Lets
@@ -2474,6 +2486,19 @@ fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
     map.insert(name.to_string(), val);
 }
 
+/// Deferred inputs for the fused call-parent merge (see the field doc on
+/// `pending_fused_parent`): the callee's captured env and the caller's
+/// inherited-key filter, both held by Arc so building the plan is two
+/// refcount bumps — the actual key/value cloning happens once, at frame
+/// entry, directly into the callee's `locals`.
+#[derive(Debug)]
+struct FusedParentPlan {
+    env: Option<Arc<std::sync::RwLock<ValueMap>>>,
+    /// `None` = carry everything (closure expression, or the caller is a
+    /// template/page frame whose locals ARE the page variables scope).
+    filter: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+}
+
 #[derive(Debug, Clone)]
 struct CallFrame {
     function_name: String,
@@ -2650,6 +2675,7 @@ impl CfmlVirtualMachine {
             pending_result_writeback: None,
             pending_extra_named_args: None,
             pending_closure_env: None,
+            pending_fused_parent: None,
             pending_called_name: None,
             native_classes: HashMap::new(),
             qoq_registry: QoQFunctionRegistry::new(),
@@ -5641,6 +5667,12 @@ impl CfmlVirtualMachine {
         args: Vec<CfmlValue>,
         parent_scope: Option<&ValueMap>,
     ) -> CfmlResult {
+        // Take the fused parent plan unconditionally at entry — a JIT
+        // fast-path early return below must not leave a stale plan behind for
+        // an unrelated later call. When set, `parent_scope` is the RAW caller
+        // locals and the frame seed below merges (env ∪ filtered caller)
+        // straight into `locals` (perf plan 3.2 stage 1).
+        let fused_plan = self.pending_fused_parent.take();
         // Tier-1 JIT fast path. Returns `Some` only when a compiled native body
         // ran to completion for these exact (all-Int) arguments; otherwise this
         // falls through to the interpreter unchanged. `func`/`args` are the
@@ -5849,7 +5881,22 @@ impl CfmlVirtualMachine {
         // "locals" are the page `variables` scope), so its includes must not
         // leak page vars in as `local.*`.
         let frame_has_local_scope = !is_template_frame || share_local_keys.is_some();
-        if let Some(parent) = parent_scope {
+        if let Some(plan) = fused_plan {
+            // Fused path (perf plan 3.2 stage 1): `parent_scope` is the RAW
+            // caller locals; merge (captured env ∪ filtered caller) straight
+            // into `locals`. Decision table identical to
+            // `build_call_parent_scope` followed by the copy-in loop below —
+            // each carried entry is cloned exactly ONCE here instead of once
+            // into an intermediate map and again into `locals`.
+            self.fused_parent_merge(
+                plan,
+                parent_scope,
+                &mut locals,
+                &mut inherited_or_param_keys,
+                &mut inherited_from_parent,
+                share_local_keys.as_ref(),
+            );
+        } else if let Some(parent) = parent_scope {
             for (k, v) in parent {
                 // Function values are normally skipped here: a named function /
                 // sibling closure is already reachable via user_functions or the
@@ -13095,7 +13142,7 @@ impl CfmlVirtualMachine {
                             // adopting the parent env outright.
                             self.pending_closure_env = func.captured_scope.clone();
                         }
-                        let effective_parent = self.build_call_parent_scope(func, parent_locals);
+                        let fused_parent_plan = self.fused_call_parent_plan(func);
                         // Lexical relative-component resolution: while a user
                         // function runs, a bare createObject("component","X")/
                         // `new X()` inside it must resolve X relative to the
@@ -13141,10 +13188,11 @@ impl CfmlVirtualMachine {
                         {
                             self.pending_called_name = Some(func.name.clone());
                         }
+                        self.pending_fused_parent = Some(fused_parent_plan);
                         let result = self.execute_function_with_args(
                             &user_func,
                             args,
-                            Some(&effective_parent),
+                            Some(parent_locals),
                         );
                         if let Some(prev) = saved_source_file {
                             self.source_file = prev;
@@ -14025,8 +14073,8 @@ impl CfmlVirtualMachine {
             // merge it with parent_locals so the function retains access to its
             // defining scope's variables when called from a different context.
             if let Some(user_func) = self.user_functions.get(&func.name).cloned() {
-                let effective_parent = self.build_call_parent_scope(func, parent_locals);
-                return self.execute_function_with_args(&user_func, args, Some(&effective_parent));
+                self.pending_fused_parent = Some(self.fused_call_parent_plan(func));
+                return self.execute_function_with_args(&user_func, args, Some(parent_locals));
             }
 
             // Case-insensitive user function lookup
@@ -14037,8 +14085,8 @@ impl CfmlVirtualMachine {
                 .map(|(_, v)| v.clone());
 
             if let Some(user_func) = user_match {
-                let effective_parent = self.build_call_parent_scope(func, parent_locals);
-                return self.execute_function_with_args(&user_func, args, Some(&effective_parent));
+                self.pending_fused_parent = Some(self.fused_call_parent_plan(func));
+                return self.execute_function_with_args(&user_func, args, Some(parent_locals));
             }
 
             // Higher-order standalone functions (arrayMap, arrayFilter, arrayReduce, etc.)
@@ -20582,37 +20630,33 @@ impl CfmlVirtualMachine {
     /// legitimate cross-frame carry is helper FUNCTIONS: var-scoped function
     /// expressions and sibling references stay callable by bare name (PR #198),
     /// so those are copied from the call site while data values are dropped.
-    fn build_call_parent_scope(
+    /// Build the fused call-parent merge plan for a bare named call to
+    /// `func_ref` (perf plan 3.2 stage 1): the callee's captured env and the
+    /// caller's inherited-key filter, captured as two cheap Arc bumps. The
+    /// actual merge runs in `fused_parent_merge` at frame entry, so carried
+    /// entries are cloned exactly once, straight into the callee's `locals`.
+    ///
+    /// The filter: an anonymous function EXPRESSION / arrow is a true lexical
+    /// closure — it captures the ENCLOSING function's locals wholesale, so no
+    /// filter applies. Otherwise the caller is whatever frame is currently
+    /// executing this call, read from `frame_ctx` (which — unlike `call_stack`
+    /// — includes `__main__`/template frames):
+    ///   • no frame, or the immediate caller is a TEMPLATE/page frame → None:
+    ///     the caller's locals ARE the page `variables` scope, so all carry.
+    ///   • the immediate caller is a real function → only the keys it itself
+    ///     inherited (lexical/page scope + structural + helpers) propagate —
+    ///     never its own `var` locals or params (that would be dynamic
+    ///     scoping, not CFML).
+    /// Reading `call_stack.last()` here was the GH #259 bug: a bare call from
+    /// inside an `include`d template found the nearest *pushed* function frame
+    /// and applied ITS inherited set, dropping page vars the template held.
+    fn fused_call_parent_plan(
         &self,
         func_ref: &cfml_common::dynamic::CfmlFunction,
-        parent_locals: &ValueMap,
-    ) -> ValueMap {
-        let mut parent: ValueMap = match func_ref.captured_scope {
-            Some(ref shared_env) => shared_env.read().unwrap().clone(),
-            None => ValueMap::default(),
-        };
-        // An anonymous function EXPRESSION / arrow is a true lexical closure: it
-        // captures the ENCLOSING function's locals (incl. mutable data like an
-        // accumulator), and in this VM that enclosing scope arrives as
-        // `parent_locals` (its `captured_scope` is seeded without late-bound and
-        // mutated vars). So it inherits the caller's data wholesale.
+    ) -> FusedParentPlan {
         let is_closure_expr =
             func_ref.name.starts_with("__closure_") || func_ref.name.starts_with("__arrow_");
-        // The caller is whatever frame is currently executing this call, read
-        // from `frame_ctx` (which — unlike `call_stack` — includes `__main__`/
-        // template frames). Cases:
-        //   • no frame, or the immediate caller is a TEMPLATE/page frame → None:
-        //     the caller's locals ARE the page `variables` scope, so all carry.
-        //   • the immediate caller is a real function → only the keys it itself
-        //     inherited (lexical/page scope + structural + helpers) propagate —
-        //     never its own `var` locals or params (that would be dynamic
-        //     scoping, not CFML). This stops a callee's bare `x ?: default` from
-        //     silently reading the caller's same-named local.
-        // Reading `call_stack.last()` here was the GH #259 bug: a bare call from
-        // inside an `include`d template found the nearest *pushed* function frame
-        // (e.g. Preside's `renderViewComposite`) and applied ITS inherited set,
-        // dropping page vars (`controller`) the template legitimately held.
-        let caller_inherited = if is_closure_expr {
+        let filter = if is_closure_expr {
             None // closures capture the full enclosing scope; skip the filter
         } else {
             match self.frame_ctx.last() {
@@ -20621,39 +20665,105 @@ impl CfmlVirtualMachine {
                 Some((inh, false)) => Some(inh.clone()),
             }
         };
-        for (k, v) in parent_locals {
-            let carry = match &caller_inherited {
+        FusedParentPlan {
+            env: func_ref.captured_scope.clone(),
+            filter,
+        }
+    }
+
+    /// Execute the fused call-parent merge at frame entry. Replicates, key by
+    /// key, what `build_call_parent_scope` + the frame-seed copy-in loop used
+    /// to produce (each rule's rationale lives on those two originals):
+    ///
+    /// - filter-carry (per caller entry): carried iff no filter (closure expr /
+    ///   template caller), the key is in the caller's inherited set, it's a
+    ///   stripped helper function, or a structural key (this/__variables/
+    ///   variables/super).
+    /// - env∪caller composition: a filter-carried caller FUNCTION overrides a
+    ///   same-named env entry; filter-carried caller DATA only fills keys the
+    ///   env lacks.
+    /// - seed-carry (per composed entry): a Function is seeded iff its captured
+    ///   scope was stripped or it isn't a declared user function (PR #198/§32);
+    ///   data always seeds.
+    /// - every seeded key is marked inherited (minus `share_local_keys`, which
+    ///   stay part of this frame's `local` view).
+    ///
+    /// One deliberate divergence: a caller function that overrides an env key
+    /// lands at the END of `locals` insertion order rather than at the env
+    /// entry's slot. Inherited keys are excluded from `local`-view iteration,
+    /// so the order is unobservable there.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_parent_merge(
+        &self,
+        plan: FusedParentPlan,
+        caller: Option<&ValueMap>,
+        locals: &mut ValueMap,
+        inherited_or_param_keys: &mut std::collections::HashSet<String>,
+        inherited_from_parent: &mut std::collections::HashSet<String>,
+        share_local_keys: Option<&std::collections::HashSet<String>>,
+    ) {
+        let filter_carry = |k: &str, v: &CfmlValue| -> bool {
+            match &plan.filter {
                 None => true,
                 Some(inh) => {
-                    // The helper-function carve-out is limited to the
-                    // captured-scope-STRIPPED values `closure_env_capture_value`
-                    // produces (PR #198) — those are not reachable any other
-                    // way. A caller's own `var f = function(){…}` keeps its
-                    // captured scope, and carrying THAT would be dynamic
-                    // scoping: Lucee 7 reports `isDefined("f")` false in the
-                    // callee and throws "No matching function [F] found" on a
-                    // bare call. It only became reachable once the §32 fix
-                    // stopped the frame seed from dropping scope-bearing
-                    // functions, so the filter has to reject it here instead.
-                    inh.contains(k.as_str())
+                    inh.contains(k)
                         || matches!(v, CfmlValue::Function(f) if f.captured_scope.is_none())
-                        || matches!(k.as_str(), "this" | "__variables" | "variables" | "super")
+                        || matches!(k, "this" | "__variables" | "variables" | "super")
                 }
-            };
-            if !carry {
-                continue;
             }
-            // Functions overwrite (call-site helper wins, preserving prior
-            // behaviour); scope/data keys only fill gaps so a callee's OWN
-            // captured page/component scope is never clobbered by the caller's.
-            if matches!(v, CfmlValue::Function(_)) {
-                parent.insert(k.clone(), v.clone());
-            } else {
-                parent.entry(k.clone()).or_insert_with(|| v.clone());
+        };
+        let seed_carry = |slf: &Self, k: &str, v: &CfmlValue| -> bool {
+            match v {
+                CfmlValue::Function(f) => {
+                    f.captured_scope.is_none() || !slf.is_declared_user_function(k)
+                }
+                _ => true,
+            }
+        };
+        let env_guard = plan.env.as_ref().and_then(|e| e.read().ok());
+        // Pass 1: env entries — skipping any key a filter-carried caller
+        // FUNCTION will override.
+        if let Some(env) = env_guard.as_deref() {
+            for (k, v) in env.iter() {
+                if let Some(cv) = caller.and_then(|c| c.get(k)) {
+                    if matches!(cv, CfmlValue::Function(_)) && filter_carry(k, cv) {
+                        continue;
+                    }
+                }
+                if seed_carry(self, k, v) {
+                    locals.insert(k.clone(), v.clone());
+                    if share_local_keys.is_none_or(|s| !s.contains(k)) {
+                        inherited_or_param_keys.insert(k.clone());
+                    }
+                    inherited_from_parent.insert(k.clone());
+                }
             }
         }
-        parent
+        // Pass 2: caller locals.
+        if let Some(caller) = caller {
+            for (k, v) in caller {
+                if !filter_carry(k, v) {
+                    continue;
+                }
+                if !matches!(v, CfmlValue::Function(_))
+                    && env_guard.as_deref().is_some_and(|e| e.contains_key(k))
+                {
+                    // Data only fills gaps the env left (or_insert semantics) —
+                    // including keys whose env value was later dropped by the
+                    // seed-carry rule (the composed value was still the env's).
+                    continue;
+                }
+                if seed_carry(self, k, v) {
+                    locals.insert(k.clone(), v.clone());
+                    if share_local_keys.is_none_or(|s| !s.contains(k)) {
+                        inherited_or_param_keys.insert(k.clone());
+                    }
+                    inherited_from_parent.insert(k.clone());
+                }
+            }
+        }
     }
+
 
     fn lookup_name_in_scopes(
         &self,
