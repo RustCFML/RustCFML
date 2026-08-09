@@ -817,7 +817,7 @@ fn build_caller_kinds(
         }
         // Case-insensitive lookup against the live locals map.
         let v = locals
-            .get(name)
+            .get(name.as_str())
             .or_else(|| locals.iter().find(|(k, _)| k.eq_ignore_ascii_case(&lower)).map(|(_, v)| v));
         let k = match v {
             Some(CfmlValue::Int(_)) => analysis::Kind::Int,

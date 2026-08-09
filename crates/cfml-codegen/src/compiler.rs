@@ -1,6 +1,7 @@
 //! CFML Code Generator - AST to bytecode
 
 use cfml_compiler::ast::*;
+pub use cfml_common::name::Name;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -338,15 +339,15 @@ pub enum BytecodeOp {
     String(String),
 
     // Variables
-    LoadLocal(String),
-    StoreLocal(String),
+    LoadLocal(Name),
+    StoreLocal(Name),
     /// Fused arrayAppend(<ident>, value): pops the value off the stack and
     /// appends it to the array held in the named variable, in place. Avoids the
     /// LoadLocal/clone + builtin call + StoreLocal round-trip whose Arc aliasing
     /// makes a loop of appends O(n²) (every `make_mut` deep-clones the backing
     /// Vec). Emitted only for a 2-arg call with a simple, non-scope identifier.
-    ArrayAppendLocal(String),
-    LoadGlobal(String),
+    ArrayAppendLocal(Name),
+    LoadGlobal(Name),
     /// Page-scope `variables.foo` read peephole. Same locals-then-globals
     /// resolution chain as LoadGlobal, but READ position: a plain data value
     /// is always returned as-is. LoadGlobal is otherwise emitted only in
@@ -354,8 +355,8 @@ pub enum BytecodeOp {
     /// under a builtin name) must stay invisible to function-name
     /// resolution (PR #97) — semantics that would corrupt reads of
     /// variables named like builtins (`variables.log`, `variables.len`).
-    LoadVariablesKey(String),
-    StoreGlobal(String),
+    LoadVariablesKey(Name),
+    StoreGlobal(Name),
 
     // Stack
     Pop,
@@ -403,12 +404,12 @@ pub enum BytecodeOp {
     /// Loop-condition super-instruction: `if !(locals[name] CMP const) { jump offset }`.
     /// Fuses LoadLocal + Integer + Cmp + JumpIfFalse into one dispatch.
     /// Emitted by compile_for for conditions of the shape `<identifier> <cmp> <int-const>`.
-    JumpIfLocalCmpConstFalse(String, i64, CmpOp, usize),
+    JumpIfLocalCmpConstFalse(Name, i64, CmpOp, usize),
     /// For-loop step super-instruction: `locals[name] += step; if (locals[name] CMP const) jump target`.
     /// Fuses Increment + LoadLocal + Integer + Cmp + JumpIfFalse-style test into one
     /// dispatch. `step` is +1 (for `i++`) or -1 (for `i--`). The jump fires on the
     /// TRUE arm (back to body); falling through means the loop has finished.
-    ForLoopStep(String, i64, CmpOp, i64, usize),
+    ForLoopStep(Name, i64, CmpOp, i64, usize),
     Call(usize),
     Return,
 
@@ -417,12 +418,12 @@ pub enum BytecodeOp {
     BuildStruct(usize),  // Build struct from top N key-value pairs
     GetIndex,            // Get array[index] or struct[key]
     SetIndex,            // Set array[index] = value or struct[key] = value
-    GetProperty(String), // Get object.property — THROWS "Variable '<name>' is undefined" on a genuine miss (Lucee/ACF parity)
+    GetProperty(Name), // Get object.property — THROWS "Variable '<name>' is undefined" on a genuine miss (Lucee/ACF parity)
     /// Null-tolerant twin of GetProperty: a missing struct/component member reads
     /// as Null instead of throwing. Emitted only in contexts that must tolerate a
     /// missing member — the `?:` (Elvis) left operand, `isNull()`, null-safe `?.`,
     /// and nested-write auto-vivification bases (`q["a"]["b"] = v` with `q` unset).
-    TryGetProperty(String),
+    TryGetProperty(Name),
     /// Push the `super` receiver for the CURRENTLY EXECUTING method, resolved
     /// relative to that method's defining class (not the leaf instance). Reads
     /// `this.__super_map[<defining source>]` keyed by the active `source_file`,
@@ -432,18 +433,18 @@ pub enum BytecodeOp {
     /// Push the static "holder" (a cached, lazily-built template instance whose
     /// `__variables.__static` is the shared static scope) for a named component.
     /// Used by the `::` operator to reach static members without instantiating.
-    LoadStaticHolder(String),
+    LoadStaticHolder(Name),
     /// Pop a static holder (or any component value) and push the named member of
     /// its static scope (`Component::member`). Pushes Null if absent.
-    GetStaticProperty(String),
+    GetStaticProperty(Name),
     /// Fused LoadLocal(name) + GetProperty(member) — reads a struct field from a
     /// named local in one dispatch. Only emitted for non-null-safe accesses
     /// where the receiver is a plain identifier (the common `s.foo` pattern).
-    LoadLocalProperty(String, String),
+    LoadLocalProperty(Name, Name),
     /// Fused LoadLocal(name) + SetProperty(member) — stores a value into a struct
     /// field of a named local in one dispatch. Only emitted for non-null-safe
     /// accesses where the receiver is a plain identifier (the common `s.foo = x` pattern).
-    StoreLocalProperty(String, String),
+    StoreLocalProperty(Name, Name),
     /// Fused LoadLocal("local") + GetProperty(member) for an explicit `local.foo`
     /// read. The generic path materializes the ENTIRE per-call `local` scope view
     /// (cloning every visible key+value into a fresh struct) just to extract one
@@ -453,12 +454,12 @@ pub enum BytecodeOp {
     /// (`build_local_scope_view`): inherited/param keys, `this`/`super`, and
     /// `__`-prefixed bridge keys are invisible; a miss yields Null (matching
     /// GetProperty on the materialized view).
-    LoadLocalKey(String),
+    LoadLocalKey(Name),
     /// Null-tolerant twins of the fused read ops (see TryGetProperty). A missing
     /// receiver variable OR a missing member reads as Null instead of throwing.
-    TryLoadLocalProperty(String, String),
-    TryLoadLocalKey(String),
-    SetProperty(String), // Set object.property = value
+    TryLoadLocalProperty(Name, Name),
+    TryLoadLocalKey(Name),
+    SetProperty(Name), // Set object.property = value
     /// Mark a property name as accessor-private on the current frame's `this`
     /// component: its value was written by a generated `setX()` accessor, so
     /// Lucee keeps it in the private `variables` scope and it must be hidden from
@@ -466,7 +467,7 @@ pub enum BytecodeOp {
     /// via `getX()`/`serializeJSON`). Records into the `ACCESSOR_PRIVATE_MARKER`
     /// set on `this`. No stack effect. The implicit accessor constructor does the
     /// equivalent from Rust (`mark_accessor_private`).
-    MarkAccessorPrivate(String),
+    MarkAccessorPrivate(Name),
     /// Dynamic/quoted-string LHS assignment: `"#scope#.#prop#" = v` or
     /// `"variables.x" = v`. Stack: [pathString, value]. The path is resolved at
     /// runtime and the value stored scope-aware into the current frame (so
@@ -491,7 +492,7 @@ pub enum BytecodeOp {
     /// the in-place struct mutation that handles `StructDelete(localStruct, k)`
     /// can't reach the live scope; this op deletes straight from it. Pushes
     /// nothing.
-    DeleteScopeKey(String),
+    DeleteScopeKey(Name),
 
     // Object
     NewObject(usize),  // arg_count for constructor
@@ -503,10 +504,10 @@ pub enum BytecodeOp {
     DefineFunction(usize), // BytecodeFunction.global_id (resolved via the VM's fn_registry)
 
     // Postfix ops
-    Increment(String),  // Increment variable (+1)
-    Decrement(String),  // Decrement variable (-1)
-    AddLocalConst(String, i64),  // Add constant to local: i += K or i = i + K
-    MulLocalConst(String, i64),  // Multiply local by constant: i *= K
+    Increment(Name),  // Increment variable (+1)
+    Decrement(Name),  // Decrement variable (-1)
+    AddLocalConst(Name, i64),  // Add constant to local: i += K or i = i + K
+    MulLocalConst(Name, i64),  // Multiply local by constant: i *= K
 
     // Exception handling
     TryStart(usize),    // Jump target for catch
@@ -528,12 +529,12 @@ pub enum BytecodeOp {
     // THAT clause caught, even when a nested try/catch in the same body has since
     // overwritten `last_exception` with an already-handled inner error. A no-op
     // if the named local is undefined.
-    SetLastExceptionFromLocal(String),
+    SetLastExceptionFromLocal(Name),
     // Peek the exception value on top of the stack (does NOT consume it) and
     // push a boolean: does its `type` match this catch clause's declared type?
     // "any"/empty matches everything; otherwise case-insensitive exact match or
     // dotted-hierarchy prefix (catch "Foo" also catches "Foo.Bar").
-    CatchMatch(String),
+    CatchMatch(Name),
 
     // Method call: object is on stack, then args, method name + arg count
     // Optional write-back: (object_var, Option<property_name>)
@@ -541,13 +542,13 @@ pub enum BytecodeOp {
     //   - Some(vec!["this", "items"]) for this.items.method() — write result back to this.items
     //   - Some(vec!["local", "_taffy", "factory"]) for local._taffy.factory.method()
     //   - None — no write-back needed
-    CallMethod(String, usize, Option<Vec<String>>),
+    CallMethod(Name, usize, Option<Vec<String>>),
     // Method call with named arguments: like CallMethod but carries the
     // call-site argument names (empty string for positional args), so the VM
     // can rebind them to the resolved method's parameters by name. Mirrors
     // CallNamed for free-function calls. The names are boxed so this variant
     // does not grow BytecodeOp past its size ceiling (it is the rare path).
-    CallMethodNamed(String, Box<Vec<String>>, usize, Option<Vec<String>>),
+    CallMethodNamed(Name, Box<Vec<String>>, usize, Option<Vec<String>>),
 
     // Computed-name method call: `obj[ nameExpr ]( args )`. Stack layout (bottom
     // to top): object, method-name value, then `arg_count` positional args. The
@@ -579,7 +580,7 @@ pub enum BytecodeOp {
     // this never consults the enclosing scope, so an omitted param whose default
     // expression reads a same-named outer variable (`function f(x = x)`) is not
     // shadowed by its own not-yet-initialized slot (GitHub #240). No stack traffic.
-    JumpIfArgPresent(String, usize),
+    JumpIfArgPresent(Name, usize),
 
     /// Enforce the declared type of param `N` (index into the function's
     /// `params`/`param_types`) against its CURRENT local value — emitted only
@@ -594,7 +595,7 @@ pub enum BytecodeOp {
     Halt,
 
     // Variable existence check
-    IsDefined(String),
+    IsDefined(Name),
 
     // Spread operator support
     ConcatArrays,
@@ -636,10 +637,10 @@ pub enum BytecodeOp {
     AbandonTagPairs(usize),
 
     // Safe variable load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
-    TryLoadLocal(String),
+    TryLoadLocal(Name),
 
     // Declare a variable as function-local (var keyword) — prevents writeback to parent scope
-    DeclareLocal(String),
+    DeclareLocal(Name),
 
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
@@ -824,7 +825,7 @@ impl CfmlCompiler {
             if let CfmlNode::Statement(Statement::FunctionDecl(fd)) = node {
                 let idx = hoist_iter.next().expect("hoist index");
                 instructions.push(BytecodeOp::DefineFunction(idx));
-                instructions.push(BytecodeOp::StoreLocal(fd.func.name.clone()));
+                instructions.push(BytecodeOp::StoreLocal(Name::from(&fd.func.name)));
             } else {
                 self.compile_node(node, &mut instructions);
             }
@@ -1242,7 +1243,7 @@ impl CfmlCompiler {
     fn compile_index_assign_base(&mut self, base: &Expression, instructions: &mut Vec<BytecodeOp>) {
         match base {
             Expression::Identifier(ident) if !Self::is_reserved_scope_name(&ident.name) => {
-                instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
             }
             // A nested base (`q["lineData"][0] = v`, `q.lineData[0] = v`): recurse
             // so the *root* identifier is the Null-tolerant TryLoadLocal above,
@@ -1260,7 +1261,7 @@ impl CfmlCompiler {
                 self.compile_index_assign_base(&access.object, instructions);
                 // Auto-viv base: a not-yet-existing link must read as Null so the
                 // leaf SetIndex can build the chain — Try* twin, not throwing.
-                instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
+                instructions.push(BytecodeOp::TryGetProperty(Name::from(&access.member)));
             }
             _ => self.compile_expression(base, instructions),
         }
@@ -1273,14 +1274,14 @@ impl CfmlCompiler {
     fn emit_load_current_target(&mut self, target: &AssignTarget, instructions: &mut Vec<BytecodeOp>) {
         match target {
             AssignTarget::Variable(name) => {
-                instructions.push(BytecodeOp::LoadLocal(name.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&name)));
             }
             AssignTarget::StructAccess(obj, member) => {
                 // Compound assign (`s.x += 1`) reads the current value; preserve the
                 // pre-existing Null-on-miss behaviour (treated as 0/"") rather than
                 // throwing when the target member doesn't exist yet.
                 self.compile_expression(obj, instructions);
-                instructions.push(BytecodeOp::TryGetProperty(member.clone()));
+                instructions.push(BytecodeOp::TryGetProperty(Name::from(&member)));
             }
             AssignTarget::ArrayAccess(arr, idx) => {
                 self.compile_expression(arr, instructions);
@@ -1301,7 +1302,7 @@ impl CfmlCompiler {
         match expr {
             Expression::Identifier(ident) if !Self::is_reserved_scope_name(&ident.name) => {
                 // A bare variable root that may be undefined → Null, not a throw.
-                instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
             }
             Expression::MemberAccess(access) if !access.null_safe => {
                 // Mirror the normal read path's fusion peepholes so the JIT sees
@@ -1311,19 +1312,17 @@ impl CfmlCompiler {
                 // then TryGetProperty.
                 if let Expression::Identifier(ref ident) = *access.object {
                     if ident.name.eq_ignore_ascii_case("local") {
-                        instructions.push(BytecodeOp::TryLoadLocalKey(access.member.clone()));
+                        instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&access.member)));
                         return;
                     }
                     if !is_reserved_scope_name(&ident.name) {
-                        instructions.push(BytecodeOp::TryLoadLocalProperty(
-                            ident.name.clone(),
-                            access.member.clone(),
+                        instructions.push(BytecodeOp::TryLoadLocalProperty(Name::from(&ident.name),Name::from(&access.member),
                         ));
                         return;
                     }
                 }
                 self.compile_member_read_tolerant(&access.object, instructions);
-                instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
+                instructions.push(BytecodeOp::TryGetProperty(Name::from(&access.member)));
             }
             Expression::ArrayAccess(access) => {
                 // GetIndex already reads a missing key / Null receiver as Null.
@@ -1360,17 +1359,17 @@ impl CfmlCompiler {
     fn emit_nested_writeback(&mut self, obj: &Expression, instructions: &mut Vec<BytecodeOp>) {
         match obj {
             Expression::Identifier(ident) => {
-                instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                instructions.push(BytecodeOp::StoreLocal(Name::from(&ident.name)));
             }
             Expression::This(_) => {
-                instructions.push(BytecodeOp::StoreLocal("this".to_string()));
+                instructions.push(BytecodeOp::StoreLocal(Name::intern("this")));
             }
             Expression::MemberAccess(access) => {
                 // Stack has modified child value. Load the parent, swap, set property.
                 // Then recurse to write back the parent.
                 self.emit_load_for_writeback(&access.object, instructions);
                 instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(access.member.clone()));
+                instructions.push(BytecodeOp::SetProperty(Name::from(&access.member)));
                 self.emit_nested_writeback(&access.object, instructions);
             }
             Expression::ArrayAccess(access) => {
@@ -1405,13 +1404,13 @@ impl CfmlCompiler {
                 // TryLoadLocal yields Null instead of throwing, and the parent
                 // SetIndex/SetProperty + StoreLocal then build & store the chain.
                 if Self::is_reserved_scope_name(&ident.name) {
-                    instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
+                    instructions.push(BytecodeOp::LoadLocal(Name::from(&ident.name)));
                 } else {
-                    instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                    instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
                 }
             }
             Expression::This(_) => {
-                instructions.push(BytecodeOp::LoadLocal("this".to_string()));
+                instructions.push(BytecodeOp::LoadLocal(Name::intern("this")));
             }
             Expression::MemberAccess(access) => {
                 // For nested access like loading "s.a", we load s then get property a.
@@ -1419,7 +1418,7 @@ impl CfmlCompiler {
                 // Try* twin — a throwing GetProperty would abort `s.a.b = v` when
                 // `s.a` doesn't exist yet.
                 self.emit_load_for_writeback(&access.object, instructions);
-                instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
+                instructions.push(BytecodeOp::TryGetProperty(Name::from(&access.member)));
             }
             Expression::ArrayAccess(access) => {
                 // For nested access like loading "s.a[0]", we load s.a then get index 0.
@@ -1569,7 +1568,7 @@ impl CfmlCompiler {
                     Self::structdelete_scope_target(&expr_stmt.expr)
                 {
                     self.compile_expression(key_expr, instructions);
-                    instructions.push(BytecodeOp::DeleteScopeKey(scope));
+                    instructions.push(BytecodeOp::DeleteScopeKey(Name::from(scope)));
                 }
                 // Check for mutating function calls: structAppend(a, b), structInsert(a, k, v), etc.
                 // These return the modified struct; store it back to the first arg's location.
@@ -1586,12 +1585,12 @@ impl CfmlCompiler {
                                 if let Expression::FunctionCall(call) = &expr_stmt.expr {
                                     self.compile_expression(&call.arguments[1], instructions);
                                 }
-                                instructions.push(BytecodeOp::ArrayAppendLocal(ident.name.clone()));
+                                instructions.push(BytecodeOp::ArrayAppendLocal(Name::from(&ident.name)));
                             }
                             Expression::Identifier(ident) => {
                                 // Simple: structAppend(a, b) → compile call → StoreLocal(a)
                                 self.compile_expression(&expr_stmt.expr, instructions);
-                                instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                                instructions.push(BytecodeOp::StoreLocal(Name::from(&ident.name)));
                             }
                             Expression::MemberAccess(_) => {
                                 // Nested: structAppend(local._taffy.settings, defaultConfig)
@@ -1629,7 +1628,7 @@ impl CfmlCompiler {
                     Some(rest) if !rest.contains('.') => var.name[6..].to_string(),
                     _ => var.name.clone(),
                 };
-                instructions.push(BytecodeOp::DeclareLocal(name.clone()));
+                instructions.push(BytecodeOp::DeclareLocal(Name::from(&name)));
                 if let Some(value) = &var.value {
                     // `var x = y = expr` — the initialiser is itself an assignment
                     // (value position), so it must LEAVE its assigned value on the
@@ -1655,14 +1654,14 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
                         let end_idx = instructions.len() - 1;
                         instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
-                        instructions.push(BytecodeOp::StoreLocal(name.clone()));
+                        instructions.push(BytecodeOp::StoreLocal(Name::from(&name)));
                         instructions[end_idx] = BytecodeOp::Jump(instructions.len());
                     } else {
-                        instructions.push(BytecodeOp::StoreLocal(name.clone()));
+                        instructions.push(BytecodeOp::StoreLocal(Name::from(&name)));
                     }
                 } else {
                     instructions.push(BytecodeOp::Null);
-                    instructions.push(BytecodeOp::StoreLocal(name.clone()));
+                    instructions.push(BytecodeOp::StoreLocal(Name::from(&name)));
                 }
             }
             Statement::Assignment(assign) => {
@@ -1672,9 +1671,9 @@ impl CfmlCompiler {
                 if let AssignTarget::Variable(name) = &assign.target {
                     if let Some(k) = int_lit(&assign.value) {
                         let op = match &assign.operator {
-                            AssignOp::PlusEqual  => Some(BytecodeOp::AddLocalConst(name.clone(),  k)),
-                            AssignOp::MinusEqual => Some(BytecodeOp::AddLocalConst(name.clone(), -k)),
-                            AssignOp::StarEqual  => Some(BytecodeOp::MulLocalConst(name.clone(),  k)),
+                            AssignOp::PlusEqual  => Some(BytecodeOp::AddLocalConst(Name::from(&name),  k)),
+                            AssignOp::MinusEqual => Some(BytecodeOp::AddLocalConst(Name::from(&name), -k)),
+                            AssignOp::StarEqual  => Some(BytecodeOp::MulLocalConst(Name::from(&name),  k)),
                             _ => None,
                         };
                         if let Some(op) = op {
@@ -1754,7 +1753,7 @@ impl CfmlCompiler {
 
                 match &assign.target {
                     AssignTarget::Variable(name) => {
-                        instructions.push(BytecodeOp::StoreLocal(name.clone()));
+                        instructions.push(BytecodeOp::StoreLocal(Name::from(&name)));
                     }
                     AssignTarget::ArrayAccess(arr, idx) => {
                         self.compile_index_assign_base(arr, instructions);
@@ -1791,21 +1790,19 @@ impl CfmlCompiler {
                             instructions.push(BytecodeOp::Pop);
                         } else if let Expression::Identifier(ref ident) = **obj {
                             if !is_reserved_scope_name(&ident.name) {
-                                instructions.push(BytecodeOp::StoreLocalProperty(
-                                    ident.name.clone(),
-                                    member.clone(),
+                                instructions.push(BytecodeOp::StoreLocalProperty(Name::from(&ident.name),Name::from(&member),
                                 ));
                             } else if ident.name.eq_ignore_ascii_case("local") {
                                 // `local.X = v` is identical to `var X = v` in CFML —
                                 // function-frame scope, must NOT propagate to caller at
                                 // return. Compile to DeclareLocal + StoreLocal so the
                                 // classic-localmode writeback loop skips it (same as `var`).
-                                instructions.push(BytecodeOp::DeclareLocal(member.clone()));
-                                instructions.push(BytecodeOp::StoreLocal(member.clone()));
+                                instructions.push(BytecodeOp::DeclareLocal(Name::from(&member)));
+                                instructions.push(BytecodeOp::StoreLocal(Name::from(&member)));
                             } else {
                                 self.compile_expression(obj, instructions);
                                 instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::SetProperty(member.clone()));
+                                instructions.push(BytecodeOp::SetProperty(Name::from(&member)));
                                 self.emit_nested_writeback(obj, instructions);
                             }
                         } else {
@@ -1815,7 +1812,7 @@ impl CfmlCompiler {
                             // build the chain) rather than throwing.
                             self.compile_index_assign_base(obj, instructions);
                             instructions.push(BytecodeOp::Swap);
-                            instructions.push(BytecodeOp::SetProperty(member.clone()));
+                            instructions.push(BytecodeOp::SetProperty(Name::from(&member)));
                             self.emit_nested_writeback(obj, instructions);
                         }
                     }
@@ -1855,7 +1852,7 @@ impl CfmlCompiler {
                 // net-zero relative to an extra value sitting beneath them); the
                 // `__`-prefix keeps the temp out of the variables-scope writeback.
                 if !self.finally_stack.is_empty() {
-                    instructions.push(BytecodeOp::StoreLocal("__cf_finally_retval".to_string()));
+                    instructions.push(BytecodeOp::StoreLocal(Name::intern("__cf_finally_retval")));
                     // Take the whole stack while emitting the finallys inline, so a
                     // `return`/`rethrow` that appears INSIDE a finally body does not
                     // re-emit the very finallys being emitted (which contain it) —
@@ -1870,7 +1867,7 @@ impl CfmlCompiler {
                         }
                     }
                     self.finally_stack = saved;
-                    instructions.push(BytecodeOp::LoadLocal("__cf_finally_retval".to_string()));
+                    instructions.push(BytecodeOp::LoadLocal(Name::intern("__cf_finally_retval")));
                 }
                 instructions.push(BytecodeOp::Return);
             }
@@ -1985,7 +1982,7 @@ impl CfmlCompiler {
                 // cfcatch struct (type/message/detail/tagcontext). Emitted AFTER
                 // any inline finally so it wins.
                 if let Some(catch_var) = self.catch_var_stack.last() {
-                    instructions.push(BytecodeOp::SetLastExceptionFromLocal(catch_var.clone()));
+                    instructions.push(BytecodeOp::SetLastExceptionFromLocal(Name::from(&catch_var)));
                 }
                 instructions.push(BytecodeOp::Rethrow);
             }
@@ -2143,7 +2140,7 @@ impl CfmlCompiler {
     ) -> usize {
         if let Some((name, c, cmp)) = Self::match_local_cmp_const(condition) {
             let idx = instructions.len();
-            instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, 0));
+            instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::from(name), c, cmp, 0));
             idx
         } else {
             self.compile_expression(condition, instructions);
@@ -2426,11 +2423,11 @@ impl CfmlCompiler {
                 if let Expression::Identifier(ident) = &*postfix.operand {
                     match postfix.operator {
                         PostfixOpType::Increment => {
-                            instructions.push(BytecodeOp::Increment(ident.name.clone()));
+                            instructions.push(BytecodeOp::Increment(Name::from(&ident.name)));
                             return true;
                         }
                         PostfixOpType::Decrement => {
-                            instructions.push(BytecodeOp::Decrement(ident.name.clone()));
+                            instructions.push(BytecodeOp::Decrement(Name::from(&ident.name)));
                             return true;
                         }
                     }
@@ -2448,11 +2445,11 @@ impl CfmlCompiler {
                 if let Expression::Identifier(ident) = &*unary.operand {
                     match unary.operator {
                         UnaryOpType::PrefixIncrement => {
-                            instructions.push(BytecodeOp::Increment(ident.name.clone()));
+                            instructions.push(BytecodeOp::Increment(Name::from(&ident.name)));
                             return true;
                         }
                         UnaryOpType::PrefixDecrement => {
-                            instructions.push(BytecodeOp::Decrement(ident.name.clone()));
+                            instructions.push(BytecodeOp::Decrement(Name::from(&ident.name)));
                             return true;
                         }
                         _ => {}
@@ -2508,7 +2505,7 @@ impl CfmlCompiler {
                 Self::match_local_cmp_const(condition)
             {
                 let idx = instructions.len();
-                instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, 0));
+                instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::from(name), c, cmp, 0));
                 idx
             } else {
                 self.compile_expression(condition, instructions);
@@ -2571,8 +2568,7 @@ impl CfmlCompiler {
         // Initial check: if the condition is already false at entry, skip
         // the loop entirely. Emits one op; the target is patched to loop_end.
         let entry_check_idx = instructions.len();
-        instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(
-            name.to_string(), limit, cmp, 0,
+        instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::intern(name), limit, cmp, 0,
         ));
 
         let body_start = instructions.len();
@@ -2591,8 +2587,7 @@ impl CfmlCompiler {
 
         // continue target = the step — continue runs the step, then re-tests.
         let continue_target = instructions.len();
-        instructions.push(BytecodeOp::ForLoopStep(
-            name.to_string(), limit, cmp, step, body_start,
+        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start,
         ));
 
         let loop_end = instructions.len();
@@ -2626,36 +2621,36 @@ impl CfmlCompiler {
         let limit_var = format!("__limit_{}", instructions.len());
         // Declare as function-locals so StoreLocal writes to locals (not __variables
         // in a CFC method context) — otherwise the loop counter never increments.
-        instructions.push(BytecodeOp::DeclareLocal(iter_var.clone()));
-        instructions.push(BytecodeOp::DeclareLocal(idx_var.clone()));
-        instructions.push(BytecodeOp::DeclareLocal(limit_var.clone()));
-        instructions.push(BytecodeOp::StoreLocal(iter_var.clone()));
+        instructions.push(BytecodeOp::DeclareLocal(Name::from(&iter_var)));
+        instructions.push(BytecodeOp::DeclareLocal(Name::from(&idx_var)));
+        instructions.push(BytecodeOp::DeclareLocal(Name::from(&limit_var)));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&iter_var)));
 
         // Hoist len(iterable) out of the loop. The old codegen looked up the
         // `len` builtin and invoked it every iteration — a HashMap probe plus
         // full function-call trampoline per element. Compute once, reuse.
-        instructions.push(BytecodeOp::LoadGlobal("len".to_string()));
-        instructions.push(BytecodeOp::LoadLocal(iter_var.clone()));
+        instructions.push(BytecodeOp::LoadGlobal(Name::intern("len")));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
         instructions.push(BytecodeOp::Call(1));
-        instructions.push(BytecodeOp::StoreLocal(limit_var.clone()));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&limit_var)));
 
         // CFML arrays are 1-based, so start index at 1.
         instructions.push(BytecodeOp::Integer(1));
-        instructions.push(BytecodeOp::StoreLocal(idx_var.clone()));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&idx_var)));
 
         let loop_start = instructions.len();
 
         // Condition: idx <= limit  (both locals; no builtin call per iter).
-        instructions.push(BytecodeOp::LoadLocal(idx_var.clone()));
-        instructions.push(BytecodeOp::LoadLocal(limit_var.clone()));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&limit_var)));
         instructions.push(BytecodeOp::Lte);
 
         let jump_false_idx = instructions.len();
         instructions.push(BytecodeOp::JumpIfFalse(0));
 
         // Set loop variable = iterable[idx]
-        instructions.push(BytecodeOp::LoadLocal(iter_var.clone()));
-        instructions.push(BytecodeOp::LoadLocal(idx_var.clone()));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
         instructions.push(BytecodeOp::GetIndex);
         // Strip a leading `local.` prefix from the loop variable so it stores
         // as a simple local rather than a literal key containing a dot. A
@@ -2686,9 +2681,7 @@ impl CfmlCompiler {
                 // Stack on entry: [element_value]. StoreLocalProperty pops the
                 // value, auto-vivifies the root local as a struct if absent,
                 // and sets the leaf.
-                instructions.push(BytecodeOp::StoreLocalProperty(
-                    segments[0].clone(),
-                    segments[1].clone(),
+                instructions.push(BytecodeOp::StoreLocalProperty(Name::from(&segments[0]),Name::from(&segments[1]),
                 ));
             } else {
                 let root = segments[0].clone();
@@ -2696,30 +2689,30 @@ impl CfmlCompiler {
                 let intermediate = &segments[1..segments.len() - 1];
                 // Stack on entry: [element_value]
                 // Load deepest parent: root[.intermediate[0]...intermediate[n]]
-                instructions.push(BytecodeOp::LoadLocal(root.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&root)));
                 for seg in intermediate {
-                    instructions.push(BytecodeOp::TryGetProperty(seg.clone()));
+                    instructions.push(BytecodeOp::TryGetProperty(Name::from(&seg)));
                 }
                 // Stack: [element_value, deepest_parent]
                 instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(leaf));
+                instructions.push(BytecodeOp::SetProperty(Name::from(leaf)));
                 // Stack: [modified_deepest_parent]
                 // Unwind: for each intermediate level (deepest -> shallowest),
                 // reload its parent and SetProperty back in.
                 for i in (0..intermediate.len()).rev() {
-                    instructions.push(BytecodeOp::LoadLocal(root.clone()));
+                    instructions.push(BytecodeOp::LoadLocal(Name::from(&root)));
                     for seg in &intermediate[..i] {
-                        instructions.push(BytecodeOp::TryGetProperty(seg.clone()));
+                        instructions.push(BytecodeOp::TryGetProperty(Name::from(&seg)));
                     }
                     instructions.push(BytecodeOp::Swap);
-                    instructions.push(BytecodeOp::SetProperty(intermediate[i].clone()));
+                    instructions.push(BytecodeOp::SetProperty(Name::from(&intermediate[i])));
                 }
                 // Stack: [modified_root]
-                instructions.push(BytecodeOp::StoreLocal(root));
+                instructions.push(BytecodeOp::StoreLocal(Name::from(root)));
             }
         } else {
-            instructions.push(BytecodeOp::DeclareLocal(loop_var_name.clone()));
-            instructions.push(BytecodeOp::StoreLocal(loop_var_name));
+            instructions.push(BytecodeOp::DeclareLocal(Name::from(&loop_var_name)));
+            instructions.push(BytecodeOp::StoreLocal(Name::from(loop_var_name)));
         }
 
         self.loop_stack.push((
@@ -2737,7 +2730,7 @@ impl CfmlCompiler {
         let continue_target = instructions.len();
 
         // idx++  (single Increment op, not Load+Int+Add+Store).
-        instructions.push(BytecodeOp::Increment(idx_var.clone()));
+        instructions.push(BytecodeOp::Increment(Name::from(&idx_var)));
 
         instructions.push(BytecodeOp::Jump(loop_start));
 
@@ -2882,8 +2875,7 @@ impl CfmlCompiler {
         }
 
         let continue_target = instructions.len();
-        instructions.push(BytecodeOp::ForLoopStep(
-            name.to_string(), limit, cmp, step, body_start,
+        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start,
         ));
 
         let loop_end = instructions.len();
@@ -2901,7 +2893,7 @@ impl CfmlCompiler {
         // Evaluate switch expression and store
         self.compile_expression(&switch_stmt.expression, instructions);
         let switch_var = format!("__switch_{}", instructions.len());
-        instructions.push(BytecodeOp::StoreLocal(switch_var.clone()));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&switch_var)));
 
         self.loop_stack.push((
             Vec::new(),
@@ -2927,7 +2919,7 @@ impl CfmlCompiler {
         for case in &switch_stmt.cases {
             // Compare switch value to case value(s); OR multiple values together.
             for (i, val) in case.values.iter().enumerate() {
-                instructions.push(BytecodeOp::LoadLocal(switch_var.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&switch_var)));
                 self.compile_expression(val, instructions);
                 instructions.push(BytecodeOp::Eq);
 
@@ -3058,7 +3050,7 @@ impl CfmlCompiler {
             // `catch (e)` with no declared type behaves like `catch (any e)`.
             let catch_type = catch.var_type.clone().unwrap_or_else(|| "any".to_string());
             // Peek the exception (leaves it on the stack), push the match bool.
-            instructions.push(BytecodeOp::CatchMatch(catch_type));
+            instructions.push(BytecodeOp::CatchMatch(Name::from(catch_type)));
             let jump_if_no_match = instructions.len();
             instructions.push(BytecodeOp::JumpIfFalse(0)); // -> next clause's test
             // Matched: bind the exception to the catch variable (consumes it).
@@ -3069,8 +3061,8 @@ impl CfmlCompiler {
             // `variables.e` untouched; RustCFML clobbered it — surfaced when
             // custom-tag frames gained a live `__variables` scope and a
             // harness `catch (any e)` started overwriting a test's `e`).
-            instructions.push(BytecodeOp::DeclareLocal(catch.var_name.clone()));
-            instructions.push(BytecodeOp::StoreLocal(catch.var_name.clone()));
+            instructions.push(BytecodeOp::DeclareLocal(Name::from(&catch.var_name)));
+            instructions.push(BytecodeOp::StoreLocal(Name::from(&catch.var_name)));
             // GH #244: track the caught-exception variable so a `rethrow` in this
             // body re-raises THIS clause's exception even if a nested try/catch
             // clobbered `last_exception`.
@@ -3164,7 +3156,7 @@ impl CfmlCompiler {
         for (idx, param) in func.params.iter().enumerate() {
             if let Some(ref default_expr) = param.default {
                 let jump_idx = func_instructions.len();
-                func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0)); // placeholder
+                func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0)); // placeholder
                 // Set the local variable
                 self.compile_expression(default_expr, &mut func_instructions);
                 // Seed the local AND the `arguments` key from the default, WITHOUT reading
@@ -3175,11 +3167,11 @@ impl CfmlCompiler {
                 // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
                 // documented "Load s, Swap, SetProperty -> modified s" pattern.
                 func_instructions.push(BytecodeOp::Dup);
-                func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
-                func_instructions.push(BytecodeOp::LoadLocal("arguments".to_string()));
+                func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
+                func_instructions.push(BytecodeOp::LoadLocal(Name::intern("arguments")));
                 func_instructions.push(BytecodeOp::Swap);
-                func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
-                func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
+                func_instructions.push(BytecodeOp::SetProperty(Name::from(&param.name)));
+                func_instructions.push(BytecodeOp::StoreLocal(Name::intern("arguments")));
                 // A DEFAULT is type-checked exactly like a supplied argument
                 // (Lucee: `function f( numeric n = "abc" )` throws on `f()`).
                 // A supplied argument is checked by the VM at bind time, which
@@ -3189,7 +3181,7 @@ impl CfmlCompiler {
                     func_instructions.push(BytecodeOp::ValidateParamType(idx));
                 }
                 func_instructions[jump_idx] =
-                    BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
+                    BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len());
             }
         }
 
@@ -3260,7 +3252,7 @@ impl CfmlCompiler {
         // Define the function in current scope. The op carries the function's
         // process-stable global_id, resolved by the VM through its registry.
         instructions.push(BytecodeOp::DefineFunction(global_id));
-        instructions.push(BytecodeOp::StoreLocal(func.name.clone()));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&func.name)));
         global_id
     }
 
@@ -3382,9 +3374,9 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::BuildStruct(prop_count));
 
         // Store in local and global scope (same as component)
-        instructions.push(BytecodeOp::StoreLocal(interface.name.clone()));
-        instructions.push(BytecodeOp::LoadLocal(interface.name.clone()));
-        instructions.push(BytecodeOp::StoreGlobal(interface.name.clone()));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&interface.name)));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&interface.name)));
+        instructions.push(BytecodeOp::StoreGlobal(Name::from(&interface.name)));
     }
 
     fn compile_component(&mut self, component: &Component, instructions: &mut Vec<BytecodeOp>) {
@@ -3467,7 +3459,7 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::BuildStruct(prop_count));
 
         // Store as a component template in local scope first
-        instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
+        instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
 
         // Generate accessor methods if accessors="true" (BEFORE storing globally)
         if component.accessors {
@@ -3490,8 +3482,8 @@ impl CfmlCompiler {
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
-                        BytecodeOp::LoadLocal("variables".to_string()),
-                        BytecodeOp::TryGetProperty(prop.name.clone()),
+                        BytecodeOp::LoadLocal(Name::intern("variables")),
+                        BytecodeOp::TryGetProperty(Name::from(&prop.name)),
                         BytecodeOp::Return,
                     ],
                     source_file: self.source_file.clone(),
@@ -3519,10 +3511,10 @@ impl CfmlCompiler {
                 // Swap: [component, getter_func]
                 // SetProperty(getter_name): sets component.getter_name = getter_func, stack is [component]
                 // StoreLocal: []
-                instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
                 instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(getter_name.clone()));
-                instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
+                instructions.push(BytecodeOp::SetProperty(Name::from(&getter_name)));
+                instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
 
                 // Generate setter: setPropertyName(value)
                 // Set the property directly on this struct and __variables
@@ -3541,35 +3533,35 @@ impl CfmlCompiler {
                 let setter_instructions = if collides_with_method {
                     vec![
                         // Set on __variables only: this.__variables.name = value
-                        BytecodeOp::LoadLocal("this".to_string()),
-                        BytecodeOp::TryGetProperty("__variables".to_string()),
-                        BytecodeOp::LoadLocal(prop.name.clone()),
-                        BytecodeOp::SetProperty(prop.name.clone()),
-                        BytecodeOp::StoreLocal("__variables".to_string()),
+                        BytecodeOp::LoadLocal(Name::intern("this")),
+                        BytecodeOp::TryGetProperty(Name::intern("__variables")),
+                        BytecodeOp::LoadLocal(Name::from(&prop.name)),
+                        BytecodeOp::SetProperty(Name::from(&prop.name)),
+                        BytecodeOp::StoreLocal(Name::intern("__variables")),
                         // Return this (unmodified — method preserved on this.name)
-                        BytecodeOp::LoadLocal("this".to_string()),
+                        BytecodeOp::LoadLocal(Name::intern("this")),
                         BytecodeOp::Return,
                     ]
                 } else {
                     vec![
                         // Set on this: this.name = value; store modified this back
-                        BytecodeOp::LoadLocal("this".to_string()),
-                        BytecodeOp::LoadLocal(prop.name.clone()),
-                        BytecodeOp::SetProperty(prop.name.clone()),
-                        BytecodeOp::StoreLocal("this".to_string()),
+                        BytecodeOp::LoadLocal(Name::intern("this")),
+                        BytecodeOp::LoadLocal(Name::from(&prop.name)),
+                        BytecodeOp::SetProperty(Name::from(&prop.name)),
+                        BytecodeOp::StoreLocal(Name::intern("this")),
                         // Set on __variables: this.__variables.name = value
-                        BytecodeOp::LoadLocal("this".to_string()),
-                        BytecodeOp::TryGetProperty("__variables".to_string()),
-                        BytecodeOp::LoadLocal(prop.name.clone()),
-                        BytecodeOp::SetProperty(prop.name.clone()),
-                        BytecodeOp::StoreLocal("__variables".to_string()),
+                        BytecodeOp::LoadLocal(Name::intern("this")),
+                        BytecodeOp::TryGetProperty(Name::intern("__variables")),
+                        BytecodeOp::LoadLocal(Name::from(&prop.name)),
+                        BytecodeOp::SetProperty(Name::from(&prop.name)),
+                        BytecodeOp::StoreLocal(Name::intern("__variables")),
                         // The value now sits on the top-level `this` scope (public),
                         // but Lucee keeps an accessor property PRIVATE (variables
                         // only). Mark it so introspection/for-in hide it while
                         // getX()/serializeJSON still surface it.
-                        BytecodeOp::MarkAccessorPrivate(prop.name.clone()),
+                        BytecodeOp::MarkAccessorPrivate(Name::from(&prop.name)),
                         // Return this
-                        BytecodeOp::LoadLocal("this".to_string()),
+                        BytecodeOp::LoadLocal(Name::intern("this")),
                         BytecodeOp::Return,
                     ]
                 };
@@ -3603,16 +3595,16 @@ impl CfmlCompiler {
                 // Stack: [setter_func]
 
                 // Add setter to component (same pattern)
-                instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
                 instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(setter_name.clone()));
-                instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
+                instructions.push(BytecodeOp::SetProperty(Name::from(&setter_name)));
+                instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
             }
         }
 
         // Now store as a component template in global scope (with accessors included)
-        instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
-        instructions.push(BytecodeOp::StoreGlobal(component.name.clone()));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
+        instructions.push(BytecodeOp::StoreGlobal(Name::from(&component.name)));
 
         // Compile component methods and add them to the component struct.
         // Set in_component_method so the resulting BytecodeFunction is flagged
@@ -3628,10 +3620,10 @@ impl CfmlCompiler {
             // avoids loading the local *scope* when the method name is a
             // reserved scope word like `local` (Preside Config.cfc environment
             // methods: `function local(){}`).
-            instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
             instructions.push(BytecodeOp::DefineFunction(gid));
-            instructions.push(BytecodeOp::SetProperty(func.name.clone()));
-            instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
+            instructions.push(BytecodeOp::SetProperty(Name::from(&func.name)));
+            instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
         }
         self.in_component_method = prev_in_method;
 
@@ -3644,10 +3636,10 @@ impl CfmlCompiler {
                     instructions.push(BytecodeOp::String(v.clone()));
                 }
                 instructions.push(BytecodeOp::BuildStruct(func.metadata.len()));
-                instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
                 instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(meta_key));
-                instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
+                instructions.push(BytecodeOp::SetProperty(Name::from(meta_key)));
+                instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
             }
         }
 
@@ -3705,34 +3697,34 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::BuildStruct(attr_count));
             }
             instructions.push(BytecodeOp::BuildArray(prop_count));
-            instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
             instructions.push(BytecodeOp::Swap);
-            instructions.push(BytecodeOp::SetProperty("__properties".to_string()));
-            instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
+            instructions.push(BytecodeOp::SetProperty(Name::intern("__properties")));
+            instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
         }
 
         // Update global copy after methods and metadata are added
         if !component.functions.is_empty() || !component.metadata.is_empty() || !component.properties.is_empty() {
-            instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
-            instructions.push(BytecodeOp::StoreGlobal(component.name.clone()));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
+            instructions.push(BytecodeOp::StoreGlobal(Name::from(&component.name)));
         }
 
         // Compile component body statements (e.g., this.name = "xxx", this.mappings = {...})
         // These execute as init code that modifies the component struct via `this`
         if !component.body.is_empty() {
             // Bind `this` to the component struct so `this.xxx = val` works
-            instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
-            instructions.push(BytecodeOp::StoreLocal("this".to_string()));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
+            instructions.push(BytecodeOp::StoreLocal(Name::intern("this")));
 
             for stmt in &component.body {
                 self.compile_statement(stmt, instructions);
             }
 
             // Copy modified `this` back to component name and global
-            instructions.push(BytecodeOp::LoadLocal("this".to_string()));
-            instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
-            instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
-            instructions.push(BytecodeOp::StoreGlobal(component.name.clone()));
+            instructions.push(BytecodeOp::LoadLocal(Name::intern("this")));
+            instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
+            instructions.push(BytecodeOp::StoreGlobal(Name::from(&component.name)));
         }
 
         // Compile the `static { ... }` initialization block into a standalone
@@ -3814,7 +3806,7 @@ impl CfmlCompiler {
                 LiteralValue::String(s) => instructions.push(BytecodeOp::String(s.clone())),
             },
             Expression::Identifier(id) => {
-                instructions.push(BytecodeOp::LoadLocal(id.name.clone()));
+                instructions.push(BytecodeOp::LoadLocal(Name::from(&id.name)));
             }
             Expression::BinaryOp(binop) => {
                 if binop.operator == BinaryOpType::Assign {
@@ -3892,7 +3884,7 @@ impl CfmlCompiler {
                             if want_value {
                                 instructions.push(BytecodeOp::Dup);
                             }
-                            instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::StoreLocal(Name::from(&ident.name)));
                         }
                         Expression::MemberAccess(access) => {
                             // Nested write to an undeclared scope-qualified
@@ -3946,9 +3938,7 @@ impl CfmlCompiler {
                                     if want_value {
                                         instructions.push(BytecodeOp::Dup);
                                     }
-                                    instructions.push(BytecodeOp::StoreLocalProperty(
-                                        ident.name.clone(),
-                                        access.member.clone(),
+                                    instructions.push(BytecodeOp::StoreLocalProperty(Name::from(&ident.name),Name::from(&access.member),
                                     ));
                                 } else if ident.name.eq_ignore_ascii_case("local") {
                                     // `local.X = v` is identical to `var X = v` —
@@ -3958,13 +3948,13 @@ impl CfmlCompiler {
                                     if want_value {
                                         instructions.push(BytecodeOp::Dup);
                                     }
-                                    instructions.push(BytecodeOp::DeclareLocal(access.member.clone()));
-                                    instructions.push(BytecodeOp::StoreLocal(access.member.clone()));
+                                    instructions.push(BytecodeOp::DeclareLocal(Name::from(&access.member)));
+                                    instructions.push(BytecodeOp::StoreLocal(Name::from(&access.member)));
                                 } else {
                                     // SetProperty needs [obj, value].
                                     self.compile_expression(&access.object, instructions);
                                     instructions.push(BytecodeOp::Swap);
-                                    instructions.push(BytecodeOp::SetProperty(access.member.clone()));
+                                    instructions.push(BytecodeOp::SetProperty(Name::from(&access.member)));
                                     self.emit_nested_writeback(&access.object, instructions);
                                 }
                             } else {
@@ -3982,7 +3972,7 @@ impl CfmlCompiler {
                                 // SetProperty needs [obj, value].
                                 self.compile_expression(&access.object, instructions);
                                 instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::SetProperty(access.member.clone()));
+                                instructions.push(BytecodeOp::SetProperty(Name::from(&access.member)));
                                 // Write back through nested chain
                                 self.emit_nested_writeback(&access.object, instructions);
                             }
@@ -4115,11 +4105,11 @@ impl CfmlCompiler {
                             -1
                         };
                         if let Expression::Identifier(ident) = &*unary.operand {
-                            instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::LoadLocal(Name::from(&ident.name)));
                             instructions.push(BytecodeOp::Integer(delta));
                             instructions.push(BytecodeOp::Add);
                             instructions.push(BytecodeOp::Dup);
-                            instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::StoreLocal(Name::from(&ident.name)));
                         } else if matches!(
                             &*unary.operand,
                             Expression::MemberAccess(_) | Expression::ArrayAccess(_)
@@ -4157,19 +4147,19 @@ impl CfmlCompiler {
                 if let Expression::Identifier(ident) = &*postfix.operand {
                     match postfix.operator {
                         PostfixOpType::Increment => {
-                            instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::LoadLocal(Name::from(&ident.name)));
                             instructions.push(BytecodeOp::Dup);
                             instructions.push(BytecodeOp::Integer(1));
                             instructions.push(BytecodeOp::Add);
-                            instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::StoreLocal(Name::from(&ident.name)));
                             // The original value stays on the stack
                         }
                         PostfixOpType::Decrement => {
-                            instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::LoadLocal(Name::from(&ident.name)));
                             instructions.push(BytecodeOp::Dup);
                             instructions.push(BytecodeOp::Integer(1));
                             instructions.push(BytecodeOp::Sub);
-                            instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                            instructions.push(BytecodeOp::StoreLocal(Name::from(&ident.name)));
                         }
                     }
                 } else if matches!(
@@ -4198,18 +4188,18 @@ impl CfmlCompiler {
             Expression::StaticMember(sm) => {
                 // `Component::member` — read a static member without an instance.
                 if let Some(name) = Self::static_class_name(&sm.class) {
-                    instructions.push(BytecodeOp::LoadStaticHolder(name));
+                    instructions.push(BytecodeOp::LoadStaticHolder(Name::from(name)));
                 } else {
                     self.compile_expression(&sm.class, instructions);
                 }
-                instructions.push(BytecodeOp::GetStaticProperty(sm.member.clone()));
+                instructions.push(BytecodeOp::GetStaticProperty(Name::from(&sm.member)));
             }
             Expression::StaticCall(sc) => {
                 // `Component::method(args)` — call a static method without an
                 // instance. The holder carries `__variables.__static`, so
                 // `static.X` inside the method resolves through the normal chain.
                 if let Some(name) = Self::static_class_name(&sc.class) {
-                    instructions.push(BytecodeOp::LoadStaticHolder(name));
+                    instructions.push(BytecodeOp::LoadStaticHolder(Name::from(name)));
                 } else {
                     self.compile_expression(&sc.class, instructions);
                 }
@@ -4228,15 +4218,13 @@ impl CfmlCompiler {
                     }
                 }
                 if has_named {
-                    instructions.push(BytecodeOp::CallMethodNamed(
-                        sc.method.clone(),
+                    instructions.push(BytecodeOp::CallMethodNamed(Name::from(&sc.method),
                         Box::new(names),
                         sc.arguments.len(),
                         None,
                     ));
                 } else {
-                    instructions.push(BytecodeOp::CallMethod(
-                        sc.method.clone(),
+                    instructions.push(BytecodeOp::CallMethod(Name::from(&sc.method),
                         sc.arguments.len(),
                         None,
                     ));
@@ -4253,7 +4241,7 @@ impl CfmlCompiler {
                     if let Expression::Identifier(ref ident) = *access.object {
                         if ident.name.eq_ignore_ascii_case("variables") {
                             instructions
-                                .push(BytecodeOp::LoadVariablesKey(access.member.clone()));
+                                .push(BytecodeOp::LoadVariablesKey(Name::from(&access.member)));
                             return;
                         }
                     }
@@ -4275,13 +4263,11 @@ impl CfmlCompiler {
                         // `local.foo = x` writes go through the assignment path.
                         if ident.name.eq_ignore_ascii_case("local") {
                             instructions
-                                .push(BytecodeOp::LoadLocalKey(access.member.clone()));
+                                .push(BytecodeOp::LoadLocalKey(Name::from(&access.member)));
                             return;
                         }
                         if !is_reserved_scope_name(&ident.name) {
-                            instructions.push(BytecodeOp::LoadLocalProperty(
-                                ident.name.clone(),
-                                access.member.clone(),
+                            instructions.push(BytecodeOp::LoadLocalProperty(Name::from(&ident.name),Name::from(&access.member),
                             ));
                             return;
                         }
@@ -4292,7 +4278,7 @@ impl CfmlCompiler {
                 // rather than throwing (`s.deep?.x` with `deep` absent → Null).
                 if access.null_safe {
                     if let Expression::Identifier(ref ident) = *access.object {
-                        instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                        instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
                     } else if matches!(
                         *access.object,
                         Expression::MemberAccess(_) | Expression::ArrayAccess(_)
@@ -4316,10 +4302,10 @@ impl CfmlCompiler {
                     // stay Null-tolerant on a missing member (the `?.` contract),
                     // so use the Try* twin rather than the throwing GetProperty.
                     instructions[jump_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
-                    instructions.push(BytecodeOp::TryGetProperty(access.member.clone()));
+                    instructions.push(BytecodeOp::TryGetProperty(Name::from(&access.member)));
                     instructions[jump_end] = BytecodeOp::Jump(instructions.len());
                 } else {
-                    instructions.push(BytecodeOp::GetProperty(access.member.clone()));
+                    instructions.push(BytecodeOp::GetProperty(Name::from(&access.member)));
                 }
             }
             Expression::ArrayAccess(access) => {
@@ -4344,7 +4330,7 @@ impl CfmlCompiler {
                 if let Expression::Identifier(ident) = &*call.name {
                     if ident.name.to_lowercase() == "isdefined" && call.arguments.len() == 1 {
                         if let Expression::Literal(Literal { value: LiteralValue::String(ref var_name), .. }) = call.arguments[0] {
-                            instructions.push(BytecodeOp::IsDefined(var_name.clone()));
+                            instructions.push(BytecodeOp::IsDefined(Name::from(&var_name)));
                             return;
                         }
                     }
@@ -4352,7 +4338,7 @@ impl CfmlCompiler {
                     // Uses TryLoadLocal so undefined vars return Null (true) rather than erroring
                     if ident.name.to_lowercase() == "isnull" && call.arguments.len() == 1 {
                         if let Expression::Identifier(ref arg_ident) = call.arguments[0] {
-                            instructions.push(BytecodeOp::TryLoadLocal(arg_ident.name.clone()));
+                            instructions.push(BytecodeOp::TryLoadLocal(Name::from(&arg_ident.name)));
                             instructions.push(BytecodeOp::IsNull);
                             return;
                         }
@@ -4366,7 +4352,7 @@ impl CfmlCompiler {
                             call.arguments[0],
                             Expression::MemberAccess(_) | Expression::ArrayAccess(_)
                         ) {
-                            instructions.push(BytecodeOp::LoadGlobal(ident.name.clone()));
+                            instructions.push(BytecodeOp::LoadGlobal(Name::from(&ident.name)));
                             self.compile_member_read_tolerant(&call.arguments[0], instructions);
                             instructions.push(BytecodeOp::Call(1));
                             return;
@@ -4414,7 +4400,7 @@ impl CfmlCompiler {
                 if has_spread {
                     // Push function reference first
                     if let Expression::Identifier(ident) = &*call.name {
-                        instructions.push(BytecodeOp::LoadGlobal(ident.name.clone()));
+                        instructions.push(BytecodeOp::LoadGlobal(Name::from(&ident.name)));
                     } else {
                         self.compile_expression(&call.name, instructions);
                     }
@@ -4434,7 +4420,7 @@ impl CfmlCompiler {
                 } else if has_named {
                     // Named arguments: push function ref, then compile values, emit CallNamed
                     if let Expression::Identifier(ident) = &*call.name {
-                        instructions.push(BytecodeOp::LoadGlobal(ident.name.clone()));
+                        instructions.push(BytecodeOp::LoadGlobal(Name::from(&ident.name)));
                     } else {
                         self.compile_expression(&call.name, instructions);
                     }
@@ -4453,7 +4439,7 @@ impl CfmlCompiler {
                 } else {
                     // Push function reference first
                     if let Expression::Identifier(ident) = &*call.name {
-                        instructions.push(BytecodeOp::LoadGlobal(ident.name.clone()));
+                        instructions.push(BytecodeOp::LoadGlobal(Name::from(&ident.name)));
                     } else {
                         self.compile_expression(&call.name, instructions);
                     }
@@ -4495,7 +4481,7 @@ impl CfmlCompiler {
                 // For null-safe method calls, use TryLoadLocal for simple identifiers
                 if call.null_safe {
                     if let Expression::Identifier(ref ident) = *call.object {
-                        instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                        instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
                     } else {
                         self.compile_expression(&call.object, instructions);
                     }
@@ -4510,15 +4496,13 @@ impl CfmlCompiler {
                     instructions[jump_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
                     let names = compile_args(self, instructions);
                     if has_named {
-                        instructions.push(BytecodeOp::CallMethodNamed(
-                            call.method.clone(),
+                        instructions.push(BytecodeOp::CallMethodNamed(Name::from(&call.method),
                             Box::new(names),
                             call.arguments.len(),
                             write_back.clone(),
                         ));
                     } else {
-                        instructions.push(BytecodeOp::CallMethod(
-                            call.method.clone(),
+                        instructions.push(BytecodeOp::CallMethod(Name::from(&call.method),
                             call.arguments.len(),
                             write_back.clone(),
                         ));
@@ -4527,15 +4511,13 @@ impl CfmlCompiler {
                 } else {
                     let names = compile_args(self, instructions);
                     if has_named {
-                        instructions.push(BytecodeOp::CallMethodNamed(
-                            call.method.clone(),
+                        instructions.push(BytecodeOp::CallMethodNamed(Name::from(&call.method),
                             Box::new(names),
                             call.arguments.len(),
                             write_back,
                         ));
                     } else {
-                        instructions.push(BytecodeOp::CallMethod(
-                            call.method.clone(),
+                        instructions.push(BytecodeOp::CallMethod(Name::from(&call.method),
                             call.arguments.len(),
                             write_back,
                         ));
@@ -4720,7 +4702,7 @@ impl CfmlCompiler {
                 for (idx, param) in closure.params.iter().enumerate() {
                     if let Some(ref default_expr) = param.default {
                         let jump_idx = func_instructions.len();
-                        func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
+                        func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0));
                         self.compile_expression(default_expr, &mut func_instructions);
                         // Seed the local AND the `arguments` key from the default, WITHOUT reading
                         // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
@@ -4730,17 +4712,17 @@ impl CfmlCompiler {
                         // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
                         // documented "Load s, Swap, SetProperty -> modified s" pattern.
                         func_instructions.push(BytecodeOp::Dup);
-                        func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
-                        func_instructions.push(BytecodeOp::LoadLocal("arguments".to_string()));
+                        func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
+                        func_instructions.push(BytecodeOp::LoadLocal(Name::intern("arguments")));
                         func_instructions.push(BytecodeOp::Swap);
-                        func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
-                        func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
+                        func_instructions.push(BytecodeOp::SetProperty(Name::from(&param.name)));
+                        func_instructions.push(BytecodeOp::StoreLocal(Name::intern("arguments")));
                         // Type-check the applied default (see compile_function_decl).
                         if declared_type_is_checkable(param.param_type.as_deref()) {
                             func_instructions.push(BytecodeOp::ValidateParamType(idx));
                         }
                         func_instructions[jump_idx] =
-                            BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
+                            BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len());
                     }
                 }
                 for s in &closure.body {
@@ -4805,7 +4787,7 @@ impl CfmlCompiler {
                 for (idx, param) in arrow.params.iter().enumerate() {
                     if let Some(ref default_expr) = param.default {
                         let jump_idx = func_instructions.len();
-                        func_instructions.push(BytecodeOp::JumpIfArgPresent(param.name.clone(), 0));
+                        func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0));
                         self.compile_expression(default_expr, &mut func_instructions);
                         // Seed the local AND the `arguments` key from the default, WITHOUT reading
                         // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
@@ -4815,17 +4797,17 @@ impl CfmlCompiler {
                         // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
                         // documented "Load s, Swap, SetProperty -> modified s" pattern.
                         func_instructions.push(BytecodeOp::Dup);
-                        func_instructions.push(BytecodeOp::StoreLocal(param.name.clone()));
-                        func_instructions.push(BytecodeOp::LoadLocal("arguments".to_string()));
+                        func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
+                        func_instructions.push(BytecodeOp::LoadLocal(Name::intern("arguments")));
                         func_instructions.push(BytecodeOp::Swap);
-                        func_instructions.push(BytecodeOp::SetProperty(param.name.clone()));
-                        func_instructions.push(BytecodeOp::StoreLocal("arguments".to_string()));
+                        func_instructions.push(BytecodeOp::SetProperty(Name::from(&param.name)));
+                        func_instructions.push(BytecodeOp::StoreLocal(Name::intern("arguments")));
                         // Type-check the applied default (see compile_function_decl).
                         if declared_type_is_checkable(param.param_type.as_deref()) {
                             func_instructions.push(BytecodeOp::ValidateParamType(idx));
                         }
                         func_instructions[jump_idx] =
-                            BytecodeOp::JumpIfArgPresent(param.name.clone(), func_instructions.len());
+                            BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len());
                     }
                 }
                 self.compile_expression(&arrow.body, &mut func_instructions);
@@ -4862,7 +4844,7 @@ impl CfmlCompiler {
                 self.current_fn_local_mode = prev_fn_local_mode;
             }
             Expression::This(_) => {
-                instructions.push(BytecodeOp::LoadLocal("this".to_string()));
+                instructions.push(BytecodeOp::LoadLocal(Name::intern("this")));
             }
             Expression::Super(_) => {
                 instructions.push(BytecodeOp::LoadSuper);
@@ -4899,7 +4881,7 @@ impl CfmlCompiler {
                 // JumpIfNotNull peeks without popping, so no Dup needed
                 // Use TryLoadLocal for simple identifiers (undefined vars → Null, not error)
                 if let Expression::Identifier(ref ident) = *elvis.left {
-                    instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                    instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
                 } else if matches!(
                     *elvis.left,
                     Expression::MemberAccess(_) | Expression::ArrayAccess(_)
@@ -4954,9 +4936,10 @@ mod size_probe {
         let op = size_of::<BytecodeOp>();
         eprintln!("size_of::<BytecodeOp>() = {op} B");
         assert!(
-            op <= 64,
-            "BytecodeOp grew to {op} B (ceiling 64 B) — a perf regression. \
-             If intentional, justify and raise the ceiling."
+            op <= 48,
+            "BytecodeOp grew to {op} B (ceiling 48 B, set when Phase 3.1 name \
+             interning shrank it from 64 B) — a perf regression. If \
+             intentional, justify and raise the ceiling."
         );
     }
 }

@@ -208,7 +208,7 @@ pub fn analyze_loop(
     let term_ip = region_end_excl - 1;
     let counter_name: Option<String> = match &code[term_ip] {
         BytecodeOp::ForLoopStep(name, _, _, _, target) if *target == region_start => {
-            Some(name.clone())
+            Some(name.to_string())
         }
         BytecodeOp::Jump(target)
         | BytecodeOp::JumpIfTrue(target)

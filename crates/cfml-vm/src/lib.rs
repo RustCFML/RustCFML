@@ -6197,13 +6197,7 @@ impl CfmlVirtualMachine {
                     // Avoid allocating a lowercase String when the identifier is
                     // already all-lowercase ASCII (the common case). Unicode
                     // identifiers still get full case-folding.
-                    let name_lower_owned: String;
-                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                        name_lower_owned = name.to_lowercase();
-                        &name_lower_owned
-                    } else {
-                        name.as_str()
-                    };
+                    let name_lower: &str = name.lower();
                     // GH #312: a built-in scope name is RESERVED for a bare read.
                     // A same-named parameter or `var` local does NOT shadow it —
                     // `request` is always the request scope, and the shadowing
@@ -6593,13 +6587,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::TryLoadLocal(name) => {
                     // Safe load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
                     // Same zero-alloc lowercase guard as LoadLocal.
-                    let name_lower_owned: String;
-                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                        name_lower_owned = name.to_lowercase();
-                        &name_lower_owned
-                    } else {
-                        name.as_str()
-                    };
+                    let name_lower: &str = name.lower();
                     let val = if name_lower == "local" {
                         // PR #93: per-frame `local` — only keys established here.
                         CfmlValue::strukt(Self::build_local_scope_view(
@@ -6639,9 +6627,9 @@ impl CfmlVirtualMachine {
                     // the `variables` scope (ColdBox's Router.buildFlashScope). The
                     // original-case entry keeps the `local`-view visibility filter
                     // (which checks `contains(k)` with the key's own casing) intact.
-                    declared_locals.insert(name.clone());
-                    if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                        declared_locals.insert(name.to_lowercase());
+                    declared_locals.insert(name.to_string());
+                    if !name.is_lowercase() {
+                        declared_locals.insert(name.lower().to_string());
                     }
                     // PR #93: a `var x` / `local.x` declaration RECLAIMS the
                     // name into THIS frame's `local` scope, shadowing any
@@ -6658,20 +6646,14 @@ impl CfmlVirtualMachine {
                     // that still-inherited key and `build_local_scope_view`
                     // filtered the write straight back out — the local assignment
                     // was silently lost. Drop every CI-matching entry.
-                    inherited_or_param_keys.remove(name);
+                    inherited_or_param_keys.remove(name.as_str());
                     // eq_ignore_ascii_case doesn't need a pre-lowered operand.
                     inherited_or_param_keys.retain(|k| !k.eq_ignore_ascii_case(name));
                 }
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
                         // Same zero-alloc lowercase guard as LoadLocal.
-                        let name_lower_owned: String;
-                        let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                            name_lower_owned = name.to_lowercase();
-                            &name_lower_owned
-                        } else {
-                            name.as_str()
-                        };
+                        let name_lower: &str = name.lower();
                         // Subclass pseudo-constructor: the body's `this`-binding
                         // (LoadLocal(name) → StoreLocal("this"), emitted before any
                         // body statement). Merge the parent's explicit `this.*` data
@@ -6984,10 +6966,10 @@ impl CfmlVirtualMachine {
                                 .get_mut(ARGUMENTS_SCOPE_KEY)
                                 .and_then(|v| v.as_cfml_struct())
                             {
-                                args.insert(name.clone(), val);
+                                args.insert(name.to_string(), val);
                             }
                         } else if locals.contains_key("__variables")
-                            && !declared_locals.contains(name)
+                            && !declared_locals.contains(name.as_str())
                             && !declared_locals.contains(name_lower)
                             && !locals.contains_key(name.as_str())
                             && name_lower != "arguments"
@@ -7036,7 +7018,7 @@ impl CfmlVirtualMachine {
                                     }
                                     _ => val,
                                 };
-                                vars.insert(name.clone(), val);
+                                vars.insert(name.to_string(), val);
                             }
                         } else {
                             scope_insert_ci(&mut locals, name, val.clone());
@@ -7045,7 +7027,7 @@ impl CfmlVirtualMachine {
                             // frame's `local` view, shadowing any inherited
                             // same-named key from the caller / closure parent.
                             if effective_local_mode_modern {
-                                inherited_or_param_keys.remove(name);
+                                inherited_or_param_keys.remove(name.as_str());
                             }
                             // Bidirectional sync: when a function param is stored by
                             // its bare name, also update arguments[param] so a later
@@ -7064,7 +7046,7 @@ impl CfmlVirtualMachine {
                                 if let Some(args) =
                                     locals.get_mut(ARGUMENTS_SCOPE_KEY).and_then(|v| v.as_cfml_struct())
                                 {
-                                    args.insert(name.clone(), val.clone());
+                                    args.insert(name.to_string(), val.clone());
                                 }
                             }
                             // Sync to shared closure env so closures see updated value
@@ -7100,10 +7082,10 @@ impl CfmlVirtualMachine {
                                     if let CfmlValue::Function(f) = &val {
                                         let mut stripped = (**f).clone();
                                         stripped.captured_scope = None;
-                                        m.insert(name.clone(), CfmlValue::Function(Arc::new(stripped)));
+                                        m.insert(name.to_string(), CfmlValue::Function(Arc::new(stripped)));
                                     }
                 } else if m.contains_key(name.as_str()) {
-                                    m.insert(name.clone(), val);
+                                    m.insert(name.to_string(), val);
                                 }
                             }
                         }
@@ -7171,13 +7153,7 @@ impl CfmlVirtualMachine {
                     // Resolve through the full scope chain; the returned handle
                     // shares the backing with the scope slot, so a push is seen
                     // by the original (globals/__variables/case-insensitive).
-                    let name_lower_owned: String;
-                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                        name_lower_owned = name.to_lowercase();
-                        &name_lower_owned
-                    } else {
-                        name.as_str()
-                    };
+                    let name_lower: &str = name.lower();
                     if let Some(CfmlValue::Array(arr)) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
                     {
@@ -7202,10 +7178,10 @@ impl CfmlVirtualMachine {
                         if let Some(vars) =
                             locals.get_mut("__variables").and_then(|v| v.as_cfml_struct())
                         {
-                            vars.insert(name.clone(), val);
+                            vars.insert(name.to_string(), val);
                         }
                     } else {
-                        locals.insert(name.clone(), val.clone());
+                        locals.insert(name.to_string(), val.clone());
                         if is_inside_function
                             && !declared_locals.contains(name.as_str())
                             && !declared_locals.contains(name_lower)
@@ -7214,13 +7190,13 @@ impl CfmlVirtualMachine {
                             if let Some(args) =
                                 locals.get_mut(ARGUMENTS_SCOPE_KEY).and_then(|v| v.as_cfml_struct())
                             {
-                                args.insert(name.clone(), val.clone());
+                                args.insert(name.to_string(), val.clone());
                             }
                         }
                         if let Some(ref env) = closure_env {
                             let mut m = env.write().unwrap();
                             if m.contains_key(name.as_str()) {
-                                m.insert(name.clone(), val);
+                                m.insert(name.to_string(), val);
                             }
                         }
                     }
@@ -7230,13 +7206,7 @@ impl CfmlVirtualMachine {
                     // already all-lowercase ASCII (the common case for the most
                     // frequent read op). Unicode/mixed-case idents still get full
                     // case-folding. Mirrors the LoadLocal guard above.
-                    let name_lower_owned: String;
-                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                        name_lower_owned = name.to_lowercase();
-                        &name_lower_owned
-                    } else {
-                        name.as_str()
-                    };
+                    let name_lower: &str = name.lower();
                     // PR #97: CFML is lexically scoped — a non-Function value that
                     // leaked in from an ANCESTOR frame (the parent-scope copy above)
                     // must stay invisible to bare-name call resolution; only data
@@ -7338,9 +7308,9 @@ impl CfmlVirtualMachine {
                                 && !f.name.starts_with("__closure_")
                                 && !f.name.starts_with("__arrow_")
                             {
-                                self.pending_called_name = Some(name.clone());
+                                self.pending_called_name = Some(name.to_string());
                                 let mut bf = (**f).clone();
-                                bf.name = name.clone();
+                                bf.name = name.to_string();
                                 v = CfmlValue::Function(Arc::new(bf));
                             }
                         }
@@ -7376,7 +7346,7 @@ impl CfmlVirtualMachine {
                                 // an injected provider whose source method is named
                                 // "buildProviderMixer". Drained by the next call.
                                 if !f.name.eq_ignore_ascii_case(name.as_str()) {
-                                    self.pending_called_name = Some(name.clone());
+                                    self.pending_called_name = Some(name.to_string());
                                 }
                                 let foreign_bind = f
                                     .captured_scope
@@ -7413,7 +7383,7 @@ impl CfmlVirtualMachine {
                                     // name — WireBox's buildProviderMixer keys
                                     // `this.$wbProviders[getFunctionCalledName()]`.
                                     if !bf.name.eq_ignore_ascii_case(name.as_str()) {
-                                        bf.name = name.clone();
+                                        bf.name = name.to_string();
                                     }
                                     CfmlValue::Function(Arc::new(bf))
                                 } else if !f.name.eq_ignore_ascii_case(name.as_str())
@@ -7428,7 +7398,7 @@ impl CfmlVirtualMachine {
                                     // keep their generated name (load-bearing for
                                     // call_function's live-capture refresh).
                                     let mut bf = (**f).clone();
-                                    bf.name = name.clone();
+                                    bf.name = name.to_string();
                                     CfmlValue::Function(Arc::new(bf))
                                 } else {
                                     val
@@ -7487,7 +7457,7 @@ impl CfmlVirtualMachine {
                             let ret_type = uf.return_type.clone();
                             let val = CfmlValue::Function(Arc::new(
                                 cfml_common::dynamic::CfmlFunction {
-                                    name: name.clone(),
+                                    name: name.to_string(),
                                     params,
                                     // Reference the function by its stable global_id.
                                     body: cfml_common::dynamic::CfmlClosureBody::Expression(
@@ -7519,7 +7489,7 @@ impl CfmlVirtualMachine {
                                     .find(|k| k.eq_ignore_ascii_case(&name_lower))
                             })
                             .cloned()
-                            .unwrap_or(name.clone());
+                            .unwrap_or(name.to_string());
                         let params = self
                             .user_functions
                             .iter()
@@ -7583,7 +7553,7 @@ impl CfmlVirtualMachine {
                             | "precisionevaluate"
                     ) {
                         stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
-                            name: name.clone(),
+                            name: name.to_string(),
                             params: Vec::new(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                                 CfmlValue::Null,
@@ -7680,7 +7650,7 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::StoreGlobal(name) => {
                     if let Some(val) = stack.pop() {
-                        self.globals.insert(name.clone(), val);
+                        self.globals.insert(name.to_string(), val);
                     }
                 }
 
@@ -8112,14 +8082,14 @@ impl CfmlVirtualMachine {
                         if let Some(vars) =
                             locals.get("__variables").and_then(|v| v.as_cfml_struct())
                         {
-                            vars.insert(name.clone(), new_val.clone());
+                            vars.insert(name.to_string(), new_val.clone());
                         }
                     } else {
-                        locals.insert(name.clone(), new_val.clone());
+                        locals.insert(name.to_string(), new_val.clone());
                         if let Some(ref env) = closure_env {
                             let mut m = env.write().unwrap();
                             if m.contains_key(name.as_str()) {
-                                m.insert(name.clone(), new_val.clone());
+                                m.insert(name.to_string(), new_val.clone());
                             }
                         }
                     }
@@ -9520,14 +9490,7 @@ impl CfmlVirtualMachine {
                     // variables live in `globals`. Falling back through
                     // `lookup_name_in_scopes` matches the semantics of plain
                     // `LoadLocal` so `p.foo` reads agree with `p["foo"]`.
-                    let name_lower_owned: String;
-                    let name_lower: &str =
-                        if local_name.bytes().any(|b| b.is_ascii_uppercase()) {
-                            name_lower_owned = local_name.to_lowercase();
-                            &name_lower_owned
-                        } else {
-                            local_name.as_str()
-                        };
+                    let name_lower: &str = local_name.lower();
                     let receiver = locals
                         .get(local_name.as_str())
                         .cloned()
@@ -9578,14 +9541,7 @@ impl CfmlVirtualMachine {
                             && k != "super"
                             && !k.starts_with("__")
                     };
-                    let name_lower_owned: String;
-                    let name_lower: &str =
-                        if prop_name.bytes().any(|b| b.is_ascii_uppercase()) {
-                            name_lower_owned = prop_name.to_lowercase();
-                            &name_lower_owned
-                        } else {
-                            prop_name.as_str()
-                        };
+                    let name_lower: &str = prop_name.lower();
                     // Exact hit first (the common case), then a case-insensitive
                     // scan — mirrors GetProperty's resolution order.
                     let val = locals
@@ -9630,7 +9586,7 @@ impl CfmlVirtualMachine {
                                 .entry(local_name.to_lowercase())
                                 .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
                             if let Some(s) = entry.as_cfml_struct() {
-                                s.insert(prop_name.clone(), value);
+                                s.insert(prop_name.to_string(), value);
                             }
                             continue;
                         }
@@ -9642,7 +9598,7 @@ impl CfmlVirtualMachine {
                         // fast path (no scan); the linear key scan only runs
                         // when the exact case misses (i.e. the buggy case).
                         let resolved_local = if locals.contains_key(local_name.as_str()) {
-                            Some(local_name.clone())
+                            Some(local_name.to_string())
                         } else {
                             locals
                                 .keys()
@@ -9694,13 +9650,13 @@ impl CfmlVirtualMachine {
                                 match handled {
                                     Some(result) => result?,
                                     None => {
-                                        inst.read().this_members.insert(prop_name.clone(), value);
+                                        inst.read().this_members.insert(prop_name.to_string(), value);
                                     }
                                 }
                                 continue;
                             }
                             if let Some(s) = obj.as_cfml_struct() {
-                                s.insert(prop_name.clone(), value);
+                                s.insert(prop_name.to_string(), value);
                             } else {
                                 return Err(CfmlError::runtime(format!(
                                     "Cannot set property '{}' on non-struct in local '{}'",
@@ -9763,13 +9719,13 @@ impl CfmlVirtualMachine {
                                 // (struct backing or the instance's public data map),
                                 // so this write is visible through `variables.<name>`.
                                 // `set` handles both Struct and flyweight Instance.
-                                existing.set(prop_name.clone(), value);
+                                existing.set(prop_name.to_string(), value);
                             } else {
                                 // Auto-vivification: assigning to a member path of a
                                 // variable that does not yet exist creates that variable
                                 // as a struct, matching Lucee/ACF/BoxLang.
                                 let mut s = ValueMap::default();
-                                s.insert(prop_name.clone(), value);
+                                s.insert(prop_name.to_string(), value);
                                 // Inside a CFC method under classic localmode, an
                                 // unscoped write belongs to the component (variables)
                                 // scope — so sibling methods AND super/override
@@ -9790,13 +9746,13 @@ impl CfmlVirtualMachine {
                                         .and_then(|v| v.as_cfml_struct())
                                         .map(|vars| {
                                             vars.insert(
-                                                local_name.clone(),
+                                                local_name.to_string(),
                                                 CfmlValue::strukt(s.clone()),
                                             );
                                         })
                                         .is_some();
                                 if !vivd_into_variables {
-                                    locals.insert(local_name.clone(), CfmlValue::strukt(s));
+                                    locals.insert(local_name.to_string(), CfmlValue::strukt(s));
                                 }
                             }
                         }
@@ -9902,12 +9858,12 @@ impl CfmlVirtualMachine {
                                 let val = s
                                     .get(name.as_str())
                                     .or_else(|| s.get(&name.to_uppercase()))
-                                    .or_else(|| s.get(&name.to_lowercase()))
+                                    .or_else(|| s.get(name.lower()))
                                     .or_else(|| {
                                         // Full case-insensitive scan for mixed-case keys.
                                         // Pure key compare + one value clone, so read under
                                         // the lock instead of cloning the whole struct.
-                                        let name_lower = name.to_lowercase();
+                                        let name_lower = name.lower();
                                         s.with_map(|m| {
                                             m.iter()
                                                 .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
@@ -10005,7 +9961,7 @@ impl CfmlVirtualMachine {
                             }
                             CfmlValue::Array(arr) => {
                                 // Array member functions
-                                match name.to_lowercase().as_str() {
+                                match name.lower() {
                                     "len" | "length" => {
                                         stack.push(CfmlValue::Int(arr.len() as i64));
                                     }
@@ -10014,7 +9970,7 @@ impl CfmlVirtualMachine {
                             }
                             CfmlValue::String(s) => {
                                 // String member functions
-                                match name.to_lowercase().as_str() {
+                                match name.lower() {
                                     "len" | "length" => {
                                         // CFML len() is a character count (see fn_len).
                                         stack.push(CfmlValue::Int(s.chars().count() as i64));
@@ -10023,7 +9979,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             CfmlValue::Query(q) => {
-                                match name.to_lowercase().as_str() {
+                                match name.lower() {
                                     "recordcount" => {
                                         stack.push(CfmlValue::Int(q.row_count() as i64));
                                     }
@@ -10184,7 +10140,7 @@ impl CfmlVirtualMachine {
                                 match handled {
                                     Some(result) => result?,
                                     None => {
-                                        inst.read().this_members.insert(name.clone(), value);
+                                        inst.read().this_members.insert(name.to_string(), value);
                                     }
                                 }
                                 stack.push(obj);
@@ -10218,7 +10174,7 @@ impl CfmlVirtualMachine {
                             // `property name="x"` so they're accessible unscoped in methods.
                             if let Some(s) = obj.as_cfml_struct() {
                                 if s.contains_key("__variables") && s.contains_key("__properties") {
-                                    let name_lower = name.to_lowercase();
+                                    let name_lower = name.lower();
                                     let is_declared = if let Some(CfmlValue::Array(props)) =
                                         s.get("__properties")
                                     {
@@ -10240,12 +10196,12 @@ impl CfmlVirtualMachine {
                                         if let Some(CfmlValue::Struct(vars)) =
                                             s.get("__variables")
                                         {
-                                            vars.insert(name.clone(), value.clone());
+                                            vars.insert(name.to_string(), value.clone());
                                         }
                                     }
                                 }
                             }
-                            obj.set(name.clone(), value);
+                            obj.set(name.to_string(), value);
                             stack.push(obj);
                         }
                     }
@@ -10862,8 +10818,7 @@ impl CfmlVirtualMachine {
                     // already-handled inner exception left in the register by a
                     // nested try/catch. A missing local (shouldn't happen for a
                     // real catch var) leaves the register untouched.
-                    let name_lower = name.to_lowercase();
-                    if let Some(v) = self.lookup_name_in_scopes(name.as_str(), &name_lower, &locals) {
+                    if let Some(v) = self.lookup_name_in_scopes(name.as_str(), name.lower(), &locals) {
                         if !matches!(v, CfmlValue::Null) {
                             self.last_exception = Some(v);
                         }
@@ -12246,7 +12201,7 @@ impl CfmlVirtualMachine {
                         Some(CfmlValue::Struct(a)) => a.contains_key_ci(name),
                         _ => arguments_supplied
                             .as_ref()
-                            .is_some_and(|s| s.contains(&name.to_lowercase())),
+                            .is_some_and(|s| s.contains(name.lower())),
                     };
                     if supplied {
                         ip = *target;
@@ -34830,7 +34785,7 @@ fn find_arg_sources(ops: &[BytecodeOp], call_ip: usize, arg_count: usize) -> Vec
                 | BytecodeOp::LoadGlobal(name)
                 | BytecodeOp::LoadVariablesKey(name) = op
                 {
-                    sources[arg_idx] = Some(name.clone());
+                    sources[arg_idx] = Some(name.to_string());
                 }
             }
         }
