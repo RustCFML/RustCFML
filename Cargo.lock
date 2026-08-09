@@ -6388,6 +6388,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "http-body-util",
+ "httpdate",
  "indexmap",
  "libc",
  "log",

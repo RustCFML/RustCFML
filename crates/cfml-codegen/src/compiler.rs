@@ -222,9 +222,39 @@ pub struct BytecodeFunction {
     /// `this` for chaining. Enforcing either would break CFCs that are
     /// perfectly legal on the reference engine.
     pub is_generated_accessor: bool,
+    /// True when this function is declared `output="false"`/`"no"`/`"0"`,
+    /// meaning its body must produce NO page output (Lucee/ACF `<cfsilent>`
+    /// semantics). Derived from `metadata` once at compile finalize
+    /// ([`Self::finalize`]) so the VM's per-call prologue doesn't re-scan and
+    /// re-lowercase the metadata on every dispatch.
+    pub output_suppressed: bool,
+    /// True for the synthetic template-shaped frames — `__main__`,
+    /// `__cfc_body__`, `__cfc_static_init__` — whose locals ARE the page /
+    /// component `variables` scope and must never leak out as a closure
+    /// parent-scope writeback. Derived from `name` at compile finalize
+    /// ([`Self::finalize`]).
+    pub is_template_frame: bool,
 }
 
 impl BytecodeFunction {
+    /// Stamp the name/metadata-derived dispatch flags and trim allocation
+    /// slack. Every function reaches this exactly once, at registration
+    /// ([`BytecodeCompiler::push_function`]) or, for the `__main__` template
+    /// body, at the end of [`BytecodeCompiler::compile`] — construction sites
+    /// leave the derived fields `false` and rely on this stamp.
+    pub fn finalize(&mut self) {
+        self.output_suppressed = self.metadata.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("output") && {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no") || v == "0"
+            }
+        });
+        self.is_template_frame = self.name == "__main__"
+            || self.name == "__cfc_body__"
+            || self.name == "__cfc_static_init__";
+        self.shrink_to_fit();
+    }
+
     /// Release the spare capacity every `Vec` here accumulated while being built.
     ///
     /// Bytecode is produced by repeated `push`, so each vector grows by amortized
@@ -642,6 +672,8 @@ impl CfmlCompiler {
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
                     is_generated_accessor: false,
+                    output_suppressed: false,
+                    is_template_frame: false,
                 })],
             },
             loop_stack: Vec::new(),
@@ -754,7 +786,7 @@ impl CfmlCompiler {
     /// slack first. Every site that adds a compiled function goes through here
     /// so a new one can't silently reintroduce the untrimmed path.
     fn push_function(&mut self, mut func: BytecodeFunction) -> usize {
-        func.shrink_to_fit();
+        func.finalize();
         self.program.functions.push(Arc::new(func));
         self.program.functions.len() - 1
     }
@@ -805,7 +837,7 @@ impl CfmlCompiler {
         instructions.shrink_to_fit();
         let main = Arc::get_mut(&mut self.program.functions[0]).unwrap();
         main.instructions = instructions;
-        main.shrink_to_fit();
+        main.finalize();
         self.program.functions.shrink_to_fit();
 
         self.program
@@ -3218,6 +3250,8 @@ impl CfmlCompiler {
                 .cloned()
                 .collect(),
             is_generated_accessor: false,
+            output_suppressed: false,
+            is_template_frame: false,
         };
 
         let global_id = bc_func.global_id as usize;
@@ -3471,6 +3505,8 @@ impl CfmlCompiler {
                     metadata: Vec::new(),
                     // Declared for metadata, NOT enforced — see the field docs.
                     is_generated_accessor: true,
+                    output_suppressed: false,
+                    is_template_frame: false,
                 };
                 self.push_function(getter_func);
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3558,6 +3594,8 @@ impl CfmlCompiler {
                     // so this declaration names a type the returned `this` could
                     // never satisfy.
                     is_generated_accessor: true,
+                    output_suppressed: false,
+                    is_template_frame: false,
                 };
                 self.push_function(setter_func);
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3730,6 +3768,8 @@ impl CfmlCompiler {
                 access: cfml_common::dynamic::CfmlAccess::Public,
                 metadata: Vec::new(),
                 is_generated_accessor: false,
+                output_suppressed: false,
+                is_template_frame: false,
             };
             self.push_function(static_func);
         }
@@ -4738,6 +4778,8 @@ impl CfmlCompiler {
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
                     is_generated_accessor: false,
+                    output_suppressed: false,
+                    is_template_frame: false,
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -4810,6 +4852,8 @@ impl CfmlCompiler {
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
                     is_generated_accessor: false,
+                    output_suppressed: false,
+                    is_template_frame: false,
                 };
 
                 let global_id = bc_func.global_id as usize;

@@ -1251,6 +1251,8 @@ mod tests {
             access: cfml_common::dynamic::CfmlAccess::Public,
             metadata: Vec::new(),
             is_generated_accessor: false,
+            output_suppressed: false,
+            is_template_frame: false,
         }
     }
 

@@ -1229,6 +1229,13 @@ struct AppState {
     /// Cache of URL-path → resolved file. Only populated in production mode;
     /// keyed by the rewritten URL path (after rewrite rules have applied).
     resolved_file_cache: Arc<RwLock<HashMap<String, Option<ResolvedFile>>>>,
+    /// Front-controller fallback template resolution, computed once per
+    /// process (production mode only — dev keeps re-resolving so a template
+    /// created while the server runs is picked up). The fallback target is a
+    /// fixed config value, so re-running `resolve_file` on it for every
+    /// unresolved URL (i.e. every routed request on a front-controller app)
+    /// was pure repeated IO. Outer `Option` = "not computed yet".
+    fallback_resolved_cache: Arc<RwLock<Option<Option<ResolvedFile>>>>,
     /// Resolved RustCFML configuration. In production mode this is read once
     /// at startup; dev mode currently also reads once (live-reload lands in a
     /// later phase). Used for HTTP-block list and downstream wiring.
@@ -1902,6 +1909,7 @@ async fn async_run_server(
         vfs,
         sandbox,
         resolved_file_cache: Arc::new(RwLock::new(HashMap::new())),
+        fallback_resolved_cache: Arc::new(RwLock::new(None)),
         cfconfig,
     });
 
@@ -2318,13 +2326,34 @@ async fn handle_request_inner(
     // scope and the original query string preserved.
     let fallback = &state.cfconfig.server.fallback;
     let resolved = if resolved.is_none() && !fallback.template.is_empty() {
-        match resolve_file(
-            &state.doc_root,
-            &fallback.template,
-            state.vfs.as_ref(),
-            welcome_files,
-            cfml_exts,
-        ) {
+        // The fallback target is a fixed config value — resolve it once per
+        // process in production instead of per unresolved URL.
+        let fallback_resolved = if state.server_state.production_mode {
+            let cached = state.fallback_resolved_cache.read().unwrap().clone();
+            match cached {
+                Some(hit) => hit,
+                None => {
+                    let r = resolve_file(
+                        &state.doc_root,
+                        &fallback.template,
+                        state.vfs.as_ref(),
+                        welcome_files,
+                        cfml_exts,
+                    );
+                    *state.fallback_resolved_cache.write().unwrap() = Some(r.clone());
+                    r
+                }
+            }
+        } else {
+            resolve_file(
+                &state.doc_root,
+                &fallback.template,
+                state.vfs.as_ref(),
+                welcome_files,
+                cfml_exts,
+            )
+        };
+        match fallback_resolved {
             Some(rf) => {
                 // Inject the original path as url.<routeParam>, ahead of the
                 // original params (the template reads it via the URL scope).
@@ -2439,15 +2468,67 @@ async fn handle_request_inner(
             }
         }
         Some(ref rf) => {
-            // Serve static file (via VFS for embedded support)
-            match state.vfs.read(&rf.file_path.to_string_lossy()) {
+            // Serve static file (via VFS for embedded support), with
+            // conditional-GET support: validators derive from the file mtime,
+            // so a repeat visitor's revalidation is answered 304 from a stat
+            // instead of re-reading and re-sending the whole body.
+            let path_str = rf.file_path.to_string_lossy();
+            let mtime = state.vfs.modified(&path_str).ok();
+            let etag = mtime
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| format!("\"{:x}-{:x}\"", d.as_secs(), d.subsec_nanos()));
+            let req_header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            };
+            // If-None-Match wins over If-Modified-Since (RFC 9110 §13.1.3).
+            let not_modified = if let (Some(etag), Some(inm)) =
+                (etag.as_deref(), req_header("if-none-match"))
+            {
+                inm.split(',')
+                    .any(|c| c.trim().trim_start_matches("W/") == etag || c.trim() == "*")
+            } else if let (Some(mtime), Some(ims)) =
+                (mtime, req_header("if-modified-since"))
+            {
+                // IMS carries second precision; truncate the mtime to seconds
+                // so an unchanged file with sub-second mtime still matches.
+                httpdate::parse_http_date(ims).is_ok_and(|since| {
+                    let secs = |t: std::time::SystemTime| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    };
+                    secs(mtime) <= secs(since)
+                })
+            } else {
+                false
+            };
+            let with_validators = |mut b: axum::http::response::Builder| {
+                if let Some(t) = mtime {
+                    b = b.header("Last-Modified", httpdate::fmt_http_date(t));
+                }
+                if let Some(ref e) = etag {
+                    b = b.header("ETag", e.as_str());
+                }
+                b
+            };
+            if not_modified {
+                return with_validators(axum::response::Response::builder().status(304))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+            match state.vfs.read(&path_str) {
                 Ok(data) => {
                     let ct = content_type_for(&rf.file_path);
-                    axum::response::Response::builder()
-                        .status(200)
-                        .header("Content-Type", ct)
-                        .body(axum::body::Body::from(data))
-                        .unwrap()
+                    with_validators(
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("Content-Type", ct),
+                    )
+                    .body(axum::body::Body::from(data))
+                    .unwrap()
                 }
                 Err(_) => {
                     axum::response::Response::builder()

@@ -602,6 +602,22 @@ fn xml_escape_into(s: &str, in_attr: bool, out: &mut String) {
     }
 }
 
+/// Receiver-shape flags for a member-method dispatch, computed in one read
+/// lock by [`CfmlStruct::probe_dispatch_shape`]. The marker keys distinguish
+/// CFC instances (`__variables`/`__name`), java shims (`__java_shim`) and the
+/// `super` dispatch struct (`__is_super`) from plain structs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DispatchShape {
+    pub has_variables: bool,
+    pub has_name: bool,
+    pub has_java_shim: bool,
+    pub has_is_super: bool,
+    /// True when the probed method name resolves to a `CfmlValue::Function`
+    /// member (a plain struct key holding a function shadows the built-in
+    /// member function of the same name).
+    pub method_is_fn: bool,
+}
+
 #[derive(Clone)]
 pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
@@ -995,6 +1011,45 @@ impl CfmlStruct {
         // `StructKeyExists(variables, "this")` must see the live alias (Lucee
         // parity — Wheels Plugins.cfc gates the public mixin append on it).
         key.eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
+    }
+
+    /// Single-lock probe for the VM's member-dispatch prologue: answers, under
+    /// ONE read guard, which of the receiver-shape marker keys are present and
+    /// whether `method` resolves to a plain `Function` member. Replaces a chain
+    /// of `contains_key`/`get_ci` calls that each took their own read lock (the
+    /// old CallMethod prologue took ~12 per dispatch). Marker-key presence
+    /// mirrors `contains_key` (exact map hit, plus method-table fallthrough);
+    /// `method_is_fn` mirrors `get_ci`'s resolution order (exact, CI index,
+    /// method table) minus the `this` alias — a member literally named "this"
+    /// is a struct, never a Function, so the flag's value is unaffected.
+    pub fn probe_dispatch_shape(&self, method: &str) -> DispatchShape {
+        let g = self.0.read();
+        let contains = |k: &str| {
+            g.map.contains_key(k)
+                || g.method_table.as_ref().is_some_and(|t| {
+                    t.contains_key(k) || t.keys().any(|tk| tk.eq_ignore_ascii_case(k))
+                })
+        };
+        let method_val = g
+            .map
+            .get(method)
+            .or_else(|| g.resolve_ci_key(method).and_then(|orig| g.map.get(orig)))
+            .or_else(|| {
+                g.method_table.as_ref().and_then(|t| {
+                    t.get(method).or_else(|| {
+                        t.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(method))
+                            .map(|(_, v)| v)
+                    })
+                })
+            });
+        DispatchShape {
+            has_variables: contains("__variables"),
+            has_name: contains("__name"),
+            has_java_shim: contains("__java_shim"),
+            has_is_super: contains("__is_super"),
+            method_is_fn: matches!(method_val, Some(CfmlValue::Function(_))),
+        }
     }
 
     /// Insert (interior mutability — visible to all aliases). Returns the

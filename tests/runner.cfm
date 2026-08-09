@@ -528,6 +528,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfthread_shared_component.cfm">
 <cf_runtest file="tags/test_tags_cflock_scope.cfm">
 <cf_runtest file="tags/test_tags_cfscript_statements.cfm">
+<cf_runtest file="tags/test_static_conditional_get.cfm">
 <cf_runtest file="tags/test_cfcookie_path_samesite.cfm">
 <cf_runtest file="tags/test_cfcookie_inrequest_readback.cfm">
 <cf_runtest file="tags/test_tags_cfhttp_interpolation.cfm">

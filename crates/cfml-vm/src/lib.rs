@@ -141,21 +141,35 @@ fn lever_c_untracking_enabled() -> bool {
 static SHARED_FN_REGISTRY: RwLock<Vec<std::sync::Weak<BytecodeFunction>>> = RwLock::new(Vec::new());
 
 /// Publish function `Arc`s into [`SHARED_FN_REGISTRY`], taking the write lock
-/// once for the whole batch. Idempotent: re-publishing the same id is a no-op
-/// while the existing entry is still live (ids never rebind, so a live entry is
-/// always the same function).
+/// at most once for the whole batch. Idempotent: re-publishing the same id is a
+/// no-op while the existing entry is still live (ids never rebind, so a live
+/// entry is always the same function). Warm requests re-register the same
+/// cached programs on every include, so the common case is "everything already
+/// live" — that path is served entirely under the read lock (an empty `filter`
+/// collect never allocates), and the write lock is only touched when at least
+/// one id is genuinely new or its previous Arc has died.
 fn publish_shared_fns<'a, I>(fns: I)
 where
     I: IntoIterator<Item = &'a Arc<BytecodeFunction>>,
 {
-    let mut it = fns.into_iter().peekable();
-    if it.peek().is_none() {
+    let missing: Vec<&'a Arc<BytecodeFunction>> = {
+        let Ok(reg) = SHARED_FN_REGISTRY.read() else {
+            return; // poisoned: degrade to per-request resolution, never panic a request
+        };
+        fns.into_iter()
+            .filter(|f| {
+                reg.get(f.global_id as usize)
+                    .is_none_or(|w| w.strong_count() == 0)
+            })
+            .collect()
+    };
+    if missing.is_empty() {
         return;
     }
     let Ok(mut reg) = SHARED_FN_REGISTRY.write() else {
         return; // poisoned: degrade to per-request resolution, never panic a request
     };
-    for f in it {
+    for f in missing {
         let id = f.global_id as usize;
         if id >= reg.len() {
             reg.resize(id + 1, std::sync::Weak::new());
@@ -681,20 +695,6 @@ fn os_version_string() -> String {
     {
         String::new()
     }
-}
-
-/// True when a function is declared `output="false"` (or `output="no"`/`="0"`),
-/// meaning its body must produce NO page output — inter-tag whitespace, plain
-/// text, and cfoutput/writeOutput are all suppressed, exactly like wrapping the
-/// body in `<cfsilent>` (Lucee/ACF semantics). A function with no `output`
-/// attribute, or `output="true"`, is NOT suppressed (its body text is emitted;
-/// both engines do this). Reads the metadata the parser captured from the
-/// tag/script function header.
-fn function_output_suppressed(func: &BytecodeFunction) -> bool {
-    func.metadata.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("output")
-            && matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "no" | "0")
-    })
 }
 
 /// Build the baseline `server` scope.
@@ -2455,19 +2455,23 @@ const _: fn() = || {
 /// identifiers are case-insensitive, so `foo = ""; FOO = "bar"` must leave a
 /// single variable equal to "bar" (ColdBox's RequestService relies on this: it
 /// declares `var flashPath` then assigns `flashpath` inside a switch). The
-/// exact-match fast path keeps hot loops O(1); the CI scan runs only when the
-/// exact key is absent (a genuinely new key or a case mismatch).
+/// exact-match fast path keeps hot loops O(1) and allocation-free (overwrite
+/// in place, no key clone); the CI scan runs only when the exact key is absent
+/// (a genuinely new key or a case mismatch), and a CI hit also updates in
+/// place. A key String is only allocated for a genuinely new entry.
 #[inline]
 fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
-    if map.contains_key(name) {
-        map.insert(name.to_string(), val);
+    if let Some(slot) = map.get_mut(name) {
+        *slot = val;
         return;
     }
-    if let Some(existing) = map.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() {
-        map.insert(existing, val);
-    } else {
-        map.insert(name.to_string(), val);
+    if let Some(idx) = map.keys().position(|k| k.eq_ignore_ascii_case(name)) {
+        if let Some((_, slot)) = map.get_index_mut(idx) {
+            *slot = val;
+            return;
+        }
     }
+    map.insert(name.to_string(), val);
 }
 
 #[derive(Debug, Clone)]
@@ -5369,7 +5373,7 @@ impl CfmlVirtualMachine {
         // body; the buffer is discarded on the normal-return cleanup below (and by
         // restore_capture_state on a caught throw), so nothing the body writes ever
         // reaches the page.
-        let suppress_body_output = function_output_suppressed(func);
+        let suppress_body_output = func.output_suppressed;
         if suppress_body_output {
             self.saved_output_buffers
                 .push(std::mem::take(&mut self.output_buffer));
@@ -5808,9 +5812,7 @@ impl CfmlVirtualMachine {
         // (`__main__`) frame: its locals are the component's `variables` scope,
         // captured via `captured_locals`, and must never leak out as a closure
         // parent-scope writeback (see the two write-back sites below).
-        let is_template_frame = func.name == "__cfc_body__"
-            || func.name == "__main__"
-            || func.name == "__cfc_static_init__";
+        let is_template_frame = func.is_template_frame;
 
         // Copy parent scope variables (closures and nested functions see parent vars).
         // Skip Function values — they're immutable and already available via
@@ -10981,13 +10983,23 @@ impl CfmlVirtualMachine {
                     // clobber the struct variable with the closure's return value.
                     // Restricted to plain structs (no __variables/__name) so CFC
                     // method dispatch and its `this`-writeback are unaffected.
-                    let plain_struct_fn_member_shadows = matches!(&object,
-                        CfmlValue::Struct(ref s)
-                            if !s.contains_key("__variables")
-                                && !s.contains_key("__name")
-                                && !s.contains_key("__java_shim")
-                                && !s.contains_key("__is_super")
-                                && matches!(s.get_ci(method_name.as_str()), Some(CfmlValue::Function(_))));
+                    // All four receiver-shape flags below come from ONE read
+                    // lock (probe_dispatch_shape) — the old chain of
+                    // contains_key/get_ci probes took ~12 separate read locks
+                    // per method dispatch.
+                    let shape = match &object {
+                        CfmlValue::Struct(ref s) => {
+                            s.probe_dispatch_shape(method_name.as_str())
+                        }
+                        _ => cfml_common::dynamic::DispatchShape::default(),
+                    };
+                    let plain_struct_recv = matches!(&object, CfmlValue::Struct(_))
+                        && !shape.has_variables
+                        && !shape.has_name
+                        && !shape.has_java_shim
+                        && !shape.has_is_super;
+                    let plain_struct_fn_member_shadows =
+                        plain_struct_recv && shape.method_is_fn;
 
                     // GH #307: the java.util.Map passthroughs on a PLAIN struct
                     // (`put`/`putIfAbsent`) return the affected VALUE, per Lucee —
@@ -10998,16 +11010,9 @@ impl CfmlVirtualMachine {
                     // `put` (java_shims.rs:2053, TreeMap et al.) genuinely does
                     // return a fresh struct and still needs the writeback, hence the
                     // `__java_shim` exclusion.
-                    let plain_struct_map_passthrough = matches!(&object,
-                        CfmlValue::Struct(ref s)
-                            if !s.contains_key("__variables")
-                                && !s.contains_key("__name")
-                                && !s.contains_key("__java_shim")
-                                && !s.contains_key("__is_super")
-                                && matches!(
-                                    method_name.to_lowercase().as_str(),
-                                    "put" | "putifabsent"
-                                ));
+                    let plain_struct_map_passthrough = plain_struct_recv
+                        && (method_name.eq_ignore_ascii_case("put")
+                            || method_name.eq_ignore_ascii_case("putifabsent"));
 
                     // Record this frame's `__variables` so a method dispatched on
                     // a still-being-constructed receiver (no `__variables` of its
@@ -11025,13 +11030,8 @@ impl CfmlVirtualMachine {
                     // => m.isAspect() )`). Applying it would overwrite the receiver
                     // variable with the closure's captured `this`. Gate on this flag
                     // so the leaked writeback is discarded for plain receivers.
-                    let receiver_writeback_ok = matches!(
-                        &object,
-                        CfmlValue::Struct(ref s)
-                            if s.contains_key("__variables")
-                                || s.contains_key("__name")
-                                || s.contains_key("__java_shim")
-                    );
+                    let receiver_writeback_ok =
+                        shape.has_variables || shape.has_name || shape.has_java_shim;
 
                     // A `super.method(...)` call (receiver is the `__is_super`
                     // dispatch struct) operates on the existing `this` in place —
@@ -11042,10 +11042,7 @@ impl CfmlVirtualMachine {
                     // setter by is_mutating_method) would overwrite the caller's
                     // `this` with its return value — destroying the component
                     // struct mid-construction (no methods/__name survive).
-                    let is_super_call = matches!(
-                        &object,
-                        CfmlValue::Struct(ref s) if s.contains_key("__is_super")
-                    );
+                    let is_super_call = shape.has_is_super;
 
                     // Clear method-writeback state before the call. Both fields must
                     // be cleared — leaving `method_variables_writeback` set from an
@@ -11070,7 +11067,7 @@ impl CfmlVirtualMachine {
                         if let Err(e) = named_args_check {
                             Err(e)
                         } else if let CfmlValue::Struct(ref s) = object {
-                            if s.contains_key("__is_super") {
+                            if is_super_call {
                                 // Super dispatch — find the parent's function by stored index.
                                 // CFML method names are case-insensitive (incl. super calls),
                                 // so resolve the parent method case-insensitively. An exact-case
@@ -25874,21 +25871,29 @@ impl CfmlVirtualMachine {
         }
 
         let root = parts[0].to_lowercase();
+        let rest = &parts[1..];
 
-        // Try to resolve the root variable from scope chain
-        let root_val = if root == "variables" {
+        // `local` and bare-`variables` roots resolve against the raw locals
+        // map. Probe it directly instead of materializing an O(frame) struct
+        // copy of every local per isDefined() call — frameworks probe these
+        // in per-request hot paths (`isDefined("local.x")` guards).
+        if root == "local" {
+            return Self::path_defined_from_map(locals, rest);
+        }
+        if root == "variables" {
             // Inside a component method the `variables` scope is the component
             // scope stored under `__variables`, not the function-local frame.
             // Without this, `isDefined("variables.x")` checks the wrong scope
             // and wrongly returns false for a member set in the pseudo-ctor or
             // an inherited method (e.g. Wheels' SQLite migrator sqlTypes map).
-            match locals.get("__variables") {
-                Some(vars) => Some(vars.clone()),
-                None => Some(CfmlValue::strukt(locals.clone())),
-            }
-        } else if root == "local" {
-            Some(CfmlValue::strukt(locals.clone()))
-        } else if root == "arguments" {
+            return match locals.get("__variables") {
+                Some(vars) => Self::path_defined_from(vars.clone(), rest),
+                None => Self::path_defined_from_map(locals, rest),
+            };
+        }
+
+        // Try to resolve the root variable from scope chain
+        let root_val = if root == "arguments" {
             // The arguments scope lives under the reserved ARGUMENTS_SCOPE_KEY,
             // not under the literal "arguments" key — without this case a
             // nested probe like `isDefined("arguments.md.properties")` would
@@ -25957,15 +25962,35 @@ impl CfmlVirtualMachine {
             None => return false,
         };
 
-        if parts.len() == 1 {
-            return true;
-        }
+        Self::path_defined_from(root_val, rest)
+    }
 
+    /// Is the dotted path `segments` defined starting from a raw locals map?
+    /// Empty `segments` means the scope root itself was probed (always defined).
+    /// The first segment is resolved in the map (exact then CI, no map copy),
+    /// then the remainder walks values via [`Self::path_defined_from`].
+    fn path_defined_from_map(map: &ValueMap, segments: &[&str]) -> bool {
+        let Some((first, rest)) = segments.split_first() else {
+            return true;
+        };
+        let hit = map.get(*first).or_else(|| {
+            map.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(first))
+                .map(|(_, v)| v)
+        });
+        match hit {
+            Some(v) => Self::path_defined_from(v.clone(), rest),
+            None => false,
+        }
+    }
+
+    /// Walk the remaining dotted path segments down from an already-resolved
+    /// root value. Extracted from [`Self::is_variable_defined`] so map-rooted
+    /// probes (`local.x`) can join the walk without building a struct copy.
+    fn path_defined_from(root_val: CfmlValue, segments: &[&str]) -> bool {
         // Walk the dotted path segments
         let mut current = root_val;
-        // For scope-named roots (request, local, etc.), start resolving from parts[1]
-        // For regular vars, start from parts[1] too
-        for &segment in &parts[1..] {
+        for &segment in segments {
             let seg_lower = segment.to_lowercase();
             match &current {
                 CfmlValue::Struct(s) => {
@@ -28847,6 +28872,7 @@ impl CfmlVirtualMachine {
             // (prevents globals leaking into `variables` via LoadLocal).
             let mut cfc_body = (*cfc_func).clone();
             cfc_body.name = "__cfc_body__".to_string();
+            cfc_body.is_template_frame = true;
             // Expose `super` to the body so `super.method(...)` calls in the
             // pseudo-constructor resolve to the parent (see pseudo_ctor_super).
             let pushed_super = super_value.is_some();
@@ -32038,6 +32064,7 @@ impl CfmlVirtualMachine {
         // (prevents globals leaking into `variables` via LoadLocal)
         let mut cfc_body = (*cfc_func).clone();
         cfc_body.name = "__cfc_body__".to_string();
+        cfc_body.is_template_frame = true;
 
         // Application.cfc commonly extends a framework Bootstrap and calls
         // `super.setupApplication(...)` at body level (Preside, FW/1, ColdBox).

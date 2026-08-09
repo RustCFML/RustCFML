@@ -43,6 +43,9 @@ axum = { version = "0.8", features = ["ws"] }
 # Only for `LengthLimitError`: lets a body-read failure be classified as a real
 # over-limit (413) rather than lumping every transport error in with it.
 http-body-util = "0.1"
+# Static-asset conditional GET (Last-Modified/If-Modified-Since parsing and
+# formatting). Already in the dependency graph via hyper — zero extra weight.
+httpdate = "1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
