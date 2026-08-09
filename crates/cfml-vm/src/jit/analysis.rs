@@ -1253,6 +1253,7 @@ mod tests {
             is_generated_accessor: false,
             output_suppressed: false,
             is_template_frame: false,
+            chain_tier: 0,
         }
     }
 

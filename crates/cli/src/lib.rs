@@ -1061,6 +1061,11 @@ fn compile_and_run(
     // engine to the thread-local on scope exit (incl. panic/early return).
     // The `--jit-stats` read must happen while the engine is still in the VM
     // (before the lease drops), so it reports the cumulative per-worker count.
+    // Perf-plan 3.2 stage-2 sizing: per-request delta of the call-parent
+    // seeding counters (RCFML_FUSED_COUNTERS=1). Measurement-only.
+    let fuse_before = cfml_vm::fuse_counters::enabled()
+        .then(|| (cfml_vm::fuse_counters::snapshot(), std::time::Instant::now()));
+
     let result;
     #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
     {
@@ -1080,6 +1085,18 @@ fn compile_and_run(
         if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("jit-stats: JIT feature not built in (rebuild with --features jit)");
         }
+    }
+
+    if let Some((before, started)) = fuse_before {
+        let after = cfml_vm::fuse_counters::snapshot();
+        let d: Vec<u64> = after.iter().zip(before.iter()).map(|(a, b)| a - b).collect();
+        eprintln!(
+            "[fuse-counters] {} ms={} frames={} fused={} classic={} env_keys={} caller_keys={} key_bytes={} caller_scanned={} tier_frames(0/B/A)={}/{}/{} tier_keys(0/B/A)={}/{}/{} struct_keys={}",
+            vm.base_template_path.as_deref().unwrap_or("?"),
+            started.elapsed().as_millis(),
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6],
+            d[7], d[8], d[9], d[10], d[11], d[12], d[13]
+        );
     }
 
     // Flush any buffered <cfhtmlhead>/<cfhtmlbody> content into the output

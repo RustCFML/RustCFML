@@ -235,6 +235,26 @@ pub struct BytecodeFunction {
     /// parent-scope writeback. Derived from `name` at compile finalize
     /// ([`Self::finalize`]).
     pub is_template_frame: bool,
+    /// Chained-parent eligibility (perf plan 3.2 stage 2), derived from a
+    /// one-pass opcode scan at compile finalize ([`Self::finalize`]):
+    ///
+    /// - `2` (tier A, strict): the body provably never observes the parent
+    ///   scope except through bare-name reads/writes — no scope-as-value
+    ///   loads, no dynamic names, no closures defined, no includes. The
+    ///   frame can skip the eager parent-key copy entirely and fall back
+    ///   through a (env, caller, filter) chain on lookup miss.
+    /// - `1` (tier B): additionally uses shapes that resolve through a
+    ///   handful of chokepoints (`is_variable_defined`, `scope_aware_load`/
+    ///   `_store`, the property-op locals probes, `apply_numeric_delta`) —
+    ///   chainable once those chokepoints take a chain fallback parameter.
+    /// - `0`: ineligible — the body materializes or mutates the scope map
+    ///   wholesale (bare `variables`/`static`/`thread`/`attributes` as a
+    ///   value, `DefineFunction` closure capture, includes, dynamic
+    ///   set/unset, `ArrayAppendLocal`, explicit `variables.x`).
+    ///
+    /// Template frames are always `0`: their locals ARE the page/component
+    /// variables scope (`captured_locals`), so they must keep eager seeding.
+    pub chain_tier: u8,
 }
 
 impl BytecodeFunction {
@@ -253,7 +273,58 @@ impl BytecodeFunction {
         self.is_template_frame = self.name == "__main__"
             || self.name == "__cfc_body__"
             || self.name == "__cfc_static_init__";
+        self.chain_tier = if self.is_template_frame {
+            0
+        } else {
+            Self::scan_chain_tier(&self.instructions)
+        };
         self.shrink_to_fit();
+    }
+
+    /// One-pass opcode scan classifying chained-parent eligibility (see
+    /// [`Self::chain_tier`]). Starts at tier A (2) and only ever downgrades.
+    fn scan_chain_tier(ops: &[BytecodeOp]) -> u8 {
+        let mut tier = 2u8;
+        for op in ops {
+            match op {
+                // Hard disqualifiers: the body materializes/mutates the scope
+                // map wholesale, or captures it into a closure env.
+                BytecodeOp::Include(_)
+                | BytecodeOp::IncludeDynamic
+                | BytecodeOp::DefineFunction(_)
+                | BytecodeOp::SetDynamicVar
+                | BytecodeOp::UnsetPath(_)
+                | BytecodeOp::DeleteScopeKey(_)
+                | BytecodeOp::ArrayAppendLocal(_)
+                | BytecodeOp::LoadVariablesKey(_) => return 0,
+                BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n) => {
+                    if matches!(
+                        n.lower(),
+                        "variables" | "static" | "thread" | "attributes" | "caller"
+                    ) {
+                        return 0;
+                    }
+                }
+                // Tier-B shapes: resolvable through chain-aware chokepoints.
+                BytecodeOp::IsDefined(_)
+                | BytecodeOp::LoadLocalProperty(..)
+                | BytecodeOp::TryLoadLocalProperty(..)
+                | BytecodeOp::StoreLocalProperty(..)
+                | BytecodeOp::LoadLocalKey(_)
+                | BytecodeOp::TryLoadLocalKey(_)
+                | BytecodeOp::Increment(_)
+                | BytecodeOp::Decrement(_)
+                | BytecodeOp::AddLocalConst(..)
+                | BytecodeOp::MulLocalConst(..) => tier = tier.min(1),
+                BytecodeOp::CallMethod(_, _, wb) | BytecodeOp::CallMethodNamed(_, _, _, wb) => {
+                    if wb.is_some() {
+                        tier = tier.min(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        tier
     }
 
     /// Release the spare capacity every `Vec` here accumulated while being built.
@@ -675,6 +746,7 @@ impl CfmlCompiler {
                     is_generated_accessor: false,
                     output_suppressed: false,
                     is_template_frame: false,
+            chain_tier: 0,
                 })],
             },
             loop_stack: Vec::new(),
@@ -3244,6 +3316,7 @@ impl CfmlCompiler {
             is_generated_accessor: false,
             output_suppressed: false,
             is_template_frame: false,
+            chain_tier: 0,
         };
 
         let global_id = bc_func.global_id as usize;
@@ -3499,6 +3572,7 @@ impl CfmlCompiler {
                     is_generated_accessor: true,
                     output_suppressed: false,
                     is_template_frame: false,
+            chain_tier: 0,
                 };
                 self.push_function(getter_func);
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3588,6 +3662,7 @@ impl CfmlCompiler {
                     is_generated_accessor: true,
                     output_suppressed: false,
                     is_template_frame: false,
+            chain_tier: 0,
                 };
                 self.push_function(setter_func);
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3762,6 +3837,7 @@ impl CfmlCompiler {
                 is_generated_accessor: false,
                 output_suppressed: false,
                 is_template_frame: false,
+            chain_tier: 0,
             };
             self.push_function(static_func);
         }
@@ -4762,6 +4838,7 @@ impl CfmlCompiler {
                     is_generated_accessor: false,
                     output_suppressed: false,
                     is_template_frame: false,
+            chain_tier: 0,
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -4836,6 +4913,7 @@ impl CfmlCompiler {
                     is_generated_accessor: false,
                     output_suppressed: false,
                     is_template_frame: false,
+            chain_tier: 0,
                 };
 
                 let global_id = bc_func.global_id as usize;

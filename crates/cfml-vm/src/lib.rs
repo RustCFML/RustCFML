@@ -44,6 +44,63 @@ pub mod jit;
 #[cfg(feature = "s3")]
 mod s3_vfs;
 pub mod session_store;
+/// Measurement-only counters for the call-parent seeding paths (perf plan 3.2
+/// stage 2 sizing). Enabled with `RCFML_FUSED_COUNTERS=1`; the CLI serve loop
+/// prints a per-request delta. Zero overhead when disabled beyond one cached
+/// bool check per frame. Values are Arc-backed so clones are refcount bumps —
+/// the real per-seeded-key cost is 3 owned key Strings (locals insert + two
+/// HashSet inserts) plus hashing, which is why keys/key-bytes are the metric.
+pub mod fuse_counters {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0); // execute_function_body entries
+    pub static FUSED_MERGES: AtomicU64 = AtomicU64::new(0); // frames with a fused plan
+    pub static CLASSIC_SEEDS: AtomicU64 = AtomicU64::new(0); // frames on the classic parent copy-in
+    pub static ENV_KEYS: AtomicU64 = AtomicU64::new(0); // keys seeded from captured env (fused pass 1)
+    pub static CALLER_KEYS: AtomicU64 = AtomicU64::new(0); // keys seeded from caller locals (fused pass 2 + classic)
+    pub static KEY_BYTES: AtomicU64 = AtomicU64::new(0); // sum of seeded key lengths (owned-String volume proxy)
+    pub static CALLER_SCANNED: AtomicU64 = AtomicU64::new(0); // caller entries walked (incl. filtered-out)
+    pub static STRUCT_KEYS: AtomicU64 = AtomicU64::new(0); // seeded keys that are structural (this/super/__variables/variables)
+    // Per-chain-tier breakdown of fused frames and their seeded keys (see
+    // BytecodeFunction::chain_tier): index 0/1/2 = ineligible / tier B / tier A.
+    pub static TIER_FRAMES: [AtomicU64; 3] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    pub static TIER_KEYS: [AtomicU64; 3] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("RCFML_FUSED_COUNTERS").is_ok_and(|v| v == "1")
+        })
+    }
+
+    pub fn snapshot() -> [u64; 14] {
+        [
+            FRAMES.load(Relaxed),
+            FUSED_MERGES.load(Relaxed),
+            CLASSIC_SEEDS.load(Relaxed),
+            ENV_KEYS.load(Relaxed),
+            CALLER_KEYS.load(Relaxed),
+            KEY_BYTES.load(Relaxed),
+            CALLER_SCANNED.load(Relaxed),
+            TIER_FRAMES[0].load(Relaxed),
+            TIER_FRAMES[1].load(Relaxed),
+            TIER_FRAMES[2].load(Relaxed),
+            TIER_KEYS[0].load(Relaxed),
+            TIER_KEYS[1].load(Relaxed),
+            TIER_KEYS[2].load(Relaxed),
+            STRUCT_KEYS.load(Relaxed),
+        ]
+    }
+
+    /// Is this seeded key one of the structural scope keys (always carried
+    /// regardless of filter; Arc-bump values)?
+    pub fn is_structural(k: &str) -> bool {
+        matches!(k, "this" | "super" | "__variables" | "variables")
+    }
+}
 pub mod socketio_compat;
 pub mod web;
 pub mod websocket;
@@ -1620,7 +1677,7 @@ pub struct CfmlVirtualMachine {
     /// (GH #259: `controller` dropped when a nested Preside view called the
     /// mixed-in `renderViewlet()`). Maintained in lockstep with `call_stack` via
     /// `execute_function_with_args`'s truncate-to-entry-depth epilogue.
-    frame_ctx: Vec<(std::sync::Arc<std::collections::HashSet<String>>, bool)>,
+    frame_ctx: Vec<(std::sync::Arc<InheritedKeys>, bool)>,
     /// Call-dispatch Lever D1 (scope pooling) — free-list of emptied per-call
     /// `locals` maps. `execute_function_body` pops one at entry (pre-sized) and
     /// pushes it back (cleared) at a non-escaping success exit, so warm calls
@@ -2496,7 +2553,115 @@ struct FusedParentPlan {
     env: Option<Arc<std::sync::RwLock<ValueMap>>>,
     /// `None` = carry everything (closure expression, or the caller is a
     /// template/page frame whose locals ARE the page variables scope).
-    filter: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    filter: Option<std::sync::Arc<InheritedKeys>>,
+}
+
+/// The set of keys a frame inherited from its parent scope, split by kind
+/// (perf plan 3.2 stage 2). Counters on warm Preside showed 92–94% of all
+/// seeded parent keys are the STRUCTURAL scope keys a CFC method dispatch
+/// carries (`this`/`__variables`/`super`) — so materializing them as owned
+/// `String`s in two per-call `HashSet`s (plus a fresh `Arc` for `frame_ctx`)
+/// was the bulk of the per-call seeding cost. This representation stores the
+/// structural keys as a bitmask and allocates the `HashSet` only when a
+/// genuine DATA key is inherited (rare: ~6–8% of keys, mostly template-frame
+/// callers). Structural-only shapes are shared via [`InheritedKeys::shared`],
+/// so the common method-call frame allocates NOTHING here.
+///
+/// Membership semantics are identical to the old `HashSet<String>`:
+/// structural names match exactly (they are engine-generated lowercase; the
+/// old sets stored them verbatim), data keys match exactly, and the CI
+/// `retain`-style reclaim used by `DeclareLocal` (GH #243) is provided by
+/// [`Self::remove_ci`].
+#[derive(Debug, Default, Clone)]
+struct InheritedKeys {
+    /// Bitmask over STRUCTURAL_NAMES (this/__variables/super/variables).
+    structural: u8,
+    /// Non-structural inherited keys (page vars, helpers, params where the
+    /// caller tracks them here). `None` until the first insert — the common
+    /// structural-only frame never allocates.
+    other: Option<std::collections::HashSet<String>>,
+}
+
+impl InheritedKeys {
+    const STRUCTURAL_NAMES: [&'static str; 4] = ["this", "__variables", "super", "variables"];
+
+    #[inline]
+    fn structural_bit(k: &str) -> Option<u8> {
+        match k {
+            "this" => Some(1),
+            "__variables" => Some(2),
+            "super" => Some(4),
+            "variables" => Some(8),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, k: &str) {
+        if let Some(bit) = Self::structural_bit(k) {
+            self.structural |= bit;
+        } else {
+            self.other
+                .get_or_insert_with(std::collections::HashSet::new)
+                .insert(k.to_string());
+        }
+    }
+
+    #[inline]
+    fn contains(&self, k: &str) -> bool {
+        if let Some(bit) = Self::structural_bit(k) {
+            self.structural & bit != 0
+        } else {
+            self.other.as_ref().is_some_and(|s| s.contains(k))
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, k: &str) {
+        if let Some(bit) = Self::structural_bit(k) {
+            self.structural &= !bit;
+        } else if let Some(s) = self.other.as_mut() {
+            s.remove(k);
+        }
+    }
+
+    /// Case-insensitive reclaim: remove every member matching `name` under
+    /// CFML case-insensitivity (the `DeclareLocal` GH #243 semantics, which
+    /// used `retain(|k| !k.eq_ignore_ascii_case(name))`).
+    fn remove_ci(&mut self, name: &str) {
+        for s in Self::STRUCTURAL_NAMES {
+            if s.eq_ignore_ascii_case(name) {
+                self.structural &= !Self::structural_bit(s).unwrap();
+            }
+        }
+        if let Some(set) = self.other.as_mut() {
+            set.retain(|k| !k.eq_ignore_ascii_case(name));
+        }
+    }
+
+    #[inline]
+    fn has_data_keys(&self) -> bool {
+        self.other.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// Arc this set for `frame_ctx`. Structural-only shapes (the overwhelmingly
+    /// common case) return one of 16 process-shared singletons — zero allocation.
+    fn into_shared(self) -> Arc<InheritedKeys> {
+        use std::sync::OnceLock;
+        static SHARED: OnceLock<[Arc<InheritedKeys>; 16]> = OnceLock::new();
+        if self.has_data_keys() {
+            return Arc::new(self);
+        }
+        let shared = SHARED.get_or_init(|| {
+            std::array::from_fn(|i| {
+                Arc::new(InheritedKeys {
+                    structural: i as u8,
+                    other: None,
+                })
+            })
+        });
+        shared[(self.structural & 15) as usize].clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2513,15 +2678,6 @@ struct CallFrame {
     line: usize,
     /// Line in the caller where this function was invoked
     caller_line: usize,
-    /// Keys that were inherited INTO this frame from its parent scope (page/
-    /// component `variables`, structural scope keys, helper functions) — i.e.
-    /// the keys present in the `parent_scope` this frame was seeded from, before
-    /// its own params and `var`-locals were added. Used by
-    /// `build_call_parent_scope` to decide what may propagate to a callee: a
-    /// bare call from THIS frame carries these forward (they are lexical/page
-    /// scope) but NOT this frame's own local data (which would be dynamic
-    /// scoping — not CFML). `Arc` so the push stays cheap.
-    inherited_from_parent: std::sync::Arc<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -5673,6 +5829,9 @@ impl CfmlVirtualMachine {
         // locals and the frame seed below merges (env ∪ filtered caller)
         // straight into `locals` (perf plan 3.2 stage 1).
         let fused_plan = self.pending_fused_parent.take();
+        if fuse_counters::enabled() {
+            fuse_counters::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // The captured env is ALSO part of the return-writeback baseline. The
         // old shape diffed the callee's final locals against `effective_parent`
         // (env ∪ filtered caller), so an env-seeded key with an unchanged value
@@ -5867,13 +6026,16 @@ impl CfmlVirtualMachine {
         // isn't an inherited key (and isn't a function parameter — those
         // belong to `arguments`, not `local`) was established in this frame
         // and is part of `local`.
-        let mut inherited_or_param_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(seed_cap);
+        // Perf plan 3.2 stage 2: both sets are `InheritedKeys` — the common
+        // method-frame case (structural keys only) sets bits and allocates
+        // nothing; the inner HashSet materializes only for genuine data keys.
+        let _ = seed_cap;
+        let _ = parent_len;
+        let mut inherited_or_param_keys = InheritedKeys::default();
         // Exactly the keys seeded from the parent scope (no params added) —
-        // stored in the call frame so a bare call from this frame knows which
+        // pushed to frame_ctx so a bare call from this frame knows which
         // of its keys are lexical/page scope (propagate) vs its own locals.
-        let mut inherited_from_parent: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(parent_len);
+        let mut inherited_from_parent = InheritedKeys::default();
         // For a function-scoped `<cfinclude>`, the caller passes down exactly its
         // genuine `local`-scope keys here. Those keys are seeded into this frame's
         // locals like any other parent var, but must remain part of the frame's
@@ -5898,6 +6060,10 @@ impl CfmlVirtualMachine {
             // `build_call_parent_scope` followed by the copy-in loop below —
             // each carried entry is cloned exactly ONCE here instead of once
             // into an intermediate map and again into `locals`.
+            let keys_before = fuse_counters::enabled().then(|| {
+                use std::sync::atomic::Ordering::Relaxed;
+                fuse_counters::ENV_KEYS.load(Relaxed) + fuse_counters::CALLER_KEYS.load(Relaxed)
+            });
             self.fused_parent_merge(
                 plan,
                 parent_scope,
@@ -5906,7 +6072,20 @@ impl CfmlVirtualMachine {
                 &mut inherited_from_parent,
                 share_local_keys.as_ref(),
             );
+            if let Some(before) = keys_before {
+                use std::sync::atomic::Ordering::Relaxed;
+                let after = fuse_counters::ENV_KEYS.load(Relaxed)
+                    + fuse_counters::CALLER_KEYS.load(Relaxed);
+                let tier = (func.chain_tier as usize).min(2);
+                fuse_counters::TIER_FRAMES[tier].fetch_add(1, Relaxed);
+                fuse_counters::TIER_KEYS[tier].fetch_add(after - before, Relaxed);
+            }
         } else if let Some(parent) = parent_scope {
+            if fuse_counters::enabled() {
+                use std::sync::atomic::Ordering::Relaxed;
+                fuse_counters::CLASSIC_SEEDS.fetch_add(1, Relaxed);
+                fuse_counters::CALLER_SCANNED.fetch_add(parent.len() as u64, Relaxed);
+            }
             for (k, v) in parent {
                 // Function values are normally skipped here: a named function /
                 // sibling closure is already reachable via user_functions or the
@@ -5941,6 +6120,14 @@ impl CfmlVirtualMachine {
                     _ => true,
                 };
                 if carry {
+                    if fuse_counters::enabled() {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        fuse_counters::CALLER_KEYS.fetch_add(1, Relaxed);
+                        fuse_counters::KEY_BYTES.fetch_add(k.len() as u64, Relaxed);
+                        if fuse_counters::is_structural(k) {
+                            fuse_counters::STRUCT_KEYS.fetch_add(1, Relaxed);
+                        }
+                    }
                     locals.insert(k.clone(), v.clone());
                     // A shared `local` key from a function-scoped cfinclude stays
                     // in this frame's `local` view — do NOT mark it inherited.
@@ -5948,13 +6135,13 @@ impl CfmlVirtualMachine {
                         .as_ref()
                         .is_none_or(|s| !s.contains(k))
                     {
-                        inherited_or_param_keys.insert(k.clone());
+                        inherited_or_param_keys.insert(k);
                     }
-                    inherited_from_parent.insert(k.clone());
+                    inherited_from_parent.insert(k);
                 }
             }
         }
-        let inherited_from_parent = std::sync::Arc::new(inherited_from_parent);
+        let inherited_from_parent = inherited_from_parent.into_shared();
 
         // Record this frame's call context for `build_call_parent_scope`. Pushed
         // for EVERY frame (templates included, unlike `call_stack`) so a bare
@@ -6033,7 +6220,7 @@ impl CfmlVirtualMachine {
         // extras beyond declared params with no matching name) DO get numeric
         // keys — that's the only handle they have.
         for (i, param_name) in func.params.iter().enumerate() {
-            inherited_or_param_keys.insert(param_name.clone());
+            inherited_or_param_keys.insert(param_name);
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
             // A Null arg value counts as "not supplied": CFML has no way to pass
             // an explicit null, and the named-argument rebinder pads omitted
@@ -6197,7 +6384,6 @@ impl CfmlVirtualMachine {
                     .unwrap_or_default(),
                 line: 0,
                 caller_line: self.current_line,
-                inherited_from_parent: inherited_from_parent.clone(),
             });
         }
 
@@ -6703,9 +6889,8 @@ impl CfmlVirtualMachine {
                     // that still-inherited key and `build_local_scope_view`
                     // filtered the write straight back out — the local assignment
                     // was silently lost. Drop every CI-matching entry.
-                    inherited_or_param_keys.remove(name.as_str());
-                    // eq_ignore_ascii_case doesn't need a pre-lowered operand.
-                    inherited_or_param_keys.retain(|k| !k.eq_ignore_ascii_case(name));
+                    // remove_ci covers the exact match and every CI casing (GH #243).
+                    inherited_or_param_keys.remove_ci(name.as_str());
                 }
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
@@ -20720,8 +20905,8 @@ impl CfmlVirtualMachine {
         plan: FusedParentPlan,
         caller: Option<&ValueMap>,
         locals: &mut ValueMap,
-        inherited_or_param_keys: &mut std::collections::HashSet<String>,
-        inherited_from_parent: &mut std::collections::HashSet<String>,
+        inherited_or_param_keys: &mut InheritedKeys,
+        inherited_from_parent: &mut InheritedKeys,
         share_local_keys: Option<&std::collections::HashSet<String>>,
     ) {
         let filter_carry = |k: &str, v: &CfmlValue| -> bool {
@@ -20743,6 +20928,11 @@ impl CfmlVirtualMachine {
             }
         };
         let env_guard = plan.env.as_ref().and_then(|e| e.read().ok());
+        let counting = fuse_counters::enabled();
+        if counting {
+            use std::sync::atomic::Ordering::Relaxed;
+            fuse_counters::FUSED_MERGES.fetch_add(1, Relaxed);
+        }
         // Pass 1: env entries — skipping any key a filter-carried caller
         // FUNCTION will override.
         if let Some(env) = env_guard.as_deref() {
@@ -20753,16 +20943,28 @@ impl CfmlVirtualMachine {
                     }
                 }
                 if seed_carry(self, k, v) {
+                    if counting {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        fuse_counters::ENV_KEYS.fetch_add(1, Relaxed);
+                        fuse_counters::KEY_BYTES.fetch_add(k.len() as u64, Relaxed);
+                        if fuse_counters::is_structural(k) {
+                            fuse_counters::STRUCT_KEYS.fetch_add(1, Relaxed);
+                        }
+                    }
                     locals.insert(k.clone(), v.clone());
                     if share_local_keys.is_none_or(|s| !s.contains(k)) {
-                        inherited_or_param_keys.insert(k.clone());
+                        inherited_or_param_keys.insert(k);
                     }
-                    inherited_from_parent.insert(k.clone());
+                    inherited_from_parent.insert(k);
                 }
             }
         }
         // Pass 2: caller locals.
         if let Some(caller) = caller {
+            if counting {
+                use std::sync::atomic::Ordering::Relaxed;
+                fuse_counters::CALLER_SCANNED.fetch_add(caller.len() as u64, Relaxed);
+            }
             for (k, v) in caller {
                 if !filter_carry(k, v) {
                     continue;
@@ -20776,11 +20978,19 @@ impl CfmlVirtualMachine {
                     continue;
                 }
                 if seed_carry(self, k, v) {
+                    if counting {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        fuse_counters::CALLER_KEYS.fetch_add(1, Relaxed);
+                        fuse_counters::KEY_BYTES.fetch_add(k.len() as u64, Relaxed);
+                        if fuse_counters::is_structural(k) {
+                            fuse_counters::STRUCT_KEYS.fetch_add(1, Relaxed);
+                        }
+                    }
                     locals.insert(k.clone(), v.clone());
                     if share_local_keys.is_none_or(|s| !s.contains(k)) {
-                        inherited_or_param_keys.insert(k.clone());
+                        inherited_or_param_keys.insert(k);
                     }
-                    inherited_from_parent.insert(k.clone());
+                    inherited_from_parent.insert(k);
                 }
             }
         }
@@ -21467,7 +21677,7 @@ impl CfmlVirtualMachine {
     fn apply_pending_result_writeback(
         &mut self,
         locals: &mut ValueMap,
-        inherited_or_param_keys: &mut std::collections::HashSet<String>,
+        inherited_or_param_keys: &mut InheritedKeys,
         declared_locals: &mut std::collections::HashSet<String>,
         local_mode_modern: bool,
     ) {
@@ -22549,7 +22759,7 @@ impl CfmlVirtualMachine {
     /// excluded.
     fn build_local_scope_view(
         locals: &ValueMap,
-        inherited_or_param_keys: &std::collections::HashSet<String>,
+        inherited_or_param_keys: &InheritedKeys,
     ) -> ValueMap {
         let mut out = ValueMap::default();
         for (k, v) in locals {
