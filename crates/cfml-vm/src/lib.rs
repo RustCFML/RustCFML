@@ -2343,7 +2343,7 @@ pub struct CfmlVirtualMachine {
     /// writing it, an external process, a `java.io` shim), and the classic
     /// `while (!fileExists(f)) sleep(50)` poll must never spin forever. Positives
     /// can only go stale via a *delete*, and every filesystem-mutating BIF clears
-    /// this cache (see `builtin_may_change_existence`). Dropped at request end.
+    /// this cache (see `builtin_may_remove_path`). Dropped at request end.
     pub request_exists_cache: parking_lot::RwLock<HashMap<String, u8>>,
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
@@ -14247,7 +14247,7 @@ impl CfmlVirtualMachine {
                         // recursive directoryDelete/fileMove changes an unbounded
                         // set of paths, and mutations are rare next to the probes
                         // the memo exists to serve.
-                        let clears_existence = Self::builtin_may_change_existence(&name_lower);
+                        let clears_existence = Self::builtin_may_remove_path(&name_lower);
                         let write_targets = Self::file_write_targets(&name_lower, &args);
                         // Runs in EVERY serve mode, production included. v0.521.0
                         // gated this on `!production_mode` and the GH #284
@@ -19563,7 +19563,7 @@ impl CfmlVirtualMachine {
                     // An external program can delete or move anything, so the
                     // request existence memo cannot be trusted across it.
                     // VM-intercepted, so the BIF dispatcher's
-                    // `builtin_may_change_existence` check never sees it.
+                    // `builtin_may_remove_path` check never sees it.
                     //
                     // Dropped on the way IN rather than out, which is equivalent
                     // and survives the handler's many early returns: this thread
@@ -30962,17 +30962,9 @@ impl CfmlVirtualMachine {
         found
     }
 
-    /// Whether dispatching this builtin could change what exists on disk, and so
-    /// must drop the request-scoped existence memo.
-    ///
-    /// Deliberately over-broad: every `file*`/`directory*` BIF that is not a known
-    /// read-only probe counts, plus the other known file-producing BIFs. A missed
-    /// invalidator would let a stale `fileExists()` survive a delete within the
-    /// same request, so anything uncertain is treated as mutating. (Creations need
-    /// no invalidation at all — negatives are never cached.)
     /// Does this java-shim method mutate the filesystem?
     ///
-    /// The BIF path has `builtin_may_change_existence` for exactly this, but the
+    /// The BIF path has `builtin_may_remove_path` for exactly this, but the
     /// java shims dispatch through `call_member_function`, never reach it, and so
     /// left `request_exists_cache` holding a pre-mutation answer: after
     /// `File.delete()` or `Files.move()`, `fileExists()` still returned true for
@@ -31032,42 +31024,64 @@ impl CfmlVirtualMachine {
         out
     }
 
-    fn builtin_may_change_existence(name_lower: &str) -> bool {
-        // Read-only file/directory BIFs — everything else under those prefixes is
-        // assumed to mutate.
-        const READ_ONLY: &[&str] = &[
+    /// Whether dispatching this builtin could REMOVE a path, and so must drop the
+    /// existence memos.
+    ///
+    /// The memos hold POSITIVES ONLY, so the question is not "does this touch the
+    /// filesystem" but the much narrower "can this make an existing path stop
+    /// existing". A creation or an overwrite leaves the path existing, so a cached
+    /// positive stays correct; and a path that did NOT exist was never cached in the
+    /// first place. The old predicate asked the broad question — every `file*`/
+    /// `directory*` BIF that was not on a read-only allowlist — which meant the hot
+    /// CREATION BIFs blanket-cleared the whole map. On a warm Preside page that was
+    /// ~835 `fileClose` calls plus every `fileWriteLine` of request logging, so the
+    /// memo was being destroyed continuously and almost never got to serve anything.
+    ///
+    /// Anything genuinely ambiguous stays on the removing side: a missed invalidator
+    /// would let a stale `fileExists()` outlive a delete, which is a correctness bug,
+    /// whereas an extra invalidation only costs performance. The cold ambiguous ops
+    /// (upload/copy/setAttribute) are therefore left in even where a removal is
+    /// unlikely — they are rare enough to cost nothing.
+    fn builtin_may_remove_path(name_lower: &str) -> bool {
+        // CREATION- or read-only file/directory BIFs: none of these can remove a
+        // path, so none of them can invalidate a cached positive.
+        const NON_REMOVING: &[&str] = &[
+            // Pure reads.
             "fileexists",
             "fileread",
             "filereadbinary",
             "filereadline",
-            "fileisEOF",
             "fileiseof",
             "filegetmimetype",
-            "fileopen",
+            "filewassaved",
             "directoryexists",
             "directorylist",
+            // Handle lifecycle — opening may CREATE (fine: negatives are never
+            // cached) and closing does nothing at all. `fileClose` was the single
+            // biggest source of spurious invalidation on a real workload.
+            "fileopen",
+            "fileclose",
+            // Creations / overwrites. After each of these the target EXISTS, so a
+            // cached positive is still correct and a cached negative never existed.
+            "filewrite",
+            "filewriteline",
+            "fileappend",
+            "directorycreate",
         ];
         if name_lower.starts_with("file") || name_lower.starts_with("directory") {
-            return !READ_ONLY.contains(&name_lower);
+            return !NON_REMOVING.contains(&name_lower);
         }
         matches!(
             name_lower,
-            "imagewrite"
-                | "imagewritebase64"
-                | "spreadsheetwrite"
-                | "spreadsheetwritetocsv"
-                | "cfzip"
-                | "writelog"
-                // Script-form tag builtins — `cffile( action="delete", … )`,
-                // `cfdirectory( action="delete", … )`. These reach the
-                // dispatcher under the TAG's name, so the `file`/`directory`
-                // prefix test above never matched them and a path they deleted
-                // stayed memoised as present for the rest of the request. (The
-                // tag forms are safe already: `<cffile action="delete">` lowers
-                // to `fileDelete()`, which the prefix test does cover.)
-                | "cffile"
-                | "cfdirectory"
-                | "__cfdirectory"
+            // Script-form tag builtins — `cffile( action="delete", … )`,
+            // `cfdirectory( action="delete", … )`, and `cfzip`. These reach the
+            // dispatcher under the TAG's name, so the `file`/`directory` prefix
+            // test above never matched them and a path they deleted stayed
+            // memoised as present. The `action` attribute is only known at
+            // runtime, so they always invalidate. (The tag forms are safe
+            // already: `<cffile action="delete">` lowers to `fileDelete()`,
+            // which the prefix test does cover.)
+            "cffile" | "cfdirectory" | "__cfdirectory" | "cfzip"
         )
     }
 

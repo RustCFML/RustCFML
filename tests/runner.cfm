@@ -246,6 +246,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_json_query_roundtrip.cfm">
 <cf_runtest file="stdlib/test_arraysort_callback_reverse.cfm">
 <cf_runtest file="stdlib/test_file_io.cfm">
+<cf_runtest file="stdlib/test_exists_memo_invalidation.cfm">
 <!--- Request-scoped fileExists()/directoryExists() memo: positives only, and --->
 <!--- every mutating file BIF drops it (GH #299). --->
 <cf_runtest file="stdlib/test_existence_cache.cfm">
