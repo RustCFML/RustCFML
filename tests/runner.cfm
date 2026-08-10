@@ -926,6 +926,14 @@ include "harness.cfm";
 <cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_cfloop_query_currentrow.cfm">
 <cf_runtest file="tags/test_tags_cfloop_query_window_group.cfm">
+<!--- - cfloop_query_bare_column: inside <cfloop query>, a BARE column --->
+<!--- reference (expression read or interpolated output) must resolve to the --->
+<!--- current row like the scoped q.col form -- the same row-into-scope merge --->
+<!--- <cfoutput query> already does (§13). RustCFML throws "Variable 'grp' is --->
+<!--- undefined" for both bare forms; the scoped spelling is the in-suite --->
+<!--- control. Runtime-level (catchable), runner-safe. Reduced from the titan --->
+<!--- (Moopa) codebase port. --->
+<cf_runtest file="tags/test_cfloop_query_bare_column.cfm">
 <cf_runtest file="tags/test_tags_cfexit_loop.cfm">
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
