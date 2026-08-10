@@ -9898,19 +9898,29 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     let opts = mysql::Opts::from_url(&sanitized)
         .map_err(|e| CfmlError::database(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
     // Connection-per-request model (matching Lucee/ACF, which pool by request):
-    //   * `reset_connection = true` (the crate default) — a connection is reset
-    //     (COM_RESET_CONNECTION) when it is actually returned to the pool, wiping
-    //     session/user state so it can NOT leak to the next request that reuses it.
+    //   * `reset_connection = true` stays the POOL default (the fail-safe): any
+    //     connection dropped outside the request-boundary path — error unwind,
+    //     transaction conns, the query-timeout watchdog conn — is reset
+    //     (COM_RESET_CONNECTION) on return, wiping session/user state so it can
+    //     NOT leak to the next request that reuses it.
     //   * A request HOLDS one connection per datasource for its whole duration (see
     //     REQUEST_MYSQL_CONNS / checkout_request_mysql_conn); it is only returned to
-    //     the pool — and thus only reset — at the request boundary
-    //     (`release_request_db_conns`). So within a request, session/user state
-    //     persists across statements (Masa's `core/setup/db/mysql.sql` sets
-    //     `@OLD_SQL_MODE`/`SQL_MODE` in separate cfqueries and restores them later;
-    //     `SET SQL_MODE=@OLD_SQL_MODE` needs @OLD_SQL_MODE to still be set), but a
-    //     transient `SET foreign_key_checks=0` / `sql_mode` does NOT outlive the
-    //     request (GitHub #275 — the reset-disabled pool leaked pool-wide and across
-    //     requests). `pool_min = 1` avoids the wasteful eager 10-connection burst.
+    //     the pool at the request boundary (`release_request_db_conns`). So within a
+    //     request, session/user state persists across statements (Masa's
+    //     `core/setup/db/mysql.sql` sets `@OLD_SQL_MODE`/`SQL_MODE` in separate
+    //     cfqueries and restores them later; `SET SQL_MODE=@OLD_SQL_MODE` needs
+    //     @OLD_SQL_MODE to still be set), but a transient `SET foreign_key_checks=0`
+    //     / `sql_mode` does NOT outlive the request (GitHub #275 — the
+    //     reset-disabled pool leaked pool-wide and across requests).
+    //   * DIRTY-TRACKED reset at the boundary: COM_RESET_CONNECTION also
+    //     deallocates all server-side prepared statements, so resetting every
+    //     request forced every warm request to re-prepare every statement (one
+    //     COM_STMT_PREPARE round-trip per query — Lucee's JDBC pool never resets,
+    //     so it never pays this). `release_request_db_conns` therefore skips the
+    //     reset (per-conn one-shot `PooledConn::reset_connection(false)`) unless
+    //     the request ran session-state-risky SQL (`mysql_sql_is_session_risky`),
+    //     preserving the #275 guarantee: risky SQL still triggers a full reset.
+    //     `pool_min = 1` avoids the wasteful eager 10-connection burst.
     let constraints =
         mysql::PoolConstraints::new(1, 100).unwrap_or(mysql::PoolConstraints::DEFAULT);
     let pool_opts = mysql::PoolOpts::default()
@@ -9926,6 +9936,9 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         // MySQL wire writes were ~13% of warm-request CPU on a live Preside
         // profile. 256 comfortably covers a request's working set; JDBC pools
         // on Lucee ship a per-connection statement cache the same way.
+        // NOTE: this cache only survives across requests because
+        // `release_request_db_conns` skips COM_RESET_CONNECTION for clean
+        // connections (reset clears it, client- and server-side).
         .stmt_cache_size(256)
         // Socket-level bounds — see `db_net_secs` for why keepalive is the one
         // that matters and why read/write default to off. Without these, a
@@ -9956,12 +9969,140 @@ thread_local! {
     /// one connection per datasource so session/user state (SET sql_mode, user
     /// variables like @OLD_SQL_MODE, foreign_key_checks, autocommit) persists across
     /// the request's statements — the Lucee/ACF connection-per-request model. The
-    /// held connection is only returned to the pool — and thus only reset
-    /// (COM_RESET_CONNECTION, since the pool has reset_connection=true) — at the
-    /// request boundary via `release_request_db_conns`, so transient session state
-    /// does NOT leak into the next request (GitHub #275).
+    /// held connection is only returned to the pool at the request boundary via
+    /// `release_request_db_conns`. It is reset there (COM_RESET_CONNECTION) ONLY if
+    /// the request ran session-state-risky SQL (see `mysql_sql_is_session_risky` /
+    /// REQUEST_MYSQL_DIRTY): a reset wipes session state so it cannot leak into the
+    /// next request (GitHub #275), but it ALSO deallocates every server-side
+    /// prepared statement — a blanket per-request reset forced every warm request
+    /// to re-prepare every statement (one COM_STMT_PREPARE round-trip per query),
+    /// a structural per-query cost Lucee's never-reset JDBC pool does not pay.
     static REQUEST_MYSQL_CONNS: std::cell::RefCell<HashMap<String, mysql::PooledConn>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Datasource URLs whose request-held connection ran session-state-risky SQL
+    /// during the current request. Only those connections are reset when returned
+    /// to the pool; clean connections skip the reset so their prepared-statement
+    /// cache survives across requests. Cleared with REQUEST_MYSQL_CONNS at the
+    /// request boundary.
+    static REQUEST_MYSQL_DIRTY: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Conservative classifier: could `sql` mutate MySQL *session* state (user/session
+/// variables, sql_mode, session locks, temp tables, an explicitly opened
+/// transaction, ...)? Decides whether the request's held connection must be reset
+/// (COM_RESET_CONNECTION) when it returns to the pool at request end.
+///
+/// Errs on the side of "risky": only statements positively recognised as plain
+/// reads/DML are clean, so an unrecognised statement can never leak session state
+/// into the pool (the GitHub #275 failure mode). The cost of a false positive is
+/// one reset — i.e. exactly the pre-existing blanket behaviour. `CALL` is risky
+/// because a stored procedure body can SET anything. Multi-statement payloads
+/// can't hide a second risky statement: CLIENT_MULTI_STATEMENTS is not enabled,
+/// so the server rejects them outright.
+#[cfg(feature = "mysql_db")]
+fn mysql_sql_is_session_risky(sql: &str) -> bool {
+    // Any user/system-variable reference (`@x`, `@@sql_mode`) is session state,
+    // and GET_LOCK()/RELEASE_LOCK() take session-scoped locks from inside a
+    // SELECT. The substring scan is deliberately over-broad — an `@` inside an
+    // inline string literal merely costs one reset (bound params are `?` by the
+    // time SQL reaches the driver, so the common email case never hits this).
+    if sql.as_bytes().contains(&b'@') {
+        return true;
+    }
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("get_lock") || lower.contains("release_lock") {
+        return true;
+    }
+
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let kw = trimmed[..kw_len].to_ascii_uppercase();
+
+    // Plain reads and row DML: no session state. Everything else — SET, USE,
+    // LOCK/UNLOCK TABLES, BEGIN/START TRANSACTION, CREATE (incl. TEMPORARY
+    // TABLE), DDL, FLUSH, KILL, PREPARE, CALL, ... — is risky by default.
+    !matches!(
+        kw.as_str(),
+        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "WITH" | "VALUES"
+            | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"
+    )
+}
+
+/// Record that the request's held connection for `url` ran session-state-risky
+/// SQL, so it must be reset when returned to the pool at the request boundary.
+#[cfg(feature = "mysql_db")]
+fn mark_request_mysql_dirty(url: &str) {
+    REQUEST_MYSQL_DIRTY.with(|d| {
+        d.borrow_mut().insert(url.to_string());
+    });
+}
+
+#[cfg(all(test, feature = "mysql_db"))]
+mod mysql_session_risky_tests {
+    use super::mysql_sql_is_session_risky;
+
+    #[test]
+    fn plain_reads_and_dml_are_clean() {
+        for sql in [
+            "SELECT id, label FROM page WHERE id = ?",
+            "  select 1",
+            "/* hint */ SELECT * FROM t",
+            "-- comment\nSELECT 1",
+            "INSERT INTO t ( a, b ) VALUES ( ?, ? )",
+            "UPDATE t SET col = ? WHERE id = ?",
+            "delete from t where id = ?",
+            "REPLACE INTO t VALUES (?)",
+            "WITH cte AS (SELECT 1) SELECT * FROM cte",
+            "SHOW TABLES",
+            "EXPLAIN SELECT 1",
+            "DESCRIBE page",
+        ] {
+            assert!(!mysql_sql_is_session_risky(sql), "should be clean: {sql}");
+        }
+    }
+
+    #[test]
+    fn session_state_is_risky() {
+        for sql in [
+            "SET SQL_MODE = 'ANSI'",
+            "set foreign_key_checks=0",
+            "SET @OLD_SQL_MODE = @@SQL_MODE", // also caught by '@'
+            "SELECT @x := count(*) FROM t",   // user var inside a SELECT
+            "USE otherdb",
+            "LOCK TABLES t WRITE",
+            "UNLOCK TABLES",
+            "BEGIN",
+            "START TRANSACTION",
+            "CREATE TEMPORARY TABLE tmp (a INT)",
+            "CREATE TABLE t2 (a INT)",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "CALL some_proc(?)", // proc body can SET anything
+            "FLUSH PRIVILEGES",
+            "KILL QUERY 42",
+            "SELECT GET_LOCK('m', 5)",
+            "SELECT RELEASE_LOCK('m')",
+            "DO SLEEP(1)", // unrecognised leading keyword → risky by default
+            "# mysql comment\nSET @x = 1",
+        ] {
+            assert!(mysql_sql_is_session_risky(sql), "should be risky: {sql}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_empty_defaults_to_risky() {
+        assert!(mysql_sql_is_session_risky(""));
+        assert!(mysql_sql_is_session_risky("   "));
+        assert!(mysql_sql_is_session_risky("XA START 'x1'"));
+        assert!(mysql_sql_is_session_risky("PREPARE s FROM 'SELECT 1'"));
+    }
 }
 
 /// Take the request's held MySQL connection for `url`, or check a fresh one out of
@@ -9997,9 +10138,26 @@ fn return_request_mysql_conn(url: &str, conn: mysql::PooledConn) {
 /// wipes its session/user state. Cheap no-op when nothing is held.
 pub fn release_request_db_conns() {
     #[cfg(feature = "mysql_db")]
-    REQUEST_MYSQL_CONNS.with(|c| {
-        c.borrow_mut().clear();
-    });
+    {
+        let dirty: std::collections::HashSet<String> =
+            REQUEST_MYSQL_DIRTY.with(|d| std::mem::take(&mut *d.borrow_mut()));
+        REQUEST_MYSQL_CONNS.with(|c| {
+            for (url, mut conn) in c.borrow_mut().drain() {
+                if !dirty.contains(&url) {
+                    // Clean connection: opt out of COM_RESET_CONNECTION for THIS
+                    // return only, so its server-side prepared statements survive
+                    // for the next request. One-shot by construction: the crate's
+                    // cleanup_for_pool re-arms reset_upon_return from the pool
+                    // default (true) after every check-in, so a connection dropped
+                    // on any other path — error unwind, transaction conn, watchdog
+                    // conn — still gets the full reset.
+                    conn.reset_connection(false);
+                }
+                // Dirty (or unknown) connections drop with the pool default:
+                // COM_RESET_CONNECTION wipes session state (GitHub #275).
+            }
+        });
+    }
 }
 
 #[cfg(feature = "postgres_db")]
@@ -11909,6 +12067,12 @@ fn execute_mysql(
     // does not break the connection) and ensures it is eventually reset.
     let pool = get_mysql_pool(url)?;
     let mut conn = checkout_request_mysql_conn(url, &pool)?;
+    // Session-state-risky SQL (SET, USE, @vars, locks, DDL, ...) taints the held
+    // connection: it will be reset at the request boundary instead of returning
+    // to the pool with its prepared-statement cache intact.
+    if mysql_sql_is_session_risky(sql) {
+        mark_request_mysql_dirty(url);
+    }
     let result = execute_mysql_on_conn(&mut conn, url, sql, params_arg, return_type, timeout_secs);
     return_request_mysql_conn(url, conn);
     result

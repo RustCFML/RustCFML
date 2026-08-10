@@ -135,3 +135,67 @@ fn zero_row_result_keeps_column_list() {
     );
     run(&url, "DROP TABLE IF EXISTS _rcf_cols_probe").expect("drop temp table");
 }
+
+/// Dirty-tracking counterpart of `session_state_reset_at_request_boundary`: a
+/// request that ran ONLY clean SQL (reads/DML) skips COM_RESET_CONNECTION at the
+/// request boundary, so the connection's server-side prepared statements survive
+/// and the next request's identical statements are cache hits — zero
+/// COM_STMT_PREPARE round-trips. (A blanket per-request reset wiped the statement
+/// cache, forcing every warm request to re-prepare every statement.)
+///
+/// Observed via the connection's own `Com_stmt_prepare` session counter. The test
+/// uses a URL with an extra opt so it gets a PRIVATE pool (pool key = URL string):
+/// with a single serial user, checkout always returns the same connection, making
+/// the session counter deterministic even when other tests here run in parallel
+/// against the shared pool.
+#[test]
+fn clean_request_keeps_prepared_statements_across_boundary() {
+    let Ok(url) = std::env::var("RUSTCFML_MYSQL_TEST_URL") else {
+        eprintln!("skipping: RUSTCFML_MYSQL_TEST_URL not set");
+        return;
+    };
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}prefer_socket=false");
+
+    fn com_stmt_prepare(url: &str) -> i64 {
+        // SHOW is classified clean, so this probe never dirties the connection.
+        let result = run(url, "SHOW SESSION STATUS LIKE 'Com_stmt_prepare'")
+            .expect("SHOW SESSION STATUS should succeed");
+        let CfmlValue::Query(q) = &result else {
+            panic!("expected a Query, got: {:?}", result);
+        };
+        let debug = format!("{:?}", q);
+        // Row shape: Variable_name = Com_stmt_prepare, Value = <n>. Pull the
+        // last integer out of the debug rendering rather than depending on the
+        // query accessor surface.
+        debug
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok())
+            .expect("Com_stmt_prepare value should parse")
+    }
+
+    // Fresh boundary so this test can't inherit held-conn/dirty state.
+    cfml_stdlib::builtins::release_request_db_conns();
+
+    // "Request A": clean statements only.
+    run(&url, "SELECT 1 AS v").expect("request A select");
+    let before = com_stmt_prepare(&url);
+    assert!(before > 0, "request A should have prepared at least one statement");
+
+    // Clean request boundary: the held connection must NOT be reset.
+    cfml_stdlib::builtins::release_request_db_conns();
+
+    // "Request B": identical statements — all must hit the surviving cache.
+    run(&url, "SELECT 1 AS v").expect("request B select");
+    let after = com_stmt_prepare(&url);
+
+    assert_eq!(
+        before, after,
+        "a clean request boundary must preserve the prepared-statement cache \
+         (no new COM_STMT_PREPARE in request B); before={before} after={after}"
+    );
+
+    // Leave no held connection behind for other tests.
+    cfml_stdlib::builtins::release_request_db_conns();
+}
