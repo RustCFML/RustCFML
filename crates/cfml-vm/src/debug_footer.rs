@@ -86,6 +86,15 @@ pub struct DebugData {
     pub traces: Vec<TraceRow>,
     /// Per-section overflow counts when `maxRecords` clips a section.
     pub dropped_queries: usize,
+    /// Time spent in queries whose ROW DETAIL was clipped by `maxRecords`.
+    /// The clip drops the SQL/params bulk, never the accounting — the
+    /// Execution Time summary and the per-file query column stay correct no
+    /// matter how low the cap is.
+    pub dropped_query_us: i64,
+    /// The clipped queries' time attributed to the template that issued them
+    /// (keyed by `src`), so the Files table's per-file query/app split stays
+    /// correct too.
+    pub dropped_query_us_by_src: std::collections::HashMap<String, i64>,
 }
 
 /// Config snapshot the collector/renderer need (copied from `DebuggingCfg` so
@@ -199,7 +208,14 @@ impl VmObserver for DebugCollector {
     fn on_query(&self, q: &QueryEvent) {
         if let Ok(mut d) = self.inner.lock() {
             if d.queries.len() >= self.cfg.max_records {
+                // Drop the row detail (SQL/params are the bulk) but keep the
+                // accounting: total query time and its per-file attribution
+                // must not depend on the display cap.
                 d.dropped_queries += 1;
+                d.dropped_query_us += q.elapsed_us;
+                *d.dropped_query_us_by_src
+                    .entry(q.src.to_string())
+                    .or_insert(0) += q.elapsed_us;
                 return;
             }
             d.queries.push(QueryRow {
@@ -539,6 +555,13 @@ fn render_comment(data: &DebugData, total_us: i64) -> String {
     ));
     s.push_str(&format!("  Total time: {} ms\n", fmt_us(total_us)));
     s.push_str(&format!("  Queries: {}\n", data.queries.len()));
+    if data.dropped_queries > 0 {
+        s.push_str(&format!(
+            "  (+{} more queries, {} ms, clipped by maxRecords)\n",
+            data.dropped_queries,
+            fmt_us(data.dropped_query_us)
+        ));
+    }
     for q in &data.queries {
         s.push_str(&format!(
             "    [{} ms] {} ({} rows) — {}\n",
@@ -600,8 +623,12 @@ fn render_html(
 
     // Execution Time summary (Lucee's breakdown): Total, time spent in Query,
     // and Application (= total − query). Load/compilation is not yet tracked
-    // separately, so it folds into Application.
-    let query_total_us: i64 = data.queries.iter().map(|q| q.time).sum();
+    // separately, so it folds into Application. Queries clipped from the list
+    // by `maxRecords` still count here — the cap trims the display, not the
+    // accounting (Lucee's own summary undercounts when debugMaxRecordsLogged
+    // clips; deliberately not inherited).
+    let query_total_us: i64 =
+        data.queries.iter().map(|q| q.time).sum::<i64>() + data.dropped_query_us;
     if cfg.database || !data.templates.is_empty() {
         s.push_str("<h4 style=\"margin:6px 0 2px\">Execution Time</h4>\n");
         s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
@@ -656,13 +683,19 @@ fn render_html(
         for (idx, p) in pages.iter().enumerate() {
             let avg = if p.count > 0 { p.total / p.count } else { 0 };
             // Per-template query time: sum of queries issued from this file
-            // (Lucee's per-page Query column). `app` = total − query.
+            // (Lucee's per-page Query column), including any clipped from the
+            // Queries list by maxRecords. `app` = total − query.
             let q_us: i64 = data
                 .queries
                 .iter()
                 .filter(|q| q.src == p.id)
                 .map(|q| q.time)
-                .sum();
+                .sum::<i64>()
+                + data
+                    .dropped_query_us_by_src
+                    .get(&p.id)
+                    .copied()
+                    .unwrap_or(0);
             let app_us = (p.total - q_us).max(0);
             // Files with a method breakdown get a `+` toggle in the leading
             // column; everything else gets an empty cell so the grid lines up.
@@ -768,8 +801,9 @@ fn render_html(
             s.push_str("</table>\n");
             if data.dropped_queries > 0 {
                 s.push_str(&format!(
-                    "<div>(+{} more queries clipped by maxRecords)</div>\n",
-                    data.dropped_queries
+                    "<div>(+{} more queries, {} ms, clipped by maxRecords — still counted in Execution Time and the per-file query column)</div>\n",
+                    data.dropped_queries,
+                    fmt_us(data.dropped_query_us)
                 ));
             }
         }
@@ -1416,7 +1450,13 @@ mod tests {
         }
         let html = c.render(&[], None, &[]);
         assert!(html.contains("Queries (2)"));
-        assert!(html.contains("+3 more queries clipped"));
+        assert!(html.contains("+3 more queries, 9.000 ms, clipped"));
+        // The clip trims the display only — Execution Time still counts all 5
+        // queries: kept 0+1 ms plus dropped 2+3+4 ms = 10 ms total.
+        assert!(
+            html.contains("<tr><td class=\"txt-r\">10.000 ms</td><td>Query</td></tr>"),
+            "Query total must include clipped queries' time"
+        );
     }
 
     #[test]
