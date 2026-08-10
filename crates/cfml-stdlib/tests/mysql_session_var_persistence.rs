@@ -199,3 +199,157 @@ fn clean_request_keeps_prepared_statements_across_boundary() {
     // Leave no held connection behind for other tests.
     cfml_stdlib::builtins::release_request_db_conns();
 }
+
+/// Transaction connections get the same dirty-tracking: a cftransaction that ran
+/// only clean SQL and was properly committed returns its connection to the pool
+/// WITHOUT a reset, so the next transaction's identical statements are prepared-
+/// statement cache hits. (Preside wraps most writes in a transaction, so a
+/// per-transaction reset would re-prepare every write's statements every time.)
+#[test]
+fn clean_transaction_keeps_prepared_statements() {
+    let Ok(url) = std::env::var("RUSTCFML_MYSQL_TEST_URL") else {
+        eprintln!("skipping: RUSTCFML_MYSQL_TEST_URL not set");
+        return;
+    };
+    // Private pool (distinct URL string = distinct pool key) so parallel tests
+    // can't check its single connection out from under us.
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}prefer_socket=false&tcp_connect_timeout_ms=9999");
+
+    fn txn_prepare_count(conn: &mut Box<dyn std::any::Any>) -> i64 {
+        // SHOW is classified clean and runs on the transaction's own connection,
+        // so this reads THAT session's counter without dirtying anything.
+        let result = cfml_stdlib::builtins::txn_execute_boxed(
+            conn,
+            "SHOW SESSION STATUS LIKE 'Com_stmt_prepare'",
+            &CfmlValue::Null,
+            "query",
+        )
+        .expect("SHOW SESSION STATUS inside txn should succeed");
+        let debug = format!("{:?}", result);
+        debug
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok())
+            .expect("Com_stmt_prepare value should parse")
+    }
+
+    // Transaction 1: clean statements, committed.
+    let mut txn = cfml_stdlib::builtins::txn_begin_boxed(&url).expect("begin txn 1");
+    cfml_stdlib::builtins::txn_execute_boxed(&mut txn, "SELECT 1 AS v", &CfmlValue::Null, "query")
+        .expect("txn 1 select");
+    let before = txn_prepare_count(&mut txn);
+    assert!(before > 0, "txn 1 should have prepared at least one statement");
+    cfml_stdlib::builtins::txn_commit_boxed(&mut txn).expect("commit txn 1");
+    drop(txn); // returns to the pool — clean + committed must skip the reset
+
+    // Transaction 2 (same single-conn pool): identical statements must all hit
+    // the surviving prepared-statement cache.
+    let mut txn = cfml_stdlib::builtins::txn_begin_boxed(&url).expect("begin txn 2");
+    cfml_stdlib::builtins::txn_execute_boxed(&mut txn, "SELECT 1 AS v", &CfmlValue::Null, "query")
+        .expect("txn 2 select");
+    let after = txn_prepare_count(&mut txn);
+    cfml_stdlib::builtins::txn_commit_boxed(&mut txn).expect("commit txn 2");
+    drop(txn);
+
+    assert_eq!(
+        before, after,
+        "a committed clean transaction must return its connection unreset \
+         (no new COM_STMT_PREPARE in txn 2); before={before} after={after}"
+    );
+}
+
+/// The safety half: session state mutated INSIDE a transaction must still be
+/// wiped when the transaction connection returns to the pool, and an abandoned
+/// (never committed) transaction must be rolled back by the pool reset rather
+/// than leaking an open transaction to the next checkout.
+#[test]
+fn dirty_or_abandoned_transaction_still_resets() {
+    let Ok(url) = std::env::var("RUSTCFML_MYSQL_TEST_URL") else {
+        eprintln!("skipping: RUSTCFML_MYSQL_TEST_URL not set");
+        return;
+    };
+    // Own private pool, distinct from every other test's key.
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}prefer_socket=false&tcp_connect_timeout_ms=9998");
+
+    fn read_fkc(conn: &mut Box<dyn std::any::Any>) -> String {
+        let result = cfml_stdlib::builtins::txn_execute_boxed(
+            conn,
+            "SELECT @@session.foreign_key_checks AS v",
+            &CfmlValue::Null,
+            "query",
+        )
+        .expect("read fkc");
+        format!("{:?}", result)
+    }
+
+    // Dirty transaction: SET inside, then committed. The SET must not survive
+    // the return-to-pool.
+    let mut txn = cfml_stdlib::builtins::txn_begin_boxed(&url).expect("begin dirty txn");
+    cfml_stdlib::builtins::txn_execute_boxed(
+        &mut txn,
+        "SET SESSION foreign_key_checks=0",
+        &CfmlValue::Null,
+        "query",
+    )
+    .expect("SET inside txn");
+    cfml_stdlib::builtins::txn_commit_boxed(&mut txn).expect("commit dirty txn");
+    drop(txn);
+
+    let mut txn = cfml_stdlib::builtins::txn_begin_boxed(&url).expect("begin check txn");
+    let fkc = read_fkc(&mut txn);
+    assert!(
+        fkc.contains('1'),
+        "SET SESSION inside a transaction must not leak past return-to-pool, got: {fkc}"
+    );
+
+    // Abandoned transaction: insert into a temp-free probe table, never commit,
+    // just drop. The pool reset must roll it back.
+    cfml_stdlib::builtins::txn_execute_boxed(
+        &mut txn,
+        "CREATE TABLE IF NOT EXISTS _rcf_txn_probe (id INT)",
+        &CfmlValue::Null,
+        "query",
+    )
+    .expect("create probe table");
+    cfml_stdlib::builtins::txn_commit_boxed(&mut txn).expect("commit ddl txn");
+    drop(txn);
+
+    let mut txn = cfml_stdlib::builtins::txn_begin_boxed(&url).expect("begin abandoned txn");
+    cfml_stdlib::builtins::txn_execute_boxed(
+        &mut txn,
+        "INSERT INTO _rcf_txn_probe VALUES (99)",
+        &CfmlValue::Null,
+        "query",
+    )
+    .expect("insert inside abandoned txn");
+    drop(txn); // no commit/rollback — `open` stays true, pool reset rolls back
+
+    let mut txn = cfml_stdlib::builtins::txn_begin_boxed(&url).expect("begin verify txn");
+    let max_id = format!(
+        "{:?}",
+        cfml_stdlib::builtins::txn_execute_boxed(
+            &mut txn,
+            "SELECT MAX(id) AS m FROM _rcf_txn_probe",
+            &CfmlValue::Null,
+            "query",
+        )
+        .expect("read probe rows")
+    );
+    cfml_stdlib::builtins::txn_execute_boxed(
+        &mut txn,
+        "DROP TABLE IF EXISTS _rcf_txn_probe",
+        &CfmlValue::Null,
+        "query",
+    )
+    .expect("drop probe table");
+    cfml_stdlib::builtins::txn_commit_boxed(&mut txn).expect("commit verify txn");
+    drop(txn);
+
+    assert!(
+        !max_id.contains("99"),
+        "an abandoned transaction must be rolled back by the pool reset \
+         (the uncommitted row 99 must not be visible), got: {max_id}"
+    );
+}

@@ -13417,13 +13417,85 @@ fn mssql_column_to_cfml_typed(row: &tiberius::Row, col_idx: usize) -> CfmlValue 
 // Transaction support (public functions called by VM)
 // -----------------------------------------------
 
+/// A MySQL transaction connection plus the state deciding whether it must be
+/// reset (COM_RESET_CONNECTION) when it returns to the pool. A reset wipes the
+/// connection's server-side prepared statements, so a fleet of per-write
+/// `cftransaction` blocks (Preside wraps most writes in one) would otherwise
+/// re-prepare its statements on every single transaction.
+///
+/// `open` tracks whether an explicit transaction is (still) open: set at BEGIN,
+/// cleared only by a SUCCESSFUL commit/rollback. `dirty` tracks session-state
+/// mutation via the same `mysql_sql_is_session_risky` classifier as the
+/// request-held path. On drop, a connection that is provably closed and clean
+/// skips the reset (one-shot `reset_connection(false)`); every other state —
+/// abandoned BEGIN, failed commit, risky SQL — keeps the pool-default full
+/// reset, which also rolls the transaction back (GH #275 / #308 safety).
+#[cfg(feature = "mysql_db")]
+struct MysqlTxnConn {
+    conn: mysql::PooledConn,
+    open: bool,
+    dirty: bool,
+}
+
+#[cfg(feature = "mysql_db")]
+impl MysqlTxnConn {
+    /// Update `open`/`dirty` for a statement about to run on this connection.
+    /// Transaction-control statements steer `open` and are NOT dirty (they
+    /// leave no session state behind once the transaction is closed); savepoint
+    /// operations are transaction-scoped and neutral; everything else goes
+    /// through the session-risk classifier.
+    fn note_sql(&mut self, sql: &str) {
+        let trimmed = strip_leading_sql_noise(sql);
+        let kw_len = trimmed
+            .as_bytes()
+            .iter()
+            .take_while(|b| b.is_ascii_alphabetic())
+            .count();
+        let kw = trimmed[..kw_len].to_ascii_uppercase();
+        match kw.as_str() {
+            "BEGIN" | "START" => self.open = true,
+            "COMMIT" => self.open = false,
+            // `ROLLBACK TO SAVEPOINT x` keeps the transaction open; a bare
+            // ROLLBACK closes it.
+            "ROLLBACK" => {
+                let rest = trimmed[kw_len..].trim_start();
+                let to = rest
+                    .get(..2)
+                    .map(|s| s.eq_ignore_ascii_case("to"))
+                    .unwrap_or(false);
+                if !to {
+                    self.open = false;
+                }
+            }
+            "SAVEPOINT" | "RELEASE" => {}
+            _ => {
+                if mysql_sql_is_session_risky(sql) {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mysql_db")]
+impl Drop for MysqlTxnConn {
+    fn drop(&mut self) {
+        if !self.open && !self.dirty {
+            // Closed and clean: skip COM_RESET_CONNECTION for this return so
+            // the prepared-statement cache survives for the next transaction.
+            // One-shot — the crate re-arms the flag from the pool default.
+            self.conn.reset_connection(false);
+        }
+    }
+}
+
 /// Enum to hold driver-specific transaction connections
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 enum TransactionConn {
     #[cfg(feature = "sqlite")]
     Sqlite(r2d2::PooledConnection<SqliteConnectionManager>),
     #[cfg(feature = "mysql_db")]
-    Mysql(mysql::PooledConn),
+    Mysql(MysqlTxnConn),
     #[cfg(feature = "postgres_db")]
     Postgres(r2d2::PooledConnection<PostgresConnectionManager>),
     #[cfg(feature = "mssql_db")]
@@ -13500,7 +13572,11 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
             use mysql::prelude::Queryable;
             conn.query_drop("BEGIN")
                 .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?;
-            Ok(TransactionConn::Mysql(conn))
+            Ok(TransactionConn::Mysql(MysqlTxnConn {
+                conn,
+                open: true,
+                dirty: false,
+            }))
         }
         #[cfg(feature = "postgres_db")]
         DbDriver::Postgres(url) => {
@@ -13544,8 +13620,14 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         #[cfg(feature = "mysql_db")]
         TransactionConn::Mysql(c) => {
             use mysql::prelude::Queryable;
-            c.query_drop("COMMIT")
-                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))
+            c.conn
+                .query_drop("COMMIT")
+                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))?;
+            // Only a SUCCESSFUL commit closes the transaction; on error `open`
+            // stays true and the drop path keeps the full pool reset (which
+            // rolls back).
+            c.open = false;
+            Ok(())
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
@@ -13582,8 +13664,11 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         #[cfg(feature = "mysql_db")]
         TransactionConn::Mysql(c) => {
             use mysql::prelude::Queryable;
-            c.query_drop("ROLLBACK")
-                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))
+            c.conn
+                .query_drop("ROLLBACK")
+                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))?;
+            c.open = false;
+            Ok(())
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
@@ -13671,7 +13756,9 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
                 SavepointOp::Release => format!("RELEASE SAVEPOINT {}", name),
                 SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
             };
-            c.query_drop(&sql)
+            // Savepoint ops are transaction-scoped: no open/dirty change.
+            c.conn
+                .query_drop(&sql)
                 .map_err(|e| CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
         }
         #[cfg(feature = "postgres_db")]
@@ -13728,7 +13815,11 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         }
         #[cfg(feature = "mysql_db")]
         TransactionConn::Mysql(c) => {
-            execute_mysql_with_conn(c, sql, params_arg, return_type)
+            // Track manual transaction control (`queryExecute("COMMIT")`) and
+            // session-state-risky SQL so the drop path knows whether this
+            // connection can skip the pool reset.
+            c.note_sql(sql);
+            execute_mysql_with_conn(&mut c.conn, sql, params_arg, return_type)
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
