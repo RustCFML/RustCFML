@@ -624,6 +624,7 @@ pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 impl CfmlStruct {
     #[inline]
     pub fn new(m: ValueMap) -> Self {
+        crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW);
         // Build the case-insensitive index eagerly ONLY for large structs; small
         // structs (the common per-call case) skip it and scan on the rare ci
         // read. See `CI_THRESHOLD`. `HashMap::with_hasher` allocates nothing.
@@ -667,6 +668,7 @@ impl CfmlStruct {
     /// in doubt, use [`CfmlStruct::new`].
     #[inline]
     pub fn new_untracked(m: ValueMap) -> Self {
+        crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW_UNTRACKED);
         let ci = if m.len() > CI_THRESHOLD {
             let mut ci =
                 HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());

@@ -14,6 +14,7 @@ pub mod introspection;
 pub mod locale;
 pub mod logging;
 pub mod name;
+pub mod perf_counters;
 pub mod position;
 pub mod session_cookie;
 pub mod vfs;

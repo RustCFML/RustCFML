@@ -227,8 +227,9 @@ struct Args {
     /// (flamegraph) + `rustcfml-profile.pb` (pprof protobuf, loadable in
     /// `go tool pprof` / speedscope / Pyroscope). Works for a one-shot run
     /// (profiles that run) and with `--serve` (process-wide aggregate over all
-    /// requests; written on graceful Ctrl+C shutdown). Requires a build with
-    /// `--features obs-pprof`; Unix-only.
+    /// requests; written on graceful Ctrl+C shutdown). Only present in builds
+    /// with `--features obs-pprof` (Unix-only) — other builds reject the flag.
+    #[cfg(all(feature = "obs-pprof", unix))]
     #[arg(long)]
     profile: bool,
 
@@ -238,8 +239,10 @@ struct Args {
     /// `rustcfml-memprofile-N-inuse.{pb,folded}` (where the RSS is) and
     /// `-alloc.{pb,folded}` (what is churning), both loadable in `go tool pprof`.
     /// In `--serve` mode, `kill -USR2 <pid>` dumps on demand without stopping the
-    /// server; a final dump is written on graceful Ctrl+C shutdown. Requires a
-    /// build with `--features memprofile`; Unix-only.
+    /// server; a final dump is written on graceful Ctrl+C shutdown. Only present
+    /// in builds with `--features memprofile` (Unix-only) — other builds reject
+    /// the flag.
+    #[cfg(all(feature = "memprofile", unix))]
     #[arg(long)]
     memprofile: bool,
 }
@@ -500,6 +503,17 @@ fn real_main() {
         // webroot, so this has to follow the server.webroot fallback above.
         configure_cfml_logging(&mut cfconfig, Some(&doc_root));
 
+        // The profiler flags only exist as CLI args in builds carrying the
+        // matching feature; elsewhere they are compile-time false.
+        #[cfg(all(feature = "obs-pprof", unix))]
+        let profile = args.profile;
+        #[cfg(not(all(feature = "obs-pprof", unix)))]
+        let profile = false;
+        #[cfg(all(feature = "memprofile", unix))]
+        let memprofile = args.memprofile;
+        #[cfg(not(all(feature = "memprofile", unix)))]
+        let memprofile = false;
+
         run_server(
             &doc_root,
             port,
@@ -513,8 +527,8 @@ fn real_main() {
             false,
             production,
             Arc::new(cfconfig),
-            args.profile,
-            args.memprofile,
+            profile,
+            memprofile,
         );
         return;
     }
@@ -554,19 +568,11 @@ fn real_main() {
     } else {
         None
     };
-    #[cfg(not(all(feature = "obs-pprof", unix)))]
-    if args.profile {
-        eprintln!("--profile requires a build with `--features obs-pprof` (Unix only)");
-    }
 
     // Sampling heap profiler: arm around the run, dump once it completes.
     #[cfg(all(feature = "memprofile", unix))]
     if args.memprofile {
         memprofile::arm("rustcfml-memprofile");
-    }
-    #[cfg(not(all(feature = "memprofile", unix)))]
-    if args.memprofile {
-        eprintln!("--memprofile requires a build with `--features memprofile` (Unix only)");
     }
 
     execute_file(&path, args.debug);
@@ -1280,9 +1286,7 @@ fn run_server(
         memprofile::arm("rustcfml-memprofile");
     }
     #[cfg(not(all(feature = "memprofile", unix)))]
-    if memprofile_on {
-        eprintln!("--memprofile requires a build with `--features memprofile` (Unix only)");
-    }
+    let _ = memprofile_on;
 
     // Native sampling profiler (Phase 6) in serve mode. Sampling is process-wide
     // (a SIGPROF timer over all worker threads), so it captures aggregate CPU
@@ -1297,9 +1301,7 @@ fn run_server(
         None
     };
     #[cfg(not(all(feature = "obs-pprof", unix)))]
-    if profile {
-        eprintln!("--profile requires a build with `--features obs-pprof` (Unix only)");
-    }
+    let _ = profile;
 
     // Arm the request-boundary cycle collector so a long-lived serve process
     // reclaims reference cycles instead of leaking them on every request. Opt
@@ -1328,6 +1330,10 @@ fn run_server(
     #[cfg(all(feature = "obs-pprof", unix))]
     if let Some(session) = profiler {
         session.finish();
+    }
+
+    if cfml_common::perf_counters::enabled() {
+        eprintln!("{}", cfml_common::perf_counters::report());
     }
 
     #[cfg(all(feature = "memprofile", unix))]
@@ -2097,6 +2103,12 @@ async fn handle_request(
 ) -> axum::response::Response {
     let response = handle_request_inner(state, addr, req).await;
     logging::flush_all();
+    // Counter-first lever sizing: cumulative totals after every request, so a
+    // boot request and warm requests can be separated by diffing consecutive
+    // reports. Diagnostics only, opt-in via RUSTCFML_COUNTERS=1.
+    if cfml_common::perf_counters::enabled() {
+        eprintln!("{}", cfml_common::perf_counters::report());
+    }
     response
 }
 

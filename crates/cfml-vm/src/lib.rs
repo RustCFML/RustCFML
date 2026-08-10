@@ -28602,6 +28602,7 @@ impl CfmlVirtualMachine {
         class_name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
+        cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CALLS);
         // Reset any stashed compile error so a `None` return reflects THIS
         // resolution (a parse error in the target file, or a genuine not-found).
         self.last_component_compile_error = None;
@@ -28723,8 +28724,10 @@ impl CfmlVirtualMachine {
         };
 
         let cfc_path: Arc<str> = if let Some(hit) = cached {
+            cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CACHE_HITS);
             hit
         } else {
+            cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_PROBE_WALKS);
             let resolved = {
             // If class_name is already an absolute path or has .cfc extension, use directly
             let as_path = std::path::Path::new(class_name);
@@ -30953,8 +30956,10 @@ impl CfmlVirtualMachine {
             .get(path)
             .map_or(false, |f| f & bit != 0)
         {
+            cfml_common::perf_counters::bump(&cfml_common::perf_counters::EXISTS_MEMO_HITS);
             return true;
         }
+        cfml_common::perf_counters::bump(&cfml_common::perf_counters::EXISTS_FS_PROBES);
         let found = probe(&self.vfs);
         if found {
             *self
