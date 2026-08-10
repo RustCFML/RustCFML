@@ -99,6 +99,9 @@ obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otl
 # pprof protobuf. Unix-only (uses SIGPROF/setitimer) — the `pprof` dependency is
 # declared under the unix target table; never built for wasm or Windows.
 obs-pprof = ["dep:pprof"]
+# GH#297 sizing: struct-allocation call-site attribution appended to the
+# RUSTCFML_COUNTERS report. Sizing builds only — see cfml-common/Cargo.toml.
+alloc-sizing = ["cfml-common/alloc-sizing"]
 # Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
 # whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
 dhat-heap = ["dep:dhat"]

@@ -62,6 +62,7 @@ pub mod fuse_counters {
     pub static KEY_BYTES: AtomicU64 = AtomicU64::new(0); // sum of seeded key lengths (owned-String volume proxy)
     pub static CALLER_SCANNED: AtomicU64 = AtomicU64::new(0); // caller entries walked (incl. filtered-out)
     pub static STRUCT_KEYS: AtomicU64 = AtomicU64::new(0); // seeded keys that are structural (this/super/__variables/variables)
+    pub static PARAM_KEYS: AtomicU64 = AtomicU64::new(0); // supplied params bound into locals (each also inserted into arguments_map when eager)
     // Per-chain-tier breakdown of fused frames and their seeded keys (see
     // BytecodeFunction::chain_tier): index 0/1/2 = ineligible / tier B / tier A.
     pub static TIER_FRAMES: [AtomicU64; 3] =
@@ -76,7 +77,7 @@ pub mod fuse_counters {
         })
     }
 
-    pub fn snapshot() -> [u64; 14] {
+    pub fn snapshot() -> [u64; 15] {
         [
             FRAMES.load(Relaxed),
             FUSED_MERGES.load(Relaxed),
@@ -92,6 +93,7 @@ pub mod fuse_counters {
             TIER_KEYS[1].load(Relaxed),
             TIER_KEYS[2].load(Relaxed),
             STRUCT_KEYS.load(Relaxed),
+            PARAM_KEYS.load(Relaxed),
         ]
     }
 
@@ -6235,6 +6237,10 @@ impl CfmlVirtualMachine {
             };
             match supplied {
                 Some(value) => {
+                    if fuse_counters::enabled() {
+                        fuse_counters::PARAM_KEYS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // §29 — declared parameter types are enforced here, for
                     // EVERY declared type (they used to be enforced only for
                     // COMPONENT/INTERFACE types, with primitives silently

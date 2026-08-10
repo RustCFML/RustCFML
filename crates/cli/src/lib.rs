@@ -1097,11 +1097,11 @@ fn compile_and_run(
         let after = cfml_vm::fuse_counters::snapshot();
         let d: Vec<u64> = after.iter().zip(before.iter()).map(|(a, b)| a - b).collect();
         eprintln!(
-            "[fuse-counters] {} ms={} frames={} fused={} classic={} env_keys={} caller_keys={} key_bytes={} caller_scanned={} tier_frames(0/B/A)={}/{}/{} tier_keys(0/B/A)={}/{}/{} struct_keys={}",
+            "[fuse-counters] {} ms={} frames={} fused={} classic={} env_keys={} caller_keys={} key_bytes={} caller_scanned={} tier_frames(0/B/A)={}/{}/{} tier_keys(0/B/A)={}/{}/{} struct_keys={} param_keys={}",
             vm.base_template_path.as_deref().unwrap_or("?"),
             started.elapsed().as_millis(),
             d[0], d[1], d[2], d[3], d[4], d[5], d[6],
-            d[7], d[8], d[9], d[10], d[11], d[12], d[13]
+            d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14]
         );
     }
 

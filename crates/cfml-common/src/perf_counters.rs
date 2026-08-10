@@ -32,6 +32,18 @@ pub fn bump(c: &AtomicU64) {
 /// Snapshot every counter as a one-block human-readable report.
 pub fn report() -> String {
     let g = |c: &AtomicU64| c.load(Relaxed);
+    #[cfg(feature = "alloc-sizing")]
+    {
+        let mut out = report_totals(g);
+        out.push('\n');
+        out.push_str(&alloc_sites::report(60));
+        return out;
+    }
+    #[cfg(not(feature = "alloc-sizing"))]
+    report_totals(g)
+}
+
+fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
     format!(
         "=== RUSTCFML_COUNTERS ===\n\
          struct_new (tracked):        {:>12}\n\
@@ -49,6 +61,52 @@ pub fn report() -> String {
         g(&EXISTS_MEMO_HITS),
         g(&EXISTS_FS_PROBES),
     )
+}
+
+/// Call-site attribution for `CfmlStruct` construction (`alloc-sizing` builds
+/// only). Every constructor in the chain (`new`/`new_untracked` and their thin
+/// wrappers) carries `#[track_caller]`, so `Location::caller()` here resolves
+/// to the real VM/stdlib call site, not the wrapper.
+#[cfg(feature = "alloc-sizing")]
+pub mod alloc_sites {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::panic::Location;
+
+    /// site → [tracked, untracked] construction counts (cumulative).
+    static SITES: Mutex<Option<HashMap<&'static Location<'static>, [u64; 2]>>> =
+        Mutex::new(None);
+
+    #[inline]
+    #[track_caller]
+    pub fn record(tracked: bool) {
+        let loc = Location::caller();
+        let mut g = SITES.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        m.entry(loc).or_default()[if tracked { 0 } else { 1 }] += 1;
+    }
+
+    /// Cumulative top-`n` sites, sorted by total count descending. Diff two
+    /// consecutive reports to isolate a single request's shape.
+    pub fn report(n: usize) -> String {
+        let g = SITES.lock();
+        let Some(m) = g.as_ref() else {
+            return String::from("--- struct-alloc sites: none recorded ---");
+        };
+        let mut rows: Vec<_> = m.iter().map(|(l, c)| (*l, *c)).collect();
+        rows.sort_by_key(|(_, c)| std::cmp::Reverse(c[0] + c[1]));
+        let mut out = String::from("--- struct-alloc sites (cumulative; tracked/untracked) ---");
+        for (loc, [t, u]) in rows.into_iter().take(n) {
+            out.push_str(&format!(
+                "\n{:>12} {:>12}   {}:{}",
+                t,
+                u,
+                loc.file(),
+                loc.line()
+            ));
+        }
+        out
+    }
 }
 
 /// True when `RUSTCFML_COUNTERS=1` — memoized once per process.

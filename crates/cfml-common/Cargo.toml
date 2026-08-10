@@ -24,6 +24,12 @@ publish = false
 # producer). A default build is byte-identical to before this feature existed.
 # See COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
 component-instance = []
+# Struct-allocation call-site attribution (counter-first lever sizing for
+# GH#297). Puts `#[track_caller]` on the CfmlStruct constructor chain and
+# records a per-call-site count, appended to the RUSTCFML_COUNTERS report.
+# Sizing builds only — adds a Location argument to every hot constructor call
+# plus a Mutex'd map bump per construction. Never ship a release with this on.
+alloc-sizing = []
 
 [dependencies]
 thiserror = { workspace = true }

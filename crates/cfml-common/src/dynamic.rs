@@ -623,8 +623,11 @@ pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
 impl CfmlStruct {
     #[inline]
+    #[cfg_attr(feature = "alloc-sizing", track_caller)]
     pub fn new(m: ValueMap) -> Self {
         crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW);
+        #[cfg(feature = "alloc-sizing")]
+        crate::perf_counters::alloc_sites::record(true);
         // Build the case-insensitive index eagerly ONLY for large structs; small
         // structs (the common per-call case) skip it and scan on the rare ci
         // read. See `CI_THRESHOLD`. `HashMap::with_hasher` allocates nothing.
@@ -667,8 +670,11 @@ impl CfmlStruct {
     /// actually did form a surviving cycle — which the RSS-flat gate guards. When
     /// in doubt, use [`CfmlStruct::new`].
     #[inline]
+    #[cfg_attr(feature = "alloc-sizing", track_caller)]
     pub fn new_untracked(m: ValueMap) -> Self {
         crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW_UNTRACKED);
+        #[cfg(feature = "alloc-sizing")]
+        crate::perf_counters::alloc_sites::record(false);
         let ci = if m.len() > CI_THRESHOLD {
             let mut ci =
                 HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
@@ -718,6 +724,7 @@ impl CfmlStruct {
     }
 
     #[inline]
+    #[cfg_attr(feature = "alloc-sizing", track_caller)]
     pub fn empty() -> Self {
         CfmlStruct::new(ValueMap::default())
     }
@@ -729,6 +736,7 @@ impl CfmlStruct {
     /// collection candidates (that caused the over-collection regression), and
     /// the collector reaches their contents by walking the Instance node instead.
     #[inline]
+    #[cfg_attr(feature = "alloc-sizing", track_caller)]
     pub fn empty_untracked() -> Self {
         CfmlStruct::new_untracked(ValueMap::default())
     }
@@ -2056,6 +2064,7 @@ impl CfmlValue {
     /// Construct a `CfmlValue::Struct` from an owned `IndexMap`, wrapping in
     /// the shared Arc layer. Named `strukt` because `struct` is a keyword.
     #[inline]
+    #[cfg_attr(feature = "alloc-sizing", track_caller)]
     pub fn strukt(m: ValueMap) -> Self {
         CfmlValue::Struct(CfmlStruct::new(m))
     }
@@ -2064,6 +2073,7 @@ impl CfmlValue {
     /// [`CfmlStruct::new_untracked`] for the strict soundness contract. Use ONLY
     /// for a struct provably confined to its creating call frame.
     #[inline]
+    #[cfg_attr(feature = "alloc-sizing", track_caller)]
     pub fn strukt_untracked(m: ValueMap) -> Self {
         CfmlValue::Struct(CfmlStruct::new_untracked(m))
     }
