@@ -598,70 +598,6 @@ fn render_html(
     ));
     s.push_str(TOGGLE_SCRIPT);
 
-    // Queries
-    if cfg.database {
-        s.push_str(&format!(
-            "<h4 style=\"margin:6px 0 2px\">Queries ({})</h4>\n",
-            data.queries.len()
-        ));
-        if data.queries.is_empty() {
-            s.push_str("<div>(none)</div>\n");
-        } else {
-            s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
-            // The SQL + params live in a sub-row, collapsed by default, so a
-            // request with a dozen queries stays a readable one-line-per-query
-            // list. The header `+` opens them all.
-            s.push_str(&format!(
-                "<tr><th style=\"text-align:center;width:1em\">{}</th><th>name</th><th>ms</th><th>rows</th><th>datasource</th><th>src</th></tr>\n",
-                tog_all_link("rcfml-qrow", "rcfml-qtog", "show/hide every query's SQL")
-            ));
-            for (qidx, q) in data.queries.iter().enumerate() {
-                // highlight_ms is in ms; query time is in µs.
-                let slow = q.time >= cfg.highlight_ms * 1000;
-                let row_style = if slow {
-                    " style=\"background:#fdd\""
-                } else {
-                    ""
-                };
-                // SQL, then the bound parameters underneath (Lucee shows the
-                // params used — name, value and cfsqltype — so you can see
-                // exactly what was sent).
-                let mut sql_cell = format!(
-                    "<pre style=\"margin:0;white-space:pre-wrap\">{}</pre>",
-                    esc(&q.sql)
-                );
-                if !q.params.is_empty() {
-                    sql_cell.push_str("<div style=\"color:#555;margin-top:2px\">params: ");
-                    sql_cell.push_str(&fmt_params_html(&q.params));
-                    sql_cell.push_str("</div>");
-                }
-                let grp = format!("rcfml-q{}", qidx);
-                s.push_str(&format!(
-                    "<tr{}><td style=\"text-align:center;width:1em\">{}</td><td>{}</td><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td><td>{}:{}</td></tr>\n",
-                    row_style,
-                    tog_link(&grp, " class=\"rcfml-qtog\"", "show the SQL and bound params"),
-                    esc(&q.name),
-                    fmt_us(q.time),
-                    q.count,
-                    esc(&q.datasource),
-                    esc(&q.src),
-                    q.line,
-                ));
-                s.push_str(&format!(
-                    "<tr class=\"{} rcfml-qrow\" style=\"display:none\"><td></td><td colspan=\"5\">{}</td></tr>\n",
-                    grp, sql_cell,
-                ));
-            }
-            s.push_str("</table>\n");
-            if data.dropped_queries > 0 {
-                s.push_str(&format!(
-                    "<div>(+{} more queries clipped by maxRecords)</div>\n",
-                    data.dropped_queries
-                ));
-            }
-        }
-    }
-
     // Execution Time summary (Lucee's breakdown): Total, time spent in Query,
     // and Application (= total − query). Load/compilation is not yet tracked
     // separately, so it folds into Application.
@@ -686,12 +622,20 @@ fn render_html(
 
     // Pages (templates) — main page first, then each include / component
     // method / Application.cfc execution, aggregated per file (Lucee parity).
+    // The whole section collapses behind its heading and starts CLOSED — on a
+    // framework request it is hundreds of rows, and the summary above already
+    // answers "where did the time go" at a glance.
     let pages = aggregate_pages_with_main(&data.templates, main_page, total_us);
     if !pages.is_empty() {
-        s.push_str(&format!(
-            "<h4 style=\"margin:6px 0 2px\">Files (Templates/Tags/CFCs) ({} executed)</h4>\n",
-            pages.iter().map(|p| p.count).sum::<i64>()
-        ));
+        collapsible_heading(
+            &mut s,
+            "rcfml-files",
+            &format!(
+                "Files (Templates/Tags/CFCs) ({} executed)",
+                pages.iter().map(|p| p.count).sum::<i64>()
+            ),
+        );
+        s.push_str("<div class=\"rcfml-files\" style=\"display:none\">\n");
         let any_methods = pages.iter().any(|p| !p.methods.is_empty());
         s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
         // The header cell of the toggle column expands/collapses EVERY file's
@@ -760,6 +704,76 @@ fn render_html(
             }
         }
         s.push_str("</table>\n");
+        s.push_str("</div>\n");
+    }
+
+    // Queries — like Files, the section collapses behind its heading and
+    // starts CLOSED (the Execution Time table above shows the total query
+    // cost; the detail is one click away).
+    if cfg.database {
+        collapsible_heading(
+            &mut s,
+            "rcfml-queries",
+            &format!("Queries ({})", data.queries.len()),
+        );
+        s.push_str("<div class=\"rcfml-queries\" style=\"display:none\">\n");
+        if data.queries.is_empty() {
+            s.push_str("<div>(none)</div>\n");
+        } else {
+            s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+            // The SQL + params live in a sub-row, collapsed by default, so a
+            // request with a dozen queries stays a readable one-line-per-query
+            // list. The header `+` opens them all.
+            s.push_str(&format!(
+                "<tr><th style=\"text-align:center;width:1em\">{}</th><th>name</th><th>ms</th><th>rows</th><th>datasource</th><th>src</th></tr>\n",
+                tog_all_link("rcfml-qrow", "rcfml-qtog", "show/hide every query's SQL")
+            ));
+            for (qidx, q) in data.queries.iter().enumerate() {
+                // highlight_ms is in ms; query time is in µs.
+                let slow = q.time >= cfg.highlight_ms * 1000;
+                let row_style = if slow {
+                    " style=\"background:#fdd\""
+                } else {
+                    ""
+                };
+                // SQL, then the bound parameters underneath (Lucee shows the
+                // params used — name, value and cfsqltype — so you can see
+                // exactly what was sent).
+                let mut sql_cell = format!(
+                    "<pre style=\"margin:0;white-space:pre-wrap\">{}</pre>",
+                    esc(&q.sql)
+                );
+                if !q.params.is_empty() {
+                    sql_cell.push_str("<div style=\"color:#555;margin-top:2px\">params: ");
+                    sql_cell.push_str(&fmt_params_html(&q.params));
+                    sql_cell.push_str("</div>");
+                }
+                let grp = format!("rcfml-q{}", qidx);
+                s.push_str(&format!(
+                    "<tr{}><td style=\"text-align:center;width:1em\">{}</td><td>{}</td><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td><td>{}:{}</td></tr>\n",
+                    row_style,
+                    tog_link(&grp, " class=\"rcfml-qtog\"", "show the SQL and bound params"),
+                    esc(&q.name),
+                    fmt_us(q.time),
+                    q.count,
+                    esc(&q.datasource),
+                    esc(&q.src),
+                    q.line,
+                ));
+                s.push_str(&format!(
+                    "<tr class=\"{} rcfml-qrow\" style=\"display:none\"><td></td><td colspan=\"5\">{}</td></tr>\n",
+                    grp, sql_cell,
+                ));
+            }
+            s.push_str("</table>\n");
+            if data.dropped_queries > 0 {
+                s.push_str(&format!(
+                    "<div>(+{} more queries clipped by maxRecords)</div>\n",
+                    data.dropped_queries
+                ));
+            }
+        }
+        s.push_str("</div>\n");
     }
 
     // Exceptions
@@ -1211,6 +1225,22 @@ mod tests {
         assert!(html.contains("kaboom"));
         assert!(html.contains("Generic data"));
         assert!(html.contains("controller"));
+        // Section order: Execution Time first, then Files, then Queries.
+        let time_at = html.find("Execution Time").expect("Execution Time section");
+        let files_at = html
+            .find("Files (Templates/Tags/CFCs)")
+            .expect("Files section");
+        let queries_at = html.find("Queries (2)").expect("Queries section");
+        assert!(
+            time_at < files_at && files_at < queries_at,
+            "expected Execution Time < Files < Queries, got {time_at}/{files_at}/{queries_at}"
+        );
+        // Files and Queries collapse behind their headings and start CLOSED,
+        // same as the scope dumps.
+        assert!(html.contains("window.rcfmlTog(this,'rcfml-files')"));
+        assert!(html.contains("window.rcfmlTog(this,'rcfml-queries')"));
+        assert!(html.contains("<div class=\"rcfml-files\" style=\"display:none\">"));
+        assert!(html.contains("<div class=\"rcfml-queries\" style=\"display:none\">"));
     }
 
     #[test]
