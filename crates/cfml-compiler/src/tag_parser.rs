@@ -867,10 +867,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // internal __querySetRow helper, so `q.col` reads the current
                 // row, `q.currentRow` reports the position, and `q` can still be
                 // passed to functions that expect the whole query. The cursor is
-                // reset to row 1 after the loop.
+                // reset to row 1 after the loop. BARE column refs in the body
+                // must also resolve to the current row (Lucee puts the query at
+                // the head of the loop body's scope cascade) — the same
+                // row-into-variables merge `<cfoutput query>` and the grouped
+                // form already do (docs known-issues §13, GitHub PR #318).
                 (
                     format!(
-                        "{window}for (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
+                        "{window}for (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\nstructAppend(variables, queryGetRow({q}, {i}), true);\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
                         window = window,
                         q = q,
                         sr = sr,
