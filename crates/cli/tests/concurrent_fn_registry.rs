@@ -66,13 +66,20 @@ fn start_server() -> Server {
         .arg(port.to_string())
         .spawn()
         .expect("spawn rustcfml --serve");
-    for _ in 0..100 {
+    // A debug-build server under a fully parallel `cargo test --workspace` can
+    // take well over 5s to bind; time out loudly instead of falling through to
+    // an opaque connect panic in the first request.
+    let mut server = Server { child, port };
+    for _ in 0..600 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
+            return server;
+        }
+        if let Ok(Some(status)) = server.child.try_wait() {
+            panic!("rustcfml --serve exited before accepting connections: {status}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Server { child, port }
+    panic!("rustcfml --serve not accepting connections on port {port} after 30s");
 }
 
 /// Minimal HTTP/1.0 GET returning the full response (headers + body).

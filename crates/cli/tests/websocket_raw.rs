@@ -610,13 +610,20 @@ fn start_cluster_node(http_port: u16, gossip_port: u16, peer_gossip: u16, node: 
         .arg(&cfg_path)
         .spawn()
         .expect("spawn clustered rustcfml --serve");
-    for _ in 0..100 {
+    // A debug-build server under a fully parallel `cargo test --workspace` can
+    // take well over 5s to bind; time out loudly instead of falling through to
+    // an opaque connect panic in the first request.
+    let mut child = child;
+    for _ in 0..600 {
         if std::net::TcpStream::connect(("127.0.0.1", http_port)).is_ok() {
-            break;
+            return child;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("clustered rustcfml --serve exited before accepting connections: {status}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    child
+    panic!("clustered rustcfml --serve not accepting connections on port {http_port} after 30s");
 }
 
 #[tokio::test]
