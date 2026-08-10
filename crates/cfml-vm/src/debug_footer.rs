@@ -40,6 +40,9 @@ pub struct QueryRow {
 #[derive(Clone, Default)]
 pub struct TemplateHit {
     pub path: String,
+    /// Component/lifecycle method this hit entered; empty for a plain template
+    /// execution (include, custom tag, `<cfmodule>`).
+    pub method: String,
     pub time: i64,
 }
 
@@ -217,6 +220,7 @@ impl VmObserver for DebugCollector {
         if let Ok(mut d) = self.inner.lock() {
             d.templates.push(TemplateHit {
                 path: t.path.to_string(),
+                method: t.method.unwrap_or_default().to_string(),
                 time: t.elapsed_us,
             });
         }
@@ -255,6 +259,18 @@ struct PageAgg {
     min: i64,
     max: i64,
     total: i64,
+    /// Per-method breakdown, in first-call order. A file whose hits carry no
+    /// method name (a plain include / custom tag) has an empty vec, so the row
+    /// renders exactly as before.
+    methods: Vec<MethodAgg>,
+}
+
+/// One method within a `PageAgg` — a CFC row is usually many *different*
+/// methods, so the count on the file row alone hides where the time went.
+struct MethodAgg {
+    name: String,
+    count: i64,
+    total: i64,
 }
 
 /// Aggregate template hits into `pages` rows, optionally leading with the main
@@ -270,6 +286,7 @@ fn aggregate_pages_with_main(
     if let Some(p) = main_page {
         hits.push(TemplateHit {
             path: p.to_string(),
+            method: String::new(),
             time: total_us,
         });
     }
@@ -280,20 +297,50 @@ fn aggregate_pages_with_main(
 fn aggregate_pages(templates: &[TemplateHit]) -> Vec<PageAgg> {
     let mut out: Vec<PageAgg> = Vec::new();
     for t in templates {
-        if let Some(p) = out.iter_mut().find(|p| p.id == t.path) {
-            p.count += 1;
-            p.total += t.time;
-            p.min = p.min.min(t.time);
-            p.max = p.max.max(t.time);
+        let page = match out.iter_mut().position(|p| p.id == t.path) {
+            Some(i) => {
+                let p = &mut out[i];
+                p.count += 1;
+                p.total += t.time;
+                p.min = p.min.min(t.time);
+                p.max = p.max.max(t.time);
+                p
+            }
+            None => {
+                out.push(PageAgg {
+                    id: t.path.clone(),
+                    count: 1,
+                    min: t.time,
+                    max: t.time,
+                    total: t.time,
+                    methods: Vec::new(),
+                });
+                out.last_mut().expect("just pushed")
+            }
+        };
+        if t.method.is_empty() {
+            continue;
+        }
+        // Method names are case-insensitive in CFML; fold `getFoo`/`GETFOO`
+        // into one row, keeping the casing first seen.
+        if let Some(m) = page
+            .methods
+            .iter_mut()
+            .find(|m| m.name.eq_ignore_ascii_case(&t.method))
+        {
+            m.count += 1;
+            m.total += t.time;
         } else {
-            out.push(PageAgg {
-                id: t.path.clone(),
+            page.methods.push(MethodAgg {
+                name: t.method.clone(),
                 count: 1,
-                min: t.time,
-                max: t.time,
                 total: t.time,
             });
         }
+    }
+    // Busiest method first within each file — that's the one you're looking for.
+    for p in &mut out {
+        p.methods.sort_by(|a, b| b.total.cmp(&a.total));
     }
     out
 }
@@ -574,12 +621,46 @@ fn render_html(
     let pages = aggregate_pages_with_main(&data.templates, main_page, total_us);
     if !pages.is_empty() {
         s.push_str(&format!(
-            "<h4 style=\"margin:6px 0 2px\">Templates ({} executed)</h4>\n",
+            "<h4 style=\"margin:6px 0 2px\">Files (Templates/Tags/CFCs) ({} executed)</h4>\n",
             pages.iter().map(|p| p.count).sum::<i64>()
         ));
+        // Expand/collapse for the per-method sub-rows. Emitted once, and only
+        // when at least one file actually has a breakdown, so a request with no
+        // CFC calls carries no script at all. Self-contained (no external JS)
+        // and idempotent — the guard lets a page carrying two footers work.
+        let any_methods = pages.iter().any(|p| !p.methods.is_empty());
+        if any_methods {
+            s.push_str(
+                "<script>if(!window.rcfmlTogMethods){\
+window.rcfmlSetTog=function(a,open){a.setAttribute('data-open',open?'1':'0');a.textContent=open?'\u{2212}':'+';};\
+window.rcfmlTogMethods=function(a,c){\
+var rows=document.getElementsByClassName(c),open=a.getAttribute('data-open')!=='1',i;\
+for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
+window.rcfmlSetTog(a,open);return false;};\
+window.rcfmlTogAll=function(a){\
+var open=a.getAttribute('data-open')!=='1',\
+rows=document.getElementsByClassName('rcfml-mrow'),\
+togs=document.getElementsByClassName('rcfml-mtog'),i;\
+for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
+for(i=0;i<togs.length;i++){window.rcfmlSetTog(togs[i],open);}\
+window.rcfmlSetTog(a,open);return false;};}</script>\n",
+            );
+        }
         s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
-        s.push_str("<tr><th>total ms</th><th>app ms</th><th>query ms</th><th>count</th><th>avg ms</th><th>template</th></tr>\n");
-        for p in &pages {
+        // The header cell of the toggle column expands/collapses EVERY file's
+        // breakdown at once, and keeps the per-row icons in sync with it.
+        let all_toggle = if any_methods {
+            "<a href=\"#\" data-open=\"0\" onclick=\"return window.rcfmlTogAll(this)\" \
+title=\"show/hide every per-method breakdown\" \
+style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>"
+        } else {
+            ""
+        };
+        s.push_str(&format!(
+            "<tr><th style=\"text-align:center;width:1em\">{}</th><th>total ms</th><th>app ms</th><th>query ms</th><th>count</th><th>avg ms</th><th>file</th></tr>\n",
+            all_toggle
+        ));
+        for (idx, p) in pages.iter().enumerate() {
             let avg = if p.count > 0 { p.total / p.count } else { 0 };
             // Per-template query time: sum of queries issued from this file
             // (Lucee's per-page Query column). `app` = total − query.
@@ -590,8 +671,22 @@ fn render_html(
                 .map(|q| q.time)
                 .sum();
             let app_us = (p.total - q_us).max(0);
+            // Files with a method breakdown get a `+` toggle in the leading
+            // column; everything else gets an empty cell so the grid lines up.
+            let grp = format!("rcfml-m{}", idx);
+            let toggle = if p.methods.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<a href=\"#\" class=\"rcfml-mtog\" data-open=\"0\" onclick=\"return window.rcfmlTogMethods(this,'{}')\" \
+title=\"show the per-method breakdown\" \
+style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>",
+                    grp
+                )
+            };
             s.push_str(&format!(
-                "<tr><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+                "<tr><td style=\"text-align:center;width:1em\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+                toggle,
                 fmt_us(p.total),
                 fmt_us(app_us),
                 fmt_us(q_us),
@@ -599,6 +694,22 @@ fn render_html(
                 fmt_us(avg),
                 esc(&p.id),
             ));
+            // A CFC row aggregates every method called on that file, so the file
+            // count alone can't tell you whether it was 321 calls to one method
+            // or a handful each to twenty. The breakdown goes underneath —
+            // COLLAPSED by default (a request with hundreds of files would
+            // otherwise be unreadable), revealed per file by the `+` above.
+            for m in &p.methods {
+                let m_avg = if m.count > 0 { m.total / m.count } else { 0 };
+                s.push_str(&format!(
+                    "<tr class=\"{} rcfml-mrow\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td></td><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td style=\"padding-left:22px\">&#8627; {}()</td></tr>\n",
+                    grp,
+                    fmt_us(m.total),
+                    m.count,
+                    fmt_us(m_avg),
+                    esc(&m.name),
+                ));
+            }
         }
         s.push_str("</table>\n");
     }
@@ -814,6 +925,20 @@ fn to_cfml_struct(
             m.insert("min".into(), CfmlValue::Int(p.min));
             m.insert("max".into(), CfmlValue::Int(p.max));
             m.insert("total".into(), CfmlValue::Int(p.total));
+            // Per-method breakdown for a CFC row (empty array for a plain
+            // template). Each entry: name, count, total (µs).
+            let methods: Vec<CfmlValue> = p
+                .methods
+                .iter()
+                .map(|mm| {
+                    let mut e = ValueMap::default();
+                    e.insert("name".into(), CfmlValue::string(mm.name.clone()));
+                    e.insert("count".into(), CfmlValue::Int(mm.count));
+                    e.insert("total".into(), CfmlValue::Int(mm.total));
+                    CfmlValue::strukt(e)
+                })
+                .collect();
+            m.insert("methods".into(), CfmlValue::array(methods));
             CfmlValue::strukt(m)
         })
         .collect();
@@ -923,7 +1048,25 @@ mod tests {
         });
         c.on_template(&TemplateEvent {
             path: "/header.cfm",
+            method: None,
             elapsed_us: 2_000,
+        });
+        // Two different methods on one CFC — the per-file row must break down
+        // into per-method sub-rows rather than showing a bare count of 3.
+        c.on_template(&TemplateEvent {
+            path: "/services/UserService.cfc",
+            method: Some("getUser"),
+            elapsed_us: 1_000,
+        });
+        c.on_template(&TemplateEvent {
+            path: "/services/UserService.cfc",
+            method: Some("GETUSER"),
+            elapsed_us: 3_000,
+        });
+        c.on_template(&TemplateEvent {
+            path: "/services/UserService.cfc",
+            method: Some("saveUser"),
+            elapsed_us: 500,
         });
         c.on_error(&ErrorEvent {
             etype: "Custom.Boom",
@@ -974,10 +1117,28 @@ mod tests {
         assert!(html.contains("<code>active=true</code>"));
         // slow query (>= highlightMs 250) is red-highlighted
         assert!(html.contains("background:#fdd"));
-        assert!(html.contains("Templates"));
+        assert!(html.contains("Files (Templates/Tags/CFCs) (5 executed)"));
         // the main page is listed alongside the include
         assert!(html.contains("/index.cfm"));
         assert!(html.contains("/header.cfm"));
+        // per-method breakdown under the CFC row, busiest first, case-folded
+        assert!(html.contains("/services/UserService.cfc"));
+        let get_at = html.find("getUser()").expect("getUser sub-row");
+        let save_at = html.find("saveUser()").expect("saveUser sub-row");
+        assert!(get_at < save_at, "busiest method should sort first");
+        // getUser + GETUSER folded into one row with count 2
+        assert!(!html.contains("GETUSER()"));
+        // collapsed by default, with a `+` toggle on the CFC row only
+        assert!(html.contains("rcfmlTogMethods"));
+        assert!(html.contains("style=\"display:none;color:#555\""));
+        assert_eq!(
+            html.matches("class=\"rcfml-mtog\"").count(),
+            1,
+            "only the one file with methods gets a row toggle"
+        );
+        // plus the expand-all toggle in the column header
+        assert_eq!(html.matches("window.rcfmlTogAll(this)").count(), 1);
+        assert_eq!(html.matches("rcfml-mrow").count(), 3, "2 sub-rows + the JS");
         assert!(html.contains("Exceptions (1)"));
         assert!(html.contains("kaboom"));
         assert!(html.contains("Generic data"));

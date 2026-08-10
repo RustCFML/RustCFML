@@ -3767,9 +3767,13 @@ impl CfmlVirtualMachine {
     /// Fire the `template` hook (guarded by `TEMPLATE` interest at the call
     /// site). `elapsed_us` is microseconds.
     #[cfg(feature = "observability")]
-    fn fire_template(&self, path: &str, elapsed_us: i64) {
+    fn fire_template(&self, path: &str, method: Option<&str>, elapsed_us: i64) {
         if let Some(o) = &self.observer {
-            o.on_template(&observe::TemplateEvent { path, elapsed_us });
+            o.on_template(&observe::TemplateEvent {
+                path,
+                method,
+                elapsed_us,
+            });
         }
     }
 
@@ -3789,9 +3793,9 @@ impl CfmlVirtualMachine {
     /// attributed to exactly one frame, and self-times sum to ≈ the request
     /// total instead of being multiplied up by nesting depth.
     #[cfg(feature = "observability")]
-    fn template_frame_end(&mut self, path: &str, inclusive_us: i64) {
+    fn template_frame_end(&mut self, path: &str, method: Option<&str>, inclusive_us: i64) {
         let self_us = frame_exclusive_us(&mut self.tmpl_child_us_stack, inclusive_us);
-        self.fire_template(path, self_us);
+        self.fire_template(path, method, self_us);
     }
 
     /// Flatten a queryExecute params argument into the debug footer's param
@@ -12575,7 +12579,7 @@ impl CfmlVirtualMachine {
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
                                 let us = start.elapsed().as_micros() as i64;
-                                self.template_frame_end(&resolved, us);
+                                self.template_frame_end(&resolved, None, us);
                             }
                             // Merge newly created variables from the include back
                             // into the caller's locals. This makes variables set via
@@ -12765,7 +12769,7 @@ impl CfmlVirtualMachine {
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
                                 let us = start.elapsed().as_micros() as i64;
-                                self.template_frame_end(&resolved, us);
+                                self.template_frame_end(&resolved, None, us);
                             }
                             // Merge new non-function variables from the include
                             if let Some(inc_locals) = self.captured_locals.take() {
@@ -23342,7 +23346,7 @@ impl CfmlVirtualMachine {
                         arg_names,
                         caller_locals,
                     );
-                    self.template_frame_end(&src, start.elapsed().as_micros() as i64);
+                    self.template_frame_end(&src, Some(method), start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
@@ -27229,7 +27233,7 @@ impl CfmlVirtualMachine {
                 let start = std::time::Instant::now();
                 self.template_frame_begin();
                 let r = self.execute_custom_tag_template_impl(template_path, tag_locals);
-                self.template_frame_end(template_path, start.elapsed().as_micros() as i64);
+                self.template_frame_end(template_path, None, start.elapsed().as_micros() as i64);
                 return r;
             }
         }
@@ -28120,7 +28124,7 @@ impl CfmlVirtualMachine {
                     self.template_frame_begin();
                     let r =
                         self.call_instance_method_impl(inst, method, extra_args, arg_names);
-                    self.template_frame_end(&src, start.elapsed().as_micros() as i64);
+                    self.template_frame_end(&src, Some(method), start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
@@ -33102,7 +33106,7 @@ impl CfmlVirtualMachine {
                     let start = std::time::Instant::now();
                     self.template_frame_begin();
                     let r = self.call_lifecycle_method_impl(template, method, args);
-                    self.template_frame_end(&src, start.elapsed().as_micros() as i64);
+                    self.template_frame_end(&src, Some(method), start.elapsed().as_micros() as i64);
                     return r;
                 }
             }

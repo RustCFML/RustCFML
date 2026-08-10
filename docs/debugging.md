@@ -83,7 +83,7 @@ client IP rather than the proxy's (see the config reference below).
 |---|---|
 | **Queries** | Each `queryExecute` / `<cfquery>`: name, execution time, recordcount, datasource, issuing `template:line`, the SQL, and the **bound parameters** (value + cfsqltype). |
 | **Execution Time** | The request total, split into **Application** and **Query** time. |
-| **Templates** | Every template executed — the requested page, each `<cfinclude>`, every custom tag and `<cfmodule>` body, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg. Same scope as Lucee's Execution Time section ("templates, includes, modules, custom tags, and component method calls"); a body tag's start and end phases count as two executions, as they do on Lucee. |
+| **Files (Templates/Tags/CFCs)** | Every file executed — the requested page, each `<cfinclude>`, every custom tag and `<cfmodule>` body, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg. A CFC row is followed by indented `↳ method()` sub-rows giving the total / count / avg **per method**, so a file with 321 executions shows which methods those were. Same scope as Lucee's Execution Time section ("templates, includes, modules, custom tags, and component method calls"); a body tag's start and end phases count as two executions, as they do on Lucee. |
 | **Exceptions** | Exceptions raised during the request (including ones caught by `try`/`catch`), with type, message and tag context. |
 | **Trace / Log** | `writeLog` / `<cflog>` and `trace` / `<cftrace>` entries. |
 | **Generic data** | App- and framework-injected panels (see `debugAdd` below). |
@@ -105,7 +105,8 @@ Available whenever gates 1–2 pass:
 
 - **`getDebugData()`** → a struct with the sections above (`queries`, `pages`,
   `exceptions`, `traces`, `genericData`, `scopes`, `total`, …). Times are in
-  microseconds. Use it to build a custom/AJAX debug view or feed your own tooling.
+  microseconds. Each `pages` entry carries a `methods` array (`name`, `count`,
+  `total`) — the per-method breakdown, empty for a non-CFC file. Use it to build a custom/AJAX debug view or feed your own tooling.
 - **`isDebugMode()`** → boolean; `true` when the footer is active this request.
 - **`debugAdd(category, name, value)`** or **`debugAdd(category, struct)`** →
   append rows to the **Generic data** section. The supported channel for app code

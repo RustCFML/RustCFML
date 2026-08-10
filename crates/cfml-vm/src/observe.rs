@@ -115,6 +115,11 @@ pub struct QueryParam {
 /// `pages`/Templates section).
 pub struct TemplateEvent<'a> {
     pub path: &'a str,
+    /// The component method / lifecycle method this execution entered, when the
+    /// hit came from a CFC call. `None` for a plain template execution (an
+    /// `<cfinclude>`, custom tag or `<cfmodule>` body), which has no method
+    /// granularity. The footer uses it to break a per-file row down by method.
+    pub method: Option<&'a str>,
     /// Execution time in **microseconds**.
     pub elapsed_us: i64,
 }
