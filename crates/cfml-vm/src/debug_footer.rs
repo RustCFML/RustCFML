@@ -388,6 +388,62 @@ fn fmt_params_html(params: &[QueryParam]) -> String {
         .join(", ")
 }
 
+// ── Collapse/expand plumbing ────────────────────────────────────────────────
+//
+// Every collapsible thing in the footer — a file's per-method sub-rows, a
+// query's SQL, a whole scope dump — works the same way: the collapsible
+// elements carry a group class and `display:none`, and a `+`/`−` link flips
+// them. One inline script serves the lot; no external assets.
+
+/// The single inline script backing every toggle. Emitted once per footer,
+/// guarded so a page carrying two footers doesn't redefine it.
+///
+/// * `rcfmlTog(a, cls)` — flip everything in one group.
+/// * `rcfmlTogAll(a, rowCls, togCls)` — flip every group at once and re-sync
+///   the individual toggles so their icons can't disagree with the screen.
+const TOGGLE_SCRIPT: &str = "<script>if(!window.rcfmlTog){\
+window.rcfmlSetTog=function(a,open){a.setAttribute('data-open',open?'1':'0');a.textContent=open?'\u{2212}':'+';};\
+window.rcfmlTog=function(a,c){\
+var els=document.getElementsByClassName(c),open=a.getAttribute('data-open')!=='1',i;\
+for(i=0;i<els.length;i++){els[i].style.display=open?'':'none';}\
+window.rcfmlSetTog(a,open);return false;};\
+window.rcfmlTogAll=function(a,rc,tc){\
+var open=a.getAttribute('data-open')!=='1',\
+rows=document.getElementsByClassName(rc),togs=document.getElementsByClassName(tc),i;\
+for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
+for(i=0;i<togs.length;i++){window.rcfmlSetTog(togs[i],open);}\
+window.rcfmlSetTog(a,open);return false;};}</script>\n";
+
+const TOG_STYLE: &str =
+    "text-decoration:none;color:#333;font-weight:bold;cursor:pointer;margin-right:4px";
+
+/// A `+` link that flips one group of elements. `class_attr` tags it for the
+/// section's expand-all (empty when it has none).
+fn tog_link(group: &str, class_attr: &str, title: &str) -> String {
+    format!(
+        "<a href=\"#\"{} data-open=\"0\" onclick=\"return window.rcfmlTog(this,'{}')\" title=\"{}\" style=\"{}\">+</a>",
+        class_attr, group, title, TOG_STYLE
+    )
+}
+
+/// A `+` link that flips every group in a section at once.
+fn tog_all_link(row_class: &str, tog_class: &str, title: &str) -> String {
+    format!(
+        "<a href=\"#\" data-open=\"0\" onclick=\"return window.rcfmlTogAll(this,'{}','{}')\" title=\"{}\" style=\"{}\">+</a>",
+        row_class, tog_class, title, TOG_STYLE
+    )
+}
+
+/// An `<h4>` section heading with a leading `+` that shows/hides the block
+/// tagged with `group` (which the caller must render `display:none`).
+fn collapsible_heading(s: &mut String, group: &str, title: &str) {
+    s.push_str(&format!(
+        "<h4 style=\"margin:6px 0 2px\">{}{}</h4>\n",
+        tog_link(group, "", "show/hide this block"),
+        title
+    ));
+}
+
 /// Truncate a scope value's string form so a giant struct can't balloon the page.
 fn short_val(v: &CfmlValue) -> String {
     let s = v.as_string();
@@ -540,6 +596,7 @@ fn render_html(
         env!("CARGO_PKG_VERSION"),
         fmt_us(total_us)
     ));
+    s.push_str(TOGGLE_SCRIPT);
 
     // Queries
     if cfg.database {
@@ -551,8 +608,14 @@ fn render_html(
             s.push_str("<div>(none)</div>\n");
         } else {
             s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
-            s.push_str("<tr><th>name</th><th>ms</th><th>rows</th><th>datasource</th><th>src</th><th>sql &amp; params</th></tr>\n");
-            for q in &data.queries {
+            // The SQL + params live in a sub-row, collapsed by default, so a
+            // request with a dozen queries stays a readable one-line-per-query
+            // list. The header `+` opens them all.
+            s.push_str(&format!(
+                "<tr><th style=\"text-align:center;width:1em\">{}</th><th>name</th><th>ms</th><th>rows</th><th>datasource</th><th>src</th></tr>\n",
+                tog_all_link("rcfml-qrow", "rcfml-qtog", "show/hide every query's SQL")
+            ));
+            for (qidx, q) in data.queries.iter().enumerate() {
                 // highlight_ms is in ms; query time is in µs.
                 let slow = q.time >= cfg.highlight_ms * 1000;
                 let row_style = if slow {
@@ -572,16 +635,21 @@ fn render_html(
                     sql_cell.push_str(&fmt_params_html(&q.params));
                     sql_cell.push_str("</div>");
                 }
+                let grp = format!("rcfml-q{}", qidx);
                 s.push_str(&format!(
-                    "<tr{}><td>{}</td><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td><td>{}:{}</td><td>{}</td></tr>\n",
+                    "<tr{}><td style=\"text-align:center;width:1em\">{}</td><td>{}</td><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td><td>{}:{}</td></tr>\n",
                     row_style,
+                    tog_link(&grp, " class=\"rcfml-qtog\"", "show the SQL and bound params"),
                     esc(&q.name),
                     fmt_us(q.time),
                     q.count,
                     esc(&q.datasource),
                     esc(&q.src),
                     q.line,
-                    sql_cell,
+                ));
+                s.push_str(&format!(
+                    "<tr class=\"{} rcfml-qrow\" style=\"display:none\"><td></td><td colspan=\"5\">{}</td></tr>\n",
+                    grp, sql_cell,
                 ));
             }
             s.push_str("</table>\n");
@@ -624,37 +692,18 @@ fn render_html(
             "<h4 style=\"margin:6px 0 2px\">Files (Templates/Tags/CFCs) ({} executed)</h4>\n",
             pages.iter().map(|p| p.count).sum::<i64>()
         ));
-        // Expand/collapse for the per-method sub-rows. Emitted once, and only
-        // when at least one file actually has a breakdown, so a request with no
-        // CFC calls carries no script at all. Self-contained (no external JS)
-        // and idempotent — the guard lets a page carrying two footers work.
         let any_methods = pages.iter().any(|p| !p.methods.is_empty());
-        if any_methods {
-            s.push_str(
-                "<script>if(!window.rcfmlTogMethods){\
-window.rcfmlSetTog=function(a,open){a.setAttribute('data-open',open?'1':'0');a.textContent=open?'\u{2212}':'+';};\
-window.rcfmlTogMethods=function(a,c){\
-var rows=document.getElementsByClassName(c),open=a.getAttribute('data-open')!=='1',i;\
-for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
-window.rcfmlSetTog(a,open);return false;};\
-window.rcfmlTogAll=function(a){\
-var open=a.getAttribute('data-open')!=='1',\
-rows=document.getElementsByClassName('rcfml-mrow'),\
-togs=document.getElementsByClassName('rcfml-mtog'),i;\
-for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
-for(i=0;i<togs.length;i++){window.rcfmlSetTog(togs[i],open);}\
-window.rcfmlSetTog(a,open);return false;};}</script>\n",
-            );
-        }
         s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
         // The header cell of the toggle column expands/collapses EVERY file's
         // breakdown at once, and keeps the per-row icons in sync with it.
         let all_toggle = if any_methods {
-            "<a href=\"#\" data-open=\"0\" onclick=\"return window.rcfmlTogAll(this)\" \
-title=\"show/hide every per-method breakdown\" \
-style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>"
+            tog_all_link(
+                "rcfml-mrow",
+                "rcfml-mtog",
+                "show/hide every per-method breakdown",
+            )
         } else {
-            ""
+            String::new()
         };
         s.push_str(&format!(
             "<tr><th style=\"text-align:center;width:1em\">{}</th><th>total ms</th><th>app ms</th><th>query ms</th><th>count</th><th>avg ms</th><th>file</th></tr>\n",
@@ -677,11 +726,10 @@ style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>"
             let toggle = if p.methods.is_empty() {
                 String::new()
             } else {
-                format!(
-                    "<a href=\"#\" class=\"rcfml-mtog\" data-open=\"0\" onclick=\"return window.rcfmlTogMethods(this,'{}')\" \
-title=\"show the per-method breakdown\" \
-style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>",
-                    grp
+                tog_link(
+                    &grp,
+                    " class=\"rcfml-mtog\"",
+                    "show the per-method breakdown",
                 )
             };
             s.push_str(&format!(
@@ -768,16 +816,18 @@ style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>"
     // environment: process env vars + CLI flags) render directly under the cgi
     // scope — the natural place to look for "what was this engine started with"
     // while reading request context. Order: CFConfig, Environment, Runtime flags.
+    //
+    // These are bulk dumps — a cgi scope alone is ~30 rows and the environment
+    // block can be hundreds — so each one collapses behind its heading and
+    // starts closed, keeping the timing sections above it on screen.
     let mut env_rendered = false;
-    for (name, map) in scopes {
+    for (idx, (name, map)) in scopes.iter().enumerate() {
         if map.is_empty() {
             continue;
         }
-        s.push_str(&format!(
-            "<h4 style=\"margin:6px 0 2px\">{} scope</h4>\n",
-            esc(name)
-        ));
-        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        let grp = format!("rcfml-s{}", idx);
+        collapsible_heading(&mut s, &grp, &format!("{} scope", esc(name)));
+        s.push_str(&format!("<table class=\"{}\" border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"display:none;border-collapse:collapse\">\n", grp));
         for (k, v) in map.iter() {
             s.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td></tr>\n",
@@ -806,14 +856,15 @@ style=\"text-decoration:none;color:#333;font-weight:bold;cursor:pointer\">+</a>"
 fn render_env_and_flags(s: &mut String) {
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
     envs.sort_by(|a, b| a.0.cmp(&b.0));
-    s.push_str(&format!(
-        "<h4 style=\"margin:6px 0 2px\">Environment variables ({})</h4>\n",
-        envs.len()
-    ));
+    collapsible_heading(
+        s,
+        "rcfml-env",
+        &format!("Environment variables ({})", envs.len()),
+    );
     if envs.is_empty() {
-        s.push_str("<div>(none)</div>\n");
+        s.push_str("<div class=\"rcfml-env\" style=\"display:none\">(none)</div>\n");
     } else {
-        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        s.push_str("<table class=\"rcfml-env\" border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"display:none;border-collapse:collapse\">\n");
         for (k, v) in &envs {
             let shown = if v.len() > 200 {
                 let mut end = 200;
@@ -834,14 +885,11 @@ fn render_env_and_flags(s: &mut String) {
     }
 
     let flags: Vec<String> = std::env::args().skip(1).collect();
-    s.push_str(&format!(
-        "<h4 style=\"margin:6px 0 2px\">Runtime flags ({})</h4>\n",
-        flags.len()
-    ));
+    collapsible_heading(s, "rcfml-flags", &format!("Runtime flags ({})", flags.len()));
     if flags.is_empty() {
-        s.push_str("<div>(none)</div>\n");
+        s.push_str("<div class=\"rcfml-flags\" style=\"display:none\">(none)</div>\n");
     } else {
-        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        s.push_str("<table class=\"rcfml-flags\" border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"display:none;border-collapse:collapse\">\n");
         for f in &flags {
             s.push_str(&format!("<tr><td>{}</td></tr>\n", esc(f)));
         }
@@ -852,14 +900,13 @@ fn render_env_and_flags(s: &mut String) {
 /// Render the settings this deploy's cfconfig changed from engine defaults
 /// (already flattened + credential-redacted by [`cfconfig_diff_rows`]).
 fn render_cfconfig(s: &mut String, rows: &[(String, String)]) {
-    s.push_str(&format!(
-        "<h4 style=\"margin:6px 0 2px\">CFConfig ({})</h4>\n",
-        rows.len()
-    ));
+    collapsible_heading(s, "rcfml-cfg", &format!("CFConfig ({})", rows.len()));
     if rows.is_empty() {
-        s.push_str("<div>(engine defaults — no cfconfig overrides)</div>\n");
+        s.push_str(
+            "<div class=\"rcfml-cfg\" style=\"display:none\">(engine defaults — no cfconfig overrides)</div>\n",
+        );
     } else {
-        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        s.push_str("<table class=\"rcfml-cfg\" border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"display:none;border-collapse:collapse\">\n");
         for (k, v) in rows {
             s.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td></tr>\n",
@@ -1129,7 +1176,7 @@ mod tests {
         // getUser + GETUSER folded into one row with count 2
         assert!(!html.contains("GETUSER()"));
         // collapsed by default, with a `+` toggle on the CFC row only
-        assert!(html.contains("rcfmlTogMethods"));
+        assert!(html.contains("window.rcfmlTog=function"));
         assert!(html.contains("style=\"display:none;color:#555\""));
         assert_eq!(
             html.matches("class=\"rcfml-mtog\"").count(),
@@ -1137,8 +1184,29 @@ mod tests {
             "only the one file with methods gets a row toggle"
         );
         // plus the expand-all toggle in the column header
-        assert_eq!(html.matches("window.rcfmlTogAll(this)").count(), 1);
-        assert_eq!(html.matches("rcfml-mrow").count(), 3, "2 sub-rows + the JS");
+        assert_eq!(
+            html.matches("window.rcfmlTogAll(this,'rcfml-mrow','rcfml-mtog')")
+                .count(),
+            1
+        );
+        assert_eq!(
+            html.matches("rcfml-mrow").count(),
+            3,
+            "2 sub-rows + the expand-all onclick"
+        );
+        // queries: SQL/params moved into a collapsed sub-row, one toggle each
+        // plus the section-wide one in the header cell
+        assert_eq!(html.matches("class=\"rcfml-qtog\"").count(), 2);
+        assert_eq!(
+            html.matches("window.rcfmlTogAll(this,'rcfml-qrow','rcfml-qtog')")
+                .count(),
+            1
+        );
+        assert_eq!(
+            html.matches("<tr class=\"rcfml-q0 rcfml-qrow\" style=\"display:none\">")
+                .count(),
+            1
+        );
         assert!(html.contains("Exceptions (1)"));
         assert!(html.contains("kaboom"));
         assert!(html.contains("Generic data"));
@@ -1178,6 +1246,51 @@ mod tests {
             order.windows(2).all(|w| w[0] < w[1]),
             "expected URL, FORM, CGI, CFConfig, Environment, Runtime flags — got offsets {order:?}"
         );
+    }
+
+    #[test]
+    fn dump_blocks_are_collapsed_behind_their_headings() {
+        let scope = |k: &str| {
+            let mut m = ValueMap::default();
+            m.insert(k.to_string(), CfmlValue::string("v".to_string()));
+            m
+        };
+        let scopes = vec![
+            ("url".to_string(), scope("a")),
+            ("cgi".to_string(), scope("c")),
+        ];
+        let html = sample_collector().render(
+            &scopes,
+            Some("/index.cfm"),
+            &[("runtime.reportAsLucee".to_string(), "false".to_string())],
+        );
+        // Every dump block ships hidden, each behind its own heading toggle.
+        for grp in ["rcfml-s0", "rcfml-s1", "rcfml-cfg", "rcfml-env", "rcfml-flags"] {
+            assert!(
+                html.contains(&format!("window.rcfmlTog(this,'{grp}')")),
+                "{grp} has no heading toggle"
+            );
+            assert!(
+                html.contains(&format!("class=\"{grp}\"")),
+                "{grp} block is not tagged"
+            );
+        }
+        // …and none of them is visible on load: every tagged block carries
+        // display:none.
+        for block in html.split("class=\"rcfml-").skip(1) {
+            let tag = block.split('"').next().unwrap_or("");
+            if tag.starts_with('s')
+                || tag == "cfg"
+                || tag == "env"
+                || tag == "flags"
+            {
+                let head: String = block.chars().take(160).collect();
+                assert!(
+                    head.contains("display:none"),
+                    "rcfml-{tag} block renders expanded: {head}"
+                );
+            }
+        }
     }
 
     #[test]

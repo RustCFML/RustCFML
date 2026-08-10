@@ -81,13 +81,28 @@ client IP rather than the proxy's (see the config reference below).
 
 | Section | Contents |
 |---|---|
-| **Queries** | Each `queryExecute` / `<cfquery>`: name, execution time, recordcount, datasource, issuing `template:line`, the SQL, and the **bound parameters** (value + cfsqltype). |
+| **Queries** | Each `queryExecute` / `<cfquery>`: name, execution time, recordcount, datasource and issuing `template:line` on one line, with the SQL and the **bound parameters** (value + cfsqltype) in a collapsed sub-row behind that row's `+`. |
 | **Execution Time** | The request total, split into **Application** and **Query** time. |
 | **Files (Templates/Tags/CFCs)** | Every file executed — the requested page, each `<cfinclude>`, every custom tag and `<cfmodule>` body, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg. A CFC row is followed by indented `↳ method()` sub-rows giving the total / count / avg **per method**, so a file with 321 executions shows which methods those were. Same scope as Lucee's Execution Time section ("templates, includes, modules, custom tags, and component method calls"); a body tag's start and end phases count as two executions, as they do on Lucee. |
 | **Exceptions** | Exceptions raised during the request (including ones caught by `try`/`catch`), with type, message and tag context. |
 | **Trace / Log** | `writeLog` / `<cflog>` and `trace` / `<cftrace>` entries. |
 | **Generic data** | App- and framework-injected panels (see `debugAdd` below). |
-| **Scopes** | The configured request scopes (`cgi`, `url`, `form`, … — never `variables`/`local`). |
+| **Scopes** | The configured request scopes (`cgi`, `url`, `form`, … — never `variables`/`local`), plus the deploy blocks (CFConfig overrides, environment variables, runtime flags). Each is collapsed behind its heading. |
+
+### Expanding and collapsing
+
+The bulky parts of the footer ship collapsed so the timings stay on one screen,
+and open on a `+` you click:
+
+- **Queries** — the `+` on a row reveals its SQL and params; the `+` in the
+  column header opens every query at once.
+- **Files** — the `+` on a CFC row reveals its per-method breakdown; the `+` in
+  the column header opens every file at once.
+- **Scopes, CFConfig, Environment variables, Runtime flags** — the `+` on the
+  heading reveals that block.
+
+It is one small inline script and inline styles — no external assets, and
+nothing is fetched. The `comment` template has no toggles (it is plain text).
 
 ## Templates
 
