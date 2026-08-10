@@ -10856,6 +10856,26 @@ fn expand_sql_placeholders(sql: &str, counts: &[usize]) -> String {
                 i += 1;
             }
             if i < len { result.push('\''); }
+        } else if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            // A `--` comment is opaque: an apostrophe in it would open a
+            // phantom string, and a `?` in it must not consume a list slot.
+            while i < len && bytes[i] != b'\n' {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            result.push_str("/*");
+            i += 2;
+            while i < len && !(bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/') {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < len {
+                result.push_str("*/");
+                i += 2;
+            }
+            continue;
         } else {
             result.push(bytes[i] as char);
         }
@@ -11804,6 +11824,25 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec
                     while i < len && bytes[i] != b'\'' {
                         i += 1;
                     }
+                    i += 1;
+                    continue;
+                }
+                // Comments are opaque too: an apostrophe in one would open a
+                // phantom string literal, and a bare `:word` in one would bind
+                // a phantom parameter. The bytes stay in the unflushed segment.
+                if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+                    while i < len && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(len);
+                    continue;
                 }
                 i += 1;
             }
@@ -11936,8 +11975,9 @@ fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
 /// are ASCII alphanumeric + `_` (case-insensitively matched against the params
 /// struct), so camelCase names like `:dateCreated` are captured whole — unlike
 /// the mysql crate's lowercase-only named-param parser. Single-quoted string
-/// literals are skipped so a `:` inside them is not treated as a placeholder.
-/// `list=true` params expand to `?,?,…` (one per element). Mirrors
+/// literals and `--` / `/* */` comments are skipped so a `:` (or an apostrophe
+/// that would open a phantom string) inside them is not treated as a
+/// placeholder. `list=true` params expand to `?,?,…` (one per element). Mirrors
 /// build_sqlite_params' rewrite.
 #[cfg(feature = "mysql_db")]
 fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlValue>) {
@@ -11987,6 +12027,25 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
             while i < len && bytes[i] != b'\'' {
                 i += 1;
             }
+            i += 1;
+            continue;
+        }
+        // Comments are opaque: an apostrophe in one would open a phantom
+        // string literal, and a bare `:word` in one would bind a phantom
+        // parameter. The bytes stay in the unflushed segment.
+        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
         }
         i += 1;
     }
@@ -13129,9 +13188,11 @@ fn mssql_bind_params(params: &[CfmlValue]) -> Vec<MssqlParam> {
 }
 
 /// Rewrite positional `?` placeholders to tiberius/T-SQL `@P1`, `@P2`, … (1-based),
-/// skipping `?` inside single-quoted string literals. List-param `?` expansion
-/// already happened in `fn_query_execute`, so this is a 1:1 mapping onto the
-/// bound parameter vector.
+/// skipping `?` inside single-quoted string literals and `--` / `/* */`
+/// comments (an apostrophe in a comment would otherwise open a phantom string
+/// that swallows later placeholders). List-param `?` expansion already
+/// happened in `fn_query_execute`, so this is a 1:1 mapping onto the bound
+/// parameter vector.
 #[cfg(feature = "mssql_db")]
 fn mssql_rewrite_placeholders(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len() + 8);
@@ -13152,6 +13213,24 @@ fn mssql_rewrite_placeholders(sql: &str) -> String {
                 i += 1;
             }
             if i < len { result.push('\''); }
+        } else if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            result.push_str("/*");
+            i += 2;
+            while i < len && !(bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/') {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < len {
+                result.push_str("*/");
+                i += 2;
+            }
+            continue;
         } else {
             result.push(bytes[i] as char);
         }
@@ -18862,6 +18941,41 @@ mod mysql_named_param_tests {
         assert_eq!(vals[0].as_string(), "a");
         assert_eq!(vals[2].as_string(), "c");
     }
+
+    // --- comments are opaque to the rewrite (same bug class as GitHub PR #321) ---
+
+    #[test]
+    fn word_after_colon_in_line_comment_is_not_a_placeholder() {
+        let map = struct_of(&[("id", CfmlValue::Int(5))]);
+        let (sql, vals) = mysql_named_to_positional(
+            "select * from t where id = :id -- see :note for details",
+            &map,
+        );
+        assert_eq!(sql, "select * from t where id = ? -- see :note for details");
+        assert_eq!(vals.len(), 1);
+    }
+
+    #[test]
+    fn apostrophe_in_line_comment_does_not_open_string() {
+        let map = struct_of(&[("a", CfmlValue::Int(1)), ("b", CfmlValue::Int(2))]);
+        let (sql, vals) = mysql_named_to_positional(
+            "select :a as a -- it's a comment\n, :b as b",
+            &map,
+        );
+        assert_eq!(sql, "select ? as a -- it's a comment\n, ? as b");
+        assert_eq!(vals.len(), 2);
+    }
+
+    #[test]
+    fn apostrophe_in_block_comment_does_not_open_string() {
+        let map = struct_of(&[("a", CfmlValue::Int(1)), ("b", CfmlValue::Int(2))]);
+        let (sql, vals) = mysql_named_to_positional(
+            "select :a as a, /* don't panic */ :b as b",
+            &map,
+        );
+        assert_eq!(sql, "select ? as a, /* don't panic */ ? as b");
+        assert_eq!(vals.len(), 2);
+    }
 }
 
 /// A row-returning statement wrapped in parentheses — `( SELECT ... ) UNION ALL
@@ -18892,6 +19006,64 @@ mod sql_classifier_tests {
         assert!(!is_select_query("insert into t (a) values (1)"));
         assert!(!is_select_query("update t set a = 1"));
         assert!(!is_select_query("delete from t"));
+    }
+}
+
+/// SQL comments must be opaque to every placeholder scanner (same bug class as
+/// GitHub PR #321): an apostrophe in one would open a phantom string literal
+/// that swallows later placeholders, and a `?` in one must not consume a slot.
+#[cfg(all(test, any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+mod placeholder_comment_scan_tests {
+    use super::expand_sql_placeholders;
+
+    #[test]
+    fn list_expansion_skips_question_mark_in_comments() {
+        assert_eq!(
+            expand_sql_placeholders("select * from t -- what? really?\nwhere id in (?)", &[3]),
+            "select * from t -- what? really?\nwhere id in (?,?,?)"
+        );
+        assert_eq!(
+            expand_sql_placeholders("select * from t /* eh? */ where id in (?)", &[2]),
+            "select * from t /* eh? */ where id in (?,?)"
+        );
+    }
+
+    #[test]
+    fn list_expansion_apostrophe_in_comment_does_not_open_string() {
+        assert_eq!(
+            expand_sql_placeholders("select 1 -- it's a comment\nwhere id in (?)", &[2]),
+            "select 1 -- it's a comment\nwhere id in (?,?)"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_named_rewrite_skips_comments() {
+        use super::build_sqlite_params;
+        use cfml_common::dynamic::{CfmlValue, ValueMap};
+        let mut m = ValueMap::default();
+        m.insert("a".to_string(), CfmlValue::Int(1));
+        let (sql, vals) = build_sqlite_params(
+            &CfmlValue::strukt(m),
+            "select :a as a -- it's :note, not a param",
+        )
+        .unwrap();
+        assert_eq!(sql, "select ? as a -- it's :note, not a param");
+        assert_eq!(vals.len(), 1);
+    }
+
+    #[cfg(feature = "mssql_db")]
+    #[test]
+    fn mssql_rewrite_skips_comments() {
+        use super::mssql_rewrite_placeholders;
+        assert_eq!(
+            mssql_rewrite_placeholders("select ? as a -- what? it's fine\n, ? as b"),
+            "select @P1 as a -- what? it's fine\n, @P2 as b"
+        );
+        assert_eq!(
+            mssql_rewrite_placeholders("select ? as a, /* don't? */ ? as b"),
+            "select @P1 as a, /* don't? */ @P2 as b"
+        );
     }
 }
 

@@ -146,9 +146,11 @@ pub fn prepare_pg_statements(
 }
 
 /// Rewrite positional `?` placeholders to `$1..$n`, skipping quoted string
-/// literals, quoted identifiers (and their doubled-quote escapes) and
-/// dollar-quoted bodies. Returns the rewritten SQL and the number of
-/// placeholders consumed.
+/// literals, quoted identifiers (and their doubled-quote escapes),
+/// dollar-quoted bodies and `--` / `/* */` comments. Comments must be opaque:
+/// an apostrophe in one ("it's") would otherwise open a phantom string that
+/// swallows every later `?` in the statement. Returns the rewritten SQL and
+/// the number of placeholders consumed.
 fn rewrite_positional(stmt: &str) -> (String, usize) {
     let mut out = String::with_capacity(stmt.len() + 8);
     let mut count = 0usize;
@@ -163,6 +165,8 @@ fn rewrite_positional(stmt: &str) -> (String, usize) {
                 i += 1;
             }
             '\'' | '"' => i = copy_quoted_at(&chars, i, &mut out),
+            '-' if chars.get(i + 1) == Some(&'-') => i = copy_line_comment(&chars, i, &mut out),
+            '/' if chars.get(i + 1) == Some(&'*') => i = copy_block_comment(&chars, i, &mut out),
             '$' if dollar_delim_len(&chars, i).is_some() => {
                 let len = dollar_delim_len(&chars, i).unwrap();
                 i = copy_dollar_quoted(&chars, i, len, &mut out);
@@ -177,7 +181,10 @@ fn rewrite_positional(stmt: &str) -> (String, usize) {
 }
 
 /// Rewrite named `:name` placeholders to `$1..$n` (per statement), skipping
-/// quoted regions, dollar-quoted bodies and the `::` cast operator. Returns the
+/// quoted regions, dollar-quoted bodies, `--` / `/* */` comments and the `::`
+/// cast operator. Comments must be opaque twice over: an apostrophe in one
+/// would open a phantom string, and a bare `:word` in one ("see :note") would
+/// be rewritten to a `$n` that consumes a parameter slot. Returns the
 /// rewritten SQL and the ordered list of distinct names in first-seen order (a
 /// name reused within the statement reuses its `$n`).
 fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
@@ -190,6 +197,14 @@ fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
         let c = chars[i];
         if c == '\'' || c == '"' {
             i = copy_quoted_at(&chars, i, &mut out);
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            i = copy_line_comment(&chars, i, &mut out);
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i = copy_block_comment(&chars, i, &mut out);
             continue;
         }
         if let Some(len) = dollar_delim_len(&chars, i) {
@@ -247,6 +262,37 @@ fn copy_quoted_at(chars: &[char], i: usize, out: &mut String) -> usize {
             }
             return j + 1;
         }
+        j += 1;
+    }
+    j
+}
+
+/// Copy the `--` line comment opening at `chars[i]` into `out` verbatim.
+/// Returns the index of the terminating newline (left for the caller, so line
+/// counting/whitespace stays untouched) or EOF.
+fn copy_line_comment(chars: &[char], i: usize, out: &mut String) -> usize {
+    let mut j = i;
+    while j < chars.len() && chars[j] != '\n' {
+        out.push(chars[j]);
+        j += 1;
+    }
+    j
+}
+
+/// Copy the `/* */` block comment opening at `chars[i]` into `out` verbatim.
+/// Returns the index just past the closing `*/` (or EOF for an unterminated
+/// comment). Not nesting-aware, matching `split_sql_statements`.
+fn copy_block_comment(chars: &[char], i: usize, out: &mut String) -> usize {
+    out.push('/');
+    out.push('*');
+    let mut j = i + 2;
+    while j < chars.len() {
+        if chars[j] == '*' && chars.get(j + 1) == Some(&'/') {
+            out.push('*');
+            out.push('/');
+            return j + 2;
+        }
+        out.push(chars[j]);
         j += 1;
     }
     j
@@ -471,6 +517,93 @@ mod tests {
         .unwrap();
         assert_eq!(p[0].sql, "select id::text from t where id = $1");
         assert_eq!(params_str(&p[0]), vec!["abc"]);
+    }
+
+    // Comments must be opaque to the rewriters (GitHub PR #321): an apostrophe
+    // in one would otherwise open a phantom string literal that swallows every
+    // later placeholder, and a bare `:word` in one would consume a param slot.
+
+    #[test]
+    fn positional_apostrophe_in_line_comment_does_not_open_string() {
+        let p = prepare_pg_statements(
+            "select ?::int as a -- it's a comment\n, ?::int as b",
+            &arr(vec![CfmlValue::Int(1), CfmlValue::Int(2)]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            p[0].sql,
+            "select $1::int as a -- it's a comment\n, $2::int as b"
+        );
+        assert_eq!(p[0].params.len(), 2);
+    }
+
+    #[test]
+    fn positional_apostrophe_in_block_comment_does_not_open_string() {
+        let p = prepare_pg_statements(
+            "select ?::int as a, /* don't panic */ ?::int as b",
+            &arr(vec![CfmlValue::Int(1), CfmlValue::Int(2)]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            p[0].sql,
+            "select $1::int as a, /* don't panic */ $2::int as b"
+        );
+        assert_eq!(p[0].params.len(), 2);
+    }
+
+    #[test]
+    fn named_apostrophe_in_line_comment_does_not_open_string() {
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("a".to_string(), CfmlValue::Int(1));
+        m.insert("b".to_string(), CfmlValue::Int(2));
+        let p = prepare_pg_statements(
+            "select cast(:a as int) as a -- it's a comment\n, cast(:b as int) as b",
+            &CfmlValue::strukt(m),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            p[0].sql,
+            "select cast($1 as int) as a -- it's a comment\n, cast($2 as int) as b"
+        );
+        assert_eq!(params_str(&p[0]), vec!["1", "2"]);
+    }
+
+    #[test]
+    fn named_word_inside_line_comment_is_not_a_placeholder() {
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("a".to_string(), CfmlValue::Int(1));
+        let p = prepare_pg_statements(
+            "select cast(:a as int) as a -- see :note for details",
+            &CfmlValue::strukt(m),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            p[0].sql,
+            "select cast($1 as int) as a -- see :note for details"
+        );
+        assert_eq!(params_str(&p[0]), vec!["1"]);
+    }
+
+    #[test]
+    fn named_word_inside_block_comment_is_not_a_placeholder() {
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("a".to_string(), CfmlValue::Int(1));
+        m.insert("b".to_string(), CfmlValue::Int(2));
+        let p = prepare_pg_statements(
+            "select cast(:a as int) as a, /* cf. :note */ cast(:b as int) as b",
+            &CfmlValue::strukt(m),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            p[0].sql,
+            "select cast($1 as int) as a, /* cf. :note */ cast($2 as int) as b"
+        );
+        assert_eq!(params_str(&p[0]), vec!["1", "2"]);
     }
 
     #[test]
