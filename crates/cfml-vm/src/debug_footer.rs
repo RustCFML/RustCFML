@@ -452,11 +452,15 @@ fn tog_all_link(row_class: &str, tog_class: &str, title: &str) -> String {
 
 /// An `<h4>` section heading with a leading `+` that shows/hides the block
 /// tagged with `group` (which the caller must render `display:none`).
+///
+/// The WHOLE heading is the click target, not just the `+` — the anchor is
+/// only the state indicator. Its own onclick merely suppresses the `#`
+/// navigation; the click bubbles to the h4, so either way the toggle fires
+/// exactly once.
 fn collapsible_heading(s: &mut String, group: &str, title: &str) {
     s.push_str(&format!(
-        "<h4 style=\"margin:6px 0 2px\">{}{}</h4>\n",
-        tog_link(group, "", "show/hide this block"),
-        title
+        "<h4 style=\"margin:6px 0 2px;cursor:pointer;user-select:none\" title=\"show/hide this block\" onclick=\"return window.rcfmlTog(this.getElementsByTagName('a')[0],'{}')\"><a href=\"#\" data-open=\"0\" onclick=\"return false\" style=\"{}\">+</a>{}</h4>\n",
+        group, TOG_STYLE, title
     ));
 }
 
@@ -1270,9 +1274,9 @@ mod tests {
             "expected Execution Time < Files < Queries, got {time_at}/{files_at}/{queries_at}"
         );
         // Files and Queries collapse behind their headings and start CLOSED,
-        // same as the scope dumps.
-        assert!(html.contains("window.rcfmlTog(this,'rcfml-files')"));
-        assert!(html.contains("window.rcfmlTog(this,'rcfml-queries')"));
+        // same as the scope dumps — and the whole heading is the click target.
+        assert!(html.contains("window.rcfmlTog(this.getElementsByTagName('a')[0],'rcfml-files')"));
+        assert!(html.contains("window.rcfmlTog(this.getElementsByTagName('a')[0],'rcfml-queries')"));
         assert!(html.contains("<div class=\"rcfml-files\" style=\"display:none\">"));
         assert!(html.contains("<div class=\"rcfml-queries\" style=\"display:none\">"));
     }
@@ -1331,7 +1335,9 @@ mod tests {
         // Every dump block ships hidden, each behind its own heading toggle.
         for grp in ["rcfml-s0", "rcfml-s1", "rcfml-cfg", "rcfml-env", "rcfml-flags"] {
             assert!(
-                html.contains(&format!("window.rcfmlTog(this,'{grp}')")),
+                html.contains(&format!(
+                    "window.rcfmlTog(this.getElementsByTagName('a')[0],'{grp}')"
+                )),
                 "{grp} has no heading toggle"
             );
             assert!(
