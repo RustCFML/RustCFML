@@ -5,6 +5,14 @@
 //!
 //! Bodies were moved verbatim from the `execute_function_body` dispatch match
 //! (roadmap P3 slice 1). See `super` for the rules.
+//!
+//! Thirteen of these carry `#[inline(always)]` rather than `#[inline]`. They are
+//! the trivial ops LLVM chose to emit out of line after extraction — a call that
+//! did not exist when the body sat inside the dispatch match. Forcing the inline
+//! restores the original codegen and measures ~1% on realistic workloads (Preside
+//! TestBox quick suite: all 3 interleaved rounds faster, median -1.12%; Wheels
+//! core suite same direction; CLI suite neutral). Anything larger is left to
+//! LLVM's judgement, which declined for good reason on the big handlers.
 
 use crate::{
     binary_op, cfml_compare, cfml_equal, cfml_strict_equal, compare_op, numeric_op,
@@ -41,7 +49,7 @@ pub(crate) fn op_double(stack: &mut Vec<CfmlValue>, d: f64) {
     stack.push(CfmlValue::Double(d))
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_string(stack: &mut Vec<CfmlValue>, s: &str) {
     stack.push(CfmlValue::string(s.to_string()))
 }
@@ -50,19 +58,19 @@ pub(crate) fn op_string(stack: &mut Vec<CfmlValue>, s: &str) {
 // Stack shuffling
 // ---------------------------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_pop(stack: &mut Vec<CfmlValue>) {
     stack.pop();
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_dup(stack: &mut Vec<CfmlValue>) {
     if let Some(val) = stack.last() {
         stack.push(val.clone());
     }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_swap(stack: &mut Vec<CfmlValue>) {
     let len = stack.len();
     if len >= 2 {
@@ -141,7 +149,7 @@ pub(crate) fn op_int_div(stack: &mut Vec<CfmlValue>) {
     });
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_negate(stack: &mut Vec<CfmlValue>) {
     if let Some(val) = stack.pop() {
         match val {
@@ -238,7 +246,7 @@ pub(crate) fn op_or(stack: &mut Vec<CfmlValue>) {
     binary_op(stack, |a, b| CfmlValue::Bool(a.is_true() || b.is_true()));
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_not(stack: &mut Vec<CfmlValue>) {
     if let Some(a) = stack.pop() {
         stack.push(CfmlValue::Bool(!a.is_true()));
@@ -264,7 +272,7 @@ pub(crate) fn op_imp(stack: &mut Vec<CfmlValue>) {
 // Construction / containers
 // ---------------------------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_build_array(stack: &mut Vec<CfmlValue>, count: usize) {
     let mut elements = Vec::new();
     for _ in 0..count {
@@ -276,7 +284,7 @@ pub(crate) fn op_build_array(stack: &mut Vec<CfmlValue>, count: usize) {
     stack.push(CfmlValue::array(elements));
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_build_struct(stack: &mut Vec<CfmlValue>, count: usize) {
     let mut pairs = Vec::new();
     for _ in 0..count {
@@ -293,7 +301,7 @@ pub(crate) fn op_build_struct(stack: &mut Vec<CfmlValue>, count: usize) {
     stack.push(CfmlValue::strukt(map));
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_concat_arrays(stack: &mut Vec<CfmlValue>) {
     let right = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
     let left = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
@@ -308,7 +316,7 @@ pub(crate) fn op_concat_arrays(stack: &mut Vec<CfmlValue>) {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_merge_structs(stack: &mut Vec<CfmlValue>) {
     let right = stack.pop().unwrap_or(CfmlValue::strukt(ValueMap::default()));
     let left = stack.pop().unwrap_or(CfmlValue::strukt(ValueMap::default()));
@@ -327,7 +335,7 @@ pub(crate) fn op_merge_structs(stack: &mut Vec<CfmlValue>) {
 // Misc stack-only ops
 // ---------------------------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_is_null(stack: &mut Vec<CfmlValue>) {
     if let Some(val) = stack.pop() {
         stack.push(CfmlValue::Bool(matches!(val, CfmlValue::Null)));
@@ -336,14 +344,14 @@ pub(crate) fn op_is_null(stack: &mut Vec<CfmlValue>) {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_get_static_property(stack: &mut Vec<CfmlValue>, member: &str) {
     let holder = stack.pop().unwrap_or(CfmlValue::Null);
     let val = CfmlVirtualMachine::read_static_member(&holder, member).unwrap_or(CfmlValue::Null);
     stack.push(val);
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn op_catch_match(stack: &mut Vec<CfmlValue>, catch_type: &str) {
     // Peek (do NOT consume) the exception value the catch handler
     // was entered with, and push whether its `type` matches this
