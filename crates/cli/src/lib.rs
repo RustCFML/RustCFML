@@ -26,6 +26,25 @@ use std::process::exit;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use cfml_codegen::compiler::CfmlCompiler;
+
+/// Labels for the `call-phases` prologue report, in phase order.
+#[cfg(feature = "call-phases")]
+const CALL_PHASE_LABELS: [&str; 14] = [
+    "0 entry: fused-plan take, JIT probe, recursion guard",
+    "1 allocate: locals map, operand stack, slots, declared_locals",
+    "2 parent-scope seed copy",
+    "3 frame_ctx push",
+    "4 arguments scope + param binding + required check",
+    "5 called_name, call_stack push, entry depths",
+    "6 BODY (run-off-end frames only)",
+    "7 Return op arm: this/variables write-back, unwind, recycle",
+    "8 CALLER pre-call: arg_sources, arg pop, scope merge, slot spill",
+    "9 CALLER post-call: arg/closure/result write-back",
+    "10 call_function dispatch: disallowed check, id resolve, fused-parent plan",
+    "11 call_function return: source_file restore",
+    "12 wrapper execute_function_with_args: pre-body",
+    "13 wrapper execute_function_with_args: post-body (truncate, buffers, hooks)",
+];
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::logging;
 use cfml_common::vfs::{self, Vfs};
@@ -716,14 +735,22 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     // Op census for a plain script run (probe builds only). Must happen here:
     // the error arm below `exit(1)`s, and `run()`'s worker thread never rejoins
     // on that path.
-    #[cfg(feature = "op-census")]
+    #[cfg(any(feature = "op-census", feature = "call-phases"))]
     if cfml_common::perf_counters::enabled() {
+        #[cfg(feature = "op-census")]
         eprintln!(
             "{}",
             cfml_common::perf_counters::op_census::report(
                 &cfml_codegen::compiler::BytecodeOp::CENSUS_NAMES
             )
         );
+        #[cfg(feature = "call-phases")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::call_phases::report(&CALL_PHASE_LABELS)
+        );
+        #[cfg(feature = "call-phases")]
+        eprintln!("{}", cfml_common::perf_counters::call_phases::branch_report());
     }
     match result {
         Ok(response) => {
@@ -1353,6 +1380,13 @@ fn run_server(
                 &cfml_codegen::compiler::BytecodeOp::CENSUS_NAMES
             )
         );
+        #[cfg(feature = "call-phases")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::call_phases::report(&CALL_PHASE_LABELS)
+        );
+        #[cfg(feature = "call-phases")]
+        eprintln!("{}", cfml_common::perf_counters::call_phases::branch_report());
     }
 
     #[cfg(all(feature = "memprofile", unix))]
@@ -2134,6 +2168,13 @@ async fn handle_request(
                 &cfml_codegen::compiler::BytecodeOp::CENSUS_NAMES
             )
         );
+        #[cfg(feature = "call-phases")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::call_phases::report(&CALL_PHASE_LABELS)
+        );
+        #[cfg(feature = "call-phases")]
+        eprintln!("{}", cfml_common::perf_counters::call_phases::branch_report());
     }
     response
 }

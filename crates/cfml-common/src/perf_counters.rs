@@ -224,6 +224,103 @@ pub mod op_census {
     }
 }
 
+/// Phase attribution for the UDF call prologue (`call-phases` builds only).
+///
+/// The 2026-08-11 op census established that a UDF call costs ~700 ns of frame
+/// machinery against ~60 ns for a builtin dispatch, i.e. ~640 ns of pure setup,
+/// and that this — not interpreter dispatch — is the warm-request lever. Sizing
+/// the rework needs to know WHICH of the prologue's phases owns that budget, so
+/// this accumulates nanoseconds per phase across every call.
+///
+/// The clock itself is not free (`Instant::now()` is tens of ns on macOS), so
+/// [`CLOCK_CAL_NS`] accumulates the cost of a back-to-back pair of reads on the
+/// same path. Subtract `CLOCK_CAL_NS / CALLS` per phase boundary before reading
+/// any phase total as a real cost.
+#[cfg(feature = "call-phases")]
+pub mod call_phases {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub const N: usize = 14;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    /// Cumulative nanoseconds per phase.
+    pub static NS: [AtomicU64; N] = [ZERO; N];
+    /// Frames measured (every `execute_function_body` entry).
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Cumulative cost of one extra clock read per call — the calibration term.
+    pub static CLOCK_CAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn bump_calls() {
+        CALLS.fetch_add(1, Relaxed);
+    }
+
+    /// Frames that built the `arguments` scope EAGERLY vs took the lazy path
+    /// (Lever A). Phase 4 is 338 ns/frame on live Preside, so which side of this
+    /// branch the real workload sits on decides whether the fix is "make eager
+    /// cheaper" or "make more calls lazy".
+    pub static ARGS_EAGER: AtomicU64 = AtomicU64::new(0);
+    pub static ARGS_LAZY: AtomicU64 = AtomicU64::new(0);
+    /// Frames whose `Return` arm did the component-method `this`/`variables`
+    /// write-back (phase 7's expensive branch) vs those that skipped it.
+    pub static RET_THIS_WRITEBACK: AtomicU64 = AtomicU64::new(0);
+    pub static RET_PLAIN: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn bump_calls_args(eager: bool) {
+        if eager { ARGS_EAGER.fetch_add(1, Relaxed) } else { ARGS_LAZY.fetch_add(1, Relaxed) };
+    }
+
+    #[inline]
+    pub fn bump_ret(has_this: bool) {
+        if has_this { RET_THIS_WRITEBACK.fetch_add(1, Relaxed) } else { RET_PLAIN.fetch_add(1, Relaxed) };
+    }
+
+    pub fn branch_report() -> String {
+        let g = |c: &AtomicU64| c.load(Relaxed);
+        let (e, l) = (g(&ARGS_EAGER), g(&ARGS_LAZY));
+        let (t, pl) = (g(&RET_THIS_WRITEBACK), g(&RET_PLAIN));
+        format!(
+            "--- call-path branch split ---\n\
+             arguments scope eager:  {:>12}  ({:.1}%)\n\
+             arguments scope lazy:   {:>12}  ({:.1}%)\n\
+             Return with this-wb:    {:>12}  ({:.1}%)\n\
+             Return plain:           {:>12}  ({:.1}%)",
+            e, e as f64 / (e + l).max(1) as f64 * 100.0,
+            l, l as f64 / (e + l).max(1) as f64 * 100.0,
+            t, t as f64 / (t + pl).max(1) as f64 * 100.0,
+            pl, pl as f64 / (t + pl).max(1) as f64 * 100.0,
+        )
+    }
+
+    #[inline]
+    pub fn add(phase: usize, ns: u64) {
+        if let Some(c) = NS.get(phase) {
+            c.fetch_add(ns, Relaxed);
+        }
+    }
+
+    pub fn report(labels: &[&str]) -> String {
+        let calls = CALLS.load(Relaxed).max(1);
+        let cal = CLOCK_CAL_NS.load(Relaxed) as f64 / calls as f64;
+        let tot: u64 = NS.iter().map(|c| c.load(Relaxed)).sum();
+        let mut out = format!(
+            "--- UDF call-prologue phases: {} frames, {:.1} ns/frame measured \
+             (clock read ≈ {:.1} ns, already subtracted below) ---",
+            calls,
+            tot as f64 / calls as f64,
+            cal
+        );
+        for (i, label) in labels.iter().enumerate() {
+            let raw = NS[i].load(Relaxed) as f64 / calls as f64;
+            let net = (raw - cal).max(0.0);
+            out.push_str(&format!("\n{:>9.1} ns/frame  {}", net, label));
+        }
+        out
+    }
+}
+
 /// Call-site attribution for `CfmlStruct` construction (`alloc-sizing` builds
 /// only). Every constructor in the chain (`new`/`new_untracked` and their thin
 /// wrappers) carries `#[track_caller]`, so `Location::caller()` here resolves

@@ -103,6 +103,7 @@ obs-pprof = ["dep:pprof"]
 # RUSTCFML_COUNTERS report. Sizing builds only — see cfml-common/Cargo.toml.
 alloc-sizing = ["cfml-common/alloc-sizing"]
 op-census = ["cfml-common/op-census", "cfml-vm/op-census"]
+call-phases = ["cfml-common/call-phases", "cfml-vm/call-phases"]
 # Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
 # whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
 dhat-heap = ["dep:dhat"]

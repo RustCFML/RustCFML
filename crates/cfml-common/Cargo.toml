@@ -35,6 +35,11 @@ alloc-sizing = []
 # the mix Preside really runs instead of the static op-weight scan. Probe builds
 # only; a default build has no counter and no branch. See PERFORMANCE_ROADMAP P3.
 op-census = []
+# UDF call-prologue phase attribution (the 2026-08-11 lever: ~640ns of frame
+# setup per call). Times each prologue phase with a real clock, so it perturbs
+# the very thing it measures — read it for SHARES, never as an absolute. Probe
+# builds only.
+call-phases = []
 
 [dependencies]
 thiserror = { workspace = true }

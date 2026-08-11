@@ -5546,6 +5546,8 @@ impl CfmlVirtualMachine {
         args: Vec<CfmlValue>,
         parent_scope: Option<&ValueMap>,
     ) -> CfmlResult {
+        #[cfg(feature = "call-phases")]
+        let _cp_wrap = std::time::Instant::now();
         let call_depth_before = self.call_stack.len();
         let frame_ctx_before = self.frame_ctx.len();
         let try_depth_before = self.try_stack.len();
@@ -5591,7 +5593,15 @@ impl CfmlVirtualMachine {
             }
         }
 
+        #[cfg(feature = "call-phases")]
+        {
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                12, _n.duration_since(_cp_wrap).as_nanos() as u64);
+        }
         let result = self.execute_function_body(func, args, parent_scope);
+        #[cfg(feature = "call-phases")]
+        let _cp_wrap = std::time::Instant::now();
         // Never grow past where we started: a complete call must leave the
         // call/try stacks exactly as it found them. truncate() only shrinks, so a
         // balanced clean exit (len == before) and __main__'s unconditional pop
@@ -5641,6 +5651,12 @@ impl CfmlVirtualMachine {
                     is_error: result.is_err(),
                 });
             }
+        }
+        #[cfg(feature = "call-phases")]
+        {
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                13, _n.duration_since(_cp_wrap).as_nanos() as u64);
         }
         result
     }
@@ -5836,6 +5852,21 @@ impl CfmlVirtualMachine {
         // an unrelated later call. When set, `parent_scope` is the RAW caller
         // locals and the frame seed below merges (env ∪ filtered caller)
         // straight into `locals` (perf plan 3.2 stage 1).
+        // Call-prologue phase attribution (`call-phases` probe builds only).
+        // `_cp_t` is re-based at every mark, so each phase is measured in
+        // isolation; `_cp0` is a second read taken immediately after the first,
+        // whose delta calibrates the clock cost out of the per-phase totals.
+        #[cfg(feature = "call-phases")]
+        let mut _cp_t = std::time::Instant::now();
+        #[cfg(feature = "call-phases")]
+        {
+            let _cp0 = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::CLOCK_CAL_NS
+                .fetch_add(_cp0.duration_since(_cp_t).as_nanos() as u64,
+                           std::sync::atomic::Ordering::Relaxed);
+            cfml_common::perf_counters::call_phases::bump_calls();
+            _cp_t = _cp0;
+        }
         let fused_plan = self.pending_fused_parent.take();
         if fuse_counters::enabled() {
             fuse_counters::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5984,6 +6015,14 @@ impl CfmlVirtualMachine {
         // loops never trigger an incremental rehash-and-grow.
         let parent_len = parent_scope.map(|p| p.len()).unwrap_or(0);
         let seed_cap = parent_len + func.params.len();
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 0: entry: fused-plan take, JIT probe, recursion guard, depth
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                0, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+        }
         // Lever D1 (scope-pool): reuse a per-call `locals` backing from the
         // free-list; recycled at the non-escaping success exits below. Flag-off
         // path is the original per-call allocation, byte-identical.
@@ -6096,6 +6135,14 @@ impl CfmlVirtualMachine {
         // "locals" are the page `variables` scope), so its includes must not
         // leak page vars in as `local.*`.
         let frame_has_local_scope = !is_template_frame || share_local_keys.is_some();
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 1: allocate: locals map, stack, slots, declared_locals, flags
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                1, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+        }
         if let Some(plan) = fused_plan {
             // Fused path (perf plan 3.2 stage 1): `parent_scope` is the RAW
             // caller locals; merge (captured env ∪ filtered caller) straight
@@ -6185,6 +6232,14 @@ impl CfmlVirtualMachine {
             }
         }
         let inherited_from_parent = inherited_from_parent.into_shared();
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 2: parent-scope seed copy
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                2, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+        }
 
         // Record this frame's call context for `build_call_parent_scope`. Pushed
         // for EVERY frame (templates included, unlike `call_stack`) so a bare
@@ -6193,6 +6248,14 @@ impl CfmlVirtualMachine {
         // `execute_function_with_args` (robust to `__main__`'s early pop). GH #259.
         self.frame_ctx
             .push((inherited_from_parent.clone(), is_template_frame));
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 3: frame_ctx push
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                3, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+        }
 
         // Build CFML arguments scope.
         //
@@ -6223,6 +6286,8 @@ impl CfmlVirtualMachine {
                 .is_some_and(|e| !e.is_empty());
         let build_arguments_eager =
             is_template_frame || has_overflow_args || self.arguments_scope_needed(func);
+        #[cfg(feature = "call-phases")]
+        cfml_common::perf_counters::call_phases::bump_calls_args(build_arguments_eager);
         // Call-dispatch Lever C: when the eager `arguments` scope provably can't
         // escape this frame, build it UNTRACKED (skip the per-alloc cycle-GC
         // `log_struct` = `LocalKey::with` + `Weak::downgrade`). Template frames
@@ -6411,6 +6476,15 @@ impl CfmlVirtualMachine {
             self.pending_extra_named_args.take();
         }
 
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 4: arguments scope build + param binding + required check
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                4, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+        }
+
         // The name this call was dispatched under (a member-call alias, if any).
         // Always drained so it can't leak into a later call; falls back to the
         // function's declared name for plain named calls.
@@ -6458,6 +6532,15 @@ impl CfmlVirtualMachine {
         // leave the frame, so codegen handles those with `AbandonTagPairs`.)
         let entry_tag_depth = self.custom_tag_stack.len();
         let entry_buffers_depth = self.saved_output_buffers.len();
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 5: called_name, call_stack push, entry-depth capture
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                5, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+            let _ = _cp_t; // last mark: the dispatch loop follows
+        }
 
         loop {
             // `cfexit` unwind: a pending exit signal terminates the current
@@ -8181,6 +8264,8 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Call(arg_count) => {
+                    #[cfg(feature = "call-phases")]
+                    let _cp_call = std::time::Instant::now();
                     // Identify which local variables are being passed as args
                     // (for pass-by-reference writeback of complex types)
                     // ip was already incremented past this Call op, so use ip-1
@@ -8285,7 +8370,16 @@ impl CfmlVirtualMachine {
                         } else {
                             Some(std::mem::take(&mut self.try_stack))
                         };
+                        #[cfg(feature = "call-phases")]
+                        let _cp_call = {
+                            let _n = std::time::Instant::now();
+                            cfml_common::perf_counters::call_phases::add(
+                                8, _n.duration_since(_cp_call).as_nanos() as u64);
+                            _n
+                        };
                         let call_result = self.call_function(&func_ref, args, effective_locals);
+                        #[cfg(feature = "call-phases")]
+                        let _cp_call = std::time::Instant::now();
                         if let Some(saved) = saved_try_stack {
                             self.try_stack = saved;
                         }
@@ -8362,6 +8456,12 @@ impl CfmlVirtualMachine {
                                     return Err(e);
                                 }
                             }
+                        }
+                        #[cfg(feature = "call-phases")]
+                        {
+                            let _n = std::time::Instant::now();
+                            cfml_common::perf_counters::call_phases::add(
+                                9, _n.duration_since(_cp_call).as_nanos() as u64);
                         }
                     } else {
                         stack.push(CfmlValue::Null);
@@ -9026,6 +9126,11 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Return => {
+                    #[cfg(feature = "call-phases")]
+                    let _cp_ret = std::time::Instant::now();
+                    #[cfg(feature = "call-phases")]
+                    cfml_common::perf_counters::call_phases::bump_ret(
+                        locals.get("this").is_some());
                     // Save modified 'this' for component method write-back
                     if let Some(this_val) = locals.get("this") {
                         self.method_this_writeback = Some(this_val.clone());
@@ -9190,6 +9295,12 @@ impl CfmlVirtualMachine {
                     #[cfg(feature = "scope-pool")]
                     if !is_template_frame {
                         self.recycle_locals_map(std::mem::take(&mut locals));
+                    }
+                    #[cfg(feature = "call-phases")]
+                    {
+                        let _n = std::time::Instant::now();
+                        cfml_common::perf_counters::call_phases::add(
+                            7, _n.duration_since(_cp_ret).as_nanos() as u64);
                     }
                     return Ok(stack.pop().unwrap_or(CfmlValue::Null));
                 }
@@ -11493,6 +11604,15 @@ impl CfmlVirtualMachine {
             }
         }
 
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 6: the BODY (run-off-the-end path only; a `return` exits the
+            // loop through its own arm and is not measured here)
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                6, _n.duration_since(_cp_t).as_nanos() as u64);
+            _cp_t = _n;
+        }
         // Pop call frame on function exit
         self.call_stack.pop();
         // Discard any try-handlers this frame leaked by returning from inside an
@@ -11644,6 +11764,14 @@ impl CfmlVirtualMachine {
         if !is_template_frame {
             self.recycle_locals_map(std::mem::take(&mut locals));
         }
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 7: epilogue (frame pop, unwind, this/variables write-back,
+            // locals recycle)
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                7, _n.duration_since(_cp_t).as_nanos() as u64);
+        }
         Ok(stack.pop().unwrap_or(CfmlValue::Null))
     }
 
@@ -11743,6 +11871,8 @@ impl CfmlVirtualMachine {
         mut args: Vec<CfmlValue>,
         parent_locals: &ValueMap,
     ) -> CfmlResult {
+        #[cfg(feature = "call-phases")]
+        let _cp_disp = std::time::Instant::now();
         if let CfmlValue::Function(func) = func_ref {
             // security.disallowedFunctions: enforced at the very top so the
             // user-defined fast path below can't bypass it. Checked once per
@@ -11844,13 +11974,27 @@ impl CfmlVirtualMachine {
                             self.pending_called_name = Some(func.name.clone());
                         }
                         self.pending_fused_parent = Some(fused_parent_plan);
+                        #[cfg(feature = "call-phases")]
+                        {
+                            let _n = std::time::Instant::now();
+                            cfml_common::perf_counters::call_phases::add(
+                                10, _n.duration_since(_cp_disp).as_nanos() as u64);
+                        }
                         let result = self.execute_function_with_args(
                             &user_func,
                             args,
                             Some(parent_locals),
                         );
+                        #[cfg(feature = "call-phases")]
+                        let _cp_disp = std::time::Instant::now();
                         if let Some(prev) = saved_source_file {
                             self.source_file = prev;
+                        }
+                        #[cfg(feature = "call-phases")]
+                        {
+                            let _n = std::time::Instant::now();
+                            cfml_common::perf_counters::call_phases::add(
+                                11, _n.duration_since(_cp_disp).as_nanos() as u64);
                         }
                         return result;
                     }
