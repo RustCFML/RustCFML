@@ -471,6 +471,14 @@ include "harness.cfm";
 <cf_runtest file="tags/test_customtag_caller_semantics.cfm">
 <cf_runtest file="tags/test_custom_tag_attribute_collection.cfm">
 <cf_runtest file="tags/test_tags_customtag_lifecycle.cfm">
+<!--- - customtag_path_deep_search: a custom tag in a SUBDIRECTORY of a --->
+<!--- this.customtagpaths dir must resolve (Lucee with customTagDeepSearch --->
+<!--- on, which is how Lucee-based projects ship). RustCFML resolves the --->
+<!--- path root (in-suite control) but never descends: "Custom tag --->
+<!--- 'cf_ctpath_deep' not found". Runtime-level (catchable), runner-safe. --->
+<!--- Fixture dirs under tests/tags/ctpathroot/; the path itself is declared --->
+<!--- in tests/Application.cfc. Reduced from the titan (Moopa) codebase port. --->
+<cf_runtest file="tags/test_customtag_path_deep_search.cfm">
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
 <cf_runtest file="tags/test_tags_cfexecute.cfm">
 <cf_runtest file="tags/test_tags_cfmail.cfm">
