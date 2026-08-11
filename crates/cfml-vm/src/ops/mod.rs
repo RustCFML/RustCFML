@@ -40,6 +40,10 @@
 //! Slice 2: the arms needing the live VM plus `ip` — `Div`/`Concat` (catchable
 //! errors), `Throw`/`Rethrow`, `Print`, and the custom-tag/jump ops — in
 //! `effect.rs`, which documents how `continue` and `return Err` translate.
+//!
+//! Slice 3: the four hot property/index arms (`GetProperty`/`TryGetProperty`,
+//! `GetIndex`, `SetProperty`, `GetKeys`) in `access.rs` — ~694 lines.
 
+pub(crate) mod access;
 pub(crate) mod effect;
 pub(crate) mod value;
