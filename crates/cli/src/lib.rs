@@ -713,6 +713,18 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     // Buffered `<cflog>` lines must reach disk before we return or `exit(1)`
     // — the error path below never unwinds, so no Drop guard would run.
     logging::flush_all();
+    // Op census for a plain script run (probe builds only). Must happen here:
+    // the error arm below `exit(1)`s, and `run()`'s worker thread never rejoins
+    // on that path.
+    #[cfg(feature = "op-census")]
+    if cfml_common::perf_counters::enabled() {
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::op_census::report(
+                &cfml_codegen::compiler::BytecodeOp::CENSUS_NAMES
+            )
+        );
+    }
     match result {
         Ok(response) => {
             if !response.output.is_empty() {
@@ -1334,6 +1346,13 @@ fn run_server(
 
     if cfml_common::perf_counters::enabled() {
         eprintln!("{}", cfml_common::perf_counters::report());
+        #[cfg(feature = "op-census")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::op_census::report(
+                &cfml_codegen::compiler::BytecodeOp::CENSUS_NAMES
+            )
+        );
     }
 
     #[cfg(all(feature = "memprofile", unix))]
@@ -2108,6 +2127,13 @@ async fn handle_request(
     // reports. Diagnostics only, opt-in via RUSTCFML_COUNTERS=1.
     if cfml_common::perf_counters::enabled() {
         eprintln!("{}", cfml_common::perf_counters::report());
+        #[cfg(feature = "op-census")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::op_census::report(
+                &cfml_codegen::compiler::BytecodeOp::CENSUS_NAMES
+            )
+        );
     }
     response
 }

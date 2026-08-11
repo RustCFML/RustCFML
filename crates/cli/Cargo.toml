@@ -102,6 +102,7 @@ obs-pprof = ["dep:pprof"]
 # GH#297 sizing: struct-allocation call-site attribution appended to the
 # RUSTCFML_COUNTERS report. Sizing builds only — see cfml-common/Cargo.toml.
 alloc-sizing = ["cfml-common/alloc-sizing"]
+op-census = ["cfml-common/op-census", "cfml-vm/op-census"]
 # Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
 # whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
 dhat-heap = ["dep:dhat"]

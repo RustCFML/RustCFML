@@ -6474,6 +6474,12 @@ impl CfmlVirtualMachine {
             let op = &func.instructions[ip];
             ip += 1;
 
+            // Dynamic op census (probe builds only — `--features op-census`).
+            // One relaxed add per executed op; sizes the Tier-0 JIT against the
+            // mix the workload really runs rather than the static op-weight scan.
+            #[cfg(feature = "op-census")]
+            cfml_common::perf_counters::op_census::bump(op.census_index());
+
             match op {
                 BytecodeOp::Null => ops::value::op_null(&mut stack),
                 BytecodeOp::True => ops::value::op_true(&mut stack),

@@ -160,6 +160,70 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
     )
 }
 
+/// Dynamic op census (`op-census` builds only) — how many times each bytecode
+/// op is actually EXECUTED, as opposed to how many times it appears in compiled
+/// bodies. The 2026-08 JIT admission scan weighted ops statically; a Tier-0
+/// design has to be sized against the dynamic mix, because loops mean a
+/// function's ops do not execute once per frame entry. Indexed by
+/// `BytecodeOp::census_index()`; the VM's dispatch loop bumps one relaxed add
+/// per op, which is why this lives behind a feature and never ships on.
+#[cfg(feature = "op-census")]
+pub mod op_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Room for every `BytecodeOp` variant (121 today) plus headroom, so adding
+    /// an op cannot silently start writing out of bounds.
+    pub const SLOTS: usize = 192;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    pub static COUNTS: [AtomicU64; SLOTS] = [ZERO; SLOTS];
+
+    #[inline]
+    pub fn bump(idx: usize) {
+        if let Some(c) = COUNTS.get(idx) {
+            c.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Snapshot every non-zero slot as `(index, count)`, so callers can diff two
+    /// snapshots to isolate one request's mix from cumulative boot totals.
+    pub fn snapshot() -> Vec<(usize, u64)> {
+        COUNTS
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.load(Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+
+    /// Human-readable descending report. `names` comes from
+    /// `BytecodeOp::CENSUS_NAMES` (cfml-common cannot depend on cfml-codegen,
+    /// so the embedder passes it in).
+    pub fn report(names: &[&str]) -> String {
+        let mut rows = snapshot();
+        let total: u64 = rows.iter().map(|(_, n)| *n).sum();
+        rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let mut out = format!(
+            "--- dynamic op census: {} ops executed across {} distinct opcodes ---",
+            total,
+            rows.len()
+        );
+        let mut cum = 0u64;
+        for (i, n) in &rows {
+            cum += n;
+            out.push_str(&format!(
+                "\n{:>14} {:>6.2}% {:>6.2}%cum  {}",
+                n,
+                *n as f64 / total.max(1) as f64 * 100.0,
+                cum as f64 / total.max(1) as f64 * 100.0,
+                names.get(*i).copied().unwrap_or("<unknown>"),
+            ));
+        }
+        out
+    }
+}
+
 /// Call-site attribution for `CfmlStruct` construction (`alloc-sizing` builds
 /// only). Every constructor in the chain (`new`/`new_untracked` and their thin
 /// wrappers) carries `#[track_caller]`, so `Location::caller()` here resolves
