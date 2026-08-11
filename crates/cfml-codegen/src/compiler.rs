@@ -1587,6 +1587,15 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::LoadLocal(Name::from(&name)));
             }
             AssignTarget::StructAccess(obj, member) => {
+                // `local.x += 1`: read the single frame key (same Null-on-miss
+                // filter as the materialized-view read below, minus the clone —
+                // and slot-resolvable, see `emit_load_for_writeback`).
+                if let Expression::Identifier(ref ident) = **obj {
+                    if ident.name.eq_ignore_ascii_case("local") {
+                        instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&member)));
+                        return;
+                    }
+                }
                 // Compound assign (`s.x += 1`) reads the current value; preserve the
                 // pre-existing Null-on-miss behaviour (treated as 0/"") rather than
                 // throwing when the target member doesn't exist yet.
@@ -1675,6 +1684,26 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::StoreLocal(Name::intern("this")));
             }
             Expression::MemberAccess(access) => {
+                // `local.X` is the function frame itself, not a struct living in
+                // it: write the single key with the SAME ops a plain
+                // `local.X = v` assignment emits (DeclareLocal + StoreLocal, see
+                // the Statement::Assignment StructAccess arm). The generic path
+                // below would instead materialize the ENTIRE per-call `local`
+                // scope view (`LoadLocal("local")`), SetProperty into that copy,
+                // and merge the whole copy back (`StoreLocal("local")`) — three
+                // costs for a one-key write: the view clone, the whole-map merge,
+                // and (since v0.584.0) permanent deactivation of the frame's
+                // slots, so every `local.i++`-idiom function lost the slot win.
+                // Only single-segment `local.X` is special-cased; `local.a.b`
+                // recurses here with `access.object == local.a` and reaches this
+                // arm one level up, which is exactly the right write for it.
+                if let Expression::Identifier(ref ident) = *access.object {
+                    if ident.name.eq_ignore_ascii_case("local") {
+                        instructions.push(BytecodeOp::DeclareLocal(Name::from(&access.member)));
+                        instructions.push(BytecodeOp::StoreLocal(Name::from(&access.member)));
+                        return;
+                    }
+                }
                 // Stack has modified child value. Load the parent, swap, set property.
                 // Then recurse to write back the parent.
                 self.emit_load_for_writeback(&access.object, instructions);
@@ -1723,6 +1752,18 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::LoadLocal(Name::intern("this")));
             }
             Expression::MemberAccess(access) => {
+                // `local.X` reads one key out of the frame, not a member of a
+                // materialized scope copy: the fused TryLoadLocalKey is the same
+                // read the normal expression path already emits for `local.X`
+                // (`compile_member_read_tolerant`), minus the whole-view clone —
+                // and it has a slot twin, so a `local.a.b = v` write-back keeps
+                // the frame's slots alive.
+                if let Expression::Identifier(ref ident) = *access.object {
+                    if ident.name.eq_ignore_ascii_case("local") {
+                        instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&access.member)));
+                        return;
+                    }
+                }
                 // For nested access like loading "s.a", we load s then get property a.
                 // Write-back reads a not-yet-existing link as Null (auto-viv), so the
                 // Try* twin — a throwing GetProperty would abort `s.a.b = v` when
@@ -5322,6 +5363,61 @@ mod slot_tests {
             "outer",
         );
         assert!(f.slot_names.is_empty(), "DefineFunction disqualifies");
+    }
+
+    /// Stage 1.5: writes through the explicit `local.` prefix must not
+    /// materialize/merge the whole `local` scope view. `local.i++` used to emit
+    /// LoadLocal("local") + SetProperty + StoreLocal("local"), whose whole-scope
+    /// merge also permanently deactivated the frame's slots.
+    #[test]
+    fn local_prefixed_member_writes_use_slots() {
+        let f = compile_named(
+            "function f() { local.i = 1; local.i++; local.t = 0; local.t += 2; return local.i; }",
+            "f",
+        );
+        assert!(
+            f.slot_names.iter().any(|n| n.lower() == "i")
+                && f.slot_names.iter().any(|n| n.lower() == "t"),
+            "local.i / local.t should be slotted, got {:?}",
+            f.slot_names
+        );
+        // No whole-scope view load or merge left behind.
+        assert!(
+            !f.instructions.iter().any(|op| matches!(
+                op,
+                BytecodeOp::LoadLocal(n) | BytecodeOp::StoreLocal(n) if n.lower() == "local"
+            )),
+            "`local` scope view still materialized: {:?}",
+            f.instructions
+        );
+        assert!(f
+            .instructions
+            .iter()
+            .any(|op| matches!(op, BytecodeOp::StoreSlot(..))));
+        assert!(f
+            .instructions
+            .iter()
+            .any(|op| matches!(op, BytecodeOp::LoadSlotKey(..) | BytecodeOp::TryLoadSlotKey(..))));
+    }
+
+    /// A nested `local.a.b` write still needs the parent read + set, but the
+    /// `local.a` link itself resolves through the frame (slot twin), never
+    /// through a materialized scope copy.
+    #[test]
+    fn nested_local_prefixed_write_reads_frame_key() {
+        let f = compile_named(
+            "function f() { local.a = { b = 1 }; local.a.b++; return local.a.b; }",
+            "f",
+        );
+        assert!(f.slot_names.iter().any(|n| n.lower() == "a"));
+        assert!(!f.instructions.iter().any(|op| matches!(
+            op,
+            BytecodeOp::LoadLocal(n) | BytecodeOp::StoreLocal(n) if n.lower() == "local"
+        )));
+        assert!(f
+            .instructions
+            .iter()
+            .any(|op| matches!(op, BytecodeOp::TryLoadSlotKey(..))));
     }
 
     #[test]
