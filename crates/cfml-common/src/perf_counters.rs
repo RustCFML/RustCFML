@@ -280,6 +280,21 @@ pub mod call_phases {
     /// write-back (phase 7's expensive branch) vs those that skipped it.
     pub static RET_THIS_WRITEBACK: AtomicU64 = AtomicU64::new(0);
     pub static RET_PLAIN: AtomicU64 = AtomicU64::new(0);
+    /// Inside the write-back diff: how many keys the `argument_scope_key_set`
+    /// HashSet lowercases and allocates per frame (a FIXED per-frame cost paid
+    /// before the key loop), and how many scanned locals actually reach that
+    /// set's `contains` probe — i.e. survive the cheap `__`/param/declared
+    /// filters. If almost none reach it, building the set eagerly is pure waste.
+    pub static ARGSET_BUILT: AtomicU64 = AtomicU64::new(0);
+    pub static ARGSET_KEYS: AtomicU64 = AtomicU64::new(0);
+    pub static ARGSET_PROBED: AtomicU64 = AtomicU64::new(0);
+    /// Worst case seen on any SINGLE frame. The allocation-free probe scans the
+    /// `arguments` keys per probing local, so its worst-case work is
+    /// probes x argKeys on one frame — where a build-once HashSet would have won.
+    /// These maxima say whether that tail is real or hypothetical.
+    pub static WB_MAX_ARGKEYS: AtomicU64 = AtomicU64::new(0);
+    pub static WB_MAX_PROBES: AtomicU64 = AtomicU64::new(0);
+    pub static WB_MAX_PRODUCT: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub fn bump_calls_args(eager: bool) {
@@ -312,6 +327,24 @@ pub mod call_phases {
         }
     }
 
+    #[inline]
+    pub fn record_wb_argset(keys: u64) {
+        ARGSET_BUILT.fetch_add(1, Relaxed);
+        ARGSET_KEYS.fetch_add(keys, Relaxed);
+    }
+
+    #[inline]
+    pub fn bump_wb_argset_probe() {
+        ARGSET_PROBED.fetch_add(1, Relaxed);
+    }
+
+    /// Per-frame maxima for the tail analysis above.
+    pub fn record_wb_frame(argkeys: u64, probes: u64) {
+        WB_MAX_ARGKEYS.fetch_max(argkeys, Relaxed);
+        WB_MAX_PROBES.fetch_max(probes, Relaxed);
+        WB_MAX_PRODUCT.fetch_max(argkeys * probes, Relaxed);
+    }
+
     pub fn branch_report() -> String {
         let g = |c: &AtomicU64| c.load(Relaxed);
         let (e, l) = (g(&ARGS_EAGER), g(&ARGS_LAZY));
@@ -332,7 +365,10 @@ pub mod call_phases {
                eager because body uses it:    {:>12}\n\
              classic-localMode wb diffs run:  {:>12}\n\
                .. that wrote ANY key:         {:>12}  ({:.1}%)\n\
-               .. keys scanned / written:     {:>12} / {}",
+               .. keys scanned / written:     {:>12} / {}\n\
+               .. argset builds / keys lc'd:  {:>12} / {}\n\
+               .. locals reaching argset:     {:>12}\n\
+               .. WORST single frame: argKeys {:>4}, probes {:>4}, product {:>6}",
             g(&ARGS_EAGER_TEMPLATE),
             g(&ARGS_EAGER_OVERFLOW),
             g(&ARGS_EAGER_REFERENCED),
@@ -341,6 +377,12 @@ pub mod call_phases {
             g(&CLOSURE_WB_NONEMPTY) as f64 / g(&CLOSURE_WB_SCANNED).max(1) as f64 * 100.0,
             g(&CLOSURE_WB_KEYS_SCANNED),
             g(&CLOSURE_WB_KEYS_WRITTEN),
+            g(&ARGSET_BUILT),
+            g(&ARGSET_KEYS),
+            g(&ARGSET_PROBED),
+            g(&WB_MAX_ARGKEYS),
+            g(&WB_MAX_PROBES),
+            g(&WB_MAX_PRODUCT),
         )
     }
 

@@ -51,9 +51,9 @@ const CALL_PHASE_LABELS: [&str; 24] = [
     "18   template-frame locals capture",
     "19   call_stack pop, try truncate, tag unwind",
     "20   locals-map recycle",
-    "21 (unused)",
-    "22 (unused)",
-    "23 (unused)",
+    "21     argument_scope_key_set build (fixed per frame)",
+    "22     fused-env baseline read lock",
+    "23     per-key diff loop",
 ];
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::logging;

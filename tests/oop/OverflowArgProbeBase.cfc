@@ -15,6 +15,14 @@ component {
 		return "PROP:" & arguments.name;
 	}
 
+	// Same shape, but the overflow named arg is passed with DIFFERENT CASING
+	// (`PROPERTY` vs the `property()` function). The writeback exclusion is
+	// case-insensitive, so this must not leak either.
+	function runConfigMixedCase() {
+		takesNamed(PROPERTY = "password", minimum = "4");
+		return property(name = "mixedCase");
+	}
+
 	// Mirrors Wheels' $initModelClass calling the developer's config() bare.
 	function runConfig() {
 		if (StructKeyExists(variables, "config")) {

@@ -9242,12 +9242,35 @@ impl CfmlVirtualMachine {
                     // locals — poisoning later bare-name calls.
                     if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
                         if !effective_local_mode_modern {
-                            let arg_scope_keys = Self::argument_scope_key_set(&locals);
+                            #[cfg(feature = "call-phases")]
+                            let mut _cp_wb = std::time::Instant::now();
+                            let arg_scope = Self::arguments_scope_struct(&locals);
+                            #[cfg(feature = "call-phases")]
+                            {
+                                // 16-split 21: arguments-scope hoist (was: the
+                                // eager argument_scope_key_set HashSet build)
+                                let _n = std::time::Instant::now();
+                                cfml_common::perf_counters::call_phases::add(
+                                    21, _n.duration_since(_cp_wb).as_nanos() as u64);
+                                _cp_wb = _n;
+                                cfml_common::perf_counters::call_phases::record_wb_argset(
+                                    arg_scope.map_or(0, |a| a.with_map(|m| m.len() as u64)));
+                            }
                             let fused_env_guard =
                                 fused_env_baseline.as_ref().and_then(|e| e.read().ok());
+                            #[cfg(feature = "call-phases")]
+                            {
+                                // 16-split 22: fused-env baseline read lock
+                                let _n = std::time::Instant::now();
+                                cfml_common::perf_counters::call_phases::add(
+                                    22, _n.duration_since(_cp_wb).as_nanos() as u64);
+                                _cp_wb = _n;
+                            }
                             let mut writeback = ValueMap::default();
                             #[cfg(feature = "call-phases")]
                             let _wb_scanned = locals.len() as u64;
+                            #[cfg(feature = "call-phases")]
+                            let mut _wb_probes: u64 = 0;
                             for (k, v) in &locals {
                                 // See the matching note on the normal-exit epilogue
                                 // below: arguments-scope keys (incl. overflow named
@@ -9258,8 +9281,15 @@ impl CfmlVirtualMachine {
                                     || k.starts_with("__")
                                     || func.params.contains(k)
                                     || declared_locals.contains(k.as_str())
-                                    || arg_scope_keys.contains(&k.to_lowercase())
                                 {
+                                    continue;
+                                }
+                                #[cfg(feature = "call-phases")]
+                                {
+                                    cfml_common::perf_counters::call_phases::bump_wb_argset_probe();
+                                    _wb_probes += 1;
+                                }
+                                if Self::arguments_scope_has_key(arg_scope, k) {
                                     continue;
                                 }
                                 // Baseline: the captured env first (fused path — env values
@@ -9275,10 +9305,19 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             #[cfg(feature = "call-phases")]
-                            cfml_common::perf_counters::call_phases::record_closure_wb(
-                                _wb_scanned,
-                                writeback.len() as u64,
-                            );
+                            {
+                                // 16-split 23: the per-key diff loop
+                                cfml_common::perf_counters::call_phases::add(
+                                    23, _cp_wb.elapsed().as_nanos() as u64);
+                                cfml_common::perf_counters::call_phases::record_closure_wb(
+                                    _wb_scanned,
+                                    writeback.len() as u64,
+                                );
+                                cfml_common::perf_counters::call_phases::record_wb_frame(
+                                    arg_scope.map_or(0, |a| a.with_map(|m| m.len() as u64)),
+                                    _wb_probes,
+                                );
+                            }
                             if !writeback.is_empty() {
                                 self.closure_parent_writeback = Some(writeback);
                             }
@@ -11729,7 +11768,7 @@ impl CfmlVirtualMachine {
         // caller locals with the new component's methods).
         if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
             if !effective_local_mode_modern {
-                let arg_scope_keys = Self::argument_scope_key_set(&locals);
+                let arg_scope = Self::arguments_scope_struct(&locals);
                 let fused_env_guard =
                     fused_env_baseline.as_ref().and_then(|e| e.read().ok());
                 let mut writeback = ValueMap::default();
@@ -11748,7 +11787,7 @@ impl CfmlVirtualMachine {
                         || k.starts_with("__")
                         || func.params.contains(k)
                         || declared_locals.contains(k.as_str())
-                        || arg_scope_keys.contains(&k.to_lowercase())
+                        || Self::arguments_scope_has_key(arg_scope, k)
                     {
                         continue;
                     }
@@ -20462,15 +20501,49 @@ impl CfmlVirtualMachine {
     /// leaking out as legacy-localmode parent-scope writebacks. Engine-internal
     /// sentinels (`__arguments_scope`/`__arguments_params`) and numeric
     /// positional keys are irrelevant here and harmlessly included.
-    fn argument_scope_key_set(locals: &ValueMap) -> std::collections::HashSet<String> {
+    /// The frame's `arguments` scope, if it has one — hoisted once per write-back
+    /// diff so the per-key probe below needs no allocation at all.
+    fn arguments_scope_struct(locals: &ValueMap) -> Option<&CfmlStruct> {
         match locals.get(ARGUMENTS_SCOPE_KEY) {
-            // Pure key read — no CFML runs in the closure, so take the lock
-            // rather than cloning the whole arguments scope to read its names.
-            Some(CfmlValue::Struct(args)) => {
-                args.with_map(|m| m.keys().map(|k| k.to_lowercase()).collect())
-            }
-            _ => std::collections::HashSet::new(),
+            Some(CfmlValue::Struct(args)) => Some(args),
+            _ => None,
         }
+    }
+
+    /// Is `k` a key of this frame's `arguments` scope?
+    ///
+    /// Exactly equivalent to the `HashSet<String>` of lowercased `arguments`
+    /// keys this replaced (`arg_scope_keys.contains(&k.to_lowercase())`), but
+    /// allocation-free. The set was built EAGERLY on every returning frame —
+    /// 8,083 HashSets and 20,081 `to_lowercase()` allocations per warm Preside
+    /// request (84.5 ns/frame, 69% of the whole diff) — to answer a question
+    /// only 1,270 keys per request ever asked, because the cheap
+    /// `__`/param/declared-local filters reject 96% of scanned locals first.
+    /// An `arguments` scope holds ~2.5 keys, so a case-insensitive linear scan
+    /// is far cheaper than hashing even when the probe DOES happen.
+    ///
+    /// Pure key read — no CFML runs under the guard, so take the lock rather
+    /// than cloning the whole arguments scope to read its names.
+    fn arguments_scope_has_key(args: Option<&CfmlStruct>, k: &str) -> bool {
+        let Some(args) = args else { return false };
+        args.with_map(|m| {
+            if m.contains_key(k) {
+                return true;
+            }
+            // Mirror the old two-sided `to_lowercase()` comparison: ASCII-fold
+            // when both sides are ASCII (always, for CFML identifiers), and fall
+            // back to full Unicode lowercasing otherwise so a non-ASCII named
+            // argument still matches case-insensitively.
+            let k_ascii = k.is_ascii();
+            let mut k_lower: Option<String> = None;
+            m.keys().any(|kk| {
+                if k_ascii && kk.is_ascii() {
+                    kk.eq_ignore_ascii_case(k)
+                } else {
+                    kk.to_lowercase() == *k_lower.get_or_insert_with(|| k.to_lowercase())
+                }
+            })
+        })
     }
 
     fn is_tag_call_builtin(name: &str) -> bool {
