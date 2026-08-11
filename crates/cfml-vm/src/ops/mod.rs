@@ -43,7 +43,12 @@
 //!
 //! Slice 3: the four hot property/index arms (`GetProperty`/`TryGetProperty`,
 //! `GetIndex`, `SetProperty`, `GetKeys`) in `access.rs` — ~694 lines.
+//!
+//! Slice 4: the frame-state arms needing exactly one frame field (`locals` or the
+//! slot vector) in `frame.rs`. A `FrameCtx` struct is deliberately deferred until
+//! an op genuinely needs most of the frame — true of the call/store ops, not these.
 
 pub(crate) mod access;
 pub(crate) mod effect;
+pub(crate) mod frame;
 pub(crate) mod value;
