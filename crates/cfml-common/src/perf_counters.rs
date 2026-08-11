@@ -240,7 +240,7 @@ pub mod op_census {
 pub mod call_phases {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub const N: usize = 14;
+    pub const N: usize = 24;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -262,6 +262,20 @@ pub mod call_phases {
     /// cheaper" or "make more calls lazy".
     pub static ARGS_EAGER: AtomicU64 = AtomicU64::new(0);
     pub static ARGS_LAZY: AtomicU64 = AtomicU64::new(0);
+    /// Which disjunct of `build_arguments_eager` fired (first-wins order:
+    /// template frame, overflow args, body actually references `arguments`).
+    /// Decides whether widening laziness is even possible.
+    pub static ARGS_EAGER_TEMPLATE: AtomicU64 = AtomicU64::new(0);
+    pub static ARGS_EAGER_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+    pub static ARGS_EAGER_REFERENCED: AtomicU64 = AtomicU64::new(0);
+    /// Frames whose classic-localMode parent write-back diff ran, and of those,
+    /// how many actually produced any write-back (phase-7 split item 16 is
+    /// 44% of the Return arm — if almost nothing is written back, the whole diff
+    /// is avoidable work).
+    pub static CLOSURE_WB_SCANNED: AtomicU64 = AtomicU64::new(0);
+    pub static CLOSURE_WB_NONEMPTY: AtomicU64 = AtomicU64::new(0);
+    pub static CLOSURE_WB_KEYS_SCANNED: AtomicU64 = AtomicU64::new(0);
+    pub static CLOSURE_WB_KEYS_WRITTEN: AtomicU64 = AtomicU64::new(0);
     /// Frames whose `Return` arm did the component-method `this`/`variables`
     /// write-back (phase 7's expensive branch) vs those that skipped it.
     pub static RET_THIS_WRITEBACK: AtomicU64 = AtomicU64::new(0);
@@ -275,6 +289,27 @@ pub mod call_phases {
     #[inline]
     pub fn bump_ret(has_this: bool) {
         if has_this { RET_THIS_WRITEBACK.fetch_add(1, Relaxed) } else { RET_PLAIN.fetch_add(1, Relaxed) };
+    }
+
+    #[inline]
+    pub fn bump_eager_reason(template: bool, overflow: bool) {
+        if template {
+            ARGS_EAGER_TEMPLATE.fetch_add(1, Relaxed);
+        } else if overflow {
+            ARGS_EAGER_OVERFLOW.fetch_add(1, Relaxed);
+        } else {
+            ARGS_EAGER_REFERENCED.fetch_add(1, Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_closure_wb(keys_scanned: u64, keys_written: u64) {
+        CLOSURE_WB_SCANNED.fetch_add(1, Relaxed);
+        CLOSURE_WB_KEYS_SCANNED.fetch_add(keys_scanned, Relaxed);
+        CLOSURE_WB_KEYS_WRITTEN.fetch_add(keys_written, Relaxed);
+        if keys_written > 0 {
+            CLOSURE_WB_NONEMPTY.fetch_add(1, Relaxed);
+        }
     }
 
     pub fn branch_report() -> String {
@@ -291,6 +326,21 @@ pub mod call_phases {
             l, l as f64 / (e + l).max(1) as f64 * 100.0,
             t, t as f64 / (t + pl).max(1) as f64 * 100.0,
             pl, pl as f64 / (t + pl).max(1) as f64 * 100.0,
+        ) + &format!(
+            "\n  eager because template frame:  {:>12}\n\
+               eager because overflow args:   {:>12}\n\
+               eager because body uses it:    {:>12}\n\
+             classic-localMode wb diffs run:  {:>12}\n\
+               .. that wrote ANY key:         {:>12}  ({:.1}%)\n\
+               .. keys scanned / written:     {:>12} / {}",
+            g(&ARGS_EAGER_TEMPLATE),
+            g(&ARGS_EAGER_OVERFLOW),
+            g(&ARGS_EAGER_REFERENCED),
+            g(&CLOSURE_WB_SCANNED),
+            g(&CLOSURE_WB_NONEMPTY),
+            g(&CLOSURE_WB_NONEMPTY) as f64 / g(&CLOSURE_WB_SCANNED).max(1) as f64 * 100.0,
+            g(&CLOSURE_WB_KEYS_SCANNED),
+            g(&CLOSURE_WB_KEYS_WRITTEN),
         )
     }
 

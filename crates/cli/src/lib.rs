@@ -29,7 +29,7 @@ use cfml_codegen::compiler::CfmlCompiler;
 
 /// Labels for the `call-phases` prologue report, in phase order.
 #[cfg(feature = "call-phases")]
-const CALL_PHASE_LABELS: [&str; 14] = [
+const CALL_PHASE_LABELS: [&str; 24] = [
     "0 entry: fused-plan take, JIT probe, recursion guard",
     "1 allocate: locals map, operand stack, slots, declared_locals",
     "2 parent-scope seed copy",
@@ -37,13 +37,23 @@ const CALL_PHASE_LABELS: [&str; 14] = [
     "4 arguments scope + param binding + required check",
     "5 called_name, call_stack push, entry depths",
     "6 BODY (run-off-end frames only)",
-    "7 Return op arm: this/variables write-back, unwind, recycle",
+    "7 Return arm TOTAL (= sum of 14..20 below)",
     "8 CALLER pre-call: arg_sources, arg pop, scope merge, slot spill",
     "9 CALLER post-call: arg/closure/result write-back",
     "10 call_function dispatch: disallowed check, id resolve, fused-parent plan",
     "11 call_function return: source_file restore",
     "12 wrapper execute_function_with_args: pre-body",
     "13 wrapper execute_function_with_args: post-body (truncate, buffers, hooks)",
+    "14   this_val.clone() + `return this;` variables embed",
+    "15   __variables writeback (Arc clone) OR full locals rescan",
+    "16   closure parent-scope writeback diff",
+    "17   collect_arg_ref_writeback",
+    "18   template-frame locals capture",
+    "19   call_stack pop, try truncate, tag unwind",
+    "20   locals-map recycle",
+    "21 (unused)",
+    "22 (unused)",
+    "23 (unused)",
 ];
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::logging;
