@@ -452,6 +452,60 @@ impl JitEngine {
         self.try_call(func, args, &mut |_| false, &|_| None)
     }
 
+    /// T3.1 slot-locals interop: the analyser/translator work by NAME, so a
+    /// function whose codegen assigned local slots is compiled from a
+    /// normalized copy with every slot op rewritten back to its named twin —
+    /// semantically identical (a slot IS the `var`-declared local it names).
+    /// Runs once per (function, signature) at compile time, never on the
+    /// cached fast path.
+    fn normalize_slot_ops(func: &BytecodeFunction) -> BytecodeFunction {
+        let mut f = func.clone();
+        for op in &mut f.instructions {
+            let new = match &*op {
+                BytecodeOp::DeclareSlot(_, n) => Some(BytecodeOp::DeclareLocal(n.clone())),
+                BytecodeOp::LoadSlot(_, n) => Some(BytecodeOp::LoadLocal(n.clone())),
+                BytecodeOp::TryLoadSlot(_, n) => Some(BytecodeOp::TryLoadLocal(n.clone())),
+                BytecodeOp::StoreSlot(_, n) => Some(BytecodeOp::StoreLocal(n.clone())),
+                BytecodeOp::IncrementSlot(_, n) => Some(BytecodeOp::Increment(n.clone())),
+                BytecodeOp::DecrementSlot(_, n) => Some(BytecodeOp::Decrement(n.clone())),
+                BytecodeOp::AddSlotConst(_, n, k) => {
+                    Some(BytecodeOp::AddLocalConst(n.clone(), *k))
+                }
+                BytecodeOp::MulSlotConst(_, n, k) => {
+                    Some(BytecodeOp::MulLocalConst(n.clone(), *k))
+                }
+                BytecodeOp::JumpIfSlotCmpConstFalse(_, n, c, cmp, t) => {
+                    Some(BytecodeOp::JumpIfLocalCmpConstFalse(n.clone(), *c, *cmp, *t))
+                }
+                BytecodeOp::ForSlotStep(_, n, l, cmp, s, t) => {
+                    Some(BytecodeOp::ForLoopStep(n.clone(), *l, *cmp, *s, *t))
+                }
+                BytecodeOp::LoadSlotKey(_, n) => Some(BytecodeOp::LoadLocalKey(n.clone())),
+                BytecodeOp::TryLoadSlotKey(_, n) => {
+                    Some(BytecodeOp::TryLoadLocalKey(n.clone()))
+                }
+                BytecodeOp::LoadSlotProperty(_, n, p) => {
+                    Some(BytecodeOp::LoadLocalProperty(n.clone(), p.clone()))
+                }
+                BytecodeOp::TryLoadSlotProperty(_, n, p) => {
+                    Some(BytecodeOp::TryLoadLocalProperty(n.clone(), p.clone()))
+                }
+                BytecodeOp::StoreSlotProperty(_, n, p) => {
+                    Some(BytecodeOp::StoreLocalProperty(n.clone(), p.clone()))
+                }
+                BytecodeOp::ArrayAppendSlot(_, n) => {
+                    Some(BytecodeOp::ArrayAppendLocal(n.clone()))
+                }
+                _ => None,
+            };
+            if let Some(new) = new {
+                *op = new;
+            }
+        }
+        f.slot_names = Vec::new();
+        f
+    }
+
     /// The dispatch hook, called at the top of `execute_function_with_args`.
     ///
     /// Returns `Some(result)` only when a compiled native body ran to completion
@@ -521,6 +575,14 @@ impl JitEngine {
             });
         }
 
+        // T3.1: analyse/compile from the slot-normalized copy when needed.
+        let normalized = if func.slot_names.is_empty() {
+            None
+        } else {
+            Some(Self::normalize_slot_ops(func))
+        };
+        let afunc: &BytecodeFunction = normalized.as_ref().unwrap_or(func);
+
         // ── Analyse with a UDF resolver that consults this engine's cache.
         //
         // Self-recursion is admitted optimistically: when the callee's
@@ -582,7 +644,7 @@ impl JitEngine {
                         }),
                     }
                 };
-            match analysis::analyze(func, &kinds, &resolver) {
+            match analysis::analyze(afunc, &kinds, &resolver) {
                 Some(plan) => {
                     let ret_kind = RetKind::from_analysis(plan.ret_kind);
                     // Self-recursion kind check: the resolver optimistically
@@ -599,7 +661,7 @@ impl JitEngine {
                     } else {
                         let builtins = plan.referenced_builtins.clone();
                         let udfs = plan.referenced_udfs.clone();
-                        match self.backend.compile(func, &plan) {
+                        match self.backend.compile(afunc, &plan) {
                             Ok(ptr) => CacheEntry::Compiled { ptr, ret_kind, builtins, udfs },
                             Err(_) => CacheEntry::Unjittable,
                         }
@@ -1031,17 +1093,25 @@ mod tests {
     use cfml_codegen::compiler::CfmlCompiler;
     use cfml_compiler::parser::Parser;
 
-    /// Compile CFML `src` and return the named function's bytecode.
+    /// Compile CFML `src` and return the named function's bytecode,
+    /// slot-normalized the same way `try_call` does before analysis (the
+    /// codegen slot pass rewrites `var` locals to `*Slot*` ops the analyser
+    /// doesn't model — see [`JitEngine::normalize_slot_ops`]).
     fn compile_fn(src: &str, name: &str) -> BytecodeFunction {
         let ast = Parser::new(src.to_string()).parse().expect("parse");
         let program = CfmlCompiler::new().compile(ast);
-        program
+        let f = program
             .functions
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name))
             .unwrap_or_else(|| panic!("function {name} not found in program"))
             .as_ref()
-            .clone()
+            .clone();
+        if f.slot_names.is_empty() {
+            f
+        } else {
+            JitEngine::normalize_slot_ops(&f)
+        }
     }
 
     /// Test-helper: default kind vector — every declared param pinned to Int.

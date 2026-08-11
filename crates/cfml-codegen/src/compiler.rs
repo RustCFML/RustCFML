@@ -255,6 +255,13 @@ pub struct BytecodeFunction {
     /// Template frames are always `0`: their locals ARE the page/component
     /// variables scope (`captured_locals`), so they must keep eager seeding.
     pub chain_tier: u8,
+    /// Slot-resolved locals (perf plan T3.1 stage 1): the frame-private
+    /// `var`-declared names this function's `*Slot*` ops index into, in slot
+    /// order. Empty = no slots assigned (ineligible function, or the pass is
+    /// disabled) — the frame allocates no slot vector. Derived at compile
+    /// finalize by [`Self::assign_local_slots`]; construction sites leave it
+    /// empty.
+    pub slot_names: Vec<Name>,
 }
 
 impl BytecodeFunction {
@@ -278,6 +285,9 @@ impl BytecodeFunction {
         } else {
             Self::scan_chain_tier(&self.instructions)
         };
+        if !self.is_template_frame && slot_locals_enabled() {
+            self.assign_local_slots();
+        }
         self.shrink_to_fit();
     }
 
@@ -327,6 +337,181 @@ impl BytecodeFunction {
         tier
     }
 
+    /// Slot-resolved locals pass (perf plan T3.1 stage 1). Runs once at
+    /// finalize for non-template functions. Assigns a `u16` slot to every
+    /// `var`-declared name that is provably frame-private and only touched by
+    /// ops that have slot twins, then rewrites those ops in place. The
+    /// conservative rules (each is a correctness requirement, see
+    /// SLOT_LOCALS_PLAN.md):
+    ///
+    /// * Whole-function disqualifiers — bodies where the frame's locals map
+    ///   escapes or is reflected on dynamically: `DefineFunction` (closure env
+    ///   captures the whole frame), `Include`/`IncludeDynamic` (function-scoped
+    ///   include shares genuine `local` keys by name), `SetDynamicVar`,
+    ///   `DeleteScopeKey("local")` (dynamic-key delete against the live local
+    ///   scope), and call-position loads of the reflective builtins
+    ///   (`evaluate` family) that read/write the calling frame's locals by
+    ///   runtime-computed name.
+    /// * Per-name exclusions — names referenced by ops we do NOT rewrite in
+    ///   stage 1, whose handlers resolve the name against the locals map and
+    ///   would silently miss a slotted value: call-position `LoadGlobal`,
+    ///   `StoreGlobal`, `IsDefined` (first path segment, and the second when
+    ///   the first is `local`), `SetLastExceptionFromLocal`,
+    ///   `JumpIfArgPresent`, method write-back paths (`CallMethod`/
+    ///   `CallMethodNamed` `wb[0]`, and `wb[1]` when `wb[0]` is `local`), and
+    ///   `LoadVariablesKey`. `UnsetPath` is NOT an exclusion — the VM handler
+    ///   clears the slot by name before running the generic delete.
+    /// * Reserved scope names and declared params are never slotted (GH#312
+    ///   scope reservation; params belong to the `arguments` bidi-sync
+    ///   machinery, untouched in stage 1).
+    fn assign_local_slots(&mut self) {
+        use std::collections::{HashMap, HashSet};
+
+        const SCOPE_NAMES: &[&str] = &[
+            "local", "arguments", "variables", "this", "super", "request",
+            "session", "application", "server", "url", "form", "cgi", "cookie",
+            "client", "static", "attributes", "caller", "thread",
+        ];
+        const REFLECTIVE_BUILTINS: &[&str] = &[
+            "evaluate", "precisionevaluate", "getvariable", "setvariable",
+            "structget", "iif", "de", "structdelete", "structclear",
+        ];
+
+        // Pass 1: collect candidates + exclusions in one scan.
+        let mut declared: Vec<Name> = Vec::new(); // first-declaration order
+        let mut declared_seen: HashSet<String> = HashSet::new();
+        let mut excluded: HashSet<String> = HashSet::new();
+        for op in &self.instructions {
+            match op {
+                BytecodeOp::DefineFunction(_)
+                | BytecodeOp::Include(_)
+                | BytecodeOp::IncludeDynamic
+                | BytecodeOp::SetDynamicVar => return,
+                BytecodeOp::DeleteScopeKey(n) if n.lower() == "local" => return,
+                BytecodeOp::DeclareLocal(n) => {
+                    if declared_seen.insert(n.lower().to_string()) {
+                        declared.push(n.clone());
+                    }
+                }
+                BytecodeOp::LoadGlobal(n) => {
+                    if REFLECTIVE_BUILTINS.contains(&n.lower()) {
+                        return;
+                    }
+                    excluded.insert(n.lower().to_string());
+                }
+                BytecodeOp::StoreGlobal(n)
+                | BytecodeOp::SetLastExceptionFromLocal(n)
+                | BytecodeOp::JumpIfArgPresent(n, _)
+                | BytecodeOp::LoadVariablesKey(n) => {
+                    excluded.insert(n.lower().to_string());
+                }
+                BytecodeOp::IsDefined(n) => {
+                    let mut segs = n.lower().split('.');
+                    if let Some(first) = segs.next() {
+                        excluded.insert(first.to_string());
+                        if first == "local" {
+                            if let Some(second) = segs.next() {
+                                excluded.insert(second.to_string());
+                            }
+                        }
+                    }
+                }
+                BytecodeOp::CallMethod(_, _, Some(wb))
+                | BytecodeOp::CallMethodNamed(_, _, _, Some(wb)) => {
+                    if let Some(first) = wb.first() {
+                        let first_lower = first.to_lowercase();
+                        if first_lower == "local" {
+                            if let Some(second) = wb.get(1) {
+                                excluded.insert(second.to_lowercase());
+                            }
+                        }
+                        excluded.insert(first_lower);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Filter: drop scope names, params, excluded names; cap at u16.
+        let mut slot_of: HashMap<String, u16> = HashMap::new();
+        let mut slot_names: Vec<Name> = Vec::new();
+        for n in declared {
+            let lower = n.lower();
+            if SCOPE_NAMES.contains(&lower)
+                || excluded.contains(lower)
+                || self.params.iter().any(|p| p.eq_ignore_ascii_case(lower))
+            {
+                continue;
+            }
+            if slot_names.len() >= u16::MAX as usize {
+                break;
+            }
+            slot_of.insert(lower.to_string(), slot_names.len() as u16);
+            slot_names.push(n);
+        }
+        if slot_names.is_empty() {
+            return;
+        }
+
+        // Pass 2: rewrite ops whose name resolves to a slot.
+        let slot = |n: &Name| slot_of.get(n.lower()).copied();
+        for op in &mut self.instructions {
+            let new = match &*op {
+                BytecodeOp::DeclareLocal(n) => {
+                    slot(n).map(|i| BytecodeOp::DeclareSlot(i, n.clone()))
+                }
+                BytecodeOp::LoadLocal(n) => {
+                    slot(n).map(|i| BytecodeOp::LoadSlot(i, n.clone()))
+                }
+                BytecodeOp::TryLoadLocal(n) => {
+                    slot(n).map(|i| BytecodeOp::TryLoadSlot(i, n.clone()))
+                }
+                BytecodeOp::StoreLocal(n) => {
+                    slot(n).map(|i| BytecodeOp::StoreSlot(i, n.clone()))
+                }
+                BytecodeOp::Increment(n) => {
+                    slot(n).map(|i| BytecodeOp::IncrementSlot(i, n.clone()))
+                }
+                BytecodeOp::Decrement(n) => {
+                    slot(n).map(|i| BytecodeOp::DecrementSlot(i, n.clone()))
+                }
+                BytecodeOp::AddLocalConst(n, k) => {
+                    slot(n).map(|i| BytecodeOp::AddSlotConst(i, n.clone(), *k))
+                }
+                BytecodeOp::MulLocalConst(n, k) => {
+                    slot(n).map(|i| BytecodeOp::MulSlotConst(i, n.clone(), *k))
+                }
+                BytecodeOp::JumpIfLocalCmpConstFalse(n, k, c, t) => slot(n)
+                    .map(|i| BytecodeOp::JumpIfSlotCmpConstFalse(i, n.clone(), *k, *c, *t)),
+                BytecodeOp::ForLoopStep(n, step, c, k, t) => slot(n)
+                    .map(|i| BytecodeOp::ForSlotStep(i, n.clone(), *step, *c, *k, *t)),
+                BytecodeOp::LoadLocalKey(n) => {
+                    slot(n).map(|i| BytecodeOp::LoadSlotKey(i, n.clone()))
+                }
+                BytecodeOp::TryLoadLocalKey(n) => {
+                    slot(n).map(|i| BytecodeOp::TryLoadSlotKey(i, n.clone()))
+                }
+                BytecodeOp::LoadLocalProperty(n, p) => {
+                    slot(n).map(|i| BytecodeOp::LoadSlotProperty(i, n.clone(), p.clone()))
+                }
+                BytecodeOp::TryLoadLocalProperty(n, p) => {
+                    slot(n).map(|i| BytecodeOp::TryLoadSlotProperty(i, n.clone(), p.clone()))
+                }
+                BytecodeOp::StoreLocalProperty(n, p) => {
+                    slot(n).map(|i| BytecodeOp::StoreSlotProperty(i, n.clone(), p.clone()))
+                }
+                BytecodeOp::ArrayAppendLocal(n) => {
+                    slot(n).map(|i| BytecodeOp::ArrayAppendSlot(i, n.clone()))
+                }
+                _ => None,
+            };
+            if let Some(new) = new {
+                *op = new;
+            }
+        }
+        self.slot_names = slot_names;
+    }
+
     /// Release the spare capacity every `Vec` here accumulated while being built.
     ///
     /// Bytecode is produced by repeated `push`, so each vector grows by amortized
@@ -349,6 +534,7 @@ impl BytecodeFunction {
             a.shrink_to_fit();
         }
         self.metadata.shrink_to_fit();
+        self.slot_names.shrink_to_fit();
     }
 }
 
@@ -386,6 +572,25 @@ pub fn metadata_declared_local_mode(metadata: &[(String, String)]) -> Option<boo
         }
     }
     None
+}
+
+/// Runtime kill switch for the slot-locals pass (perf plan T3.1 stage 1):
+/// `RUSTCFML_SLOT_LOCALS=0|false|off|no` disables it, anything else (including
+/// unset) leaves it on. Read once per process — flipping mid-process would
+/// only affect not-yet-compiled files anyway (cached bytecode keeps whatever
+/// shape it was compiled with; both shapes execute correctly side by side).
+fn slot_locals_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("RUSTCFML_SLOT_LOCALS")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 /// Comparison operator tag for fused-compare super-instructions.
@@ -713,6 +918,38 @@ pub enum BytecodeOp {
     // Declare a variable as function-local (var keyword) — prevents writeback to parent scope
     DeclareLocal(Name),
 
+    // ── Slot-resolved locals (perf plan T3.1 stage 1) ────────────────────────
+    // Each is the slot twin of the correspondingly-named `*Local*` op, produced
+    // by the `assign_local_slots` finalize pass for `var`-declared names in
+    // eligible functions. `u16` indexes the frame's slot vector
+    // (`BytecodeFunction::slot_names` names each slot); the carried `Name` is
+    // BOTH the diagnostic spelling AND the runtime fallback identity: a slot
+    // that is `None` (the `var` statement hasn't executed yet on this control
+    // path, or the name was `UnsetPath`-deleted) makes the op behave exactly
+    // like its named twin, preserving CFML's order-sensitive `var` semantics
+    // with no dominance analysis. Semantics notes:
+    // * `LoadSlotKey`/`TryLoadSlotKey` are the `local.x` fused reads — their
+    //   `None` fallback is the LoadLocalKey path (local-scope-only, Null on
+    //   miss), NOT the scope chain.
+    // * A declared slot always wins the scope chain (a `var` name shadows
+    //   everything except reserved scope names, which are never slotted).
+    DeclareSlot(u16, Name),
+    LoadSlot(u16, Name),
+    TryLoadSlot(u16, Name),
+    StoreSlot(u16, Name),
+    IncrementSlot(u16, Name),
+    DecrementSlot(u16, Name),
+    AddSlotConst(u16, Name, i64),
+    MulSlotConst(u16, Name, i64),
+    JumpIfSlotCmpConstFalse(u16, Name, i64, CmpOp, usize),
+    ForSlotStep(u16, Name, i64, CmpOp, i64, usize),
+    LoadSlotKey(u16, Name),
+    TryLoadSlotKey(u16, Name),
+    LoadSlotProperty(u16, Name, Name),
+    TryLoadSlotProperty(u16, Name, Name),
+    StoreSlotProperty(u16, Name, Name),
+    ArrayAppendSlot(u16, Name),
+
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
     CallNamed(Vec<String>, usize),
@@ -747,6 +984,7 @@ impl CfmlCompiler {
                     output_suppressed: false,
                     is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
                 })],
             },
             loop_stack: Vec::new(),
@@ -3317,6 +3555,7 @@ impl CfmlCompiler {
             output_suppressed: false,
             is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
         };
 
         let global_id = bc_func.global_id as usize;
@@ -3573,6 +3812,7 @@ impl CfmlCompiler {
                     output_suppressed: false,
                     is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
                 };
                 self.push_function(getter_func);
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3663,6 +3903,7 @@ impl CfmlCompiler {
                     output_suppressed: false,
                     is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
                 };
                 self.push_function(setter_func);
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -3838,6 +4079,7 @@ impl CfmlCompiler {
                 output_suppressed: false,
                 is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
             };
             self.push_function(static_func);
         }
@@ -4839,6 +5081,7 @@ impl CfmlCompiler {
                     output_suppressed: false,
                     is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -4914,6 +5157,7 @@ impl CfmlCompiler {
                     output_suppressed: false,
                     is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -5019,5 +5263,74 @@ mod size_probe {
              interning shrank it from 64 B) — a perf regression. If \
              intentional, justify and raise the ceiling."
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    fn compile_named(src: &str, name: &str) -> BytecodeFunction {
+        let ast = cfml_compiler::parser::Parser::new(src.to_string())
+            .parse()
+            .expect("parse");
+        let program = CfmlCompiler::new().compile(ast);
+        program
+            .functions
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .expect("function present")
+            .as_ref()
+            .clone()
+    }
+
+    #[test]
+    fn var_locals_get_slots() {
+        let f = compile_named(
+            "function sumTo(n) { var t = 0; for (var i = 1; i <= n; i++) { t = t + i; } return t; }",
+            "sumTo",
+        );
+        assert_eq!(f.slot_names.len(), 2, "t and i should be slotted");
+        assert!(f
+            .instructions
+            .iter()
+            .any(|op| matches!(op, BytecodeOp::StoreSlot(..))));
+        assert!(f
+            .instructions
+            .iter()
+            .any(|op| matches!(op, BytecodeOp::IncrementSlot(..))));
+        // Const-bound loops take the fused super-instruction — slot twin form.
+        let g = compile_named(
+            "function sumK() { var t = 0; for (var i = 1; i <= 100; i++) { t = t + i; } return t; }",
+            "sumK",
+        );
+        assert!(g
+            .instructions
+            .iter()
+            .any(|op| matches!(op, BytecodeOp::ForSlotStep(..))));
+        // No leftover named twins for the slotted names.
+        assert!(!f.instructions.iter().any(|op| matches!(
+            op,
+            BytecodeOp::DeclareLocal(_) | BytecodeOp::ForLoopStep(..)
+        )));
+    }
+
+    #[test]
+    fn closure_defining_fn_is_ineligible() {
+        let f = compile_named(
+            "function outer() { var t = 1; var cl = function() { return 2; }; return t; }",
+            "outer",
+        );
+        assert!(f.slot_names.is_empty(), "DefineFunction disqualifies");
+    }
+
+    #[test]
+    fn scope_names_and_params_never_slotted() {
+        let f = compile_named(
+            "function f(p) { var request = 1; var p2 = p; return p2; }",
+            "f",
+        );
+        assert!(f.slot_names.iter().all(|n| n.lower() != "request"));
+        assert!(f.slot_names.iter().all(|n| n.lower() != "p"));
     }
 }

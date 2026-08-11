@@ -1750,6 +1750,9 @@ mod tests {
             .unwrap()
             .as_ref()
             .clone();
+        // Slot-normalize like try_call does — the codegen slot pass rewrites
+        // this function's `var` loop to ForSlotStep, which OSR doesn't model.
+        let score = crate::jit::JitEngine::normalize_slot_ops(&score);
         let (s, e) = first_loop_region(&score);
         let kinds = int_kinds(&["t", "i"]);
         assert!(analyze_loop(&score, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_none());

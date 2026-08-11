@@ -5991,6 +5991,21 @@ impl CfmlVirtualMachine {
         let mut locals: ValueMap =
             ValueMap::with_capacity_and_hasher(seed_cap + 1, Default::default());
         let mut stack: Vec<CfmlValue> = Vec::new();
+        // Slot-resolved locals (perf plan T3.1 stage 1): direct-indexed storage
+        // for the `var`-declared names in `func.slot_names`. `None` = not (yet)
+        // declared on this control path, or deleted via UnsetPath — the slot
+        // ops then fall back to their named twins' generic path. Empty for the
+        // (vast majority of) functions with no slots: zero allocation.
+        let mut slots: Vec<Option<CfmlValue>> = if func.slot_names.is_empty() {
+            Vec::new()
+        } else {
+            vec![None; func.slot_names.len()]
+        };
+        // Parallel to `slots`: a slot whose activation was refused once (a
+        // CI-cased inherited copy exists in the locals map) stays on the
+        // generic path for the rest of the frame — without this the O(map)
+        // CI probe would re-run on EVERY subsequent store.
+        let mut slot_blocked: Vec<bool> = vec![false; slots.len()];
         let mut ip = 0;
         // Track variables declared with `var` (function-local, not written back to parent)
         let mut declared_locals: std::collections::HashSet<String> =
@@ -6445,7 +6460,17 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Double(d) => stack.push(CfmlValue::Double(*d)),
                 BytecodeOp::String(s) => stack.push(CfmlValue::string(s.clone())),
 
-                BytecodeOp::LoadLocal(name) => {
+                BytecodeOp::LoadLocal(name) | BytecodeOp::LoadSlot(_, name) => {
+                    // Slot fast path (T3.1): a declared slot always wins — the
+                    // name is never a scope name or param, and `local` is first
+                    // in the resolution chain. `None` (not yet declared /
+                    // deleted) falls through to the generic named path below.
+                    if let BytecodeOp::LoadSlot(i, _) = op {
+                        if let Some(v) = slots[*i as usize].as_ref() {
+                            stack.push(v.clone());
+                            continue;
+                        }
+                    }
                     // Handle CFML scope references
                     // Avoid allocating a lowercase String when the identifier is
                     // already all-lowercase ASCII (the common case). Unicode
@@ -6495,6 +6520,8 @@ impl CfmlVirtualMachine {
                         CfmlValue::strukt(Self::build_local_scope_view(
                             &locals,
                             &inherited_or_param_keys,
+                            &func.slot_names,
+                            &slots,
                         ))
                     } else if name_lower == "variables"
                     {
@@ -6837,7 +6864,14 @@ impl CfmlVirtualMachine {
                     };
                     stack.push(val);
                 }
-                BytecodeOp::TryLoadLocal(name) => {
+                BytecodeOp::TryLoadLocal(name) | BytecodeOp::TryLoadSlot(_, name) => {
+                    // Slot fast path (T3.1) — see LoadSlot.
+                    if let BytecodeOp::TryLoadSlot(i, _) = op {
+                        if let Some(v) = slots[*i as usize].as_ref() {
+                            stack.push(v.clone());
+                            continue;
+                        }
+                    }
                     // Safe load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
                     // Same zero-alloc lowercase guard as LoadLocal.
                     let name_lower: &str = name.lower();
@@ -6846,6 +6880,8 @@ impl CfmlVirtualMachine {
                         CfmlValue::strukt(Self::build_local_scope_view(
                             &locals,
                             &inherited_or_param_keys,
+                            &func.slot_names,
+                            &slots,
                         ))
                     } else if name_lower == "variables" {
                         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
@@ -6870,7 +6906,11 @@ impl CfmlVirtualMachine {
                     };
                     stack.push(val);
                 }
-                BytecodeOp::DeclareLocal(name) => {
+                BytecodeOp::DeclareLocal(name) | BytecodeOp::DeclareSlot(_, name) => {
+                    // DeclareSlot shares this body verbatim: declaration only
+                    // marks the name local + reclaims inherited keys. The slot
+                    // itself activates at the first StoreSlot (see there) so
+                    // read-before-first-store keeps today's exact semantics.
                     // Mark this variable as function-local (var keyword). Record
                     // BOTH the original casing and the lowercased form (mirrors the
                     // param path in `apply_pending_result_writeback`): CFML
@@ -6902,7 +6942,40 @@ impl CfmlVirtualMachine {
                     // remove_ci covers the exact match and every CI casing (GH #243).
                     inherited_or_param_keys.remove_ci(name.as_str());
                 }
-                BytecodeOp::StoreLocal(name) => {
+                BytecodeOp::StoreLocal(name) | BytecodeOp::StoreSlot(_, name) => {
+                    // Slot store (T3.1). An active slot is overwritten in place.
+                    // An inactive one ACTIVATES here iff the name has been
+                    // declared (`var` executed on this path) AND no CI-cased
+                    // copy exists in the locals map — an inherited same-named
+                    // key must keep today's in-place-overwrite semantics (its
+                    // value propagates to bare callees via
+                    // build_call_parent_scope), so such frames simply leave the
+                    // slot inactive and stay on the generic path below.
+                    if let BytecodeOp::StoreSlot(i, _) = op {
+                        let idx = *i as usize;
+                        if slots[idx].is_some() {
+                            if let Some(val) = stack.pop() {
+                                slots[idx] = Some(val);
+                            }
+                            continue;
+                        }
+                        if !slot_blocked[idx]
+                            && (declared_locals.contains(name.as_str())
+                                || declared_locals.contains(name.lower()))
+                        {
+                            if !locals.contains_key(name.as_str())
+                                && !locals
+                                    .keys()
+                                    .any(|k| k.eq_ignore_ascii_case(name.lower()))
+                            {
+                                if let Some(val) = stack.pop() {
+                                    slots[idx] = Some(val);
+                                }
+                                continue;
+                            }
+                            slot_blocked[idx] = true;
+                        }
+                    }
                     if let Some(val) = stack.pop() {
                         // Same zero-alloc lowercase guard as LoadLocal.
                         let name_lower: &str = name.lower();
@@ -6930,6 +7003,23 @@ impl CfmlVirtualMachine {
                             // `local.X = Y` — write back into the function's locals
                             // (or the template-scope locals when called outside a function),
                             // NOT __variables (which is the component scope in CFC methods).
+                            //
+                            // T3.1: this whole-scope merge writes keys by NAME
+                            // into the map. A slotted key updated through the
+                            // view round-trip (`local.i++` compiles to
+                            // LoadLocal("local") → SetProperty → here) would
+                            // land in the map while reads keep hitting the
+                            // stale slot — the counter never advances. Spill
+                            // and deactivate all slots first so the map is the
+                            // single source of truth for the rest of the frame.
+                            if !slots.is_empty() {
+                                Self::spill_slots_for_writeback(
+                                    &mut locals,
+                                    &func.slot_names,
+                                    &mut slots,
+                                    &mut slot_blocked,
+                                );
+                            }
                             if let CfmlValue::Struct(s) = val {
                                 // Preserve __variables if present; merge everything else.
                                 let saved_vars = locals.get("__variables").cloned();
@@ -7361,6 +7451,30 @@ impl CfmlVirtualMachine {
                     // CFML null-assignment: `x = voidFn()` (Null RHS) must DELETE
                     // the target rather than materialize a null-valued key. The
                     // value (Null) was already popped by the guard's `Pop`.
+                    //
+                    // T3.1: an active slot for a bare `x` / `local.x` target is
+                    // cleared back to `None` — the name reads as undefined again
+                    // (slot ops fall back to the generic chain) and the generic
+                    // delete below still removes any inherited map copy. Codegen
+                    // excludes names that root a DEEPER dotted UnsetPath from
+                    // slotting, so `a.b.c` targets never involve a slot.
+                    if !slots.is_empty() {
+                        let mut segs = path.split('.');
+                        let first = segs.next().unwrap_or("");
+                        let second = segs.next();
+                        let target = match (second, segs.next()) {
+                            (None, _) => Some(first),
+                            (Some(s), None) if first.eq_ignore_ascii_case("local") => Some(s),
+                            _ => None,
+                        };
+                        if let Some(t) = target {
+                            if let Some(i) =
+                                func.slot_names.iter().position(|n| n.eq_ci(t))
+                            {
+                                slots[i] = None;
+                            }
+                        }
+                    }
                     self.delete_scope_path(path, &mut locals, effective_local_mode_modern);
                     // Drop any closure-env copy so sibling closures see the
                     // deletion too (mirrors StoreLocal's env sync).
@@ -7387,7 +7501,7 @@ impl CfmlVirtualMachine {
                     let path = format!("{}.{}", scope, key);
                     self.delete_scope_path(&path, &mut locals, effective_local_mode_modern);
                 }
-                BytecodeOp::ArrayAppendLocal(name) => {
+                BytecodeOp::ArrayAppendLocal(name) | BytecodeOp::ArrayAppendSlot(_, name) => {
                     // Fused arrayAppend(<ident>, value). The value is on top of
                     // the stack; the array lives in the named variable. With
                     // reference-typed arrays the variable holds a shared handle,
@@ -7395,6 +7509,24 @@ impl CfmlVirtualMachine {
                     // no clone, no store-back, no env sync needed. (Pre-reference
                     // this had to fight Arc copy-on-write; that's all gone now.)
                     let value = stack.pop().unwrap_or(CfmlValue::Null);
+
+                    // Slot fast path (T3.1): active slot holds the array handle.
+                    // A non-array active slot mirrors the generic "replace with a
+                    // fresh single-element array" tail (the slot IS the declared
+                    // local, so the store routes here by definition).
+                    if let BytecodeOp::ArrayAppendSlot(i, _) = op {
+                        match slots[*i as usize].as_ref() {
+                            Some(CfmlValue::Array(arr)) => {
+                                arr.push(value);
+                                continue;
+                            }
+                            Some(_) => {
+                                slots[*i as usize] = Some(CfmlValue::array(vec![value]));
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
 
                     // Fast path: array held directly in this frame's locals.
                     if let Some(CfmlValue::Array(arr)) = locals.get(name.as_str()) {
@@ -8229,11 +8361,22 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
-                BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, target) => {
+                BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, target)
+                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => {
                     // Fused loop-condition super-instruction. Equivalent to
                     // LoadLocal(name) + Integer(c) + <cmp> + JumpIfFalse(target)
                     // but avoids 3 dispatches per iteration.
-                    let matched = match locals.get(name.as_str()) {
+                    // T3.1: the slot twin resolves the counter from its slot
+                    // (any value type — the `other` arm below still applies full
+                    // CFML comparison semantics to a non-numeric slot value);
+                    // an inactive slot falls back to the named lookup.
+                    let slot_val = match op {
+                        BytecodeOp::JumpIfSlotCmpConstFalse(i, ..) => {
+                            slots[*i as usize].as_ref()
+                        }
+                        _ => None,
+                    };
+                    let matched = match slot_val.or_else(|| locals.get(name.as_str())) {
                         Some(CfmlValue::Int(i)) => {
                             let c = *c;
                             let i = *i;
@@ -8295,12 +8438,70 @@ impl CfmlVirtualMachine {
                         ip = *target;
                     }
                 }
-                BytecodeOp::ForLoopStep(name, limit, cmp, step, target) => {
+                BytecodeOp::ForLoopStep(name, limit, cmp, step, target)
+                | BytecodeOp::ForSlotStep(_, name, limit, cmp, step, target) => {
                     // Fused loop-step super-instruction emitted at the bottom
                     // of counted for-loops. Equivalent to:
                     //   Increment(name)   // or Decrement if step is -1
                     //   JumpIfLocalCmpConstTrue(name, limit, cmp, target)
                     // but one dispatch instead of two.
+                    //
+                    // T3.1 slot fast path: the counter lives in its slot — step
+                    // and test in place, no map traffic. Deliberately does NOT
+                    // attempt OSR (the slot interpreter path is already the
+                    // optimisation; extending OSR to slot regions is a follow-up
+                    // noted in SLOT_LOCALS_PLAN.md). An inactive slot falls
+                    // through to the generic named body below.
+                    if let BytecodeOp::ForSlotStep(i, ..) = op {
+                        let idx = *i as usize;
+                        if let Some(v) = slots[idx].as_mut() {
+                            let matched = match v {
+                                CfmlValue::Int(cur) => {
+                                    *cur += *step;
+                                    let (i, c) = (*cur, *limit);
+                                    match cmp {
+                                        CmpOp::Lt => i < c,
+                                        CmpOp::Lte => i <= c,
+                                        CmpOp::Gt => i > c,
+                                        CmpOp::Gte => i >= c,
+                                        CmpOp::Eq => i == c,
+                                        CmpOp::Neq => i != c,
+                                    }
+                                }
+                                CfmlValue::Double(cur) => {
+                                    *cur += *step as f64;
+                                    let (d, c) = (*cur, *limit as f64);
+                                    match cmp {
+                                        CmpOp::Lt => d < c,
+                                        CmpOp::Lte => d <= c,
+                                        CmpOp::Gt => d > c,
+                                        CmpOp::Gte => d >= c,
+                                        CmpOp::Eq => d == c,
+                                        CmpOp::Neq => d != c,
+                                    }
+                                }
+                                other => {
+                                    // Loop var changed type mid-loop: mirror the
+                                    // generic "safe-step" reset — the slot IS the
+                                    // declared local, so the reset lands here.
+                                    *other = CfmlValue::Int(*step);
+                                    let (i, c) = (*step, *limit);
+                                    match cmp {
+                                        CmpOp::Lt => i < c,
+                                        CmpOp::Lte => i <= c,
+                                        CmpOp::Gt => i > c,
+                                        CmpOp::Gte => i >= c,
+                                        CmpOp::Eq => i == c,
+                                        CmpOp::Neq => i != c,
+                                    }
+                                }
+                            };
+                            if matched {
+                                ip = *target;
+                            }
+                            continue;
+                        }
+                    }
                     let (new_val, wrote_vars) = match locals.get(name.as_str()) {
                         Some(CfmlValue::Int(i)) => (CfmlValue::Int(*i + *step), false),
                         Some(CfmlValue::Double(d)) => (CfmlValue::Double(*d + (*step as f64)), false),
@@ -8486,6 +8687,21 @@ impl CfmlVirtualMachine {
                         // For CFC method calls (this in locals), caller locals take priority.
                         // For plain UDF calls, pass caller locals by reference (no clone).
                         let merged_scope;
+                        // T3.1: callees that resolve the CALLER's variables by
+                        // name at runtime (QoQ table sources via queryExecute /
+                        // cfquery, custom-tag `caller` bridging) can't see slot
+                        // storage — spill before invoking them.
+                        if !slots.is_empty()
+                            && matches!(&func_ref, CfmlValue::Function(f)
+                                if Self::callee_reflects_on_caller_scope(&f.name))
+                        {
+                            Self::spill_slots_for_writeback(
+                                &mut locals,
+                                &func.slot_names,
+                                &mut slots,
+                                &mut slot_blocked,
+                            );
+                        }
                         let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
                             if let Some(ref shared_env) = f.captured_scope {
                                 let is_cfc_context = locals.contains_key("this");
@@ -8544,6 +8760,16 @@ impl CfmlVirtualMachine {
                         }
                         match call_result {
                             Ok(result) => {
+                                // T3.1: by-name writebacks below can't see slot
+                                // storage — spill first (rare; see helper).
+                                if !slots.is_empty()
+                                    && (self.closure_parent_writeback.is_some()
+                                        || self.arg_ref_writeback.is_some()
+                                        || self.pending_result_writeback.is_some()
+                                        || self.closure_parent_deletes.is_some())
+                                {
+                                    Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                                }
                                 // Write back mutations into the shared closure environment
                                 if let Some(ref writeback) = self.closure_parent_writeback {
                                     Self::write_back_to_captured_scope(&func_ref, writeback);
@@ -8743,6 +8969,9 @@ impl CfmlVirtualMachine {
                                 Ok(result) => {
                                     if let Some(rv) = return_var {
                                         if !rv.is_empty() {
+                                            if !slots.is_empty() {
+                                                Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                                            }
                                             self.pending_result_writeback =
                                                 Some(vec![(rv, result.clone())]);
                                             self.apply_pending_result_writeback(
@@ -8966,6 +9195,17 @@ impl CfmlVirtualMachine {
                             if writeback_var.is_none() && tag_name.eq_ignore_ascii_case("cfhttp") {
                                 writeback_var = Some("cfhttp".to_string());
                             }
+                            // T3.1: statement-form cfquery can be a QoQ that
+                            // resolves table names from this frame — spill so
+                            // slotted query variables are visible to it.
+                            if !slots.is_empty() && tag_name.eq_ignore_ascii_case("cfquery") {
+                                Self::spill_slots_for_writeback(
+                                    &mut locals,
+                                    &func.slot_names,
+                                    &mut slots,
+                                    &mut slot_blocked,
+                                );
+                            }
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             self.arg_ref_writeback = None;
@@ -8991,6 +9231,9 @@ impl CfmlVirtualMachine {
                                         // cffile(action="read")) must route
                                         // through the scope-aware store, not a
                                         // literal dotted key in `locals`.
+                                        if !slots.is_empty() {
+                                            Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                                        }
                                         if var.contains('.') {
                                             self.store_runtime_path(&var, result.clone(), &mut locals, effective_local_mode_modern);
                                         } else {
@@ -9109,6 +9352,21 @@ impl CfmlVirtualMachine {
                         self.arg_ref_writeback = None;
                         self.pending_result_writeback = None;
                         let merged_scope;
+                        // T3.1: callees that resolve the CALLER's variables by
+                        // name at runtime (QoQ table sources via queryExecute /
+                        // cfquery, custom-tag `caller` bridging) can't see slot
+                        // storage — spill before invoking them.
+                        if !slots.is_empty()
+                            && matches!(&func_ref, CfmlValue::Function(f)
+                                if Self::callee_reflects_on_caller_scope(&f.name))
+                        {
+                            Self::spill_slots_for_writeback(
+                                &mut locals,
+                                &func.slot_names,
+                                &mut slots,
+                                &mut slot_blocked,
+                            );
+                        }
                         let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
                             if let Some(ref shared_env) = f.captured_scope {
                                 let is_cfc_context = locals.contains_key("this");
@@ -9160,6 +9418,13 @@ impl CfmlVirtualMachine {
                         }
                         match call_result {
                             Ok(result) => {
+                                if !slots.is_empty()
+                                    && (self.closure_parent_writeback.is_some()
+                                        || self.arg_ref_writeback.is_some()
+                                        || self.pending_result_writeback.is_some())
+                                {
+                                    Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                                }
                                 if let Some(ref writeback) = self.closure_parent_writeback {
                                     Self::write_back_to_captured_scope(&func_ref, writeback);
                                 }
@@ -9747,7 +10012,9 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::LoadLocalProperty(local_name, prop_name)
-                | BytecodeOp::TryLoadLocalProperty(local_name, prop_name) => {
+                | BytecodeOp::TryLoadLocalProperty(local_name, prop_name)
+                | BytecodeOp::LoadSlotProperty(_, local_name, prop_name)
+                | BytecodeOp::TryLoadSlotProperty(_, local_name, prop_name) => {
                     // Fused LoadLocal + GetProperty. Avoids the intermediate
                     // dispatch and the stack push/pop of the struct itself.
                     // Only emitted when the receiver is a plain identifier
@@ -9758,18 +10025,30 @@ impl CfmlVirtualMachine {
                     // variables live in `globals`. Falling back through
                     // `lookup_name_in_scopes` matches the semantics of plain
                     // `LoadLocal` so `p.foo` reads agree with `p["foo"]`.
+                    // T3.1: slot twins resolve the receiver from the slot; an
+                    // inactive slot falls back to the identical named lookup.
+                    let slot_receiver = match op {
+                        BytecodeOp::LoadSlotProperty(i, ..)
+                        | BytecodeOp::TryLoadSlotProperty(i, ..) => {
+                            slots[*i as usize].clone()
+                        }
+                        _ => None,
+                    };
                     let name_lower: &str = local_name.lower();
-                    let receiver = locals
-                        .get(local_name.as_str())
-                        .cloned()
-                        .or_else(|| {
+                    let receiver = slot_receiver.or_else(|| {
+                        locals.get(local_name.as_str()).cloned().or_else(|| {
                             self.lookup_name_in_scopes(
                                 local_name.as_str(),
                                 name_lower,
                                 &locals,
                             )
-                        });
-                    let throw_on_miss = matches!(op, BytecodeOp::LoadLocalProperty(_, _));
+                        })
+                    });
+                    let throw_on_miss = matches!(
+                        op,
+                        BytecodeOp::LoadLocalProperty(_, _)
+                            | BytecodeOp::LoadSlotProperty(..)
+                    );
                     match receiver {
                         // Undefined receiver variable: same as the unfused
                         // `LoadLocal(root)` — throw on the root name.
@@ -9794,7 +10073,22 @@ impl CfmlVirtualMachine {
                         },
                     }
                 }
-                BytecodeOp::LoadLocalKey(prop_name) | BytecodeOp::TryLoadLocalKey(prop_name) => {
+                BytecodeOp::LoadLocalKey(prop_name)
+                | BytecodeOp::TryLoadLocalKey(prop_name)
+                | BytecodeOp::LoadSlotKey(_, prop_name)
+                | BytecodeOp::TryLoadSlotKey(_, prop_name) => {
+                    // T3.1: `local.x` where x is an active slot — a slot value
+                    // is frame-established by definition, so it is always
+                    // visible through the `local` view. Inactive → generic
+                    // (map miss → Null/throw, matching an undeclared/deleted
+                    // local.x).
+                    if let BytecodeOp::LoadSlotKey(i, _) | BytecodeOp::TryLoadSlotKey(i, _) = op
+                    {
+                        if let Some(v) = slots[*i as usize].as_ref() {
+                            stack.push(v.clone());
+                            continue;
+                        }
+                    }
                     // Fused LoadLocal("local") + GetProperty for an explicit
                     // `local.foo` read. Reads the single member directly from
                     // `locals` rather than materializing the whole per-call
@@ -9825,7 +10119,11 @@ impl CfmlVirtualMachine {
                         .map(|(_, v)| v.clone());
                     match val {
                         Some(v) => stack.push(v),
-                        None if matches!(op, BytecodeOp::LoadLocalKey(_)) => {
+                        None if matches!(
+                            op,
+                            BytecodeOp::LoadLocalKey(_) | BytecodeOp::LoadSlotKey(..)
+                        ) =>
+                        {
                             // `local.foo` read where foo isn't in this frame's local
                             // scope → throw (Lucee/ACF parity).
                             let cip = self.raise_undefined_member(prop_name, &mut stack)?;
@@ -9835,10 +10133,22 @@ impl CfmlVirtualMachine {
                         None => stack.push(CfmlValue::Null),
                     }
                 }
-                BytecodeOp::StoreLocalProperty(local_name, prop_name) => {
+                BytecodeOp::StoreLocalProperty(local_name, prop_name)
+                | BytecodeOp::StoreSlotProperty(_, local_name, prop_name) => {
                     // Fused StoreLocal + SetProperty. Pops value from stack,
                     // gets the local struct, sets the property, stores back.
                     if let Some(value) = stack.pop() {
+                        // T3.1: an active slot supplies the receiver directly.
+                        // Containers are reference-typed (shared interior), so
+                        // mutating through a CLONE of the slot value mutates the
+                        // slot's container — no write-back needed. Inactive →
+                        // the generic named resolution below.
+                        let mut slot_store: Option<CfmlValue> = match op {
+                            BytecodeOp::StoreSlotProperty(i, ..) => {
+                                slots[*i as usize].clone()
+                            }
+                            _ => None,
+                        };
                         // Web request scopes (url/form/cgi/cookie): `url.path = x`
                         // must mutate the LIVE per-request scope in `self.globals`,
                         // never vivify a `url` key into a component's persistent
@@ -9873,9 +10183,9 @@ impl CfmlVirtualMachine {
                                 .find(|k| k.eq_ignore_ascii_case(local_name))
                                 .cloned()
                         };
-                        if let Some(obj) =
+                        if let Some(obj) = slot_store.as_mut().or_else(|| {
                             resolved_local.as_ref().and_then(|k| locals.get_mut(k.as_str()))
-                        {
+                        }) {
                             // CFC with a Rust-backed parent: try the native
                             // setter first; None defers to the CFC struct.
                             if let CfmlValue::Struct(ref s) = *obj {
@@ -10947,7 +11257,18 @@ impl CfmlVirtualMachine {
                     })));
                 }
 
-                BytecodeOp::Increment(name) => {
+                BytecodeOp::Increment(name) | BytecodeOp::IncrementSlot(_, name) => {
+                    // Slot fast path (T3.1): mutate the active slot in place.
+                    if let BytecodeOp::IncrementSlot(i, _) = op {
+                        if let Some(v) = slots[*i as usize].as_mut() {
+                            *v = match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(*i + 1),
+                                CfmlValue::Double(d) => CfmlValue::Double(*d + 1.0),
+                                _ => CfmlValue::Int(1),
+                            };
+                            continue;
+                        }
+                    }
                     Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
                         match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i + 1),
@@ -10956,7 +11277,17 @@ impl CfmlVirtualMachine {
                         }
                     });
                 }
-                BytecodeOp::AddLocalConst(name, k) => {
+                BytecodeOp::AddLocalConst(name, k) | BytecodeOp::AddSlotConst(_, name, k) => {
+                    if let BytecodeOp::AddSlotConst(i, _, _) = op {
+                        if let Some(v) = slots[*i as usize].as_mut() {
+                            *v = match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(*i + *k),
+                                CfmlValue::Double(d) => CfmlValue::Double(*d + *k as f64),
+                                _ => CfmlValue::Int(*k),
+                            };
+                            continue;
+                        }
+                    }
                     Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
                         match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i + *k),
@@ -10965,7 +11296,17 @@ impl CfmlVirtualMachine {
                         }
                     });
                 }
-                BytecodeOp::MulLocalConst(name, k) => {
+                BytecodeOp::MulLocalConst(name, k) | BytecodeOp::MulSlotConst(_, name, k) => {
+                    if let BytecodeOp::MulSlotConst(i, _, _) = op {
+                        if let Some(v) = slots[*i as usize].as_mut() {
+                            *v = match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(*i * *k),
+                                CfmlValue::Double(d) => CfmlValue::Double(*d * *k as f64),
+                                _ => CfmlValue::Int(*k),
+                            };
+                            continue;
+                        }
+                    }
                     Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
                         match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i * *k),
@@ -10974,7 +11315,17 @@ impl CfmlVirtualMachine {
                         }
                     });
                 }
-                BytecodeOp::Decrement(name) => {
+                BytecodeOp::Decrement(name) | BytecodeOp::DecrementSlot(_, name) => {
+                    if let BytecodeOp::DecrementSlot(i, _) = op {
+                        if let Some(v) = slots[*i as usize].as_mut() {
+                            *v = match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(*i - 1),
+                                CfmlValue::Double(d) => CfmlValue::Double(*d - 1.0),
+                                _ => CfmlValue::Int(-1),
+                            };
+                            continue;
+                        }
+                    }
                     Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
                         match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i - 1),
@@ -11159,6 +11510,9 @@ impl CfmlVirtualMachine {
                                 // reconcile the env into locals so an unscoped
                                 // enclosing var sees the mutation across the CFC-method
                                 // boundary — the marker CallMethod tail does the same.
+                                if !slots.is_empty() && self.closure_parent_writeback.is_some() {
+                                    Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                                }
                                 if let Some(wb) = self.closure_parent_writeback.take() {
                                     for (k, v) in wb {
                                         self.scope_aware_store(
@@ -12061,6 +12415,9 @@ impl CfmlVirtualMachine {
                     // mutations into the caller's locals. The BIF flavour
                     // (arrayEach/arrayMap/etc.) handles this via parent_locals
                     // threading; the member-call path does not, so we merge here.
+                    if !slots.is_empty() && self.closure_parent_writeback.is_some() {
+                        Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                    }
                     if let Some(wb) = self.closure_parent_writeback.take() {
                         for (k, v) in wb {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
@@ -12263,6 +12620,9 @@ impl CfmlVirtualMachine {
                             }
                         }
                     };
+                    if !slots.is_empty() && self.closure_parent_writeback.is_some() {
+                        Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
+                    }
                     if let Some(wb) = self.closure_parent_writeback.take() {
                         for (k, v) in wb {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
@@ -12938,6 +13298,9 @@ impl CfmlVirtualMachine {
                     // Write back mutations into the shared closure environment
                     if let Some(ref writeback) = self.closure_parent_writeback {
                         Self::write_back_to_captured_scope(&func_ref, writeback);
+                    }
+                    if !slots.is_empty() && self.closure_parent_writeback.is_some() {
+                        Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
                     }
                     if let Some(writeback) = self.closure_parent_writeback.take() {
                         for (k, v) in writeback {
@@ -21696,6 +22059,58 @@ impl CfmlVirtualMachine {
     /// `local.x = ...` assignment — otherwise a same-named key inherited from
     /// the caller/captured scope keeps the delivered variable invisible to
     /// `local.x` reads.
+    /// T3.1: does invoking this callee read/write the CALLER's variables by
+    /// NAME at runtime? QoQ (`queryExecute` / `cfquery` with dbtype=query)
+    /// resolves table names against the caller's scopes; custom tags /
+    /// cfmodule bridge the live `caller` scope both ways. These can't see
+    /// slot storage, so the caller spills first. A user-defined function
+    /// shadowing one of these names spills harmlessly.
+    #[inline]
+    fn callee_reflects_on_caller_scope(name: &str) -> bool {
+        name.eq_ignore_ascii_case("queryexecute")
+            || name.eq_ignore_ascii_case("cfquery")
+            || name.eq_ignore_ascii_case("__cfquery")
+            || name.eq_ignore_ascii_case("__cfcustomtag")
+            || name.eq_ignore_ascii_case("__cfcustomtag_start")
+            || name.eq_ignore_ascii_case("__cfmodule")
+            || name.eq_ignore_ascii_case("cfmodule")
+    }
+
+    /// T3.1 slot deopt: several runtime channels write into the CALLER's frame
+    /// by NAME after a call returns (`apply_pending_result_writeback` /
+    /// cfinvoke returnVariable via `store_runtime_path`, closure
+    /// parent-scope writeback merges). Those writes cannot see slot storage,
+    /// so before ANY of them touches `locals` every active slot is spilled
+    /// into the map and permanently deactivated for the rest of the frame —
+    /// the slot ops' `None` fallback then reads/writes the map, keeping one
+    /// source of truth. Rare in practice (the channels themselves are rare),
+    /// so the fast path is a single `is_empty` check.
+    #[inline]
+    fn spill_slots_for_writeback(
+        locals: &mut ValueMap,
+        slot_names: &[cfml_common::name::Name],
+        slots: &mut [Option<CfmlValue>],
+        slot_blocked: &mut [bool],
+    ) {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if let Some(v) = slot.take() {
+                let name = &slot_names[i];
+                // CI-aware insert: update an existing differently-cased key in
+                // place rather than forking a duplicate.
+                if let Some(existing) = locals
+                    .keys()
+                    .find(|k| k.eq_ignore_ascii_case(name.lower()))
+                    .cloned()
+                {
+                    locals.insert(existing, v);
+                } else {
+                    locals.insert(name.as_str().to_string(), v);
+                }
+            }
+            slot_blocked[i] = true;
+        }
+    }
+
     fn apply_pending_result_writeback(
         &mut self,
         locals: &mut ValueMap,
@@ -22782,6 +23197,8 @@ impl CfmlVirtualMachine {
     fn build_local_scope_view(
         locals: &ValueMap,
         inherited_or_param_keys: &InheritedKeys,
+        slot_names: &[cfml_common::name::Name],
+        slots: &[Option<CfmlValue>],
     ) -> ValueMap {
         let mut out = ValueMap::default();
         for (k, v) in locals {
@@ -22796,6 +23213,14 @@ impl CfmlVirtualMachine {
                 continue;
             }
             out.insert(k.clone(), v.clone());
+        }
+        // T3.1: active slots are frame-established locals by definition —
+        // overlay them last so a slot value wins over any stale map entry
+        // left behind by an inherited key the declaration reclaimed.
+        for (n, v) in slot_names.iter().zip(slots) {
+            if let Some(v) = v {
+                out.insert(n.as_str().to_string(), v.clone());
+            }
         }
         out
     }
@@ -35033,11 +35458,15 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         | BytecodeOp::LoadGlobal(_)
         | BytecodeOp::LoadVariablesKey(_)
         | BytecodeOp::LoadSuper
-        | BytecodeOp::TryLoadLocal(_) => (1, 0),
+        | BytecodeOp::TryLoadLocal(_)
+        | BytecodeOp::LoadSlot(..)
+        | BytecodeOp::TryLoadSlot(..) => (1, 0),
         // Variable stores: push 0, pop 1
-        BytecodeOp::StoreLocal(_) | BytecodeOp::StoreGlobal(_) => (0, 1),
+        BytecodeOp::StoreLocal(_) | BytecodeOp::StoreGlobal(_) | BytecodeOp::StoreSlot(..) => {
+            (0, 1)
+        }
         // Fused in-place append: pops the value, pushes nothing
-        BytecodeOp::ArrayAppendLocal(_) => (0, 1),
+        BytecodeOp::ArrayAppendLocal(_) | BytecodeOp::ArrayAppendSlot(..) => (0, 1),
         // Stack ops
         BytecodeOp::Pop => (0, 1),
         BytecodeOp::Dup => (1, 0),  // net +1 (peeks and pushes copy)
@@ -35071,8 +35500,9 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         // Control flow
         BytecodeOp::Jump(_) => (0, 0),
         BytecodeOp::JumpIfFalse(_) | BytecodeOp::JumpIfTrue(_) => (0, 1),
-        BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, _) => (0, 0),
-        BytecodeOp::ForLoopStep(_, _, _, _, _) => (0, 0),
+        BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, _)
+        | BytecodeOp::JumpIfSlotCmpConstFalse(..) => (0, 0),
+        BytecodeOp::ForLoopStep(_, _, _, _, _) | BytecodeOp::ForSlotStep(..) => (0, 0),
         BytecodeOp::Return => (0, 1),
         // Call: pops func + N args, pushes 1 result
         BytecodeOp::Call(n) => (1, n + 1),
@@ -35087,11 +35517,11 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::TryGetProperty(_) => (1, 1), // obj → value (Null-tolerant twin)
         BytecodeOp::LoadStaticHolder(_) => (0, 1), // → holder
         BytecodeOp::GetStaticProperty(_) => (1, 1), // holder → value
-        BytecodeOp::LoadLocalProperty(_, _) => (1, 0), // pushes value, reads nothing
-        BytecodeOp::TryLoadLocalProperty(_, _) => (1, 0), // Null-tolerant twin
-        BytecodeOp::LoadLocalKey(_) => (1, 0), // pushes value, reads nothing
-        BytecodeOp::TryLoadLocalKey(_) => (1, 0), // Null-tolerant twin
-        BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0
+        BytecodeOp::LoadLocalProperty(_, _) | BytecodeOp::LoadSlotProperty(..) => (1, 0), // pushes value, reads nothing
+        BytecodeOp::TryLoadLocalProperty(_, _) | BytecodeOp::TryLoadSlotProperty(..) => (1, 0), // Null-tolerant twin
+        BytecodeOp::LoadLocalKey(_) | BytecodeOp::LoadSlotKey(..) => (1, 0), // pushes value, reads nothing
+        BytecodeOp::TryLoadLocalKey(_) | BytecodeOp::TryLoadSlotKey(..) => (1, 0), // Null-tolerant twin
+        BytecodeOp::StoreLocalProperty(_, _) | BytecodeOp::StoreSlotProperty(..) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
         BytecodeOp::MarkAccessorPrivate(_) => (0, 0), // no stack effect
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
@@ -35104,8 +35534,14 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         // Function definition: push 1
         BytecodeOp::DefineFunction(_) => (1, 0),
         // Postfix: push 1 (new value)
-        BytecodeOp::Increment(_) | BytecodeOp::Decrement(_) => (1, 0),
-        BytecodeOp::AddLocalConst(_, _) | BytecodeOp::MulLocalConst(_, _) => (0, 0), // pure local mutation, no stack traffic
+        BytecodeOp::Increment(_)
+        | BytecodeOp::Decrement(_)
+        | BytecodeOp::IncrementSlot(..)
+        | BytecodeOp::DecrementSlot(..) => (1, 0),
+        BytecodeOp::AddLocalConst(_, _)
+        | BytecodeOp::MulLocalConst(_, _)
+        | BytecodeOp::AddSlotConst(..)
+        | BytecodeOp::MulSlotConst(..) => (0, 0), // pure local mutation, no stack traffic
         // Exception handling
         BytecodeOp::TryStart(_) | BytecodeOp::TryEnd => (0, 0),
         // Operate only on the internal exception save-stack, not the operand stack.
@@ -35133,7 +35569,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::Halt => (0, 0),
         // Misc
         BytecodeOp::IsDefined(_) => (1, 0),
-        BytecodeOp::DeclareLocal(_) => (0, 0),
+        BytecodeOp::DeclareLocal(_) | BytecodeOp::DeclareSlot(..) => (0, 0),
         BytecodeOp::LineInfo(_, _) => (0, 0),
         // Stands in for the trailing `Pop` of the end call it follows.
         BytecodeOp::TagLoopBack(_) => (0, 1),
@@ -35168,7 +35604,9 @@ fn find_arg_sources(ops: &[BytecodeOp], call_ip: usize, arg_count: usize) -> Vec
                 if let BytecodeOp::LoadLocal(name)
                 | BytecodeOp::TryLoadLocal(name)
                 | BytecodeOp::LoadGlobal(name)
-                | BytecodeOp::LoadVariablesKey(name) = op
+                | BytecodeOp::LoadVariablesKey(name)
+                | BytecodeOp::LoadSlot(_, name)
+                | BytecodeOp::TryLoadSlot(_, name) = op
                 {
                     sources[arg_idx] = Some(name.to_string());
                 }

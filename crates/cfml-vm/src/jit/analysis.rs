@@ -1254,6 +1254,7 @@ mod tests {
             output_suppressed: false,
             is_template_frame: false,
             chain_tier: 0,
+            slot_names: Vec::new(),
         }
     }
 
