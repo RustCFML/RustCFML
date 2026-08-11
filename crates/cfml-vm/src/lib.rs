@@ -34,6 +34,8 @@ pub mod debug_footer;
 #[cfg(feature = "observability")]
 pub mod profiler;
 mod java_shims;
+// Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
+mod ops;
 mod java_time;
 pub mod tz;
 pub mod type_check;
@@ -4793,7 +4795,7 @@ impl CfmlVirtualMachine {
     /// hierarchy match where catching a parent type (`Foo`) also catches its
     /// subtypes (`Foo.Bar`). Custom exception types are dotted strings, so this
     /// keeps `catch (Foo.InvalidConfiguration)` and `catch (Foo)` both working.
-    fn catch_type_matches(catch_type: &str, exc_type: &str) -> bool {
+    pub(crate) fn catch_type_matches(catch_type: &str, exc_type: &str) -> bool {
         let ct = catch_type.trim();
         if ct.is_empty() || ct.eq_ignore_ascii_case("any") {
             return true;
@@ -6473,12 +6475,12 @@ impl CfmlVirtualMachine {
             ip += 1;
 
             match op {
-                BytecodeOp::Null => stack.push(CfmlValue::Null),
-                BytecodeOp::True => stack.push(CfmlValue::Bool(true)),
-                BytecodeOp::False => stack.push(CfmlValue::Bool(false)),
-                BytecodeOp::Integer(n) => stack.push(CfmlValue::Int(*n)),
-                BytecodeOp::Double(d) => stack.push(CfmlValue::Double(*d)),
-                BytecodeOp::String(s) => stack.push(CfmlValue::string(s.clone())),
+                BytecodeOp::Null => ops::value::op_null(&mut stack),
+                BytecodeOp::True => ops::value::op_true(&mut stack),
+                BytecodeOp::False => ops::value::op_false(&mut stack),
+                BytecodeOp::Integer(n) => ops::value::op_integer(&mut stack, *n),
+                BytecodeOp::Double(d) => ops::value::op_double(&mut stack, *d),
+                BytecodeOp::String(s) => ops::value::op_string(&mut stack, s),
 
                 BytecodeOp::LoadLocal(name) | BytecodeOp::LoadSlot(_, name) => {
                     // Slot fast path (T3.1): a declared slot always wins — the
@@ -8058,55 +8060,14 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::Pop => {
-                    stack.pop();
-                }
-                BytecodeOp::Dup => {
-                    if let Some(val) = stack.last() {
-                        stack.push(val.clone());
-                    }
-                }
-                BytecodeOp::Swap => {
-                    let len = stack.len();
-                    if len >= 2 {
-                        stack.swap(len - 1, len - 2);
-                    }
-                }
+                BytecodeOp::Pop => ops::value::op_pop(&mut stack),
+                BytecodeOp::Dup => ops::value::op_dup(&mut stack),
+                BytecodeOp::Swap => ops::value::op_swap(&mut stack),
 
                 // Arithmetic
-                BytecodeOp::Add => {
-                    binary_op(&mut stack, |a, b| match (&a, &b) {
-                        (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i + j),
-                        (CfmlValue::Double(x), CfmlValue::Double(y)) => CfmlValue::Double(x + y),
-                        (CfmlValue::Int(i), CfmlValue::Double(d)) => {
-                            CfmlValue::Double(*i as f64 + d)
-                        }
-                        (CfmlValue::Double(d), CfmlValue::Int(i)) => {
-                            CfmlValue::Double(d + *i as f64)
-                        }
-                        // CFML `+` is ARITHMETIC ONLY (`&` is concatenation), so two
-                        // numeric strings like "2" + "1" must ADD to 3, not
-                        // concatenate to "21". There is deliberately no String+String
-                        // short-circuit — numeric strings fall through to coercion
-                        // below; only genuinely non-numeric operands concatenate.
-                        _ => {
-                            let a_num = to_arith_number(&a);
-                            let b_num = to_arith_number(&b);
-                            match (a_num, b_num) {
-                                (Some(x), Some(y)) => CfmlValue::Double(x + y),
-                                _ => {
-                                    CfmlValue::string(format!("{}{}", a.as_string(), b.as_string()))
-                                }
-                            }
-                        }
-                    });
-                }
-                BytecodeOp::Sub => {
-                    binary_op(&mut stack, |a, b| numeric_op(&a, &b, |x, y| x - y));
-                }
-                BytecodeOp::Mul => {
-                    binary_op(&mut stack, |a, b| numeric_op(&a, &b, |x, y| x * y));
-                }
+                BytecodeOp::Add => ops::value::op_add(&mut stack),
+                BytecodeOp::Sub => ops::value::op_sub(&mut stack),
+                BytecodeOp::Mul => ops::value::op_mul(&mut stack),
                 BytecodeOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let x = to_arith_number(&a).unwrap_or(0.0);
@@ -8146,49 +8107,10 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
-                BytecodeOp::Mod => {
-                    binary_op(&mut stack, |a, b| match (&a, &b) {
-                        (CfmlValue::Int(i), CfmlValue::Int(j)) if *j != 0 => CfmlValue::Int(i % j),
-                        _ => {
-                            let x = to_number(&a).unwrap_or(0.0);
-                            let y = to_number(&b).unwrap_or(1.0);
-                            CfmlValue::Double(x % y)
-                        }
-                    });
-                }
-                BytecodeOp::Pow => {
-                    binary_op(&mut stack, |a, b| {
-                        let x = to_number(&a).unwrap_or(0.0);
-                        let y = to_number(&b).unwrap_or(0.0);
-                        CfmlValue::Double(x.powf(y))
-                    });
-                }
-                BytecodeOp::IntDiv => {
-                    binary_op(&mut stack, |a, b| {
-                        let x = to_number(&a).unwrap_or(0.0) as i64;
-                        let y = to_number(&b).unwrap_or(1.0) as i64;
-                        if y == 0 {
-                            CfmlValue::Int(0)
-                        } else {
-                            CfmlValue::Int(x / y)
-                        }
-                    });
-                }
-                BytecodeOp::Negate => {
-                    if let Some(val) = stack.pop() {
-                        match val {
-                            CfmlValue::Int(i) => stack.push(CfmlValue::Int(-i)),
-                            CfmlValue::Double(d) => stack.push(CfmlValue::Double(-d)),
-                            _ => {
-                                if let Some(n) = to_number(&val) {
-                                    stack.push(CfmlValue::Double(-n));
-                                } else {
-                                    stack.push(CfmlValue::Int(0));
-                                }
-                            }
-                        }
-                    }
-                }
+                BytecodeOp::Mod => ops::value::op_mod(&mut stack),
+                BytecodeOp::Pow => ops::value::op_pow(&mut stack),
+                BytecodeOp::IntDiv => ops::value::op_int_div(&mut stack),
+                BytecodeOp::Negate => ops::value::op_negate(&mut stack),
 
                 // String concatenation
                 BytecodeOp::Concat => {
@@ -8219,78 +8141,26 @@ impl CfmlVirtualMachine {
                 }
 
                 // Comparison - proper value comparison
-                BytecodeOp::Eq => {
-                    compare_op(&mut stack, |a, b| cfml_equal(a, b));
-                }
-                BytecodeOp::Neq => {
-                    compare_op(&mut stack, |a, b| !cfml_equal(a, b));
-                }
-                BytecodeOp::StrictEq => {
-                    compare_op(&mut stack, |a, b| cfml_strict_equal(a, b));
-                }
-                BytecodeOp::StrictNeq => {
-                    compare_op(&mut stack, |a, b| !cfml_strict_equal(a, b));
-                }
-                BytecodeOp::Lt => {
-                    compare_op(&mut stack, |a, b| cfml_compare(a, b) < 0);
-                }
-                BytecodeOp::Lte => {
-                    compare_op(&mut stack, |a, b| cfml_compare(a, b) <= 0);
-                }
-                BytecodeOp::Gt => {
-                    compare_op(&mut stack, |a, b| cfml_compare(a, b) > 0);
-                }
-                BytecodeOp::Gte => {
-                    compare_op(&mut stack, |a, b| cfml_compare(a, b) >= 0);
-                }
+                BytecodeOp::Eq => ops::value::op_eq(&mut stack),
+                BytecodeOp::Neq => ops::value::op_neq(&mut stack),
+                BytecodeOp::StrictEq => ops::value::op_strict_eq(&mut stack),
+                BytecodeOp::StrictNeq => ops::value::op_strict_neq(&mut stack),
+                BytecodeOp::Lt => ops::value::op_lt(&mut stack),
+                BytecodeOp::Lte => ops::value::op_lte(&mut stack),
+                BytecodeOp::Gt => ops::value::op_gt(&mut stack),
+                BytecodeOp::Gte => ops::value::op_gte(&mut stack),
 
                 // CFML-specific operators
-                BytecodeOp::Contains => {
-                    compare_op(&mut stack, |a, b| {
-                        let haystack = a.as_string().to_lowercase();
-                        let needle = b.as_string().to_lowercase();
-                        haystack.contains(&needle)
-                    });
-                }
-                BytecodeOp::DoesNotContain => {
-                    compare_op(&mut stack, |a, b| {
-                        let haystack = a.as_string().to_lowercase();
-                        let needle = b.as_string().to_lowercase();
-                        !haystack.contains(&needle)
-                    });
-                }
+                BytecodeOp::Contains => ops::value::op_contains(&mut stack),
+                BytecodeOp::DoesNotContain => ops::value::op_does_not_contain(&mut stack),
 
                 // Logical
-                BytecodeOp::And => {
-                    binary_op(&mut stack, |a, b| {
-                        CfmlValue::Bool(a.is_true() && b.is_true())
-                    });
-                }
-                BytecodeOp::Or => {
-                    binary_op(&mut stack, |a, b| {
-                        CfmlValue::Bool(a.is_true() || b.is_true())
-                    });
-                }
-                BytecodeOp::Not => {
-                    if let Some(a) = stack.pop() {
-                        stack.push(CfmlValue::Bool(!a.is_true()));
-                    }
-                }
-                BytecodeOp::Xor => {
-                    binary_op(&mut stack, |a, b| {
-                        CfmlValue::Bool(a.is_true() ^ b.is_true())
-                    });
-                }
-                BytecodeOp::Eqv => {
-                    binary_op(&mut stack, |a, b| {
-                        CfmlValue::Bool(a.is_true() == b.is_true())
-                    });
-                }
-                BytecodeOp::Imp => {
-                    binary_op(&mut stack, |a, b| {
-                        CfmlValue::Bool(!a.is_true() || b.is_true())
-                    });
-                }
+                BytecodeOp::And => ops::value::op_and(&mut stack),
+                BytecodeOp::Or => ops::value::op_or(&mut stack),
+                BytecodeOp::Not => ops::value::op_not(&mut stack),
+                BytecodeOp::Xor => ops::value::op_xor(&mut stack),
+                BytecodeOp::Eqv => ops::value::op_eqv(&mut stack),
+                BytecodeOp::Imp => ops::value::op_imp(&mut stack),
 
                 // Control flow
                 BytecodeOp::Jump(target) => {
@@ -9684,31 +9554,8 @@ impl CfmlVirtualMachine {
                 }
 
                 // Collections
-                BytecodeOp::BuildArray(count) => {
-                    let mut elements = Vec::new();
-                    for _ in 0..*count {
-                        if let Some(val) = stack.pop() {
-                            elements.push(val);
-                        }
-                    }
-                    elements.reverse();
-                    stack.push(CfmlValue::array(elements));
-                }
-                BytecodeOp::BuildStruct(count) => {
-                    let mut pairs = Vec::new();
-                    for _ in 0..*count {
-                        let value = stack.pop().unwrap_or(CfmlValue::Null);
-                        let key = stack.pop().unwrap_or(CfmlValue::string(String::new()));
-                        // §3.5: the map key must be owned, but `key` was just popped
-                        // off the stack — move its String out instead of copying.
-                        pairs.push((key.into_string(), value));
-                    }
-                    let mut map = ValueMap::default();
-                    for (k, v) in pairs.into_iter().rev() {
-                        map.insert(k, v);
-                    }
-                    stack.push(CfmlValue::strukt(map));
-                }
+                BytecodeOp::BuildArray(count) => ops::value::op_build_array(&mut stack, *count),
+                BytecodeOp::BuildStruct(count) => ops::value::op_build_struct(&mut stack, *count),
                 BytecodeOp::GetIndex => {
                     let index = stack.pop().unwrap_or(CfmlValue::Null);
                     let collection = stack.pop().unwrap_or(CfmlValue::Null);
@@ -10676,12 +10523,7 @@ impl CfmlVirtualMachine {
                         .unwrap_or(CfmlValue::Null);
                     stack.push(holder);
                 }
-                BytecodeOp::GetStaticProperty(member) => {
-                    let holder = stack.pop().unwrap_or(CfmlValue::Null);
-                    let val = Self::read_static_member(&holder, member)
-                        .unwrap_or(CfmlValue::Null);
-                    stack.push(val);
-                }
+                BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
                 BytecodeOp::MarkAccessorPrivate(name) => {
                     // Emitted at the tail of a generated `setX()` accessor. Record
                     // the property on the frame's `this` so introspection/for-in
@@ -11464,19 +11306,7 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::CatchMatch(catch_type) => {
-                    // Peek (do NOT consume) the exception value the catch handler
-                    // was entered with, and push whether its `type` matches this
-                    // clause's declared type.
-                    let exc_type = match stack.last() {
-                        Some(CfmlValue::Struct(s)) => {
-                            s.get("type").map(|v| v.as_string()).unwrap_or_default()
-                        }
-                        _ => String::new(),
-                    };
-                    let matches = Self::catch_type_matches(catch_type, &exc_type);
-                    stack.push(CfmlValue::Bool(matches));
-                }
+                BytecodeOp::CatchMatch(catch_type) => ops::value::op_catch_match(&mut stack, catch_type),
 
                 BytecodeOp::CallMethod(method_name, arg_count, write_back)
                 | BytecodeOp::CallMethodNamed(method_name, _, arg_count, write_back) => {
@@ -12814,13 +12644,7 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::IsNull => {
-                    if let Some(val) = stack.pop() {
-                        stack.push(CfmlValue::Bool(matches!(val, CfmlValue::Null)));
-                    } else {
-                        stack.push(CfmlValue::Bool(true));
-                    }
-                }
+                BytecodeOp::IsNull => ops::value::op_is_null(&mut stack),
 
                 BytecodeOp::JumpIfNotNull(target) => {
                     // Peek at the top of stack - if not null, jump (leave value on stack)
@@ -13275,33 +13099,9 @@ impl CfmlVirtualMachine {
                     stack.push(CfmlValue::Bool(defined));
                 }
 
-                BytecodeOp::ConcatArrays => {
-                    let right = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
-                    let left = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
-                    if let (CfmlValue::Array(a), CfmlValue::Array(b)) = (left, right) {
-                        // Concatenation produces a NEW array (not a mutation of
-                        // either operand), so snapshot both into a fresh Vec.
-                        let mut v = a.snapshot();
-                        v.extend(b.iter());
-                        stack.push(CfmlValue::array(v));
-                    } else {
-                        stack.push(CfmlValue::array(Vec::new()));
-                    }
-                }
+                BytecodeOp::ConcatArrays => ops::value::op_concat_arrays(&mut stack),
 
-                BytecodeOp::MergeStructs => {
-                    let right = stack.pop().unwrap_or(CfmlValue::strukt(ValueMap::default()));
-                    let left = stack.pop().unwrap_or(CfmlValue::strukt(ValueMap::default()));
-                    if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (left, right) {
-                        let mut m = a.snapshot();
-                        for (k, v) in b.iter() {
-                            m.insert(k, v);
-                        }
-                        stack.push(CfmlValue::strukt(m));
-                    } else {
-                        stack.push(CfmlValue::strukt(ValueMap::default()));
-                    }
-                }
+                BytecodeOp::MergeStructs => ops::value::op_merge_structs(&mut stack),
 
                 BytecodeOp::CallSpread => {
                     // Stack: [func_ref, args_array]
@@ -21048,7 +20848,7 @@ impl CfmlVirtualMachine {
     /// Read a member of a component value's static scope (`Component::member`).
     /// Looks only in the `__static` scope (not instance variables), matching
     /// Lucee/BoxLang `::` semantics. Case-insensitive.
-    fn read_static_member(holder: &CfmlValue, member: &str) -> Option<CfmlValue> {
+    pub(crate) fn read_static_member(holder: &CfmlValue, member: &str) -> Option<CfmlValue> {
         if let CfmlValue::Struct(s) = holder {
             if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
                 if let Some(CfmlValue::Struct(stat)) = vars.get("__static") {
@@ -35090,7 +34890,7 @@ fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
     false
 }
 
-fn binary_op<F>(stack: &mut Vec<CfmlValue>, op: F)
+pub(crate) fn binary_op<F>(stack: &mut Vec<CfmlValue>, op: F)
 where
     F: FnOnce(CfmlValue, CfmlValue) -> CfmlValue,
 {
@@ -35099,7 +34899,7 @@ where
     }
 }
 
-fn compare_op<F>(stack: &mut Vec<CfmlValue>, op: F)
+pub(crate) fn compare_op<F>(stack: &mut Vec<CfmlValue>, op: F)
 where
     F: FnOnce(&CfmlValue, &CfmlValue) -> bool,
 {
@@ -35108,7 +34908,7 @@ where
     }
 }
 
-fn to_number(val: &CfmlValue) -> Option<f64> {
+pub(crate) fn to_number(val: &CfmlValue) -> Option<f64> {
     // A QueryColumn proxy behaves as its first-row value in scalar numeric
     // contexts (arithmetic, coercion) — mirrors cfml_equal/cfml_compare.
     let val = val.query_column_scalar();
@@ -35141,7 +34941,7 @@ fn cfml_date_to_serial(dt: &chrono::NaiveDateTime) -> f64 {
 /// a numeric serial (NOT a date string), which date functions re-parse via the
 /// serial branch of `parse_cfml_date`. A genuinely non-numeric, non-date string
 /// still returns None so the caller can fall back to `&`-style concatenation.
-fn to_arith_number(val: &CfmlValue) -> Option<f64> {
+pub(crate) fn to_arith_number(val: &CfmlValue) -> Option<f64> {
     if let Some(n) = to_number(val) {
         return Some(n);
     }
@@ -35153,7 +34953,7 @@ fn to_arith_number(val: &CfmlValue) -> Option<f64> {
     None
 }
 
-fn numeric_op<F>(a: &CfmlValue, b: &CfmlValue, op: F) -> CfmlValue
+pub(crate) fn numeric_op<F>(a: &CfmlValue, b: &CfmlValue, op: F) -> CfmlValue
 where
     F: FnOnce(f64, f64) -> f64,
 {
@@ -35193,7 +34993,7 @@ fn bool_literal_to_num(s: &str) -> Option<f64> {
 }
 
 /// CFML equality comparison (case-insensitive for strings, type-coercing for numbers)
-fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
+pub(crate) fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
     let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
     // A timespan compares as its fractional-day Double value.
@@ -35314,7 +35114,7 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
 ///     (same backing store), matching Lucee — `a === a` true, but two
 ///     structurally-equal-but-distinct arrays are not strictly equal.
 /// Verified against Lucee 7.
-fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
+pub(crate) fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
     let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
     match (a, b) {
@@ -35397,7 +35197,7 @@ fn try_parse_cfml_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
     None
 }
 
-fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
+pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
     let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
     // A timespan compares as its fractional-day Double value.
