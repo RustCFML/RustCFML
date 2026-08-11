@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 514 crate(s)
+  MIT License (MIT) — 516 crate(s)
   Apache License 2.0 (Apache-2.0) — 53 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 8 crate(s)
@@ -551,6 +551,8 @@ Dependencies
   rand_core 0.6.4 — https://github.com/rust-random/rand
   rand_core 0.9.5 — https://github.com/rust-random/rand
 [MIT]
+  mimalloc 0.1.52 — https://github.com/purpleprotocol/mimalloc_rust
+[MIT]
   zerocopy-derive 0.8.52 — https://github.com/google/zerocopy
   zerocopy 0.8.52 — https://github.com/google/zerocopy
 [MIT]
@@ -586,6 +588,8 @@ Dependencies
   tiff 0.11.3 — https://github.com/image-rs/image-tiff
 [MIT]
   crc32fast 1.5.0 — https://github.com/srijs/rust-crc32fast
+[MIT]
+  libmimalloc-sys 0.1.49 — https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys
 [MIT]
   asynchronous-codec 0.6.2 — https://github.com/mxinden/asynchronous-codec
 [MIT]
@@ -8707,6 +8711,39 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - mimalloc 0.1.52
+================================================================================
+
+Copyright 2019 Octavian Oncescu
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - zerocopy-derive 0.8.52
   - zerocopy 0.8.52
 ================================================================================
@@ -9090,6 +9127,35 @@ Applies to:
 MIT License
 
 Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - libmimalloc-sys 0.1.49
+================================================================================
+
+MIT License
+
+Copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

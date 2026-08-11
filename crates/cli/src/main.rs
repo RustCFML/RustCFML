@@ -27,6 +27,18 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[global_allocator]
 static ALLOC: rustcfml_cli::memprofile::SamplingAlloc = rustcfml_cli::memprofile::SamplingAlloc;
 
+// mimalloc (feature `mimalloc`). Sizing/perf lever: allocator work is ~27% of a
+// warm Preside request, and the default build inherits the platform malloc. The
+// two profiler allocators above take precedence, since a build that asked for a
+// heap profile must keep getting one.
+#[cfg(all(
+    feature = "mimalloc",
+    not(feature = "dhat-heap"),
+    not(all(feature = "memprofile", unix))
+))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();

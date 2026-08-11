@@ -74,6 +74,10 @@ dhat = { version = "0.3", optional = true }
 # Stack capture for the `memprofile` sampling heap profiler. Already in the tree
 # transitively (pprof, dhat); declared explicitly so the feature owns it.
 backtrace = { version = "0.3", optional = true }
+# Alternative global allocator (feature `mimalloc`). ~27% of a warm request is
+# allocator work and the default build uses the system malloc, which on macOS is
+# libmalloc — the slowest mainstream allocator for high-churn small allocations.
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 # ── OpenTelemetry (observability Phase 3) — host-only, behind `obs-otel` ──
 # Pinned as a compatible set (all track the opentelemetry 0.32 line). OTLP export
@@ -90,7 +94,7 @@ opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true }
 
 [features]
-default = ["memcached", "cluster", "jit", "component-instance"]
+default = ["memcached", "cluster", "jit", "component-instance", "mimalloc"]
 # OpenTelemetry distributed traces (OTLP push) + RED metrics (native Prometheus
 # scrape endpoint). Host-only; never enabled by the wasm crates. Implies the VM's
 # `observability` hook bus.
@@ -114,6 +118,16 @@ dhat-heap = ["dep:dhat"]
 # for both inuse_space and alloc_space. Unix-only (SIGUSR2). Mutually exclusive
 # with `dhat-heap` — only one global allocator can be installed.
 memprofile = ["dep:backtrace"]
+# Swap the system allocator for mimalloc. **DEFAULT-ON as of v0.590.0**: measured
+# -15.6% warm CPU and -18.9% boot on the live Preside site for +1.8% peak RSS,
+# because ~27% of a warm request is allocator work and the platform mallocs (macOS
+# libmalloc especially) are poor at high-churn small allocations. Opt out with
+# `--no-default-features` or by building a profiling variant. Mutually exclusive
+# with the two profiler allocators above (only one `#[global_allocator]` can
+# exist); the cfg in `main.rs` gives `dhat-heap`/`memprofile` precedence so a
+# profiling build still profiles. Zero effect on the wasm crates, which never
+# depend on the CLI.
+mimalloc = ["dep:mimalloc"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # Passthrough to the VM's Cranelift JIT (native only). **On by default** via

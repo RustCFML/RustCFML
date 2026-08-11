@@ -1497,7 +1497,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "cfml-common",
  "log",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-config"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "indexmap",
  "log",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-qoq"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "cfml-common",
  "indexmap",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "ab_glyph",
  "aes 0.8.4",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "anyhow",
  "cfml-codegen",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -4103,6 +4103,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4497,6 +4506,15 @@ name = "micromap"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "mime"
@@ -6368,7 +6386,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.589.0"
+version = "0.590.0"
 dependencies = [
  "anyhow",
  "automerge",
@@ -6394,6 +6412,7 @@ dependencies = [
  "log",
  "memberlist",
  "memcache",
+ "mimalloc",
  "multer",
  "openssl",
  "opentelemetry",
