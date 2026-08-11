@@ -36,5 +36,10 @@
 //! array/struct construction and the two container merge ops. These are also
 //! exactly the ops Tier-0 will inline natively first, so they are the natural
 //! starting point.
+//!
+//! Slice 2: the arms needing the live VM plus `ip` — `Div`/`Concat` (catchable
+//! errors), `Throw`/`Rethrow`, `Print`, and the custom-tag/jump ops — in
+//! `effect.rs`, which documents how `continue` and `return Err` translate.
 
+pub(crate) mod effect;
 pub(crate) mod value;

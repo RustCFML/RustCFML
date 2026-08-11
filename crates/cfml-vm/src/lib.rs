@@ -1692,12 +1692,12 @@ pub struct CfmlVirtualMachine {
     #[cfg(feature = "scope-pool")]
     locals_pool: Vec<ValueMap>,
     /// Try-catch handler stack
-    try_stack: Vec<TryHandler>,
+    pub(crate) try_stack: Vec<TryHandler>,
     /// Current exception (if any)
     #[allow(dead_code)]
     current_exception: Option<CfmlValue>,
     /// Last thrown exception (for rethrow support)
-    last_exception: Option<CfmlValue>,
+    pub(crate) last_exception: Option<CfmlValue>,
     /// Save-stack for `last_exception`, used to protect the caught exception
     /// across a `finally` body emitted inline before a `rethrow`/re-raise (the
     /// finally may itself throw-and-catch, clobbering `last_exception`).
@@ -2033,7 +2033,7 @@ pub struct CfmlVirtualMachine {
     /// body. Always consumed by the very next op, so it can never leak across
     /// tags — but the nesting is lexical anyway, so the flag set by an inner
     /// pair's end is read by that same pair's `TagLoopBack`.
-    pending_tag_loop: bool,
+    pub(crate) pending_tag_loop: bool,
     /// How many custom-tag END phases are currently executing, innermost last;
     /// `true` marks an end phase, `false` a start phase. `<cfexit method="loop">`
     /// is only legal while the innermost entry is an end phase — Lucee raises
@@ -4594,7 +4594,7 @@ impl CfmlVirtualMachine {
         None
     }
 
-    fn build_stack_trace(&self) -> Vec<cfml_common::vm::StackFrame> {
+    pub(crate) fn build_stack_trace(&self) -> Vec<cfml_common::vm::StackFrame> {
         use cfml_common::vm::StackFrame;
         let mut frames = Vec::new();
         let template = self.source_file.clone().unwrap_or_default();
@@ -4631,7 +4631,7 @@ impl CfmlVirtualMachine {
         frames
     }
 
-    fn build_tag_context(&self) -> CfmlValue {
+    pub(crate) fn build_tag_context(&self) -> CfmlValue {
         Self::tag_context_from_frames(&self.build_stack_trace())
     }
 
@@ -4728,7 +4728,7 @@ impl CfmlVirtualMachine {
     /// deliberately omits its own `rootCause`, so cfdump/serializeJSON over an
     /// exception never recurse. A pre-existing `rootCause` (e.g. carried by an
     /// object re-thrown via `throw(object=…)`) is left untouched.
-    fn add_root_cause(exc: &mut ValueMap) {
+    pub(crate) fn add_root_cause(exc: &mut ValueMap) {
         // Ensure a `stackTrace` key (Lucee/ACF parity): every cfcatch/exception
         // exposes one, and frameworks read it directly (ColdBox's RestHandler logs
         // `arguments.exception.stacktrace`). Synthesised from message + tagContext
@@ -5342,7 +5342,7 @@ impl CfmlVirtualMachine {
     /// Used by the `AbandonTagPairs` op and as the frame-exit backstop. Lucee
     /// discards the body content and skips the end phase when control leaves a
     /// tag body without reaching the end tag.
-    fn abandon_tag_pairs(&mut self, n: usize) {
+    pub(crate) fn abandon_tag_pairs(&mut self, n: usize) {
         for _ in 0..n {
             if let Some(outer) = self.saved_output_buffers.pop() {
                 // Drops the body buffer; the enclosing buffer becomes current.
@@ -5369,7 +5369,7 @@ impl CfmlVirtualMachine {
         self.custom_tag_stack.truncate(entry_tag_depth);
     }
 
-    fn restore_capture_state(&mut self, handler: &TryHandler) {
+    pub(crate) fn restore_capture_state(&mut self, handler: &TryHandler) {
         while self.saved_output_buffers.len() > handler.saved_buffers_depth {
             self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
         }
@@ -5452,7 +5452,7 @@ impl CfmlVirtualMachine {
     /// `Ok(catch_ip)` (the caller sets `ip = catch_ip; continue;`); otherwise
     /// return the error to abort the request. Generic sibling of
     /// `raise_undefined_member` for ops that need their own message/type.
-    fn raise_catchable(
+    pub(crate) fn raise_catchable(
         &mut self,
         stack: &mut Vec<CfmlValue>,
         message: &str,
@@ -8068,77 +8068,14 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Add => ops::value::op_add(&mut stack),
                 BytecodeOp::Sub => ops::value::op_sub(&mut stack),
                 BytecodeOp::Mul => ops::value::op_mul(&mut stack),
-                BytecodeOp::Div => {
-                    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        let x = to_arith_number(&a).unwrap_or(0.0);
-                        let y = to_arith_number(&b).unwrap_or(1.0);
-                        if y == 0.0 {
-                            // CFML throws on division by zero
-                            let mut exception = ValueMap::default();
-                            exception.insert(
-                                "message".to_string(),
-                                CfmlValue::string("Division by zero is not allowed.".to_string()),
-                            );
-                            exception.insert(
-                                "type".to_string(),
-                                CfmlValue::string("Expression".to_string()),
-                            );
-                            exception
-                                .insert("detail".to_string(), CfmlValue::string(String::new()));
-                            exception.insert("tagcontext".to_string(), self.build_tag_context());
-                            Self::add_root_cause(&mut exception);
-                            let error_val = CfmlValue::strukt(exception);
-                            self.last_exception = Some(error_val.clone());
-                            if let Some(handler) = self.try_stack.pop() {
-                                while stack.len() > handler.stack_depth {
-                                    stack.pop();
-                                }
-                                self.restore_capture_state(&handler);
-                                stack.push(error_val);
-                                ip = handler.catch_ip;
-                                continue;
-                            } else {
-                                return Err(CfmlError::runtime(
-                                    "Division by zero is not allowed.".to_string(),
-                                ));
-                            }
-                        } else {
-                            stack.push(CfmlValue::Double(x / y));
-                        }
-                    }
-                }
+                BytecodeOp::Div => { ops::effect::op_div(self, &mut stack, &mut ip)?; }
                 BytecodeOp::Mod => ops::value::op_mod(&mut stack),
                 BytecodeOp::Pow => ops::value::op_pow(&mut stack),
                 BytecodeOp::IntDiv => ops::value::op_int_div(&mut stack),
                 BytecodeOp::Negate => ops::value::op_negate(&mut stack),
 
                 // String concatenation
-                BytecodeOp::Concat => {
-                    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        // Lucee parity: `&` (and multi-part `"a#x#b"`) on a complex
-                        // value throws a catchable `expression` error — "Can't cast
-                        // Complex Object Type [Struct] to String" — instead of
-                        // dumping it. The dump was not just wrong-vs-Lucee: on a
-                        // densely shared object graph it expanded to an O(2^depth)
-                        // string and hung the process (ColdBox boot). Left operand
-                        // is checked first, matching CFML left-to-right evaluation.
-                        let sa = match a.to_string_strict() {
-                            Ok(s) => s,
-                            Err(e) => match self.raise_catchable(&mut stack, &e.message, "expression") {
-                                Ok(catch_ip) => { ip = catch_ip; continue; }
-                                Err(e) => return Err(e),
-                            },
-                        };
-                        let sb = match b.to_string_strict() {
-                            Ok(s) => s,
-                            Err(e) => match self.raise_catchable(&mut stack, &e.message, "expression") {
-                                Ok(catch_ip) => { ip = catch_ip; continue; }
-                                Err(e) => return Err(e),
-                            },
-                        };
-                        stack.push(CfmlValue::string(format!("{}{}", sa, sb)));
-                    }
-                }
+                BytecodeOp::Concat => { ops::effect::op_concat(self, &mut stack, &mut ip)?; }
 
                 // Comparison - proper value comparison
                 BytecodeOp::Eq => ops::value::op_eq(&mut stack),
@@ -11209,80 +11146,8 @@ impl CfmlVirtualMachine {
                 BytecodeOp::TryEnd => {
                     self.try_stack.pop();
                 }
-                BytecodeOp::Throw => {
-                    let raw = stack
-                        .pop()
-                        .unwrap_or(CfmlValue::string("Unknown error".to_string()));
-                    // The bare statement form `throw "msg";` (and `throw expr;`)
-                    // pushes a simple value. Wrap any non-struct value into a
-                    // proper exception struct so `cfcatch.message`/`.type` resolve
-                    // — mirroring the throw(...) function-call form. A struct value
-                    // (re-throw of a caught exception) is preserved verbatim.
-                    let error_val = match raw {
-                        CfmlValue::Struct(_) => raw,
-                        other => {
-                            let mut m = ValueMap::default();
-                            m.insert("message".to_string(), CfmlValue::string(other.as_string()));
-                            m.insert("type".to_string(), CfmlValue::string("Application".to_string()));
-                            m.insert("detail".to_string(), CfmlValue::string(String::new()));
-                            m.insert("tagcontext".to_string(), self.build_tag_context());
-                            Self::add_root_cause(&mut m);
-                            CfmlValue::strukt(m)
-                        }
-                    };
-                    self.last_exception = Some(error_val.clone());
-                    if let Some(handler) = self.try_stack.pop() {
-                        // Unwind stack
-                        while stack.len() > handler.stack_depth {
-                            stack.pop();
-                        }
-                        self.restore_capture_state(&handler);
-                        stack.push(error_val);
-                        ip = handler.catch_ip;
-                    } else {
-                        // Propagate the original message (not the serialized
-                        // struct) so resolve_catch_error_val matches last_exception
-                        // and reuses the full cfcatch struct — preserving the
-                        // error's `type`/`detail` across the frame boundary.
-                        let mut err = CfmlError::runtime(match &error_val {
-                            CfmlValue::Struct(s) => s
-                                .get("message")
-                                .map(|m| m.as_string())
-                                .unwrap_or_else(|| error_val.as_string()),
-                            _ => error_val.as_string(),
-                        });
-                        err.stack_trace = self.build_stack_trace();
-                        return Err(err);
-                    }
-                }
-                BytecodeOp::Rethrow => {
-                    let error_val = self
-                        .last_exception
-                        .clone()
-                        .unwrap_or(CfmlValue::string("No exception to rethrow".to_string()));
-                    if let Some(handler) = self.try_stack.pop() {
-                        while stack.len() > handler.stack_depth {
-                            stack.pop();
-                        }
-                        self.restore_capture_state(&handler);
-                        stack.push(error_val);
-                        ip = handler.catch_ip;
-                    } else {
-                        // Propagate the original message (not the serialized
-                        // struct) so resolve_catch_error_val matches last_exception
-                        // and reuses the full cfcatch struct — preserving the
-                        // error's `type`/`detail` across the frame boundary.
-                        let mut err = CfmlError::runtime(match &error_val {
-                            CfmlValue::Struct(s) => s
-                                .get("message")
-                                .map(|m| m.as_string())
-                                .unwrap_or_else(|| error_val.as_string()),
-                            _ => error_val.as_string(),
-                        });
-                        err.stack_trace = self.build_stack_trace();
-                        return Err(err);
-                    }
-                }
+                BytecodeOp::Throw => { ops::effect::op_throw(self, &mut stack, &mut ip)?; }
+                BytecodeOp::Rethrow => { ops::effect::op_rethrow(self, &mut stack, &mut ip)?; }
 
                 BytecodeOp::SaveException => {
                     self.exception_save_stack.push(self.last_exception.clone());
@@ -12646,15 +12511,7 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::IsNull => ops::value::op_is_null(&mut stack),
 
-                BytecodeOp::JumpIfNotNull(target) => {
-                    // Peek at the top of stack - if not null, jump (leave value on stack)
-                    // If null, continue (leave null on stack)
-                    if let Some(val) = stack.last() {
-                        if !matches!(val, CfmlValue::Null) {
-                            ip = *target;
-                        }
-                    }
-                }
+                BytecodeOp::JumpIfNotNull(target) => { ops::effect::op_jump_if_not_null(&stack, &mut ip, *target); }
 
                 BytecodeOp::JumpIfArgPresent(name, target) => {
                     // Default-argument preamble: skip the default when the caller
@@ -13079,21 +12936,7 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::Print => {
-                    if let Some(val) = stack.pop() {
-                        // Lucee parity: outputting a complex value throws a
-                        // catchable `expression` error rather than dumping it.
-                        let s = match val.to_string_strict() {
-                            Ok(s) => s,
-                            Err(e) => match self.raise_catchable(&mut stack, &e.message, "expression") {
-                                Ok(catch_ip) => { ip = catch_ip; continue; }
-                                Err(e) => return Err(e),
-                            },
-                        };
-                        self.output_buffer.push_str(&s);
-                        self.output_buffer.push('\n');
-                    }
-                }
+                BytecodeOp::Print => { ops::effect::op_print(self, &mut stack, &mut ip)?; }
                 BytecodeOp::IsDefined(var_name) => {
                     let defined = self.is_variable_defined(&var_name, &locals);
                     stack.push(CfmlValue::Bool(defined));
@@ -13130,27 +12973,8 @@ impl CfmlVirtualMachine {
                     stack.push(result);
                 }
 
-                BytecodeOp::TagLoopBack(body_start) => {
-                    // Trailing op of a lowered `__cfcustomtag_end()` statement,
-                    // standing in for the `Pop` an expression statement would
-                    // normally get.
-                    stack.pop();
-                    if self.pending_tag_loop {
-                        // `<cfexit method="loop">`: the end handler has already
-                        // re-armed the tag state and pushed a fresh capture
-                        // buffer, so re-entering the body from the top resumes
-                        // the same tag instance. Only the body repeats — the
-                        // start phase ran once and is not revisited.
-                        self.pending_tag_loop = false;
-                        ip = *body_start;
-                        continue;
-                    }
-                }
-                BytecodeOp::AbandonTagPairs(n) => {
-                    // A `break`/`continue` is jumping out of `n` custom tag
-                    // bodies whose `__cfcustomtag_end()` will never run.
-                    self.abandon_tag_pairs(*n);
-                }
+                BytecodeOp::TagLoopBack(body_start) => { ops::effect::op_tag_loop_back(self, &mut stack, &mut ip, *body_start); }
+                BytecodeOp::AbandonTagPairs(n) => { ops::effect::op_abandon_tag_pairs(self, *n); }
                 BytecodeOp::LineInfo(line, col) => {
                     self.current_line = *line;
                     self.current_column = *col;
