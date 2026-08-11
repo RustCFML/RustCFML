@@ -87,3 +87,45 @@ accepted = [
 
 # Crates whose SPDX expression cargo-about cannot resolve unaided.
 workarounds = ["ring"]
+
+# libmimalloc-sys ships THREE copies of the same MIT licence — its own
+# LICENSE.txt plus the vendored C sources' c_src/mimalloc/v2/LICENSE and
+# c_src/mimalloc/v3/LICENSE. cargo-about harvests every licence file it finds,
+# in filesystem-iteration order, so the concatenated text (and therefore
+# whether this crate merges into mimalloc's identical MIT block or gets one of
+# its own) differed between APFS and ext4 — and even between two ext4 runners.
+# That made the byte-exact staleness gate in .github/workflows/licenses.yml
+# flaky: v0.590.0's tag build failed the gate that the same commit had just
+# passed on main, 29 lines apart.
+#
+# Listing the files explicitly here fixes their ORDER, which is what the
+# generated text depends on — the filesystem is no longer consulted for
+# discovery, so APFS and ext4 produce the same bytes.
+#
+# All three must stay listed. They are NOT the same notice, despite both being
+# MIT: LICENSE.txt is "Copyright 2019 Octavian Oncescu" (the Rust binding),
+# while c_src/mimalloc/v2|v3/LICENSE is "Copyright (c) 2018-2025 Microsoft
+# Corporation, Daan Leijen" — the vendored C allocator that is statically
+# linked into every shipped binary. Pinning only LICENSE.txt silently dropped
+# the Microsoft/Daan copyright from the notice, which MIT requires to travel
+# with the binary.
+#
+# c_src/mimalloc/v3/LICENSE is deliberately NOT listed: it is byte-identical to
+# the v2 file (checksum 82ade5d7…), so whichever of v2/v3 is compiled, the same
+# notice text is reproduced — and listing both made cargo-about print
+# "libmimalloc-sys 0.1.49" twice in the same Applies-to block.
+#
+# Same class of problem as the miniz_oxide blank-line skew documented in
+# scripts/gen-licenses.sh.
+[libmimalloc-sys.clarify]
+license = "MIT"
+
+[[libmimalloc-sys.clarify.files]]
+path = "LICENSE.txt"
+license = "MIT"
+checksum = "a08554fab028af3af047e8588d32d019662c1b1bf07959a195a2f75fe340726b"
+
+[[libmimalloc-sys.clarify.files]]
+path = "c_src/mimalloc/v2/LICENSE"
+license = "MIT"
+checksum = "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9"

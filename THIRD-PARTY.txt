@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 516 crate(s)
+  MIT License (MIT) — 517 crate(s)
   Apache License 2.0 (Apache-2.0) — 53 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 8 crate(s)
@@ -551,6 +551,7 @@ Dependencies
   rand_core 0.6.4 — https://github.com/rust-random/rand
   rand_core 0.9.5 — https://github.com/rust-random/rand
 [MIT]
+  libmimalloc-sys 0.1.49 — https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys
   mimalloc 0.1.52 — https://github.com/purpleprotocol/mimalloc_rust
 [MIT]
   zerocopy-derive 0.8.52 — https://github.com/google/zerocopy
@@ -8711,6 +8712,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - libmimalloc-sys 0.1.49
   - mimalloc 0.1.52
 ================================================================================
 
