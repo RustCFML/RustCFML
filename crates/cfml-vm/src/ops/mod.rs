@@ -47,8 +47,14 @@
 //! Slice 4: the frame-state arms needing exactly one frame field (`locals` or the
 //! slot vector) in `frame.rs`. A `FrameCtx` struct is deliberately deferred until
 //! an op genuinely needs most of the frame — true of the call/store ops, not these.
+//!
+//! Slice 5: 22 more frame arms in `locals.rs` — try/except bookkeeping, the fused
+//! local arithmetic ops, local load/append, the super-call ops. The three
+//! OSR-entangled jump arms (`Jump`, `JumpIfFalse`, `JumpIfTrue`) are deferred to
+//! the `FrameCtx` slice, since they reach into the JIT loop-compilation path.
 
 pub(crate) mod access;
 pub(crate) mod effect;
 pub(crate) mod frame;
+pub(crate) mod locals;
 pub(crate) mod value;
