@@ -381,13 +381,66 @@ impl BytecodeFunction {
         let mut declared: Vec<Name> = Vec::new(); // first-declaration order
         let mut declared_seen: HashSet<String> = HashSet::new();
         let mut excluded: HashSet<String> = HashSet::new();
-        for op in &self.instructions {
+        for (i, op) in self.instructions.iter().enumerate() {
             match op {
-                BytecodeOp::DefineFunction(_)
-                | BytecodeOp::Include(_)
-                | BytecodeOp::IncludeDynamic
-                | BytecodeOp::SetDynamicVar => return,
-                BytecodeOp::DeleteScopeKey(n) if n.lower() == "local" => return,
+                // Closure-defining bodies are counted apart from the other
+                // wholesale disqualifiers: P2 sizing needs to know how much of
+                // the ineligible code is ONLY ineligible because of a closure,
+                // and how much of such a body precedes its first closure (all a
+                // spill-on-DefineFunction design could recover).
+                BytecodeOp::DefineFunction(_) => {
+                    self.count_slot_class(SlotClass::DisqClosure, Some(i));
+                    return;
+                }
+                BytecodeOp::Include(_) | BytecodeOp::IncludeDynamic => {
+                    self.count_slot_class(SlotClass::DisqOther(DisqReason::Include), Some(i));
+                    return;
+                }
+                // A runtime-path store only ever touches the path's FIRST
+                // segment in this frame (`store_runtime_path`: one
+                // `scope_aware_load`/`scope_aware_store` on `parts[0]`, then an
+                // in-place walk through reference-typed intermediates). So when
+                // the path is a COMPILE-TIME LITERAL — which every
+                // auto-vivifying nested-write site emits as
+                // `String(path); Swap; SetDynamicVar` — the by-name channel is
+                // known and a single per-name exclusion covers it; the whole
+                // function need not lose its slots. A reserved scope root
+                // (`variables.a.b`, `application.x.y`) touches that scope's own
+                // container, never a slottable frame name, so it needs no
+                // exclusion at all. This is the widest slot-coverage gap
+                // measured: 32% of Wheels' and 5% of Preside's non-template op
+                // weight sat behind this one disqualifier.
+                //
+                // `local.…` stays wholesale: `scope_aware_store("local", …)`
+                // merges a materialized whole-scope view back into the frame,
+                // which is exactly the by-name channel slots cannot survive.
+                // A genuinely runtime-computed path (`"#scope#.#prop#" = v`)
+                // also stays wholesale — the name isn't knowable here.
+                BytecodeOp::SetDynamicVar => {
+                    let literal_root = (i >= 2)
+                        .then(|| (&self.instructions[i - 2], &self.instructions[i - 1]))
+                        .and_then(|(two_back, one_back)| match (two_back, one_back) {
+                            (BytecodeOp::String(p), BytecodeOp::Swap) => {
+                                Some(p.split('.').next().unwrap_or("").to_lowercase())
+                            }
+                            _ => None,
+                        });
+                    match literal_root.filter(|_| slot_dynvar_narrowing_enabled()) {
+                        Some(root) if root != "local" && !root.is_empty() => {
+                            if !SCOPE_NAMES.contains(&root.as_str()) {
+                                excluded.insert(root);
+                            }
+                        }
+                        _ => {
+                            self.count_slot_class(SlotClass::DisqOther(DisqReason::DynVar), Some(i));
+                            return;
+                        }
+                    }
+                }
+                BytecodeOp::DeleteScopeKey(n) if n.lower() == "local" => {
+                    self.count_slot_class(SlotClass::DisqOther(DisqReason::DelScope), Some(i));
+                    return;
+                }
                 BytecodeOp::DeclareLocal(n) => {
                     if declared_seen.insert(n.lower().to_string()) {
                         declared.push(n.clone());
@@ -395,6 +448,7 @@ impl BytecodeFunction {
                 }
                 BytecodeOp::LoadGlobal(n) => {
                     if REFLECTIVE_BUILTINS.contains(&n.lower()) {
+                        self.count_slot_class(SlotClass::DisqOther(DisqReason::Reflective), Some(i));
                         return;
                     }
                     excluded.insert(n.lower().to_string());
@@ -443,15 +497,25 @@ impl BytecodeFunction {
             {
                 continue;
             }
-            if slot_names.len() >= u16::MAX as usize {
+            // Hard cap 64, not `u16::MAX`: the VM's per-frame "this slot
+            // refused activation" flags are a single `u64` bitmask rather than a
+            // second heap-allocated `Vec<bool>` per frame. Bodies with >64
+            // `var`s exist but are not hot loops; the surplus names simply keep
+            // the by-name path.
+            if slot_names.len() >= 64 {
                 break;
             }
             slot_of.insert(lower.to_string(), slot_names.len() as u16);
             slot_names.push(n);
         }
         if slot_names.is_empty() {
+            self.count_slot_class(
+                SlotClass::NoCandidates { any_declared: !declared_seen.is_empty() },
+                None,
+            );
             return;
         }
+        self.count_slot_class(SlotClass::Slotted, None);
 
         // Pass 2: rewrite ops whose name resolves to a slot.
         let slot = |n: &Name| slot_of.get(n.lower()).copied();
@@ -510,6 +574,67 @@ impl BytecodeFunction {
             }
         }
         self.slot_names = slot_names;
+    }
+
+    /// Record one function's slot-locals classification into the process
+    /// counters (`RUSTCFML_COUNTERS=1`; diagnostics only, no behavior). Skipped
+    /// entirely when counters are off, so the common path pays one bool load.
+    /// `first_closure_at` is the instruction index of the body's first
+    /// `DefineFunction`, used to attribute the recoverable prefix.
+    fn count_slot_class(&self, class: SlotClass, first_closure_at: Option<usize>) {
+        use cfml_common::perf_counters as pc;
+        if !pc::enabled() {
+            return;
+        }
+        let ops = self.instructions.len() as u64;
+        match class {
+            SlotClass::Slotted => {
+                pc::bump(&pc::SLOT_FN_SLOTTED);
+                pc::add(&pc::SLOT_OPS_SLOTTED, ops);
+            }
+            SlotClass::DisqClosure => {
+                pc::bump(&pc::SLOT_FN_DISQ_CLOSURE);
+                pc::add(&pc::SLOT_OPS_DISQ_CLOSURE, ops);
+                pc::add(
+                    &pc::SLOT_OPS_CLOSURE_PREFIX,
+                    first_closure_at.unwrap_or(0) as u64,
+                );
+            }
+            SlotClass::DisqOther(reason) => {
+                pc::bump(&pc::SLOT_FN_DISQ_OTHER);
+                pc::add(&pc::SLOT_OPS_DISQ_OTHER, ops);
+                match reason {
+                    DisqReason::Include => {
+                        pc::bump(&pc::SLOT_FN_DISQ_INCLUDE);
+                        pc::add(&pc::SLOT_OPS_DISQ_INCLUDE, ops);
+                        pc::add(
+                            &pc::SLOT_OPS_INCLUDE_PREFIX,
+                            first_closure_at.unwrap_or(0) as u64,
+                        );
+                    }
+                    DisqReason::DynVar => {
+                        pc::bump(&pc::SLOT_FN_DISQ_DYNVAR);
+                        pc::add(&pc::SLOT_OPS_DISQ_DYNVAR, ops);
+                    }
+                    DisqReason::Reflective => {
+                        pc::bump(&pc::SLOT_FN_DISQ_REFLECTIVE);
+                        pc::add(&pc::SLOT_OPS_DISQ_REFLECTIVE, ops);
+                    }
+                    DisqReason::DelScope => pc::bump(&pc::SLOT_FN_DISQ_DELSCOPE),
+                }
+            }
+            SlotClass::NoCandidates { any_declared } => {
+                pc::bump(&pc::SLOT_FN_NO_CANDIDATES);
+                pc::bump(if any_declared {
+                    &pc::SLOT_FN_ALL_EXCLUDED
+                } else {
+                    &pc::SLOT_FN_NO_DECLARES
+                });
+            }
+        }
+        if !matches!(class, SlotClass::Slotted) {
+            pc::add(&pc::SLOT_PARAMS_UNSLOTTED_FNS, self.params.len() as u64);
+        }
     }
 
     /// Release the spare capacity every `Vec` here accumulated while being built.
@@ -591,6 +716,50 @@ fn slot_locals_enabled() -> bool {
             "0" | "false" | "off" | "no"
         )
     })
+}
+
+/// Runtime kill switch for the literal-path `SetDynamicVar` narrowing (T3.1
+/// P2): `RUSTCFML_SLOT_DYNVAR=0` restores the wholesale disqualification — also
+/// the exact A/B arm the win was measured against. Read-once, like
+/// [`slot_locals_enabled`].
+fn slot_dynvar_narrowing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("RUSTCFML_SLOT_DYNVAR")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// How `assign_local_slots` classified one function (diagnostics only, see
+/// [`BytecodeFunction::count_slot_class`]).
+#[derive(Debug, Clone, Copy)]
+enum SlotClass {
+    Slotted,
+    DisqClosure,
+    /// Wholesale disqualification other than a closure, with the reason so P2
+    /// can be sized per reason rather than as one opaque bucket.
+    DisqOther(DisqReason),
+    NoCandidates { any_declared: bool },
+}
+
+/// Which wholesale disqualifier a function tripped (diagnostics only).
+#[derive(Debug, Clone, Copy)]
+enum DisqReason {
+    /// Function-scoped `<cfinclude>`/`include` — the included template shares
+    /// genuine `local` keys BY NAME, so slots must at least spill there.
+    Include,
+    /// `SetDynamicVar` — a runtime-computed assignment target.
+    DynVar,
+    /// A call-position load of the reflective `evaluate` family.
+    Reflective,
+    /// `structDelete(local, …)` against the live local scope.
+    DelScope,
 }
 
 /// Comparison operator tag for fused-compare super-instructions.

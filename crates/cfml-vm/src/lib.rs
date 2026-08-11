@@ -6001,11 +6001,31 @@ impl CfmlVirtualMachine {
         } else {
             vec![None; func.slot_names.len()]
         };
+        // Weights the compile-side slot classification by how often frames of
+        // each kind are actually entered (P2 sizing; `RUSTCFML_COUNTERS=1`).
+        if cfml_common::perf_counters::enabled() {
+            use cfml_common::perf_counters as pc;
+            if func.slot_names.is_empty() {
+                pc::bump(&pc::FRAMES_UNSLOTTED);
+                if !func.params.is_empty() {
+                    pc::bump(&pc::FRAMES_UNSLOTTED_WITH_PARAMS);
+                }
+            } else {
+                pc::bump(&pc::FRAMES_SLOTTED);
+            }
+        }
         // Parallel to `slots`: a slot whose activation was refused once (a
         // CI-cased inherited copy exists in the locals map) stays on the
         // generic path for the rest of the frame — without this the O(map)
         // CI probe would re-run on EVERY subsequent store.
-        let mut slot_blocked: Vec<bool> = vec![false; slots.len()];
+        //
+        // A BITMASK, not a `Vec<bool>`: this used to be a second per-frame heap
+        // allocation paid by every slotted frame (~2,600/request on Preside,
+        // ~1,750 on a Wheels ORM page) purely to hold a handful of flags.
+        // Codegen caps `slot_names` at 64 for exactly this reason, so one `u64`
+        // always suffices.
+        debug_assert!(slots.len() <= 64, "slot_names must be capped at 64 by codegen");
+        let mut slot_blocked: u64 = 0;
         let mut ip = 0;
         // Track variables declared with `var` (function-local, not written back to parent)
         let mut declared_locals: std::collections::HashSet<String> =
@@ -6959,7 +6979,7 @@ impl CfmlVirtualMachine {
                             }
                             continue;
                         }
-                        if !slot_blocked[idx]
+                        if slot_blocked & (1u64 << idx) == 0
                             && (declared_locals.contains(name.as_str())
                                 || declared_locals.contains(name.lower()))
                         {
@@ -6973,7 +6993,7 @@ impl CfmlVirtualMachine {
                                 }
                                 continue;
                             }
-                            slot_blocked[idx] = true;
+                            slot_blocked |= 1u64 << idx;
                         }
                     }
                     if let Some(val) = stack.pop() {
@@ -22090,7 +22110,7 @@ impl CfmlVirtualMachine {
         locals: &mut ValueMap,
         slot_names: &[cfml_common::name::Name],
         slots: &mut [Option<CfmlValue>],
-        slot_blocked: &mut [bool],
+        slot_blocked: &mut u64,
     ) {
         for (i, slot) in slots.iter_mut().enumerate() {
             if let Some(v) = slot.take() {
@@ -22107,8 +22127,10 @@ impl CfmlVirtualMachine {
                     locals.insert(name.as_str().to_string(), v);
                 }
             }
-            slot_blocked[i] = true;
         }
+        // Every slot is now deactivated for the rest of the frame; indices
+        // beyond `slots.len()` are never queried, so blanket-set the mask.
+        *slot_blocked = u64::MAX;
     }
 
     fn apply_pending_result_writeback(
