@@ -1109,8 +1109,17 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 Some(raw) => format_attr_value(raw, false),
                 None => "\"\"".to_string(),
             };
-            // Clean name - remove scope prefix quotes and strip hash expressions
-            let clean_name = strip_hashes(&name.replace('"', "").replace('\'', ""));
+            // Clean name — strip hash expressions, and unwrap a name that is
+            // itself fully quoted (`name="'myVar'"`).
+            //
+            // This used to `.replace('"', "").replace('\'', "")` every quote in
+            // the name, which broke any BRACKET KEY: `name="item['x-bind:href']"`
+            // became `item[x-bind:href]` and failed to parse ("Expected RBracket,
+            // found Colon"), and the quieter `name="item['href']"` became
+            // `item[href]` — parsed, but resolved the key as an IDENTIFIER, so it
+            // paramed the wrong slot. Quotes inside the path are load-bearing;
+            // only a wrapper pair is noise.
+            let clean_name = strip_hashes(&unwrap_quoted_name(&name));
             let mut script =
                 format!("if (isNull({})) {{ {} = {}; }}\n", clean_name, clean_name, default);
             // Enforce the `type` attribute (with optional min/max/pattern).
@@ -1138,7 +1147,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                         "__cfparam_validate({val}, \"{ty}\", \"{nm}\", {min}, {max}, {pat});\n",
                         val = clean_name,
                         ty = ty,
-                        nm = clean_name,
+                        // The name now keeps interior quotes (bracket keys), so
+                        // double any `"` before embedding it in a string literal.
+                        nm = clean_name.replace('"', "\"\""),
                         min = min,
                         max = max,
                         pat = pattern,
@@ -2538,6 +2549,22 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
 fn find_tag_end(chars: &[char], start: usize, len: usize) -> usize {
     let mut i = start;
+    // Bracket depth, so a `>` belonging to an expression rather than to the tag
+    // does not end the tag. Two shapes need this, both from tag-mode
+    // expressions (`<cfset>`/`<cfif>`/`<cfreturn>`):
+    //   * arrow functions — `<cfset t = arr.reduce((s, r) => s + r.count, 0)>`
+    //     truncated at the `>` of `=>`, leaving `arr.reduce((s, r) =` and the
+    //     misleading error "Expected RParen, found Comma";
+    //   * any `>`/`>=` comparison inside a call — `<cfset x = max(a, b > c)>`.
+    // The arrow's `>` is inside `reduce(`, so depth alone covers it; a
+    // top-level arrow (`<cfset f = (a) => a * 2>`) is caught by the explicit
+    // `=>` check below.
+    let mut depth: i32 = 0;
+    // Fallback: the first `>` seen at ANY depth. If the tag has no depth-0 `>`
+    // at all (unbalanced brackets outside strings — malformed, but it may have
+    // parsed before this change), use that instead of swallowing the rest of
+    // the file. Keeps this strictly more permissive than the old scanner.
+    let mut first_any: Option<usize> = None;
     while i < len {
         // A CFML comment embedded in the tag (e.g. inside a multi-line cfset
         // expression body) may contain `>` in its `--->` terminator — skip the
@@ -2561,12 +2588,27 @@ fn find_tag_end(chars: &[char], start: usize, len: usize) -> usize {
             i = skip_cfml_string(chars, i, len);
             continue;
         }
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
         if c == '>' {
-            return i + 1;
+            if first_any.is_none() {
+                first_any = Some(i + 1);
+            }
+            // `=>` is an arrow, never this tag's terminator. Guarded so `>=`,
+            // `==>`, `!=>` and `<=>` are not mistaken for one.
+            let is_arrow = i > start
+                && chars[i - 1] == '='
+                && !(i >= 2 && matches!(chars[i - 2], '=' | '!' | '<' | '>'));
+            if depth <= 0 && !is_arrow {
+                return i + 1;
+            }
         }
         i += 1;
     }
-    len
+    first_any.unwrap_or(len)
 }
 
 /// Advance past a CFML string literal. `start` must point at the opening quote.
@@ -2754,8 +2796,34 @@ fn parse_tag_attributes_ordered(
             } else {
                 // Unquoted value
                 let val_start = i;
-                while i < len && !chars[i].is_whitespace() && chars[i] != '>' {
-                    i += 1;
+                if chars[i] == '#' {
+                    // Hash-wrapped unquoted value — `<cfargument default=#{ "a":
+                    // 1 }#>`, the ACF/Lucee spelling for "evaluate this
+                    // expression". It may contain whitespace, quotes and commas,
+                    // so the whitespace/`>` scan below would cut it after `#{`
+                    // and read the remainder as further attributes (the reported
+                    // symptom was a bogus "Unterminated '#' interpolation" from
+                    // somewhere else in the tag entirely). Consume the whole
+                    // interpolation, nested strings included.
+                    i = skip_interpolation(chars, i, len);
+                    // A trailing `##` would have been an escaped literal hash;
+                    // anything else non-delimiting after the closing `#` (e.g.
+                    // `default=#x#&"y"`) still belongs to this value.
+                    while i < len && !chars[i].is_whitespace() && chars[i] != '>' {
+                        if chars[i] == '#' {
+                            i = skip_interpolation(chars, i, len);
+                            continue;
+                        }
+                        if chars[i] == '"' || chars[i] == '\'' {
+                            i = skip_cfml_string(chars, i, len);
+                            continue;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    while i < len && !chars[i].is_whitespace() && chars[i] != '>' {
+                        i += 1;
+                    }
                 }
                 let val: String = chars[val_start..i].iter().collect();
                 let key = attr_name.to_lowercase();
@@ -2839,6 +2907,15 @@ fn decode_attr_escapes(raw: &str, quote: char) -> String {
 /// the legacy expression-or-literal heuristic in `quote_if_needed`.
 fn format_attr_value(raw: &str, was_quoted: bool) -> String {
     if !was_quoted {
+        // An UNQUOTED value that is exactly one `#expr#` is an expression, and
+        // must keep its native type — `<cfargument default=#{ "a": 1 }#>` is a
+        // struct, not the string "{ \"a\": 1 }". `strip_hashes` +
+        // `quote_if_needed` used to quote it, so the argument arrived as text and
+        // any member access off it read empty. Same rule the quoted branch
+        // already applies below; parenthesised so precedence cannot leak.
+        if let Some(inner) = single_hash_expr(raw) {
+            return format!("({})", inner);
+        }
         return quote_if_needed(&strip_hashes(raw));
     }
     // Pure `#expr#` (whole value is one expression) — preserve native type
@@ -2907,6 +2984,26 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
 /// closes the opening `#` with `find_closing_hash` (string/paren aware) and only
 /// treat the value as a single expression when that closing hash is the very
 /// last character.
+/// Unwrap a name attribute that is itself wrapped in quotes (`name="'myVar'"`),
+/// leaving every interior quote alone so bracket keys survive
+/// (`item['x-bind:href']`). Only strips when the first and last characters are
+/// the SAME quote and nothing between them closes it early — so
+/// `'a' & x & 'b'` is left untouched rather than becoming `a' & x & 'b`.
+fn unwrap_quoted_name(name: &str) -> String {
+    let t = name.trim();
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() >= 2 {
+        let q = chars[0];
+        if (q == '"' || q == '\'') && chars[chars.len() - 1] == q {
+            let interior_closes = chars[1..chars.len() - 1].iter().any(|&c| c == q);
+            if !interior_closes {
+                return chars[1..chars.len() - 1].iter().collect();
+            }
+        }
+    }
+    t.to_string()
+}
+
 fn single_hash_expr(raw: &str) -> Option<String> {
     if !raw.starts_with('#') || raw.len() < 2 {
         return None;
@@ -4233,6 +4330,21 @@ fn process_sql_hashes(sql: &str) -> String {
 
     while i < len {
         if chars[i] == '#' {
+            // `##` is an ESCAPED literal hash, not the start of an expression.
+            // Without this, `SELECT 'Order ###x#'` (literal `#` then `#x#`)
+            // matched the closing hash at the second `#`, emitted an EMPTY
+            // expression, and produced malformed script — reported as the
+            // baffling "Expected RParen, found Identifier(\"x\")".
+            //
+            // The doubled form is kept, not collapsed to one `#`: this text is
+            // emitted into a CFML string literal below, so a bare `#` would be
+            // read back as an interpolation opener by our own lexer. `##` is
+            // exactly how that literal hash is spelled in the generated source.
+            if i + 1 < len && chars[i + 1] == '#' {
+                current_text.push_str("##");
+                i += 2;
+                continue;
+            }
             // Look for the MATCHING closing `#`, skipping `#` that live inside
             // nested string literals (and honouring paren depth). A naive
             // "next `#`" scan split a nested interpolation like

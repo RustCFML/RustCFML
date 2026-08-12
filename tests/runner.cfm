@@ -461,6 +461,14 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_savecontent.cfm">
 <cf_runtest file="tags/test_tags_param.cfm">
 <cf_runtest file="tags/test_tags_param_dynamic.cfm">
+<!--- - cfparam_bracket_key_colon: cfparam name= is an lvalue path whose --->
+<!--- bracket segment holds a quoted string key -- including one with a --->
+<!--- colon (name="item['x-bind:href']", the Alpine.js attribute shape). --->
+<!--- RustCFML rejects it at PARSE time ("Expected RBracket, found Colon") --->
+<!--- though the same key works in ordinary expressions (inline control). --->
+<!--- Fixture-contained (parse errors escape try/catch); dotted-name control --->
+<!--- fixture guards the wiring. Reduced from the titan (Moopa) codebase port. --->
+<cf_runtest file="tags/test_cfparam_bracket_key_colon.cfm">
 <cf_runtest file="tags/test_tags_cfoutput_query.cfm">
 <cf_runtest file="tags/test_tags_misc.cfm">
 <cf_runtest file="tags/test_tags_cfsleep.cfm">
@@ -469,8 +477,17 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_customtag.cfm">
 <cf_runtest file="tags/test_custom_tag_caller_cfc_method.cfm">
 <cf_runtest file="tags/test_customtag_caller_semantics.cfm">
+<cf_runtest file="tags/test_getbasetag_functions.cfm">
 <cf_runtest file="tags/test_custom_tag_attribute_collection.cfm">
 <cf_runtest file="tags/test_tags_customtag_lifecycle.cfm">
+<!--- - customtag_path_deep_search: a custom tag in a SUBDIRECTORY of a --->
+<!--- this.customtagpaths dir must resolve (Lucee with customTagDeepSearch --->
+<!--- on, which is how Lucee-based projects ship). RustCFML resolves the --->
+<!--- path root (in-suite control) but never descends: "Custom tag --->
+<!--- 'cf_ctpath_deep' not found". Runtime-level (catchable), runner-safe. --->
+<!--- Fixture dirs under tests/tags/ctpathroot/; the path itself is declared --->
+<!--- in tests/Application.cfc. Reduced from the titan (Moopa) codebase port. --->
+<cf_runtest file="tags/test_customtag_path_deep_search.cfm">
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
 <cf_runtest file="tags/test_tags_cfexecute.cfm">
 <cf_runtest file="tags/test_tags_cfmail.cfm">
@@ -506,6 +523,14 @@ include "harness.cfm";
 <cf_runtest file="tags/test_pg_pool_stale_connection_retry.cfm">
 <cf_runtest file="tags/test_mssql_pool_stale_connection_retry.cfm">
 <cf_runtest file="tags/test_cfquery_quoted_identifier.cfm">
+<!--- - cfquery_escaped_hash_interpolation: an escaped hash immediately --->
+<!--- followed by an interpolation inside a cfquery-body string literal --->
+<!--- ('Order ###x#' -> "Order #5") must lower like it does in cfoutput/cfset --->
+<!--- (inline control). RustCFML rejects the body at PARSE time ("Expected --->
+<!--- RParen, found Identifier"). Fixture-contained; QoQ keeps the fixtures --->
+<!--- executable with no datasource, so the VALUE is asserted, not just --->
+<!--- parseability. Reduced from the titan (Moopa) codebase port. --->
+<cf_runtest file="tags/test_cfquery_escaped_hash_interpolation.cfm">
 <cf_runtest file="tags/test_cfquery_sql_line_comments.cfm">
 <cf_runtest file="tags/test_cte_with_query.cfm">
 <cf_runtest file="tags/test_tags_cfquery_control_tags.cfm">
@@ -938,6 +963,22 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_quotes.cfm">
+<!--- - cfargument_hash_struct_default: an UNQUOTED hash-wrapped tag --->
+<!--- attribute may hold a STRUCT LITERAL (default=#{ "type": "json_object" }#); --->
+<!--- Lucee evaluates it as the argument default. RustCFML rejects it at --->
+<!--- PARSE time ("Unterminated '#' interpolation", reported away from the --->
+<!--- attribute) while the simple-expression form default=#lCase(..)# parses --->
+<!--- (control fixture). Fixture-contained (parse errors escape try/catch). --->
+<!--- Reduced from the titan (Moopa) codebase port. --->
+<cf_runtest file="tags/test_cfargument_hash_struct_default.cfm">
+<!--- - tag_mode_arrow_function: an arrow function is an expression, so it --->
+<!--- may appear in a TAG-MODE expression (<cfset t = arr.reduce((s, r) => --->
+<!--- s + r.count, 0)>), expression or block body. RustCFML rejects both at --->
+<!--- PARSE time ("Expected RParen, found Comma") while the identical code --->
+<!--- in cfscript and the classic function(){} spelling in tag mode both --->
+<!--- work (in-suite controls). Fixture-contained (parse errors escape --->
+<!--- try/catch). Found running titan (Moopa) on v0.574.0. --->
+<cf_runtest file="tags/test_tag_mode_arrow_function.cfm">
 <cf_runtest file="tags/test_cfspreadsheet.cfm">
 
 <!--- --- Query of Queries --- --->

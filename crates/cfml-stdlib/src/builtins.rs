@@ -789,6 +789,11 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // the `__cflocation` VM intercept (see `lib.rs`). Registering it as a builtin
     // shadowed that mapping and hit the stub — a 500 "requires VM intercept".
     f.insert("trace".into(), fn_trace);
+    // Custom-tag ancestry (VM-intercepted in lib.rs — they read the VM's
+    // base_tag_stack). Registered here so name resolution finds them; the stubs
+    // are only reachable off-VM.
+    f.insert("getBaseTagList".into(), fn_get_base_tag_list_stub);
+    f.insert("getBaseTagData".into(), fn_get_base_tag_data_stub);
     f.insert("exceptionKeyExists".into(), fn_exception_key_exists);
     // Classic CF debug-footer BIFs. These are VM-intercepted in lib.rs when the
     // `observability` feature is on (they need the per-request collector + live
@@ -5462,6 +5467,23 @@ fn fn_get_function_list(_args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_get_context_root(_args: Vec<CfmlValue>) -> CfmlResult {
     // In a servlet context, returns the context root. For RustCFML, always "".
     Ok(CfmlValue::string(String::new()))
+}
+
+fn fn_get_base_tag_list_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    // Fallback only. The real getBaseTagList() is VM-intercepted in `cfml-vm`
+    // (reads `base_tag_stack`). Off-VM there is no tag ancestry at all, and
+    // Lucee returns an empty list outside any custom tag, so match that.
+    Ok(CfmlValue::string(String::new()))
+}
+
+fn fn_get_base_tag_data_stub(args: Vec<CfmlValue>) -> CfmlResult {
+    // Fallback only — see fn_get_base_tag_list_stub. With no ancestry to search,
+    // the honest answer is the same error Lucee raises for an absent ancestor.
+    let name = args.first().map(|v| v.as_string()).unwrap_or_default();
+    Err(CfmlError::runtime(format!(
+        "can't find base tag with name [{}]",
+        name.to_uppercase()
+    )))
 }
 
 fn fn_is_in_thread(_args: Vec<CfmlValue>) -> CfmlResult {

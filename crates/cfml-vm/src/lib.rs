@@ -5,7 +5,7 @@ use cfml_common::dynamic::{
     build_implements_meta, interface_meta_stub, CfmlQuery, CfmlStruct, CfmlValue, ValueBuildHasher,
     ValueMap,
 };
-use cfml_common::vfs::{RealFs, Vfs};
+use cfml_common::vfs::{RealFs, Vfs, VfsDirEntry};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
 use indexmap::IndexMap;
@@ -2009,6 +2009,10 @@ pub struct CfmlVirtualMachine {
     held_locks: Vec<(String, HeldLock)>,
     /// Custom tag paths from this.customTagPaths in Application.cfc
     pub custom_tag_paths: Vec<String>,
+    /// Search `custom_tag_paths` recursively when resolving `<cf_name>`.
+    /// Lucee's `customTagDeepSearch`; default OFF (stock-Lucee parity), set by
+    /// cfconfig `customTagDeepSearch` or `this.customTagDeepSearch`.
+    pub custom_tag_deep_search: bool,
     /// Application-wide default for Lucee `localMode`. Set from
     /// `this.localMode` in Application.cfc; functions that don't declare
     /// their own `localMode` attribute inherit this. Default: classic
@@ -2016,6 +2020,11 @@ pub struct CfmlVirtualMachine {
     pub app_local_mode_modern: bool,
     /// Stack for nested body-mode custom tags
     custom_tag_stack: Vec<CustomTagState>,
+    /// Custom-tag ancestry for `getBaseTagList()`/`getBaseTagData()`, innermost
+    /// LAST. Distinct from `custom_tag_stack`, which only tracks body-mode pairs
+    /// between their start and end ops — the ancestry must also include
+    /// self-closing tags and cfmodule invocations while their template runs.
+    base_tag_stack: Vec<BaseTagEntry>,
     /// `cfexit` control-flow signal. `__cfexit` sets this to the lowered method
     /// ("exittag" / "exittemplate" / "loop"); the bytecode loop then unwinds the
     /// current function like reaching its end (preserving partial locals so a
@@ -2457,6 +2466,7 @@ pub struct ThreadSeed {
     pub source_file: Option<String>,
     pub mappings: Vec<CfmlMapping>,
     pub custom_tag_paths: Vec<String>,
+    pub custom_tag_deep_search: bool,
     pub app_local_mode_modern: bool,
     pub sandbox: bool,
     pub null_support: bool,
@@ -2697,6 +2707,33 @@ pub(crate) struct TryHandler {
     /// stale entries from custom-tag bodies that threw before their end op are
     /// truncated away.
     custom_tag_depth: usize,
+    /// Same, for `base_tag_stack` (the `getBaseTagList`/`getBaseTagData`
+    /// ancestry). A tag that throws before its end op must not stay visible as
+    /// an ancestor to whatever the catch block runs.
+    base_tag_depth: usize,
+}
+
+/// One entry in the custom-tag ancestry exposed by `getBaseTagList()` /
+/// `getBaseTagData()`.
+///
+/// Pushed for the whole lifetime of a tag invocation — start phase, body, end
+/// phase — so a tag sees ITSELF as element 1 and a tag in a host's body sees the
+/// host as element 2 (both Lucee-measured, pinned by
+/// `tests/tags/test_getbasetag_functions.cfm`).
+#[derive(Clone)]
+struct BaseTagEntry {
+    /// Uppercased ancestry name: `CF_MYTAG` for a `<cf_mytag>` invocation,
+    /// `CFMODULE` for a `<cfmodule>`/`module` one.
+    name: String,
+    /// The tag's live Arc-backed `variables` scope — what `getBaseTagData()`
+    /// hands back. Sharing the Arc (rather than snapshotting) is the whole
+    /// point: the fragment/slot pattern DEPOSITS into an ancestor's
+    /// `attributes` through this reference and the ancestor must see it.
+    tag_vars: CfmlStruct,
+    /// Whether `getBaseTagData(name)` can find this entry. False for
+    /// `cfmodule` invocations: Lucee lists them as `CFMODULE` but cannot look
+    /// them up by that name ("can't find base tag with name [CFMODULE]").
+    findable: bool,
 }
 
 /// State for a body-mode custom tag execution
@@ -2711,6 +2748,9 @@ struct CustomTagState {
     /// end phase must be skipped, but partial start-phase caller writes still
     /// propagate.
     exit_tag: bool,
+    /// `base_tag_stack` depth to restore when this pair completes or is
+    /// abandoned. The pair's own ancestry entry sits at exactly this index.
+    base_tag_depth: usize,
 }
 
 impl CfmlVirtualMachine {
@@ -2805,8 +2845,10 @@ impl CfmlVirtualMachine {
             query_execute_fn: None,
             held_locks: Vec::new(),
             custom_tag_paths: Vec::new(),
+            custom_tag_deep_search: false,
             app_local_mode_modern: false,
             custom_tag_stack: Vec::new(),
+            base_tag_stack: Vec::new(),
             pending_exit: None,
             last_exit_method: None,
             pending_tag_loop: false,
@@ -3899,6 +3941,7 @@ impl CfmlVirtualMachine {
             source_file: self.source_file.clone(),
             mappings: self.mappings.clone(),
             custom_tag_paths: self.custom_tag_paths.clone(),
+            custom_tag_deep_search: self.custom_tag_deep_search,
             app_local_mode_modern: self.app_local_mode_modern,
             sandbox: self.sandbox,
             null_support: self.null_support,
@@ -3939,6 +3982,7 @@ impl CfmlVirtualMachine {
         self.mappings = seed.mappings;
         self.refresh_mappings_fingerprint();
         self.custom_tag_paths = seed.custom_tag_paths;
+        self.custom_tag_deep_search = seed.custom_tag_deep_search;
         self.user_functions = seed.user_functions;
         self.app_local_mode_modern = seed.app_local_mode_modern;
         self.sandbox = seed.sandbox;
@@ -5348,7 +5392,9 @@ impl CfmlVirtualMachine {
                 // Drops the body buffer; the enclosing buffer becomes current.
                 self.output_buffer = outer;
             }
-            self.custom_tag_stack.pop();
+            if let Some(state) = self.custom_tag_stack.pop() {
+                self.base_tag_stack.truncate(state.base_tag_depth);
+            }
         }
     }
 
@@ -5361,7 +5407,9 @@ impl CfmlVirtualMachine {
         while self.custom_tag_stack.len() > entry_tag_depth
             && self.saved_output_buffers.len() > entry_buffers_depth
         {
-            self.custom_tag_stack.pop();
+            if let Some(state) = self.custom_tag_stack.pop() {
+                self.base_tag_stack.truncate(state.base_tag_depth);
+            }
             if let Some(outer) = self.saved_output_buffers.pop() {
                 self.output_buffer = outer;
             }
@@ -5375,6 +5423,9 @@ impl CfmlVirtualMachine {
         }
         if self.custom_tag_stack.len() > handler.custom_tag_depth {
             self.custom_tag_stack.truncate(handler.custom_tag_depth);
+        }
+        if self.base_tag_stack.len() > handler.base_tag_depth {
+            self.base_tag_stack.truncate(handler.base_tag_depth);
         }
     }
 
@@ -12858,6 +12909,8 @@ impl CfmlVirtualMachine {
                 | "callstackdump"
                 | "isinthread"
                 | "getpagecontext"
+                | "getbasetaglist"
+                | "getbasetagdata"
                 | "evaluate"
                 | "precisionevaluate" => {
                     // Will be handled at the end of this function (needs VM access)
@@ -18833,6 +18886,55 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(self.in_thread_body > 0));
                 }
 
+                "getbasetaglist" => {
+                    // Ancestry names, innermost FIRST. Element 1 is the calling
+                    // tag's own entry when called from inside a tag template;
+                    // from a page running in a tag's body it is that host — both
+                    // fall out of "reverse the stack" (Lucee-measured).
+                    let list = self
+                        .base_tag_stack
+                        .iter()
+                        .rev()
+                        .map(|e| e.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return Ok(CfmlValue::string(list));
+                }
+                "getbasetagdata" => {
+                    // Nearest ancestor with this name, searched inward-out. The
+                    // tag's live `variables` scope is returned BY REFERENCE (Arc
+                    // clone), which is what lets the fragment/slot pattern deposit
+                    // into `getBaseTagData(parent).attributes` and have the
+                    // ancestor see it.
+                    //
+                    // An optional second arg is the instance number (1 = nearest),
+                    // as on Lucee/ACF.
+                    let want = args
+                        .first()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    let instance = args
+                        .get(1)
+                        .and_then(|v| v.as_string().trim().parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    let mut seen = 0usize;
+                    for entry in self.base_tag_stack.iter().rev() {
+                        // cfmodule entries are listed but not findable — Lucee
+                        // raises the same "can't find" error for them.
+                        if !entry.findable || !entry.name.eq_ignore_ascii_case(&want) {
+                            continue;
+                        }
+                        seen += 1;
+                        if seen == instance {
+                            return Ok(CfmlValue::Struct(entry.tag_vars.clone()));
+                        }
+                    }
+                    return Err(self.wrap_error(CfmlError::runtime(format!(
+                        "can't find base tag with name [{}]",
+                        want.to_uppercase()
+                    ))));
+                }
                 "getpagecontext" => {
                     // Build the servlet-bridge page context from the request's
                     // CGI scope (serve mode) or Lucee's synthetic task-context
@@ -18900,10 +19002,28 @@ impl CfmlVirtualMachine {
                     let tag_vars = CfmlStruct::new(tag_vars_map);
                     let frame = Self::custom_tag_frame(parent_locals, &tag_vars);
 
+                    // Ancestry entry for this tag, live for BOTH phases so the
+                    // tag's own template sees itself as element 1. `__cfmodule`
+                    // never carries a `__cf_:` spec, so it lands as CFMODULE.
+                    let base_depth = self.base_tag_stack.len();
+                    let (bt_name, bt_findable) = if name_lower == "__cfmodule" {
+                        ("CFMODULE".to_string(), false)
+                    } else {
+                        Self::base_tag_identity(&path_spec)
+                    };
+                    self.base_tag_stack.push(BaseTagEntry {
+                        name: bt_name,
+                        tag_vars: tag_vars.clone(),
+                        findable: bt_findable,
+                    });
+
                     self.tag_phase_stack.push(false);
                     let start_result = self.execute_custom_tag_template(&resolved, &frame);
                     self.tag_phase_stack.pop();
-                    start_result?;
+                    if let Err(e) = start_result {
+                        self.base_tag_stack.truncate(base_depth);
+                        return Err(e);
+                    }
 
                     // `cfexit method="exittag"` in the start phase skips the end
                     // phase entirely (partial start-phase caller writes still
@@ -18934,6 +19054,7 @@ impl CfmlVirtualMachine {
                         self.last_exit_method = None;
                         if let Err(e) = end_result {
                             self.output_buffer = outer_output;
+                            self.base_tag_stack.truncate(base_depth);
                             return Err(e);
                         }
                         let end_output = std::mem::take(&mut self.output_buffer);
@@ -18949,6 +19070,7 @@ impl CfmlVirtualMachine {
                         self.output_buffer.push_str(&end_output);
                     }
 
+                    self.base_tag_stack.truncate(base_depth);
                     self.apply_tag_caller_writeback(
                         &live_caller,
                         shadow_prevals,
@@ -18994,10 +19116,25 @@ impl CfmlVirtualMachine {
                     let tag_vars = CfmlStruct::new(tag_vars_map);
                     let frame = Self::custom_tag_frame(parent_locals, &tag_vars);
 
+                    // Ancestry entry, pushed for the start phase and left in
+                    // place for the BODY: a tag written inside this host's body
+                    // must see the host as its element 2 (Lucee-measured).
+                    // `__cfcustomtag_end` pops it.
+                    let base_depth = self.base_tag_stack.len();
+                    let (bt_name, bt_findable) = Self::base_tag_identity(&path_spec);
+                    self.base_tag_stack.push(BaseTagEntry {
+                        name: bt_name,
+                        tag_vars: tag_vars.clone(),
+                        findable: bt_findable,
+                    });
+
                     self.tag_phase_stack.push(false);
                     let start_result = self.execute_custom_tag_template(&resolved, &frame);
                     self.tag_phase_stack.pop();
-                    start_result?;
+                    if let Err(e) = start_result {
+                        self.base_tag_stack.truncate(base_depth);
+                        return Err(e);
+                    }
 
                     // `cfexit method="exittag"` in the start phase: the body and
                     // the end phase are skipped, but partial start-phase caller
@@ -19021,6 +19158,7 @@ impl CfmlVirtualMachine {
                         attributes: attrs_val,
                         tag_vars,
                         exit_tag,
+                        base_tag_depth: base_depth,
                     });
 
                     // Push output buffer to capture body content (like savecontent)
@@ -19048,6 +19186,7 @@ impl CfmlVirtualMachine {
                     // caller writes already propagated from `__cfcustomtag_start`.
                     if state.exit_tag {
                         let _ = body_content;
+                        self.base_tag_stack.truncate(state.base_tag_depth);
                         return Ok(CfmlValue::Null);
                     }
 
@@ -19086,6 +19225,7 @@ impl CfmlVirtualMachine {
                         // everything rendered before this tag is lost when an
                         // enclosing try/catch resumes.
                         self.output_buffer = outer_output;
+                        self.base_tag_stack.truncate(state.base_tag_depth);
                         return Err(e);
                     }
                     // Take (not peek) so an `exittemplate`/`exittag` fired in an
@@ -19117,6 +19257,11 @@ impl CfmlVirtualMachine {
                         &state.tag_vars,
                     );
 
+                    if !loop_again {
+                        // A re-arming tag keeps its ancestry entry: the next body
+                        // pass must still see it as an ancestor.
+                        self.base_tag_stack.truncate(state.base_tag_depth);
+                    }
                     if loop_again {
                         // `<cfexit method="loop">`: re-arm for another body pass.
                         // The SAME `CustomTagState` goes back (so the tag's
@@ -25844,6 +25989,22 @@ impl CfmlVirtualMachine {
         (String::new(), CfmlValue::strukt(map))
     }
 
+    /// Ancestry name for a custom-tag invocation, plus whether
+    /// `getBaseTagData(name)` may find it.
+    ///
+    /// `<cf_mytag>` lowers to the `__cf_:mytag` spec and is listed (and found)
+    /// as `CF_MYTAG`. Everything else reached this way is a `cfmodule`
+    /// invocation, which Lucee lists as `CFMODULE` but refuses to look up by
+    /// name — so it is pushed unfindable rather than omitted, because it must
+    /// still occupy a position in `getBaseTagList()`.
+    fn base_tag_identity(path_spec: &str) -> (String, bool) {
+        if let Some(tag) = path_spec.strip_prefix("__cf_:") {
+            (format!("CF_{}", tag.to_uppercase()), true)
+        } else {
+            ("CFMODULE".to_string(), false)
+        }
+    }
+
     /// Resolve a custom tag path specification to an actual filesystem path.
     fn resolve_custom_tag_path(&self, path_spec: &str) -> Result<String, CfmlError> {
         // Request-scoped memo. Resolution depends on the calling template's
@@ -25884,6 +26045,62 @@ impl CfmlVirtualMachine {
         Ok(resolved)
     }
 
+    /// Breadth-first search for `filename` under `root`, for
+    /// `customTagDeepSearch`. Breadth-first so the shallowest match wins, which
+    /// makes the result independent of directory-iteration order for the common
+    /// case; entries within one directory are sorted so a same-depth collision
+    /// resolves deterministically across platforms rather than by `read_dir`
+    /// order. Depth- and visit-capped: a custom tag path pointed at a huge tree
+    /// (or a symlink cycle) must not turn one unresolved tag into an unbounded
+    /// filesystem walk.
+    fn find_custom_tag_deep(&self, root: &str, filename: &str) -> Option<String> {
+        const MAX_DEPTH: usize = 8;
+        const MAX_DIRS: usize = 2_048;
+
+        let mut queue: std::collections::VecDeque<(String, usize)> =
+            std::collections::VecDeque::new();
+        queue.push_back((root.to_string(), 0));
+        let mut visited = 0usize;
+
+        while let Some((dir, depth)) = queue.pop_front() {
+            visited += 1;
+            if visited > MAX_DIRS {
+                break;
+            }
+            let Ok(entries) = self.vfs.read_dir(&dir) else {
+                continue;
+            };
+            let mut subdirs: Vec<String> = Vec::new();
+            let mut names: Vec<&VfsDirEntry> = entries.iter().collect();
+            names.sort_by(|a, b| a.name.cmp(&b.name));
+            for e in names {
+                if e.is_file {
+                    // Custom tag file names are case-insensitive, like every
+                    // other CFML identifier.
+                    if e.name.eq_ignore_ascii_case(filename) {
+                        return Some(
+                            std::path::Path::new(&dir)
+                                .join(&e.name)
+                                .to_string_lossy()
+                                .to_string(),
+                        );
+                    }
+                } else if e.is_dir && depth < MAX_DEPTH {
+                    subdirs.push(
+                        std::path::Path::new(&dir)
+                            .join(&e.name)
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+            }
+            for sd in subdirs {
+                queue.push_back((sd, depth + 1));
+            }
+        }
+        None
+    }
+
     fn resolve_custom_tag_path_uncached(&self, path_spec: &str) -> Result<String, CfmlError> {
         if path_spec.starts_with("__cf_:") {
             // cf_ prefix tag: find tagname.cfm
@@ -25920,6 +26137,19 @@ impl CfmlVirtualMachine {
                     .to_string();
                 if self.vfs.exists(&candidate) {
                     return Ok(candidate);
+                }
+            }
+
+            // 4) Deep search: descend the custom tag paths. Off unless
+            // `customTagDeepSearch` is set (Lucee parity — a stray `.cfm`
+            // anywhere below a tag path would otherwise become invocable).
+            // Runs LAST so an exact hit at a path root always wins, keeping
+            // shallow resolution's meaning (and cost) unchanged.
+            if self.custom_tag_deep_search {
+                for dir in &self.custom_tag_paths {
+                    if let Some(hit) = self.find_custom_tag_deep(dir, &filename) {
+                        return Ok(hit);
+                    }
                 }
             }
 
@@ -31083,6 +31313,11 @@ impl CfmlVirtualMachine {
                 self.custom_tag_paths.push(expanded);
             }
         }
+        // Sticky: a context-level config that switches deep search on must not
+        // be undone by a later context that simply omits the key.
+        if cfg.custom_tag_deep_search {
+            self.custom_tag_deep_search = true;
+        }
     }
 
     /// Expand one cfconfig mapping/customTagPath target against `base`.
@@ -31545,7 +31780,8 @@ impl CfmlVirtualMachine {
         }
 
         // Extract and install mappings early so resolve_inheritance can find parent classes
-        let (_, _, mut early_mappings, _, _, _, _, _, _) = Self::extract_app_config(&template);
+        let (_, _, mut early_mappings, _, _, _, _, _, _, _) =
+            Self::extract_app_config(&template);
         let app_cfc_dir = std::path::Path::new(path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -31619,7 +31855,8 @@ impl CfmlVirtualMachine {
 
     /// Extract application config from a component struct.
     /// Returns (app_name, config, mappings, session_management, session_timeout_secs,
-    /// custom_tag_paths, local_mode_modern_default, session_storage, app_caches)
+    /// custom_tag_paths, custom_tag_deep_search, local_mode_modern_default,
+    /// session_storage, app_caches)
     fn extract_app_config(
         template: &CfmlValue,
     ) -> (
@@ -31629,6 +31866,7 @@ impl CfmlVirtualMachine {
         bool,
         u64,
         Vec<String>,
+        Option<bool>,
         Option<bool>,
         Option<String>,
         indexmap::IndexMap<String, cfml_config::CacheCfg>,
@@ -31643,6 +31881,7 @@ impl CfmlVirtualMachine {
                     false,
                     1800,
                     Vec::new(),
+                    None,
                     None,
                     None,
                     indexmap::IndexMap::new(),
@@ -31760,6 +31999,18 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // Extract this.customTagDeepSearch. A RustCFML superset: Lucee 7 only
+        // honours the server-level flag, so a per-app spelling is inert there —
+        // harmless to support, and it keeps a self-contained app self-describing.
+        // `None` = unspecified, so cfconfig (or the default) decides.
+        // Present-but-unparseable counts as specified-false rather than
+        // silently falling back to cfconfig: `is_true()` is the same coercion
+        // every other CFML boolean goes through.
+        let custom_tag_deep_search = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("customtagdeepsearch"))
+            .map(|(_, v)| v.is_true());
+
         // Extract this.localMode (Lucee compatibility — modern vs classic
         // function-local scope semantics). Accepts the same aliases as the
         // function-attribute helper.
@@ -31861,6 +32112,7 @@ impl CfmlVirtualMachine {
             session_management,
             session_timeout,
             custom_tag_paths,
+            custom_tag_deep_search,
             local_mode_modern_default,
             session_storage,
             app_caches,
@@ -32551,6 +32803,7 @@ impl CfmlVirtualMachine {
             session_management,
             session_timeout,
             mut custom_tag_paths,
+            app_custom_tag_deep_search,
             local_mode_modern_default,
             app_session_storage,
             app_caches,
@@ -32738,6 +32991,12 @@ impl CfmlVirtualMachine {
             }
         }
         self.custom_tag_paths = expanded_ctp;
+
+        // this.customTagDeepSearch wins over cfconfig when the app states it;
+        // otherwise whatever cfconfig set (default false) stands.
+        if let Some(deep) = app_custom_tag_deep_search {
+            self.custom_tag_deep_search = deep;
+        }
 
         // 4. Wire up application scope
         if let Some(ref server_state) = self.server_state.clone() {
