@@ -935,6 +935,41 @@ A `>` comparison at the top level of a tag expression still needs bracketing or
 the word operator — `<cfset big = (a > b)>` or `<cfset big = a GT b>`. Bare
 `<cfset big = a > b>` ends at the comparison, as it always has.
 
+## 40. `<cflock>` `timeout="0"` fails immediately instead of waiting forever 🏗 *(divergence, deliberately held)*
+
+Lucee treats `timeout="0"` — and an **omitted** `timeout` — as *no timeout*: the
+request waits as long as it takes to acquire the lock. RustCFML expires at the
+deadline, so `timeout="0"` fails at once and an omitted `timeout` expires after 5
+seconds. Measured against **Lucee 7.0.4.34** with a background thread holding the
+lock:
+
+| case | Lucee | RustCFML |
+|---|---|---|
+| `timeout` omitted, 7 s holder | acquires after 6600 ms | throws at 5005 ms |
+| `timeout="0"`, 2 s holder | acquires after 1594 ms | throws at 0 ms |
+| `timeout="1"`, 3 s holder | throws at 1010 ms, `LockOperation="Timeout"` | same ✅ |
+| `timeout="1" throwontimeout="false"` | `false` at 1011 ms | same ✅ |
+
+**The correction is small** (the acquisition deadline becomes `None` when
+`timeout_ms == 0`) and a 15-assertion cross-engine test is written and passing on
+both engines. **It is deliberately not shipped**, because today's fail-fast is
+accidentally masking a deeper bug: the `application` scope publishes its writes only
+when the writing request *ends*, so concurrent requests never observe each other's.
+Preside's `_reloadRequired()` is the guard-once idiom
+(`!StructKeyExists( application, "cbBootstrap" )`), so with lock losers made to
+**wait**, each one then decides a reload is still required and re-boots the whole
+framework: 8 concurrent cold requests went from **1 framework boot to 8** (~7 s
+each, measured 8/8 twice). Fixing the app-scope publication model is the
+prerequisite; this row should be closed immediately after, using the test that is
+already written.
+
+What *did* ship (v0.592.0) is the additive half: the timeout exception now carries
+**`LockOperation = "Timeout"`**, matching Lucee, which is what framework guards
+branch on. Preside's reload guard reads exactly that member, and without it took the
+wrong branch — clearing `application._preside_reloading` mid-reload and rethrowing,
+instead of serving its intended 503 "still reloading". Note Lucee exposes **no**
+`lockName` member on this exception, and neither do we.
+
 ## 38. Database exception members — `sqlState` is driver-dependent 🏗 *(GH [#295](https://github.com/RustCFML/RustCFML/issues/295))*
 
 Database failures now carry the structured detail Lucee/ACF attach, so

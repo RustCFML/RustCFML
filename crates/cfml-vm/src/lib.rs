@@ -1558,6 +1558,22 @@ fn lock_timeout_message(timeout_ms: u64, exclusive: bool, label: &str) -> String
     )
 }
 
+/// A `lock`-typed acquisition-timeout error carrying the `LockOperation` member
+/// Lucee puts on it. Verified against Lucee 7.0.4.34: a timed-out `<cflock>`
+/// yields `type="lock"` with `LockOperation = "Timeout"` (and, notably, NO
+/// `lockName` member — do not add one).
+///
+/// The member is load-bearing, not cosmetic. Preside's `Bootstrap.cfc` does
+/// `catch( any e ) { if ( ( e.lockOperation ?: "" ) == "Timeout" ) { 503; abort; } ... }`
+/// around its application-reload lock, so without it Preside takes the wrong
+/// branch and clears `application._preside_reloading` mid-reload.
+fn lock_timeout_error(timeout_ms: u64, exclusive: bool, label: &str) -> CfmlError {
+    CfmlError::lock(lock_timeout_message(timeout_ms, exclusive, label)).with_extras([(
+        "LockOperation".to_string(),
+        CfmlValue::string("Timeout".to_string()),
+    )])
+}
+
 /// Build the `named_locks` key for a `scope=`-form lock. The `\u{1f}` prefix is a
 /// control byte, so the key can never collide with a `name="…"` lock: CFML lock
 /// names come from source text or interpolation, never from a control character.
@@ -11994,6 +12010,8 @@ impl CfmlVirtualMachine {
                     .map(|v| v.as_string().to_lowercase())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "exclusive".to_string()),
+                // ⚠️ Lucee's default is "wait indefinitely" — see the divergence note
+                // at the acquisition loop (docs/known-issues.md §40).
                 timeout_ms: get("timeout").as_ref().and_then(to_ms).unwrap_or(5000),
                 throw_on_timeout: get("throwontimeout")
                     .as_ref()
@@ -12013,6 +12031,7 @@ impl CfmlVirtualMachine {
                     .get(1)
                     .map(|v| v.as_string().to_lowercase())
                     .unwrap_or_else(|| "exclusive".to_string()),
+                // See the divergence note above (docs/known-issues.md §40).
                 timeout_ms: args.get(2).and_then(to_ms).unwrap_or(5000),
                 throw_on_timeout: args.get(3).and_then(to_bool).unwrap_or(true),
             })
@@ -17258,9 +17277,24 @@ impl CfmlVirtualMachine {
                                 .clone()
                         };
 
-                        // Acquire lock with timeout using try_lock in a spin loop
-                        let deadline = cfml_common::clock::Monotonic::now()
-                            + std::time::Duration::from_millis(timeout_ms);
+                        // Acquire lock with timeout using try_lock in a spin loop.
+                        // ⚠️ KNOWN DIVERGENCE (docs/known-issues.md §40): Lucee treats
+                        // `timeout="0"` and an omitted `timeout` as "wait indefinitely"
+                        // (measured 1594ms / 6600ms waits against Lucee 7.0.4.34); we
+                        // fail once the deadline passes, so `timeout=0` fails at once.
+                        // The correction is small — `deadline` becomes `None` when
+                        // `timeout_ms == 0` — and a 15-assertion test is ready, BUT it
+                        // must NOT land before the application-scope publication fix:
+                        // today's fail-fast accidentally MASKS that bug, and making the
+                        // losers wait turns 8 concurrent cold Preside requests from 1
+                        // framework boot into 8 (measured 8/8, twice).
+                        let deadline = Some(
+                            cfml_common::clock::Monotonic::now()
+                                + std::time::Duration::from_millis(timeout_ms),
+                        );
+                        let timed_out = |deadline: Option<cfml_common::clock::Monotonic>| {
+                            deadline.is_some_and(|d| cfml_common::clock::Monotonic::now() >= d)
+                        };
                         let is_exclusive = lock_type != "readonly";
 
                         if is_exclusive {
@@ -17278,18 +17312,14 @@ impl CfmlVirtualMachine {
                                         .push((lock_name, HeldLock::Write(guard, lock.clone())));
                                     break;
                                 }
-                                if cfml_common::clock::Monotonic::now() >= deadline {
+                                if timed_out(deadline) {
                                     if !throw_on_timeout {
                                         // throwOnTimeout="false": the body is skipped and
                                         // execution continues. The lowering guards the body
                                         // on this return value.
                                         return Ok(CfmlValue::Bool(false));
                                     }
-                                    return Err(CfmlError::lock(lock_timeout_message(
-                                        timeout_ms,
-                                        true,
-                                        &lock_label,
-                                    )));
+                                    return Err(lock_timeout_error(timeout_ms, true, &lock_label));
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
@@ -17305,15 +17335,11 @@ impl CfmlVirtualMachine {
                                         .push((lock_name, HeldLock::Read(guard, lock.clone())));
                                     break;
                                 }
-                                if cfml_common::clock::Monotonic::now() >= deadline {
+                                if timed_out(deadline) {
                                     if !throw_on_timeout {
                                         return Ok(CfmlValue::Bool(false));
                                     }
-                                    return Err(CfmlError::lock(lock_timeout_message(
-                                        timeout_ms,
-                                        false,
-                                        &lock_label,
-                                    )));
+                                    return Err(lock_timeout_error(timeout_ms, false, &lock_label));
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
