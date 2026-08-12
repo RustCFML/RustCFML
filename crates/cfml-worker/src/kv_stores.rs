@@ -232,7 +232,10 @@ impl KvBackedApplicationStore {
                     app_name,
                     ApplicationState {
                         name: app_name.to_string(),
-                        variables: snap.variables,
+                        // KV holds a SERIALISED snapshot, so rehydrate it into a
+                        // live struct for this isolate. Cross-isolate visibility is
+                        // still request-end only — see ApplicationStore docs.
+                        variables: cfml_common::dynamic::CfmlStruct::new(snap.variables),
                         // `started` is intentionally false on cold isolates
                         // so onApplicationStart can re-fire if the user
                         // relies on it for per-isolate priming (function
@@ -262,7 +265,7 @@ impl KvBackedApplicationStore {
         };
         for name in dirty {
             let Some(state) = self.memory.get(&name) else { continue };
-            let snap = PersistedApp { variables: state.variables.clone() };
+            let snap = PersistedApp { variables: state.variables.snapshot() };
             let bytes = serde_json::to_vec(&snap)
                 .map_err(|e| worker::Error::RustError(format!("app {name} serialize: {e}")))?;
             self.kv
@@ -294,6 +297,23 @@ impl ApplicationStore for KvBackedApplicationStore {
         self.memory.modify(name, f);
         self.dirty.lock().unwrap().insert(name.to_string());
     }
+
+    /// This backend SERIALISES state, so it cannot share a live scope across
+    /// isolates/nodes and must be told when the application scope changed.
+    ///
+    /// Load-bearing since v0.593.0: `ApplicationState::variables` is now a live
+    /// `CfmlStruct` that the VM mutates in place, so the VM no longer calls
+    /// `modify()` on every request — without this hook nothing would ever mark the
+    /// application dirty and app-scope writes would silently stop reaching KV.
+    fn needs_variable_publish(&self) -> bool {{
+        true
+    }}
+
+    /// The live scope already lives in `self.memory`; all this needs to do is mark
+    /// the application dirty so the next `flush()` serialises it.
+    fn publish_variables(&self, name: &str, _variables: &cfml_common::dynamic::ValueMap) {{
+        self.dirty.lock().unwrap().insert(name.to_string());
+    }}
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -11,14 +11,12 @@ suiteBegin( "cflock timeout semantics" );
  * `application._preside_reloading` while another request is still mid-reload and
  * then rethrows. With it, Preside serves its intended "still reloading" 503.
  *
- * ⚠️ NOT COVERED HERE — see docs/known-issues.md §40: `timeout="0"` and an omitted
- * `timeout` mean "wait indefinitely" in Lucee but fail/expire here. The fix is
- * small and a 15-assertion version of this suite is ready, but it must land only
- * AFTER the application-scope publication fix — fail-fast currently masks that
- * bug, and making lock losers wait turns 8 concurrent cold Preside requests from 1
- * framework boot into 8. Asserting the Lucee behaviour now would make this suite
- * red; asserting our behaviour would bake a divergence into the tests. So the
- * divergence lives in known-issues, not in here.
+ * `timeout="0"` and an OMITTED timeout both mean "wait indefinitely" (Lucee).
+ * That only became safe once the application scope went live — with the old
+ * per-request snapshot scope, making lock losers wait sent 8 concurrent cold
+ * Preside requests through 8 full framework boots instead of 1, because
+ * `_reloadRequired()` is a guard-once idiom. See
+ * tests/tags/test_application_scope_concurrency.cfm.
  */
 
 // Runs `body` while a background thread holds `lockName` exclusively for
@@ -97,6 +95,35 @@ r = withHeldLock( 1500, function( lockName ) {
 } );
 assertTrue( "readonly acquires once the exclusive holder releases", r.got );
 assertFalse( "readonly does not throw", r.caught );
+
+// --- timeout="0" means NO timeout: wait for the holder, then acquire -----------
+r = withHeldLock( 2000, function( lockName ) {
+    var out = { got=false, caught=false, lockOperation="" };
+    try {
+        lock name=arguments.lockName type="exclusive" timeout=0 { out.got = true; }
+    } catch ( any e ) {
+        out.caught        = true;
+        out.lockOperation = e.lockOperation ?: "(missing)";
+    }
+    return out;
+} );
+assertTrue( "timeout=0 acquires rather than failing", r.got );
+assertFalse( "timeout=0 does not throw", r.caught );
+assertTrue( "timeout=0 actually WAITED for the holder (>=1000ms)", r.elapsedMs >= 1000 );
+
+// --- an OMITTED timeout behaves the same (no finite built-in default) ----------
+r = withHeldLock( 2000, function( lockName ) {
+    var out = { got=false, caught=false };
+    try {
+        lock name=arguments.lockName type="exclusive" { out.got = true; }
+    } catch ( any e ) {
+        out.caught = true;
+    }
+    return out;
+} );
+assertTrue( "omitted timeout acquires rather than failing", r.got );
+assertFalse( "omitted timeout does not throw", r.caught );
+assertTrue( "omitted timeout WAITED for the holder (>=1000ms)", r.elapsedMs >= 1000 );
 
 suiteEnd();
 </cfscript>

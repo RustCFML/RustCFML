@@ -92,7 +92,9 @@ impl DoApplicationStore {
             app_name,
             ApplicationState {
                 name: app_name.to_string(),
-                variables: snap.variables,
+                // Rehydrate the serialised snapshot into a live struct (see
+                // kv_stores.rs and the ApplicationStore trait docs).
+                variables: cfml_common::dynamic::CfmlStruct::new(snap.variables),
                 started: snap.started,
                 config: cfml_common::dynamic::ValueMap::default(),
                 app_function_table: Vec::new(),
@@ -120,7 +122,7 @@ impl DoApplicationStore {
         for name in dirty {
             let Some(state) = self.memory.get(&name) else { continue };
             let snap = PersistedApp {
-                variables: state.variables.clone(),
+                variables: state.variables.snapshot(),
                 started: state.started,
             };
             let body = serde_json::to_string(&snap)
@@ -155,6 +157,23 @@ impl ApplicationStore for DoApplicationStore {
         self.memory.modify(name, f);
         self.dirty.lock().unwrap().insert(name.to_string());
     }
+
+    /// This backend SERIALISES state, so it cannot share a live scope across
+    /// isolates/nodes and must be told when the application scope changed.
+    ///
+    /// Load-bearing since v0.593.0: `ApplicationState::variables` is now a live
+    /// `CfmlStruct` that the VM mutates in place, so the VM no longer calls
+    /// `modify()` on every request — without this hook nothing would ever mark the
+    /// application dirty and app-scope writes would silently stop reaching the Durable Object.
+    fn needs_variable_publish(&self) -> bool {{
+        true
+    }}
+
+    /// The live scope already lives in `self.memory`; all this needs to do is mark
+    /// the application dirty so the next `flush()` serialises it.
+    fn publish_variables(&self, name: &str, _variables: &cfml_common::dynamic::ValueMap) {{
+        self.dirty.lock().unwrap().insert(name.to_string());
+    }}
 }
 
 #[derive(Serialize, Deserialize)]

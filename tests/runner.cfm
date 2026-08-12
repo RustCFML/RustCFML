@@ -554,6 +554,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfthread.cfm">
 <cf_runtest file="tags/test_tags_cfthread_concurrency.cfm">
 <cf_runtest file="tags/test_cfthread_shared_component.cfm">
+<cf_runtest file="tags/test_application_scope_concurrency.cfm">
 <cf_runtest file="tags/test_cflock_timeout_semantics.cfm">
 <cf_runtest file="tags/test_tags_cflock_scope.cfm">
 <cf_runtest file="tags/test_tags_cfscript_statements.cfm">

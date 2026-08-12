@@ -38,6 +38,31 @@ pub trait ApplicationStore: Send + Sync + 'static {
             self.insert(name, state);
         }
     }
+
+    /// Whether this backend needs the application scope written through at the end
+    /// of every request.
+    ///
+    /// `false` for in-process stores: `ApplicationState::variables` is a live
+    /// `CfmlStruct` (`Arc<RwLock<…>>`), so the scope a request mutates already *is*
+    /// the stored object and republishing it would reintroduce last-writer-wins.
+    ///
+    /// `true` for backends that SERIALISE state (KV, Durable Object): they cannot
+    /// hold a live shared scope, so they must be handed a snapshot.
+    fn needs_variable_publish(&self) -> bool {
+        false
+    }
+
+    /// Write the application scope through to a serialising backend. Only called
+    /// when [`Self::needs_variable_publish`] is `true`.
+    ///
+    /// ⚠️ Such backends necessarily give a WEAKER guarantee than the in-process
+    /// store: writes become visible to other nodes/isolates only at request end,
+    /// so a guard-once idiom (`if ( !StructKeyExists( application, "x" ) ) { … }`)
+    /// can still run more than once across nodes. That is a documented divergence,
+    /// not something the trait can paper over.
+    fn publish_variables(&self, name: &str, variables: &crate::ValueMap) {
+        let _ = (name, variables);
+    }
 }
 
 // ─────────────────────────────────────────────

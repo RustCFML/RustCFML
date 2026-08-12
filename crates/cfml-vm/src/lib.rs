@@ -276,7 +276,25 @@ fn sio_room_list(value: &CfmlValue) -> Vec<String> {
 #[derive(Clone)]
 pub struct ApplicationState {
     pub name: String,
-    pub variables: ValueMap,
+    /// The LIVE application scope, shared by every request attached to this
+    /// application — `CfmlStruct` is `Arc<RwLock<…>>`, so `ApplicationStore::get`
+    /// cloning an `ApplicationState` clones a *handle*, not the data.
+    ///
+    /// This is load-bearing for correctness, not an optimisation. Until v0.593.0
+    /// this was a plain `ValueMap`: each request got `CfmlStruct::new(map.clone())`
+    /// (a private copy) and republished the whole thing at request end. So an
+    /// `application.*` write was invisible to every other in-flight request, and
+    /// the last request to finish overwrote the entire scope. That broke every
+    /// **guard-once** idiom — `if ( !StructKeyExists( application, "x" ) ) { … }` —
+    /// under concurrency: Preside's `_reloadRequired()` is exactly that shape, so
+    /// 8 concurrent cold requests each re-booted the whole framework, and
+    /// `StructClear( application )` plus racing write-backs could leave a
+    /// half-built `HandlerService` permanently installed. Lucee's application
+    /// scope is live and shared; verified against 7.0.4.34.
+    ///
+    /// Mirrors `ServerState::server_scope`, which was already a shared live
+    /// `CfmlStruct` for the same write-through reason.
+    pub variables: CfmlStruct,
     pub started: bool,
     pub config: ValueMap,
     /// Functions this application can still resolve, carried across requests so a
@@ -12010,9 +12028,9 @@ impl CfmlVirtualMachine {
                     .map(|v| v.as_string().to_lowercase())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "exclusive".to_string()),
-                // ⚠️ Lucee's default is "wait indefinitely" — see the divergence note
-                // at the acquisition loop (docs/known-issues.md §40).
-                timeout_ms: get("timeout").as_ref().and_then(to_ms).unwrap_or(5000),
+                // 0 / omitted = wait indefinitely (Lucee). See the note at the
+                // acquisition loop for why this depends on a live application scope.
+                timeout_ms: get("timeout").as_ref().and_then(to_ms).unwrap_or(0),
                 throw_on_timeout: get("throwontimeout")
                     .as_ref()
                     .and_then(to_bool)
@@ -12031,8 +12049,8 @@ impl CfmlVirtualMachine {
                     .get(1)
                     .map(|v| v.as_string().to_lowercase())
                     .unwrap_or_else(|| "exclusive".to_string()),
-                // See the divergence note above (docs/known-issues.md §40).
-                timeout_ms: args.get(2).and_then(to_ms).unwrap_or(5000),
+                // 0 / omitted = wait indefinitely (see the attribute form above).
+                timeout_ms: args.get(2).and_then(to_ms).unwrap_or(0),
                 throw_on_timeout: args.get(3).and_then(to_bool).unwrap_or(true),
             })
         }
@@ -17278,20 +17296,24 @@ impl CfmlVirtualMachine {
                         };
 
                         // Acquire lock with timeout using try_lock in a spin loop.
-                        // ⚠️ KNOWN DIVERGENCE (docs/known-issues.md §40): Lucee treats
-                        // `timeout="0"` and an omitted `timeout` as "wait indefinitely"
-                        // (measured 1594ms / 6600ms waits against Lucee 7.0.4.34); we
-                        // fail once the deadline passes, so `timeout=0` fails at once.
-                        // The correction is small — `deadline` becomes `None` when
-                        // `timeout_ms == 0` — and a 15-assertion test is ready, BUT it
-                        // must NOT land before the application-scope publication fix:
-                        // today's fail-fast accidentally MASKS that bug, and making the
-                        // losers wait turns 8 concurrent cold Preside requests from 1
-                        // framework boot into 8 (measured 8/8, twice).
-                        let deadline = Some(
+                        // `timeout_ms == 0` means NO timeout — wait indefinitely, which is
+                        // also what an omitted `timeout` means. Lucee semantics, measured
+                        // against 7.0.4.34 (it waits 1594ms / 6600ms for a held lock
+                        // rather than failing).
+                        //
+                        // ⚠️ This is only SAFE because `ApplicationState::variables` is a
+                        // LIVE shared scope. Preside guards its application reload with
+                        // `applicationReloadLockTimeout = 0`, deliberately asking
+                        // concurrent requests to QUEUE behind the reload. With the old
+                        // per-request snapshot scope every queued request then still found
+                        // `application.cbBootstrap` absent and re-booted the whole
+                        // framework — 8 concurrent cold requests did 8 boots (~7s each).
+                        // Do NOT reintroduce a snapshot application scope without also
+                        // reverting this to fail-fast.
+                        let deadline = (timeout_ms > 0).then(|| {
                             cfml_common::clock::Monotonic::now()
-                                + std::time::Duration::from_millis(timeout_ms),
-                        );
+                                + std::time::Duration::from_millis(timeout_ms)
+                        });
                         let timed_out = |deadline: Option<cfml_common::clock::Monotonic>| {
                             deadline.is_some_and(|d| cfml_common::clock::Monotonic::now() >= d)
                         };
@@ -32703,6 +32725,9 @@ impl CfmlVirtualMachine {
         if let Some(app_name) = self.current_application_name.clone() {
             if let Some(ref server_state) = self.server_state {
                 server_state.applications.modify(&app_name, &mut |app| {
+                    // Same object as `self.application_scope` (handle clone), so this
+                    // single clear destroys the scope for every in-flight request —
+                    // which is what applicationStop() means on Lucee.
                     app.variables.clear();
                     app.started = false;
                     // Discard the carried function table so a restarted
@@ -33030,7 +33055,7 @@ impl CfmlVirtualMachine {
                 // New application
                 let app_state = ApplicationState {
                     name: app_name.clone(),
-                    variables: ValueMap::default(),
+                    variables: CfmlStruct::empty(),
                     started: false,
                     config: config.clone(),
                     app_function_table: Vec::new(),
@@ -33042,7 +33067,12 @@ impl CfmlVirtualMachine {
             }
             let app_snapshot = server_state.applications.get(&app_name).unwrap();
             self.current_application_name = Some(app_name.clone());
-            self.application_scope = Some(CfmlStruct::new(app_snapshot.variables.clone()));
+            // HANDLE clone (an Arc bump), NOT a copy: this request now shares the
+            // one live application scope with every other in-flight request, so an
+            // `application.*` write is immediately visible to all of them — Lucee's
+            // semantics. Cloning the map here instead is what broke guard-once
+            // idioms; see `ApplicationState::variables`.
+            self.application_scope = Some(app_snapshot.variables.clone());
             // Expose the implicit `application.applicationName` key that Lucee/ACF
             // auto-populate from the app name. Frameworks (Wheels) build lock names
             // like `"controllerLock" & application.applicationName`, so a missing
@@ -33581,19 +33611,32 @@ impl CfmlVirtualMachine {
             }
             let rehomed = table_dirty;
             if let Some(ref app_scope) = self.application_scope {
-                // Snapshot outside the store write so the application-scope
-                // lock and the applications-store lock never nest.
-                let scope = app_scope.snapshot();
+                // The application scope is now the SAME live object the store
+                // holds (a handle clone), so there is nothing to republish —
+                // re-assigning it here is exactly the last-writer-wins bug that
+                // could install a half-built framework. Only the carried function
+                // table / prune mark still need a store write.
                 let table_update = rehomed.then(|| self.app_function_table.clone());
-                server_state.applications.modify(app_name, &mut |app| {
-                    app.variables = scope.clone();
-                    if let Some(table) = table_update.clone() {
-                        app.app_function_table = table;
-                    }
-                    if let Some(n) = pruned_to {
-                        app.app_fn_prune_at = n;
-                    }
-                });
+                if table_update.is_some() || pruned_to.is_some() {
+                    server_state.applications.modify(app_name, &mut |app| {
+                        if let Some(table) = table_update.clone() {
+                            app.app_function_table = table;
+                        }
+                        if let Some(n) = pruned_to {
+                            app.app_fn_prune_at = n;
+                        }
+                    });
+                }
+                // Backends that SERIALISE state (KV, Durable Object) cannot share a
+                // live scope, so they get an explicit write-through. Default impl is
+                // a no-op, so the in-process store pays nothing. Snapshot outside
+                // the store call so the application-scope lock and the
+                // applications-store lock never nest (deadlock discipline that
+                // matters now the scope is genuinely shared).
+                if server_state.applications.needs_variable_publish() {
+                    let scope = app_scope.snapshot();
+                    server_state.applications.publish_variables(app_name, &scope);
+                }
             }
         }
     }
