@@ -22,7 +22,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.594.0"
+version = "0.595.0"
 authors = ["RustCFML Team"]
 edition = "2021"
 rust-version = "1.75.0"
@@ -31,13 +31,13 @@ homepage = "https://github.com/RustCFML/RustCFML"
 license = "MIT"
 
 [workspace.dependencies]
-cfml-common = { path = "crates/cfml-common", version = "0.594.0" }
-cfml-config = { path = "crates/cfml-config", version = "0.594.0" }
-cfml-compiler = { path = "crates/cfml-compiler", version = "0.594.0" }
-cfml-codegen = { path = "crates/cfml-codegen", version = "0.594.0" }
-cfml-vm = { path = "crates/cfml-vm", version = "0.594.0" }
-cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.594.0", default-features = false }
-cfml-qoq = { path = "crates/cfml-qoq", version = "0.594.0" }
+cfml-common = { path = "crates/cfml-common", version = "0.595.0" }
+cfml-config = { path = "crates/cfml-config", version = "0.595.0" }
+cfml-compiler = { path = "crates/cfml-compiler", version = "0.595.0" }
+cfml-codegen = { path = "crates/cfml-codegen", version = "0.595.0" }
+cfml-vm = { path = "crates/cfml-vm", version = "0.595.0" }
+cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.595.0", default-features = false }
+cfml-qoq = { path = "crates/cfml-qoq", version = "0.595.0" }
 
 log = "0.4"
 thiserror = "1.0"
@@ -64,6 +64,19 @@ cranelift-native = "0.132"
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+
+# PGO release profile. Separate from `release` on purpose: fat LTO takes the build
+# from ~2 min to ~7 min locally, and `cargo build --release` should stay fast for
+# everyday use. CI builds shipped artifacts with this profile plus
+# `-Cprofile-use=pgo/rustcfml.profdata` — see .github/workflows/release.yml and
+# docs/pgo.md.
+#
+# Measured on a live Preside site (interleaved CPU-time A/B, 5/5 rounds):
+# fat LTO alone -1.23%; fat LTO + this profile -14.16% warm CPU and -15.25% boot.
+# PGO does essentially all of it.
+[profile.release-pgo]
+inherits = "release"
+lto = "fat"
 
 # Optimized build that keeps debug symbols, for sampling profilers (samply,
 # cargo-flamegraph). Build with `cargo build --profile profiling`.

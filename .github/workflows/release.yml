@@ -69,17 +69,50 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # PINNED, not `stable`. A PGO profile is tied to the LLVM version that
+      # produced it (rustc 1.93.0 = LLVM 21.1.8), so a silent stable bump would
+      # invalidate pgo/rustcfml.profdata and quietly ship an un-profiled binary.
+      # Bump this deliberately, and regenerate the profile in the same commit
+      # (docs/pgo.md has the recipe).
+      - name: Install Rust (pinned for PGO)
+        uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: llvm-tools
 
-      - name: Build
-        run: cargo build --release -p rustcfml-cli
+      # Fail LOUD rather than degrade quietly. `-Cprofile-use` with an
+      # unreadable/incompatible profile is the failure mode that matters: the
+      # build succeeds and the binary is simply slower, with nothing to notice.
+      - name: Verify the PGO profile is loadable by this toolchain
+        shell: bash
+        run: |
+          PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata*' | head -1)
+          if [ -z "$PROFDATA" ]; then echo "llvm-profdata not found in sysroot"; exit 1; fi
+          "$PROFDATA" show pgo/rustcfml.profdata > profile-summary.txt || {
+            echo "::error::pgo/rustcfml.profdata is not readable by rustc $(rustc --version)."
+            echo "::error::Regenerate it with docs/pgo.md, or unpin the toolchain."
+            exit 1
+          }
+          FUNCS=$(grep -i 'Total functions' profile-summary.txt | grep -oE '[0-9]+')
+          echo "profile carries $FUNCS functions"
+          # A profile that has lost most of its functions is stale, not merely old.
+          if [ "${FUNCS:-0}" -lt 5000 ]; then
+            echo "::error::profile has only $FUNCS functions — expected >5000. Stale?"
+            exit 1
+          fi
+
+      # Shipped artifacts are PGO'd. `cargo build --release` stays thin-LTO and
+      # fast for everyday local use; this profile is fat LTO (see Cargo.toml).
+      - name: Build (PGO)
+        shell: bash
+        run: |
+          RUSTFLAGS="-Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata" \
+            cargo build --profile release-pgo -p rustcfml-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: target/release/rustcfml${{ matrix.ext }}
+          path: target/release-pgo/rustcfml${{ matrix.ext }}
 
   release:
     needs: build
