@@ -9778,7 +9778,7 @@ impl CfmlVirtualMachine {
                         };
 
                         // Resolve inheritance chain
-                        let instance = self.resolve_inheritance(template, &locals);
+                        let instance = self.resolve_inheritance(template, &locals)?;
 
                         // Attach a Rust-class parent if extends="rust:Name"
                         let instance = self.attach_native_parent(instance)?;
@@ -15543,7 +15543,7 @@ impl CfmlVirtualMachine {
                         if let Some(template) =
                             self.resolve_component_template(&comp_name, parent_locals)
                         {
-                            let resolved = self.resolve_inheritance(template, parent_locals);
+                            let resolved = self.resolve_inheritance(template, parent_locals)?;
                             if let CfmlValue::Struct(ref s) = resolved {
                                 let snap = s.snapshot_with_methods();
                                 if matches!(
@@ -15633,7 +15633,7 @@ impl CfmlVirtualMachine {
                             if let Some(template) =
                                 self.resolve_component_template(&comp_name, parent_locals)
                             {
-                                let instance = self.resolve_inheritance(template, parent_locals);
+                                let instance = self.resolve_inheritance(template, parent_locals)?;
                                 let instance = self.attach_native_parent(instance)?;
                                 let instance =
                                     self.attach_implements_chain(instance, parent_locals)?;
@@ -16289,7 +16289,7 @@ impl CfmlVirtualMachine {
                             if let Some(template) =
                                 self.resolve_component_template(name, parent_locals)
                             {
-                                self.resolve_inheritance(template, parent_locals)
+                                self.resolve_inheritance(template, parent_locals)?
                             } else {
                                 return Err(CfmlError::runtime(format!(
                                     "Component '{}' not found",
@@ -16302,7 +16302,7 @@ impl CfmlVirtualMachine {
                             if let Some(template) =
                                 self.resolve_component_template(&name, parent_locals)
                             {
-                                self.resolve_inheritance(template, parent_locals)
+                                self.resolve_inheritance(template, parent_locals)?
                             } else {
                                 return Err(CfmlError::runtime(format!(
                                     "Component '{}' not found",
@@ -16380,7 +16380,7 @@ impl CfmlVirtualMachine {
                             if let Some(template) =
                                 self.resolve_component_template(name, parent_locals)
                             {
-                                self.resolve_inheritance(template, parent_locals)
+                                self.resolve_inheritance(template, parent_locals)?
                             } else {
                                 return Err(CfmlError::runtime(format!(
                                     "Component '{}' not found",
@@ -16393,7 +16393,7 @@ impl CfmlVirtualMachine {
                             if let Some(template) =
                                 self.resolve_component_template(&name, parent_locals)
                             {
-                                self.resolve_inheritance(template, parent_locals)
+                                self.resolve_inheritance(template, parent_locals)?
                             } else {
                                 return Err(CfmlError::runtime(format!(
                                     "Component '{}' not found",
@@ -28020,7 +28020,7 @@ impl CfmlVirtualMachine {
             let mut parent_this_members: Option<ValueMap> = None;
             let injected_scope: ValueMap = if let Some(ref pname) = parent_name {
                 if let Some(parent_template) = self.resolve_component_template(pname, locals) {
-                    let resolved_parent = self.resolve_inheritance(parent_template, locals);
+                    let resolved_parent = self.resolve_inheritance(parent_template, locals).ok()?;
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         let mut super_methods = ValueMap::default();
                         let mut this_members = ValueMap::default();
@@ -29253,10 +29253,10 @@ impl CfmlVirtualMachine {
         &mut self,
         template: CfmlValue,
         locals: &ValueMap,
-    ) -> CfmlValue {
+    ) -> CfmlResult {
         let s = match &template {
             CfmlValue::Struct(s) => s,
-            _ => return template,
+            _ => return Ok(template),
         };
 
         // Check for __extends key
@@ -29268,7 +29268,7 @@ impl CfmlVirtualMachine {
                 // point, run here (not `resolve_component_template`) so a template
                 // still merged into a subclass keeps its methods in `map`.
                 self.share_methods_into_table(s);
-                return template;
+                return Ok(template);
             }
         };
 
@@ -29278,7 +29278,7 @@ impl CfmlVirtualMachine {
             visited.insert(name.to_lowercase());
         }
 
-        let merged = self.resolve_inheritance_chain(template, &extends_name, locals, &mut visited);
+        let merged = self.resolve_inheritance_chain(template, &extends_name, locals, &mut visited)?;
         // Phase A: class-invariant metadata (the merged `__metadata`/`__properties`/
         // `__super_map`/... just re-derived above) is identical for every instance
         // of this class. Splice one shared Arc-backed copy in so N instances don't
@@ -29290,7 +29290,7 @@ impl CfmlVirtualMachine {
         if let CfmlValue::Struct(cs) = &merged {
             self.share_methods_into_table(cs);
         }
-        merged
+        Ok(merged)
     }
 
     /// Class-invariant metadata keys — identical for every instance of a class,
@@ -29357,10 +29357,10 @@ impl CfmlVirtualMachine {
         parent_name: &str,
         locals: &ValueMap,
         visited: &mut std::collections::HashSet<String>,
-    ) -> CfmlValue {
+    ) -> CfmlResult {
         // Check circular
         if visited.contains(&parent_name.to_lowercase()) {
-            return child;
+            return Ok(child);
         }
         visited.insert(parent_name.to_lowercase());
 
@@ -29370,7 +29370,7 @@ impl CfmlVirtualMachine {
         if let Some(rust_class) = parent_name.strip_prefix("rust:") {
             let child_map = match child {
                 CfmlValue::Struct(s) => s,
-                other => return other,
+                other => return Ok(other),
             };
             child_map.insert(
                 "__rust_extends".to_string(),
@@ -29384,7 +29384,7 @@ impl CfmlVirtualMachine {
             }
             child_map
                 .insert("__extends_chain".to_string(), CfmlValue::array(chain));
-            return CfmlValue::Struct(child_map);
+            return Ok(CfmlValue::Struct(child_map));
         }
 
         // Temporarily set source_file to the child CFC's path so parent
@@ -29408,7 +29408,28 @@ impl CfmlVirtualMachine {
                 if let Some(prev) = old_source_file {
                     self.source_file = prev;
                 }
-                return child; // Parent not found, return child as-is
+                // A named parent that cannot be found is an ERROR, not a silently
+                // parentless component. Lucee: `expression` type, message
+                // "invalid component definition, can't find component [Name]".
+                // Returning the child as-is (the behaviour until v0.594.0) turned a
+                // typo'd or moved `extends` into a component that merely lacked its
+                // inherited methods — which is exactly how a broken test once
+                // impersonated an inheritance bug.
+                //
+                // Two shapes are deliberately NOT errors: an empty/whitespace name
+                // (nothing was asked for) and the implicit base class `Component`,
+                // which has no file to find. `rust:` parents returned earlier.
+                let wanted = parent_name.trim();
+                if wanted.is_empty() || wanted.eq_ignore_ascii_case("component") {
+                    return Ok(child);
+                }
+                return Err(CfmlError::new(
+                    format!(
+                        "invalid component definition, can't find component [{}]",
+                        wanted
+                    ),
+                    cfml_common::vm::CfmlErrorType::Expression,
+                ));
             }
         };
 
@@ -29421,7 +29442,7 @@ impl CfmlVirtualMachine {
         let parent = if let CfmlValue::Struct(ref ps) = parent {
             if let Some(CfmlValue::String(grandparent)) = ps.get("__extends") {
                 let gp = grandparent.clone();
-                self.resolve_inheritance_chain(parent, &gp, locals, visited)
+                self.resolve_inheritance_chain(parent, &gp, locals, visited)?
             } else {
                 parent
             }
@@ -29482,7 +29503,7 @@ impl CfmlVirtualMachine {
         // Now merge: start with parent, layer child on top
         let child_map = match child {
             CfmlValue::Struct(s) => s,
-            _ => return parent,
+            _ => return Ok(parent),
         };
         // Snapshot the parent into an owned map so the merge never mutates the
         // shared parent template (preserves the old `Arc::make_mut` copy-on-write
@@ -29492,7 +29513,7 @@ impl CfmlVirtualMachine {
         // into the child exactly as when methods lived in the parent's map.
         let mut parent_map: ValueMap = match parent {
             CfmlValue::Struct(s) => s.snapshot_with_methods(),
-            _ => return CfmlValue::Struct(child_map),
+            _ => return Ok(CfmlValue::Struct(child_map)),
         };
 
         // Record which source file DECLARED each `implements=` interface, so a
@@ -29818,7 +29839,7 @@ impl CfmlVirtualMachine {
             }
         }
 
-        CfmlValue::strukt(parent_map)
+        Ok(CfmlValue::strukt(parent_map))
     }
 
     /// If `instance` was marked with `__rust_extends` by resolve_inheritance_chain,
@@ -31485,7 +31506,7 @@ impl CfmlVirtualMachine {
             if let Some(parent_template) =
                 self.resolve_component_template(pname, &empty_locals)
             {
-                let resolved_parent = self.resolve_inheritance(parent_template, &empty_locals);
+                let resolved_parent = self.resolve_inheritance(parent_template, &empty_locals)?;
                 if let CfmlValue::Struct(ref ps) = resolved_parent {
                     let mut super_methods = ValueMap::default();
                     let mut pvars = ValueMap::default();
@@ -31889,7 +31910,7 @@ impl CfmlVirtualMachine {
             }
         }
         // Resolve inheritance (e.g. extends="taffy.core.api")
-        let resolved = self.resolve_inheritance(template, &ValueMap::default());
+        let resolved = self.resolve_inheritance(template, &ValueMap::default())?;
         // Stamp the source path so the observability layer (debug footer) can
         // attribute Application.cfc lifecycle executions to it, and so any
         // `__source_file` reader sees the app component's own path.
@@ -32498,7 +32519,7 @@ impl CfmlVirtualMachine {
     fn sio_socket(&mut self, conn_id: &str, ns: &str) -> Option<CfmlValue> {
         let locals = ValueMap::default();
         let template = self.resolve_component_template("SocketIoSocket", &locals)?;
-        let instance = self.resolve_inheritance(template, &locals);
+        let instance = self.resolve_inheritance(template, &locals).ok()?;
         if let CfmlValue::Struct(ref s) = instance {
             let vars = s.get_or_insert_struct("__variables");
             vars.insert("id".to_string(), CfmlValue::string(conn_id.to_string()));
@@ -32568,7 +32589,7 @@ impl CfmlVirtualMachine {
             Some(t) => t,
             None => return Err(self.component_load_error(cfc_path)),
         };
-        let instance = self.resolve_inheritance(template, &locals);
+        let instance = self.resolve_inheritance(template, &locals)?;
         // Honour `extends="rust:Name"` channels (same as `new`).
         let template = self.attach_native_parent(instance)?;
 

@@ -935,6 +935,27 @@ A `>` comparison at the top level of a tag expression still needs bracketing or
 the word operator — `<cfset big = (a > b)>` or `<cfset big = a GT b>`. Bare
 `<cfset big = a > b>` ends at the comparison, as it always has.
 
+## 41. The `application` scope is live in-process, but NOT across cluster nodes 🏗 *(divergence, by construction)*
+
+Since v0.593.0 the `application` scope is a genuinely shared live structure: a write
+by one request is immediately visible to every other in-flight request on that
+node, matching Lucee. Guard-once idioms
+(`if ( !StructKeyExists( application, "x" ) ) { expensive(); … }`) are therefore
+safe **within a process**.
+
+They are **not** safe across nodes when a serialising application store is in use —
+Cloudflare KV, the Durable Object store, or any future cluster backend. Those hold
+a snapshot per node and publish it at request end (`ApplicationStore::publish_variables`),
+so two nodes can both observe a key as absent and both run the expensive branch,
+and one node's write can overwrite another's.
+
+There is no way to paper over this at the trait level: a live shared scope needs
+shared memory, which distinct isolates/nodes do not have. If you need
+exactly-once initialisation across nodes, use an external mutex (a database row,
+a Durable Object, a distributed lock) rather than an application-scope key.
+Note the Durable Object backend serialises all requests through a single instance,
+so it is closer to correct than plain KV, but still snapshot-based.
+
 ## 40. `<cflock>` `timeout="0"` fails immediately instead of waiting forever ✅ *(fixed in v0.593.0)*
 
 Lucee treats `timeout="0"` — and an **omitted** `timeout` — as *no timeout*: the
