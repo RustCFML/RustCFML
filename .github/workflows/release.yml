@@ -49,6 +49,10 @@ jobs:
   build:
     needs: licenses
     strategy:
+      # Do not cancel sibling targets when one fails: a single broken target used to
+      # cancel the other three mid-build, so a Windows-only fault looked like a
+      # total failure and the healthy targets produced no evidence.
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -102,11 +106,18 @@ jobs:
 
       # Shipped artifacts are PGO'd. `cargo build --release` stays thin-LTO and
       # fast for everyday local use; this profile is fat LTO (see Cargo.toml).
+      #
+      # ⚠️ RUSTFLAGS goes through `env:`, and this step must NOT set `shell: bash`.
+      # v0.595.0's release failed exactly there: `shell: bash` switches the Windows
+      # runner to Git-Bash, which puts MSYS Perl (/usr/share/perl5/core_perl) ahead
+      # of Strawberry Perl on PATH — and MSYS Perl cannot configure vendored OpenSSL
+      # for VC-WIN64A, so openssl-sys's build script dies. The default per-OS shell
+      # (pwsh on Windows) has the right Perl. Using `env:` also sidesteps quoting a
+      # Windows path that contains backslashes.
       - name: Build (PGO)
-        shell: bash
-        run: |
-          RUSTFLAGS="-Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata" \
-            cargo build --profile release-pgo -p rustcfml-cli
+        env:
+          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
+        run: cargo build --profile release-pgo -p rustcfml-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

@@ -80,6 +80,22 @@ $PROFDATA merge --sparse -o pgo/rustcfml.profdata merged.profdata
    `--sparse` profile: sparse deliberately drops never-executed functions, so they
    must report missing.
 
+## ⚠️ Do not put `shell: bash` on the Windows build step
+
+v0.595.0's release failed on all four targets because of this. `shell: bash` makes
+the Windows runner use Git-Bash, which puts **MSYS Perl**
+(`/usr/share/perl5/core_perl`) ahead of Strawberry Perl on `PATH` — and MSYS Perl
+cannot configure vendored OpenSSL for `VC-WIN64A`, so `openssl-sys`'s build script
+dies with *"'perl' reported failure with exit code: 2"*. Nothing to do with PGO.
+
+Pass `RUSTFLAGS` through `env:` instead of a shell line-continuation, which also
+avoids quoting a Windows path full of backslashes. (The profile-verification step
+*may* keep `shell: bash` — it only runs `find`/`grep` and does not invoke Perl.)
+
+The matrix also sets `fail-fast: false`: the Windows-only fault cancelled the other
+three targets mid-build, so a single broken platform looked like a total failure and
+the healthy targets produced no evidence at all.
+
 ## Staleness is safe, but silent
 
 LLVM matches a profile to a function by name + CFG hash, so a changed function
