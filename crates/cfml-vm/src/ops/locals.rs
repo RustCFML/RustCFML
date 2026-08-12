@@ -61,6 +61,7 @@ pub(crate) fn op_try_start(
         stack_depth: stack.len(),
         saved_buffers_depth: vm.saved_output_buffers.len(),
         custom_tag_depth: vm.custom_tag_stack.len(),
+        base_tag_depth: vm.base_tag_stack.len(),
     });
 }
 

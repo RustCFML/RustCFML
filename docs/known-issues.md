@@ -909,6 +909,32 @@ behave as `en_US`. Extend the table rather than letting a caller's locale be dro
 
 <a id="38"></a>
 
+## 39. Tag-mode expressions: `>` ends a tag unless it is bracketed or part of `=>` 🏗
+
+A tag ends at the first `>` that is not inside a string, a CFML comment, or a
+bracketed sub-expression. That last clause exists because tag-mode expressions
+legitimately contain `>`:
+
+```cfml
+<cfset total = arr.reduce((s, r) => s + r.count, 0)>   <!--- arrow, inside reduce( --->
+<cfset f     = (a) => a * 2>                           <!--- arrow, at top level --->
+```
+
+The scanner therefore ignores a `>` while any `(`/`[` is open, and ignores a
+literal `=>` anywhere (guarded so `>=`, `==>`, `!=>` and `<=>` are unaffected).
+
+**The residual edge:** an *unquoted* attribute value whose last character is a
+bare `=`, immediately followed by the tag's `>`, is read as an arrow and the tag
+does not end there — e.g. `<cfhttp url=http://example.com/?a=>`. Quote the value
+(`url="http://example.com/?a="`), which is what every style guide asks for
+anyway. The reverse spelling is genuinely ambiguous and is resolved the other
+way: `<cfif cond>=5</cfif>` still outputs `=5`, because only `=` *before* `>`
+counts as an arrow.
+
+A `>` comparison at the top level of a tag expression still needs bracketing or
+the word operator — `<cfset big = (a > b)>` or `<cfset big = a GT b>`. Bare
+`<cfset big = a > b>` ends at the comparison, as it always has.
+
 ## 38. Database exception members — `sqlState` is driver-dependent 🏗 *(GH [#295](https://github.com/RustCFML/RustCFML/issues/295))*
 
 Database failures now carry the structured detail Lucee/ACF attach, so

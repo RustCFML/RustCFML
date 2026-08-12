@@ -47,6 +47,13 @@ component {
     // enabled in the Lucee config. String form, as Lucee also accepts.
     this.customtagpaths = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/ctpathroot/";
 
+    // Deep search is OFF by default in RustCFML too (stock-Lucee parity: a stray
+    // .cfm under a tag path must not become invocable). RustCFML honours this
+    // per-application spelling as a superset; on Lucee it is inert, so a
+    // cross-engine run of that suite still needs server-level
+    // customTagDeepSearch=true in .CFConfig.json.
+    this.customTagDeepSearch = true;
+
     // Per-application datasources (Lucee/BoxLang parity). Scoped to THIS
     // application and resolved by cfquery/queryExecute ahead of the global
     // cfconfig registry. Exercised by tests/config/test_app_datasources.cfm.

@@ -32,6 +32,14 @@ pub struct RustCfmlConfig {
     pub mappings: IndexMap<String, String>,
     #[serde(rename = "customTagPaths")]
     pub custom_tag_paths: Vec<String>,
+    /// Search `customTagPaths` RECURSIVELY when resolving `<cf_name>` tags.
+    /// Lucee's server-level `customTagDeepSearch`; OFF by default there and
+    /// here, because a stray `.cfm` anywhere under a tag path would otherwise
+    /// become a resolvable custom tag. Lucee-based projects that organise tags
+    /// in subdirectories switch it on (per-application `this.customTagDeepSearch`
+    /// also works in RustCFML — a superset; Lucee 7 ignores that spelling).
+    #[serde(rename = "customTagDeepSearch")]
+    pub custom_tag_deep_search: bool,
     #[serde(rename = "mailServers")]
     pub mail_servers: Vec<MailServerCfg>,
     pub caches: IndexMap<String, CacheCfg>,
