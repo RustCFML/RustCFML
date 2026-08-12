@@ -532,6 +532,7 @@ include "harness.cfm";
 <!--- parseability. Reduced from the titan (Moopa) codebase port. --->
 <cf_runtest file="tags/test_cfquery_escaped_hash_interpolation.cfm">
 <cf_runtest file="tags/test_cfquery_sql_line_comments.cfm">
+<cf_runtest file="tags/test_cfquery_cfml_comments.cfm">
 <cf_runtest file="tags/test_cte_with_query.cfm">
 <cf_runtest file="tags/test_tags_cfquery_control_tags.cfm">
 <cf_runtest file="tags/test_cfquery_result_delivery.cfm">
