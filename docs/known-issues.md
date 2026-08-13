@@ -1018,7 +1018,7 @@ Covered by `tests/database/test_query_error_sqlstate_members.cfm` (SQLite
 control gated on driver availability so it skips on Lucee; PostgreSQL, MySQL and
 SQL Server legs gated on `RUSTCFML_TEST_PG_DS` / `_MYSQL_DS` / `_MSSQL_DS`).
 
-## 39. The request existence memo caches positives only 🏗
+## 45. The request existence memo caches positives only 🏗
 
 `Vm::request_exists_cache` (`crates/cfml-vm/src/lib.rs:2459`) is a
 `HashMap<String, u8>` of bit flags — is-file, is-dir, exists
@@ -1055,7 +1055,7 @@ problem, or undoing a deliberate decision about staleness — a negative memo is
 exactly where a "file appeared after we said it didn't" bug would live, and the
 dev-mode freshness rules matter here.
 
-## 40. Member-function dispatch lowercases the method name per call 🏗
+## 46. Member-function dispatch lowercases the method name per call 🏗
 
 `obj.method()` dispatch normalises the method name with `to_lowercase()` on the
 call path (`crates/cfml-vm/src/lib.rs:24597`, and previously 2–3 such allocations
@@ -1075,7 +1075,7 @@ through the `Cow` discriminant cost more than the allocation it saved
 (registry-cased `len` 186→210 ms/1M, `structKeyExists` 262→290 ms/1M). It was
 reverted, and a comment left at the site. The same trap may well apply here.
 
-## 41. Surplus built-in function arguments are accepted, not rejected 🏗
+## 47. Surplus built-in function arguments are accepted, not rejected 🏗
 
 RustCFML tolerates extra positional arguments to a built-in where Lucee raises a
 **compile-time** error:
@@ -1784,7 +1784,7 @@ Two things worth recording because they contradict the intuitive reading:
 
 Covered by `tests/stdlib/test_duplicate_deepcopy_flag.cfm` (26 assertions, green
 on both engines) with fixture `tests/core/DuplicateFlagFixture.cfc`. Surplus-argument
-tolerance is **not** fixed — see §41.
+tolerance is **not** fixed — see §47.
 
 ## 43. `getComponentMetaData( "dotted.path" )` was recomputed on every call ✅ *(fixed in v0.596.0)*
 
@@ -1863,7 +1863,7 @@ Notes:
   matching entry. True for every in-tree embedder; it is an ordering assumption
   rather than a mechanical guarantee.
 - Eliminating the per-call `to_lowercase()` was tried, measured **slower**, and
-  reverted — see §40.
+  reverted — see §46.
 
 Covered by `tests/functions/test_builtin_name_ci_index.cfm` (+31 assertions:
 lowerCamel/UpperCamel/ALLCAPS/mixed for the measured functions, the VM-intercepted
