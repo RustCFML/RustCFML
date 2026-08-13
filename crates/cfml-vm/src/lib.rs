@@ -1180,6 +1180,16 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// are retained here and re-checked on every hit, so a hash collision degrades
 /// to a re-resolve and can never hand back another component's path.
 ///
+/// Key for the request-scoped metadata memos
+/// ([`CfmlVirtualMachine::component_inherit_meta_cache`] and
+/// [`CfmlVirtualMachine::component_path_meta_cache`]):
+/// `(class name as written, source context, base template, mappings fingerprint)`.
+///
+/// Built by [`CfmlVirtualMachine::meta_memo_key`], which documents why each part
+/// is load-bearing. Unlike [`ComponentPathEntry`] the name is compared
+/// case-SENSITIVELY, because the derived metadata can echo the name as written.
+type MetaMemoKey = (String, String, String, u64);
+
 /// `path` is an `Arc<str>` so a hit clones a pointer, not the path bytes.
 #[derive(Clone, Debug)]
 pub struct ComponentPathEntry {
@@ -1660,7 +1670,26 @@ pub struct CfmlVirtualMachine {
     /// is only trusted while those agree; otherwise the probe falls back to the
     /// original correct-but-slow path. Call `refresh_builtin_index()` after bulk
     /// registration to arm it.
-    builtin_names_lc: std::collections::HashSet<String, cfml_common::dynamic::ValueBuildHasher>,
+    ///
+    /// The index maps the lowercased name to `(canonical registry key, fn ptr)`
+    /// so it also answers RESOLUTION, not just existence: a miscased call
+    /// (`Len()`, `StructKeyExists()` — the spelling most real CFML codebases
+    /// use, while the registry is keyed lowerCamel) used to fall into a chain of
+    /// FIVE `eq_ignore_ascii_case` linear scans over all ~730 builtins plus a
+    /// fresh `Arc<CfmlFunction>` allocation, measured at +236..+635 ns per call,
+    /// i.e. 2-4x the entire cost of the call itself.
+    ///
+    /// The third tuple field marks an AMBIGUOUS entry: two registry keys that
+    /// differ only by case (the registry does carry one such pair,
+    /// `getContextRoot`/`GetContextRoot`), which one lowercased slot cannot
+    /// represent. Those — and only those — keep the exact-match-first probe, so
+    /// resolution is unchanged for them while the other ~700 names stay on the
+    /// single-probe path.
+    builtin_names_lc: HashMap<
+        String,
+        (String, BuiltinFunction, bool),
+        cfml_common::dynamic::ValueBuildHasher,
+    >,
     builtin_lc_src_len: usize,
     /// Memoized `isValid` builtin, for the §29 declared-type checks (which need
     /// the format predicates but must not pay a case-insensitive scan of the
@@ -1674,6 +1703,18 @@ pub struct CfmlVirtualMachine {
     /// Held as `Arc<BytecodeFunction>` so that cloning (very hot on every call)
     /// is a refcount bump rather than a deep clone of the whole bytecode body.
     pub user_functions: HashMap<String, Arc<BytecodeFunction>>,
+    /// ASCII-lowercased name -> declared-spelling key index over
+    /// `user_functions`, so the case-insensitive resolution fallback (a bare
+    /// call spelled with a casing that differs from the declaration) is one
+    /// Fx-hashed probe rather than a linear scan of a large app's whole
+    /// function table. Maintained incrementally next to every insert; nothing
+    /// ever removes from `user_functions`, so the index cannot go stale by
+    /// deletion. `user_fn_lc_src_len` carries the `user_functions.len()` the
+    /// index was last maintained at — an embedder inserting into the public
+    /// field directly desynchronises the lengths and the probe falls back to
+    /// the original correct-but-slow scan.
+    user_fn_lc: HashMap<String, String, cfml_common::dynamic::ValueBuildHasher>,
+    user_fn_lc_src_len: usize,
     /// Per-class-invariant cache of component-method `CfmlFunction` values, keyed
     /// by the function's process-unique `global_id`. A CFC method's `CfmlFunction`
     /// (name + params + `global_id` body + access, `captured_scope: None`) is
@@ -2332,6 +2373,30 @@ pub struct CfmlVirtualMachine {
     /// `exists()` storm when a request instantiates the same component many times.
     /// Same key/value shape as the production layer (see [`ComponentPathEntry`]).
     pub request_component_cache: HashMap<u64, ComponentPathEntry>,
+    /// Request-scoped memo of [`Self::build_inheritance_metadata`], keyed by
+    /// [`MetaMemoKey`].
+    ///
+    /// Metadata is derived purely from the class DEFINITION, which cannot change
+    /// within a single request — so this is safe in every mode and, being dropped
+    /// with the request VM, dev still sees an edited `.cfc` on the next request
+    /// (the same safety argument as `request_component_cache`). It exists because
+    /// the builder walks the inheritance chain resolving EVERY level's raw
+    /// template, and each of those resolutions itself resolves its own parent for
+    /// super/scope injection — roughly D² pseudo-constructor executions for a
+    /// chain of depth D, repeated in full on every single call.
+    ///
+    /// Values are stored and returned as DEEP COPIES: metadata structs are
+    /// reference-typed, and callers (ColdBox `Util.getInheritedMetaData`) mutate
+    /// the struct they are handed. A shared handle would let one caller's edit
+    /// poison every later reader.
+    component_inherit_meta_cache: HashMap<MetaMemoKey, CfmlValue>,
+    /// Request-scoped memo of the PATH-STRING form of `getComponentMetaData("a.b.C")`
+    /// (same key shape / same freshness argument as `component_inherit_meta_cache`).
+    /// Only dotted/slashed names that are not shadowed by a caller local are
+    /// memoized: an in-memory component definition is registered in `globals`
+    /// under its declared SHORT name, so a dotted name can never be answered from
+    /// `globals` and no later in-request definition can be shadowed by this cache.
+    component_path_meta_cache: HashMap<MetaMemoKey, CfmlValue>,
     /// Phase C.3 (feature `component-instance`): per-`__source_file` cache of the
     /// class-invariant [`cfml_common::component::ClassBlueprint`], `Arc`-shared
     /// across every instance the producer builds. Request-scoped (rebuilt next
@@ -2793,12 +2858,14 @@ impl CfmlVirtualMachine {
             program,
             globals: ValueMap::default(),
             builtins: HashMap::new(),
-            builtin_names_lc: std::collections::HashSet::default(),
+            builtin_names_lc: HashMap::default(),
             builtin_lc_src_len: usize::MAX, // no index yet — probe takes the slow path
             type_check_is_valid: None,
             output_buffer: String::new(),
             vfs: Arc::new(RealFs),
             user_functions: HashMap::new(),
+            user_fn_lc: HashMap::default(),
+            user_fn_lc_src_len: 0,
             method_arc_cache: HashMap::new(),
             class_method_tables: HashMap::new(),
             source_file: None,
@@ -2936,6 +3003,8 @@ impl CfmlVirtualMachine {
             static_holders: HashMap::new(),
             class_meta_cache: HashMap::new(),
             request_component_cache: HashMap::new(),
+            component_inherit_meta_cache: HashMap::new(),
+            component_path_meta_cache: HashMap::new(),
             #[cfg(feature = "component-instance")]
             component_blueprints: HashMap::new(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -4018,6 +4087,8 @@ impl CfmlVirtualMachine {
         self.custom_tag_paths = seed.custom_tag_paths;
         self.custom_tag_deep_search = seed.custom_tag_deep_search;
         self.user_functions = seed.user_functions;
+        // Whole-map replacement: rebuild the lowercased resolution index.
+        self.refresh_user_fn_index();
         self.app_local_mode_modern = seed.app_local_mode_modern;
         self.sandbox = seed.sandbox;
         self.null_support = seed.null_support;
@@ -4403,11 +4474,25 @@ impl CfmlVirtualMachine {
     /// `builtins` field MUST call this afterwards, otherwise the hot-path probe
     /// silently falls back to the O(n) scan it exists to replace.
     pub fn refresh_builtin_index(&mut self) {
-        self.builtin_names_lc = self
-            .builtins
-            .keys()
-            .map(|k| k.to_ascii_lowercase())
-            .collect();
+        let mut idx: HashMap<
+            String,
+            (String, BuiltinFunction, bool),
+            cfml_common::dynamic::ValueBuildHasher,
+        > = HashMap::with_capacity_and_hasher(self.builtins.len(), Default::default());
+        for (k, f) in self.builtins.iter() {
+            match idx.entry(k.to_ascii_lowercase()) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((k.clone(), *f, false));
+                }
+                // Two registry keys differing only by case: one lowercased slot
+                // cannot represent both, so mark the entry ambiguous and let
+                // every lookup of it keep the exact-match-first probe.
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().2 = true;
+                }
+            }
+        }
+        self.builtin_names_lc = idx;
         self.builtin_lc_src_len = self.builtins.len();
     }
 
@@ -4421,13 +4506,119 @@ impl CfmlVirtualMachine {
     #[inline]
     fn is_builtin_name_ci(&self, name: &str, name_lower: &str) -> bool {
         if self.builtin_lc_src_len == self.builtins.len() {
-            return self.builtin_names_lc.contains(name_lower);
+            return self.builtin_names_lc.contains_key(name_lower);
         }
         self.builtins.contains_key(name)
             || self
                 .builtins
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case(name_lower))
+    }
+
+    /// EXACT-spelling `builtins.contains_key(name)`, answered off the lowercased
+    /// index so the hottest resolution step costs one Fx probe rather than a
+    /// SipHash probe of the std `builtins` map. Falls back to the map itself
+    /// when the index is unarmed, or for the one entry whose lowercased slot is
+    /// ambiguous (two registry keys differing only by case).
+    ///
+    /// `name_lower` must be `name.to_lowercase()`.
+    #[inline]
+    fn is_builtin_exact(&self, name: &str, name_lower: &str) -> bool {
+        if self.builtin_lc_src_len == self.builtins.len() {
+            return match self.builtin_names_lc.get(name_lower) {
+                Some((_, _, true)) => self.builtins.contains_key(name),
+                Some((canonical, _, false)) => canonical == name,
+                None => false,
+            };
+        }
+        self.builtins.contains_key(name)
+    }
+
+    /// Case-insensitively RESOLVE `name` to `(canonical registry key, fn ptr)`.
+    ///
+    /// Same answer as the exact-then-linear-scan chain this replaces:
+    /// `builtins.get(name)` first (so a registry that holds two keys differing
+    /// only by case still prefers the exact spelling), then the first
+    /// `eq_ignore_ascii_case` match. Only the lowercased slots flagged ambiguous
+    /// by `refresh_builtin_index` still pay that exact probe; every other name
+    /// gets the answer from one Fx-hashed lookup.
+    ///
+    /// `name_lower` must be `name.to_lowercase()`.
+    #[inline]
+    fn builtin_lookup_ci(&self, name: &str, name_lower: &str) -> Option<(&str, BuiltinFunction)> {
+        if self.builtin_lc_src_len == self.builtins.len() {
+            let (canonical, f, ambiguous) = match self.builtin_names_lc.get(name_lower) {
+                Some(hit) => hit,
+                None => return None,
+            };
+            cfml_common::perf_counters::bump(&cfml_common::perf_counters::BUILTIN_LOOKUP_CI);
+            if *ambiguous {
+                // Two registry keys differ only by case here: prefer the exact
+                // spelling, exactly as the map probe this replaced did.
+                if let Some((k, f)) = self.builtins.get_key_value(name) {
+                    return Some((k.as_str(), *f));
+                }
+            }
+            if canonical.as_str() != name {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::BUILTIN_LOOKUP_CI_MISCASED,
+                );
+            }
+            return Some((canonical.as_str(), *f));
+        }
+        // Index not armed (an embedder inserted into the public `builtins` field
+        // without calling `refresh_builtin_index`): original correct-but-slow path.
+        cfml_common::perf_counters::bump(&cfml_common::perf_counters::BUILTIN_LOOKUP_CI_SCAN);
+        if let Some((k, f)) = self.builtins.get_key_value(name) {
+            return Some((k.as_str(), *f));
+        }
+        self.builtins
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
+            .map(|(k, f)| (k.as_str(), *f))
+    }
+
+    /// Record `name` in the lowercased `user_functions` index. MUST be called
+    /// next to every `user_functions.insert`, otherwise the case-insensitive
+    /// resolution fallback silently reverts to a linear scan of the table.
+    #[inline]
+    fn index_user_function(&mut self, name: &str) {
+        self.user_fn_lc.insert(name.to_ascii_lowercase(), name.to_string());
+        self.user_fn_lc_src_len = self.user_functions.len();
+    }
+
+    /// Rebuild the lowercased `user_functions` index from scratch. Only needed
+    /// where the whole map is replaced wholesale (thread seeding).
+    fn refresh_user_fn_index(&mut self) {
+        self.user_fn_lc = self
+            .user_functions
+            .keys()
+            .map(|k| (k.to_ascii_lowercase(), k.clone()))
+            .collect();
+        self.user_fn_lc_src_len = self.user_functions.len();
+    }
+
+    /// Case-insensitively resolve `name_lower` to a `user_functions` entry.
+    /// Equivalent to `user_functions.iter().find(|(k, _)| k.eq_ignore_ascii_case(name_lower))`
+    /// but one Fx-hashed probe while the index is in step with the map.
+    #[inline]
+    fn user_fn_lookup_ci(&self, name_lower: &str) -> Option<(&String, &Arc<BytecodeFunction>)> {
+        if self.user_fn_lc_src_len == self.user_functions.len() {
+            match self.user_fn_lc.get(name_lower) {
+                // Belt and braces: an index entry whose key is somehow no longer
+                // in the map falls through to the scan rather than reporting a
+                // miss the scan would have found.
+                Some(key) => {
+                    if let Some(hit) = self.user_functions.get_key_value(key) {
+                        return Some(hit);
+                    }
+                }
+                None => return None,
+            }
+        }
+        self.user_functions
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
     }
 
     pub fn register_native_fn(&mut self, name: &str, f: BuiltinFunction) {
@@ -6982,12 +7173,7 @@ impl CfmlVirtualMachine {
                     } else if let Some(bc_func) = self
                         .user_functions
                         .get(name.as_str())
-                        .or_else(|| {
-                            self.user_functions
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
-                                .map(|(_, v)| v)
-                        })
+                        .or_else(|| self.user_fn_lookup_ci(name_lower).map(|(_, v)| v))
                         .cloned()
                     {
                         // User-defined function referenced as a value (first-class function)
@@ -7776,10 +7962,33 @@ impl CfmlVirtualMachine {
                     } else if let Some(val) = self.globals.get(name.as_str()) {
                         stack.push(val.clone());
                     } else if let Some(val) = self
-                        .globals
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                        .map(|(_, v)| v.clone())
+                        // The page scope is SEEDED with a first-class value for
+                        // every builtin under its registry spelling, so a bare
+                        // call written in any other casing — `Len()`,
+                        // `StructKeyExists()`, i.e. most real CFML — missed the
+                        // exact probe and was answered by the linear scan below,
+                        // over all ~730 builtins plus every page variable. That
+                        // single scan is where the measured +236..635 ns per
+                        // miscased builtin call actually went.
+                        //
+                        // Resolve the canonical spelling in O(1) and probe for
+                        // THAT key instead. The answer is identical: `globals`
+                        // is an insertion-ordered map seeded with the builtins
+                        // before any page variable can exist, so for a builtin
+                        // name the canonical key is always the first
+                        // CI-matching entry the scan would have found — and if
+                        // it is absent (deleted from the scope, leaving only a
+                        // differently-cased entry) this probe misses and the
+                        // unchanged scan below still answers.
+                        .builtin_lookup_ci(name.as_str(), &name_lower)
+                        .and_then(|(canonical, _)| self.globals.get(canonical))
+                        .cloned()
+                        .or_else(|| {
+                            self.globals
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
+                                .map(|(_, v)| v.clone())
+                        })
                     {
                         stack.push(val);
                     // 3. Check builtins/user_functions (exact, then CI). The
@@ -7836,76 +8045,84 @@ impl CfmlVirtualMachine {
                             self.resolved_fn_memo.insert(gid, val.clone());
                             stack.push(val);
                         }
-                    } else if self.builtins.contains_key(name.as_str()) {
+                    } else if self.is_builtin_exact(name.as_str(), &name_lower) {
                         stack.push(Self::builtin_fn_value(name));
-                    } else if self.builtins.keys().any(|k| k.eq_ignore_ascii_case(&name_lower))
-                        || self
-                            .user_functions
-                            .keys()
-                            .any(|k| k.eq_ignore_ascii_case(&name_lower))
+                    // 3b. Case-insensitive fallback. CFML identifiers are
+                    // case-insensitive by language contract, and the builtin
+                    // registry is keyed lowerCamel — so a codebase written
+                    // UpperCamel (`Len`, `Trim`, `StructKeyExists`: Preside,
+                    // ColdBox and much CFML in the wild) reaches EVERY builtin
+                    // through here. This used to be a chain of FIVE
+                    // `eq_ignore_ascii_case` linear scans (~730 builtins, plus
+                    // the whole user-function table three times) ending in a
+                    // fresh `Arc<CfmlFunction>` with no memoisation at all:
+                    // +236..635 ns per call, 2-4x the entire cost of the call.
+                    // Both halves are now a single hashed probe into an index
+                    // maintained beside the map it indexes, and both memoise.
+                    //
+                    // ORDER IS UNCHANGED. The old single branch was entered on
+                    // "builtin CI-matches OR user function CI-matches", and
+                    // inside it a CI user-function match overwrote the builtin's
+                    // name/body/params — i.e. user function first, builtin
+                    // second, which is what the two branches below spell out.
+                    // The exact-match branches above still run first.
+                    } else if let Some((uf_name, uf)) = self
+                        .user_fn_lookup_ci(&name_lower)
+                        .map(|(k, v)| (k.clone(), Arc::clone(v)))
                     {
-                        let canonical = self
-                            .builtins
-                            .keys()
-                            .find(|k| k.eq_ignore_ascii_case(&name_lower))
-                            .or_else(|| {
-                                self.user_functions
-                                    .keys()
-                                    .find(|k| k.eq_ignore_ascii_case(&name_lower))
-                            })
-                            .cloned()
-                            .unwrap_or(name.to_string());
-                        let params = self
-                            .user_functions
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                            .map(|(_, uf)| {
-                                uf.params
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, p)| cfml_common::dynamic::CfmlParam {
-                                        name: p.clone(),
-                                        param_type: uf.param_types.get(i).cloned().flatten(),
-                                        default: None,
-                                        required: uf
-                                            .required_params
-                                            .get(i)
-                                            .copied()
-                                            .unwrap_or(false),
-                                        annotations: uf
-                                            .param_annotations
-                                            .get(i)
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        // For user functions (CI match), reference by stable global_id.
-                        let (body_val, scope, resolved_name, ret_type) = if let Some((uf_name, uf)) = self
-                            .user_functions
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                        {
-                            (
-                                CfmlValue::Int(uf.global_id as i64),
-                                None,
-                                uf_name.clone(),
-                                uf.return_type.clone(),
-                            )
+                        let gid = uf.global_id;
+                        // Same memo (and the same name guard) as the exact-match
+                        // branch above; the resolved value is fully determined by
+                        // the definition, so it is stable across calls.
+                        let memo_hit = self.resolved_fn_memo.get(&gid).filter(
+                            |v| matches!(v, CfmlValue::Function(f) if f.name == uf_name),
+                        );
+                        if let Some(v) = memo_hit {
+                            stack.push(v.clone());
                         } else {
-                            (CfmlValue::Null, None, canonical, None)
-                        };
-                        stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
-                            name: resolved_name,
-                            params,
-                            body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                                body_val,
-                            )),
-                            return_type: ret_type,
-                            access: cfml_common::dynamic::CfmlAccess::Public,
-                            captured_scope: scope,
-                        })));
+                            let params = uf
+                                .params
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| cfml_common::dynamic::CfmlParam {
+                                    name: p.clone(),
+                                    param_type: uf.param_types.get(i).cloned().flatten(),
+                                    default: None,
+                                    required: uf
+                                        .required_params
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(false),
+                                    annotations: uf
+                                        .param_annotations
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                })
+                                .collect();
+                            let val = CfmlValue::Function(Arc::new(
+                                cfml_common::dynamic::CfmlFunction {
+                                    name: uf_name,
+                                    params,
+                                    // Reference the function by its stable global_id.
+                                    body: cfml_common::dynamic::CfmlClosureBody::Expression(
+                                        Box::new(CfmlValue::Int(gid as i64)),
+                                    ),
+                                    return_type: uf.return_type.clone(),
+                                    access: cfml_common::dynamic::CfmlAccess::Public,
+                                    captured_scope: None,
+                                },
+                            ));
+                            self.resolved_fn_memo.insert(gid, val.clone());
+                            stack.push(val);
+                        }
+                    } else if let Some((canonical, _)) =
+                        self.builtin_lookup_ci(name.as_str(), &name_lower)
+                    {
+                        // `builtin_fn_value` is keyed by the CANONICAL registry
+                        // spelling, so every casing of a name shares one memo
+                        // entry (and one Arc) instead of allocating per call.
+                        stack.push(Self::builtin_fn_value(canonical));
                     // 4. Check VM-intercepted function names (custom tags, etc.)
                     } else if matches!(
                         name_lower,
@@ -10079,11 +10296,10 @@ impl CfmlVirtualMachine {
                     // getMetadata() call program-wide (returning empty metadata
                     // and breaking TestBox bundle discovery).
                     let shadows_builtin = !func_name.starts_with("__")
-                        && (self.builtins.contains_key(func_name.as_str())
-                            || self
-                                .builtins
-                                .keys()
-                                .any(|k| k.eq_ignore_ascii_case(func_name.as_str())));
+                        && self.is_builtin_name_ci(
+                            func_name.as_str(),
+                            &func_name.to_lowercase(),
+                        );
                     if shadows_builtin && !bc_func_arc.is_component_method {
                         return Err(self.wrap_error(CfmlError::runtime(format!(
                             "The name [{}] is already used by a built in Function",
@@ -10106,6 +10322,8 @@ impl CfmlVirtualMachine {
                     if !(shadows_builtin && bc_func_arc.is_component_method) {
                         self.user_functions
                             .insert(func_name.clone(), Arc::clone(&bc_func_arc));
+                        // Keep the lowercased resolution index in step.
+                        self.index_user_function(&func_name);
                     }
                     // Create or reuse a shared closure environment so all closures
                     // defined in this function invocation share the same mutable state.
@@ -12193,6 +12411,14 @@ impl CfmlVirtualMachine {
             }
 
             // Check builtin functions (case-insensitive)
+            //
+            // NB: a `Cow` here (borrow when the name is already lowercase, so the
+            // per-call `to_lowercase` allocation disappears) was tried and
+            // MEASURED SLOWER — this function compares `name_lower` against ~30
+            // literals per call, and routing each of those through the Cow
+            // discriminant cost more than the allocation it saved (registry-cased
+            // `len` 186 -> 210 ms/1M, `structKeyExists` 262 -> 290 ms/1M). Left as
+            // an owned String deliberately.
             let name_lower = func.name.to_lowercase();
 
             // writeOutput/writeDump must be handled before the builtin lookup
@@ -12997,12 +13223,9 @@ impl CfmlVirtualMachine {
                     // Resolve the builtin (exact match first, then
                     // case-insensitive) to a single fn pointer so the dispatch —
                     // and the GH #284 post-write cache flush below — happens once.
-                    let builtin_fn = self.builtins.get(&func.name).copied().or_else(|| {
-                        self.builtins
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                            .map(|(_, v)| *v)
-                    });
+                    let builtin_fn = self
+                        .builtin_lookup_ci(&func.name, &name_lower)
+                        .map(|(_, f)| f);
                     if let Some(builtin) = builtin_fn {
                         // GH #284: when this process rewrites/removes a template
                         // (fileWrite/append/copy/move/delete, incl. the <cffile>
@@ -13071,12 +13294,9 @@ impl CfmlVirtualMachine {
                 return self.execute_function_with_args(&user_func, args, Some(parent_locals));
             }
 
-            // Case-insensitive user function lookup
-            let user_match = self
-                .user_functions
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                .map(|(_, v)| v.clone());
+            // Case-insensitive user function lookup (one hashed probe into the
+            // lowercased index; this used to scan the whole function table).
+            let user_match = self.user_fn_lookup_ci(&name_lower).map(|(_, v)| v.clone());
 
             if let Some(user_func) = user_match {
                 self.pending_fused_parent = Some(self.fused_call_parent_plan(func));
@@ -15538,8 +15758,25 @@ impl CfmlVirtualMachine {
                             }
                             return Ok(extract_component_meta(&snap, ""));
                         }
-                        // Otherwise treat as a component name/path to look up
+                        // Otherwise treat as a component name/path to look up.
+                        //
+                        // Unlike `getMetadata(instance)` — cached once per class on
+                        // the shared blueprint — this form used to redo the ENTIRE
+                        // derivation on every call: resolve the template (executing
+                        // the pseudo-constructor and deep-copying the result), then
+                        // resolve inheritance, then rebuild the metadata by walking
+                        // the chain again. ColdBox/WireBox `Mapping.cfc` calls it
+                        // with its own metadata cache off, so a single Preside admin
+                        // request spent ~21 ms in 14 calls. Memoized per request,
+                        // keyed by (name CI, source context, mappings fingerprint) —
+                        // see `component_path_meta_cache` for the freshness argument.
                         let comp_name = arg.as_string();
+                        let meta_key = self.component_path_meta_key(&comp_name, parent_locals);
+                        if let Some(ref key) = meta_key {
+                            if let Some(hit) = self.component_path_meta_cache.get(key) {
+                                return Ok(hit.deep_copy());
+                            }
+                        }
                         if let Some(template) =
                             self.resolve_component_template(&comp_name, parent_locals)
                         {
@@ -15551,12 +15788,13 @@ impl CfmlVirtualMachine {
                                     Some(CfmlValue::Bool(true))
                                 ) {
                                     let mut visited = std::collections::HashSet::new();
-                                    return Ok(self.build_interface_metadata(
+                                    let out = self.build_interface_metadata(
                                         &snap,
                                         &comp_name,
                                         parent_locals,
                                         &mut visited,
-                                    ));
+                                    );
+                                    return Ok(self.memo_path_metadata(meta_key, out));
                                 }
                                 // Inheriting component (looked up by path): build the
                                 // RICH recursive metadata so `.extends` is a struct
@@ -15585,12 +15823,14 @@ impl CfmlVirtualMachine {
                                         if let Some(chain @ CfmlValue::Array(_)) = chain {
                                             meta.insert("fullExtends".to_string(), chain);
                                         }
-                                        return Ok(CfmlValue::strukt(meta));
+                                        let out = CfmlValue::strukt(meta);
+                                        return Ok(self.memo_path_metadata(meta_key, out));
                                     }
                                 }
-                                return Ok(extract_component_meta(&snap, &comp_name));
+                                let out = extract_component_meta(&snap, &comp_name);
+                                return Ok(self.memo_path_metadata(meta_key, out));
                             }
-                            return Ok(resolved);
+                            return Ok(self.memo_path_metadata(meta_key, resolved));
                         }
                     }
                     return Ok(CfmlValue::strukt(ValueMap::default()));
@@ -20870,11 +21110,8 @@ impl CfmlVirtualMachine {
     /// shims that delegate to native BIFs (the crypto/yaml crates live in
     /// cfml-stdlib, reachable only through the builtin table).
     fn call_named_builtin(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
-        if let Some(b) = self.builtins.get(name) {
-            return b(args);
-        }
         let nl = name.to_lowercase();
-        if let Some((_, b)) = self.builtins.iter().find(|(k, _)| k.eq_ignore_ascii_case(&nl)) {
+        if let Some((_, b)) = self.builtin_lookup_ci(name, &nl) {
             return b(args);
         }
         Err(CfmlError::runtime(format!(
@@ -23817,6 +24054,11 @@ impl CfmlVirtualMachine {
                 "findvalue" => Some("structFindValue"),
                 "clear" => Some("structClear"),
                 "copy" => Some("structCopy"),
+                // `struct.duplicate([deepCopy])` — Lucee exposes duplicate() as a
+                // struct member function (it already existed for arrays). Without
+                // this arm it fell through to the plain-struct throw
+                // ("Variable 'duplicate' is undefined").
+                "duplicate" => Some("duplicate"),
                 "append" => Some("structAppend"),
                 // java.util.Map.putAll — merge another struct/map in place
                 // (overwrite). Lucee exposes it on structs; Preside's cfflow
@@ -24351,18 +24593,9 @@ impl CfmlVirtualMachine {
                 }
             }
 
-            // Look up the builtin (case-insensitive)
+            // Look up the builtin (exact spelling first, then case-insensitive)
             let name_lower = name.to_lowercase();
-            if let Some(builtin) = self.builtins.get(name) {
-                return builtin(args);
-            }
-            // Case-insensitive fallback
-            let builtin_match = self
-                .builtins
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                .map(|(_, v)| *v);
-            if let Some(builtin) = builtin_match {
+            if let Some((_, builtin)) = self.builtin_lookup_ci(name, &name_lower) {
                 return builtin(args);
             }
         }
@@ -28889,9 +29122,60 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
         visited: &mut std::collections::HashSet<String>,
     ) -> Option<ValueMap> {
+        let mut cycle_hit = false;
+        self.build_inheritance_metadata_memo(name, source_context, locals, visited, &mut cycle_hit)
+    }
+
+    /// Memoizing implementation of [`Self::build_inheritance_metadata`].
+    ///
+    /// `cycle_hit` is set by the `visited` guard anywhere in the recursion and is
+    /// SHARED by the whole walk: a result computed while an `extends` cycle was
+    /// being broken depends on where the walk started, so no frame of such a walk
+    /// may be memoized. Cycle-free walks (every real chain) are memoized per
+    /// level, which is what collapses the D² storm — each level is then built
+    /// once per request instead of once per visit.
+    fn build_inheritance_metadata_memo(
+        &mut self,
+        name: &str,
+        source_context: Option<String>,
+        locals: &ValueMap,
+        visited: &mut std::collections::HashSet<String>,
+        cycle_hit: &mut bool,
+    ) -> Option<ValueMap> {
         let lc = name.to_lowercase();
         if visited.contains(&lc) {
+            *cycle_hit = true;
             return None;
+        }
+
+        // Memo key: the class name + the source context the raw template will
+        // actually be resolved against + the mappings fingerprint (mappings can be
+        // installed mid-request by Application.cfc, and they change which file a
+        // name resolves to). Skipped entirely when a caller LOCAL shadows the name,
+        // because `resolve_component_template` consults locals first and two frames
+        // can hold different components under the same name.
+        //
+        // The name is keyed CASE-SENSITIVELY even though resolution is
+        // case-insensitive. `component_leaf_metadata` falls back to the name AS
+        // WRITTEN for `name`/`fullname` when a template carries no `__name`, so a
+        // CI key would let `getComponentMetaData("A.B")` be answered with the
+        // casing of an earlier `getComponentMetaData("a.b")`. Distinct casings are
+        // rare (a call site passes one stable string), so this costs no real hits.
+        let memo_key: Option<MetaMemoKey> = if locals.get(name).is_some() {
+            None
+        } else {
+            let ctx = source_context
+                .clone()
+                .or_else(|| self.source_file.clone())
+                .unwrap_or_default();
+            Some(self.meta_memo_key(name, ctx))
+        };
+        if let Some(ref key) = memo_key {
+            if let Some(hit) = self.component_inherit_meta_cache.get(key) {
+                if let CfmlValue::Struct(s) = hit.deep_copy() {
+                    return Some(s.snapshot());
+                }
+            }
         }
         visited.insert(lc);
 
@@ -28934,7 +29218,13 @@ impl CfmlVirtualMachine {
                         Some(CfmlValue::String(s)) => Some((**s).clone()),
                         _ => None,
                     };
-                    match self.build_inheritance_metadata(&parent, parent_src, locals, visited) {
+                    match self.build_inheritance_metadata_memo(
+                        &parent,
+                        parent_src,
+                        locals,
+                        visited,
+                        cycle_hit,
+                    ) {
                         Some(pm) => {
                             meta.insert("extends".to_string(), CfmlValue::strukt(pm));
                         }
@@ -28950,7 +29240,58 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        // Store a DEEP COPY so a caller mutating the map we hand back (ColdBox's
+        // `getInheritedMetaData` edits the struct it is given) cannot corrupt the
+        // memo. Never cached when the walk had to break an `extends` cycle.
+        if let (Some(key), false) = (memo_key, *cycle_hit) {
+            self.component_inherit_meta_cache
+                .insert(key, CfmlValue::strukt(meta.clone()).deep_copy());
+        }
         Some(meta)
+    }
+
+    /// Build a [`MetaMemoKey`] for `name` resolved against source context `ctx`.
+    ///
+    /// Every part is something `resolve_component_template` actually consults, so
+    /// two calls sharing a key must resolve to the same file: the name as written,
+    /// the calling template, the base template (both feed that resolver's own cache
+    /// key), and the mappings fingerprint (mappings can be installed mid-request by
+    /// `Application.cfc` and change what a name resolves to — GH #301).
+    fn meta_memo_key(&self, name: &str, ctx: String) -> MetaMemoKey {
+        (
+            name.to_string(),
+            ctx,
+            self.base_template_path.clone().unwrap_or_default(),
+            self.mappings_fingerprint,
+        )
+    }
+
+    /// Memo key for the path-string form of `getComponentMetaData()`, or `None`
+    /// when the call must not be memoized. Only a DOTTED/SLASHED name qualifies:
+    /// codegen registers a component in `globals` under its declared SHORT name,
+    /// so a dotted name can never be answered from `globals` (steps 2-3 of
+    /// `resolve_component_template` always miss for it) and memoizing one cannot
+    /// shadow a component defined later in the same request. A name shadowed by a
+    /// caller local is likewise excluded (step 1 of the resolver).
+    fn component_path_meta_key(&self, comp_name: &str, locals: &ValueMap) -> Option<MetaMemoKey> {
+        if !comp_name.contains('.') && !comp_name.contains('/') && !comp_name.contains('\\') {
+            return None;
+        }
+        if locals.get(comp_name).is_some() {
+            return None;
+        }
+        Some(self.meta_memo_key(comp_name, self.source_file.clone().unwrap_or_default()))
+    }
+
+    /// Record a path-string `getComponentMetaData()` result under `key` (a deep
+    /// copy, so a caller mutating the returned struct cannot poison the memo) and
+    /// hand the original back.
+    fn memo_path_metadata(&mut self, key: Option<MetaMemoKey>, out: CfmlValue) -> CfmlValue {
+        if let Some(key) = key {
+            let copy = out.deep_copy();
+            self.component_path_meta_cache.insert(key, copy);
+        }
+        out
     }
 
     /// Build `getComponentMetadata()`-shape metadata for an INTERFACE struct
@@ -31651,6 +31992,8 @@ impl CfmlVirtualMachine {
             if func.name != "__main__" {
                 self.user_functions
                     .insert(func.name.clone(), Arc::clone(&func));
+                // Keep the lowercased resolution index in step.
+                self.index_user_function(&func.name);
             }
         }
 

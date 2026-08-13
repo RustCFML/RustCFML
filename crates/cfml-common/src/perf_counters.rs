@@ -19,6 +19,19 @@ pub static RESOLVE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 /// Resolutions that fell through to the candidate-path probe walk.
 pub static RESOLVE_PROBE_WALKS: AtomicU64 = AtomicU64::new(0);
 
+/// Case-insensitive builtin resolutions served by the lowercased index.
+pub static BUILTIN_LOOKUP_CI: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones whose call-site spelling differed from the registry key
+/// (`Len()` vs the registry's `len`) — i.e. how often the case-insensitive
+/// fallback is taken. Before v0.596 each of these was an unmemoized linear
+/// scan over all ~730 builtins plus a fresh `Arc<CfmlFunction>`; sizing that on
+/// a real app is what this pair exists to answer.
+pub static BUILTIN_LOOKUP_CI_MISCASED: AtomicU64 = AtomicU64::new(0);
+/// Resolutions that could NOT use the index because an embedder inserted into
+/// the public `builtins` field without calling `refresh_builtin_index()` —
+/// these still pay the O(n) scan and should be zero in a healthy process.
+pub static BUILTIN_LOOKUP_CI_SCAN: AtomicU64 = AtomicU64::new(0);
+
 /// Existence memo answers served without touching the filesystem.
 pub static EXISTS_MEMO_HITS: AtomicU64 = AtomicU64::new(0);
 /// Actual VFS existence probes (each is ≥1 `stat` syscall).
@@ -111,6 +124,9 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
            .. candidate probe walks:  {:>12}\n\
          exists memo hits:            {:>12}\n\
          exists FS probes (stats):    {:>12}\n\
+         builtin CI lookups:          {:>12}\n\
+           .. miscased (CI fallback): {:>12}\n\
+           .. index-stale O(n) scans: {:>12}\n\
          --- slot-locals coverage (functions / static ops) ---\n\
          slotted:                     {:>12} {:>12}\n\
          disq. closure-defining:      {:>12} {:>12}\n\
@@ -135,6 +151,9 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         g(&RESOLVE_PROBE_WALKS),
         g(&EXISTS_MEMO_HITS),
         g(&EXISTS_FS_PROBES),
+        g(&BUILTIN_LOOKUP_CI),
+        g(&BUILTIN_LOOKUP_CI_MISCASED),
+        g(&BUILTIN_LOOKUP_CI_SCAN),
         g(&SLOT_FN_SLOTTED),
         g(&SLOT_OPS_SLOTTED),
         g(&SLOT_FN_DISQ_CLOSURE),

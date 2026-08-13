@@ -1018,6 +1018,79 @@ Covered by `tests/database/test_query_error_sqlstate_members.cfm` (SQLite
 control gated on driver availability so it skips on Lucee; PostgreSQL, MySQL and
 SQL Server legs gated on `RUSTCFML_TEST_PG_DS` / `_MYSQL_DS` / `_MSSQL_DS`).
 
+## 39. The request existence memo caches positives only 🏗
+
+`Vm::request_exists_cache` (`crates/cfml-vm/src/lib.rs:2459`) is a
+`HashMap<String, u8>` of bit flags — is-file, is-dir, exists
+(`lib.rs:1157-1161`). A probe that **finds** a path sets its bit; a probe that
+finds **nothing** records nothing at all. So a path that does not exist is
+re-`stat`ed on every single probe, for the life of the request, and again on
+every subsequent request.
+
+Measured on a live Preside admin site (`RUSTCFML_COUNTERS=1`, v0.595.1):
+
+| | `exists FS probes (stats)` | `exists memo hits` |
+|---|---|---|
+| cold boot | 11,938 | 7,387 |
+| longer cumulative run | 18,908 | 9,862 |
+
+More real syscalls than cache hits is the wrong way round for a cache.
+
+It is compounded by the memo being cleared **wholesale** whenever a path-mutating
+operation runs — `lib.rs:13266`, `:13276`, `:18599`, plus a java-shim file
+mutation site — so a single file write also discards every positive entry
+accumulated so far.
+
+The pattern this hurts most is an existence check on a path that is *expected* to
+be absent. ColdBox/Preside's `HandlerService.isViewDispatch()` is the canonical
+example: it runs `fileExists( expandPath( ... ) )` only after the handler scan has
+already failed, so the path is absent **by construction** and the stat is
+guaranteed to be wasted, on every unresolved event.
+
+**Before fixing, check this against the v0.516.0 work** that added negative
+caching at the *canonicalize* layer
+(`request_canon_cache` / `canonicalize_cache`). That is a different layer to this
+one, but whoever picks this up should confirm they are not re-solving a solved
+problem, or undoing a deliberate decision about staleness — a negative memo is
+exactly where a "file appeared after we said it didn't" bug would live, and the
+dev-mode freshness rules matter here.
+
+## 40. Member-function dispatch lowercases the method name per call 🏗
+
+`obj.method()` dispatch normalises the method name with `to_lowercase()` on the
+call path (`crates/cfml-vm/src/lib.rs:24597`, and previously 2–3 such allocations
+per dispatch before v0.596.0 converted the member→BIF delegation lookup to the
+O(1) case-insensitive index).
+
+The remaining allocation is small individually but the call counts are not. One
+profiled Preside admin request showed `RequestService.getContext()` invoked 2,920
+times and `RequestContextDecorator` methods 4,278 times — thousands of
+`String` allocations per request purely to normalise a name for comparison.
+
+⚠️ **Measure before changing this.** The obvious fix — borrow with `Cow` when the
+name is already lowercase — was implemented and measured on the *bare-name*
+resolution path during the v0.596.0 work and was **slower**: the callee compares
+the normalised name against ~30 string literals, and routing each comparison
+through the `Cow` discriminant cost more than the allocation it saved
+(registry-cased `len` 186→210 ms/1M, `structKeyExists` 262→290 ms/1M). It was
+reverted, and a comment left at the site. The same trap may well apply here.
+
+## 41. Surplus built-in function arguments are accepted, not rejected 🏗
+
+RustCFML tolerates extra positional arguments to a built-in where Lucee raises a
+**compile-time** error:
+
+| call | Lucee 7.0.4 | RustCFML |
+|---|---|---|
+| `duplicate( x, false, "extra" )` | compile error, "Too many arguments (2:3)" | accepted, extra ignored |
+| `struct.copy( false )` | error, "too many arguments for function [structcopy] call" | accepted, arg ignored |
+
+This is general BIF arity tolerance rather than anything specific to those two
+functions, which is why it was left alone when the `duplicate()` deep-copy flag
+was fixed in v0.596.0 (§42) — making arity strict across ~730 built-ins is a
+separate semantics project with a much wider blast radius, and a real risk of
+breaking working user code that happens to pass a stray argument.
+
 ---
 
 # Part E — Environment-specific 🌍
@@ -1684,3 +1757,119 @@ timeout by any route.
 > `Optional.orElseGet` and `Files.write` — Lucee cannot express either call with CFML
 > types), and its largest section described work that had already shipped. Probe the
 > reference engine before acting on a compatibility claim.
+---
+
+## 42. `duplicate( x, false )` deep-copied instead of shallow-copying ✅ *(fixed in v0.596.0)*
+
+`duplicate()` read only its first argument and always deep-copied, silently
+discarding the `deepCopy` flag. Code that deliberately asked for a cheap
+one-level copy got a full recursive clone of the whole object graph.
+
+Reference behaviour captured from **Lucee 7.0.4.34** over HTTP. The signature is
+`duplicate( object, deepCopy )`; the default is `true`; 0 or 3 arguments are
+**compile-time** errors, so the second parameter is genuinely declared with a max
+arity of 2. The `false` rule is uniform: **only the top-level container is
+copied, and everything inside it is shared by reference.** Every nested case was
+wrong here — struct, array, query, component, three levels down, and the
+string-truthy form `duplicate( s, "no" )`.
+
+Two things worth recording because they contradict the intuitive reading:
+
+- Lucee's **deep** `duplicate()` really does clone a nested *component* — so a
+  nested component is not a reference boundary on the deep path either. Our
+  existing deep behaviour was already correct and was left untouched.
+- `struct.duplicate()` as a member function did not exist at all here, raising
+  "Variable 'duplicate' is undefined" where Lucee returns a copy. Registered
+  alongside the existing `copy` → `structCopy` mapping.
+
+Covered by `tests/stdlib/test_duplicate_deepcopy_flag.cfm` (26 assertions, green
+on both engines) with fixture `tests/core/DuplicateFlagFixture.cfc`. Surplus-argument
+tolerance is **not** fixed — see §41.
+
+## 43. `getComponentMetaData( "dotted.path" )` was recomputed on every call ✅ *(fixed in v0.596.0)*
+
+The instance form `getMetaData( obj )` was blueprint-cached, but the path-string
+form was rebuilt from scratch every time: `resolve_component_template`
+re-executed the component's pseudo-constructor and deep-copied the resulting
+template, and `build_inheritance_metadata` re-resolved **once per inheritance
+level** while each level separately re-resolved its own parent — roughly D²
+pseudo-constructor executions for depth D.
+
+It surfaced through WireBox, whose `Mapping.cfc` uses the path-string form while
+ColdBox's own metadata cache defaults to off (`ioc/config/Binder.cfc` sets
+`metadataCache = ''`). One Preside admin request spent 21.1 ms across just 14
+calls to `Util.getInheritedMetaData()` — 1.5 ms each.
+
+Fixed with two request-scoped memos keyed on
+`(name, source context, base template path, mappings fingerprint)`, mirroring the
+existing `component_blueprints` scoping so an edited CFC is still picked up on the
+next request. Measured on a depth-3 chain, 200 calls: **0.185 ms → 0.0075 ms per
+call**, and `resolve_component calls` per request **2,803 → 17**. Genuine
+first-time filesystem work is untouched — `candidate probe walks` stayed at 5.
+
+Two notes for anyone extending this:
+
+- The memo key is **case-sensitive on purpose.** `component_leaf_metadata` falls
+  back to the name *as written* for `name`/`fullname`, so a lowercased key made
+  `getComponentMetaData( "OOP.X" )` and `getComponentMetaData( "oop.X" )` return
+  the same casing — a real regression, caught by diffing against a baseline build.
+- The shadow check that disables the memo when a local shadows the name is an
+  **exact** lookup, matching `resolve_component_template`'s own locals probe. If
+  that probe is ever made case-insensitive, this check must change in lockstep.
+
+Covered by `tests/oop/test_gcm_path_metadata_cache.cfm` and
+`crates/cfml-vm/tests/component_metadata_freshness.rs` (cross-request freshness
+and per-call independence), plus a live check that editing a CFC on disk is
+reflected on the next request in a running server.
+
+## 44. A miscased built-in name cost an O(n) scan of every built-in ✅ *(fixed in v0.596.0)*
+
+CFML is case-insensitive, but calling a built-in with a casing other than its
+registry spelling fell into a linear scan and cost **236–692 ns per call** — more
+than the entire cost of the call.
+
+The registry is keyed lowerCamel (only 2 of ~730 keys start uppercase), while
+large real codebases write UpperCamel: `Len`, `StructKeyExists`, `ReReplace`,
+`Duplicate`, `ListLast`. On a live Preside site **32% of all built-in lookups
+were miscased** — 533,183 of 1,684,616 during boot, and 1,410 of 4,427 on a warm
+homepage request.
+
+The actual cost site is worth recording, because the obvious suspect was wrong.
+A bare call compiles to `LoadGlobal(name)` + `Call`, and page scope is seeded with
+a first-class value for **every** built-in under its registry spelling. A miscased
+call therefore missed the exact `globals` probe and was answered by the
+case-insensitive linear scan of `globals` — over ~730 built-ins plus every page
+variable — never reaching the later builtin-resolution fallback at all. Telltale
+symptom: the penalty varied wildly between processes for the same function
+(`trim` +236 ns in one run, +636 ns in another), because the registry is a std
+`HashMap` whose iteration order — and hence each name's scan position — is
+randomised per process.
+
+Fixed by promoting the existing `builtin_names_lc` set to a
+`HashMap<lowercased, (canonical, fn ptr, ambiguous)>` maintained by
+`refresh_builtin_index`, plus a parallel `user_fn_lc` index, and resolving the
+canonical spelling in O(1) before probing. Measured penalty per call, PGO build
+vs PGO baseline: `len` 607→14 ns, `trim` 158→11 ns, `listLast` 584→9 ns,
+`structKeyExists` 443→16 ns, `reReplace` 437→10 ns. Registry-cased calls are
+unchanged.
+
+Notes:
+
+- The registry contains one genuine case-duplicate pair, `getContextRoot` /
+  `GetContextRoot`. Both map to the same implementation, so the duplication is
+  harmless, but only that lowercased slot keeps an exact-match-first probe.
+- The `globals` shortcut assumes built-ins are seeded into `globals` before any
+  page variable exists, so the canonical key is the earliest case-insensitively
+  matching entry. True for every in-tree embedder; it is an ordering assumption
+  rather than a mechanical guarantee.
+- Eliminating the per-call `to_lowercase()` was tried, measured **slower**, and
+  reverted — see §40.
+
+Covered by `tests/functions/test_builtin_name_ci_index.cfm` (+31 assertions:
+lowerCamel/UpperCamel/ALLCAPS/mixed for the measured functions, the VM-intercepted
+`duplicate` path, nested miscased calls, and UDF-vs-builtin precedence) and
+`crates/cfml-vm/tests/builtin_name_casing.rs` (5 tests, including native
+`register_native_fn` resolution in any casing and the unarmed-index fallback
+agreeing with the armed index). New counters `builtin CI lookups` /
+`miscased (CI fallback)` / `index-stale O(n) scans` are reported under
+`RUSTCFML_COUNTERS=1`.

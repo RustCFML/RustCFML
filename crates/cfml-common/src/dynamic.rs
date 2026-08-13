@@ -2149,6 +2149,92 @@ impl CfmlValue {
         self.deep_copy_guarded(&mut seen, false, true)
     }
 
+    /// One-level copy — what `duplicate(value, false)` does on Lucee.
+    ///
+    /// Only the TOP-LEVEL container is copied; every value inside it is shared
+    /// by reference. Verified against Lucee 7.0.4.34: `duplicate(s, false)` on
+    /// `s = { n: { v: 1 } }` yields a struct whose own keys are independent
+    /// (adding/overwriting a key on the copy does not touch `s`) but whose `n`
+    /// is the SAME struct, so `d.n.v = 99` is visible through `s.n.v`. The same
+    /// rule holds for an array root (`d[1] = x` independent, `d[1][1] = x`
+    /// shared), a query root (copied), and a component root (copied) — while a
+    /// query or component nested INSIDE the root is shared.
+    ///
+    /// Unlike `deep_copy` this needs no `seen` map: it never recurses, so a
+    /// cyclic graph terminates trivially.
+    pub fn shallow_copy(&self) -> CfmlValue {
+        match self {
+            CfmlValue::Array(a) => {
+                let dest = CfmlArray::empty();
+                let items = a.snapshot();
+                dest.with_write(|w| *w = items);
+                CfmlValue::Array(dest)
+            }
+            CfmlValue::Struct(s) => {
+                let dest = CfmlStruct::empty();
+                let entries: ValueMap = s.iter().collect();
+                dest.with_write(|w| *w = entries);
+                // Same flyweight caveat as `deep_copy`: `iter()` yields only the
+                // per-instance data, so re-attach the Arc-shared method table or
+                // a duplicated component loses its methods.
+                if let Some(t) = s.method_table() {
+                    dest.set_method_table(t);
+                }
+                CfmlValue::Struct(dest)
+            }
+            // Fresh backing store, but the per-column `Arc<Vec<_>>`s are shared:
+            // they are copy-on-write, so a `querySetCell` through either handle
+            // forks just that column and leaves the other untouched. That is
+            // exactly Lucee's observable behaviour for a query root.
+            CfmlValue::Query(q) => {
+                let (columns, data, sql) =
+                    q.with_read(|d| (d.columns.clone(), d.data.clone(), d.sql.clone()));
+                CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData {
+                    columns,
+                    data,
+                    sql,
+                    execution_time: None,
+                    current_row: 1,
+                }))
+            }
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let g = inst.read();
+                let this_members = CfmlStruct::empty_untracked();
+                let variables_members = CfmlStruct::empty_untracked();
+                this_members.set_method_table(g.class.method_values.clone());
+                variables_members.set_method_table(g.class.method_values.clone());
+                if let Some(ref stat) = g.class.static_scope {
+                    variables_members.insert("__static".to_string(), stat.clone());
+                }
+                for (k, v) in g.this_members.snapshot() {
+                    this_members.insert(k, v);
+                }
+                for (k, v) in g.variables_members.snapshot() {
+                    if k.eq_ignore_ascii_case("__static") {
+                        continue; // shared, already attached
+                    }
+                    variables_members.insert(k, v);
+                }
+                let new_inst = std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::component::Instance {
+                        class: g.class.clone(),
+                        this_members,
+                        variables_members,
+                        instance_id: g.instance_id,
+                        accessor_private: parking_lot::RwLock::new(
+                            g.accessor_private.read().clone(),
+                        ),
+                        native_parent: g.native_parent.clone(),
+                    },
+                ));
+                crate::cycle_gc::log_instance(&new_inst);
+                CfmlValue::Instance(new_inst)
+            }
+            other => other.clone(),
+        }
+    }
+
     /// Deep-copy sharing a caller-supplied `seen` map, so that a series of
     /// deep-copies preserves aliasing ACROSS calls: an object already copied in
     /// an earlier `deep_copy_with` (recorded in `seen`) resolves to that same

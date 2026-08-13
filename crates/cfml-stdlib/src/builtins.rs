@@ -7025,12 +7025,19 @@ fn fn_iif(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_duplicate(args: Vec<CfmlValue>) -> CfmlResult {
-    // Deep copy: arrays/structs are reference-typed, so duplicate() must break
-    // all sharing and return a fully independent value.
-    Ok(args
-        .first()
-        .map(|v| v.deep_copy())
-        .unwrap_or(CfmlValue::Null))
+    // Lucee signature: `duplicate( object, deepCopy=true )`.
+    //
+    // Default / `true`  — deep copy: arrays/structs are reference-typed, so
+    //                     duplicate() must break ALL sharing and return a fully
+    //                     independent value (nested queries and components
+    //                     included; verified on Lucee 7.0.4.34).
+    // `false`           — one-level copy: the top-level container is new, but
+    //                     everything inside it stays shared by reference.
+    let Some(v) = args.first() else {
+        return Ok(CfmlValue::Null);
+    };
+    let deep = args.get(1).map(|f| f.is_true()).unwrap_or(true);
+    Ok(if deep { v.deep_copy() } else { v.shallow_copy() })
 }
 
 fn fn_sleep(args: Vec<CfmlValue>) -> CfmlResult {

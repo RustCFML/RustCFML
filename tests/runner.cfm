@@ -226,6 +226,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_array_higher_order.cfm">
 <cf_runtest file="stdlib/test_struct_functions.cfm">
 <cf_runtest file="stdlib/test_struct_higher_order.cfm">
+<cf_runtest file="stdlib/test_duplicate_deepcopy_flag.cfm">
 <cf_runtest file="stdlib/test_math_functions.cfm">
 <cf_runtest file="stdlib/test_date_functions.cfm">
 <cf_runtest file="stdlib/test_timezone.cfm">
@@ -405,6 +406,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_getmetadata_extends_functions.cfm">
 <cf_runtest file="oop/test_getmetadata_fidelity.cfm">
 <cf_runtest file="oop/test_metadata_implements_extends.cfm">
+<cf_runtest file="oop/test_gcm_path_metadata_cache.cfm">
 <cf_runtest file="oop/test_component_bool_attr.cfm">
 <cf_runtest file="oop/test_chained_writeback_clobber.cfm">
 <cf_runtest file="oop/test_instance_shares_injected_component.cfm">
