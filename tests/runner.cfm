@@ -204,6 +204,8 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_structdelete_return_and_gettime.cfm">
 <cf_runtest file="stdlib/test_numberformat_mask_padding.cfm">
 <cf_runtest file="stdlib/test_jwt.cfm">
+<!--- java.security.Signature/KeyFactory shim surface (RS256 verify+sign) — the vendored jwt-cfml path; RustCFML's java.security stops at MessageDigest. --->
+<cf_runtest file="stdlib/test_java_security_signature.cfm">
 <cf_runtest file="stdlib/test_image.cfm">
 <cf_runtest file="stdlib/test_xmp.cfm">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
