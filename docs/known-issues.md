@@ -1091,6 +1091,40 @@ was fixed in v0.596.0 (§42) — making arity strict across ~730 built-ins is a
 separate semantics project with a much wider blast radius, and a real risk of
 breaking working user code that happens to pass a stray argument.
 
+<a id="49"></a>
+
+## 48. The Elvis operator accepts any left operand, where Lucee restricts it 🏗
+
+Lucee constrains the left operand of `?:` **grammatically, at compile time**:
+
+```
+lucee.runtime.exp.TemplateException: left operand of the Elvis operator
+has to be a variable or a function call
+```
+
+| expression | Lucee 7.0.4 | RustCFML |
+|---|---|---|
+| `noSuchVar ?: "d"` | ok | ok |
+| `someFn() ?: "d"` | ok | ok |
+| `( 1 / 0 ) ?: "d"` | **compile error** | accepted, evaluates the operand |
+
+Measured while fixing the elvis *error scope* divergence (GH
+[#329](https://github.com/RustCFML/RustCFML/issues/329), v0.597.0), where Lucee's
+`?:` was found to absorb any exception raised by its left operand rather than
+only an undefined read. The runtime behaviour was brought to parity; this
+compile-time grammar restriction was deliberately **not** adopted, because
+adopting it would reject source we currently compile and run, with no
+correctness benefit to code that already works.
+
+The practical consequence is one-directional and benign: source written for
+Lucee always compiles here, but source written here may not compile on Lucee.
+Anything relying on an arithmetic or comparison expression to the left of `?:`
+is RustCFML-only.
+
+Covered from the runtime side by `tests/functions/test_elvis_error_scope.cfm`,
+which deliberately avoids the restricted shape so the suite compiles on both
+engines.
+
 ---
 
 # Part E — Environment-specific 🌍
