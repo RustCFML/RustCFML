@@ -2036,6 +2036,25 @@ impl CfmlCompiler {
         }
     }
 
+    /// True when an Elvis left operand cannot raise an exception once compiled
+    /// through `compile_member_read_tolerant` — i.e. a pure variable/member/index
+    /// chain over identifiers and literals, where every genuine miss already reads
+    /// as Null via the Try* ops. Such operands need no try/catch guard, which keeps
+    /// the overwhelmingly common `s.a.b ?: d` shape at its previous op count
+    /// (Elvis is hot in framework code). Anything else — a function call, an
+    /// arithmetic/comparison expression, a call nested in an index — can throw and
+    /// must be guarded so `?:` absorbs it the way Lucee does (GH #329).
+    fn elvis_left_is_infallible(expr: &Expression) -> bool {
+        match expr {
+            Expression::Identifier(_) | Expression::Literal(_) => true,
+            Expression::MemberAccess(m) => Self::elvis_left_is_infallible(&m.object),
+            Expression::ArrayAccess(a) => {
+                Self::elvis_left_is_infallible(&a.array) && Self::elvis_left_is_infallible(&a.index)
+            }
+            _ => false,
+        }
+    }
+
     /// Compile a member/array-access chain in a NULL-TOLERANT way: a missing
     /// receiver variable, a missing struct member, or a missing key reads as Null
     /// instead of throwing. This mirrors the normal read path (`compile_expression`
@@ -5668,6 +5687,23 @@ impl CfmlCompiler {
                 // Elvis operator: left ?: right
                 // Eval left, if not null use it, otherwise eval right
                 // JumpIfNotNull peeks without popping, so no Dup needed
+                //
+                // Lucee's `?:` absorbs ANY exception raised while evaluating the
+                // left operand — not merely an undefined read — so a defensive
+                // one-liner like `getBaseTagData(n, i).attributes.marker ?: "d"`
+                // yields the default when the CALL throws. Tolerant member reads
+                // alone are not enough: the throw can come from a function call
+                // anywhere inside the operand, including nested in an argument
+                // (`len(boom()) ?: "d"`). Guard the whole operand with the
+                // try/catch pair and route the exception path to the default.
+                // GH #329. (The `?:`-less form still propagates — the guard
+                // covers the left operand only.)
+                let fallible = !Self::elvis_left_is_infallible(&elvis.left);
+                let try_start_idx = instructions.len();
+                if fallible {
+                    instructions.push(BytecodeOp::TryStart(0)); // placeholder -> handler
+                }
+
                 // Use TryLoadLocal for simple identifiers (undefined vars → Null, not error)
                 if let Expression::Identifier(ref ident) = *elvis.left {
                     instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
@@ -5681,10 +5717,30 @@ impl CfmlCompiler {
                 } else {
                     self.compile_expression(&elvis.left, instructions);
                 }
+                if fallible {
+                    instructions.push(BytecodeOp::TryEnd);
+                }
+
                 let jump_idx = instructions.len();
-                instructions.push(BytecodeOp::JumpIfNotNull(0)); // placeholder
-                // Left is null, pop the null and eval right
+                instructions.push(BytecodeOp::JumpIfNotNull(0)); // placeholder -> end
+                // Left is null: pop the null and fall through to the default.
                 instructions.push(BytecodeOp::Pop);
+                let jump_to_default = if fallible {
+                    // Skip the exception handler on the null path.
+                    let idx = instructions.len();
+                    instructions.push(BytecodeOp::Jump(0)); // placeholder -> default
+                    // Exception handler. The unwind truncated the operand stack to
+                    // the TryStart depth and pushed the exception value; drop it and
+                    // evaluate the default in its place.
+                    instructions[try_start_idx] = BytecodeOp::TryStart(instructions.len());
+                    instructions.push(BytecodeOp::Pop);
+                    Some(idx)
+                } else {
+                    None
+                };
+                if let Some(idx) = jump_to_default {
+                    instructions[idx] = BytecodeOp::Jump(instructions.len());
+                }
                 self.compile_expression(&elvis.right, instructions);
                 instructions[jump_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
             }

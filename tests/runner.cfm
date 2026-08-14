@@ -1013,6 +1013,8 @@ include "harness.cfm";
 
 <!--- Writes through the explicit `local.` scope prefix (perf plan T3.1 stage 1.5). --->
 <cf_runtest file="functions/test_local_scope_member_writes.cfm">
+<!--- Elvis ?: absorbs exceptions from its left operand, not just undefined reads (GH #329). --->
+<cf_runtest file="functions/test_elvis_error_scope.cfm">
 
 <!--- Page-scope variables holding a function (docs/known-issues.md §32). --->
 <cf_runtest file="functions/test_page_function_vars.cfm">
