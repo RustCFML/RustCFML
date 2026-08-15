@@ -1317,7 +1317,7 @@ mod tests {
 
         // A tracks → A gets a presence_state, B gets a join diff.
         let mut meta_a = ValueMap::default();
-        meta_a.insert("user".into(), CfmlValue::string("alice"));
+        meta_a.insert("user", CfmlValue::string("alice"));
         reg.track(&id_a, "alice", CfmlValue::strukt(meta_a));
         assert_eq!(a.frames.lock().unwrap().last().unwrap().ev.as_deref(), Some("presence_state"));
         assert_eq!(b.frames.lock().unwrap().last().unwrap().ev.as_deref(), Some("presence_diff"));
@@ -1494,7 +1494,7 @@ mod tests {
         let id_a = reg.register("/chat", a_dyn, None, ValueMap::default());
 
         let mut meta = ValueMap::default();
-        meta.insert("user".into(), CfmlValue::string("alice"));
+        meta.insert("user", CfmlValue::string("alice"));
         reg.track(&id_a, "alice", CfmlValue::strukt(meta));
         assert!(
             b.published.lock().unwrap().iter().any(|m| matches!(m, BrokerMsg::PresenceTrack { .. })),
@@ -1503,7 +1503,7 @@ mod tests {
 
         // A remote node's user shows up in our roster after a PresenceTrack apply.
         let mut bob = ValueMap::default();
-        bob.insert("user".into(), CfmlValue::string("bob"));
+        bob.insert("user", CfmlValue::string("bob"));
         reg.apply_broker_msg(BrokerMsg::PresenceTrack {
             channel: "/chat".into(),
             key: "bob".into(),
@@ -1541,8 +1541,8 @@ mod tests {
         // Deserialize is deserialize_any → needs a self-describing format). Guard
         // that the frame + a struct payload survive the round trip intact.
         let mut payload = ValueMap::default();
-        payload.insert("text".into(), CfmlValue::string("hi"));
-        payload.insert("n".into(), CfmlValue::Int(42));
+        payload.insert("text", CfmlValue::string("hi"));
+        payload.insert("n", CfmlValue::Int(42));
         let msg = BrokerMsg::Broadcast {
             channel: "/chat".into(),
             frame: WireEnvelope {
@@ -1600,7 +1600,7 @@ mod tests {
 
         // Presence roster is cluster-correct: A's tracked user shows on node B.
         let mut meta = ValueMap::default();
-        meta.insert("user".into(), CfmlValue::string("alice"));
+        meta.insert("user", CfmlValue::string("alice"));
         a.track(&id_a, "alice", CfmlValue::strukt(meta));
         let CfmlValue::Struct(roster_b) = b.presence_state("/chat") else { panic!() };
         assert!(roster_b.get_ci("alice").is_some(), "alice present in node B roster");

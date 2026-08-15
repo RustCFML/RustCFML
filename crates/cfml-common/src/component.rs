@@ -224,7 +224,7 @@ impl ClassBlueprint {
                         method_access
                             .entry(k.to_ascii_lowercase())
                             .or_insert_with(|| f.access.clone());
-                        methods.entry(k.clone()).or_insert_with(|| f.clone());
+                        methods.entry(k.as_str().to_string()).or_insert_with(|| f.clone());
                     }
                 }
             });
@@ -234,7 +234,7 @@ impl ClassBlueprint {
                         method_access
                             .entry(k.to_ascii_lowercase())
                             .or_insert_with(|| f.access.clone());
-                        methods.entry(k.clone()).or_insert_with(|| f.clone());
+                        methods.entry(k.as_str().to_string()).or_insert_with(|| f.clone());
                     }
                 }
             }
@@ -728,6 +728,7 @@ impl<'a> CompRef<'a> {
                 .snapshot()
                 .into_keys()
                 .filter(|k| !ap.contains(&k.to_ascii_lowercase()))
+                .map(|k| k.as_str().to_string())
                 .collect();
             // Methods enumerate only while the shared table is still attached —
             // `structClear(instance)` drops it (MockBox `clearMethods`), after which

@@ -108,14 +108,14 @@ pub(crate) fn op_mark_accessor_private(
     // hide it (Lucee keeps accessor values private in `variables`);
     // getX()/serializeJSON still read the top-level value. Persists
     // to the receiver the same way the setter's value write does.
-    if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
+    if let Some(CfmlValue::Struct(this_s)) = locals.get(&*cfml_common::key::well_known::THIS) {
         CfmlVirtualMachine::mark_accessor_private(this_s, name);
     }
     // Flyweight instance: record on the instance's accessor-private set
     // (the marker's `__cfml_accessor_private__` analogue) so a runtime
     // `setX()` after construction hides the property from introspection.
     #[cfg(feature = "component-instance")]
-    if let Some(CfmlValue::Instance(inst)) = locals.get("this") {
+    if let Some(CfmlValue::Instance(inst)) = locals.get(&*cfml_common::key::well_known::THIS) {
         inst.read()
             .accessor_private
             .write()
@@ -154,10 +154,10 @@ pub(crate) fn op_set_index(
             // backing String out rather than copying its contents.
             let key = index.into_string();
             // Propagate to __variables for declared CFC properties
-            if s.contains_key("__variables") && s.contains_key("__properties") {
+            if s.contains_key(&*cfml_common::key::well_known::VARIABLES) && s.contains_key(&*cfml_common::key::well_known::PROPERTIES) {
                 let key_lower = key.to_lowercase();
                 let is_declared =
-                    if let Some(CfmlValue::Array(props)) = s.get("__properties") {
+                    if let Some(CfmlValue::Array(props)) = s.get(&*cfml_common::key::well_known::PROPERTIES) {
                         props.iter().any(|p| {
                             if let CfmlValue::Struct(ps) = p {
                                 ps.iter().any(|(k, v)| {
@@ -172,7 +172,7 @@ pub(crate) fn op_set_index(
                         false
                     };
                 if is_declared {
-                    if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                    if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
                         vars.insert(key.clone(), value.clone());
                     }
                 }

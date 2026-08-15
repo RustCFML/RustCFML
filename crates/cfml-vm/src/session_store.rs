@@ -220,9 +220,9 @@ mod tests {
         let store = MemoryStore::new();
         let now = now_epoch_secs();
         let mut a = session("appA", now, 1800);
-        a.variables.insert("x".into(), CfmlValue::string("alpha"));
+        a.variables.insert("x", CfmlValue::string("alpha"));
         let mut b = session("appB", now, 1800);
-        b.variables.insert("x".into(), CfmlValue::string("beta"));
+        b.variables.insert("x", CfmlValue::string("beta"));
         store.set("appA", "shared-cfid", a);
         store.set("appB", "shared-cfid", b);
 

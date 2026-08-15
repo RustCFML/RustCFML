@@ -106,6 +106,7 @@ obs-pprof = ["dep:pprof"]
 # GH#297 sizing: struct-allocation call-site attribution appended to the
 # RUSTCFML_COUNTERS report. Sizing builds only — see cfml-common/Cargo.toml.
 alloc-sizing = ["cfml-common/alloc-sizing"]
+probe-sites = ["cfml-common/probe-sites"]
 op-census = ["cfml-common/op-census", "cfml-vm/op-census"]
 call-phases = ["cfml-common/call-phases", "cfml-vm/call-phases"]
 # Existence-probe outcome census (known-issues §45 sizing) — see

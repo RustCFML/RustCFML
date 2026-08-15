@@ -2427,7 +2427,7 @@ pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
                     .iter()
                     .filter(|(k, _)| !k.starts_with("__"))
                     .map(|(k, _)| k.clone())
-                    .collect();
+                    .map(|k| k.as_str().to_string()).collect();
                 ks.sort(); // TreeMap = sorted key order
                 Ok(CfmlValue::array(
                     ks.into_iter().map(CfmlValue::string).collect(),

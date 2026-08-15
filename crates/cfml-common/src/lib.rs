@@ -11,6 +11,7 @@ pub mod cycle_gc;
 pub mod dynamic;
 pub mod encodings;
 pub mod introspection;
+pub mod key;
 pub mod locale;
 pub mod logging;
 pub mod name;

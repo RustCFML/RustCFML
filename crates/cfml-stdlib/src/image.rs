@@ -572,7 +572,7 @@ pub fn fn_cfimage(args: Vec<CfmlValue>) -> CfmlResult {
             dispatch(&handle, "setdrawingcolor", vec![CfmlValue::string("black")])?;
             let size = ((height as f32) * 0.6).max(8.0);
             let mut attrs = ValueMap::default();
-            attrs.insert("size".into(), CfmlValue::Double(size as f64));
+            attrs.insert("size", CfmlValue::Double(size as f64));
             let tx = 6i64;
             let ty = ((height as f32 - size) / 2.0).max(0.0) as i64;
             dispatch(
@@ -1500,10 +1500,10 @@ impl CfmlImage {
         let (w, h) = (self.img.width(), self.img.height());
         let color = self.img.color();
         let mut info = ValueMap::default();
-        info.insert("width".into(), CfmlValue::Int(w as i64));
-        info.insert("height".into(), CfmlValue::Int(h as i64));
-        info.insert("source".into(), CfmlValue::string(self.source.clone()));
-        info.insert("colormodel".into(), color_model_struct(color));
+        info.insert("width", CfmlValue::Int(w as i64));
+        info.insert("height", CfmlValue::Int(h as i64));
+        info.insert("source", CfmlValue::string(self.source.clone()));
+        info.insert("colormodel", color_model_struct(color));
         CfmlValue::strukt(info)
     }
 }
@@ -1532,20 +1532,20 @@ fn color_model_struct(color: image::ColorType) -> CfmlValue {
     let pixel_size = num_components * bits_per_channel;
 
     let mut cm = ValueMap::default();
-    cm.insert("alpha_channel_support".into(), CfmlValue::Bool(has_alpha));
-    cm.insert("alpha_premultiplied".into(), CfmlValue::Bool(false));
+    cm.insert("alpha_channel_support", CfmlValue::Bool(has_alpha));
+    cm.insert("alpha_premultiplied", CfmlValue::Bool(false));
     cm.insert(
-        "transparency".into(),
+        "transparency",
         CfmlValue::string(if has_alpha { "TRANSLUCENT" } else { "OPAQUE" }),
     );
-    cm.insert("pixel_size".into(), CfmlValue::Int(pixel_size as i64));
-    cm.insert("num_components".into(), CfmlValue::Int(num_components as i64));
+    cm.insert("pixel_size", CfmlValue::Int(pixel_size as i64));
+    cm.insert("num_components", CfmlValue::Int(num_components as i64));
     cm.insert(
-        "num_color_components".into(),
+        "num_color_components",
         CfmlValue::Int(num_color_components as i64),
     );
     cm.insert(
-        "colorspace".into(),
+        "colorspace",
         CfmlValue::string(if is_gray {
             "Any of the family of GRAY color spaces"
         } else {
@@ -1560,9 +1560,9 @@ fn color_model_struct(color: image::ColorType) -> CfmlValue {
         );
         bits.push(CfmlValue::Int(bits_per_channel as i64));
     }
-    cm.insert("bits_component".into(), CfmlValue::array(bits));
+    cm.insert("bits_component", CfmlValue::array(bits));
     cm.insert(
-        "colormodel_type".into(),
+        "colormodel_type",
         CfmlValue::string("ComponentColorModel"),
     );
     CfmlValue::strukt(cm)

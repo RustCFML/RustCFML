@@ -315,764 +315,764 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     let mut f: HashMap<String, BuiltinFunction> = HashMap::new();
 
     // ---- Output functions ----
-    f.insert("writeOutput".into(), write_output);
+    f.insert("writeOutput".to_string(), write_output);
     // `echo()` — Lucee/ACF alias of writeOutput (writes to the page buffer).
-    f.insert("echo".into(), write_output);
-    f.insert("writeDump".into(), write_dump);
-    f.insert("dump".into(), write_dump);
+    f.insert("echo".to_string(), write_output);
+    f.insert("writeDump".to_string(), write_dump);
+    f.insert("dump".to_string(), write_dump);
     // `cfdump(var=…)` — the cf-prefixed script-call form of <cfdump>/writeDump.
-    f.insert("cfdump".into(), write_dump);
+    f.insert("cfdump".to_string(), write_dump);
 
     // ---- String functions ----
-    f.insert("len".into(), fn_len);
-    f.insert("ucase".into(), fn_ucase);
-    f.insert("lcase".into(), fn_lcase);
-    f.insert("trim".into(), fn_trim);
-    f.insert("ltrim".into(), fn_ltrim);
-    f.insert("rtrim".into(), fn_rtrim);
-    f.insert("replace".into(), fn_replace);
-    f.insert("replaceNoCase".into(), fn_replace_no_case);
-    f.insert("find".into(), fn_find);
-    f.insert("findNoCase".into(), fn_find_no_case);
-    f.insert("findOneOf".into(), fn_find_one_of);
-    f.insert("mid".into(), fn_mid);
-    f.insert("left".into(), fn_left);
-    f.insert("right".into(), fn_right);
-    f.insert("reverse".into(), fn_reverse);
-    f.insert("repeatString".into(), fn_repeat_string);
-    f.insert("insert".into(), fn_insert);
-    f.insert("removeChars".into(), fn_remove_chars);
-    f.insert("spanIncluding".into(), fn_span_including);
-    f.insert("spanExcluding".into(), fn_span_excluding);
-    f.insert("compare".into(), fn_compare);
-    f.insert("compareNoCase".into(), fn_compare_no_case);
-    f.insert("asc".into(), fn_asc);
-    f.insert("chr".into(), fn_chr);
-    f.insert("reFind".into(), fn_re_find);
-    f.insert("reFindNoCase".into(), fn_re_find_no_case);
-    f.insert("reReplace".into(), fn_re_replace);
-    f.insert("reReplaceNoCase".into(), fn_re_replace_no_case);
-    f.insert("reMatch".into(), fn_re_match);
-    f.insert("reMatchNoCase".into(), fn_re_match_no_case);
-    f.insert("wrap".into(), fn_wrap);
-    f.insert("stripCr".into(), fn_strip_cr);
-    f.insert("toBase64".into(), fn_to_base64);
-    f.insert("toBinary".into(), fn_to_binary);
-    f.insert("binaryEncode".into(), fn_binary_encode);
-    f.insert("binaryDecode".into(), fn_binary_decode);
-    f.insert("urlEncodedFormat".into(), fn_url_encode);
-    f.insert("urlDecode".into(), fn_url_decode);
-    f.insert("htmlEditFormat".into(), fn_html_edit_format);
-    f.insert("htmlCodeFormat".into(), fn_html_code_format);
-    f.insert("encodeForHTML".into(), fn_encode_for_html);
-    f.insert("lJustify".into(), fn_ljustify);
-    f.insert("rJustify".into(), fn_rjustify);
-    f.insert("numberFormat".into(), fn_number_format);
-    f.insert("decimalFormat".into(), fn_decimal_format);
-    f.insert("formatBaseN".into(), fn_format_base_n);
-    f.insert("inputBaseN".into(), fn_input_base_n);
-    f.insert("replaceList".into(), fn_replace_list);
-    f.insert("replaceListNoCase".into(), fn_replace_list_no_case);
-    f.insert("xmlFormat".into(), fn_xml_format);
-    f.insert("paragraphFormat".into(), fn_paragraph_format);
-    f.insert("cJustify".into(), fn_cjustify);
-    f.insert("ucFirst".into(), fn_uc_first);
-    f.insert("jsStringFormat".into(), fn_js_string_format);
-    f.insert("reEscape".into(), fn_re_escape);
-    f.insert("getToken".into(), fn_get_token);
-    f.insert("newLine".into(), fn_new_line);
+    f.insert("len".to_string(), fn_len);
+    f.insert("ucase".to_string(), fn_ucase);
+    f.insert("lcase".to_string(), fn_lcase);
+    f.insert("trim".to_string(), fn_trim);
+    f.insert("ltrim".to_string(), fn_ltrim);
+    f.insert("rtrim".to_string(), fn_rtrim);
+    f.insert("replace".to_string(), fn_replace);
+    f.insert("replaceNoCase".to_string(), fn_replace_no_case);
+    f.insert("find".to_string(), fn_find);
+    f.insert("findNoCase".to_string(), fn_find_no_case);
+    f.insert("findOneOf".to_string(), fn_find_one_of);
+    f.insert("mid".to_string(), fn_mid);
+    f.insert("left".to_string(), fn_left);
+    f.insert("right".to_string(), fn_right);
+    f.insert("reverse".to_string(), fn_reverse);
+    f.insert("repeatString".to_string(), fn_repeat_string);
+    f.insert("insert".to_string(), fn_insert);
+    f.insert("removeChars".to_string(), fn_remove_chars);
+    f.insert("spanIncluding".to_string(), fn_span_including);
+    f.insert("spanExcluding".to_string(), fn_span_excluding);
+    f.insert("compare".to_string(), fn_compare);
+    f.insert("compareNoCase".to_string(), fn_compare_no_case);
+    f.insert("asc".to_string(), fn_asc);
+    f.insert("chr".to_string(), fn_chr);
+    f.insert("reFind".to_string(), fn_re_find);
+    f.insert("reFindNoCase".to_string(), fn_re_find_no_case);
+    f.insert("reReplace".to_string(), fn_re_replace);
+    f.insert("reReplaceNoCase".to_string(), fn_re_replace_no_case);
+    f.insert("reMatch".to_string(), fn_re_match);
+    f.insert("reMatchNoCase".to_string(), fn_re_match_no_case);
+    f.insert("wrap".to_string(), fn_wrap);
+    f.insert("stripCr".to_string(), fn_strip_cr);
+    f.insert("toBase64".to_string(), fn_to_base64);
+    f.insert("toBinary".to_string(), fn_to_binary);
+    f.insert("binaryEncode".to_string(), fn_binary_encode);
+    f.insert("binaryDecode".to_string(), fn_binary_decode);
+    f.insert("urlEncodedFormat".to_string(), fn_url_encode);
+    f.insert("urlDecode".to_string(), fn_url_decode);
+    f.insert("htmlEditFormat".to_string(), fn_html_edit_format);
+    f.insert("htmlCodeFormat".to_string(), fn_html_code_format);
+    f.insert("encodeForHTML".to_string(), fn_encode_for_html);
+    f.insert("lJustify".to_string(), fn_ljustify);
+    f.insert("rJustify".to_string(), fn_rjustify);
+    f.insert("numberFormat".to_string(), fn_number_format);
+    f.insert("decimalFormat".to_string(), fn_decimal_format);
+    f.insert("formatBaseN".to_string(), fn_format_base_n);
+    f.insert("inputBaseN".to_string(), fn_input_base_n);
+    f.insert("replaceList".to_string(), fn_replace_list);
+    f.insert("replaceListNoCase".to_string(), fn_replace_list_no_case);
+    f.insert("xmlFormat".to_string(), fn_xml_format);
+    f.insert("paragraphFormat".to_string(), fn_paragraph_format);
+    f.insert("cJustify".to_string(), fn_cjustify);
+    f.insert("ucFirst".to_string(), fn_uc_first);
+    f.insert("jsStringFormat".to_string(), fn_js_string_format);
+    f.insert("reEscape".to_string(), fn_re_escape);
+    f.insert("getToken".to_string(), fn_get_token);
+    f.insert("newLine".to_string(), fn_new_line);
 
     // ---- Array functions ----
-    f.insert("arrayNew".into(), fn_array_new);
-    f.insert("arrayLen".into(), fn_array_len);
-    f.insert("arrayAppend".into(), fn_array_append);
-    f.insert("arrayPrepend".into(), fn_array_prepend);
-    f.insert("arrayDeleteAt".into(), fn_array_delete_at);
-    f.insert("arrayInsertAt".into(), fn_array_insert_at);
-    f.insert("arrayContains".into(), fn_array_contains);
-    f.insert("arrayContainsNoCase".into(), fn_array_contains_no_case);
-    f.insert("arrayFind".into(), fn_array_find);
-    f.insert("arrayFindNoCase".into(), fn_array_find_no_case);
-    f.insert("arraySort".into(), fn_array_sort);
-    f.insert("arrayReverse".into(), fn_array_reverse);
-    f.insert("arraySlice".into(), fn_array_slice);
-    f.insert("arrayToList".into(), fn_array_to_list);
-    f.insert("arrayMerge".into(), fn_array_merge);
-    f.insert("arrayClear".into(), fn_array_clear);
-    f.insert("arrayIsDefined".into(), fn_array_is_defined);
-    f.insert("arraySet".into(), fn_array_set);
-    f.insert("arraySwap".into(), fn_array_swap);
-    f.insert("arrayMin".into(), fn_array_min);
-    f.insert("arrayMax".into(), fn_array_max);
-    f.insert("arrayAvg".into(), fn_array_avg);
-    f.insert("arraySum".into(), fn_array_sum);
-    f.insert("arrayMap".into(), fn_array_map);
-    f.insert("arrayFilter".into(), fn_array_filter);
-    f.insert("arrayReduce".into(), fn_array_reduce);
-    f.insert("arrayEach".into(), fn_array_each);
-    f.insert("arraySome".into(), fn_array_each);  // VM intercepts
-    f.insert("arrayEvery".into(), fn_array_each);  // VM intercepts
-    f.insert("isArray".into(), fn_is_array);
-    f.insert("arrayIsEmpty".into(), fn_array_is_empty);
-    f.insert("arrayDelete".into(), fn_array_delete);
-    f.insert("arrayFindAll".into(), fn_array_find_all);
-    f.insert("arrayFindAllNoCase".into(), fn_array_find_all_no_case);
-    f.insert("arrayFirst".into(), fn_array_first);
-    f.insert("arrayLast".into(), fn_array_last);
-    f.insert("arrayPush".into(), fn_array_append);  // alias
-    f.insert("arrayUnshift".into(), fn_array_prepend);  // alias
-    f.insert("arrayIndexExists".into(), fn_array_index_exists);
-    f.insert("arrayResize".into(), fn_array_resize);
-    f.insert("arrayMedian".into(), fn_array_median);
-    f.insert("arrayMid".into(), fn_array_mid);
-    f.insert("arrayReduceRight".into(), fn_array_each);  // VM intercepts
-    f.insert("arraySplice".into(), fn_array_splice);
-    f.insert("arrayRange".into(), fn_array_range);
-    f.insert("arrayToStruct".into(), fn_array_to_struct);
-    f.insert("arrayDeleteNoCase".into(), fn_array_delete_no_case);
+    f.insert("arrayNew".to_string(), fn_array_new);
+    f.insert("arrayLen".to_string(), fn_array_len);
+    f.insert("arrayAppend".to_string(), fn_array_append);
+    f.insert("arrayPrepend".to_string(), fn_array_prepend);
+    f.insert("arrayDeleteAt".to_string(), fn_array_delete_at);
+    f.insert("arrayInsertAt".to_string(), fn_array_insert_at);
+    f.insert("arrayContains".to_string(), fn_array_contains);
+    f.insert("arrayContainsNoCase".to_string(), fn_array_contains_no_case);
+    f.insert("arrayFind".to_string(), fn_array_find);
+    f.insert("arrayFindNoCase".to_string(), fn_array_find_no_case);
+    f.insert("arraySort".to_string(), fn_array_sort);
+    f.insert("arrayReverse".to_string(), fn_array_reverse);
+    f.insert("arraySlice".to_string(), fn_array_slice);
+    f.insert("arrayToList".to_string(), fn_array_to_list);
+    f.insert("arrayMerge".to_string(), fn_array_merge);
+    f.insert("arrayClear".to_string(), fn_array_clear);
+    f.insert("arrayIsDefined".to_string(), fn_array_is_defined);
+    f.insert("arraySet".to_string(), fn_array_set);
+    f.insert("arraySwap".to_string(), fn_array_swap);
+    f.insert("arrayMin".to_string(), fn_array_min);
+    f.insert("arrayMax".to_string(), fn_array_max);
+    f.insert("arrayAvg".to_string(), fn_array_avg);
+    f.insert("arraySum".to_string(), fn_array_sum);
+    f.insert("arrayMap".to_string(), fn_array_map);
+    f.insert("arrayFilter".to_string(), fn_array_filter);
+    f.insert("arrayReduce".to_string(), fn_array_reduce);
+    f.insert("arrayEach".to_string(), fn_array_each);
+    f.insert("arraySome".to_string(), fn_array_each);  // VM intercepts
+    f.insert("arrayEvery".to_string(), fn_array_each);  // VM intercepts
+    f.insert("isArray".to_string(), fn_is_array);
+    f.insert("arrayIsEmpty".to_string(), fn_array_is_empty);
+    f.insert("arrayDelete".to_string(), fn_array_delete);
+    f.insert("arrayFindAll".to_string(), fn_array_find_all);
+    f.insert("arrayFindAllNoCase".to_string(), fn_array_find_all_no_case);
+    f.insert("arrayFirst".to_string(), fn_array_first);
+    f.insert("arrayLast".to_string(), fn_array_last);
+    f.insert("arrayPush".to_string(), fn_array_append);  // alias
+    f.insert("arrayUnshift".to_string(), fn_array_prepend);  // alias
+    f.insert("arrayIndexExists".to_string(), fn_array_index_exists);
+    f.insert("arrayResize".to_string(), fn_array_resize);
+    f.insert("arrayMedian".to_string(), fn_array_median);
+    f.insert("arrayMid".to_string(), fn_array_mid);
+    f.insert("arrayReduceRight".to_string(), fn_array_each);  // VM intercepts
+    f.insert("arraySplice".to_string(), fn_array_splice);
+    f.insert("arrayRange".to_string(), fn_array_range);
+    f.insert("arrayToStruct".to_string(), fn_array_to_struct);
+    f.insert("arrayDeleteNoCase".to_string(), fn_array_delete_no_case);
 
     // ---- Struct functions ----
-    f.insert("structNew".into(), fn_struct_new);
-    f.insert("structCount".into(), fn_struct_count);
-    f.insert("structKeyExists".into(), fn_struct_key_exists);
-    f.insert("structKeyList".into(), fn_struct_key_list);
-    f.insert("structKeyArray".into(), fn_struct_key_array);
-    f.insert("structDelete".into(), fn_struct_delete);
-    f.insert("structInsert".into(), fn_struct_insert);
-    f.insert("structUpdate".into(), fn_struct_update);
-    f.insert("structFind".into(), fn_struct_find);
-    f.insert("structFindKey".into(), fn_struct_find_key);
-    f.insert("structFindValue".into(), fn_struct_find_value);
-    f.insert("structClear".into(), fn_struct_clear);
-    f.insert("structCopy".into(), fn_struct_copy);
-    f.insert("structAppend".into(), fn_struct_append);
-    f.insert("structIsEmpty".into(), fn_struct_is_empty);
-    f.insert("structSort".into(), fn_struct_sort);
-    f.insert("structEach".into(), fn_struct_each);
-    f.insert("structMap".into(), fn_struct_map);
-    f.insert("structFilter".into(), fn_struct_filter);
-    f.insert("structReduce".into(), fn_struct_each);  // VM intercepts
-    f.insert("structSome".into(), fn_struct_each);  // VM intercepts
-    f.insert("structEvery".into(), fn_struct_each);  // VM intercepts
-    f.insert("isStruct".into(), fn_is_struct);
-    f.insert("structGet".into(), fn_struct_get);
-    f.insert("structValueArray".into(), fn_struct_value_array);
-    f.insert("structEquals".into(), fn_struct_equals);
-    f.insert("structKeyTranslate".into(), fn_struct_key_translate);
-    f.insert("structToSorted".into(), fn_struct_to_sorted);
-    f.insert("structIsOrdered".into(), fn_struct_is_ordered);
-    f.insert("structIsCaseSensitive".into(), fn_struct_is_case_sensitive);
-    f.insert("structToQueryString".into(), fn_struct_to_query_string);
+    f.insert("structNew".to_string(), fn_struct_new);
+    f.insert("structCount".to_string(), fn_struct_count);
+    f.insert("structKeyExists".to_string(), fn_struct_key_exists);
+    f.insert("structKeyList".to_string(), fn_struct_key_list);
+    f.insert("structKeyArray".to_string(), fn_struct_key_array);
+    f.insert("structDelete".to_string(), fn_struct_delete);
+    f.insert("structInsert".to_string(), fn_struct_insert);
+    f.insert("structUpdate".to_string(), fn_struct_update);
+    f.insert("structFind".to_string(), fn_struct_find);
+    f.insert("structFindKey".to_string(), fn_struct_find_key);
+    f.insert("structFindValue".to_string(), fn_struct_find_value);
+    f.insert("structClear".to_string(), fn_struct_clear);
+    f.insert("structCopy".to_string(), fn_struct_copy);
+    f.insert("structAppend".to_string(), fn_struct_append);
+    f.insert("structIsEmpty".to_string(), fn_struct_is_empty);
+    f.insert("structSort".to_string(), fn_struct_sort);
+    f.insert("structEach".to_string(), fn_struct_each);
+    f.insert("structMap".to_string(), fn_struct_map);
+    f.insert("structFilter".to_string(), fn_struct_filter);
+    f.insert("structReduce".to_string(), fn_struct_each);  // VM intercepts
+    f.insert("structSome".to_string(), fn_struct_each);  // VM intercepts
+    f.insert("structEvery".to_string(), fn_struct_each);  // VM intercepts
+    f.insert("isStruct".to_string(), fn_is_struct);
+    f.insert("structGet".to_string(), fn_struct_get);
+    f.insert("structValueArray".to_string(), fn_struct_value_array);
+    f.insert("structEquals".to_string(), fn_struct_equals);
+    f.insert("structKeyTranslate".to_string(), fn_struct_key_translate);
+    f.insert("structToSorted".to_string(), fn_struct_to_sorted);
+    f.insert("structIsOrdered".to_string(), fn_struct_is_ordered);
+    f.insert("structIsCaseSensitive".to_string(), fn_struct_is_case_sensitive);
+    f.insert("structToQueryString".to_string(), fn_struct_to_query_string);
 
     // ---- General utility functions ----
-    f.insert("isEmpty".into(), fn_is_empty);
+    f.insert("isEmpty".to_string(), fn_is_empty);
 
     // ---- Type checking functions ----
-    f.insert("isNull".into(), fn_is_null);
-    f.insert("isDefined".into(), fn_is_defined);
-    f.insert("isSimpleValue".into(), fn_is_simple_value);
-    f.insert("isNumeric".into(), fn_is_numeric);
-    f.insert("isBoolean".into(), fn_is_boolean);
-    f.insert("isDate".into(), fn_is_date);
-    f.insert("isQuery".into(), fn_is_query);
-    f.insert("isObject".into(), fn_is_object);
-    f.insert("isImageFile".into(), fn_is_image_file);
-    f.insert("getReadableImageFormats".into(), fn_get_readable_image_formats);
-    f.insert("getWriteableImageFormats".into(), fn_get_readable_image_formats);
+    f.insert("isNull".to_string(), fn_is_null);
+    f.insert("isDefined".to_string(), fn_is_defined);
+    f.insert("isSimpleValue".to_string(), fn_is_simple_value);
+    f.insert("isNumeric".to_string(), fn_is_numeric);
+    f.insert("isBoolean".to_string(), fn_is_boolean);
+    f.insert("isDate".to_string(), fn_is_date);
+    f.insert("isQuery".to_string(), fn_is_query);
+    f.insert("isObject".to_string(), fn_is_object);
+    f.insert("isImageFile".to_string(), fn_is_image_file);
+    f.insert("getReadableImageFormats".to_string(), fn_get_readable_image_formats);
+    f.insert("getWriteableImageFormats".to_string(), fn_get_readable_image_formats);
     register_image_functions(&mut f);
     register_spreadsheet_functions(&mut f);
-    f.insert("isBinary".into(), fn_is_binary);
-    f.insert("isCustomFunction".into(), fn_is_custom_function);
-    f.insert("isClosure".into(), fn_is_closure);
-    f.insert("isValid".into(), fn_is_valid);
-    f.insert("__cfparam_validate".into(), fn_cfparam_validate);
+    f.insert("isBinary".to_string(), fn_is_binary);
+    f.insert("isCustomFunction".to_string(), fn_is_custom_function);
+    f.insert("isClosure".to_string(), fn_is_closure);
+    f.insert("isValid".to_string(), fn_is_valid);
+    f.insert("__cfparam_validate".to_string(), fn_cfparam_validate);
 
     // ---- Conversion functions ----
-    f.insert("toString".into(), fn_to_string);
-    f.insert("toNumeric".into(), fn_to_numeric);
-    f.insert("toBoolean".into(), fn_to_boolean);
-    f.insert("val".into(), fn_val);
-    f.insert("int".into(), fn_int);
-    f.insert("javacast".into(), fn_java_cast);
-    f.insert("createTimeSpan".into(), fn_create_time_span);
-    f.insert("yesNoFormat".into(), fn_yes_no_format);
-    f.insert("booleanFormat".into(), fn_yes_no_format);  // alias
-    f.insert("trueFalseFormat".into(), fn_true_false_format);
-    f.insert("nullValue".into(), fn_null_value);
-    f.insert("incrementValue".into(), fn_increment_value);
-    f.insert("decrementValue".into(), fn_decrement_value);
-    f.insert("de".into(), fn_de);
-    f.insert("dollarFormat".into(), fn_dollar_format);
+    f.insert("toString".to_string(), fn_to_string);
+    f.insert("toNumeric".to_string(), fn_to_numeric);
+    f.insert("toBoolean".to_string(), fn_to_boolean);
+    f.insert("val".to_string(), fn_val);
+    f.insert("int".to_string(), fn_int);
+    f.insert("javacast".to_string(), fn_java_cast);
+    f.insert("createTimeSpan".to_string(), fn_create_time_span);
+    f.insert("yesNoFormat".to_string(), fn_yes_no_format);
+    f.insert("booleanFormat".to_string(), fn_yes_no_format);  // alias
+    f.insert("trueFalseFormat".to_string(), fn_true_false_format);
+    f.insert("nullValue".to_string(), fn_null_value);
+    f.insert("incrementValue".to_string(), fn_increment_value);
+    f.insert("decrementValue".to_string(), fn_decrement_value);
+    f.insert("de".to_string(), fn_de);
+    f.insert("dollarFormat".to_string(), fn_dollar_format);
 
     // ---- Math functions ----
-    f.insert("abs".into(), fn_abs);
-    f.insert("ceiling".into(), fn_ceiling);
-    f.insert("floor".into(), fn_floor);
-    f.insert("round".into(), fn_round);
-    f.insert("rand".into(), fn_rand);
-    f.insert("randRange".into(), fn_rand_range);
-    f.insert("randomize".into(), fn_randomize);
-    f.insert("max".into(), fn_max);
-    f.insert("min".into(), fn_min);
-    f.insert("sqr".into(), fn_sqr);
-    f.insert("sqrt".into(), fn_sqr);
-    f.insert("exp".into(), fn_exp);
-    f.insert("log".into(), fn_log);
-    f.insert("log10".into(), fn_log10);
-    f.insert("sin".into(), fn_sin);
-    f.insert("cos".into(), fn_cos);
-    f.insert("tan".into(), fn_tan);
-    f.insert("asin".into(), fn_asin);
-    f.insert("acos".into(), fn_acos);
-    f.insert("atan".into(), fn_atan);
-    f.insert("pi".into(), fn_pi);
-    f.insert("sgn".into(), fn_sgn);
-    f.insert("fix".into(), fn_fix);
-    f.insert("pow".into(), fn_pow);
-    f.insert("bitAnd".into(), fn_bit_and);
-    f.insert("bitOr".into(), fn_bit_or);
-    f.insert("bitXor".into(), fn_bit_xor);
-    f.insert("bitNot".into(), fn_bit_not);
-    f.insert("bitSHLN".into(), fn_bit_shln);
-    f.insert("bitSHRN".into(), fn_bit_shrn);
-    f.insert("bitMaskRead".into(), fn_bit_mask_read);
-    f.insert("bitMaskSet".into(), fn_bit_mask_set);
-    f.insert("bitMaskClear".into(), fn_bit_mask_clear);
+    f.insert("abs".to_string(), fn_abs);
+    f.insert("ceiling".to_string(), fn_ceiling);
+    f.insert("floor".to_string(), fn_floor);
+    f.insert("round".to_string(), fn_round);
+    f.insert("rand".to_string(), fn_rand);
+    f.insert("randRange".to_string(), fn_rand_range);
+    f.insert("randomize".to_string(), fn_randomize);
+    f.insert("max".to_string(), fn_max);
+    f.insert("min".to_string(), fn_min);
+    f.insert("sqr".to_string(), fn_sqr);
+    f.insert("sqrt".to_string(), fn_sqr);
+    f.insert("exp".to_string(), fn_exp);
+    f.insert("log".to_string(), fn_log);
+    f.insert("log10".to_string(), fn_log10);
+    f.insert("sin".to_string(), fn_sin);
+    f.insert("cos".to_string(), fn_cos);
+    f.insert("tan".to_string(), fn_tan);
+    f.insert("asin".to_string(), fn_asin);
+    f.insert("acos".to_string(), fn_acos);
+    f.insert("atan".to_string(), fn_atan);
+    f.insert("pi".to_string(), fn_pi);
+    f.insert("sgn".to_string(), fn_sgn);
+    f.insert("fix".to_string(), fn_fix);
+    f.insert("pow".to_string(), fn_pow);
+    f.insert("bitAnd".to_string(), fn_bit_and);
+    f.insert("bitOr".to_string(), fn_bit_or);
+    f.insert("bitXor".to_string(), fn_bit_xor);
+    f.insert("bitNot".to_string(), fn_bit_not);
+    f.insert("bitSHLN".to_string(), fn_bit_shln);
+    f.insert("bitSHRN".to_string(), fn_bit_shrn);
+    f.insert("bitMaskRead".to_string(), fn_bit_mask_read);
+    f.insert("bitMaskSet".to_string(), fn_bit_mask_set);
+    f.insert("bitMaskClear".to_string(), fn_bit_mask_clear);
 
     // ---- Date/Time functions ----
-    f.insert("now".into(), fn_now);
-    f.insert("createDate".into(), fn_create_date);
-    f.insert("createDateTime".into(), fn_create_date_time);
-    f.insert("createTime".into(), fn_create_time);
-    f.insert("createODBCDate".into(), fn_create_odbc_date);
-    f.insert("createODBCDateTime".into(), fn_create_odbc_date_time);
-    f.insert("createODBCTime".into(), fn_create_odbc_time);
-    f.insert("dateAdd".into(), fn_date_add);
-    f.insert("dateDiff".into(), fn_date_diff);
-    f.insert("dateFormat".into(), fn_date_format);
-    f.insert("timeFormat".into(), fn_time_format);
-    f.insert("dateTimeFormat".into(), fn_date_time_format);
-    f.insert("parseDateTime".into(), fn_parse_date_time);
-    f.insert("datePart".into(), fn_date_part);
-    f.insert("dateCompare".into(), fn_date_compare);
-    f.insert("year".into(), fn_year);
-    f.insert("month".into(), fn_month);
-    f.insert("day".into(), fn_day);
-    f.insert("hour".into(), fn_hour);
-    f.insert("minute".into(), fn_minute);
-    f.insert("second".into(), fn_second);
-    f.insert("dayOfWeek".into(), fn_day_of_week);
-    f.insert("dayOfWeekAsString".into(), fn_day_of_week_as_string);
-    f.insert("dayOfWeekShortAsString".into(), fn_day_of_week_short_as_string);
-    f.insert("dayOfYear".into(), fn_day_of_year);
-    f.insert("daysInMonth".into(), fn_days_in_month);
-    f.insert("daysInYear".into(), fn_days_in_year);
-    f.insert("firstDayOfMonth".into(), fn_first_day_of_month);
-    f.insert("isLeapYear".into(), fn_is_leap_year);
-    f.insert("monthAsString".into(), fn_month_as_string);
-    f.insert("monthShortAsString".into(), fn_month_short_as_string);
-    f.insert("quarter".into(), fn_quarter);
-    f.insert("week".into(), fn_week);
-    f.insert("millisecond".into(), fn_millisecond);
-    f.insert("dateConvert".into(), fn_date_convert);
-    f.insert("getNumericDate".into(), fn_get_numeric_date);
-    f.insert("getHTTPTimeString".into(), fn_get_http_time_string);
-    f.insert("nowServer".into(), fn_now_server);
-    f.insert("getTickCount".into(), fn_get_tick_count);
-    f.insert("getFunctionList".into(), fn_get_function_list);
-    f.insert("getTagData".into(), fn_get_tag_data);
-    f.insert("getFunctionCalledName".into(), fn_get_function_called_name);
-    f.insert("getContextRoot".into(), fn_get_context_root);
-    f.insert("GetContextRoot".into(), fn_get_context_root);
-    f.insert("getPageContext".into(), fn_get_page_context);
-    f.insert("isInThread".into(), fn_is_in_thread);
+    f.insert("now".to_string(), fn_now);
+    f.insert("createDate".to_string(), fn_create_date);
+    f.insert("createDateTime".to_string(), fn_create_date_time);
+    f.insert("createTime".to_string(), fn_create_time);
+    f.insert("createODBCDate".to_string(), fn_create_odbc_date);
+    f.insert("createODBCDateTime".to_string(), fn_create_odbc_date_time);
+    f.insert("createODBCTime".to_string(), fn_create_odbc_time);
+    f.insert("dateAdd".to_string(), fn_date_add);
+    f.insert("dateDiff".to_string(), fn_date_diff);
+    f.insert("dateFormat".to_string(), fn_date_format);
+    f.insert("timeFormat".to_string(), fn_time_format);
+    f.insert("dateTimeFormat".to_string(), fn_date_time_format);
+    f.insert("parseDateTime".to_string(), fn_parse_date_time);
+    f.insert("datePart".to_string(), fn_date_part);
+    f.insert("dateCompare".to_string(), fn_date_compare);
+    f.insert("year".to_string(), fn_year);
+    f.insert("month".to_string(), fn_month);
+    f.insert("day".to_string(), fn_day);
+    f.insert("hour".to_string(), fn_hour);
+    f.insert("minute".to_string(), fn_minute);
+    f.insert("second".to_string(), fn_second);
+    f.insert("dayOfWeek".to_string(), fn_day_of_week);
+    f.insert("dayOfWeekAsString".to_string(), fn_day_of_week_as_string);
+    f.insert("dayOfWeekShortAsString".to_string(), fn_day_of_week_short_as_string);
+    f.insert("dayOfYear".to_string(), fn_day_of_year);
+    f.insert("daysInMonth".to_string(), fn_days_in_month);
+    f.insert("daysInYear".to_string(), fn_days_in_year);
+    f.insert("firstDayOfMonth".to_string(), fn_first_day_of_month);
+    f.insert("isLeapYear".to_string(), fn_is_leap_year);
+    f.insert("monthAsString".to_string(), fn_month_as_string);
+    f.insert("monthShortAsString".to_string(), fn_month_short_as_string);
+    f.insert("quarter".to_string(), fn_quarter);
+    f.insert("week".to_string(), fn_week);
+    f.insert("millisecond".to_string(), fn_millisecond);
+    f.insert("dateConvert".to_string(), fn_date_convert);
+    f.insert("getNumericDate".to_string(), fn_get_numeric_date);
+    f.insert("getHTTPTimeString".to_string(), fn_get_http_time_string);
+    f.insert("nowServer".to_string(), fn_now_server);
+    f.insert("getTickCount".to_string(), fn_get_tick_count);
+    f.insert("getFunctionList".to_string(), fn_get_function_list);
+    f.insert("getTagData".to_string(), fn_get_tag_data);
+    f.insert("getFunctionCalledName".to_string(), fn_get_function_called_name);
+    f.insert("getContextRoot".to_string(), fn_get_context_root);
+    f.insert("GetContextRoot".to_string(), fn_get_context_root);
+    f.insert("getPageContext".to_string(), fn_get_page_context);
+    f.insert("isInThread".to_string(), fn_is_in_thread);
 
     // ---- List functions ----
-    f.insert("listNew".into(), fn_list_new);
-    f.insert("listLen".into(), fn_list_len);
-    f.insert("listAppend".into(), fn_list_append);
-    f.insert("listPrepend".into(), fn_list_prepend);
-    f.insert("listGetAt".into(), fn_list_get_at);
-    f.insert("listSetAt".into(), fn_list_set_at);
-    f.insert("listInsertAt".into(), fn_list_insert_at);
-    f.insert("listDeleteAt".into(), fn_list_delete_at);
-    f.insert("listFind".into(), fn_list_find);
-    f.insert("listFindNoCase".into(), fn_list_find_no_case);
-    f.insert("listContains".into(), fn_list_contains);
-    f.insert("listContainsNoCase".into(), fn_list_contains_no_case);
-    f.insert("listSort".into(), fn_list_sort);
-    f.insert("listToArray".into(), fn_list_to_array);
-    f.insert("listFirst".into(), fn_list_first);
-    f.insert("listLast".into(), fn_list_last);
-    f.insert("listRest".into(), fn_list_rest);
-    f.insert("listRemoveDuplicates".into(), fn_list_remove_duplicates);
-    f.insert("listValueCount".into(), fn_list_value_count);
-    f.insert("listValueCountNoCase".into(), fn_list_value_count_no_case);
-    f.insert("listChangeDelims".into(), fn_list_change_delims);
-    f.insert("listQualify".into(), fn_list_qualify);
-    f.insert("listCompact".into(), fn_list_compact);
-    f.insert("listEach".into(), fn_list_each);
-    f.insert("listMap".into(), fn_list_map);
-    f.insert("listFilter".into(), fn_list_filter);
-    f.insert("listSome".into(), fn_list_each);  // VM intercepts
-    f.insert("listEvery".into(), fn_list_each);  // VM intercepts
-    f.insert("listAvg".into(), fn_list_avg);
-    f.insert("listItemTrim".into(), fn_list_item_trim);
-    f.insert("listIndexExists".into(), fn_list_index_exists);
-    f.insert("listReduceRight".into(), fn_list_each);  // VM intercepts
+    f.insert("listNew".to_string(), fn_list_new);
+    f.insert("listLen".to_string(), fn_list_len);
+    f.insert("listAppend".to_string(), fn_list_append);
+    f.insert("listPrepend".to_string(), fn_list_prepend);
+    f.insert("listGetAt".to_string(), fn_list_get_at);
+    f.insert("listSetAt".to_string(), fn_list_set_at);
+    f.insert("listInsertAt".to_string(), fn_list_insert_at);
+    f.insert("listDeleteAt".to_string(), fn_list_delete_at);
+    f.insert("listFind".to_string(), fn_list_find);
+    f.insert("listFindNoCase".to_string(), fn_list_find_no_case);
+    f.insert("listContains".to_string(), fn_list_contains);
+    f.insert("listContainsNoCase".to_string(), fn_list_contains_no_case);
+    f.insert("listSort".to_string(), fn_list_sort);
+    f.insert("listToArray".to_string(), fn_list_to_array);
+    f.insert("listFirst".to_string(), fn_list_first);
+    f.insert("listLast".to_string(), fn_list_last);
+    f.insert("listRest".to_string(), fn_list_rest);
+    f.insert("listRemoveDuplicates".to_string(), fn_list_remove_duplicates);
+    f.insert("listValueCount".to_string(), fn_list_value_count);
+    f.insert("listValueCountNoCase".to_string(), fn_list_value_count_no_case);
+    f.insert("listChangeDelims".to_string(), fn_list_change_delims);
+    f.insert("listQualify".to_string(), fn_list_qualify);
+    f.insert("listCompact".to_string(), fn_list_compact);
+    f.insert("listEach".to_string(), fn_list_each);
+    f.insert("listMap".to_string(), fn_list_map);
+    f.insert("listFilter".to_string(), fn_list_filter);
+    f.insert("listSome".to_string(), fn_list_each);  // VM intercepts
+    f.insert("listEvery".to_string(), fn_list_each);  // VM intercepts
+    f.insert("listAvg".to_string(), fn_list_avg);
+    f.insert("listItemTrim".to_string(), fn_list_item_trim);
+    f.insert("listIndexExists".to_string(), fn_list_index_exists);
+    f.insert("listReduceRight".to_string(), fn_list_each);  // VM intercepts
 
     // ---- String higher-order functions (VM-intercepted stubs) ----
-    f.insert("stringEach".into(), fn_list_each);     // VM intercepts
-    f.insert("stringMap".into(), fn_list_each);      // VM intercepts
-    f.insert("stringFilter".into(), fn_list_each);   // VM intercepts
-    f.insert("stringReduce".into(), fn_list_each);   // VM intercepts
-    f.insert("stringSome".into(), fn_list_each);     // VM intercepts
-    f.insert("stringEvery".into(), fn_list_each);    // VM intercepts
-    f.insert("stringSort".into(), fn_list_each);     // VM intercepts
+    f.insert("stringEach".to_string(), fn_list_each);     // VM intercepts
+    f.insert("stringMap".to_string(), fn_list_each);      // VM intercepts
+    f.insert("stringFilter".to_string(), fn_list_each);   // VM intercepts
+    f.insert("stringReduce".to_string(), fn_list_each);   // VM intercepts
+    f.insert("stringSome".to_string(), fn_list_each);     // VM intercepts
+    f.insert("stringEvery".to_string(), fn_list_each);    // VM intercepts
+    f.insert("stringSort".to_string(), fn_list_each);     // VM intercepts
 
     // ---- Collection higher-order functions (VM-intercepted stubs) ----
-    f.insert("collectionEach".into(), fn_list_each);    // VM intercepts
-    f.insert("collectionMap".into(), fn_list_each);     // VM intercepts
-    f.insert("collectionFilter".into(), fn_list_each);  // VM intercepts
-    f.insert("collectionReduce".into(), fn_list_each);  // VM intercepts
-    f.insert("collectionSome".into(), fn_list_each);    // VM intercepts
-    f.insert("collectionEvery".into(), fn_list_each);   // VM intercepts
-    f.insert("each".into(), fn_list_each);              // VM intercepts (alias for collectionEach)
+    f.insert("collectionEach".to_string(), fn_list_each);    // VM intercepts
+    f.insert("collectionMap".to_string(), fn_list_each);     // VM intercepts
+    f.insert("collectionFilter".to_string(), fn_list_each);  // VM intercepts
+    f.insert("collectionReduce".to_string(), fn_list_each);  // VM intercepts
+    f.insert("collectionSome".to_string(), fn_list_each);    // VM intercepts
+    f.insert("collectionEvery".to_string(), fn_list_each);   // VM intercepts
+    f.insert("each".to_string(), fn_list_each);              // VM intercepts (alias for collectionEach)
 
     // ---- WebSocket / realtime BIFs (VM-intercepted in cfml-vm/src/lib.rs) ----
     // Registered so the names resolve to callable functions; the real behaviour
     // reaches the connection registry on ServerState, so it is intercepted in
     // the VM before these stub bodies ever run.
-    f.insert("io".into(), fn_ws_stub); // VM intercepts
-    f.insert("wsPublish".into(), fn_ws_stub); // VM intercepts
-    f.insert("wsSubscribe".into(), fn_ws_stub); // VM intercepts
-    f.insert("wsUnsubscribe".into(), fn_ws_stub); // VM intercepts
-    f.insert("wsPresence".into(), fn_ws_stub); // VM intercepts
-    f.insert("assertBroadcast".into(), fn_ws_stub); // VM intercepts (test harness)
+    f.insert("io".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("wsPublish".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("wsSubscribe".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("wsUnsubscribe".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("wsPresence".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("assertBroadcast".to_string(), fn_ws_stub); // VM intercepts (test harness)
 
     // socket.io-lucee compat seam ($sio*) — the flat BIFs the imperative
     // SocketIoServer/Namespace/Socket CFCs call; all VM-intercepted in lib.rs.
-    f.insert("$sioRegisterNamespace".into(), fn_ws_stub);
-    f.insert("$sioRegisteredNamespaces".into(), fn_ws_stub);
-    f.insert("$sioRegisterNsHandler".into(), fn_ws_stub);
-    f.insert("$sioRegisterSocketHandler".into(), fn_ws_stub);
-    f.insert("$sioBroadcast".into(), fn_ws_stub);
-    f.insert("$sioSend".into(), fn_ws_stub);
-    f.insert("$sioJoinRoom".into(), fn_ws_stub);
-    f.insert("$sioLeaveRoom".into(), fn_ws_stub);
-    f.insert("$sioLeaveAllRooms".into(), fn_ws_stub);
-    f.insert("$sioDisconnect".into(), fn_ws_stub);
-    f.insert("$sioGetData".into(), fn_ws_stub);
-    f.insert("$sioSetData".into(), fn_ws_stub);
-    f.insert("$sioSocketCount".into(), fn_ws_stub);
+    f.insert("$sioRegisterNamespace".to_string(), fn_ws_stub);
+    f.insert("$sioRegisteredNamespaces".to_string(), fn_ws_stub);
+    f.insert("$sioRegisterNsHandler".to_string(), fn_ws_stub);
+    f.insert("$sioRegisterSocketHandler".to_string(), fn_ws_stub);
+    f.insert("$sioBroadcast".to_string(), fn_ws_stub);
+    f.insert("$sioSend".to_string(), fn_ws_stub);
+    f.insert("$sioJoinRoom".to_string(), fn_ws_stub);
+    f.insert("$sioLeaveRoom".to_string(), fn_ws_stub);
+    f.insert("$sioLeaveAllRooms".to_string(), fn_ws_stub);
+    f.insert("$sioDisconnect".to_string(), fn_ws_stub);
+    f.insert("$sioGetData".to_string(), fn_ws_stub);
+    f.insert("$sioSetData".to_string(), fn_ws_stub);
+    f.insert("$sioSocketCount".to_string(), fn_ws_stub);
 
     // ---- JSON functions ----
-    f.insert("serializeJSON".into(), fn_serialize_json);
-    f.insert("deserializeJSON".into(), fn_deserialize_json);
-    f.insert("isJSON".into(), fn_is_json);
+    f.insert("serializeJSON".to_string(), fn_serialize_json);
+    f.insert("deserializeJSON".to_string(), fn_deserialize_json);
+    f.insert("isJSON".to_string(), fn_is_json);
     // CFML-literal serialisation (Lucee/ACF): produces a string that
     // `evaluate()` reads back. Distinct from JSON — strings escape `"` by
     // doubling it (`""`) CFML-literal style, not with backslashes.
-    f.insert("serialize".into(), fn_serialize);
+    f.insert("serialize".to_string(), fn_serialize);
     // Binary object serialization (ACF/Lucee). RustCFML uses an INTERNAL,
     // self-describing format (magic header + JSON body) that round-trips with
     // itself — it is NOT wire-compatible with JVM object serialization, but
     // objectSave/objectLoad are only ever paired on the same engine (e.g.
     // ColdBox's cache DiskStore marshaller saves then loads).
-    f.insert("objectSave".into(), fn_object_save);
-    f.insert("objectLoad".into(), fn_object_load);
+    f.insert("objectSave".to_string(), fn_object_save);
+    f.insert("objectLoad".to_string(), fn_object_load);
 
     // ---- Query functions ----
-    f.insert("queryNew".into(), fn_query_new);
-    f.insert("queryAddRow".into(), fn_query_add_row);
-    f.insert("querySetCell".into(), fn_query_set_cell);
-    f.insert("queryAddColumn".into(), fn_query_add_column);
-    f.insert("queryGetRow".into(), fn_query_get_row as BuiltinFunction);
-    f.insert("queryGetCell".into(), fn_query_get_cell as BuiltinFunction);
-    f.insert("queryRecordCount".into(), fn_query_record_count as BuiltinFunction);
-    f.insert("queryColumnCount".into(), fn_query_column_count as BuiltinFunction);
-    f.insert("queryColumnList".into(), fn_query_column_list as BuiltinFunction);
-    f.insert("queryDeleteRow".into(), fn_query_delete_row as BuiltinFunction);
-    f.insert("queryDeleteColumn".into(), fn_query_delete_column as BuiltinFunction);
-    f.insert("queryAppend".into(), fn_query_append as BuiltinFunction);
-    f.insert("queryInsertAt".into(), fn_query_insert_at as BuiltinFunction);
-    f.insert("queryPrepend".into(), fn_query_prepend as BuiltinFunction);
-    f.insert("queryReverse".into(), fn_query_reverse as BuiltinFunction);
-    f.insert("queryRowSwap".into(), fn_query_row_swap as BuiltinFunction);
-    f.insert("querySetRow".into(), fn_query_set_row as BuiltinFunction);
+    f.insert("queryNew".to_string(), fn_query_new);
+    f.insert("queryAddRow".to_string(), fn_query_add_row);
+    f.insert("querySetCell".to_string(), fn_query_set_cell);
+    f.insert("queryAddColumn".to_string(), fn_query_add_column);
+    f.insert("queryGetRow".to_string(), fn_query_get_row as BuiltinFunction);
+    f.insert("queryGetCell".to_string(), fn_query_get_cell as BuiltinFunction);
+    f.insert("queryRecordCount".to_string(), fn_query_record_count as BuiltinFunction);
+    f.insert("queryColumnCount".to_string(), fn_query_column_count as BuiltinFunction);
+    f.insert("queryColumnList".to_string(), fn_query_column_list as BuiltinFunction);
+    f.insert("queryDeleteRow".to_string(), fn_query_delete_row as BuiltinFunction);
+    f.insert("queryDeleteColumn".to_string(), fn_query_delete_column as BuiltinFunction);
+    f.insert("queryAppend".to_string(), fn_query_append as BuiltinFunction);
+    f.insert("queryInsertAt".to_string(), fn_query_insert_at as BuiltinFunction);
+    f.insert("queryPrepend".to_string(), fn_query_prepend as BuiltinFunction);
+    f.insert("queryReverse".to_string(), fn_query_reverse as BuiltinFunction);
+    f.insert("queryRowSwap".to_string(), fn_query_row_swap as BuiltinFunction);
+    f.insert("querySetRow".to_string(), fn_query_set_row as BuiltinFunction);
     // Higher-order query functions (VM-intercepted stubs)
-    f.insert("queryEach".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("queryMap".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("queryFilter".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("queryReduce".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("querySort".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("querySome".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("queryEvery".into(), fn_query_ho_stub as BuiltinFunction);
-    f.insert("queryColumnExists".into(), fn_query_column_exists as BuiltinFunction);
-    f.insert("queryRowData".into(), fn_query_get_row as BuiltinFunction);  // alias
-    f.insert("querySlice".into(), fn_query_slice as BuiltinFunction);
-    f.insert("queryGetResult".into(), fn_query_get_result as BuiltinFunction);
-    f.insert("queryKeyExists".into(), fn_query_column_exists as BuiltinFunction);  // alias
-    f.insert("queryColumnData".into(), fn_query_column_data as BuiltinFunction);
-    f.insert("queryColumnArray".into(), fn_query_column_data as BuiltinFunction);  // alias
-    f.insert("queryCurrentRow".into(), fn_query_current_row as BuiltinFunction);
-    f.insert("__querySetRow".into(), fn_query_move_cursor as BuiltinFunction);
+    f.insert("queryEach".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("queryMap".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("queryFilter".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("queryReduce".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("querySort".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("querySome".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("queryEvery".to_string(), fn_query_ho_stub as BuiltinFunction);
+    f.insert("queryColumnExists".to_string(), fn_query_column_exists as BuiltinFunction);
+    f.insert("queryRowData".to_string(), fn_query_get_row as BuiltinFunction);  // alias
+    f.insert("querySlice".to_string(), fn_query_slice as BuiltinFunction);
+    f.insert("queryGetResult".to_string(), fn_query_get_result as BuiltinFunction);
+    f.insert("queryKeyExists".to_string(), fn_query_column_exists as BuiltinFunction);  // alias
+    f.insert("queryColumnData".to_string(), fn_query_column_data as BuiltinFunction);
+    f.insert("queryColumnArray".to_string(), fn_query_column_data as BuiltinFunction);  // alias
+    f.insert("queryCurrentRow".to_string(), fn_query_current_row as BuiltinFunction);
+    f.insert("__querySetRow".to_string(), fn_query_move_cursor as BuiltinFunction);
     // QoQ custom-function registration (VM-intercepted).
-    f.insert("queryRegisterFunction".into(), fn_query_register_function_stub as BuiltinFunction);
+    f.insert("queryRegisterFunction".to_string(), fn_query_register_function_stub as BuiltinFunction);
 
     // ---- Query value list functions ----
-    f.insert("valueList".into(), fn_value_list as BuiltinFunction);
-    f.insert("valueArray".into(), fn_value_array as BuiltinFunction);
-    f.insert("quotedValueList".into(), fn_quoted_value_list as BuiltinFunction);
+    f.insert("valueList".to_string(), fn_value_list as BuiltinFunction);
+    f.insert("valueArray".to_string(), fn_value_array as BuiltinFunction);
+    f.insert("quotedValueList".to_string(), fn_quoted_value_list as BuiltinFunction);
 
     // ---- Utility functions ----
-    f.insert("evaluate".into(), fn_evaluate);
-    f.insert("iif".into(), fn_iif);
-    f.insert("duplicate".into(), fn_duplicate);
-    f.insert("sleep".into(), fn_sleep);
-    f.insert("getMetadata".into(), fn_get_metadata);
-    f.insert("isInstanceOf".into(), fn_is_instance_of);
-    f.insert("createObject".into(), fn_create_object);
-    f.insert("getDirectoryFromPath".into(), fn_get_directory_from_path);
-    f.insert("getComponentMetadata".into(), fn_get_component_metadata);
-    f.insert("getComponentStaticScope".into(), fn_get_component_static_scope);
-    f.insert("createUUID".into(), fn_create_uuid);
-    f.insert("createUniqueID".into(), fn_create_unique_id);
-    f.insert("preserveSingleQuotes".into(), fn_preserve_single_quotes);
-    f.insert("createGUID".into(), fn_create_guid);
-    f.insert("hash".into(), fn_hash);
-    f.insert("lsParseNumber".into(), fn_ls_parse_number);
+    f.insert("evaluate".to_string(), fn_evaluate);
+    f.insert("iif".to_string(), fn_iif);
+    f.insert("duplicate".to_string(), fn_duplicate);
+    f.insert("sleep".to_string(), fn_sleep);
+    f.insert("getMetadata".to_string(), fn_get_metadata);
+    f.insert("isInstanceOf".to_string(), fn_is_instance_of);
+    f.insert("createObject".to_string(), fn_create_object);
+    f.insert("getDirectoryFromPath".to_string(), fn_get_directory_from_path);
+    f.insert("getComponentMetadata".to_string(), fn_get_component_metadata);
+    f.insert("getComponentStaticScope".to_string(), fn_get_component_static_scope);
+    f.insert("createUUID".to_string(), fn_create_uuid);
+    f.insert("createUniqueID".to_string(), fn_create_unique_id);
+    f.insert("preserveSingleQuotes".to_string(), fn_preserve_single_quotes);
+    f.insert("createGUID".to_string(), fn_create_guid);
+    f.insert("hash".to_string(), fn_hash);
+    f.insert("lsParseNumber".to_string(), fn_ls_parse_number);
 
     // ---- System functions ----
-    f.insert("getTickCount".into(), fn_get_tick_count);
-    f.insert("getFunctionList".into(), fn_get_function_list);
-    f.insert("getCurrentTemplatePath".into(), fn_get_current_template_path);
-    f.insert("getBaseTemplatePath".into(), fn_get_base_template_path);
-    f.insert("getTimeZone".into(), fn_get_time_zone);
-    f.insert("getTimeZoneInfo".into(), fn_get_time_zone_info);
-    f.insert("getContextRoot".into(), fn_get_context_root);
-    f.insert("GetContextRoot".into(), fn_get_context_root);
-    f.insert("getPageContext".into(), fn_get_page_context);
-    f.insert("isInThread".into(), fn_is_in_thread);
-    f.insert("getFileFromPath".into(), fn_get_file_from_path);
-    f.insert("getCanonicalPath".into(), fn_get_canonical_path);
-    f.insert("systemOutput".into(), fn_system_output);
-    f.insert("systemCacheClear".into(), fn_system_cache_clear);
-    f.insert("getEnvironmentVariable".into(), fn_get_environment_variable);
-    f.insert("readLine".into(), fn_read_line);
-    f.insert("getTemplatePath".into(), fn_get_current_template_path);  // alias
-    f.insert("writeLog".into(), fn_write_log);
-    f.insert("setLocale".into(), fn_set_locale);
-    f.insert("getLocale".into(), fn_get_locale);
-    f.insert("setTimeZone".into(), fn_set_time_zone);
-    f.insert("setEncoding".into(), fn_set_encoding);
+    f.insert("getTickCount".to_string(), fn_get_tick_count);
+    f.insert("getFunctionList".to_string(), fn_get_function_list);
+    f.insert("getCurrentTemplatePath".to_string(), fn_get_current_template_path);
+    f.insert("getBaseTemplatePath".to_string(), fn_get_base_template_path);
+    f.insert("getTimeZone".to_string(), fn_get_time_zone);
+    f.insert("getTimeZoneInfo".to_string(), fn_get_time_zone_info);
+    f.insert("getContextRoot".to_string(), fn_get_context_root);
+    f.insert("GetContextRoot".to_string(), fn_get_context_root);
+    f.insert("getPageContext".to_string(), fn_get_page_context);
+    f.insert("isInThread".to_string(), fn_is_in_thread);
+    f.insert("getFileFromPath".to_string(), fn_get_file_from_path);
+    f.insert("getCanonicalPath".to_string(), fn_get_canonical_path);
+    f.insert("systemOutput".to_string(), fn_system_output);
+    f.insert("systemCacheClear".to_string(), fn_system_cache_clear);
+    f.insert("getEnvironmentVariable".to_string(), fn_get_environment_variable);
+    f.insert("readLine".to_string(), fn_read_line);
+    f.insert("getTemplatePath".to_string(), fn_get_current_template_path);  // alias
+    f.insert("writeLog".to_string(), fn_write_log);
+    f.insert("setLocale".to_string(), fn_set_locale);
+    f.insert("getLocale".to_string(), fn_get_locale);
+    f.insert("setTimeZone".to_string(), fn_set_time_zone);
+    f.insert("setEncoding".to_string(), fn_set_encoding);
 
     // ---- Locale (ls*) functions ----
-    f.insert("lsDateFormat".into(), fn_ls_date_format);
-    f.insert("lsTimeFormat".into(), fn_ls_time_format);
-    f.insert("lsDateTimeFormat".into(), fn_ls_date_time_format);
-    f.insert("lsCurrencyFormat".into(), fn_ls_currency_format);
-    f.insert("lsEuroCurrencyFormat".into(), fn_ls_euro_currency_format);
-    f.insert("lsIsDate".into(), fn_ls_is_date);
-    f.insert("lsIsNumeric".into(), fn_ls_is_numeric);
-    f.insert("lsIsCurrency".into(), fn_ls_is_currency);
-    f.insert("lsParseCurrency".into(), fn_ls_parse_currency);
-    f.insert("lsParseDateTime".into(), fn_ls_parse_date_time);
-    f.insert("lsNumberFormat".into(), fn_ls_number_format);
-    f.insert("lsWeek".into(), fn_ls_week);
-    f.insert("lsDayOfWeek".into(), fn_ls_day_of_week);
-    f.insert("applicationStop".into(), fn_application_stop);
-    f.insert("getApplicationMetadata".into(), fn_get_application_metadata);
-    f.insert("getApplicationSettings".into(), fn_get_application_metadata);  // alias
+    f.insert("lsDateFormat".to_string(), fn_ls_date_format);
+    f.insert("lsTimeFormat".to_string(), fn_ls_time_format);
+    f.insert("lsDateTimeFormat".to_string(), fn_ls_date_time_format);
+    f.insert("lsCurrencyFormat".to_string(), fn_ls_currency_format);
+    f.insert("lsEuroCurrencyFormat".to_string(), fn_ls_euro_currency_format);
+    f.insert("lsIsDate".to_string(), fn_ls_is_date);
+    f.insert("lsIsNumeric".to_string(), fn_ls_is_numeric);
+    f.insert("lsIsCurrency".to_string(), fn_ls_is_currency);
+    f.insert("lsParseCurrency".to_string(), fn_ls_parse_currency);
+    f.insert("lsParseDateTime".to_string(), fn_ls_parse_date_time);
+    f.insert("lsNumberFormat".to_string(), fn_ls_number_format);
+    f.insert("lsWeek".to_string(), fn_ls_week);
+    f.insert("lsDayOfWeek".to_string(), fn_ls_day_of_week);
+    f.insert("applicationStop".to_string(), fn_application_stop);
+    f.insert("getApplicationMetadata".to_string(), fn_get_application_metadata);
+    f.insert("getApplicationSettings".to_string(), fn_get_application_metadata);  // alias
     // `location` (script alias for `cflocation`) is intentionally NOT registered
     // as a builtin: it must flow through the LoadGlobal script-tag-call mapping to
     // the `__cflocation` VM intercept (see `lib.rs`). Registering it as a builtin
     // shadowed that mapping and hit the stub — a 500 "requires VM intercept".
-    f.insert("trace".into(), fn_trace);
+    f.insert("trace".to_string(), fn_trace);
     // Custom-tag ancestry (VM-intercepted in lib.rs — they read the VM's
     // base_tag_stack). Registered here so name resolution finds them; the stubs
     // are only reachable off-VM.
-    f.insert("getBaseTagList".into(), fn_get_base_tag_list_stub);
-    f.insert("getBaseTagData".into(), fn_get_base_tag_data_stub);
-    f.insert("exceptionKeyExists".into(), fn_exception_key_exists);
+    f.insert("getBaseTagList".to_string(), fn_get_base_tag_list_stub);
+    f.insert("getBaseTagData".to_string(), fn_get_base_tag_data_stub);
+    f.insert("exceptionKeyExists".to_string(), fn_exception_key_exists);
     // Classic CF debug-footer BIFs. These are VM-intercepted in lib.rs when the
     // `observability` feature is on (they need the per-request collector + live
     // scopes); the stubs below are the fallback for feature-off builds (e.g. the
     // wasm worker) so a page calling them never errors.
-    f.insert("getDebugData".into(), fn_get_debug_data_stub);
-    f.insert("isDebugMode".into(), fn_is_debug_mode_stub);
-    f.insert("debugAdd".into(), fn_debug_add_stub);
+    f.insert("getDebugData".to_string(), fn_get_debug_data_stub);
+    f.insert("isDebugMode".to_string(), fn_is_debug_mode_stub);
+    f.insert("debugAdd".to_string(), fn_debug_add_stub);
     // Sampling-profiler BIFs (Phase 2) — VM-intercepted when observability is on;
     // these stubs keep pages portable on feature-off / wasm builds.
-    f.insert("getRequestProfile".into(), fn_get_request_profile_stub);
-    f.insert("profileNow".into(), fn_profile_now_stub);
+    f.insert("getRequestProfile".to_string(), fn_get_request_profile_stub);
+    f.insert("profileNow".to_string(), fn_profile_now_stub);
 
     // ---- File I/O functions ----
-    f.insert("fileRead".into(), fn_file_read);
-    f.insert("fileWrite".into(), fn_file_write);
-    f.insert("fileAppend".into(), fn_file_append);
-    f.insert("fileExists".into(), fn_file_exists);
-    f.insert("fileDelete".into(), fn_file_delete);
-    f.insert("fileMove".into(), fn_file_move);
-    f.insert("fileCopy".into(), fn_file_copy);
-    f.insert("directoryCreate".into(), fn_directory_create);
-    f.insert("directoryExists".into(), fn_directory_exists);
-    f.insert("directoryDelete".into(), fn_directory_delete);
-    f.insert("directoryList".into(), fn_directory_list);
-    f.insert("getTempDirectory".into(), fn_get_temp_directory);
-    f.insert("getTempFile".into(), fn_get_temp_file);
-    f.insert("getFileInfo".into(), fn_get_file_info);
-    f.insert("expandPath".into(), fn_expand_path);
-    f.insert("fileReadBinary".into(), fn_file_read_binary);
-    f.insert("fileGetMimeType".into(), fn_file_get_mime_type);
-    f.insert("directoryRename".into(), fn_directory_rename);
-    f.insert("directoryCopy".into(), fn_directory_copy);
-    f.insert("fileOpen".into(), fn_file_open);
-    f.insert("fileClose".into(), fn_file_close);
-    f.insert("fileReadLine".into(), fn_file_read_line);
-    f.insert("fileWriteLine".into(), fn_file_write_line);
-    f.insert("fileIsEOF".into(), fn_file_is_eof);
-    f.insert("fileUpload".into(), fn_file_upload);
-    f.insert("fileUploadAll".into(), fn_file_upload_all);
-    f.insert("__cffile_upload".into(), fn_cffile_upload);
-    f.insert("getProfileString".into(), fn_get_profile_string);
-    f.insert("setProfileString".into(), fn_set_profile_string);
-    f.insert("getProfileSections".into(), fn_get_profile_sections);
+    f.insert("fileRead".to_string(), fn_file_read);
+    f.insert("fileWrite".to_string(), fn_file_write);
+    f.insert("fileAppend".to_string(), fn_file_append);
+    f.insert("fileExists".to_string(), fn_file_exists);
+    f.insert("fileDelete".to_string(), fn_file_delete);
+    f.insert("fileMove".to_string(), fn_file_move);
+    f.insert("fileCopy".to_string(), fn_file_copy);
+    f.insert("directoryCreate".to_string(), fn_directory_create);
+    f.insert("directoryExists".to_string(), fn_directory_exists);
+    f.insert("directoryDelete".to_string(), fn_directory_delete);
+    f.insert("directoryList".to_string(), fn_directory_list);
+    f.insert("getTempDirectory".to_string(), fn_get_temp_directory);
+    f.insert("getTempFile".to_string(), fn_get_temp_file);
+    f.insert("getFileInfo".to_string(), fn_get_file_info);
+    f.insert("expandPath".to_string(), fn_expand_path);
+    f.insert("fileReadBinary".to_string(), fn_file_read_binary);
+    f.insert("fileGetMimeType".to_string(), fn_file_get_mime_type);
+    f.insert("directoryRename".to_string(), fn_directory_rename);
+    f.insert("directoryCopy".to_string(), fn_directory_copy);
+    f.insert("fileOpen".to_string(), fn_file_open);
+    f.insert("fileClose".to_string(), fn_file_close);
+    f.insert("fileReadLine".to_string(), fn_file_read_line);
+    f.insert("fileWriteLine".to_string(), fn_file_write_line);
+    f.insert("fileIsEOF".to_string(), fn_file_is_eof);
+    f.insert("fileUpload".to_string(), fn_file_upload);
+    f.insert("fileUploadAll".to_string(), fn_file_upload_all);
+    f.insert("__cffile_upload".to_string(), fn_cffile_upload);
+    f.insert("getProfileString".to_string(), fn_get_profile_string);
+    f.insert("setProfileString".to_string(), fn_set_profile_string);
+    f.insert("getProfileSections".to_string(), fn_get_profile_sections);
 
     // ---- Additional builtins ----
-    f.insert("encodeForURL".into(), fn_encode_for_url);
-    f.insert("encodeForCSS".into(), fn_encode_for_css);
-    f.insert("encodeForJavaScript".into(), fn_encode_for_javascript);
-    f.insert("charsetDecode".into(), fn_charset_decode);
-    f.insert("charsetEncode".into(), fn_charset_encode);
-    f.insert("encodeForHTMLAttribute".into(), fn_encode_for_html_attribute);
-    f.insert("encodeForXML".into(), fn_encode_for_xml);
-    f.insert("encodeForXMLAttribute".into(), fn_encode_for_xml_attribute);
-    f.insert("encodeFor".into(), fn_encode_for);
-    f.insert("decodeForHTML".into(), fn_decode_for_html);
-    f.insert("decodeFromURL".into(), fn_decode_from_url);
-    f.insert("urlEncode".into(), fn_url_encode_alias);
-    f.insert("canonicalize".into(), fn_canonicalize);
-    f.insert("listReduce".into(), fn_list_reduce);
-    f.insert("arrayPop".into(), fn_array_pop);
-    f.insert("arrayShift".into(), fn_array_shift);
+    f.insert("encodeForURL".to_string(), fn_encode_for_url);
+    f.insert("encodeForCSS".to_string(), fn_encode_for_css);
+    f.insert("encodeForJavaScript".to_string(), fn_encode_for_javascript);
+    f.insert("charsetDecode".to_string(), fn_charset_decode);
+    f.insert("charsetEncode".to_string(), fn_charset_encode);
+    f.insert("encodeForHTMLAttribute".to_string(), fn_encode_for_html_attribute);
+    f.insert("encodeForXML".to_string(), fn_encode_for_xml);
+    f.insert("encodeForXMLAttribute".to_string(), fn_encode_for_xml_attribute);
+    f.insert("encodeFor".to_string(), fn_encode_for);
+    f.insert("decodeForHTML".to_string(), fn_decode_for_html);
+    f.insert("decodeFromURL".to_string(), fn_decode_from_url);
+    f.insert("urlEncode".to_string(), fn_url_encode_alias);
+    f.insert("canonicalize".to_string(), fn_canonicalize);
+    f.insert("listReduce".to_string(), fn_list_reduce);
+    f.insert("arrayPop".to_string(), fn_array_pop);
+    f.insert("arrayShift".to_string(), fn_array_shift);
 
     // ---- HTTP/Tag infrastructure (VM-intercepted) ----
-    f.insert("__cfheader".into(), fn_cfheader_stub);
-    f.insert("__cfcontent".into(), fn_cfcontent_stub);
-    f.insert("__cflocation".into(), fn_cflocation_stub);
-    f.insert("getHTTPRequestData".into(), fn_get_http_request_data_stub);
-    f.insert("__cfinvoke".into(), fn_cfinvoke_stub);
-    f.insert("__cfsavecontent_start".into(), fn_cfsavecontent_start_stub);
-    f.insert("__cfsavecontent_end".into(), fn_cfsavecontent_end_stub);
-    f.insert("__cfabort".into(), fn_cfabort_stub);
-    f.insert("__cfexit".into(), fn_cfexit_stub);
-    f.insert("__cfhtmlhead".into(), fn_cfhtmlhead_stub);
-    f.insert("__cfhtmlbody".into(), fn_cfhtmlbody_stub);
-    f.insert("invoke".into(), fn_invoke_stub);
-    f.insert("__cftransaction_start".into(), fn_cftransaction_start_stub);
-    f.insert("__cftransaction_commit".into(), fn_cftransaction_commit_stub);
-    f.insert("__cftransaction_rollback".into(), fn_cftransaction_rollback_stub);
-    f.insert("__cftransaction_end".into(), fn_cftransaction_end_stub);
-    f.insert("cfdirectory".into(), fn_cfdirectory);
-    f.insert("cffile".into(), fn_cffile);
-    f.insert("cfdbinfo".into(), fn_cfdbinfo_stub);
-    f.insert("dbinfo".into(), fn_cfdbinfo_stub);
+    f.insert("__cfheader".to_string(), fn_cfheader_stub);
+    f.insert("__cfcontent".to_string(), fn_cfcontent_stub);
+    f.insert("__cflocation".to_string(), fn_cflocation_stub);
+    f.insert("getHTTPRequestData".to_string(), fn_get_http_request_data_stub);
+    f.insert("__cfinvoke".to_string(), fn_cfinvoke_stub);
+    f.insert("__cfsavecontent_start".to_string(), fn_cfsavecontent_start_stub);
+    f.insert("__cfsavecontent_end".to_string(), fn_cfsavecontent_end_stub);
+    f.insert("__cfabort".to_string(), fn_cfabort_stub);
+    f.insert("__cfexit".to_string(), fn_cfexit_stub);
+    f.insert("__cfhtmlhead".to_string(), fn_cfhtmlhead_stub);
+    f.insert("__cfhtmlbody".to_string(), fn_cfhtmlbody_stub);
+    f.insert("invoke".to_string(), fn_invoke_stub);
+    f.insert("__cftransaction_start".to_string(), fn_cftransaction_start_stub);
+    f.insert("__cftransaction_commit".to_string(), fn_cftransaction_commit_stub);
+    f.insert("__cftransaction_rollback".to_string(), fn_cftransaction_rollback_stub);
+    f.insert("__cftransaction_end".to_string(), fn_cftransaction_end_stub);
+    f.insert("cfdirectory".to_string(), fn_cfdirectory);
+    f.insert("cffile".to_string(), fn_cffile);
+    f.insert("cfdbinfo".to_string(), fn_cfdbinfo_stub);
+    f.insert("dbinfo".to_string(), fn_cfdbinfo_stub);
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-    f.insert("__dbinfo_impl".into(), crate::dbinfo::fn_dbinfo_impl);
+    f.insert("__dbinfo_impl".to_string(), crate::dbinfo::fn_dbinfo_impl);
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-    f.insert("__register_ds_timeout".into(), fn_register_ds_timeout);
-    f.insert("__cflog".into(), fn_cflog_stub);
-    f.insert("__cfparam".into(), fn_cfparam_stub);
-    f.insert("__cfsetting".into(), fn_cfsetting_stub);
-    f.insert("__cfapplication".into(), fn_cfapplication_stub);
-    f.insert("__cflock_start".into(), fn_cflock_start_stub);
-    f.insert("__cflock_end".into(), fn_cflock_end_stub);
-    f.insert("__cfcookie".into(), fn_cfcookie_stub);
-    f.insert("__cfcache".into(), fn_cfcache_stub);
-    f.insert("__cfloop_file_lines".into(), fn_cfloop_file_lines_stub);
-    f.insert("__cfexecute".into(), fn_cfexecute_stub);
-    f.insert("__cfmail".into(), fn_cfmail);
+    f.insert("__register_ds_timeout".to_string(), fn_register_ds_timeout);
+    f.insert("__cflog".to_string(), fn_cflog_stub);
+    f.insert("__cfparam".to_string(), fn_cfparam_stub);
+    f.insert("__cfsetting".to_string(), fn_cfsetting_stub);
+    f.insert("__cfapplication".to_string(), fn_cfapplication_stub);
+    f.insert("__cflock_start".to_string(), fn_cflock_start_stub);
+    f.insert("__cflock_end".to_string(), fn_cflock_end_stub);
+    f.insert("__cfcookie".to_string(), fn_cfcookie_stub);
+    f.insert("__cfcache".to_string(), fn_cfcache_stub);
+    f.insert("__cfloop_file_lines".to_string(), fn_cfloop_file_lines_stub);
+    f.insert("__cfexecute".to_string(), fn_cfexecute_stub);
+    f.insert("__cfmail".to_string(), fn_cfmail);
 
     // ---- Whitespace/output control functions (VM-intercepted) ----
-    f.insert("__writeText".into(), fn_write_text_stub);
-    f.insert("__cfprocessingdirective_collapse".into(), fn_cfprocessingdirective_collapse);
+    f.insert("__writeText".to_string(), fn_write_text_stub);
+    f.insert("__cfprocessingdirective_collapse".to_string(), fn_cfprocessingdirective_collapse);
 
     // ---- cfthread functions (VM-intercepted) ----
-    f.insert("__cfthread_run".into(), fn_cfthread_stub);
-    f.insert("__cfthread_join".into(), fn_cfthread_stub);
-    f.insert("__cfthread_terminate".into(), fn_cfthread_stub);
+    f.insert("__cfthread_run".to_string(), fn_cfthread_stub);
+    f.insert("__cfthread_join".to_string(), fn_cfthread_stub);
+    f.insert("__cfthread_terminate".to_string(), fn_cfthread_stub);
     // Script BIFs threadJoin()/threadTerminate() route to the same handlers.
-    f.insert("threadjoin".into(), fn_cfthread_stub);
-    f.insert("threadterminate".into(), fn_cfthread_stub);
+    f.insert("threadjoin".to_string(), fn_cfthread_stub);
+    f.insert("threadterminate".to_string(), fn_cfthread_stub);
 
     // ---- async kernel: runAsync + _schedule (VM-intercepted) ----
-    f.insert("runAsync".into(), fn_async_stub);
-    f.insert("_schedule".into(), fn_async_stub);
+    f.insert("runAsync".to_string(), fn_async_stub);
+    f.insert("_schedule".to_string(), fn_async_stub);
     // createDynamicProxy: wraps a CFC as a Java SAM (Callable/Runnable/…) so the
     // java.util.concurrent shim can invoke it. VM-intercepted. See lib.rs.
-    f.insert("createDynamicProxy".into(), fn_async_stub);
+    f.insert("createDynamicProxy".to_string(), fn_async_stub);
 
     // ---- Cache functions (VM-intercepted) ----
-    f.insert("cachePut".into(), fn_cache_stub);
-    f.insert("cacheGet".into(), fn_cache_stub);
-    f.insert("cacheDelete".into(), fn_cache_stub);
-    f.insert("cacheClear".into(), fn_cache_stub);
-    f.insert("cacheKeyExists".into(), fn_cache_stub);
-    f.insert("cacheCount".into(), fn_cache_stub);
-    f.insert("cacheGetAll".into(), fn_cache_stub);
-    f.insert("cacheGetAllIds".into(), fn_cache_stub);
-    f.insert("cacheGetProperties".into(), fn_cache_stub);
+    f.insert("cachePut".to_string(), fn_cache_stub);
+    f.insert("cacheGet".to_string(), fn_cache_stub);
+    f.insert("cacheDelete".to_string(), fn_cache_stub);
+    f.insert("cacheClear".to_string(), fn_cache_stub);
+    f.insert("cacheKeyExists".to_string(), fn_cache_stub);
+    f.insert("cacheCount".to_string(), fn_cache_stub);
+    f.insert("cacheGetAll".to_string(), fn_cache_stub);
+    f.insert("cacheGetAllIds".to_string(), fn_cache_stub);
+    f.insert("cacheGetProperties".to_string(), fn_cache_stub);
 
     // ---- Session & Auth functions (VM-intercepted) ----
-    f.insert("sessionInvalidate".into(), fn_session_stub);
-    f.insert("sessionRotate".into(), fn_session_stub);
-    f.insert("sessionCommit".into(), fn_session_stub);
-    f.insert("sessionGetMetaData".into(), fn_session_stub);
-    f.insert("getAuthUser".into(), fn_session_stub);
-    f.insert("isUserInRole".into(), fn_session_stub);
-    f.insert("isUserLoggedIn".into(), fn_session_stub);
-    f.insert("__cfloginuser".into(), fn_session_stub);
-    f.insert("__cflogout".into(), fn_session_stub);
+    f.insert("sessionInvalidate".to_string(), fn_session_stub);
+    f.insert("sessionRotate".to_string(), fn_session_stub);
+    f.insert("sessionCommit".to_string(), fn_session_stub);
+    f.insert("sessionGetMetaData".to_string(), fn_session_stub);
+    f.insert("getAuthUser".to_string(), fn_session_stub);
+    f.insert("isUserInRole".to_string(), fn_session_stub);
+    f.insert("isUserLoggedIn".to_string(), fn_session_stub);
+    f.insert("__cfloginuser".to_string(), fn_session_stub);
+    f.insert("__cflogout".to_string(), fn_session_stub);
 
     // ---- Variable scope functions (VM-intercepted) ----
-    f.insert("setVariable".into(), fn_session_stub);
-    f.insert("getVariable".into(), fn_session_stub);
+    f.insert("setVariable".to_string(), fn_session_stub);
+    f.insert("getVariable".to_string(), fn_session_stub);
 
     // ---- throw() function form (VM-intercepted) ----
-    f.insert("throw".into(), fn_session_stub);
+    f.insert("throw".to_string(), fn_session_stub);
 
     // ---- Struct metadata functions ----
-    f.insert("structGetMetadata".into(), fn_struct_get_metadata);
-    f.insert("structSetMetadata".into(), fn_struct_set_metadata);
+    f.insert("structGetMetadata".to_string(), fn_struct_get_metadata);
+    f.insert("structSetMetadata".to_string(), fn_struct_set_metadata);
 
     // ---- File attribute functions ----
-    f.insert("fileSetAccessMode".into(), fn_file_set_access_mode);
-    f.insert("fileSetAttribute".into(), fn_file_set_attribute);
-    f.insert("fileSetLastModified".into(), fn_file_set_last_modified);
+    f.insert("fileSetAccessMode".to_string(), fn_file_set_access_mode);
+    f.insert("fileSetAttribute".to_string(), fn_file_set_attribute);
+    f.insert("fileSetLastModified".to_string(), fn_file_set_last_modified);
 
     // ---- HTTP functions ----
     #[cfg(feature = "http")]
-    f.insert("cfhttp".into(), fn_cfhttp);
+    f.insert("cfhttp".to_string(), fn_cfhttp);
 
     // ---- Database functions ----
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-    f.insert("queryExecute".into(), fn_query_execute);
+    f.insert("queryExecute".to_string(), fn_query_execute);
     // No per-engine DB feature compiled in (e.g. the Cloudflare Workers
     // build). Fall back to the dynamic-driver-only path so cfquery /
     // queryExecute against an externally-registered driver (D1, etc.)
     // still works.
     #[cfg(not(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
-    f.insert("queryExecute".into(), fn_query_execute_dynamic);
+    f.insert("queryExecute".to_string(), fn_query_execute_dynamic);
 
     // ---- Security functions ----
-    f.insert("hmac".into(), fn_hmac);
+    f.insert("hmac".to_string(), fn_hmac);
     // JWT (Lucee crypto-extension names) — HMAC algorithms (HS256/384/512).
-    f.insert("jwtSign".into(), fn_jwt_sign);
-    f.insert("jwtVerify".into(), fn_jwt_verify);
-    f.insert("jwtDecode".into(), fn_jwt_decode);
+    f.insert("jwtSign".to_string(), fn_jwt_sign);
+    f.insert("jwtVerify".to_string(), fn_jwt_verify);
+    f.insert("jwtDecode".to_string(), fn_jwt_decode);
     #[cfg(feature = "security")]
-    f.insert("generateSecretKey".into(), fn_generate_secret_key);
-    f.insert("encrypt".into(), fn_encrypt);
-    f.insert("decrypt".into(), fn_decrypt);
+    f.insert("generateSecretKey".to_string(), fn_generate_secret_key);
+    f.insert("encrypt".to_string(), fn_encrypt);
+    f.insert("decrypt".to_string(), fn_decrypt);
 
     // ---- Password hashing / CSRF functions ----
     #[cfg(feature = "security")]
     {
-        f.insert("generatePBKDFKey".into(), fn_generate_pbkdf_key);
-        f.insert("generateBCryptHash".into(), fn_generate_bcrypt_hash);
-        f.insert("verifyBCryptHash".into(), fn_verify_bcrypt_hash);
+        f.insert("generatePBKDFKey".to_string(), fn_generate_pbkdf_key);
+        f.insert("generateBCryptHash".to_string(), fn_generate_bcrypt_hash);
+        f.insert("verifyBCryptHash".to_string(), fn_verify_bcrypt_hash);
         // Lucee crypto-extension modern names (GenerateBCryptHash/VerifyBCryptHash
         // are the deprecated predecessors).
-        f.insert("bcryptHash".into(), fn_bcrypt_hash);
-        f.insert("bcryptVerify".into(), fn_bcrypt_verify);
-        f.insert("generateSCryptHash".into(), fn_generate_scrypt_hash);
-        f.insert("verifySCryptHash".into(), fn_verify_scrypt_hash);
-        f.insert("generateArgon2Hash".into(), fn_generate_argon2_hash);
-        f.insert("argon2CheckHash".into(), fn_argon2_check_hash);
-        f.insert("csrfGenerateToken".into(), fn_csrf_generate_token);
-        f.insert("csrfVerifyToken".into(), fn_csrf_verify_token);
+        f.insert("bcryptHash".to_string(), fn_bcrypt_hash);
+        f.insert("bcryptVerify".to_string(), fn_bcrypt_verify);
+        f.insert("generateSCryptHash".to_string(), fn_generate_scrypt_hash);
+        f.insert("verifySCryptHash".to_string(), fn_verify_scrypt_hash);
+        f.insert("generateArgon2Hash".to_string(), fn_generate_argon2_hash);
+        f.insert("argon2CheckHash".to_string(), fn_argon2_check_hash);
+        f.insert("csrfGenerateToken".to_string(), fn_csrf_generate_token);
+        f.insert("csrfVerifyToken".to_string(), fn_csrf_verify_token);
     }
 
     // ---- YAML functions (BoxLang-compatible names) ----
     #[cfg(feature = "yaml")]
     {
-        f.insert("yamlDeserialize".into(), fn_yaml_deserialize);
-        f.insert("yamlSerialize".into(), fn_yaml_serialize);
-        f.insert("yamlDeserializeFile".into(), fn_yaml_deserialize_file);
+        f.insert("yamlDeserialize".to_string(), fn_yaml_deserialize);
+        f.insert("yamlSerialize".to_string(), fn_yaml_serialize);
+        f.insert("yamlDeserializeFile".to_string(), fn_yaml_deserialize_file);
     }
 
     // ---- JSON Schema validation (Lucee `validateJSON`) ----
     #[cfg(feature = "jsonschema")]
     {
-        f.insert("validateJSON".into(), fn_validate_json);
+        f.insert("validateJSON".to_string(), fn_validate_json);
         // Internal: returns Preside's {valid,error} JSON string for the
         // ca.vanmulligen.json.schema.Validator shim's isValid().
-        f.insert("__jsonSchemaValidateResult".into(), fn_json_schema_validate_result);
+        f.insert("__jsonSchemaValidateResult".to_string(), fn_json_schema_validate_result);
     }
 
     // ---- XML functions ----
     #[cfg(feature = "xml")]
     {
-        f.insert("xmlParse".into(), fn_xml_parse);
+        f.insert("xmlParse".to_string(), fn_xml_parse);
         // XMP metadata (RDF/XML) flattener — replaces Preside's xmpcore.jar.
-        f.insert("xmpParse".into(), crate::xmp::fn_xmp_parse);
-        f.insert("xmlSearch".into(), fn_xml_search);
-        f.insert("isXML".into(), fn_is_xml);
-        f.insert("xmlTransform".into(), fn_xml_transform_stub);
-        f.insert("xmlValidate".into(), fn_xml_validate_stub);
-        f.insert("xmlNew".into(), fn_xml_new);
-        f.insert("xmlElemNew".into(), fn_xml_elem_new);
-        f.insert("xmlChildPos".into(), fn_xml_child_pos);
-        f.insert("xmlGetNodeType".into(), fn_xml_get_node_type);
-        f.insert("xmlHasChild".into(), fn_xml_has_child);
-        f.insert("isXMLDoc".into(), fn_is_xml_doc);
-        f.insert("isXMLElem".into(), fn_is_xml_elem);
-        f.insert("isXMLNode".into(), fn_is_xml_node);
-        f.insert("isXMLRoot".into(), fn_is_xml_root);
-        f.insert("isXMLAttribute".into(), fn_is_xml_attribute);
+        f.insert("xmpParse".to_string(), crate::xmp::fn_xmp_parse);
+        f.insert("xmlSearch".to_string(), fn_xml_search);
+        f.insert("isXML".to_string(), fn_is_xml);
+        f.insert("xmlTransform".to_string(), fn_xml_transform_stub);
+        f.insert("xmlValidate".to_string(), fn_xml_validate_stub);
+        f.insert("xmlNew".to_string(), fn_xml_new);
+        f.insert("xmlElemNew".to_string(), fn_xml_elem_new);
+        f.insert("xmlChildPos".to_string(), fn_xml_child_pos);
+        f.insert("xmlGetNodeType".to_string(), fn_xml_get_node_type);
+        f.insert("xmlHasChild".to_string(), fn_xml_has_child);
+        f.insert("isXMLDoc".to_string(), fn_is_xml_doc);
+        f.insert("isXMLElem".to_string(), fn_is_xml_elem);
+        f.insert("isXMLNode".to_string(), fn_is_xml_node);
+        f.insert("isXMLRoot".to_string(), fn_is_xml_root);
+        f.insert("isXMLAttribute".to_string(), fn_is_xml_attribute);
     }
 
     // ---- HTML functions ----
     #[cfg(feature = "html")]
     {
-        f.insert("htmlParse".into(), fn_html_parse);
+        f.insert("htmlParse".to_string(), fn_html_parse);
     }
 
     // ---- Zip functions ----
     #[cfg(feature = "zip_support")]
     {
-        f.insert("cfzip".into(), fn_cfzip);
+        f.insert("cfzip".to_string(), fn_cfzip);
     }
 
     // ---- Misc functions ----
-    f.insert("soundex".into(), fn_soundex);
-    f.insert("metaphone".into(), fn_metaphone);
-    f.insert("toScript".into(), fn_to_script);
+    f.insert("soundex".to_string(), fn_soundex);
+    f.insert("metaphone".to_string(), fn_metaphone);
+    f.insert("toScript".to_string(), fn_to_script);
 
     // ---- S3 functions (gated on `s3` feature) ----
     #[cfg(feature = "s3")]
     {
-        f.insert("s3Read".into(), crate::s3_builtins::fn_s3_read);
-        f.insert("s3ReadBinary".into(), crate::s3_builtins::fn_s3_read_binary);
-        f.insert("s3Write".into(), crate::s3_builtins::fn_s3_write);
-        f.insert("s3Upload".into(), crate::s3_builtins::fn_s3_upload);
-        f.insert("s3Download".into(), crate::s3_builtins::fn_s3_download);
-        f.insert("s3ListBuckets".into(), crate::s3_builtins::fn_s3_list_buckets);
-        f.insert("s3ListBucket".into(), crate::s3_builtins::fn_s3_list_bucket);
-        f.insert("s3CreateBucket".into(), crate::s3_builtins::fn_s3_create_bucket);
-        f.insert("s3Delete".into(), crate::s3_builtins::fn_s3_delete);
-        f.insert("s3ClearBucket".into(), crate::s3_builtins::fn_s3_clear_bucket);
-        f.insert("s3Exists".into(), crate::s3_builtins::fn_s3_exists);
-        f.insert("s3Copy".into(), crate::s3_builtins::fn_s3_copy);
-        f.insert("s3Move".into(), crate::s3_builtins::fn_s3_move);
-        f.insert("s3GetMetaData".into(), crate::s3_builtins::fn_s3_get_metadata);
+        f.insert("s3Read".to_string(), crate::s3_builtins::fn_s3_read);
+        f.insert("s3ReadBinary".to_string(), crate::s3_builtins::fn_s3_read_binary);
+        f.insert("s3Write".to_string(), crate::s3_builtins::fn_s3_write);
+        f.insert("s3Upload".to_string(), crate::s3_builtins::fn_s3_upload);
+        f.insert("s3Download".to_string(), crate::s3_builtins::fn_s3_download);
+        f.insert("s3ListBuckets".to_string(), crate::s3_builtins::fn_s3_list_buckets);
+        f.insert("s3ListBucket".to_string(), crate::s3_builtins::fn_s3_list_bucket);
+        f.insert("s3CreateBucket".to_string(), crate::s3_builtins::fn_s3_create_bucket);
+        f.insert("s3Delete".to_string(), crate::s3_builtins::fn_s3_delete);
+        f.insert("s3ClearBucket".to_string(), crate::s3_builtins::fn_s3_clear_bucket);
+        f.insert("s3Exists".to_string(), crate::s3_builtins::fn_s3_exists);
+        f.insert("s3Copy".to_string(), crate::s3_builtins::fn_s3_copy);
+        f.insert("s3Move".to_string(), crate::s3_builtins::fn_s3_move);
+        f.insert("s3GetMetaData".to_string(), crate::s3_builtins::fn_s3_get_metadata);
         f.insert(
-            "s3GeneratePresignedURL".into(),
+            "s3GeneratePresignedURL".to_string(),
             crate::s3_builtins::fn_s3_generate_presigned_url,
         );
-        f.insert("s3GenerateURI".into(), crate::s3_builtins::fn_s3_generate_uri);
-        f.insert("storeGetMetadata".into(), crate::s3_builtins::fn_store_get_metadata);
+        f.insert("s3GenerateURI".to_string(), crate::s3_builtins::fn_s3_generate_uri);
+        f.insert("storeGetMetadata".to_string(), crate::s3_builtins::fn_store_get_metadata);
     }
     #[cfg(not(feature = "s3"))]
     {
@@ -2962,15 +2962,15 @@ fn fn_get_tag_data(args: Vec<CfmlValue>) -> CfmlResult {
     let mut attributes = ValueMap::default();
     for (name, ty, required) in attrs {
         let mut entry = ValueMap::default();
-        entry.insert("name".into(), CfmlValue::string((*name).to_string()));
-        entry.insert("type".into(), CfmlValue::string((*ty).to_string()));
-        entry.insert("required".into(), CfmlValue::Bool(*required));
+        entry.insert("name", CfmlValue::string((*name).to_string()));
+        entry.insert("type", CfmlValue::string((*ty).to_string()));
+        entry.insert("required", CfmlValue::Bool(*required));
         attributes.insert((*name).to_string(), CfmlValue::strukt(entry));
     }
 
     let mut result = ValueMap::default();
-    result.insert("name".into(), CfmlValue::string(tag.to_lowercase()));
-    result.insert("attributes".into(), CfmlValue::strukt(attributes));
+    result.insert("name", CfmlValue::string(tag.to_lowercase()));
+    result.insert("attributes", CfmlValue::strukt(attributes));
     Ok(CfmlValue::strukt(result))
 }
 
@@ -3319,7 +3319,8 @@ fn struct_find_key_recursive(
 ) {
     let search_lower = search_key.to_lowercase();
     for (k, v) in s.iter() {
-        let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+        let current_path =
+            if path.is_empty() { k.as_str().to_string() } else { format!("{}.{}", path, k) };
         if k.eq_ignore_ascii_case(&search_lower) {
             let mut result_struct = ValueMap::default();
             result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
@@ -3367,7 +3368,8 @@ fn struct_find_value_recursive(
 ) {
     let search_lower = search_value.to_lowercase();
     for (k, v) in s.iter() {
-        let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+        let current_path =
+            if path.is_empty() { k.as_str().to_string() } else { format!("{}.{}", path, k) };
         if v.as_string().to_lowercase() == search_lower {
             let mut result_struct = ValueMap::default();
             result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
@@ -3421,6 +3423,7 @@ fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
             let preserved: Vec<(String, CfmlValue)> = s
                 .iter()
                 .filter(|(k, _)| cfml_common::component::is_reserved_component_key(k))
+                .map(|(k, v)| (k.as_str().to_string(), v))
                 .collect();
             s.clear();
             // Methods live in the shared per-class table (component flyweight);
@@ -3490,7 +3493,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
                     if !overwrite && dst.instance_has_public(&k) {
                         continue;
                     }
-                    dst.instance_set_public(k, v);
+                    dst.instance_set_public(k.as_str().to_string(), v);
                 }
                 return Ok(args[0].clone());
             }
@@ -3522,7 +3525,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
             let entries: Vec<(String, CfmlValue)> = if src_is_component || src_has_methods {
                 b.all_entries()
             } else {
-                b.iter().collect()
+                b.iter().map(|(k, v)| (k.as_str().to_string(), v)).collect()
             };
             for (k, v) in entries {
                 if (src_is_component || src_has_methods)
@@ -3712,7 +3715,7 @@ fn fn_struct_key_translate(args: Vec<CfmlValue>) -> CfmlResult {
         let retain = args.get(1).map(|v| v.is_true()).unwrap_or(false);
         let mut result = ValueMap::default();
         for (k, v) in s.iter() {
-            let new_key = if retain { k.clone() } else { k.to_lowercase() };
+            let new_key = if retain { k.as_str().to_string() } else { k.to_lowercase() };
             result.insert(new_key, v.clone());
         }
         return Ok(CfmlValue::strukt(result));
@@ -3910,75 +3913,75 @@ const IMAGE_TIER1_NAMES: &[&str] = &[
 #[cfg(feature = "image_support")]
 fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     use crate::image as img;
-    f.insert("imageNew".into(), img::fn_image_new);
-    f.insert("imageRead".into(), img::fn_image_read);
-    f.insert("imageReadBase64".into(), img::fn_image_read_base64);
-    f.insert("imageWrite".into(), img::fn_image_write);
-    f.insert("imageWriteBase64".into(), img::fn_image_write_base64);
-    f.insert("imageGetBlob".into(), img::fn_image_get_blob);
-    f.insert("imageResize".into(), img::fn_image_resize);
-    f.insert("imageScaleToFit".into(), img::fn_image_scale_to_fit);
-    f.insert("imageGetWidth".into(), img::fn_image_get_width);
-    f.insert("imageGetHeight".into(), img::fn_image_get_height);
-    f.insert("imageInfo".into(), img::fn_image_info);
-    f.insert("imageCrop".into(), img::fn_image_crop);
-    f.insert("imageRotate".into(), img::fn_image_rotate);
-    f.insert("imageFlip".into(), img::fn_image_flip);
-    f.insert("isImage".into(), img::fn_is_image);
-    f.insert("cfimage".into(), img::fn_cfimage);
+    f.insert("imageNew".to_string(), img::fn_image_new);
+    f.insert("imageRead".to_string(), img::fn_image_read);
+    f.insert("imageReadBase64".to_string(), img::fn_image_read_base64);
+    f.insert("imageWrite".to_string(), img::fn_image_write);
+    f.insert("imageWriteBase64".to_string(), img::fn_image_write_base64);
+    f.insert("imageGetBlob".to_string(), img::fn_image_get_blob);
+    f.insert("imageResize".to_string(), img::fn_image_resize);
+    f.insert("imageScaleToFit".to_string(), img::fn_image_scale_to_fit);
+    f.insert("imageGetWidth".to_string(), img::fn_image_get_width);
+    f.insert("imageGetHeight".to_string(), img::fn_image_get_height);
+    f.insert("imageInfo".to_string(), img::fn_image_info);
+    f.insert("imageCrop".to_string(), img::fn_image_crop);
+    f.insert("imageRotate".to_string(), img::fn_image_rotate);
+    f.insert("imageFlip".to_string(), img::fn_image_flip);
+    f.insert("isImage".to_string(), img::fn_is_image);
+    f.insert("cfimage".to_string(), img::fn_cfimage);
 
     // Tier 2 — drawing state
-    f.insert("imageSetDrawingColor".into(), img::fn_image_set_drawing_color);
-    f.insert("imageSetBackgroundColor".into(), img::fn_image_set_background_color);
-    f.insert("imageSetDrawingStroke".into(), img::fn_image_set_drawing_stroke);
-    f.insert("imageSetAntialiasing".into(), img::fn_image_set_antialiasing);
-    f.insert("imageSetDrawingTransparency".into(), img::fn_image_set_drawing_transparency);
-    f.insert("imageXORDrawingMode".into(), img::fn_image_xor_drawing_mode);
+    f.insert("imageSetDrawingColor".to_string(), img::fn_image_set_drawing_color);
+    f.insert("imageSetBackgroundColor".to_string(), img::fn_image_set_background_color);
+    f.insert("imageSetDrawingStroke".to_string(), img::fn_image_set_drawing_stroke);
+    f.insert("imageSetAntialiasing".to_string(), img::fn_image_set_antialiasing);
+    f.insert("imageSetDrawingTransparency".to_string(), img::fn_image_set_drawing_transparency);
+    f.insert("imageXORDrawingMode".to_string(), img::fn_image_xor_drawing_mode);
     // Tier 2 — drawing primitives
-    f.insert("imageDrawLine".into(), img::fn_image_draw_line);
-    f.insert("imageDrawLines".into(), img::fn_image_draw_lines);
-    f.insert("imageDrawPoint".into(), img::fn_image_draw_point);
-    f.insert("imageDrawRect".into(), img::fn_image_draw_rect);
-    f.insert("imageDrawRoundRect".into(), img::fn_image_draw_round_rect);
-    f.insert("imageDrawBeveledRect".into(), img::fn_image_draw_beveled_rect);
-    f.insert("imageDrawOval".into(), img::fn_image_draw_oval);
-    f.insert("imageDrawArc".into(), img::fn_image_draw_arc);
-    f.insert("imageDrawCubicCurve".into(), img::fn_image_draw_cubic_curve);
-    f.insert("imageDrawQuadraticCurve".into(), img::fn_image_draw_quadratic_curve);
-    f.insert("imageDrawText".into(), img::fn_image_draw_text);
-    f.insert("imageClearRect".into(), img::fn_image_clear_rect);
+    f.insert("imageDrawLine".to_string(), img::fn_image_draw_line);
+    f.insert("imageDrawLines".to_string(), img::fn_image_draw_lines);
+    f.insert("imageDrawPoint".to_string(), img::fn_image_draw_point);
+    f.insert("imageDrawRect".to_string(), img::fn_image_draw_rect);
+    f.insert("imageDrawRoundRect".to_string(), img::fn_image_draw_round_rect);
+    f.insert("imageDrawBeveledRect".to_string(), img::fn_image_draw_beveled_rect);
+    f.insert("imageDrawOval".to_string(), img::fn_image_draw_oval);
+    f.insert("imageDrawArc".to_string(), img::fn_image_draw_arc);
+    f.insert("imageDrawCubicCurve".to_string(), img::fn_image_draw_cubic_curve);
+    f.insert("imageDrawQuadraticCurve".to_string(), img::fn_image_draw_quadratic_curve);
+    f.insert("imageDrawText".to_string(), img::fn_image_draw_text);
+    f.insert("imageClearRect".to_string(), img::fn_image_clear_rect);
     // Tier 2 — compositing
-    f.insert("imageDrawImage".into(), img::fn_image_draw_image);
-    f.insert("imagePaste".into(), img::fn_image_paste);
-    f.insert("imageOverlay".into(), img::fn_image_overlay);
-    f.insert("imageCopy".into(), img::fn_image_copy);
-    f.insert("imageAddBorder".into(), img::fn_image_add_border);
+    f.insert("imageDrawImage".to_string(), img::fn_image_draw_image);
+    f.insert("imagePaste".to_string(), img::fn_image_paste);
+    f.insert("imageOverlay".to_string(), img::fn_image_overlay);
+    f.insert("imageCopy".to_string(), img::fn_image_copy);
+    f.insert("imageAddBorder".to_string(), img::fn_image_add_border);
     // Tier 3 — filters / effects
-    f.insert("imageBlur".into(), img::fn_image_blur);
-    f.insert("imageSharpen".into(), img::fn_image_sharpen);
-    f.insert("imageNegative".into(), img::fn_image_negative);
-    f.insert("imageGrayscale".into(), img::fn_image_grayscale);
-    f.insert("imageMakeColorTransparent".into(), img::fn_image_make_color_transparent);
-    f.insert("imageMakeTranslucent".into(), img::fn_image_make_translucent);
+    f.insert("imageBlur".to_string(), img::fn_image_blur);
+    f.insert("imageSharpen".to_string(), img::fn_image_sharpen);
+    f.insert("imageNegative".to_string(), img::fn_image_negative);
+    f.insert("imageGrayscale".to_string(), img::fn_image_grayscale);
+    f.insert("imageMakeColorTransparent".to_string(), img::fn_image_make_color_transparent);
+    f.insert("imageMakeTranslucent".to_string(), img::fn_image_make_translucent);
     // Tier 3 — coordinate transforms
-    f.insert("imageTranslate".into(), img::fn_image_translate);
-    f.insert("imageTranslateDrawingAxis".into(), img::fn_image_translate_drawing_axis);
-    f.insert("imageShear".into(), img::fn_image_shear);
-    f.insert("imageShearDrawingAxis".into(), img::fn_image_shear_drawing_axis);
-    f.insert("imageRotateDrawingAxis".into(), img::fn_image_rotate_drawing_axis);
+    f.insert("imageTranslate".to_string(), img::fn_image_translate);
+    f.insert("imageTranslateDrawingAxis".to_string(), img::fn_image_translate_drawing_axis);
+    f.insert("imageShear".to_string(), img::fn_image_shear);
+    f.insert("imageShearDrawingAxis".to_string(), img::fn_image_shear_drawing_axis);
+    f.insert("imageRotateDrawingAxis".to_string(), img::fn_image_rotate_drawing_axis);
     // Tier 3 — metadata / interop
-    f.insert("imageGetEXIFMetadata".into(), img::fn_image_get_exif_metadata);
-    f.insert("imageGetEXIFTag".into(), img::fn_image_get_exif_tag);
-    f.insert("imageGetIPTCMetadata".into(), img::fn_image_get_iptc_metadata);
-    f.insert("imageGetIPTCTag".into(), img::fn_image_get_iptc_tag);
-    f.insert("imageGetBufferedImage".into(), img::fn_image_get_buffered_image);
+    f.insert("imageGetEXIFMetadata".to_string(), img::fn_image_get_exif_metadata);
+    f.insert("imageGetEXIFTag".to_string(), img::fn_image_get_exif_tag);
+    f.insert("imageGetIPTCMetadata".to_string(), img::fn_image_get_iptc_metadata);
+    f.insert("imageGetIPTCTag".to_string(), img::fn_image_get_iptc_tag);
+    f.insert("imageGetBufferedImage".to_string(), img::fn_image_get_buffered_image);
 }
 
 #[cfg(not(feature = "image_support"))]
 fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     // isImage is a type predicate — always safe to answer "false".
-    f.insert("isImage".into(), |_args| Ok(CfmlValue::Bool(false)));
-    f.insert("cfimage".into(), fn_image_disabled);
+    f.insert("isImage", |_args| Ok(CfmlValue::Bool(false)));
+    f.insert("cfimage", fn_image_disabled);
     for name in IMAGE_TIER1_NAMES.iter().chain(IMAGE_TIER23_STUBS) {
         f.insert((*name).into(), fn_image_disabled);
     }
@@ -4014,80 +4017,80 @@ const SPREADSHEET_FN_NAMES: &[&str] = &[
 #[cfg(feature = "spreadsheet")]
 fn register_spreadsheet_functions(f: &mut HashMap<String, BuiltinFunction>) {
     use crate::spreadsheet as ss;
-    f.insert("spreadsheetNew".into(), ss::fn_spreadsheet_new);
-    f.insert("spreadsheet".into(), ss::fn_spreadsheet);
-    f.insert("spreadsheetRead".into(), ss::fn_spreadsheet_read);
-    f.insert("spreadsheetReadBinary".into(), ss::fn_spreadsheet_read_binary);
-    f.insert("isSpreadsheetObject".into(), ss::fn_is_spreadsheet_object);
-    f.insert("spreadsheetSetCellValue".into(), ss::fn_spreadsheet_set_cell_value);
-    f.insert("spreadsheetGetCellValue".into(), ss::fn_spreadsheet_get_cell_value);
-    f.insert("spreadsheetCreateSheet".into(), ss::fn_spreadsheet_create_sheet);
-    f.insert("spreadsheetRenameSheet".into(), ss::fn_spreadsheet_rename_sheet);
-    f.insert("spreadsheetWrite".into(), ss::fn_spreadsheet_write);
-    f.insert("spreadsheetInfo".into(), ss::fn_spreadsheet_info);
-    f.insert("spreadsheetGetColumnCount".into(), ss::fn_spreadsheet_get_column_count);
-    f.insert("spreadsheetSetActiveSheet".into(), ss::fn_spreadsheet_set_active_sheet);
-    f.insert("spreadsheetSetActiveSheetNumber".into(), ss::fn_spreadsheet_set_active_sheet_number);
-    f.insert("spreadsheetAddRow".into(), ss::fn_spreadsheet_add_row);
-    f.insert("spreadsheetAddRows".into(), ss::fn_spreadsheet_add_rows);
-    f.insert("spreadsheetAddColumn".into(), ss::fn_spreadsheet_add_column);
-    f.insert("spreadsheetFormatCell".into(), ss::fn_spreadsheet_format_cell);
-    f.insert("spreadsheetFormatRow".into(), ss::fn_spreadsheet_format_row);
-    f.insert("spreadsheetFormatColumn".into(), ss::fn_spreadsheet_format_column);
-    f.insert("spreadsheetFormatCellRange".into(), ss::fn_spreadsheet_format_cell_range);
-    f.insert("spreadsheetMergeCells".into(), ss::fn_spreadsheet_merge_cells);
-    f.insert("spreadsheetAddFreezePane".into(), ss::fn_spreadsheet_add_freeze_pane);
-    f.insert("spreadsheetSetColumnWidth".into(), ss::fn_spreadsheet_set_column_width);
-    f.insert("spreadsheetSetRowHeight".into(), ss::fn_spreadsheet_set_row_height);
-    f.insert("spreadsheetDeleteRow".into(), ss::fn_spreadsheet_delete_row);
-    f.insert("spreadsheetDeleteRows".into(), ss::fn_spreadsheet_delete_rows);
-    f.insert("spreadsheetDeleteColumn".into(), ss::fn_spreadsheet_delete_column);
-    f.insert("spreadsheetDeleteColumns".into(), ss::fn_spreadsheet_delete_columns);
-    f.insert("spreadsheetShiftRows".into(), ss::fn_spreadsheet_shift_rows);
-    f.insert("spreadsheetShiftColumns".into(), ss::fn_spreadsheet_shift_columns);
-    f.insert("spreadsheetSetCellFormula".into(), ss::fn_spreadsheet_set_cell_formula);
-    f.insert("spreadsheetGetCellFormula".into(), ss::fn_spreadsheet_get_cell_formula);
-    f.insert("spreadsheetGetCellType".into(), ss::fn_spreadsheet_get_cell_type);
-    f.insert("spreadsheetClearCell".into(), ss::fn_spreadsheet_clear_cell);
-    f.insert("spreadsheetClearCellRange".into(), ss::fn_spreadsheet_clear_cell_range);
-    f.insert("spreadsheetSetCellRangeValue".into(), ss::fn_spreadsheet_set_cell_range_value);
-    f.insert("spreadsheetSetCellComment".into(), ss::fn_spreadsheet_set_cell_comment);
-    f.insert("spreadsheetSetCellHyperlink".into(), ss::fn_spreadsheet_set_cell_hyperlink);
-    f.insert("spreadsheetAddAutofilter".into(), ss::fn_spreadsheet_add_autofilter);
-    f.insert("spreadsheetAddInfo".into(), ss::fn_spreadsheet_add_info);
-    f.insert("spreadsheetAddImage".into(), ss::fn_spreadsheet_add_image);
-    f.insert("spreadsheetAddChart".into(), ss::fn_spreadsheet_add_chart);
-    f.insert("spreadsheetToQuery".into(), ss::fn_spreadsheet_to_query);
-    f.insert("spreadsheetToArray".into(), ss::fn_spreadsheet_to_array);
-    f.insert("spreadsheetToCsv".into(), ss::fn_spreadsheet_to_csv);
-    f.insert("spreadsheetWriteToCsv".into(), ss::fn_spreadsheet_write_to_csv);
-    f.insert("spreadsheetReadCsv".into(), ss::fn_spreadsheet_read_csv);
-    f.insert("isSpreadsheetFile".into(), ss::fn_is_spreadsheet_file);
-    f.insert("spreadsheetGetCellComment".into(), ss::fn_spreadsheet_get_cell_comment);
-    f.insert("spreadsheetGetCellHyperlink".into(), ss::fn_spreadsheet_get_cell_hyperlink);
-    f.insert("spreadsheetAddSplitPane".into(), ss::fn_spreadsheet_add_split_pane);
-    f.insert("spreadsheetSetPrintOrientation".into(), ss::fn_spreadsheet_set_print_orientation);
-    f.insert("spreadsheetSetFitToPage".into(), ss::fn_spreadsheet_set_fit_to_page);
-    f.insert("spreadsheetSetHeader".into(), ss::fn_spreadsheet_set_header);
-    f.insert("spreadsheetSetFooter".into(), ss::fn_spreadsheet_set_footer);
-    f.insert("spreadsheetSetColumnHidden".into(), ss::fn_spreadsheet_set_column_hidden);
-    f.insert("spreadsheetSetRowHidden".into(), ss::fn_spreadsheet_set_row_hidden);
-    f.insert("spreadsheetAddDataValidation".into(), ss::fn_spreadsheet_add_data_validation);
-    f.insert("spreadsheetAddConditionalFormatting".into(), ss::fn_spreadsheet_add_conditional_formatting);
-    f.insert("spreadsheetGetColumnWidth".into(), ss::fn_spreadsheet_get_column_width);
-    f.insert("spreadsheetGetCellFormat".into(), ss::fn_spreadsheet_get_cell_format);
-    f.insert("spreadsheetSetActiveCell".into(), ss::fn_spreadsheet_set_active_cell);
-    f.insert("spreadsheetAddPageBreaks".into(), ss::fn_spreadsheet_add_page_breaks);
-    f.insert("spreadsheetSetRepeatingRows".into(), ss::fn_spreadsheet_set_repeating_rows);
-    f.insert("spreadsheetSetRepeatingColumns".into(), ss::fn_spreadsheet_set_repeating_columns);
-    f.insert("spreadsheetToJson".into(), ss::fn_spreadsheet_to_json);
-    f.insert("spreadsheetFromJson".into(), ss::fn_spreadsheet_from_json);
+    f.insert("spreadsheetNew".to_string(), ss::fn_spreadsheet_new);
+    f.insert("spreadsheet".to_string(), ss::fn_spreadsheet);
+    f.insert("spreadsheetRead".to_string(), ss::fn_spreadsheet_read);
+    f.insert("spreadsheetReadBinary".to_string(), ss::fn_spreadsheet_read_binary);
+    f.insert("isSpreadsheetObject".to_string(), ss::fn_is_spreadsheet_object);
+    f.insert("spreadsheetSetCellValue".to_string(), ss::fn_spreadsheet_set_cell_value);
+    f.insert("spreadsheetGetCellValue".to_string(), ss::fn_spreadsheet_get_cell_value);
+    f.insert("spreadsheetCreateSheet".to_string(), ss::fn_spreadsheet_create_sheet);
+    f.insert("spreadsheetRenameSheet".to_string(), ss::fn_spreadsheet_rename_sheet);
+    f.insert("spreadsheetWrite".to_string(), ss::fn_spreadsheet_write);
+    f.insert("spreadsheetInfo".to_string(), ss::fn_spreadsheet_info);
+    f.insert("spreadsheetGetColumnCount".to_string(), ss::fn_spreadsheet_get_column_count);
+    f.insert("spreadsheetSetActiveSheet".to_string(), ss::fn_spreadsheet_set_active_sheet);
+    f.insert("spreadsheetSetActiveSheetNumber".to_string(), ss::fn_spreadsheet_set_active_sheet_number);
+    f.insert("spreadsheetAddRow".to_string(), ss::fn_spreadsheet_add_row);
+    f.insert("spreadsheetAddRows".to_string(), ss::fn_spreadsheet_add_rows);
+    f.insert("spreadsheetAddColumn".to_string(), ss::fn_spreadsheet_add_column);
+    f.insert("spreadsheetFormatCell".to_string(), ss::fn_spreadsheet_format_cell);
+    f.insert("spreadsheetFormatRow".to_string(), ss::fn_spreadsheet_format_row);
+    f.insert("spreadsheetFormatColumn".to_string(), ss::fn_spreadsheet_format_column);
+    f.insert("spreadsheetFormatCellRange".to_string(), ss::fn_spreadsheet_format_cell_range);
+    f.insert("spreadsheetMergeCells".to_string(), ss::fn_spreadsheet_merge_cells);
+    f.insert("spreadsheetAddFreezePane".to_string(), ss::fn_spreadsheet_add_freeze_pane);
+    f.insert("spreadsheetSetColumnWidth".to_string(), ss::fn_spreadsheet_set_column_width);
+    f.insert("spreadsheetSetRowHeight".to_string(), ss::fn_spreadsheet_set_row_height);
+    f.insert("spreadsheetDeleteRow".to_string(), ss::fn_spreadsheet_delete_row);
+    f.insert("spreadsheetDeleteRows".to_string(), ss::fn_spreadsheet_delete_rows);
+    f.insert("spreadsheetDeleteColumn".to_string(), ss::fn_spreadsheet_delete_column);
+    f.insert("spreadsheetDeleteColumns".to_string(), ss::fn_spreadsheet_delete_columns);
+    f.insert("spreadsheetShiftRows".to_string(), ss::fn_spreadsheet_shift_rows);
+    f.insert("spreadsheetShiftColumns".to_string(), ss::fn_spreadsheet_shift_columns);
+    f.insert("spreadsheetSetCellFormula".to_string(), ss::fn_spreadsheet_set_cell_formula);
+    f.insert("spreadsheetGetCellFormula".to_string(), ss::fn_spreadsheet_get_cell_formula);
+    f.insert("spreadsheetGetCellType".to_string(), ss::fn_spreadsheet_get_cell_type);
+    f.insert("spreadsheetClearCell".to_string(), ss::fn_spreadsheet_clear_cell);
+    f.insert("spreadsheetClearCellRange".to_string(), ss::fn_spreadsheet_clear_cell_range);
+    f.insert("spreadsheetSetCellRangeValue".to_string(), ss::fn_spreadsheet_set_cell_range_value);
+    f.insert("spreadsheetSetCellComment".to_string(), ss::fn_spreadsheet_set_cell_comment);
+    f.insert("spreadsheetSetCellHyperlink".to_string(), ss::fn_spreadsheet_set_cell_hyperlink);
+    f.insert("spreadsheetAddAutofilter".to_string(), ss::fn_spreadsheet_add_autofilter);
+    f.insert("spreadsheetAddInfo".to_string(), ss::fn_spreadsheet_add_info);
+    f.insert("spreadsheetAddImage".to_string(), ss::fn_spreadsheet_add_image);
+    f.insert("spreadsheetAddChart".to_string(), ss::fn_spreadsheet_add_chart);
+    f.insert("spreadsheetToQuery".to_string(), ss::fn_spreadsheet_to_query);
+    f.insert("spreadsheetToArray".to_string(), ss::fn_spreadsheet_to_array);
+    f.insert("spreadsheetToCsv".to_string(), ss::fn_spreadsheet_to_csv);
+    f.insert("spreadsheetWriteToCsv".to_string(), ss::fn_spreadsheet_write_to_csv);
+    f.insert("spreadsheetReadCsv".to_string(), ss::fn_spreadsheet_read_csv);
+    f.insert("isSpreadsheetFile".to_string(), ss::fn_is_spreadsheet_file);
+    f.insert("spreadsheetGetCellComment".to_string(), ss::fn_spreadsheet_get_cell_comment);
+    f.insert("spreadsheetGetCellHyperlink".to_string(), ss::fn_spreadsheet_get_cell_hyperlink);
+    f.insert("spreadsheetAddSplitPane".to_string(), ss::fn_spreadsheet_add_split_pane);
+    f.insert("spreadsheetSetPrintOrientation".to_string(), ss::fn_spreadsheet_set_print_orientation);
+    f.insert("spreadsheetSetFitToPage".to_string(), ss::fn_spreadsheet_set_fit_to_page);
+    f.insert("spreadsheetSetHeader".to_string(), ss::fn_spreadsheet_set_header);
+    f.insert("spreadsheetSetFooter".to_string(), ss::fn_spreadsheet_set_footer);
+    f.insert("spreadsheetSetColumnHidden".to_string(), ss::fn_spreadsheet_set_column_hidden);
+    f.insert("spreadsheetSetRowHidden".to_string(), ss::fn_spreadsheet_set_row_hidden);
+    f.insert("spreadsheetAddDataValidation".to_string(), ss::fn_spreadsheet_add_data_validation);
+    f.insert("spreadsheetAddConditionalFormatting".to_string(), ss::fn_spreadsheet_add_conditional_formatting);
+    f.insert("spreadsheetGetColumnWidth".to_string(), ss::fn_spreadsheet_get_column_width);
+    f.insert("spreadsheetGetCellFormat".to_string(), ss::fn_spreadsheet_get_cell_format);
+    f.insert("spreadsheetSetActiveCell".to_string(), ss::fn_spreadsheet_set_active_cell);
+    f.insert("spreadsheetAddPageBreaks".to_string(), ss::fn_spreadsheet_add_page_breaks);
+    f.insert("spreadsheetSetRepeatingRows".to_string(), ss::fn_spreadsheet_set_repeating_rows);
+    f.insert("spreadsheetSetRepeatingColumns".to_string(), ss::fn_spreadsheet_set_repeating_columns);
+    f.insert("spreadsheetToJson".to_string(), ss::fn_spreadsheet_to_json);
+    f.insert("spreadsheetFromJson".to_string(), ss::fn_spreadsheet_from_json);
 }
 
 #[cfg(not(feature = "spreadsheet"))]
 fn register_spreadsheet_functions(f: &mut HashMap<String, BuiltinFunction>) {
     // isSpreadsheetObject is a type predicate — always safe to answer "false".
-    f.insert("isSpreadsheetObject".into(), |_args| Ok(CfmlValue::Bool(false)));
+    f.insert("isSpreadsheetObject".to_string(), |_args| Ok(CfmlValue::Bool(false)));
     for name in SPREADSHEET_FN_NAMES {
         f.insert((*name).into(), fn_spreadsheet_disabled);
     }
@@ -8907,7 +8910,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let mut hdrs: HashMap<String, String> = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("headers"))
                 .and_then(|(_,v)| if let CfmlValue::Struct(h) = v {
-                    Some(h.iter().map(|(k, v)| (k.clone(), v.as_string())).collect())
+                    Some(h.iter().map(|(k, v)| (k.as_str().to_string(), v.as_string())).collect())
                 } else { None })
                 .unwrap_or_default();
             // Process cfhttpparam params array
@@ -14398,14 +14401,14 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
 
                     if should_include {
                         let mut row = ValueMap::default();
-                        row.insert("name".into(), CfmlValue::string(name.clone()));
+                        row.insert("name", CfmlValue::string(name.clone()));
                         row.insert(
-                            "directory".into(),
+                            "directory",
                             CfmlValue::string(dir.to_string_lossy().to_string()),
                         );
-                        row.insert("type".into(), CfmlValue::string(file_type));
-                        row.insert("size".into(), CfmlValue::Int(size));
-                        row.insert("datelastmodified".into(), CfmlValue::string(modified));
+                        row.insert("type", CfmlValue::string(file_type));
+                        row.insert("size", CfmlValue::Int(size));
+                        row.insert("datelastmodified", CfmlValue::string(modified));
                         rows.push(row);
                     }
 
@@ -17986,7 +17989,7 @@ fn cfml_to_yaml(v: &CfmlValue) -> serde_yaml::Value {
                 if k.starts_with("__") {
                     continue;
                 }
-                m.insert(Y::String(k), cfml_to_yaml(&val));
+                m.insert(Y::String(k.as_str().to_string()), cfml_to_yaml(&val));
             }
             Y::Mapping(m)
         }

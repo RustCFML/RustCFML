@@ -15,7 +15,6 @@
 
 use crate::{
     cfml_compare, cfml_equal, CfmlVirtualMachine, InheritedKeys, TryHandler,
-    ARGUMENTS_SCOPE_KEY,
 };
 use cfml_codegen::{BytecodeFunction, BytecodeOp, CmpOp};
 use cfml_common::dynamic::{CfmlValue, ValueMap};
@@ -104,7 +103,7 @@ pub(crate) fn op_store_global(
     name: &Name,
 ) {
     if let Some(val) = stack.pop() {
-        vm.globals.insert(name.to_string(), val);
+        vm.globals.insert(name, val);
     }
 }
 
@@ -196,7 +195,7 @@ pub(crate) fn op_jump_if_arg_present(
     // set is `arguments_supplied` — same GH #240 guarantee (it holds
     // only the params the caller passed, never carried enclosing
     // vars). `contains` uses the pre-lowercased key.
-    let supplied = match locals.get(ARGUMENTS_SCOPE_KEY) {
+    let supplied = match locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
         Some(CfmlValue::Struct(a)) => a.contains_key_ci(name),
         _ => arguments_supplied
             .as_ref()
@@ -351,7 +350,7 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
         }
         _ => None,
     };
-    let matched = match slot_val.or_else(|| locals.get(name.as_str())) {
+    let matched = match slot_val.or_else(|| locals.get(name)) {
         Some(CfmlValue::Int(i)) => {
             let c = c;
             let i = *i;
@@ -393,7 +392,7 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
             let left = match other {
                 Some(v) => v.clone(),
                 None => locals
-                    .get("__variables")
+                    .get(&*cfml_common::key::well_known::VARIABLES)
                     .and_then(|v| v.as_cfml_struct())
                     .and_then(|s| s.get_ci(name.as_str()))
                     .unwrap_or(CfmlValue::Null),
@@ -445,7 +444,7 @@ pub(crate) fn op_try_load_local(
             &slots,
         ))
     } else if name_lower == "variables" {
-        if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+        if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
             CfmlValue::Struct(vars.clone())
         } else {
             CfmlValue::strukt(locals.clone())
@@ -572,7 +571,7 @@ pub(crate) fn op_load_local_property(
     };
     let name_lower: &str = local_name.lower();
     let receiver = slot_receiver.or_else(|| {
-        locals.get(local_name.as_str()).cloned().or_else(|| {
+        locals.get(local_name).cloned().or_else(|| {
             vm.lookup_name_in_scopes(
                 local_name.as_str(),
                 name_lower,
@@ -653,7 +652,7 @@ pub(crate) fn op_array_append_local(
     }
 
     // Fast path: array held directly in this frame's locals.
-    if let Some(CfmlValue::Array(arr)) = locals.get(name.as_str()) {
+    if let Some(CfmlValue::Array(arr)) = locals.get(name) {
         arr.push(value);
         return Ok(());
     }
@@ -673,10 +672,10 @@ pub(crate) fn op_array_append_local(
     // array and store it in the correct scope, mirroring how
     // StoreLocal routes a plain identifier.
     let val = CfmlValue::array(vec![value]);
-    if locals.contains_key("__variables")
+    if locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
         && !declared_locals.contains(name.as_str())
         && !declared_locals.contains(name_lower)
-        && !locals.contains_key(name.as_str())
+        && !locals.contains_key(name)
         && !effective_local_mode_modern
         // A declared parameter is local, never the component scope —
         // see the matching guard in StoreLocal above.
@@ -684,27 +683,27 @@ pub(crate) fn op_array_append_local(
     {
         // CFC method, classic localmode: component (variables) scope.
         if let Some(vars) =
-            locals.get_mut("__variables").and_then(|v| v.as_cfml_struct())
+            locals.get_mut(&*cfml_common::key::well_known::VARIABLES).and_then(|v| v.as_cfml_struct())
         {
-            vars.insert(name.to_string(), val);
+            vars.insert(name, val);
         }
     } else {
-        locals.insert(name.to_string(), val.clone());
+        locals.insert(name, val.clone());
         if is_inside_function
             && !declared_locals.contains(name.as_str())
             && !declared_locals.contains(name_lower)
             && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
         {
             if let Some(args) =
-                locals.get_mut(ARGUMENTS_SCOPE_KEY).and_then(|v| v.as_cfml_struct())
+                locals.get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE).and_then(|v| v.as_cfml_struct())
             {
-                args.insert(name.to_string(), val.clone());
+                args.insert(name, val.clone());
             }
         }
         if let Some(ref env) = closure_env {
             let mut m = env.write().unwrap();
-            if m.contains_key(name.as_str()) {
-                m.insert(name.to_string(), val);
+            if m.contains_key(name) {
+                m.insert(name, val);
             }
         }
     }
@@ -816,7 +815,7 @@ pub(crate) fn op_call_rust_super_ctor(
         (0..arg_count).filter_map(|_| stack.pop()).collect();
     ctor_args.reverse();
 
-    let this_val = locals.get("this").cloned().ok_or_else(|| {
+    let this_val = locals.get(&*cfml_common::key::well_known::THIS).cloned().ok_or_else(|| {
         CfmlError::runtime(
             "super(...) called outside of a CFC method".to_string(),
         )
@@ -893,7 +892,7 @@ pub(crate) fn op_load_super(
     // defining source, then reuse the marker `__is_super` dispatch
     // (which binds `this` to the live instance from the frame).
     #[cfg(feature = "component-instance")]
-    if let Some(CfmlValue::Instance(inst)) = locals.get("this") {
+    if let Some(CfmlValue::Instance(inst)) = locals.get(&*cfml_common::key::well_known::THIS) {
         let g = inst.read();
         let mut pushed = false;
         if let (Some(src), Some(CfmlValue::Struct(map))) =
@@ -941,7 +940,7 @@ pub(crate) fn op_load_super(
     // chain. Falls back to the flat `__super` (2-level CFCs and
     // rust-parent objects, which carry no map).
     let mut pushed = false;
-    if let Some(CfmlValue::Struct(s)) = locals.get("this") {
+    if let Some(CfmlValue::Struct(s)) = locals.get(&*cfml_common::key::well_known::THIS) {
         if let (Some(src), Some(CfmlValue::Struct(map))) =
             (vm.source_file.as_ref(), s.get_ci("__super_map"))
         {
@@ -955,7 +954,7 @@ pub(crate) fn op_load_super(
             }
         }
         if !pushed {
-            if let Some(sup) = s.get_ci("__super") {
+            if let Some(sup) = s.get_ci(&*cfml_common::key::well_known::SUPER_NATIVE) {
                 stack.push(sup);
                 pushed = true;
             }

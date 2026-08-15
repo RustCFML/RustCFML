@@ -239,11 +239,11 @@ fn rows_to_query(
     }
 
     let mut q = ValueMap::default();
-    q.insert("recordCount".into(), CfmlValue::Int(record_count as i64));
+    q.insert("recordCount", CfmlValue::Int(record_count as i64));
     // columnList reports column names uppercased, matching Lucee/ACF.
-    q.insert("columnList".into(), CfmlValue::string(columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
+    q.insert("columnList", CfmlValue::string(columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
     q.insert(
-        "columns".into(),
+        "columns",
         CfmlValue::array(
             columns
                 .iter()
@@ -251,19 +251,19 @@ fn rows_to_query(
                 .collect(),
         ),
     );
-    q.insert("data".into(), CfmlValue::array(records));
+    q.insert("data", CfmlValue::array(records));
 
     let mut driver_meta = ValueMap::default();
-    driver_meta.insert("duration_ms".into(), CfmlValue::Double(meta.duration));
+    driver_meta.insert("duration_ms", CfmlValue::Double(meta.duration));
     driver_meta.insert(
-        "rows_affected".into(),
+        "rows_affected",
         CfmlValue::Int(meta.rows_affected),
     );
     driver_meta.insert(
-        "last_insert_id".into(),
+        "last_insert_id",
         CfmlValue::Int(meta.last_insert_id),
     );
-    q.insert("_meta".into(), CfmlValue::strukt(driver_meta));
+    q.insert("_meta", CfmlValue::strukt(driver_meta));
 
     CfmlValue::strukt(q)
 }

@@ -30,6 +30,12 @@ use std::sync::{Arc, RwLock};
 
 #[derive(Debug)]
 struct NameInner {
+    /// The map key for this identifier, built ONCE here at intern time — i.e.
+    /// at compile time, since `Name`s are created by codegen. This is the
+    /// BoxLang trick (`Key` emitted as a compile-time constant): a scope or
+    /// struct lookup through a `Name` needs no fold and no hash, and seeding a
+    /// frame with one allocates nothing (cloning a `Key` is a refcount bump).
+    key: crate::key::Key,
     orig: Box<str>,
     /// `None` when `orig` is already all-lowercase (the common case for CFML
     /// code in practice) — `lower()` then borrows `orig` directly.
@@ -81,6 +87,7 @@ impl Name {
             None
         };
         Name(Arc::new(NameInner {
+            key: crate::key::Key::new(s),
             orig: Box::from(s),
             lower,
         }))
@@ -115,6 +122,33 @@ impl Name {
     #[inline]
     pub fn eq_ci(&self, other: &str) -> bool {
         self.lower().eq_ignore_ascii_case(other)
+    }
+
+    /// This identifier as a struct/scope [`Key`] — free, precomputed at intern
+    /// time. Use for INSERTS (`scope.insert(name.key(), v)`): it clones an
+    /// existing `Key`, so no string is allocated and nothing is hashed.
+    #[inline]
+    pub fn key(&self) -> &crate::key::Key {
+        &self.0.key
+    }
+}
+
+/// Probe a [`ValueMap`](crate::dynamic::ValueMap) with a `Name` directly —
+/// the hash comes from the interned `Key`, so the lookup does no hashing at
+/// all. This is the fast path the whole `Key` migration exists to enable.
+impl crate::dynamic::ProbeKey for Name {
+    #[inline]
+    fn probe(&self) -> crate::key::KeyRef<'_> {
+        #[cfg(feature = "probe-sites")]
+        crate::perf_counters::bump(&crate::perf_counters::PROBE_PRECOMPUTED);
+        self.0.key.as_ref()
+    }
+}
+
+impl crate::dynamic::IntoKey for &Name {
+    #[inline]
+    fn into_key(self) -> crate::key::Key {
+        self.0.key.clone()
     }
 }
 

@@ -470,7 +470,7 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
                 } else if let Some((name, e)) = component_view(&snap) {
                     (format!("Component {}", name), e)
                 } else {
-                    ("Struct".into(), snap.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    ("Struct".into(), snap.iter().map(|(k, v)| (k.clone(), v.clone())).map(|(k, v)| (k.as_str().to_string(), v)).collect())
                 };
             out.push_str(&format!("{} ({})\n", label, entries.len()));
             for (k, v) in &entries {
@@ -574,7 +574,7 @@ fn component_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<
         if cfml_common::component::is_reserved_component_key(k) || k.eq_ignore_ascii_case("this") {
             continue;
         }
-        entries.push((k.clone(), v.clone()));
+        entries.push((k.as_str().to_string(), v.clone()));
     }
     Some((name, entries))
 }

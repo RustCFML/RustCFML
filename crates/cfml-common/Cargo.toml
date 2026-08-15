@@ -30,6 +30,7 @@ component-instance = []
 # Sizing builds only — adds a Location argument to every hot constructor call
 # plus a Mutex'd map bump per construction. Never ship a release with this on.
 alloc-sizing = []
+probe-sites = []
 # Dynamic op census (P3/P4 sizing) — the VM's dispatch loop bumps one relaxed
 # atomic add per EXECUTED bytecode op, so the Tier-0 JIT can be sized against
 # the mix Preside really runs instead of the static op-weight scan. Probe builds
@@ -53,7 +54,7 @@ exists-census = []
 [dependencies]
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-indexmap = { workspace = true }
+indexmap = { workspace = true, features = ["serde"] }
 rustc-hash = { workspace = true }
 num-traits = { workspace = true }
 log = { workspace = true }

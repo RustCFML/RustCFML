@@ -30,37 +30,23 @@ pub(crate) fn op_get_property(
     if let Some(obj) = stack.pop() {
         match &obj {
             CfmlValue::Struct(s) => {
-                let val = s
-                    .get(name.as_str())
-                    .or_else(|| s.get(&name.to_uppercase()))
-                    .or_else(|| s.get(name.lower()))
-                    .or_else(|| {
-                        // Full case-insensitive scan for mixed-case keys.
-                        // Pure key compare + one value clone, so read under
-                        // the lock instead of cloning the whole struct.
-                        let name_lower = name.lower();
-                        s.with_map(|m| {
-                            m.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                                .map(|(_, v)| v.clone())
-                        })
-                    })
-                    .or_else(|| {
-                        // Fall back to __variables for component properties
-                        if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
-                            let name_lower = name.to_lowercase();
-                            vars.get(name.as_str())
-                                .or_else(|| vars.get(&name_lower))
-                                .or_else(|| {
-                                    vars.iter()
-                                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                                        .map(|(_, v)| v)
-                                })
-                        } else {
-                            None
-                        }
-                    })
-                    ;
+                // v0.599 — ONE probe. `name` is an interned bytecode operand
+                // carrying its precomputed key hash, and the map itself folds
+                // case, so the old exact → UPPER → lower → full-scan ladder
+                // (four probes plus a `to_uppercase()` allocation per miss —
+                // 6.3% of all keyed lookups on a warm Preside render) collapses
+                // into it. Same answer: every rung differed only in the casing
+                // it tried.
+                let val = s.get(name).or_else(|| {
+                    // Fall back to __variables for component properties.
+                    if let Some(CfmlValue::Struct(vars)) =
+                        s.get(&*cfml_common::key::well_known::VARIABLES)
+                    {
+                        vars.get(name)
+                    } else {
+                        None
+                    }
+                });
                 let val = match val {
                     Some(v) => {
                         // A component method extracted as a VALUE
@@ -78,16 +64,16 @@ pub(crate) fn op_get_property(
                         // component methods on a component receiver.
                         if let CfmlValue::Function(ref f) = v {
                             if f.captured_scope.is_none()
-                                && (s.contains_key("__variables")
+                                && (s.contains_key(&*cfml_common::key::well_known::VARIABLES)
                                     || s.contains_key("__name"))
                             {
                                 let mut bound: ValueMap = ValueMap::default();
                                 bound.insert("this".to_string(), obj.clone());
-                                if let Some(vars) = s.get("__variables") {
+                                if let Some(vars) = s.get(&*cfml_common::key::well_known::VARIABLES) {
                                     bound.insert("__variables".to_string(), vars.clone());
                                     bound.insert("variables".to_string(), vars.clone());
                                 }
-                                if let Some(sup) = s.get("__super") {
+                                if let Some(sup) = s.get(&*cfml_common::key::well_known::SUPER_NATIVE) {
                                     bound.insert("super".to_string(), sup.clone());
                                 }
                                 let mut bound_fn = (**f).clone();
@@ -104,7 +90,7 @@ pub(crate) fn op_get_property(
                     None => {
                         // Fall through to a Rust-backed parent if attached.
                         if let Some(CfmlValue::NativeObject(parent)) =
-                            s.get("__super")
+                            s.get(&*cfml_common::key::well_known::SUPER_NATIVE)
                         {
                             if let Ok(guard) = parent.read() {
                                 guard.get_property(name).unwrap_or(CfmlValue::Null)
@@ -514,7 +500,7 @@ pub(crate) fn op_set_property(
             // parent returns None to defer to the CFC.
             if let CfmlValue::Struct(ref s) = obj {
                 if let Some(CfmlValue::NativeObject(parent)) =
-                    s.get("__super")
+                    s.get(&*cfml_common::key::well_known::SUPER_NATIVE)
                 {
                     let handled = {
                         let mut guard = parent.write().map_err(|_| {
@@ -535,10 +521,10 @@ pub(crate) fn op_set_property(
             // also update __variables for properties declared via
             // `property name="x"` so they're accessible unscoped in methods.
             if let Some(s) = obj.as_cfml_struct() {
-                if s.contains_key("__variables") && s.contains_key("__properties") {
+                if s.contains_key(&*cfml_common::key::well_known::VARIABLES) && s.contains_key(&*cfml_common::key::well_known::PROPERTIES) {
                     let name_lower = name.lower();
                     let is_declared = if let Some(CfmlValue::Array(props)) =
-                        s.get("__properties")
+                        s.get(&*cfml_common::key::well_known::PROPERTIES)
                     {
                         props.iter().any(|p| {
                             if let CfmlValue::Struct(ps) = p {
@@ -556,9 +542,9 @@ pub(crate) fn op_set_property(
                     };
                     if is_declared {
                         if let Some(CfmlValue::Struct(vars)) =
-                            s.get("__variables")
+                            s.get(&*cfml_common::key::well_known::VARIABLES)
                         {
-                            vars.insert(name.to_string(), value.clone());
+                            vars.insert(name, value.clone());
                         }
                     }
                 }

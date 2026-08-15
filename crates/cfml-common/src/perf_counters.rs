@@ -32,6 +32,16 @@ pub static BUILTIN_LOOKUP_CI_MISCASED: AtomicU64 = AtomicU64::new(0);
 /// these still pay the O(n) scan and should be zero in a healthy process.
 pub static BUILTIN_LOOKUP_CI_SCAN: AtomicU64 = AtomicU64::new(0);
 
+/// (`probe-sites` builds only — these sit on the hottest path in the engine,
+/// so the shipped binary must not pay even a relaxed atomic for them.)
+/// Keyed lookups whose probe carried a PRE-COMPUTED hash — a `Key` or a
+/// bytecode `Name` (interned at compile time). These do no hashing at all.
+pub static PROBE_PRECOMPUTED: AtomicU64 = AtomicU64::new(0);
+/// Keyed lookups that had to fold-hash a `&str`/`String` probe at the call
+/// site. The ratio of these two is what says how much of the interned-key
+/// lever has actually been captured.
+pub static PROBE_HASHED: AtomicU64 = AtomicU64::new(0);
+
 /// Existence memo answers served without touching the filesystem.
 pub static EXISTS_MEMO_HITS: AtomicU64 = AtomicU64::new(0);
 /// Actual VFS existence probes (each is ≥1 `stat` syscall).
@@ -109,6 +119,13 @@ pub fn report() -> String {
     {
         out.push('\n');
         out.push_str(&alloc_sites::report(60));
+    }
+    #[cfg(feature = "probe-sites")]
+    {
+        out.push('\n');
+        out.push_str(&probe_sites::totals());
+        out.push('\n');
+        out.push_str(&probe_sites::report(40));
     }
     #[cfg(feature = "exists-census")]
     {
@@ -431,6 +448,66 @@ pub mod call_phases {
             let raw = NS[i].load(Relaxed) as f64 / calls as f64;
             let net = (raw - cal).max(0.0);
             out.push_str(&format!("\n{:>9.1} ns/frame  {}", net, label));
+        }
+        out
+    }
+}
+
+/// Call-site census for keyed lookups that fold-hash a `&str` at the probe
+/// site (`probe-sites` builds only).
+///
+/// The [`PROBE_PRECOMPUTED`]/[`PROBE_HASHED`] pair says how much of the
+/// interned-key lever is captured; this says WHICH call sites still owe. A
+/// site listed here is one `&str` probe away from being free — convert it to
+/// take a `Name`/`Key` and its whole count moves to the precomputed column.
+#[cfg(feature = "probe-sites")]
+pub mod probe_sites {
+    /// Totals for the two probe classes, reported alongside the site list.
+    pub fn totals() -> String {
+        use super::{Relaxed, PROBE_HASHED, PROBE_PRECOMPUTED};
+        use std::sync::atomic::Ordering;
+        let _ = Relaxed;
+        let (p, h) = (
+            PROBE_PRECOMPUTED.load(Ordering::Relaxed),
+            PROBE_HASHED.load(Ordering::Relaxed),
+        );
+        let tot = (p + h).max(1);
+        format!(
+            "--- key probes: {p} precomputed ({:.1}%) / {h} hashed at site ({:.1}%) ---",
+            p as f64 / tot as f64 * 100.0,
+            h as f64 / tot as f64 * 100.0
+        )
+    }
+
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::panic::Location;
+
+    static SITES: Mutex<Option<HashMap<&'static Location<'static>, u64>>> = Mutex::new(None);
+
+    #[inline]
+    #[track_caller]
+    pub fn record() {
+        let loc = Location::caller();
+        let mut g = SITES.lock();
+        *g.get_or_insert_with(HashMap::new).entry(loc).or_default() += 1;
+    }
+
+    /// Cumulative top-`n` hashing probe sites, most frequent first.
+    pub fn report(n: usize) -> String {
+        let g = SITES.lock();
+        let Some(m) = g.as_ref() else {
+            return String::from("--- hashed probe sites: none recorded ---");
+        };
+        let mut rows: Vec<_> = m.iter().map(|(l, c)| (*l, *c)).collect();
+        rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let total: u64 = rows.iter().map(|(_, c)| c).sum();
+        let mut out = format!(
+            "--- hashed probe sites (cumulative; {total} total) ---"
+        );
+        for (loc, c) in rows.into_iter().take(n) {
+            out.push_str(&format!("\n{:>12}  {:>5.1}%   {}:{}", c,
+                c as f64 / total as f64 * 100.0, loc.file(), loc.line()));
         }
         out
     }

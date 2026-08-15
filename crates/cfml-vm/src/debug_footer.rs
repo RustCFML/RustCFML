@@ -979,9 +979,9 @@ fn to_cfml_struct(
     main_page: Option<&str>,
 ) -> CfmlValue {
     let mut root = ValueMap::default();
-    root.insert("starttime".into(), CfmlValue::Int(0));
+    root.insert("starttime", CfmlValue::Int(0));
     // Times are microseconds (Lucee's unit).
-    root.insert("total".into(), CfmlValue::Int(total_us));
+    root.insert("total", CfmlValue::Int(total_us));
 
     // queries
     let queries: Vec<CfmlValue> = data
@@ -989,41 +989,41 @@ fn to_cfml_struct(
         .iter()
         .map(|q| {
             let mut m = ValueMap::default();
-            m.insert("name".into(), CfmlValue::string(q.name.clone()));
-            m.insert("sql".into(), CfmlValue::string(q.sql.clone()));
-            m.insert("datasource".into(), CfmlValue::string(q.datasource.clone()));
-            m.insert("count".into(), CfmlValue::Int(q.count));
-            m.insert("time".into(), CfmlValue::Int(q.time));
-            m.insert("cached".into(), CfmlValue::Bool(q.cached));
-            m.insert("src".into(), CfmlValue::string(q.src.clone()));
-            m.insert("line".into(), CfmlValue::Int(q.line as i64));
+            m.insert("name", CfmlValue::string(q.name.clone()));
+            m.insert("sql", CfmlValue::string(q.sql.clone()));
+            m.insert("datasource", CfmlValue::string(q.datasource.clone()));
+            m.insert("count", CfmlValue::Int(q.count));
+            m.insert("time", CfmlValue::Int(q.time));
+            m.insert("cached", CfmlValue::Bool(q.cached));
+            m.insert("src", CfmlValue::string(q.src.clone()));
+            m.insert("line", CfmlValue::Int(q.line as i64));
             let params: Vec<CfmlValue> = q
                 .params
                 .iter()
                 .map(|p| {
                     let mut pm = ValueMap::default();
-                    pm.insert("name".into(), CfmlValue::string(p.name.clone()));
-                    pm.insert("value".into(), CfmlValue::string(p.value.clone()));
-                    pm.insert("type".into(), CfmlValue::string(p.sqltype.clone()));
+                    pm.insert("name", CfmlValue::string(p.name.clone()));
+                    pm.insert("value", CfmlValue::string(p.value.clone()));
+                    pm.insert("type", CfmlValue::string(p.sqltype.clone()));
                     CfmlValue::strukt(pm)
                 })
                 .collect();
-            m.insert("params".into(), CfmlValue::array(params));
+            m.insert("params", CfmlValue::array(params));
             CfmlValue::strukt(m)
         })
         .collect();
-    root.insert("queries".into(), CfmlValue::array(queries));
+    root.insert("queries", CfmlValue::array(queries));
 
     // pages
     let pages: Vec<CfmlValue> = aggregate_pages_with_main(&data.templates, main_page, total_us)
         .into_iter()
         .map(|p| {
             let mut m = ValueMap::default();
-            m.insert("id".into(), CfmlValue::string(p.id));
-            m.insert("count".into(), CfmlValue::Int(p.count));
-            m.insert("min".into(), CfmlValue::Int(p.min));
-            m.insert("max".into(), CfmlValue::Int(p.max));
-            m.insert("total".into(), CfmlValue::Int(p.total));
+            m.insert("id", CfmlValue::string(p.id));
+            m.insert("count", CfmlValue::Int(p.count));
+            m.insert("min", CfmlValue::Int(p.min));
+            m.insert("max", CfmlValue::Int(p.max));
+            m.insert("total", CfmlValue::Int(p.total));
             // Per-method breakdown for a CFC row (empty array for a plain
             // template). Each entry: name, count, total (µs).
             let methods: Vec<CfmlValue> = p
@@ -1031,17 +1031,17 @@ fn to_cfml_struct(
                 .iter()
                 .map(|mm| {
                     let mut e = ValueMap::default();
-                    e.insert("name".into(), CfmlValue::string(mm.name.clone()));
-                    e.insert("count".into(), CfmlValue::Int(mm.count));
-                    e.insert("total".into(), CfmlValue::Int(mm.total));
+                    e.insert("name", CfmlValue::string(mm.name.clone()));
+                    e.insert("count", CfmlValue::Int(mm.count));
+                    e.insert("total", CfmlValue::Int(mm.total));
                     CfmlValue::strukt(e)
                 })
                 .collect();
-            m.insert("methods".into(), CfmlValue::array(methods));
+            m.insert("methods", CfmlValue::array(methods));
             CfmlValue::strukt(m)
         })
         .collect();
-    root.insert("pages".into(), CfmlValue::array(pages));
+    root.insert("pages", CfmlValue::array(pages));
 
     // exceptions
     let exceptions: Vec<CfmlValue> = data
@@ -1049,25 +1049,25 @@ fn to_cfml_struct(
         .iter()
         .map(|e| {
             let mut m = ValueMap::default();
-            m.insert("type".into(), CfmlValue::string(e.etype.clone()));
-            m.insert("message".into(), CfmlValue::string(e.message.clone()));
-            m.insert("detail".into(), CfmlValue::string(e.detail.clone()));
-            m.insert("line".into(), CfmlValue::Int(e.line as i64));
+            m.insert("type", CfmlValue::string(e.etype.clone()));
+            m.insert("message", CfmlValue::string(e.message.clone()));
+            m.insert("detail", CfmlValue::string(e.detail.clone()));
+            m.insert("line", CfmlValue::Int(e.line as i64));
             let ctx: Vec<CfmlValue> = e
                 .stack
                 .iter()
                 .map(|(tmpl, line)| {
                     let mut cm = ValueMap::default();
-                    cm.insert("template".into(), CfmlValue::string(tmpl.clone()));
-                    cm.insert("line".into(), CfmlValue::Int(*line as i64));
+                    cm.insert("template", CfmlValue::string(tmpl.clone()));
+                    cm.insert("line", CfmlValue::Int(*line as i64));
                     CfmlValue::strukt(cm)
                 })
                 .collect();
-            m.insert("tagContext".into(), CfmlValue::array(ctx));
+            m.insert("tagContext", CfmlValue::array(ctx));
             CfmlValue::strukt(m)
         })
         .collect();
-    root.insert("exceptions".into(), CfmlValue::array(exceptions));
+    root.insert("exceptions", CfmlValue::array(exceptions));
 
     // genericData
     let generic: Vec<CfmlValue> = data
@@ -1075,13 +1075,13 @@ fn to_cfml_struct(
         .iter()
         .map(|g| {
             let mut m = ValueMap::default();
-            m.insert("category".into(), CfmlValue::string(g.category.clone()));
-            m.insert("name".into(), CfmlValue::string(g.name.clone()));
-            m.insert("value".into(), CfmlValue::string(g.value.clone()));
+            m.insert("category", CfmlValue::string(g.category.clone()));
+            m.insert("name", CfmlValue::string(g.name.clone()));
+            m.insert("value", CfmlValue::string(g.value.clone()));
             CfmlValue::strukt(m)
         })
         .collect();
-    root.insert("genericData".into(), CfmlValue::array(generic));
+    root.insert("genericData", CfmlValue::array(generic));
 
     // traces
     let traces: Vec<CfmlValue> = data
@@ -1089,20 +1089,20 @@ fn to_cfml_struct(
         .iter()
         .map(|t| {
             let mut m = ValueMap::default();
-            m.insert("category".into(), CfmlValue::string(t.category.clone()));
-            m.insert("text".into(), CfmlValue::string(t.text.clone()));
-            m.insert("type".into(), CfmlValue::string(t.log_type.clone()));
+            m.insert("category", CfmlValue::string(t.category.clone()));
+            m.insert("text", CfmlValue::string(t.text.clone()));
+            m.insert("type", CfmlValue::string(t.log_type.clone()));
             CfmlValue::strukt(m)
         })
         .collect();
-    root.insert("traces".into(), CfmlValue::array(traces));
+    root.insert("traces", CfmlValue::array(traces));
 
     // scopes
     let mut scope_struct = ValueMap::default();
     for (name, map) in scopes {
         scope_struct.insert(name.clone(), CfmlValue::strukt(map.clone()));
     }
-    root.insert("scopes".into(), CfmlValue::strukt(scope_struct));
+    root.insert("scopes", CfmlValue::strukt(scope_struct));
 
     CfmlValue::strukt(root)
 }

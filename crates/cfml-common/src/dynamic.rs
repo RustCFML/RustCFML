@@ -1,5 +1,6 @@
 //! Dynamic value types for CFML runtime
 
+use crate::key::{Key, KeyBuildHasher, KeyRef};
 use crate::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 use parking_lot::RwLock as PlRwLock;
@@ -15,11 +16,350 @@ use std::sync::{Arc, RwLock, Weak};
 /// short keys; hashing was the #1 self-time bucket in the v0.192 `/posts` profile.
 pub type ValueBuildHasher = std::hash::BuildHasherDefault<rustc_hash::FxHasher>;
 
-/// `ValueMap` with the fast [`ValueBuildHasher`]. The ordered
-/// key-value map underpinning CFML structs, scopes, and query rows. Construct with
-/// `ValueMap::default()` (the `ValueMap::default()` ctor only exists for `RandomState`)
-/// and pre-size with `ValueMap::with_capacity_and_hasher(n, Default::default())`.
-pub type ValueMap = IndexMap<String, CfmlValue, ValueBuildHasher>;
+/// The raw ordered map underneath [`ValueMap`]. Keyed by [`Key`], which hashes
+/// and compares case-insensitively while preserving the casing a key was first
+/// written with — so this map *is* CFML struct semantics, with no side index.
+pub type RawValueMap = IndexMap<Key, CfmlValue, KeyBuildHasher>;
+
+/// The ordered key-value map underpinning CFML structs, scopes, and query rows.
+///
+/// A thin newtype over [`RawValueMap`] whose lookup/insert methods accept a
+/// `&str`, a `String`, or a pre-built [`Key`] ([`IntoKey`] / [`ProbeKey`]).
+/// That is the whole point: a call site holding only a string keeps working
+/// unchanged (it pays one fold-hash, about what the old `ci`-index path cost),
+/// while a hot call site that already holds a `Key` — a name interned once at
+/// codegen and cloned thereafter — pays no hashing and no allocation at all.
+///
+/// Construct with `ValueMap::default()`, pre-size with
+/// `ValueMap::with_capacity_and_hasher(n, Default::default())`. Everything not
+/// defined inline here (`keys`, `values`, `iter`, `retain`, `get_index`, …)
+/// reaches the inner `IndexMap` through `Deref`/`DerefMut`.
+#[derive(Clone, Default)]
+pub struct ValueMap(RawValueMap);
+
+/// Types that can be turned into an owned [`Key`] for insertion. Passing a
+/// `Key` moves it (no hash, no allocation); passing a string builds one.
+pub trait IntoKey {
+    fn into_key(self) -> Key;
+}
+
+impl IntoKey for Key {
+    #[inline]
+    fn into_key(self) -> Key {
+        self
+    }
+}
+
+impl IntoKey for &Key {
+    #[inline]
+    fn into_key(self) -> Key {
+        self.clone()
+    }
+}
+
+impl IntoKey for String {
+    #[inline]
+    fn into_key(self) -> Key {
+        Key::from_string(self)
+    }
+}
+
+impl IntoKey for &str {
+    #[inline]
+    fn into_key(self) -> Key {
+        Key::new(self)
+    }
+}
+
+impl IntoKey for &String {
+    #[inline]
+    fn into_key(self) -> Key {
+        Key::new(self.as_str())
+    }
+}
+
+/// Types that can probe a [`ValueMap`] without building an owned key. A
+/// pre-built [`Key`] reuses its stored hash; a string hashes on the fly.
+pub trait ProbeKey {
+    fn probe(&self) -> KeyRef<'_>;
+}
+
+impl<'a> KeyRef<'a> {
+    /// Hash once, then reuse: methods that probe several maps (instance map,
+    /// then the shared method table) take a `KeyRef` so a `&str` caller pays
+    /// one fold-hash instead of one per probe.
+    #[inline]
+    pub fn text(&self) -> &'a str {
+        self.as_str()
+    }
+}
+
+impl ProbeKey for Key {
+    #[inline]
+    fn probe(&self) -> KeyRef<'_> {
+        #[cfg(feature = "probe-sites")]
+        crate::perf_counters::bump(&crate::perf_counters::PROBE_PRECOMPUTED);
+        self.as_ref()
+    }
+}
+
+impl ProbeKey for KeyRef<'_> {
+    #[inline]
+    fn probe(&self) -> KeyRef<'_> {
+        *self
+    }
+}
+
+impl ProbeKey for str {
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    fn probe(&self) -> KeyRef<'_> {
+        #[cfg(feature = "probe-sites")]
+        crate::perf_counters::bump(&crate::perf_counters::PROBE_HASHED);
+        #[cfg(feature = "probe-sites")]
+        crate::perf_counters::probe_sites::record();
+        KeyRef::new(self)
+    }
+}
+
+impl ProbeKey for String {
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    fn probe(&self) -> KeyRef<'_> {
+        #[cfg(feature = "probe-sites")]
+        crate::perf_counters::bump(&crate::perf_counters::PROBE_HASHED);
+        #[cfg(feature = "probe-sites")]
+        crate::perf_counters::probe_sites::record();
+        KeyRef::new(self.as_str())
+    }
+}
+
+impl ProbeKey for std::borrow::Cow<'_, str> {
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    fn probe(&self) -> KeyRef<'_> {
+        KeyRef::new(self.as_ref())
+    }
+}
+
+impl<T: ProbeKey + ?Sized> ProbeKey for Arc<T> {
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    fn probe(&self) -> KeyRef<'_> {
+        (**self).probe()
+    }
+}
+
+impl<T: ProbeKey + ?Sized> ProbeKey for &T {
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    fn probe(&self) -> KeyRef<'_> {
+        (**self).probe()
+    }
+}
+
+impl ValueMap {
+    #[inline]
+    pub fn with_capacity_and_hasher(n: usize, _h: ValueBuildHasher) -> Self {
+        ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()))
+    }
+
+    #[inline]
+    pub fn with_capacity(n: usize) -> Self {
+        ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()))
+    }
+
+    /// The inner map, for the few places that need the raw `IndexMap` API.
+    #[inline]
+    pub fn raw(&self) -> &RawValueMap {
+        &self.0
+    }
+
+    #[inline]
+    pub fn raw_mut(&mut self) -> &mut RawValueMap {
+        &mut self.0
+    }
+
+    #[inline]
+    pub fn into_raw(self) -> RawValueMap {
+        self.0
+    }
+
+    /// Insert, keeping the FIRST-written casing of an existing equal key and
+    /// replacing its value — CFML's `s.Foo = 1; s.FOO = 2` semantics.
+    #[inline]
+    pub fn insert(&mut self, key: impl IntoKey, value: CfmlValue) -> Option<CfmlValue> {
+        self.0.insert(key.into_key(), value)
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get(&self, key: impl ProbeKey) -> Option<&CfmlValue> {
+        self.0.get(&key.probe())
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_mut(&mut self, key: impl ProbeKey) -> Option<&mut CfmlValue> {
+        self.0.get_mut(&key.probe())
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn contains_key(&self, key: impl ProbeKey) -> bool {
+        self.0.contains_key(&key.probe())
+    }
+
+    /// The stored key equal to `key`, in its original casing.
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_key(&self, key: impl ProbeKey) -> Option<&Key> {
+        self.0.get_key_value(&key.probe()).map(|(k, _)| k)
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_key_value(&self, key: impl ProbeKey) -> Option<(&Key, &CfmlValue)> {
+        self.0.get_key_value(&key.probe())
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_full(&self, key: impl ProbeKey) -> Option<(usize, &Key, &CfmlValue)> {
+        self.0.get_full(&key.probe())
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_index_of(&self, key: impl ProbeKey) -> Option<usize> {
+        self.0.get_index_of(&key.probe())
+    }
+
+    /// Remove, preserving order (CFML struct key order is observable).
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn shift_remove(&mut self, key: impl ProbeKey) -> Option<CfmlValue> {
+        self.0.shift_remove(&key.probe())
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn swap_remove(&mut self, key: impl ProbeKey) -> Option<CfmlValue> {
+        self.0.swap_remove(&key.probe())
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn shift_remove_entry(&mut self, key: impl ProbeKey) -> Option<(Key, CfmlValue)> {
+        self.0.shift_remove_entry(&key.probe())
+    }
+
+    #[inline]
+    pub fn entry(&mut self, key: impl IntoKey) -> indexmap::map::Entry<'_, Key, CfmlValue> {
+        self.0.entry(key.into_key())
+    }
+
+    // By-value iteration helpers. `Deref` can only hand out borrows, so these
+    // consuming forms have to be spelled out.
+    #[inline]
+    pub fn into_keys(self) -> indexmap::map::IntoKeys<Key, CfmlValue> {
+        self.0.into_keys()
+    }
+
+    #[inline]
+    pub fn into_values(self) -> indexmap::map::IntoValues<Key, CfmlValue> {
+        self.0.into_values()
+    }
+}
+
+impl std::ops::Deref for ValueMap {
+    type Target = RawValueMap;
+    #[inline]
+    fn deref(&self) -> &RawValueMap {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ValueMap {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut RawValueMap {
+        &mut self.0
+    }
+}
+
+impl<K: IntoKey> FromIterator<(K, CfmlValue)> for ValueMap {
+    fn from_iter<I: IntoIterator<Item = (K, CfmlValue)>>(iter: I) -> Self {
+        ValueMap(iter.into_iter().map(|(k, v)| (k.into_key(), v)).collect())
+    }
+}
+
+impl<K: IntoKey> Extend<(K, CfmlValue)> for ValueMap {
+    fn extend<I: IntoIterator<Item = (K, CfmlValue)>>(&mut self, iter: I) {
+        self.0.extend(iter.into_iter().map(|(k, v)| (k.into_key(), v)));
+    }
+}
+
+impl IntoIterator for ValueMap {
+    type Item = (Key, CfmlValue);
+    type IntoIter = indexmap::map::IntoIter<Key, CfmlValue>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ValueMap {
+    type Item = (&'a Key, &'a CfmlValue);
+    type IntoIter = indexmap::map::Iter<'a, Key, CfmlValue>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut ValueMap {
+    type Item = (&'a Key, &'a mut CfmlValue);
+    type IntoIter = indexmap::map::IterMut<'a, Key, CfmlValue>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
+impl<Q: ProbeKey> std::ops::Index<Q> for ValueMap {
+    type Output = CfmlValue;
+    #[inline]
+    fn index(&self, key: Q) -> &CfmlValue {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl serde::Serialize for ValueMap {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ValueMap {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(ValueMap(RawValueMap::deserialize(d)?))
+    }
+}
+
+impl From<RawValueMap> for ValueMap {
+    #[inline]
+    fn from(m: RawValueMap) -> Self {
+        ValueMap(m)
+    }
+}
+
+impl fmt::Debug for ValueMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+
 
 /// A minimal interface-metadata stub: `{ name, fullname, type:"interface" }`.
 /// Used as the value for each entry of the `implements` / interface-`extends`
@@ -253,17 +593,6 @@ impl FromIterator<CfmlValue> for CfmlArray {
 /// uninitialised IC slot is always a miss.
 pub struct StructInner {
     pub map: ValueMap,
-    /// v0.442 (issue #262) — case-insensitive lookup index: maps each key's
-    /// ASCII-lowercased form to the ORIGINAL-cased key currently stored in
-    /// `map`. This turns every ci lookup / existence check / insert-dedup from
-    /// the old O(n) `keys().any(eq_ignore_ascii_case)` scan into an O(1) hash
-    /// probe (large per-request caches, session/URL scopes, and the pixl8/
-    /// sticker sort that motivated the fix all built and probed huge structs,
-    /// degrading to O(n²)–O(n⁴)). Invariant: for every key `K` in `map`,
-    /// `ci[fold(K)] == K` (first-written casing wins, matching `insert`). It is
-    /// rebuilt wholesale after any raw [`CfmlStruct::with_write`], whose closure
-    /// can restructure `map` arbitrarily.
-    pub ci: HashMap<String, String, ValueBuildHasher>,
     pub shape_id: u64,
     /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
     /// private `__variables` struct, a read of the `this` key resolves to the
@@ -309,80 +638,18 @@ fn next_shape_id() -> u64 {
     STRUCT_SHAPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Fold a key to its case-insensitive canonical form for the `ci` index.
-/// CFML case-insensitivity is ASCII-only (the whole codebase compares with
-/// `eq_ignore_ascii_case`), so we lower only ASCII — and, crucially, borrow
-/// the key unchanged when it is already lowercase (the overwhelmingly common
-/// case: `key_1`, `columnList`-style names, etc.), so a hot lookup loop pays
-/// zero allocations.
-#[inline]
-fn fold_key(key: &str) -> std::borrow::Cow<'_, str> {
-    if key.bytes().any(|b| b.is_ascii_uppercase()) {
-        std::borrow::Cow::Owned(key.to_ascii_lowercase())
-    } else {
-        std::borrow::Cow::Borrowed(key)
-    }
-}
-
-/// Structs at or below this size skip the case-insensitive `ci` index
-/// entirely: a linear `eq_ignore_ascii_case` scan over so few keys is cheaper
-/// than allocating, populating, and maintaining a hash index — and the
-/// overwhelmingly common structs (every function call's `arguments` scope,
-/// small option/config structs, per-row query structs) are all this small.
-/// Building that index eagerly in `CfmlStruct::new` for these tiny structs was
-/// ~25% of serve-mode CPU on the pixl8/sticker sort (millions of per-call
-/// arguments scopes). The index is built lazily only once a struct grows past
-/// this threshold — which is where O(1) ci ops actually matter (issue #262: big
-/// per-request caches, session/URL scopes, the sticker `comparisonCache`).
-///
-/// Invariant: `ci` is complete (`ci[fold(K)] == K` for every key `K`) iff
-/// `map.len() > CI_THRESHOLD`; otherwise `ci` is empty and ci resolution scans.
-const CI_THRESHOLD: usize = 16;
-
 impl StructInner {
-    /// Rebuild the `ci` index from scratch to re-establish the
-    /// `ci[fold(K)] == K` invariant after `map` may have been mutated through
-    /// a channel that doesn't maintain it incrementally (raw `with_write`).
-    /// O(n); only called off the hot path. When two keys fold to the same form
-    /// (a pre-existing raw map with case-variant duplicates — normal inserts
-    /// dedup, so this is an edge), the LAST one iterated wins the ci slot,
-    /// matching `map`'s own last-writer-wins for equal keys.
-    fn ci_rebuild(&mut self) {
-        self.ci.clear();
-        self.ci.reserve(self.map.len());
-        for k in self.map.keys() {
-            self.ci.insert(k.to_ascii_lowercase(), k.clone());
-        }
-    }
-
     /// Resolve `key` case-insensitively to the ORIGINAL-cased key stored in
-    /// `map`, or `None`. O(1) via the `ci` index when the struct is large
-    /// enough to maintain one; otherwise a linear `eq_ignore_ascii_case` scan
-    /// (cheap at `<= CI_THRESHOLD` keys — see `CI_THRESHOLD`). This is the one
-    /// place the "indexed vs scan" decision lives; every ci read routes here.
+    /// `map`, or `None`.
+    ///
+    /// v0.599 — this used to be the "indexed vs linear scan" decision point,
+    /// backed by a side `ci` index of folded → stored casing (issue #262).
+    /// [`Key`] hashes and compares case-insensitively itself, so the map *is*
+    /// the index: this is now a single probe, and it exists only for the
+    /// callers that need the stored key's original casing back.
     #[inline]
-    fn resolve_ci_key(&self, key: &str) -> Option<&String> {
-        if self.map.len() > CI_THRESHOLD {
-            self.ci.get(fold_key(key).as_ref())
-        } else {
-            self.map.keys().find(|k| k.eq_ignore_ascii_case(key))
-        }
-    }
-
-    /// Maintain the `ci` index after a genuinely-new key was appended to `map`.
-    /// A no-op while the struct is small (index inactive); rebuilds wholesale on
-    /// the insert that crosses `CI_THRESHOLD` (or when a prior shrink left the
-    /// index cleared) and incrementally otherwise. `folded`/`key` are the new
-    /// key's fold form and original casing.
-    #[inline]
-    fn ci_note_new_key(&mut self, folded: String, key: String) {
-        if self.map.len() > CI_THRESHOLD {
-            if self.ci.len() == self.map.len() - 1 {
-                self.ci.insert(folded, key); // index was complete → incremental
-            } else {
-                self.ci_rebuild(); // crossing the threshold, or stale post-shrink
-            }
-        }
+    fn resolve_ci_key(&self, key: &str) -> Option<&Key> {
+        self.map.get_key(key)
     }
 }
 
@@ -628,22 +895,8 @@ impl CfmlStruct {
         crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW);
         #[cfg(feature = "alloc-sizing")]
         crate::perf_counters::alloc_sites::record(true);
-        // Build the case-insensitive index eagerly ONLY for large structs; small
-        // structs (the common per-call case) skip it and scan on the rare ci
-        // read. See `CI_THRESHOLD`. `HashMap::with_hasher` allocates nothing.
-        let ci = if m.len() > CI_THRESHOLD {
-            let mut ci =
-                HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
-            for k in m.keys() {
-                ci.insert(k.to_ascii_lowercase(), k.clone());
-            }
-            ci
-        } else {
-            HashMap::with_hasher(ValueBuildHasher::default())
-        };
         let arc = Arc::new(PlRwLock::new(StructInner {
             map: m,
-            ci,
             shape_id: next_shape_id(),
             this_alias: None,
             #[cfg(feature = "component-instance")]
@@ -675,19 +928,8 @@ impl CfmlStruct {
         crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW_UNTRACKED);
         #[cfg(feature = "alloc-sizing")]
         crate::perf_counters::alloc_sites::record(false);
-        let ci = if m.len() > CI_THRESHOLD {
-            let mut ci =
-                HashMap::with_capacity_and_hasher(m.len(), ValueBuildHasher::default());
-            for k in m.keys() {
-                ci.insert(k.to_ascii_lowercase(), k.clone());
-            }
-            ci
-        } else {
-            HashMap::with_hasher(ValueBuildHasher::default())
-        };
         CfmlStruct(Arc::new(PlRwLock::new(StructInner {
             map: m,
-            ci,
             shape_id: next_shape_id(),
             this_alias: None,
             #[cfg(feature = "component-instance")]
@@ -774,9 +1016,18 @@ impl CfmlStruct {
         self.0.read().map.is_empty()
     }
 
-    /// Clone the value for `key` (case-sensitive), or `None`.
+    /// Clone the value for `key`, or `None`.
+    ///
+    /// v0.599 — case-INSENSITIVE, like every other keyed read: the map's key
+    /// type folds case. (It was documented as case-sensitive when keys were
+    /// `String`, which meant callers had to know to reach for `get_ci`.)
     #[inline]
-    pub fn get(&self, key: &str) -> Option<CfmlValue> {
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get(&self, key: impl ProbeKey) -> Option<CfmlValue> {
+        // Hash the probe ONCE for every map touched below. Passing a `Name`
+        // (a bytecode operand) makes even that free — its `Key` was built at
+        // compile time.
+        let key = key.probe();
         {
             let g = self.0.read();
             if let Some(v) = g.map.get(key) {
@@ -793,15 +1044,7 @@ impl CfmlStruct {
                 // the table — TestBox's xUnit `test` var vs BaseSpec.test().)
                 // This only matters when a table is present; plain structs keep
                 // `get()`'s exact-case contract.
-                if let Some(orig) = g.resolve_ci_key(key) {
-                    if let Some(v) = g.map.get(orig) {
-                        return Some(v.clone());
-                    }
-                }
                 if let Some(v) = t.get(key) {
-                    return Some(v.clone());
-                }
-                if let Some((_, v)) = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
                     return Some(v.clone());
                 }
             }
@@ -809,7 +1052,7 @@ impl CfmlStruct {
         // Live `variables.this` alias (Lucee/ACF): a CFC `__variables` with no
         // stored `this` key resolves it to the live public scope via a Weak
         // back-edge. Only consulted on a miss, and only for the `this` key.
-        if key.eq_ignore_ascii_case("this") {
+        if key.text().eq_ignore_ascii_case("this") {
             return self.this_alias_value();
         }
         None
@@ -889,30 +1132,23 @@ impl CfmlStruct {
 
     /// Clone the value for `key`, matching keys case-insensitively (CFML keys
     /// are case-insensitive). Returns the first matching entry's value.
-    pub fn get_ci(&self, key: &str) -> Option<CfmlValue> {
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_ci(&self, key: impl ProbeKey) -> Option<CfmlValue> {
+        let key = key.probe();
         {
             let g = self.0.read();
             if let Some(v) = g.map.get(key) {
-                return Some(v.clone()); // exact-case fast path (no fold)
-            }
-            // ci resolution: O(1) index for large structs, linear scan for small.
-            if let Some(orig) = g.resolve_ci_key(key) {
-                if let Some(v) = g.map.get(orig) {
-                    return Some(v.clone());
-                }
+                return Some(v.clone());
             }
             // Shared per-class method table fallthrough (component flyweight).
             if let Some(t) = &g.method_table {
                 if let Some(v) = t.get(key) {
                     return Some(v.clone());
                 }
-                if let Some((_, v)) = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
-                    return Some(v.clone());
-                }
             }
         }
         // Live `variables.this` alias on a miss (see `get`).
-        if key.eq_ignore_ascii_case("this") {
+        if key.text().eq_ignore_ascii_case("this") {
             return self.this_alias_value();
         }
         None
@@ -921,18 +1157,14 @@ impl CfmlStruct {
     /// v0.99.5 — case-insensitive lookup that also returns the IndexMap
     /// entry index. Used by the JIT member-access inline cache:
     /// `(name → idx)` is stable while `shape_id` doesn't change, so the
-    /// IC can hit `map.get_index(cached_idx)` on the fast path. Walks the
-    /// map twice in the cold case (exact, then ci-scan) — same shape as
-    /// `get_ci` but threaded with `.enumerate()`.
-    pub fn get_ci_indexed(&self, key: &str) -> Option<(usize, CfmlValue)> {
+    /// IC can hit `map.get_index(cached_idx)` on the fast path.
+    /// v0.599 — one probe (the map key is itself case-insensitive); this used
+    /// to walk the map twice on a case mismatch.
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn get_ci_indexed(&self, key: impl ProbeKey) -> Option<(usize, CfmlValue)> {
+        let key = key.probe();
         let g = self.0.read();
-        if let Some((i, _, v)) = g.map.get_full(key) {
-            return Some((i, v.clone()));
-        }
-        // Resolve original casing (O(1) index for large, scan for small), then
-        // one `get_full`.
-        let orig = g.resolve_ci_key(key)?;
-        g.map.get_full(orig).map(|(i, _, v)| (i, v.clone()))
+        g.map.get_full(key).map(|(i, _, v)| (i, v.clone()))
     }
 
     /// v0.99.5 — read the value at a specific IndexMap entry index. Used
@@ -969,7 +1201,7 @@ impl CfmlStruct {
             return Some(key.to_string()); // exact-case fast path
         }
         if let Some(orig) = g.resolve_ci_key(key) {
-            return Some(orig.clone());
+            return Some(orig.as_str().to_string());
         }
         // Shared method table (component flyweight): resolve a tabled method to
         // its stored key so structKeyExists/structFindKey see it as a member.
@@ -978,14 +1210,16 @@ impl CfmlStruct {
                 return Some(key.to_string());
             }
             if let Some((k, _)) = t.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
-                return Some(k.clone());
+                return Some(k.as_str().to_string());
             }
         }
         None
     }
 
     #[inline]
-    pub fn contains_key(&self, key: &str) -> bool {
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn contains_key(&self, key: impl ProbeKey) -> bool {
+        let key = key.probe();
         {
             let g = self.0.read();
             if g.map.contains_key(key) {
@@ -994,33 +1228,32 @@ impl CfmlStruct {
             // Shared method table (component flyweight): the method exists on the
             // instance even though it lives once per class, not in `map`.
             if let Some(t) = &g.method_table {
-                if t.contains_key(key)
-                    || t.keys().any(|k| k.eq_ignore_ascii_case(key))
-                {
+                if t.contains_key(key) {
                     return true;
                 }
             }
         }
-        key.eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
+        key.text().eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
     }
 
     /// Case-insensitive key presence check.
-    pub fn contains_key_ci(&self, key: &str) -> bool {
+    #[cfg_attr(feature = "probe-sites", track_caller)]
+    pub fn contains_key_ci(&self, key: impl ProbeKey) -> bool {
+        let key = key.probe();
         let g = self.0.read();
-        // exact hit, else ci resolution (O(1) index for large, scan for small).
-        if g.map.contains_key(key) || g.resolve_ci_key(key).is_some() {
+        if g.map.contains_key(key) {
             return true;
         }
         // Shared method table fallthrough (component flyweight).
         if let Some(t) = &g.method_table {
-            if t.contains_key(key) || t.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+            if t.contains_key(key) {
                 return true;
             }
         }
         drop(g);
         // `StructKeyExists(variables, "this")` must see the live alias (Lucee
         // parity — Wheels Plugins.cfc gates the public mixin append on it).
-        key.eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
+        key.text().eq_ignore_ascii_case("this") && self.this_alias_value().is_some()
     }
 
     /// Single-lock probe for the VM's member-dispatch prologue: answers, under
@@ -1074,27 +1307,16 @@ impl CfmlStruct {
     /// unchanged. Prior behavior forked the key — `s={a:1}; s["A"]=2` left
     /// two physical entries, poisoning set-one-case / read-another-case flows
     /// (URL/form params, query columnList lookups, option-struct merges).
-    pub fn insert(&self, key: String, value: CfmlValue) -> Option<CfmlValue> {
+    /// v0.599 — case-variant dedup is now the map's own behaviour: [`Key`]
+    /// compares case-insensitively and `IndexMap::insert` keeps the key already
+    /// stored, so a write under a different casing updates in place and the
+    /// first-written casing survives, with no side index to maintain.
+    pub fn insert(&self, key: impl IntoKey, value: CfmlValue) -> Option<CfmlValue> {
         let mut g = self.0.write();
-        if let Some(slot) = g.map.get_mut(&key) {
-            return Some(std::mem::replace(slot, value)); // exact hit, value-only
-        }
-        // Case-variant dedup: O(1) via the ci index for large structs, a linear
-        // scan for small ones (see `CI_THRESHOLD`). Either way, an existing key
-        // under a different casing is updated in place (first-casing wins).
-        if let Some(orig) = g.resolve_ci_key(&key).cloned() {
-            if let Some(slot) = g.map.get_mut(&orig) {
-                return Some(std::mem::replace(slot, value));
-            }
-        }
-        // Genuinely new key: append to `map`, bump shape, and maintain the ci
-        // index iff the struct is (or just became) large enough to keep one.
-        let folded = key.to_ascii_lowercase();
-        let prev = g.map.insert(key.clone(), value);
+        let prev = g.map.insert(key, value);
         if prev.is_none() {
             g.shape_id = next_shape_id();
         }
-        g.ci_note_new_key(folded, key);
         prev
     }
 
@@ -1117,56 +1339,29 @@ impl CfmlStruct {
         }
     }
 
-    /// Remove a key (case-sensitive), returning its value if present. Uses
-    /// `shift_remove` to preserve insertion order of the remaining entries.
+    /// Remove a key, returning its value if present. Uses `shift_remove` to
+    /// preserve insertion order of the remaining entries.
     /// v0.99.4 — shape_id bumps iff a key was actually removed.
+    ///
+    /// v0.599 — now case-INSENSITIVE, and so identical to [`Self::remove_ci`].
+    /// Key lookup is case-insensitive at the map level, which is what CFML's
+    /// `structDelete` has always meant; the old case-sensitive variant could
+    /// only ever have deleted nothing where the two differed.
     #[inline]
     pub fn remove(&self, key: &str) -> Option<CfmlValue> {
         let mut g = self.0.write();
         let prev = g.map.shift_remove(key);
         if prev.is_some() {
             g.shape_id = next_shape_id();
-            // Maintain the ci index only while one is active. If the removal
-            // drops the struct to/below the threshold, retire the index (clear)
-            // so later reads fall back to the scan and a regrow rebuilds cleanly.
-            if !g.ci.is_empty() {
-                if g.map.len() > CI_THRESHOLD {
-                    let f = fold_key(key).into_owned();
-                    if g.ci.get(&f).map(|o| o == key).unwrap_or(false) {
-                        g.ci.remove(&f);
-                    }
-                } else {
-                    g.ci.clear();
-                }
-            }
         }
         prev
     }
 
     /// Remove a key case-insensitively, returning its value if present.
     /// v0.99.4 — shape_id bumps iff a key was actually removed.
+    #[inline]
     pub fn remove_ci(&self, key: &str) -> Option<CfmlValue> {
-        let mut g = self.0.write();
-        let f = fold_key(key).into_owned();
-        // Resolve the stored original casing (O(1) index for large, scan for
-        // small), then remove it.
-        let orig = if g.map.contains_key(key) {
-            Some(key.to_string())
-        } else {
-            g.resolve_ci_key(key).cloned()
-        };
-        let prev = orig.and_then(|k| g.map.shift_remove(&k));
-        if prev.is_some() {
-            g.shape_id = next_shape_id();
-            if !g.ci.is_empty() {
-                if g.map.len() > CI_THRESHOLD {
-                    g.ci.remove(&f);
-                } else {
-                    g.ci.clear();
-                }
-            }
-        }
-        prev
+        self.remove(key)
     }
 
     /// v0.99.4 — shape_id bumps iff the map was non-empty before clear.
@@ -1175,14 +1370,13 @@ impl CfmlStruct {
         let mut g = self.0.write();
         if !g.map.is_empty() {
             g.map.clear();
-            g.ci.clear();
             g.shape_id = next_shape_id();
         }
     }
 
     #[inline]
     pub fn keys(&self) -> Vec<String> {
-        self.0.read().map.keys().cloned().collect()
+        self.0.read().map.keys().map(|k| k.as_str().to_string()).collect()
     }
 
     /// Per-instance keys UNIONED with the shared method-table keys (component
@@ -1193,11 +1387,11 @@ impl CfmlStruct {
     /// table rather than per-instance in `map` — still enumerate as members.
     pub fn all_keys(&self) -> Vec<String> {
         let g = self.0.read();
-        let mut keys: Vec<String> = g.map.keys().cloned().collect();
+        let mut keys: Vec<String> = g.map.keys().map(|k| k.as_str().to_string()).collect();
         if let Some(t) = &g.method_table {
             for k in t.keys() {
                 if !g.map.contains_key(k) && !keys.iter().any(|e| e.eq_ignore_ascii_case(k)) {
-                    keys.push(k.clone());
+                    keys.push(k.as_str().to_string());
                 }
             }
         }
@@ -1254,11 +1448,11 @@ impl CfmlStruct {
     pub fn all_entries(&self) -> Vec<(String, CfmlValue)> {
         let g = self.0.read();
         let mut out: Vec<(String, CfmlValue)> =
-            g.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            g.map.iter().map(|(k, v)| (k.as_str().to_string(), v.clone())).collect();
         if let Some(t) = &g.method_table {
             for (k, v) in t.iter() {
                 if !g.map.contains_key(k) && !out.iter().any(|(e, _)| e.eq_ignore_ascii_case(k)) {
-                    out.push((k.clone(), v.clone()));
+                    out.push((k.as_str().to_string(), v.clone()));
                 }
             }
         }
@@ -1272,7 +1466,7 @@ impl CfmlStruct {
     /// can't deadlock). Snapshots, so avoid on hot paths where `get()`/`len()`
     /// suffice.
     #[inline]
-    pub fn iter(&self) -> indexmap::map::IntoIter<String, CfmlValue> {
+    pub fn iter(&self) -> indexmap::map::IntoIter<Key, CfmlValue> {
         self.snapshot().into_iter()
     }
 
@@ -1292,16 +1486,11 @@ impl CfmlStruct {
     pub fn with_write<R>(&self, f: impl FnOnce(&mut ValueMap) -> R) -> R {
         let mut g = self.0.write();
         g.shape_id = next_shape_id();
-        let r = f(&mut g.map);
-        // The closure may have inserted / removed / renamed keys arbitrarily.
-        // Restore the invariant: rebuild the index if the struct is large,
-        // otherwise retire it (small structs scan). Off the hot path.
-        if g.map.len() > CI_THRESHOLD {
-            g.ci_rebuild();
-        } else {
-            g.ci.clear();
-        }
-        r
+        // v0.599 — the closure may restructure `map` arbitrarily, which used
+        // to force a full O(n) rebuild of the side `ci` index here (~2.7% of a
+        // warm request, since `deep_copy_guarded` goes through this path).
+        // There is no side index any more, so nothing to restore.
+        f(&mut g.map)
     }
 
     /// Run a closure with shared (read) access. Same re-entrancy caveat.
@@ -1327,14 +1516,8 @@ impl CfmlStruct {
         // a nested dotted assignment `settings.assetmanager.x = v` created a
         // parallel lowercase key, and a later `structAppend` then merged both
         // (the partial fork last-writer-wins), dropping most keys.
-        // Locate case-insensitively (O(1) index for large, scan for small).
-        let existing_idx = if g.map.contains_key(key) {
-            g.map.get_index_of(key)
-        } else if let Some(orig) = g.resolve_ci_key(key).cloned() {
-            g.map.get_index_of(&orig)
-        } else {
-            None
-        };
+        // v0.599 — one probe: map lookup is itself case-insensitive.
+        let existing_idx = g.map.get_index_of(key);
         if let Some(idx) = existing_idx {
             let (_, entry) = g.map.get_index_mut(idx).expect("existing_idx in range");
             if let CfmlValue::Struct(s) = entry {
@@ -1349,9 +1532,8 @@ impl CfmlStruct {
         }
         // Brand-new key.
         let s = CfmlStruct::empty();
-        g.map.insert(key.to_string(), CfmlValue::Struct(s.clone()));
+        g.map.insert(key, CfmlValue::Struct(s.clone()));
         g.shape_id = next_shape_id();
-        g.ci_note_new_key(fold_key(key).into_owned(), key.to_string());
         s
     }
 }
@@ -1801,7 +1983,8 @@ impl CfmlValue {
                     return (cached.clone(), true);
                 }
                 path.push(ptr);
-                let mut entries: Vec<(String, CfmlValue)> = s.iter().collect();
+                let mut entries: Vec<(String, CfmlValue)> =
+                    s.iter().map(|(k, v)| (k.as_str().to_string(), v)).collect();
                 entries.sort_by(|a, b| {
                     a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0))
                 });
@@ -2738,7 +2921,7 @@ impl CfmlQueryData {
         // the same shape).
         for k in row.keys() {
             if self.column_index_ci(k).is_none() {
-                self.columns.push(k.clone());
+                self.columns.push(k.as_str().to_string());
                 let prev = self.row_count();
                 self.data.push(Arc::new(vec![CfmlValue::Null; prev]));
             }
@@ -2767,7 +2950,7 @@ impl CfmlQueryData {
     pub fn insert_row_named(&mut self, at: usize, row: ValueMap) {
         for k in row.keys() {
             if self.column_index_ci(k).is_none() {
-                self.columns.push(k.clone());
+                self.columns.push(k.as_str().to_string());
                 let prev = self.row_count();
                 self.data.push(Arc::new(vec![CfmlValue::Null; prev]));
             }
