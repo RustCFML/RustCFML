@@ -103,15 +103,19 @@ pub fn bump(c: &AtomicU64) {
 /// Snapshot every counter as a one-block human-readable report.
 pub fn report() -> String {
     let g = |c: &AtomicU64| c.load(Relaxed);
+    #[allow(unused_mut)]
+    let mut out = report_totals(g);
     #[cfg(feature = "alloc-sizing")]
     {
-        let mut out = report_totals(g);
         out.push('\n');
         out.push_str(&alloc_sites::report(60));
-        return out;
     }
-    #[cfg(not(feature = "alloc-sizing"))]
-    report_totals(g)
+    #[cfg(feature = "exists-census")]
+    {
+        out.push('\n');
+        out.push_str(&exists_census::report(25));
+    }
+    out
 }
 
 fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
@@ -473,6 +477,198 @@ pub mod alloc_sites {
                 loc.file(),
                 loc.line()
             ));
+        }
+        out
+    }
+}
+
+/// Existence-probe outcome census (`exists-census` builds only) — the sizing
+/// instrument for known-issues §45.
+///
+/// The shipped [`EXISTS_MEMO_HITS`] / [`EXISTS_FS_PROBES`] pair says the memo
+/// takes more real syscalls than it serves hits, but it cannot say *what to
+/// build*, because `request_exists_cache` holds POSITIVES ONLY: a negative
+/// probe can never be a hit, so it is invisible to a hit-rate. The question
+/// that decides the design is how many probes are REPEATS of a path already
+/// probed — recoverable by a cache — versus genuine first looks, which no cache
+/// can remove. This splits every probe six ways to answer exactly that:
+///
+/// | class | what would recover it |
+/// |---|---|
+/// | `pos_first` / `neg_first` | nothing — irreducible filesystem truth |
+/// | `pos_repeat_req` | **only reachable after a wholesale memo clear** — measures the cost of the blanket `.clear()` |
+/// | `pos_repeat_xreq` | a cross-request positive layer (already measured dead: −1% homepage, 0% admin) |
+/// | `neg_repeat_req` | a request-scoped negative memo |
+/// | `neg_repeat_xreq` | an application-lifetime negative memo |
+///
+/// Retains every probed path in a `Mutex`'d map (that is also how it reports
+/// the distinct-path count, i.e. what a negative cache would have to hold), so
+/// this is a sizing build only.
+#[cfg(feature = "exists-census")]
+pub mod exists_census {
+    use super::{AtomicU64, Relaxed};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+
+    /// What we have already seen for one (path, probe-kind) pair.
+    #[derive(Default)]
+    struct Seen {
+        /// Epoch of the most recent probe that found the path.
+        last_pos_epoch: Option<u64>,
+        /// Epoch of the most recent probe that did NOT find the path.
+        last_neg_epoch: Option<u64>,
+        /// Total probes that did not find it — ranks the worst offenders.
+        neg_probes: u64,
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        memo_hits: u64,
+        pos_first: u64,
+        pos_repeat_req: u64,
+        pos_repeat_xreq: u64,
+        neg_first: u64,
+        neg_repeat_req: u64,
+        neg_repeat_xreq: u64,
+    }
+
+    static STATE: Mutex<Option<(HashMap<(String, u8), Seen>, Tally)>> = Mutex::new(None);
+
+    /// Monotonic request epoch. The VM takes one per `Vm` construction, which in
+    /// serve mode is one per request, and passes it back into [`record`] — so
+    /// "same request" is decided by the caller rather than by a thread-local,
+    /// and stays correct under concurrent requests.
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    /// Claim the next request epoch.
+    pub fn next_epoch() -> u64 {
+        EPOCH.fetch_add(1, Relaxed)
+    }
+
+    /// Names of builtins that retired the cached negatives, with counts — the
+    /// list that decides which creators are worth attributing to a specific path
+    /// instead of firing the coarse global retirement.
+    static CREATORS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+    /// One builtin call that retired the negatives.
+    pub fn record_creator(name_lower: &str) {
+        let mut g = CREATORS.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        *m.entry(name_lower.to_string()).or_insert(0) += 1;
+    }
+
+    /// A probe answered from the memo without touching the filesystem.
+    pub fn record_memo_hit() {
+        let mut g = STATE.lock();
+        let (_, t) = g.get_or_insert_with(Default::default);
+        t.memo_hits += 1;
+    }
+
+    /// Classify one real filesystem probe of `path` under `bit`.
+    pub fn record(path: &str, bit: u8, found: bool, epoch: u64) {
+        let mut g = STATE.lock();
+        let (m, t) = g.get_or_insert_with(Default::default);
+        // `raw_entry` is unstable, so the miss path pays one allocation for the
+        // key. This is a sizing build; correctness of the count is what matters.
+        let seen = m.entry((path.to_string(), bit)).or_default();
+        if found {
+            match seen.last_pos_epoch {
+                // Only reachable if something wiped the memo mid-request: the
+                // memo would otherwise have served this as a hit.
+                Some(e) if e == epoch => t.pos_repeat_req += 1,
+                Some(_) => t.pos_repeat_xreq += 1,
+                None => t.pos_first += 1,
+            }
+            seen.last_pos_epoch = Some(epoch);
+        } else {
+            match seen.last_neg_epoch {
+                Some(e) if e == epoch => t.neg_repeat_req += 1,
+                Some(_) => t.neg_repeat_xreq += 1,
+                None => t.neg_first += 1,
+            }
+            seen.last_neg_epoch = Some(epoch);
+            seen.neg_probes += 1;
+        }
+    }
+
+    /// The census block, plus the top-`n` most-re-probed absent paths.
+    pub fn report(n: usize) -> String {
+        let g = STATE.lock();
+        let Some((m, t)) = g.as_ref() else {
+            return String::from("--- exists census: nothing recorded ---");
+        };
+        let epochs = EPOCH.load(Relaxed).max(1);
+        let probes = t.pos_first
+            + t.pos_repeat_req
+            + t.pos_repeat_xreq
+            + t.neg_first
+            + t.neg_repeat_req
+            + t.neg_repeat_xreq;
+        let neg = t.neg_first + t.neg_repeat_req + t.neg_repeat_xreq;
+        // What each candidate cache would actually have removed.
+        let recoverable = t.neg_repeat_req + t.neg_repeat_xreq + t.pos_repeat_req + t.pos_repeat_xreq;
+        let pct = |v: u64| {
+            if probes == 0 {
+                0.0
+            } else {
+                v as f64 * 100.0 / probes as f64
+            }
+        };
+        let distinct_absent = m.values().filter(|s| s.last_neg_epoch.is_some()).count();
+        let mut out = format!(
+            "--- exists census ({} request epochs; {} probes, {} memo hits) ---\n\
+             {:>12}  positive, first ever          {:>5.1}%\n\
+             {:>12}  positive, repeat SAME request {:>5.1}%  <- cost of the wholesale memo clear\n\
+             {:>12}  positive, repeat later req    {:>5.1}%  <- cross-request positive layer (measured dead)\n\
+             {:>12}  negative, first ever          {:>5.1}%  <- irreducible\n\
+             {:>12}  negative, repeat SAME request {:>5.1}%  <- request-scoped negative memo\n\
+             {:>12}  negative, repeat later req    {:>5.1}%  <- application-lifetime negative memo\n\
+             {:>12}  negative probes total         {:>5.1}%\n\
+             {:>12}  RECOVERABLE by some cache     {:>5.1}%\n\
+             {:>12}  distinct absent paths (a negative cache must hold these)\n\
+             {:>12.1}  probes per request epoch",
+            epochs,
+            probes,
+            t.memo_hits,
+            t.pos_first,
+            pct(t.pos_first),
+            t.pos_repeat_req,
+            pct(t.pos_repeat_req),
+            t.pos_repeat_xreq,
+            pct(t.pos_repeat_xreq),
+            t.neg_first,
+            pct(t.neg_first),
+            t.neg_repeat_req,
+            pct(t.neg_repeat_req),
+            t.neg_repeat_xreq,
+            pct(t.neg_repeat_xreq),
+            neg,
+            pct(neg),
+            recoverable,
+            pct(recoverable),
+            distinct_absent,
+            probes as f64 / epochs as f64,
+        );
+        let mut rows: Vec<_> = m
+            .iter()
+            .filter(|(_, s)| s.neg_probes > 1)
+            .map(|((p, b), s)| (s.neg_probes, *b, p.as_str()))
+            .collect();
+        rows.sort_by_key(|(c, _, _)| std::cmp::Reverse(*c));
+        {
+            let g = CREATORS.lock();
+            if let Some(m) = g.as_ref() {
+                let mut rows: Vec<_> = m.iter().map(|(k, v)| (*v, k.as_str())).collect();
+                rows.sort_by_key(|(c, _)| std::cmp::Reverse(*c));
+                out.push_str("\n--- builtins that RETIRED the cached negatives (count, name) ---");
+                for (c, n) in rows.into_iter().take(20) {
+                    out.push_str(&format!("\n{:>12}  {}", c, n));
+                }
+            }
+        }
+        out.push_str("\n--- most-re-probed ABSENT paths (probes, kind bit, path) ---");
+        for (c, b, p) in rows.into_iter().take(n) {
+            out.push_str(&format!("\n{:>12}  {}  {}", c, b, p));
         }
         out
     }

@@ -172,6 +172,7 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `whitespaceCompressionEnabled` | bool | `false` | Global `cfsetting enableCFOutputOnly=true` |
 | `trustedCache` | bool | `false` | Skip recompile when template mtime unchanged |
 | `reportAsLucee` | bool | `false` | Report `server.coldfusion.productname` as `"Lucee"` instead of `"RustCFML"`. RustCFML targets the Lucee dialect and always advertises `server.lucee`, but some frameworks (e.g. ColdBox's mapping-helper selection) branch specifically on `productname == "Lucee"`. `server.lucee.versionName` stays `"RustCFML"` regardless |
+| `existenceCacheScope` | `"application"` \| `"request"` | `"application"` | How long a resolved file-existence answer (`fileExists`, `directoryExists`, and the engine's own template/helper probing) may be reused. Only consulted in `--production`; dev serve mode and the CLI are always request-scoped. `"application"` accepts that an answer can survive a change made by a *different* process — RustCFML's own writes always invalidate — in exchange for not re-`stat`ing paths it has already resolved. See [known-issues §45](known-issues.md) |
 | `applicationTimeout` | `"d,h,m,s"` | `"1,0,0,0"` | Application scope timeout |
 | `sessionTimeout` | `"d,h,m,s"` | `"0,0,30,0"` | Session scope timeout |
 | `clientTimeout` | `"d,h,m,s"` | `"7,0,0,0"` | Client scope timeout |

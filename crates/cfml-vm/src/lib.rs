@@ -1160,6 +1160,104 @@ const EXISTS_FILE: u8 = 1 << 0;
 const EXISTS_DIR: u8 = 1 << 1;
 /// `Vm::request_exists_cache` bit: the path was seen to exist (either kind).
 const EXISTS_ANY: u8 = 1 << 2;
+/// `Vm::request_exists_cache` bit: the path was seen NOT to be a regular file.
+const ABSENT_FILE: u8 = 1 << 3;
+/// `Vm::request_exists_cache` bit: the path was seen NOT to be a directory.
+const ABSENT_DIR: u8 = 1 << 4;
+/// `Vm::request_exists_cache` bit: the path was seen not to exist at all.
+const ABSENT_ANY: u8 = 1 << 5;
+/// Every negative bit — the set an invalidation drops while keeping positives.
+const ABSENT_MASK: u8 = ABSENT_FILE | ABSENT_DIR | ABSENT_ANY;
+
+/// The negative bits implied by a failed probe under `bit`.
+///
+/// "Not a file" and "not a directory" each say nothing about the other, so they
+/// record only themselves. "Does not exist" implies both.
+fn absent_bits_for(bit: u8) -> u8 {
+    match bit {
+        EXISTS_ANY => ABSENT_ANY | ABSENT_FILE | ABSENT_DIR,
+        EXISTS_FILE => ABSENT_FILE,
+        EXISTS_DIR => ABSENT_DIR,
+        _ => 0,
+    }
+}
+
+/// The positive bits implied by a successful probe under `bit`: being a file or
+/// a directory both imply existing.
+fn exists_bits_for(bit: u8) -> u8 {
+    match bit {
+        EXISTS_FILE => EXISTS_FILE | EXISTS_ANY,
+        EXISTS_DIR => EXISTS_DIR | EXISTS_ANY,
+        other => other,
+    }
+}
+
+/// One existence-cache entry (both layers): the observed bits, plus the negative
+/// generation the ABSENT half of those bits was observed in.
+///
+/// Positives need no stamp (only a delete falsifies one, and deletes invalidate
+/// by path). Negatives carry `neg_gen` so that a single O(1) bump of
+/// [`EXISTS_NEG_GENERATION`] retires every cached negative in the process,
+/// in both layers at once, without touching a positive and without any sweep.
+#[derive(Clone, Copy, Debug)]
+pub struct ExistsEntry {
+    /// [`EXISTS_FILE`] … [`ABSENT_ANY`].
+    pub flags: u8,
+    /// Generation the ABSENT bits were recorded in.
+    pub neg_gen: u64,
+}
+
+/// Validity generation for every cached NEGATIVE existence answer in the process.
+///
+/// **Process-global on purpose.** A cached negative is falsified by a
+/// *creation*, and creations do not funnel through one place: the `Vfs` trait is
+/// read-only, so writes reach `std::fs` from all over cfml-stdlib and the VM, and
+/// many creating operations (`cfdump output=`, `cfhttp file=`, the upload BIFs,
+/// `cfexecute`, `writeDump`) are **VM-intercepted** and never pass the BIF
+/// dispatcher where a per-BIF predicate could see them. That is precisely how
+/// the 2026-08 attempt missed four creators. Existence is a property of one
+/// shared filesystem, so one shared counter is both the simplest and the most
+/// honest model: any write anywhere retires every negative, positives are
+/// untouched, and the cost is one relaxed-ish atomic add.
+static EXISTS_NEG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cap on `ServerState::exists_cache` entries. A live Preside boot learns ~6k
+/// distinct paths (3,832 of them absent), so this leaves ample headroom for a
+/// real application's static tree while still bounding a workload that probes
+/// attacker- or user-shaped paths.
+const EXISTS_L2_MAX_ENTRIES: usize = 100_000;
+
+/// Retire every cached NEGATIVE existence answer in the process, leaving every
+/// positive intact. O(1) — see [`EXISTS_NEG_GENERATION`].
+#[cfg_attr(feature = "exists-census", track_caller)]
+fn invalidate_exists_negatives() {
+    #[cfg(feature = "exists-census")]
+    cfml_common::perf_counters::exists_census::record_creator(&format!(
+        "@{}",
+        std::panic::Location::caller()
+    ));
+    EXISTS_NEG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// The current negative-answer generation.
+fn exists_neg_generation() -> u64 {
+    EXISTS_NEG_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Retires cached negatives when dropped.
+///
+/// Held across any operation that may create a path, so the retirement happens
+/// **after** the creation however the handler leaves — including the intercept
+/// dispatch's many early `return`s, an error path, or a panic. Bumping only on
+/// the way in is not enough: the operation itself probes its own output path
+/// (finding it absent), and that fresh negative would then outlive the write.
+struct RetireNegativesOnDrop;
+
+impl Drop for RetireNegativesOnDrop {
+    fn drop(&mut self) {
+        invalidate_exists_negatives();
+    }
+}
 
 /// Sentinel stood in for a `None` `source_file` / `base_template_path` when
 /// hashing a component-resolution cache key. Contains a control byte, so it can
@@ -1385,6 +1483,23 @@ pub struct ServerState {
     /// Successes only — a miss must stay re-probeable. Request-lifetime sibling:
     /// the per-request VM's `request_custom_tag_cache` (all modes).
     pub custom_tag_path_cache: Arc<parking_lot::RwLock<HashMap<(String, String), String>>>,
+    /// Application-lifetime existence cache, `--production` only — layer 2 under
+    /// the per-request `Vm::request_exists_cache`, same bit vocabulary
+    /// ([`EXISTS_FILE`] … [`ABSENT_ANY`]) and the same immutable-tree contract as
+    /// `canonicalize_cache` / `component_path_cache`.
+    ///
+    /// Sized before it was written (known-issues §45): on a warm live Preside
+    /// homepage **15 of every 16 existence probes re-ask a question already
+    /// answered**, and 14 of those 15 repeats cross a request boundary — so the
+    /// request-scoped layer alone cannot see them, which is exactly why the
+    /// 2026-08 request-scoped negative memo measured zero. Boot has the mirror
+    /// shape (48% of probes repeat *within* one request), so both layers are
+    /// needed; neither subsumes the other.
+    ///
+    /// Negatives here are guarded by [`EXISTS_NEG_GENERATION`] rather than held
+    /// unconditionally — see that static for why the guard is a process-global
+    /// generation and not a per-path invalidation list.
+    pub exists_cache: Arc<parking_lot::RwLock<HashMap<String, ExistsEntry>>>,
     /// Persistent `application` scope for the Application.cfc *pseudo-constructor*
     /// phase, keyed by Application.cfc path.
     ///
@@ -1472,6 +1587,7 @@ impl ServerState {
             component_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             canonicalize_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             custom_tag_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            exists_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
@@ -2456,7 +2572,14 @@ pub struct CfmlVirtualMachine {
     /// `while (!fileExists(f)) sleep(50)` poll must never spin forever. Positives
     /// can only go stale via a *delete*, and every filesystem-mutating BIF clears
     /// this cache (see `builtin_may_remove_path`). Dropped at request end.
-    pub request_exists_cache: parking_lot::RwLock<HashMap<String, u8>>,
+    pub request_exists_cache: parking_lot::RwLock<HashMap<String, ExistsEntry>>,
+    /// Request epoch for the existence-probe census (`exists-census` builds
+    /// only). Taken once per `Vm`, which in serve mode is once per request, so
+    /// the census can tell a repeat probe *within* a request from one that
+    /// crosses requests without a thread-local. See
+    /// `cfml_common::perf_counters::exists_census`.
+    #[cfg(feature = "exists-census")]
+    pub exists_census_epoch: u64,
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
@@ -3014,6 +3137,8 @@ impl CfmlVirtualMachine {
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
+            #[cfg(feature = "exists-census")]
+            exists_census_epoch: cfml_common::perf_counters::exists_census::next_epoch(),
             last_component_compile_error: None,
             #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
             jit: jit::JitEngine::maybe_new(),
@@ -12421,6 +12546,27 @@ impl CfmlVirtualMachine {
             // an owned String deliberately.
             let name_lower = func.name.to_lowercase();
 
+            // §45: anything that may CREATE a path retires the cached negatives —
+            // held as a drop guard from here, which is the one point every
+            // builtin-shaped call passes through *whether or not* it is later
+            // VM-intercepted. Putting this in the plain-builtin dispatch branch
+            // instead is what let `cfdump output=` write a file that `fileExists()`
+            // then denied: writeDump/cfdump/cfhttp/cfexecute/the upload BIFs are
+            // all intercepted and never reach that branch.
+            // `then`, NOT `then_some`: `then_some` takes its argument by value and
+            // so CONSTRUCTS the guard even when the predicate is false, dropping it
+            // immediately — which bumped the generation on *every* builtin call,
+            // `fileExists` included, and silently retired every cached negative as
+            // fast as it was learned. Correctness tests cannot catch that (over-
+            // invalidation is always correct); it only shows up as the feature
+            // measuring zero.
+            let _retire_negatives =
+                Self::builtin_may_create_path(&name_lower).then(|| RetireNegativesOnDrop);
+            #[cfg(feature = "exists-census")]
+            if _retire_negatives.is_some() {
+                cfml_common::perf_counters::exists_census::record_creator(&name_lower);
+            }
+
             // writeOutput/writeDump must be handled before the builtin lookup
             // so output goes to output_buffer (not stdout via the builtin fn)
             if name_lower == "writeoutput" || name_lower == "echo" {
@@ -13240,11 +13386,16 @@ impl CfmlVirtualMachine {
                         // cache — each include recompiles; production trusts the
                         // cache and never re-checks, contract = restart to reload).
                         // Skip the flush work everywhere else.
-                        // GH #299: a BIF that can remove a path invalidates the
-                        // request-scoped existence memo. Cleared wholesale — a
-                        // recursive directoryDelete/fileMove changes an unbounded
-                        // set of paths, and mutations are rare next to the probes
-                        // the memo exists to serve.
+                        // GH #299 / §45: a BIF that can remove a path invalidates
+                        // cached POSITIVES; one that can create a path invalidates
+                        // cached NEGATIVES. The two are handled asymmetrically on
+                        // purpose (see `invalidate_exists_path` /
+                        // `invalidate_exists_negatives`): removals are matched by
+                        // path where the target is knowable and fall back to a
+                        // wholesale clear where it is not (a recursive
+                        // directoryDelete changes an unbounded set), while
+                        // creations only ever need the O(1) negative-generation
+                        // bump, which leaves every positive standing.
                         let clears_existence = Self::builtin_may_remove_path(&name_lower);
                         let write_targets = Self::file_write_targets(&name_lower, &args);
                         // Runs in EVERY serve mode, production included. v0.521.0
@@ -13259,11 +13410,13 @@ impl CfmlVirtualMachine {
                         // Preside hot-reload). Still skipped in CLI mode
                         // (`server_state.is_none()`), which holds no persistent
                         // bytecode cache — each include recompiles there anyway.
-                        let needs_flush = !write_targets.is_empty() && self.server_state.is_some();
-                        if !needs_flush {
+                        if write_targets.is_empty() {
                             let result = builtin(args);
+                            // No knowable target: a removal has to fall back to a
+                            // wholesale clear. (A creation with no knowable target
+                            // was already covered by the drop guard at the top.)
                             if clears_existence {
-                                self.request_exists_cache.write().clear();
+                                self.clear_exists_caches_wholesale();
                             }
                             return result;
                         }
@@ -13272,10 +13425,20 @@ impl CfmlVirtualMachine {
                             .map(|p| self.vfs.canonicalize(p).ok())
                             .collect();
                         let result = builtin(args);
-                        if clears_existence {
-                            self.request_exists_cache.write().clear();
+                        // Targets are known, so invalidate exactly them — the
+                        // "a write only invalidates caches for that file" rule.
+                        // Runs in EVERY mode, CLI included: these names are exempt
+                        // from the global negative retirement precisely because
+                        // this runs, so skipping it would strand a stale negative.
+                        for p in &write_targets {
+                            self.invalidate_exists_path(p);
                         }
-                        if result.is_ok() {
+                        for pre in pre_canon.iter().flatten() {
+                            self.invalidate_exists_path(pre);
+                        }
+                        // The GH #284 template-cache flush stays serve-only: the
+                        // CLI holds no persistent bytecode cache to go stale.
+                        if result.is_ok() && self.server_state.is_some() {
                             for (raw, pre) in write_targets.iter().zip(pre_canon.iter()) {
                                 self.invalidate_written_file_caches(raw, pre.as_deref());
                             }
@@ -15090,6 +15253,17 @@ impl CfmlVirtualMachine {
                 // abort lands mid-sleep the way Lucee's does instead of after
                 // the full duration.
                 "sleep" => {
+                    // YIELD POINT — the reason negatives are safe to cache at all.
+                    //
+                    // `while ( !fileExists( f ) ) { sleep( 50 ); }` is the classic
+                    // poll for a file another actor is producing (a cfthread, a
+                    // separate process, an upload completing). A cached negative
+                    // would make that loop spin forever, which is not a staleness
+                    // trade-off but a hang — so every point where this request
+                    // deliberately waits for the outside world retires the
+                    // negative half. Positives are untouched: waiting cannot make
+                    // an existing path vanish.
+                    self.retire_probed_negatives();
                     let total_ms = args
                         .first()
                         .map(|v| match v {
@@ -18596,7 +18770,13 @@ impl CfmlVirtualMachine {
                     // is blocked in the child process for the duration, so no
                     // CFML runs and nothing can repopulate the memo before the
                     // first post-`cfexecute` probe re-stats.
-                    self.request_exists_cache.write().clear();
+                    //
+                    // An arbitrary external program is the one case with no
+                    // knowable target at all, so this stays wholesale on both
+                    // halves and in both layers — the child can equally have
+                    // created a path we cached as absent or removed one we
+                    // cached as present.
+                    self.clear_exists_caches_wholesale();
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         let cmd_name = opts
                             .iter()
@@ -18737,6 +18917,10 @@ impl CfmlVirtualMachine {
                 // Also reached by the threadJoin() script BIF (same arg shape:
                 // optional name, optional timeout-ms).
                 "__cfthread_join" | "threadjoin" => {
+                    // YIELD POINT — see the `sleep` handler. A joined thread has
+                    // its own VM and its own writes, so anything it created must
+                    // be visible to a probe made after the join.
+                    self.retire_probed_negatives();
                     // Join named thread(s), comma-separated; empty/absent name
                     // joins all currently-live threads.
                     let names: Vec<String> = match args.get(0).map(|v| v.as_string()) {
@@ -23027,13 +23211,26 @@ impl CfmlVirtualMachine {
                 if result.is_ok()
                     && Self::java_shim_may_change_existence(&java_class, &method_lower)
                 {
-                    self.request_exists_cache.write().clear();
+                    // Unlike the BIF path, a shim's touched paths ARE knowable
+                    // (receiver `__path`/`__spec` plus path-like arguments), so
+                    // invalidate exactly those rather than the whole map. The
+                    // negative half still gets the cheap blanket bump via
+                    // `invalidate_exists_path`, covering `mkdirs()` creating
+                    // intermediate directories we never named.
+                    let touched = Self::java_shim_touched_paths(object, &fallthrough_args);
+                    if touched.is_empty() {
+                        self.clear_exists_caches_wholesale();
+                    } else {
+                        for p in &touched {
+                            self.invalidate_exists_path(p);
+                        }
+                    }
                     // And flush the compiled-template caches for the touched
                     // paths, so a shim that rewrites a .cfm is picked up by a
                     // re-include in this request (the GH #284 contract).
                     if self.server_state.is_some() {
-                        for p in Self::java_shim_touched_paths(object, &fallthrough_args) {
-                            self.invalidate_written_file_caches(&p, None);
+                        for p in &touched {
+                            self.invalidate_written_file_caches(p, None);
                         }
                     }
                 }
@@ -30349,45 +30546,255 @@ impl CfmlVirtualMachine {
         None
     }
 
-    /// `vfs.is_file` behind the request-scoped positive existence memo.
+    /// `vfs.is_file` behind the two-layer existence memo.
     fn is_file_cached(&self, path: &str) -> bool {
         self.exists_cached(path, EXISTS_FILE, |vfs| vfs.is_file(path))
     }
 
-    /// `vfs.is_dir` behind the request-scoped positive existence memo.
+    /// `vfs.is_dir` behind the two-layer existence memo.
     fn is_dir_cached(&self, path: &str) -> bool {
         self.exists_cached(path, EXISTS_DIR, |vfs| vfs.is_dir(path))
     }
 
-    /// `vfs.exists` behind the request-scoped positive existence memo.
+    /// `vfs.exists` behind the two-layer existence memo.
     fn exists_cached_path(&self, path: &str) -> bool {
         self.exists_cached(path, EXISTS_ANY, |vfs| vfs.exists(path))
     }
 
-    /// Shared body of the three memoised existence probes: answer `true` straight
-    /// from `request_exists_cache` when this path was already seen to exist under
-    /// `bit`, otherwise `probe` the VFS and remember only a `true` (see the field
-    /// docs for why negatives are never cached).
+    /// Is the application-lifetime layer 2 in play?
+    ///
+    /// Production serve mode only, and only while the scope knob leaves it on —
+    /// the same contract `canonicalize_cache` / `component_path_cache` /
+    /// `custom_tag_path_cache` already take. In dev the answer must track an edit
+    /// on the next request, so layer 1 is the only layer.
+    fn exists_l2(&self) -> Option<&ServerState> {
+        let ss = self.server_state.as_ref()?;
+        (ss.production_mode && self.exists_cache_scope_is_application()).then_some(ss)
+    }
+
+    /// Shared body of the three memoised existence probes.
+    ///
+    /// Two layers, both caching POSITIVE and NEGATIVE answers:
+    ///
+    /// * layer 1 `Vm::request_exists_cache` — every mode, request lifetime;
+    /// * layer 2 `ServerState::exists_cache` — production only, application
+    ///   lifetime, negatives guarded by the generation stamp.
+    ///
+    /// A layer-2 hit is promoted into layer 1 (the `resolve_custom_tag_path`
+    /// idiom) so the rest of the request answers without touching the shared lock.
+    ///
+    /// Sized before it was built — see `ServerState::exists_cache`: 15 of every 16
+    /// warm probes re-ask an answered question, and 14 of those cross a request
+    /// boundary, so a request-scoped layer alone leaves almost all of it on the
+    /// table while boot needs precisely the opposite.
     fn exists_cached(&self, path: &str, bit: u8, probe: impl Fn(&Arc<dyn Vfs>) -> bool) -> bool {
-        if self
-            .request_exists_cache
-            .read()
-            .get(path)
-            .map_or(false, |f| f & bit != 0)
-        {
+        let absent = absent_bits_for(bit);
+        let gen_now = exists_neg_generation();
+        // Both layers share the bit vocabulary, and in both the ABSENT half is
+        // believed only while its generation still matches.
+        let usable = |e: ExistsEntry| {
+            if e.neg_gen == gen_now {
+                e.flags
+            } else {
+                e.flags & !ABSENT_MASK
+            }
+        };
+        let hit = || {
             cfml_common::perf_counters::bump(&cfml_common::perf_counters::EXISTS_MEMO_HITS);
-            return true;
+            #[cfg(feature = "exists-census")]
+            cfml_common::perf_counters::exists_census::record_memo_hit();
+        };
+        // Layer 1 — request scoped, every mode.
+        //
+        // NOTE both lookups bind the entry through a `let` before the `if let`.
+        // `if let Some(e) = lock.read().get(..).copied()` extends the guard
+        // temporary to the end of the block, and parking_lot's RwLock is not
+        // reentrant — the layer-2 arm below calls `record_exists_bits`, which
+        // takes a `write()` on the very same lock, so the inline form
+        // self-deadlocks. It does so only when layer 2 is live, which is why the
+        // CLI test suite (no ServerState, no layer 2) stayed green through it.
+        let l1 = self.request_exists_cache.read().get(path).copied();
+        if let Some(e) = l1 {
+            let flags = usable(e);
+            if flags & bit != 0 {
+                hit();
+                return true;
+            }
+            if flags & absent != 0 {
+                hit();
+                return false;
+            }
+        }
+        // Layer 2 — application lifetime, production only. A hit is promoted into
+        // layer 1 so the rest of the request answers without the shared lock.
+        if let Some(ss) = self.exists_l2() {
+            let l2 = ss.exists_cache.read().get(path).copied();
+            if let Some(e) = l2 {
+                let flags = usable(e);
+                if flags & bit != 0 {
+                    hit();
+                    self.record_exists_bits(path, flags & !ABSENT_MASK, gen_now);
+                    return true;
+                }
+                if flags & absent != 0 {
+                    hit();
+                    self.record_exists_bits(path, flags & ABSENT_MASK, gen_now);
+                    return false;
+                }
+            }
         }
         cfml_common::perf_counters::bump(&cfml_common::perf_counters::EXISTS_FS_PROBES);
         let found = probe(&self.vfs);
-        if found {
-            *self
-                .request_exists_cache
-                .write()
-                .entry(path.to_string())
-                .or_insert(0) |= bit;
-        }
+        #[cfg(feature = "exists-census")]
+        cfml_common::perf_counters::exists_census::record(
+            path,
+            bit,
+            found,
+            self.exists_census_epoch,
+        );
+        let learned = if found { exists_bits_for(bit) } else { absent };
+        self.record_exists_bits(path, learned, gen_now);
         found
+    }
+
+    /// Is `runtime.existenceCacheScope` left at its `"application"` default?
+    ///
+    /// Anything other than an explicit `"request"` keeps the default, so a typo
+    /// fails toward the documented behaviour rather than silently halving the
+    /// cache.
+    fn exists_cache_scope_is_application(&self) -> bool {
+        let Some(ss) = self.server_state.as_ref() else {
+            return false;
+        };
+        !ss.cfconfig
+            .runtime
+            .existence_cache_scope
+            .eq_ignore_ascii_case("request")
+    }
+
+    /// Yield-point retirement: drop the cached NEGATIVES for the paths *this
+    /// request has actually probed*, in both layers, leaving every other cached
+    /// answer alone.
+    ///
+    /// This is the hang-safety property behind negative caching — `while (
+    /// !fileExists( f ) ) { sleep( 50 ) }` must be able to observe `f` appearing —
+    /// but scoped to the only paths that can possibly be in such a loop: ones this
+    /// request has asked about. The global generation bump was measurably far too
+    /// blunt for it. Preside calls `sleep()` about 2.7 times per render, so
+    /// retiring every negative in the process each time evicted the cross-request
+    /// negatives on almost every request and cost most of the benefit.
+    ///
+    /// Positives are untouched: waiting cannot make an existing path vanish.
+    fn retire_probed_negatives(&self) {
+        let polled: Vec<String> = {
+            let mut w = self.request_exists_cache.write();
+            let mut out = Vec::new();
+            w.retain(|k, e| {
+                if e.flags & ABSENT_MASK != 0 {
+                    out.push(k.clone());
+                    e.flags &= !ABSENT_MASK;
+                }
+                e.flags != 0
+            });
+            out
+        };
+        if polled.is_empty() {
+            return;
+        }
+        if let Some(ss) = self.server_state.as_ref() {
+            let mut w = ss.exists_cache.write();
+            for k in &polled {
+                if let Some(e) = w.get_mut(k) {
+                    e.flags &= !ABSENT_MASK;
+                }
+            }
+            w.retain(|_, e| e.flags != 0);
+        }
+    }
+
+    /// Drop every cached answer in both layers, positive and negative.
+    ///
+    /// The fallback for a mutation whose target is not knowable: a recursive
+    /// `directoryDelete`, or an external program under `cfexecute`. A *removal*
+    /// falsifies positives, and only a wholesale clear is sound when we cannot say
+    /// which ones.
+    fn clear_exists_caches_wholesale(&self) {
+        self.request_exists_cache.write().clear();
+        if let Some(ss) = self.server_state.as_ref() {
+            ss.exists_cache.write().clear();
+        }
+        invalidate_exists_negatives();
+    }
+
+    /// Drop every cached answer — positive and negative — for one path.
+    ///
+    /// This is the targeted counterpart to the wholesale clears: when the engine
+    /// itself writes, deletes, moves or copies a path, only that path's answer
+    /// can have changed, so only that path's answer is discarded. Matched on
+    /// **canonical path identity** for the same reason the GH #284 freshness
+    /// flush is (`invalidate_written_file_caches`): the spelling handed to
+    /// `fileWrite` may carry `./` or a mapping/symlink alias and only agrees with
+    /// the probing spelling after canonicalization.
+    fn invalidate_exists_path(&self, path: &str) {
+        let canon = self.canonicalize_cached(path).ok();
+        let matches = |k: &str| {
+            k == path
+                || canon
+                    .as_deref()
+                    .is_some_and(|c| k == c || self.canonicalize_cached(k).ok().as_deref() == Some(c))
+        };
+        self.request_exists_cache.write().retain(|k, _| !matches(k));
+        if let Some(ss) = self.server_state.as_ref() {
+            ss.exists_cache.write().retain(|k, _| !matches(k));
+        }
+        // Deliberately NO global negative retirement here. This function exists to
+        // invalidate exactly one path, and bumping the generation on top of that
+        // would retire every cached negative in the process — which is precisely
+        // what made cross-request negatives recover nothing: Preside does one
+        // `fileWrite` per request, so one attributed write was wiping the whole
+        // negative cache on every render.
+        //
+        // The residue: a *creation* also falsifies cached negatives held under a
+        // different spelling of the same path, because a not-yet-existing target
+        // has no canonical form to match against until it exists. Both spellings
+        // would have to have been probed already for that to bite, and the raw one
+        // is removed above. Anything genuinely unattributable still routes through
+        // `clear_exists_caches_wholesale` or the drop guard instead.
+    }
+
+    /// Merge `bits` into this path's entry in layer 1, and in layer 2 when it is
+    /// in play.
+    ///
+    /// Adopting a negative learned in a newer generation drops any negative held
+    /// from an older one; positives simply accumulate.
+    fn record_exists_bits(&self, path: &str, bits: u8, gen_now: u64) {
+        if bits == 0 {
+            return;
+        }
+        let merge = |map: &mut HashMap<String, ExistsEntry>| {
+            let e = map.entry(path.to_string()).or_insert(ExistsEntry {
+                flags: 0,
+                neg_gen: gen_now,
+            });
+            if e.neg_gen != gen_now {
+                e.flags &= !ABSENT_MASK;
+                e.neg_gen = gen_now;
+            }
+            e.flags |= bits;
+        };
+        merge(&mut self.request_exists_cache.write());
+        if let Some(ss) = self.exists_l2() {
+            let mut w = ss.exists_cache.write();
+            // Bounded, unlike its sibling path caches, because the key space here
+            // is not: `fileExists( uploadDir & userSuppliedName )` is ordinary CFML,
+            // so an application-lifetime map keyed on arbitrary probed paths would
+            // grow without limit on a long-lived server. A cache is allowed to
+            // forget — drop everything and re-learn rather than creep.
+            if w.len() >= EXISTS_L2_MAX_ENTRIES {
+                w.clear();
+            }
+            merge(&mut w);
+        }
     }
 
     /// Does this java-shim method mutate the filesystem?
@@ -30513,6 +30920,107 @@ impl CfmlVirtualMachine {
         )
     }
 
+    /// Whether dispatching this builtin could CREATE a path, and so must retire
+    /// cached negatives.
+    ///
+    /// This is deliberately the **broad** question, the mirror image of
+    /// `builtin_may_remove_path`'s narrow one, because the two invalidations cost
+    /// wildly different amounts. Retiring negatives is an O(1) generation bump
+    /// that leaves every positive intact, so over-firing is nearly free; missing
+    /// a creator, by contrast, is a correctness bug (`fileExists()` answering
+    /// false for a file that now exists). The 2026-08 attempt tried to enumerate
+    /// creators precisely and missed four on the first pass — `cfdump output=`,
+    /// `cfhttp file=`, the upload BIFs and `cfexecute` — one of which only
+    /// surfaced as a red test. So: everything that touches the filesystem counts
+    /// unless it is a *provably* read-only probe.
+    fn builtin_may_create_path(name_lower: &str) -> bool {
+        // Creators whose target path is knowable from the call itself. These are
+        // invalidated BY PATH after the op (see the `write_targets` branch in
+        // `call_function`), so firing the process-wide retirement for them as well
+        // would throw away every cached negative for no reason. That is not
+        // hypothetical: Preside does exactly one `fileWrite` per request, and with
+        // this list absent it retired the negatives on every single render — which
+        // is why cross-request negatives measured as recovering nothing.
+        if Self::creator_has_known_target(name_lower) {
+            return false;
+        }
+        // Provably read-only: these cannot bring a path into existence.
+        const READ_ONLY: &[&str] = &[
+            "fileexists",
+            "fileread",
+            "filereadbinary",
+            "filereadline",
+            "fileiseof",
+            "filegetmimetype",
+            "filewassaved",
+            "directoryexists",
+            "directorylist",
+            "getfileinfo",
+            "getprofilestring",
+            "getprofilesections",
+            // Closing a handle cannot bring a path into existence. It was the
+            // single biggest spurious retirer measured on a Preside boot (835 of
+            // them), the exact mirror of the positive-side bug fixed in c9fa07f.
+            "fileclose",
+        ];
+        if READ_ONLY.contains(&name_lower) {
+            return false;
+        }
+        name_lower.starts_with("file")
+            || name_lower.starts_with("directory")
+            || name_lower.starts_with("image")
+            || matches!(
+                name_lower,
+                "cffile"
+                    | "cfdirectory"
+                    | "__cfdirectory"
+                    | "cfzip"
+                    | "cfdump"
+                    | "__cfdump"
+                    | "writedump"
+                    | "cfhttp"
+                    | "__cfhttp"
+                    | "cfexecute"
+                    | "__cfexecute"
+                    | "cfspreadsheet"
+                    | "__cfspreadsheet"
+                    | "spreadsheetwrite"
+                    | "cfdocument"
+                    | "__cfdocument"
+                    | "cfpdf"
+                    | "__cfpdf"
+                    | "cflog"
+                    | "__cflog"
+                    | "writelog"
+                    | "cfzipparam"
+                    | "cfftp"
+                    | "__cfftp"
+                    | "cfmail"
+                    | "__cfmail"
+                    | "storeaddacl"
+                    | "storesetmetadata"
+            )
+    }
+
+    /// Does this builtin name a path it may create, in its own arguments?
+    ///
+    /// Must agree with `file_write_targets`: everything listed here is expected to
+    /// yield targets there and so be invalidated by path instead of by the
+    /// process-wide negative retirement.
+    fn creator_has_known_target(name_lower: &str) -> bool {
+        matches!(
+            name_lower,
+            "filewrite"
+                | "fileappend"
+                | "filewriteline"
+                | "filedelete"
+                | "fileopen"
+                | "directorycreate"
+                | "filecopy"
+                | "filemove"
+        )
+    }
+
     /// Rebase the path argument(s) of a file/directory BIF against the current
     /// template's directory before dispatch (see `resolve_template_relative`).
     /// Non-path BIFs pass through untouched. Applied uniformly so both the
@@ -30561,7 +31069,13 @@ impl CfmlVirtualMachine {
         // destination (1) is written; for move/rename both the source (0, now
         // gone) and destination (1) change. Delete/write/append target arg 0.
         let indices: &[usize] = match name_lower {
-            "filewrite" | "fileappend" | "filewriteline" | "filedelete" => &[0],
+            // Creation/overwrite/removal targets. `fileOpen` and `directoryCreate`
+            // are here for the EXISTENCE half rather than the template-cache half:
+            // both can bring a path into being, and both name it in argument 0, so
+            // attributing them beats retiring every cached negative in the process
+            // (`fileOpen` alone did that 835 times on one Preside boot).
+            "filewrite" | "fileappend" | "filewriteline" | "filedelete" | "fileopen"
+            | "directorycreate" => &[0],
             "filecopy" => &[1],
             "filemove" => &[0, 1],
             _ => return Vec::new(),

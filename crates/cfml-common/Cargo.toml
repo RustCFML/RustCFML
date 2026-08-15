@@ -40,6 +40,15 @@ op-census = []
 # the very thing it measures — read it for SHARES, never as an absolute. Probe
 # builds only.
 call-phases = []
+# Existence-probe outcome census (known-issues §45 sizing). The shipped
+# EXISTS_MEMO_HITS / EXISTS_FS_PROBES pair cannot answer the question that
+# decides the fix, because the memo holds POSITIVES ONLY: a negative probe can
+# never be a hit, so the hit-rate is structurally blind to the traffic that
+# dominates. This feature classifies every probe by outcome AND by whether the
+# same path was already probed (this request / an earlier one), which is what
+# separates recoverable repeats from irreducible first looks. Keeps a
+# Mutex'd map of every probed path, so it is a sizing build only — never ship it.
+exists-census = []
 
 [dependencies]
 thiserror = { workspace = true }

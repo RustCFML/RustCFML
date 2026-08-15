@@ -1,16 +1,19 @@
 <cfscript>
-// Request-scoped existence memo behind fileExists()/directoryExists() (GH #299).
-// Only POSITIVE answers are memoised, and every filesystem-mutating BIF drops
-// the memo — so each probe below must reflect the tree as it is right then, not
-// as an earlier probe in the same request saw it.
+// Two-layer existence cache behind fileExists()/directoryExists() (GH #299,
+// known-issues §45). BOTH answers are cached — positive and negative — with
+// positives invalidated per-path by the engine's own writes and negatives
+// retired wholesale by a generation bump whenever anything may have created a
+// path. So each probe below must reflect the tree as it is right then, not as an
+// earlier probe in the same request saw it, in EITHER direction.
 suiteBegin("Existence cache invalidation");
 
 tmp = getTempDirectory();
 f = tmp & "rustcfml_exists_" & createUUID() & ".txt";
 d = tmp & "rustcfml_existsdir_" & createUUID();
 
-// A negative is never cached: probing a missing path repeatedly must not make
-// its later creation invisible (the `while (!fileExists(x))` poll pattern).
+// A cached negative must not make a later creation invisible — repeated probing
+// of a missing path is exactly what seeds one (the `while (!fileExists(x))`
+// poll pattern), so probe twice before creating.
 assertFalse("missing file: probe 1", fileExists(f));
 assertFalse("missing file: probe 2", fileExists(f));
 fileWrite(f, "one");
@@ -93,6 +96,41 @@ assertTrue("cfexecute target exists (memoised)", fileExists(xf));
 <cfexecute name="/bin/rm" arguments="#xf#" timeout="10" />
 <cfscript>
 assertFalse("cfexecute invalidates the memoised positive", fileExists(xf));
+
+// ---------------------------------------------------------------------------
+// Creators that are VM-INTERCEPTED rather than dispatched as plain builtins.
+//
+// These never reach the builtin dispatcher, so a per-BIF "may create a path"
+// predicate placed there cannot see them — which is exactly how `cfdump
+// output=` regressed: the negative probe below cached "absent", cfdump then
+// wrote the file, and fileExists() went on denying it for the rest of the
+// request. Each case probes FIRST (seeding a negative), then creates, then
+// re-probes.
+// ---------------------------------------------------------------------------
+df = tmp & "rustcfml_exists_dump_" & createUUID() & ".html";
+assertFalse("cfdump target absent: probe 1", fileExists(df));
+assertFalse("cfdump target absent: probe 2 (negative now cached)", fileExists(df));
+writeDump( var={ a=1, b="two" }, output=df );
+assertTrue("cfdump output= creation retires the cached negative", fileExists(df));
+fileDelete(df);
+assertFalse("cleanup: dump target removed", fileExists(df));
+
+// NOTE: `fileOpen( f, "write" )` would be the other intercepted creator to pin
+// here, but in RustCFML it does not create the file at all — verified outside the
+// existence cache entirely (`directoryList` does not see it and it is absent on
+// disk), so it is a separate divergence from Lucee rather than anything this
+// cache can get wrong. See docs/known-issues.md §49.
+
+// A cfthread has its own VM and its own writes; joining it is a yield point, so
+// a negative cached before the join must not survive it.
+tf2 = tmp & "rustcfml_exists_thread_" & createUUID() & ".txt";
+assertFalse("thread target absent before start", fileExists(tf2));
+thread name="existsWriter" target=tf2 {
+	fileWrite( attributes.target, "written by thread" );
+}
+threadJoin("existsWriter");
+assertTrue("threadJoin retires the cached negative", fileExists(tf2));
+fileDelete(tf2);
 
 suiteEnd();
 </cfscript>

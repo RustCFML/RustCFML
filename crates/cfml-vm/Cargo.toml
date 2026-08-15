@@ -96,6 +96,9 @@ s3 = ["dep:cfml-stdlib", "cfml-stdlib/s3"]
 op-census = ["cfml-common/op-census"]
 # Call-prologue phase attribution — see cfml-common's `call-phases`.
 call-phases = ["cfml-common/call-phases"]
+# Existence-probe outcome census — see cfml-common's `exists-census`. Probe
+# builds only.
+exists-census = ["cfml-common/exists-census"]
 # Multi-tier Cranelift JIT. **Default-on for native targets** — included in the
 # `default` feature set above. The wasm crates (`cfml-worker`, `rustcfml-wasm`)
 # depend on cfml-vm with `default-features = false`, and the cranelift deps

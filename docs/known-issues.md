@@ -1018,42 +1018,104 @@ Covered by `tests/database/test_query_error_sqlstate_members.cfm` (SQLite
 control gated on driver availability so it skips on Lucee; PostgreSQL, MySQL and
 SQL Server legs gated on `RUSTCFML_TEST_PG_DS` / `_MYSQL_DS` / `_MSSQL_DS`).
 
-## 45. The request existence memo caches positives only 🏗
+## 45. Existence answers are cached for the life of the application ✅ *(fixed)*
 
-`Vm::request_exists_cache` (`crates/cfml-vm/src/lib.rs:2459`) is a
-`HashMap<String, u8>` of bit flags — is-file, is-dir, exists
-(`lib.rs:1157-1161`). A probe that **finds** a path sets its bit; a probe that
-finds **nothing** records nothing at all. So a path that does not exist is
-re-`stat`ed on every single probe, for the life of the request, and again on
-every subsequent request.
+**Was:** `Vm::request_exists_cache` cached **positives only**, for one request. A
+path that did not exist was re-`stat`ed on every probe, forever. Measured on a
+live Preside admin site (`RUSTCFML_COUNTERS=1`, v0.595.1) that meant more real
+syscalls than cache hits — 11,938 probes against 7,387 hits on cold boot, 18,908
+against 9,862 cumulatively.
 
-Measured on a live Preside admin site (`RUSTCFML_COUNTERS=1`, v0.595.1):
+**The sizing that explains two failed attempts.** A purpose-built census
+(`--features exists-census`, `cfml-common/src/perf_counters.rs`) classified every
+probe by outcome *and* by whether the path had been probed before. Boot and warm
+have opposite shapes, which is why each earlier attempt built one layer and then
+measured the workload the other layer serves:
 
-| | `exists FS probes (stats)` | `exists memo hits` |
+| | cold boot (28 epochs) | warm homepage (per request) |
 |---|---|---|
-| cold boot | 11,938 | 7,387 |
-| longer cumulative run | 18,908 | 9,862 |
+| positive, first ever | 19.3% | 0.0 |
+| positive, repeat later request | 0.6% | 7.0 |
+| negative, first ever *(irreducible)* | 30.4% | 1.0 |
+| negative, repeat **same** request | 47.8% | 1.0 |
+| negative, repeat later request | 1.8% | 7.0 |
+| **total** | 11,944 probes | **16.0 probes, 15 recoverable** |
 
-More real syscalls than cache hits is the wrong way round for a cache.
+Boot repetition is overwhelmingly *within* one request; warm repetition is
+overwhelmingly *across* requests (14 of 16). A request-scoped negative memo —
+built and measured at zero in 2026-08 — could only ever have recovered 1 of the
+16 warm probes. A cross-request *positive* layer — built and measured at −1.07% in
+2026-08 — could only reach 7.
 
-It is compounded by the memo being cleared **wholesale** whenever a path-mutating
-operation runs — `lib.rs:13266`, `:13276`, `:18599`, plus a java-shim file
-mutation site — so a single file write also discards every positive entry
-accumulated so far.
+**Result on the same live Preside site:** warm probes fell from **16.0 to 1.0 per
+request** and boot probes from 11,944 to 6,036, while memo hits rose from 0.04 to
+14.3 per warm request. The single remaining warm probe is the irreducible
+"negative, first ever" — every recoverable class measured at zero.
 
-The pattern this hurts most is an existence check on a path that is *expected* to
-be absent. ColdBox/Preside's `HandlerService.isViewDispatch()` is the canonical
-example: it runs `fileExists( expandPath( ... ) )` only after the handler scan has
-already failed, so the path is absent **by construction** and the stat is
-guaranteed to be wasted, on every unresolved event.
+**Now:** two layers, both caching positive *and* negative answers.
 
-**Before fixing, check this against the v0.516.0 work** that added negative
-caching at the *canonicalize* layer
-(`request_canon_cache` / `canonicalize_cache`). That is a different layer to this
-one, but whoever picks this up should confirm they are not re-solving a solved
-problem, or undoing a deliberate decision about staleness — a negative memo is
-exactly where a "file appeared after we said it didn't" bug would live, and the
-dev-mode freshness rules matter here.
+* Layer 1 `Vm::request_exists_cache` — every mode, request lifetime.
+* Layer 2 `ServerState::exists_cache` — `--production` only, application
+  lifetime, same immutable-tree contract as `canonicalize_cache` /
+  `component_path_cache` / `custom_tag_path_cache`. A layer-2 hit is promoted into
+  layer 1.
+
+Six bits per path (`EXISTS_FILE`/`DIR`/`ANY` plus `ABSENT_FILE`/`DIR`/`ANY`), with
+the implications wired in: "is a file" implies "exists", and "does not exist"
+implies neither-file-nor-directory, so one probe can answer questions of a
+different kind for free.
+
+**Invalidation is asymmetric, on purpose.** A cached positive is falsified only by
+a *removal*, which the engine can attribute to a path — so removals invalidate
+**by canonical path identity** and an unrelated write no longer discards the whole
+map (the `c9fa07f` bug: 861 flushes per Preside request, 835 of them from
+`fileClose`, which cannot remove anything). A cached negative is falsified by a
+*creation*, which has **no single choke point**: the `Vfs` trait is read-only, so
+writes reach `std::fs` from all over cfml-stdlib and the VM, and several creators
+(`cfdump output=`, `cfhttp file=`, the upload BIFs, `cfexecute`, `writeDump`) are
+**VM-intercepted and never pass the builtin dispatcher at all**. Enumerating them
+is what the 2026-08 attempt tried, missing four on the first pass. So negatives
+are instead guarded by a process-global generation
+(`EXISTS_NEG_GENERATION`): anything that may create a path bumps it via a drop
+guard taken at the single point every builtin-shaped call passes through, which
+retires every negative in O(1) while leaving every positive standing.
+
+`sleep()` and `threadJoin()` also retire negatives — but only for the paths *this
+request has already probed* (`retire_probed_negatives`). That is the property that
+makes negative caching safe at all: `while ( !fileExists( f ) ) { sleep( 50 ) }`
+is the standard poll for a file another actor is producing, and a held negative
+would turn it from a staleness trade-off into a hang. Scoping it to probed paths
+matters as much as having it: Preside calls `sleep()` ~2.7 times per render, so
+retiring every negative in the process on each one evicted the cross-request
+negatives on nearly every request and cost most of the benefit — warm probes sat
+at 5.8 per request until this was narrowed, against 1.0 after.
+
+Three things had to be right before any of it measured, and each was invisible to
+the correctness suite:
+
+* **`.then(|| guard)`, not `.then_some(guard)`.** `then_some` takes its argument by
+  value, so the guard was constructed and immediately dropped on *every* builtin
+  call — `fileExists` included — retiring negatives as fast as they were learned.
+* **Creators whose target path is knowable are attributed, not globalised.**
+  Preside does one `fileWrite` per request; while that fired the process-wide
+  retirement it wiped the negative cache every render.
+* **`fileClose` cannot create anything** and must not retire (835 spurious
+  retirements per boot) — the exact mirror of the positive-side bug in `c9fa07f`.
+
+**The trade-off, stated plainly.** In `--production`, an existence answer can
+survive a change made by a *different process* — a file deleted or created
+outside the engine may not be observed until something invalidates. That is the
+same bargain the three sibling path caches already strike, and RustCFML's own
+writes always invalidate. Dev serve mode and the CLI have no layer 2 at all, so
+they always see an external change on the next request. Opt out in production
+with `runtime.existenceCacheScope = "request"` (default `"application"`).
+
+Covered by `tests/stdlib/test_existence_cache.cfm` (36 assertions, including the
+VM-intercepted `cfdump output=` creator and the `threadJoin` yield point) and
+`crates/cfml-vm/tests/xreq_exists_cache.rs` (7 tests over the layer-2 contract:
+production holds a positive *and* a negative across requests, dev holds neither,
+the scope knob disables layer 2, own-writes invalidate in both directions, and an
+unrelated write does not discard a cached positive).
 
 ## 46. Member-function dispatch lowercases the method name per call 🏗
 
@@ -1907,3 +1969,27 @@ lowerCamel/UpperCamel/ALLCAPS/mixed for the measured functions, the VM-intercept
 agreeing with the armed index). New counters `builtin CI lookups` /
 `miscased (CI fallback)` / `index-stale O(n) scans` are reported under
 `RUSTCFML_COUNTERS=1`.
+
+## 49. `fileOpen( f, "write" )` does not create the file 🏗
+
+Lucee's `fileOpen()` in a write mode creates the target immediately, so
+`fileExists()` is true before anything is written and the handle can be closed
+without ever producing content. RustCFML defers creation until the first
+`fileWrite()` on the handle, so:
+
+```cfml
+h = fileOpen( f, "write" );
+fileClose( h );
+fileExists( f );   // Lucee: true.  RustCFML: false — nothing was created
+```
+
+Confirmed to be genuine absence rather than a stale cached answer: after the
+sequence above the path is invisible to `directoryList()` (a different code path
+from the existence memo) and absent on disk. `fileClose()` is itself a no-op stub
+in RustCFML, which is why nothing flushes a zero-byte file on close.
+
+Found while pinning §45's invalidation, where `fileOpen` was the natural second
+intercepted creator to test — it is not a creator here at all. Untouched by that
+work; the existence cache is correct either way, since it never caches an answer
+the filesystem does not agree with. Fixing it means giving handles a real
+create-on-open, which also wants `fileClose()` to stop being a stub.

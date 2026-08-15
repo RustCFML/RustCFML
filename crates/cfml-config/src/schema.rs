@@ -268,6 +268,21 @@ pub struct RuntimeCfg {
     #[serde(deserialize_with = "de_lenient_bool")]
     pub report_as_lucee: bool,
     /// `"days,hours,minutes,seconds"`.
+    /// How long a resolved file-existence answer (`fileExists`,
+    /// `directoryExists`, and the engine's own template/helper probing) may be
+    /// reused: `"application"` (**the default**) or `"request"`.
+    ///
+    /// Sized on live Preside: 15 of every 16 warm existence probes re-ask a
+    /// question already answered, and 14 of those 15 repeats cross a request
+    /// boundary — so `"request"` leaves nearly all of it on the table. It exists
+    /// because `"application"` carries a staleness trade-off that `"request"`
+    /// does not: an answer can survive a change made by a *different process*
+    /// (RustCFML's own writes always invalidate). Only ever consulted in
+    /// `--production`; dev serve mode and the CLI are always request-scoped, so a
+    /// file created or deleted outside the engine is picked up on the next
+    /// request. See docs/known-issues.md §45.
+    #[serde(rename = "existenceCacheScope")]
+    pub existence_cache_scope: String,
     #[serde(rename = "applicationTimeout")]
     pub application_timeout: String,
     #[serde(rename = "sessionTimeout")]
@@ -287,6 +302,7 @@ impl Default for RuntimeCfg {
             trusted_cache: false,
             // Report as Lucee by default (opt out with `reportAsLucee: false`).
             report_as_lucee: true,
+            existence_cache_scope: "application".into(),
             application_timeout: "1,0,0,0".into(),
             session_timeout: "0,0,30,0".into(),
             client_timeout: "7,0,0,0".into(),
