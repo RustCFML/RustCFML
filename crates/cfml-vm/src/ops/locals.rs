@@ -179,7 +179,9 @@ pub(crate) fn op_validate_param_type(
 pub(crate) fn op_jump_if_arg_present(
     ip: &mut usize,
     locals: &ValueMap,
-    arguments_supplied: &Option<std::collections::HashSet<String>>,
+    arguments_supplied: &Option<
+        std::collections::HashSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>,
+    >,
     name: &Name,
     target: usize,
 ) {
@@ -199,7 +201,7 @@ pub(crate) fn op_jump_if_arg_present(
         Some(CfmlValue::Struct(a)) => a.contains_key_ci(name),
         _ => arguments_supplied
             .as_ref()
-            .is_some_and(|s| s.contains(name.lower())),
+            .is_some_and(|s| s.contains(name.key())),
     };
     if supplied {
         *ip = target;

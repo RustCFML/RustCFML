@@ -6726,12 +6726,20 @@ impl CfmlVirtualMachine {
         // absent, so its default runs; GH #240's carried-parent-value hazard is
         // avoided because this is NOT the enclosing `locals`). `None` in the
         // eager path, where `JumpIfArgPresent` reads the real arguments struct.
-        let mut arguments_supplied: Option<std::collections::HashSet<String>> =
-            if build_arguments_eager {
-                None
-            } else {
-                Some(std::collections::HashSet::with_capacity(func.params.len()))
-            };
+        // v0.599 — keyed by the interned param `Key`, not a lowercased `String`:
+        // insertion is a refcount bump instead of a `to_lowercase()` allocation
+        // per parameter per lazy call, and `Key`'s own equality already folds
+        // case, so the lowercasing this set existed to pre-compute is gone.
+        let mut arguments_supplied: Option<
+            std::collections::HashSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>,
+        > = if build_arguments_eager {
+            None
+        } else {
+            Some(std::collections::HashSet::with_capacity_and_hasher(
+                func.params.len(),
+                Default::default(),
+            ))
+        };
         // Lucee/ACF/BoxLang: a value bound to a declared parameter appears in
         // the `arguments` scope under its parameter NAME — never under its
         // 1-based positional index. Positional access (`arguments[1]`) still
@@ -6772,10 +6780,7 @@ impl CfmlVirtualMachine {
                     if build_arguments_eager {
                         arguments_map.insert(param_keys[i].clone(), value);
                     } else {
-                        arguments_supplied
-                            .as_mut()
-                            .unwrap()
-                            .insert(param_name.to_lowercase());
+                        arguments_supplied.as_mut().unwrap().insert(param_keys[i].clone());
                     }
                 }
                 None => {
@@ -6830,7 +6835,7 @@ impl CfmlVirtualMachine {
             // `arguments[N]` (1-based) can fall through to params[N-1] at the
             // GetIndex site without having to thread the param list separately.
             // Both markers are filtered from user-visible struct introspection.
-            arguments_map.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
+            arguments_map.insert(&*cfml_common::key::well_known::ARGUMENTS_MARKER, CfmlValue::Bool(true));
             // v0.442 (call-dispatch Lever 2) — the `__arguments_params` positional
             // marker is only consulted for functions that declare params; for a
             // paramless function an absent marker behaves identically to the empty
@@ -6853,7 +6858,7 @@ impl CfmlVirtualMachine {
                         )
                     })
                     .clone();
-                arguments_map.insert("__arguments_params".to_string(), params_marker);
+                arguments_map.insert(&*cfml_common::key::well_known::ARGUMENTS_PARAMS, params_marker);
             }
             // A `cfinclude`d template (the included file's `__main__`, run with the
             // caller's scope as parent) shares the CALLER's `arguments` scope in
@@ -6876,7 +6881,7 @@ impl CfmlVirtualMachine {
                 }
             }
             locals.insert(
-                ARGUMENTS_SCOPE_KEY.to_string(),
+                &*cfml_common::key::well_known::ARGUMENTS_SCOPE,
                 if untrack_arguments_scope {
                     // Lever C: provably frame-confined → skip cycle-GC logging.
                     CfmlValue::strukt_untracked(arguments_map)

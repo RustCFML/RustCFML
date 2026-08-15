@@ -549,4 +549,9 @@ pub mod well_known {
     pub static PROPERTIES: LazyLock<Key> = LazyLock::new(|| Key::new("__properties"));
     /// A component's class name marker.
     pub static NAME_MARKER: LazyLock<Key> = LazyLock::new(|| Key::new("__name"));
+    /// Sentinel marking a struct AS the `arguments` scope.
+    pub static ARGUMENTS_MARKER: LazyLock<Key> = LazyLock::new(|| Key::new("__arguments_scope"));
+    /// Declared parameter names carried on the `arguments` scope, so
+    /// `arguments[N]` can fall through to the positional param.
+    pub static ARGUMENTS_PARAMS: LazyLock<Key> = LazyLock::new(|| Key::new("__arguments_params"));
 }
