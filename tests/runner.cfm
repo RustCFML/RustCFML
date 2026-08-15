@@ -683,6 +683,7 @@ include "harness.cfm";
 <!--- inside a runtime-instantiated fixture CFC (ForInThisLoopFixture), --->
 <!--- which degrades to a non-object silently instead of aborting. Both --->
 <!--- modes fail their assertions without taking down the run. --->
+<cf_runtest file="core/test_classic_localmode_writeback.cfm">
 <cf_runtest file="core/test_local_at_template_scope.cfm">
 <!--- - local_scope_absence_leak: a callee that never declares `local.rv` must --->
 <!--- get a fresh, EMPTY local — StructKeyExists(local, "rv") false and --->

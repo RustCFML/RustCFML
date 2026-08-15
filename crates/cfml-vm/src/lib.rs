@@ -6948,6 +6948,21 @@ impl CfmlVirtualMachine {
         // leave the frame, so codegen handles those with `AbandonTagPairs`.)
         let entry_tag_depth = self.custom_tag_stack.len();
         let entry_buffers_depth = self.saved_output_buffers.len();
+
+        // v0.599 — snapshot the locals map's mutation counter now that seeding
+        // (parent-scope copy, params, `arguments`) is complete. If the body
+        // never mutates `locals`, the classic-localMode parent-scope writeback
+        // diff at exit CANNOT produce anything: every key present here either
+        // came from the parent (so it compares equal) or is filtered out by the
+        // diff (param / declared local / `arguments` / `this` / `__*`). On live
+        // Preside that diff runs on 98% of frames and scans 3.36 M keys per
+        // boot+30 renders to write 38 — this turns almost all of it off.
+        //
+        // Sound by construction: `ValueMap` owns every `&mut` accessor and bumps
+        // the counter in all of them (`deref_mut` included), so no write path —
+        // present or future, `StoreLocal`, `i++`, dynamic var set, `include`,
+        // anything — can mutate the map without being seen here.
+        let locals_version_at_entry = locals.version();
         #[cfg(feature = "call-phases")]
         {
             // phase 5: called_name, call_stack push, entry-depth capture
@@ -9675,7 +9690,11 @@ impl CfmlVirtualMachine {
                     // the freshly-built component's methods into the caller's
                     // locals — poisoning later bare-name calls.
                     if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
-                        if !effective_local_mode_modern {
+                        // See `locals_version_at_entry`: an untouched locals map
+                        // has nothing that could diff against the parent.
+                        if !effective_local_mode_modern
+                            && locals.version() != locals_version_at_entry
+                        {
                             #[cfg(feature = "call-phases")]
                             let mut _cp_wb = std::time::Instant::now();
                             let arg_scope = Self::arguments_scope_struct(&locals);
@@ -12200,7 +12219,10 @@ impl CfmlVirtualMachine {
         // out as a closure writeback (which would poison the enclosing method's
         // caller locals with the new component's methods).
         if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
-            if !effective_local_mode_modern {
+            // Same futility guard as the early-return path: if the body never
+            // mutated `locals`, this diff has nothing to find. See
+            // `locals_version_at_entry`.
+            if !effective_local_mode_modern && locals.version() != locals_version_at_entry {
                 let arg_scope = Self::arguments_scope_struct(&locals);
                 let fused_env_guard =
                     fused_env_baseline.as_ref().and_then(|e| e.read().ok());

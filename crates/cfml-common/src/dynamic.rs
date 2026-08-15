@@ -35,7 +35,7 @@ pub type RawValueMap = IndexMap<Key, CfmlValue, KeyBuildHasher>;
 /// defined inline here (`keys`, `values`, `iter`, `retain`, `get_index`, …)
 /// reaches the inner `IndexMap` through `Deref`/`DerefMut`.
 #[derive(Clone, Default)]
-pub struct ValueMap(RawValueMap);
+pub struct ValueMap(RawValueMap, u32);
 
 /// Types that can be turned into an owned [`Key`] for insertion. Passing a
 /// `Key` moves it (no hash, no allocation); passing a string builds one.
@@ -161,12 +161,29 @@ impl<T: ProbeKey + ?Sized> ProbeKey for &T {
 impl ValueMap {
     #[inline]
     pub fn with_capacity_and_hasher(n: usize, _h: ValueBuildHasher) -> Self {
-        ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()))
+        ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()), 0)
+    }
+
+    /// Monotonic mutation counter. Every `&mut` accessor on this type bumps it,
+    /// including `deref_mut`, so a caller that snapshots this and later finds it
+    /// unchanged **knows** the map was not mutated in between — there is no way
+    /// to mutate an `IndexMap` except through a `&mut` method, and this newtype
+    /// owns all of them.
+    ///
+    /// Used by the frame epilogue to skip the classic-localMode parent-scope
+    /// writeback diff, which on live Preside scans 3.36 M keys per boot+30
+    /// renders to produce 38 writes: if the frame never touched its locals, the
+    /// diff cannot produce anything, because every seeded key either came from
+    /// the parent (so compares equal) or is filtered out (param / declared /
+    /// `arguments` / `__*`).
+    #[inline]
+    pub fn version(&self) -> u32 {
+        self.1
     }
 
     #[inline]
     pub fn with_capacity(n: usize) -> Self {
-        ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()))
+        ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()), 0)
     }
 
     /// The inner map, for the few places that need the raw `IndexMap` API.
@@ -177,6 +194,7 @@ impl ValueMap {
 
     #[inline]
     pub fn raw_mut(&mut self) -> &mut RawValueMap {
+        self.1 = self.1.wrapping_add(1);
         &mut self.0
     }
 
@@ -189,6 +207,7 @@ impl ValueMap {
     /// replacing its value — CFML's `s.Foo = 1; s.FOO = 2` semantics.
     #[inline]
     pub fn insert(&mut self, key: impl IntoKey, value: CfmlValue) -> Option<CfmlValue> {
+        self.1 = self.1.wrapping_add(1);
         self.0.insert(key.into_key(), value)
     }
 
@@ -201,6 +220,7 @@ impl ValueMap {
     #[inline]
     #[cfg_attr(feature = "probe-sites", track_caller)]
     pub fn get_mut(&mut self, key: impl ProbeKey) -> Option<&mut CfmlValue> {
+        self.1 = self.1.wrapping_add(1);
         self.0.get_mut(&key.probe())
     }
 
@@ -239,23 +259,27 @@ impl ValueMap {
     #[inline]
     #[cfg_attr(feature = "probe-sites", track_caller)]
     pub fn shift_remove(&mut self, key: impl ProbeKey) -> Option<CfmlValue> {
+        self.1 = self.1.wrapping_add(1);
         self.0.shift_remove(&key.probe())
     }
 
     #[inline]
     #[cfg_attr(feature = "probe-sites", track_caller)]
     pub fn swap_remove(&mut self, key: impl ProbeKey) -> Option<CfmlValue> {
+        self.1 = self.1.wrapping_add(1);
         self.0.swap_remove(&key.probe())
     }
 
     #[inline]
     #[cfg_attr(feature = "probe-sites", track_caller)]
     pub fn shift_remove_entry(&mut self, key: impl ProbeKey) -> Option<(Key, CfmlValue)> {
+        self.1 = self.1.wrapping_add(1);
         self.0.shift_remove_entry(&key.probe())
     }
 
     #[inline]
     pub fn entry(&mut self, key: impl IntoKey) -> indexmap::map::Entry<'_, Key, CfmlValue> {
+        self.1 = self.1.wrapping_add(1);
         self.0.entry(key.into_key())
     }
 
@@ -283,13 +307,17 @@ impl std::ops::Deref for ValueMap {
 impl std::ops::DerefMut for ValueMap {
     #[inline]
     fn deref_mut(&mut self) -> &mut RawValueMap {
+        // Conservative: hands out `&mut` to the raw map, so assume a mutation.
+        // Being wrong here only costs a scan that was going to happen anyway;
+        // NOT bumping would be a correctness hole.
+        self.1 = self.1.wrapping_add(1);
         &mut self.0
     }
 }
 
 impl<K: IntoKey> FromIterator<(K, CfmlValue)> for ValueMap {
     fn from_iter<I: IntoIterator<Item = (K, CfmlValue)>>(iter: I) -> Self {
-        ValueMap(iter.into_iter().map(|(k, v)| (k.into_key(), v)).collect())
+        ValueMap(iter.into_iter().map(|(k, v)| (k.into_key(), v)).collect(), 0)
     }
 }
 
@@ -342,14 +370,14 @@ impl serde::Serialize for ValueMap {
 
 impl<'de> serde::Deserialize<'de> for ValueMap {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(ValueMap(RawValueMap::deserialize(d)?))
+        Ok(ValueMap(RawValueMap::deserialize(d)?, 0))
     }
 }
 
 impl From<RawValueMap> for ValueMap {
     #[inline]
     fn from(m: RawValueMap) -> Self {
-        ValueMap(m)
+        ValueMap(m, 0)
     }
 }
 
