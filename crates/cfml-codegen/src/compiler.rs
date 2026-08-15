@@ -154,6 +154,17 @@ pub struct CfmlCompiler {
     source_file: Option<String>,
 }
 
+impl BytecodeFunction {
+    /// The parameter names as interned [`Key`](cfml_common::key::Key)s, built
+    /// on first call and cached for the life of the function. Use this — not
+    /// `params` — anywhere a parameter name is used to probe or seed a scope.
+    #[inline]
+    pub fn param_keys(&self) -> &[cfml_common::key::Key] {
+        self.param_keys
+            .get_or_init(|| self.params.iter().map(cfml_common::key::Key::new).collect())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BytecodeProgram {
     pub functions: Vec<Arc<BytecodeFunction>>,
@@ -163,6 +174,12 @@ pub struct BytecodeProgram {
 pub struct BytecodeFunction {
     pub name: String,
     pub params: Vec<String>,
+    /// v0.599 — the parameter names as interned map keys, built once on first
+    /// use and shared for the life of the function. Parameter binding and the
+    /// return-time write-back scan both probe `locals` once per parameter per
+    /// call; going through these means neither hashes, and binding inserts by
+    /// cloning a key instead of allocating a `String`.
+    pub param_keys: std::sync::OnceLock<Vec<cfml_common::key::Key>>,
     /// Which params are required (parallel to `params`; true = required)
     pub required_params: Vec<bool>,
     /// Which params declare a default value (parallel to `params`; true = has
@@ -1394,6 +1411,7 @@ impl CfmlCompiler {
                 functions: vec![Arc::new(BytecodeFunction {
                     name: "__main__".to_string(),
                     params: Vec::new(),
+                    param_keys: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: Vec::new(),
@@ -3999,6 +4017,7 @@ impl CfmlCompiler {
         let bc_func = BytecodeFunction {
             name: func.name.clone(),
             params: func.params.iter().map(|p| p.name.clone()).collect(),
+            param_keys: Default::default(),
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
@@ -4277,6 +4296,7 @@ impl CfmlCompiler {
                 let getter_func = BytecodeFunction {
                     name: getter_name.clone(),
                     params: Vec::new(),
+                    param_keys: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
@@ -4368,6 +4388,7 @@ impl CfmlCompiler {
                 let setter_func = BytecodeFunction {
                     name: setter_name.clone(),
                     params: vec![prop.name.clone()],
+                    param_keys: Default::default(),
                     required_params: vec![true],
                     has_default: vec![false],
                     instructions: setter_instructions,
@@ -4549,6 +4570,7 @@ impl CfmlCompiler {
             let static_func = BytecodeFunction {
                 name: "__cfc_static_init__".to_string(),
                 params: Vec::new(),
+                param_keys: Default::default(),
                 required_params: Vec::new(),
                 has_default: Vec::new(),
                 instructions: static_instrs,
@@ -5543,6 +5565,7 @@ impl CfmlCompiler {
                 let bc_func = BytecodeFunction {
                     name: func_name.clone(),
                     params: closure.params.iter().map(|p| p.name.clone()).collect(),
+                    param_keys: Default::default(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
@@ -5627,6 +5650,7 @@ impl CfmlCompiler {
                 let bc_func = BytecodeFunction {
                     name: func_name.clone(),
                     params: arrow.params.iter().map(|p| p.name.clone()).collect(),
+                    param_keys: Default::default(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,

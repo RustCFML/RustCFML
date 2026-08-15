@@ -5516,7 +5516,12 @@ impl CfmlVirtualMachine {
     /// undefined"); a `cgi`-style empty-default scope still yields `Some("")`, and
     /// non-struct receivers keep their existing Null-or-member behaviour (never a
     /// miss-throw — arrays/strings/queries are out of scope for this fix).
-    fn lookup_property_opt(obj: &CfmlValue, name: &str) -> Option<CfmlValue> {
+    /// v0.599 — `name` is the interned bytecode operand, so every probe here
+    /// reuses its compile-time key hash. (13.8% of remaining hashing probes.)
+    fn lookup_property_opt(
+        obj: &CfmlValue,
+        name: &cfml_common::name::Name,
+    ) -> Option<CfmlValue> {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = obj {
             let g = inst.read();
@@ -6736,6 +6741,10 @@ impl CfmlVirtualMachine {
         // Overflow positional args (paramless fn called positionally, or
         // extras beyond declared params with no matching name) DO get numeric
         // keys — that's the only handle they have.
+        // v0.599 — bind through the interned parameter keys: the probe does no
+        // hashing and the insert clones a key instead of allocating a `String`
+        // per parameter per call (the phase-4b cost).
+        let param_keys = func.param_keys();
         for (i, param_name) in func.params.iter().enumerate() {
             inherited_or_param_keys.insert(param_name);
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
@@ -6761,9 +6770,9 @@ impl CfmlVirtualMachine {
                     if let Some(Some(ptype)) = func.param_types.get(i) {
                         self.check_declared_param_type(func, i, param_name, ptype, &value)?;
                     }
-                    locals.insert(param_name.clone(), value.clone());
+                    locals.insert(param_keys[i].clone(), value.clone());
                     if build_arguments_eager {
-                        arguments_map.insert(param_name.clone(), value);
+                        arguments_map.insert(param_keys[i].clone(), value);
                     } else {
                         arguments_supplied
                             .as_mut()
@@ -7207,7 +7216,7 @@ impl CfmlVirtualMachine {
                             .cloned()
                             .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()))
                     } else if let Some(val) =
-                        self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
+                        self.lookup_name_in_scopes(name, name_lower, &locals)
                     {
                         // Bug #9: a CFC method retrieved by bare name in value
                         // position (e.g. `.each( processPropertyMetadata )`) is
@@ -20309,9 +20318,13 @@ impl CfmlVirtualMachine {
     }
 
 
+    /// v0.599 — takes the interned bytecode `Name` rather than a `&str`, so
+    /// every probe below reuses the key hash built at compile time. This is
+    /// the single hottest keyed-lookup site in the engine (15.7% of all
+    /// remaining hashing probes on a warm Preside render before the change).
     fn lookup_name_in_scopes(
         &self,
-        name: &str,
+        name: &cfml_common::name::Name,
         name_lower: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
@@ -20363,7 +20376,7 @@ impl CfmlVirtualMachine {
         // per-request scope instead of a `url` key that leaked onto its
         // `variables` scope (Masa front-controller infinite redirect loop).
         if Self::is_web_request_scope(name_lower) {
-            if let Some(v) = self.globals.get(name).or_else(|| self.globals.get(name_lower)) {
+            if let Some(v) = self.globals.get(name) {
                 return Some(v.clone());
             }
         }
@@ -25991,8 +26004,8 @@ impl CfmlVirtualMachine {
             return;
         }
         let mut writeback = Vec::new();
-        for (i, param_name) in func.params.iter().enumerate() {
-            if let Some(val) = locals.get(param_name) {
+        for (i, param_key) in func.param_keys().iter().enumerate() {
+            if let Some(val) = locals.get(param_key) {
                 match val {
                     // Arrays, structs AND queries are reference-typed now:
                     // in-place mutations through the parameter already propagate

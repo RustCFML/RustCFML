@@ -1238,6 +1238,7 @@ mod tests {
         BytecodeFunction {
             name: "f".to_string(),
             params: params.iter().map(|s| s.to_string()).collect(),
+            param_keys: Default::default(),
             required_params: params.iter().map(|_| true).collect(),
             has_default: params.iter().map(|_| false).collect(),
             instructions: instrs,

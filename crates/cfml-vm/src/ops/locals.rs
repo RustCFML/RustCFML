@@ -461,7 +461,7 @@ pub(crate) fn op_try_load_local(
     } else if name_lower == "server" {
         CfmlValue::Struct(vm.live_server_scope())
     } else {
-        vm.lookup_name_in_scopes(name.as_str(), &name_lower, &locals)
+        vm.lookup_name_in_scopes(name, &name_lower, &locals)
             .unwrap_or(CfmlValue::Null)
     };
     stack.push(val);
@@ -573,7 +573,7 @@ pub(crate) fn op_load_local_property(
     let receiver = slot_receiver.or_else(|| {
         locals.get(local_name).cloned().or_else(|| {
             vm.lookup_name_in_scopes(
-                local_name.as_str(),
+                local_name,
                 name_lower,
                 &locals,
             )
@@ -662,7 +662,7 @@ pub(crate) fn op_array_append_local(
     // by the original (globals/__variables/case-insensitive).
     let name_lower: &str = name.lower();
     if let Some(CfmlValue::Array(arr)) =
-        vm.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
+        vm.lookup_name_in_scopes(name, name_lower, &locals)
     {
         arr.push(value);
         return Ok(());

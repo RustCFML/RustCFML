@@ -50,7 +50,7 @@ pub(crate) fn op_set_last_exception_from_local(
     // already-handled inner exception left in the register by a
     // nested try/catch. A missing local (shouldn't happen for a
     // real catch var) leaves the register untouched.
-    if let Some(v) = vm.lookup_name_in_scopes(name.as_str(), name.lower(), &locals) {
+    if let Some(v) = vm.lookup_name_in_scopes(name, name.lower(), &locals) {
         if !matches!(v, CfmlValue::Null) {
             vm.last_exception = Some(v);
         }
