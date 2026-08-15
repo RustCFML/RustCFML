@@ -510,7 +510,9 @@ fn fixup_self_ref(scope: &CfmlStruct, marker_ptr: usize, self_val: &CfmlValue) {
 /// instances always carry `__variables`.
 #[inline]
 pub fn is_component_backing(s: &CfmlStruct) -> bool {
-    s.contains_key_ci("__variables") && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
+    use crate::key::well_known as wk;
+    s.contains_key_ci(&*wk::VARIABLES)
+        && (s.contains_key_ci(&*wk::THIS) || s.contains_key_ci(&*wk::NAME_MARKER))
 }
 
 /// True iff `a` and `b` are the SAME flyweight component instance (Arc identity).

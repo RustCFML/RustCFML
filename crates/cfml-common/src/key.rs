@@ -547,4 +547,6 @@ pub mod well_known {
     pub static SUPER_NATIVE: LazyLock<Key> = LazyLock::new(|| Key::new("__super"));
     /// A CFC's declared `property` list.
     pub static PROPERTIES: LazyLock<Key> = LazyLock::new(|| Key::new("__properties"));
+    /// A component's class name marker.
+    pub static NAME_MARKER: LazyLock<Key> = LazyLock::new(|| Key::new("__name"));
 }

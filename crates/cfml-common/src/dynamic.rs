@@ -1197,9 +1197,8 @@ impl CfmlStruct {
     #[inline]
     pub fn key_ci(&self, key: &str) -> Option<String> {
         let g = self.0.read();
-        if g.map.contains_key(key) {
-            return Some(key.to_string()); // exact-case fast path
-        }
+        // v0.599 — one probe; the map returns the stored key in its original
+        // casing directly, so the old exact-then-resolve pair is redundant.
         if let Some(orig) = g.resolve_ci_key(key) {
             return Some(orig.as_str().to_string());
         }
@@ -1267,11 +1266,12 @@ impl CfmlStruct {
     /// is a struct, never a Function, so the flag's value is unaffected.
     pub fn probe_dispatch_shape(&self, method: &str) -> DispatchShape {
         let g = self.0.read();
+        // v0.599 — the trailing `keys().any(eq_ignore_ascii_case)` scan of the
+        // shared method table is gone: `contains_key` folds case itself, so the
+        // scan could only ever repeat the probe's answer.
         let contains = |k: &str| {
             g.map.contains_key(k)
-                || g.method_table.as_ref().is_some_and(|t| {
-                    t.contains_key(k) || t.keys().any(|tk| tk.eq_ignore_ascii_case(k))
-                })
+                || g.method_table.as_ref().is_some_and(|t| t.contains_key(k))
         };
         let method_val = g
             .map

@@ -2760,23 +2760,21 @@ const _: fn() = || {
 /// identifiers are case-insensitive, so `foo = ""; FOO = "bar"` must leave a
 /// single variable equal to "bar" (ColdBox's RequestService relies on this: it
 /// declares `var flashPath` then assigns `flashpath` inside a switch). The
-/// exact-match fast path keeps hot loops O(1) and allocation-free (overwrite
-/// in place, no key clone); the CI scan runs only when the exact key is absent
-/// (a genuinely new key or a case mismatch), and a CI hit also updates in
-/// place. A key String is only allocated for a genuinely new entry.
+/// The probe keeps hot loops O(1) and allocation-free (overwrite in place, no
+/// key clone); a key is only allocated for a genuinely new entry.
 #[inline]
 fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
+    // v0.599 — one probe. This used to fall back to a linear
+    // `keys().position(eq_ignore_ascii_case)` scan over the whole scope when
+    // the exact-case probe missed, which on a warm Preside render was the
+    // single most frequent hashing probe site left in the engine. The map key
+    // folds case itself, so the scan can no longer find anything the probe
+    // did not.
     if let Some(slot) = map.get_mut(name) {
         *slot = val;
         return;
     }
-    if let Some(idx) = map.keys().position(|k| k.eq_ignore_ascii_case(name)) {
-        if let Some((_, slot)) = map.get_index_mut(idx) {
-            *slot = val;
-            return;
-        }
-    }
-    map.insert(name.to_string(), val);
+    map.insert(name, val);
 }
 
 /// Deferred inputs for the fused call-parent merge (see the field doc on
