@@ -8782,6 +8782,11 @@ impl CfmlVirtualMachine {
                         }
                         let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
                             if let Some(ref shared_env) = f.captured_scope {
+                                #[cfg(feature = "call-phases")]
+                                cfml_common::perf_counters::call_phases::bump_env_clone(
+                                    shared_env.read().map(|e| e.len() as u64).unwrap_or(0)
+                                        + locals.len() as u64,
+                                );
                                 let is_cfc_context = locals.contains_key(&*cfml_common::key::well_known::THIS);
                                 merged_scope = if is_cfc_context {
                                     // CFC methods: start with captured scope (has runtime data),
@@ -8820,9 +8825,13 @@ impl CfmlVirtualMachine {
                                 };
                                 &merged_scope
                             } else {
+                                #[cfg(feature = "call-phases")]
+                                cfml_common::perf_counters::call_phases::bump_env_passthrough();
                                 &locals
                             }
                         } else {
+                            #[cfg(feature = "call-phases")]
+                            cfml_common::perf_counters::call_phases::bump_env_passthrough();
                             &locals
                         };
                         // Isolate try-stack so throws inside the callee
@@ -9462,6 +9471,11 @@ impl CfmlVirtualMachine {
                         }
                         let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
                             if let Some(ref shared_env) = f.captured_scope {
+                                #[cfg(feature = "call-phases")]
+                                cfml_common::perf_counters::call_phases::bump_env_clone(
+                                    shared_env.read().map(|e| e.len() as u64).unwrap_or(0)
+                                        + locals.len() as u64,
+                                );
                                 let is_cfc_context = locals.contains_key(&*cfml_common::key::well_known::THIS);
                                 merged_scope = if is_cfc_context {
                                     let mut m = shared_env.read().unwrap().clone();
@@ -9490,9 +9504,13 @@ impl CfmlVirtualMachine {
                                 };
                                 &merged_scope
                             } else {
+                                #[cfg(feature = "call-phases")]
+                                cfml_common::perf_counters::call_phases::bump_env_passthrough();
                                 &locals
                             }
                         } else {
+                            #[cfg(feature = "call-phases")]
+                            cfml_common::perf_counters::call_phases::bump_env_passthrough();
                             &locals
                         };
                         let saved_try_stack = if self.try_stack.is_empty() {

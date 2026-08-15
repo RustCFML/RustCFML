@@ -296,6 +296,27 @@ pub mod call_phases {
         CALLS.fetch_add(1, Relaxed);
     }
 
+    /// Calls whose callee carried a captured scope, so the caller pre-call
+    /// (phase 8) had to CLONE the whole captured env map before merging the
+    /// caller's locals into it. Paired with the key count, this says whether
+    /// that clone is worth removing with a layered scope view.
+    pub static ENV_CLONE_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Keys copied by those clones (env size + the caller locals merged in).
+    pub static ENV_CLONE_KEYS: AtomicU64 = AtomicU64::new(0);
+    /// Calls that passed the caller's locals straight through (no clone).
+    pub static ENV_PASSTHROUGH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn bump_env_clone(keys: u64) {
+        ENV_CLONE_CALLS.fetch_add(1, Relaxed);
+        ENV_CLONE_KEYS.fetch_add(keys, Relaxed);
+    }
+
+    #[inline]
+    pub fn bump_env_passthrough() {
+        ENV_PASSTHROUGH_CALLS.fetch_add(1, Relaxed);
+    }
+
     /// Frames that built the `arguments` scope EAGERLY vs took the lazy path
     /// (Lever A). Phase 4 is 338 ns/frame on live Preside, so which side of this
     /// branch the real workload sits on decides whether the fix is "make eager
@@ -390,11 +411,16 @@ pub mod call_phases {
         let (e, l) = (g(&ARGS_EAGER), g(&ARGS_LAZY));
         let (t, pl) = (g(&RET_THIS_WRITEBACK), g(&RET_PLAIN));
         format!(
-            "--- call-path branch split ---\n\
+            "--- caller pre-call scope handling (phase 8) ---\n\
+             env CLONED (closure callee):  {:>12}\n\
+               .. keys copied:             {:>12}\n\
+             locals passed through:        {:>12}\n\
+             --- call-path branch split ---\n\
              arguments scope eager:  {:>12}  ({:.1}%)\n\
              arguments scope lazy:   {:>12}  ({:.1}%)\n\
              Return with this-wb:    {:>12}  ({:.1}%)\n\
              Return plain:           {:>12}  ({:.1}%)",
+            g(&ENV_CLONE_CALLS), g(&ENV_CLONE_KEYS), g(&ENV_PASSTHROUGH_CALLS),
             e, e as f64 / (e + l).max(1) as f64 * 100.0,
             l, l as f64 / (e + l).max(1) as f64 * 100.0,
             t, t as f64 / (t + pl).max(1) as f64 * 100.0,
