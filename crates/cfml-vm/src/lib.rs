@@ -8785,12 +8785,38 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Call(arg_count) => {
+                    // `_cp_p8_start` keeps phase 8 reported as the WHOLE
+                    // pre-call window even though 24..28 now sub-split it, so
+                    // the number stays comparable with the earlier phase table
+                    // (inflated by the sub-clock reads — read shares, not
+                    // absolutes).
                     #[cfg(feature = "call-phases")]
-                    let _cp_call = std::time::Instant::now();
-                    // Identify which local variables are being passed as args
-                    // (for pass-by-reference writeback of complex types)
-                    // ip was already incremented past this Call op, so use ip-1
-                    let arg_sources = self.arg_sources_cached(&func, ip - 1, *arg_count);
+                    let _cp_p8_start = std::time::Instant::now();
+                    #[cfg(feature = "call-phases")]
+                    let _cp_call = _cp_p8_start;
+                    // Which local variables are being passed as args, for
+                    // pass-by-reference writeback of complex types. Resolving
+                    // this is DEFERRED to the writeback branch below: it is a
+                    // hash probe plus an `Arc` clone/drop pair, it was measured
+                    // at ~42 ns on every single call (phase 24, ~0.53 ms per
+                    // warm Preside render — the largest item in phase 8), and
+                    // the result is read only when the callee actually reports
+                    // a by-ref mutation, which is rare. `ip` is captured here
+                    // because the error path below can reassign it.
+                    let call_ip = ip - 1;
+                    #[cfg(feature = "call-phases")]
+                    let _cp_call = {
+                        let _n = std::time::Instant::now();
+                        cfml_common::perf_counters::call_phases::add(
+                            24, _n.duration_since(_cp_call).as_nanos() as u64);
+                        // Census sits OUTSIDE the window it describes: an extra
+                        // atomic inside phase 24 would be a large share of the
+                        // ~20 ns it is trying to measure.
+                        cfml_common::perf_counters::call_phases::record_p8_args(
+                            *arg_count as u64,
+                        );
+                        std::time::Instant::now()
+                    };
 
                     let mut args = Vec::with_capacity(*arg_count);
                     for _ in 0..*arg_count {
@@ -8799,6 +8825,13 @@ impl CfmlVirtualMachine {
                         }
                     }
                     args.reverse();
+                    #[cfg(feature = "call-phases")]
+                    let _cp_call = {
+                        let _n = std::time::Instant::now();
+                        cfml_common::perf_counters::call_phases::add(
+                            25, _n.duration_since(_cp_call).as_nanos() as u64);
+                        _n
+                    };
 
                     if let Some(func_ref) = stack.pop() {
                         self.closure_parent_writeback = None;
@@ -8828,10 +8861,10 @@ impl CfmlVirtualMachine {
                         // name at runtime (QoQ table sources via queryExecute /
                         // cfquery, custom-tag `caller` bridging) can't see slot
                         // storage — spill before invoking them.
-                        if !slots.is_empty()
+                        let reflects_on_caller_scope = !slots.is_empty()
                             && matches!(&func_ref, CfmlValue::Function(f)
-                                if Self::callee_reflects_on_caller_scope(&f.name))
-                        {
+                                if Self::callee_reflects_on_caller_scope(&f.name));
+                        if reflects_on_caller_scope {
                             Self::spill_slots_for_writeback(
                                 &mut locals,
                                 &func.slot_names,
@@ -8839,6 +8872,18 @@ impl CfmlVirtualMachine {
                                 &mut slot_blocked,
                             );
                         }
+                        #[cfg(feature = "call-phases")]
+                        let _cp_call = {
+                            let _n = std::time::Instant::now();
+                            cfml_common::perf_counters::call_phases::add(
+                                26, _n.duration_since(_cp_call).as_nanos() as u64);
+                            if !slots.is_empty() {
+                                cfml_common::perf_counters::call_phases::record_p8_slot(
+                                    reflects_on_caller_scope,
+                                );
+                            }
+                            std::time::Instant::now()
+                        };
                         let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
                             if let Some(ref shared_env) = f.captured_scope {
                                 #[cfg(feature = "call-phases")]
@@ -8893,18 +8938,29 @@ impl CfmlVirtualMachine {
                             cfml_common::perf_counters::call_phases::bump_env_passthrough();
                             &locals
                         };
+                        #[cfg(feature = "call-phases")]
+                        let _cp_call = {
+                            let _n = std::time::Instant::now();
+                            cfml_common::perf_counters::call_phases::add(
+                                27, _n.duration_since(_cp_call).as_nanos() as u64);
+                            _n
+                        };
                         // Isolate try-stack so throws inside the callee
                         // don't consume the caller's handlers
                         let saved_try_stack = if self.try_stack.is_empty() {
                             None
                         } else {
+                            #[cfg(feature = "call-phases")]
+                            cfml_common::perf_counters::call_phases::bump_p8_try_saved();
                             Some(std::mem::take(&mut self.try_stack))
                         };
                         #[cfg(feature = "call-phases")]
                         let _cp_call = {
                             let _n = std::time::Instant::now();
                             cfml_common::perf_counters::call_phases::add(
-                                8, _n.duration_since(_cp_call).as_nanos() as u64);
+                                28, _n.duration_since(_cp_call).as_nanos() as u64);
+                            cfml_common::perf_counters::call_phases::add(
+                                8, _n.duration_since(_cp_p8_start).as_nanos() as u64);
                             _n
                         };
                         let call_result = self.call_function(&func_ref, args, effective_locals);
@@ -8945,6 +9001,10 @@ impl CfmlVirtualMachine {
                                 // Pass-by-reference writeback: update caller's local variables
                                 // with modified complex-type argument values
                                 if let Some(ref_wb) = self.arg_ref_writeback.take() {
+                                    #[cfg(feature = "call-phases")]
+                                    cfml_common::perf_counters::call_phases::bump_p8_argref_present();
+                                    let arg_sources =
+                                        self.arg_sources_cached(&func, call_ip, *arg_count);
                                     for (idx_str, modified_val) in ref_wb {
                                         if let Ok(param_idx) = idx_str.parse::<usize>() {
                                             if param_idx < arg_sources.len() {
@@ -9001,7 +9061,10 @@ impl CfmlVirtualMachine {
                 BytecodeOp::CallNamed(names, arg_count) => {
                     // Identify arg sources for pass-by-reference writeback
                     // ip was already incremented past this op, so use ip-1
-                    let named_arg_sources = self.arg_sources_cached(&func, ip - 1, *arg_count);
+                    // Deferred for the same reason as the positional `Call` arm
+                    // above — resolved only if the callee reports a by-ref
+                    // mutation.
+                    let named_call_ip = ip - 1;
 
                     let mut named_values = Vec::with_capacity(*arg_count);
                     for _ in 0..*arg_count {
@@ -9605,6 +9668,10 @@ impl CfmlVirtualMachine {
                                 }
                                 // Pass-by-reference writeback for named calls
                                 if let Some(ref_wb) = self.arg_ref_writeback.take() {
+                                    #[cfg(feature = "call-phases")]
+                                    cfml_common::perf_counters::call_phases::bump_p8_argref_present();
+                                    let named_arg_sources = self
+                                        .arg_sources_cached(&func, named_call_ip, *arg_count);
                                     for (idx_str, modified_val) in ref_wb {
                                         if let Ok(param_idx) = idx_str.parse::<usize>() {
                                             // For named args: find which call-site arg was mapped
@@ -19949,8 +20016,12 @@ impl CfmlVirtualMachine {
     ) -> Arc<Vec<Option<String>>> {
         let key = (func.global_id, call_ip);
         if let Some(v) = self.arg_sources_memo.get(&key) {
+            #[cfg(feature = "call-phases")]
+            cfml_common::perf_counters::call_phases::bump_p8_argsrc_memo(true);
             return v.clone();
         }
+        #[cfg(feature = "call-phases")]
+        cfml_common::perf_counters::call_phases::bump_p8_argsrc_memo(false);
         let v = Arc::new(find_arg_sources(&func.instructions, call_ip, arg_count));
         self.arg_sources_memo.insert(key, v.clone());
         v

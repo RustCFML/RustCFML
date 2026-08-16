@@ -385,7 +385,7 @@ pub mod op_census {
 pub mod call_phases {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub const N: usize = 24;
+    pub const N: usize = 29;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -554,6 +554,100 @@ pub mod call_phases {
             g(&WB_MAX_ARGKEYS),
             g(&WB_MAX_PROBES),
             g(&WB_MAX_PRODUCT),
+        )
+    }
+
+    /// Phase-8 sub-split census (the caller's pre-call window in the `Call`
+    /// arm). The env-clone hypothesis is already dead — 1 call in 588 — so the
+    /// remaining 139.9 ns/frame is spread across `arg_sources`, the argument
+    /// `Vec`, the slot-spill probe and the try-stack isolation. These are exact
+    /// frequencies rather than timings: at a ~17 ns clock floor a five-way
+    /// sub-split of a 140 ns phase is measuring its own instrument, so the
+    /// counters decide and the sub-timers only corroborate.
+    pub static P8_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Calls whose `arg_sources_cached` memo probe hit vs had to scan.
+    pub static P8_ARGSRC_HIT: AtomicU64 = AtomicU64::new(0);
+    pub static P8_ARGSRC_MISS: AtomicU64 = AtomicU64::new(0);
+    /// Of the hits, how many returned a vector with ANY `Some` source. Every
+    /// call pays a `HashMap` probe + `Arc` clone to obtain this; if it is
+    /// almost always all-`None` the whole lookup can collapse to a cached bool.
+    pub static P8_ARGSRC_USEFUL: AtomicU64 = AtomicU64::new(0);
+    /// Calls where the callee actually reported a by-ref mutation, i.e. the
+    /// only calls that still need `arg_sources` now the lookup is deferred.
+    /// This is the RESIDUAL of the phase-24 lever.
+    pub static P8_ARGREF_PRESENT: AtomicU64 = AtomicU64::new(0);
+    /// Arguments popped, and calls that allocated a heap `Vec` to hold them
+    /// (`arg_count > 0`). One malloc/free pair per call is the single largest
+    /// allocation on the call path if the count is near 100%.
+    pub static P8_ARGS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static P8_ARGS_VEC_ALLOC: AtomicU64 = AtomicU64::new(0);
+    /// Calls that reached the slot-spill probe (`!slots.is_empty()`), i.e. paid
+    /// `callee_reflects_on_caller_scope`'s seven `eq_ignore_ascii_case`
+    /// comparisons, vs those that actually spilled.
+    pub static P8_SLOT_PROBED: AtomicU64 = AtomicU64::new(0);
+    pub static P8_SLOT_SPILLED: AtomicU64 = AtomicU64::new(0);
+    /// Calls that had to `mem::take` a non-empty try-stack and restore it.
+    pub static P8_TRY_SAVED: AtomicU64 = AtomicU64::new(0);
+
+    /// Bumped inside `arg_sources_cached`, which already knows which side of
+    /// the memo it took — re-probing at the call site would double the hash
+    /// lookup being measured.
+    #[inline]
+    pub fn bump_p8_argsrc_memo(hit: bool) {
+        if hit { P8_ARGSRC_HIT.fetch_add(1, Relaxed) } else { P8_ARGSRC_MISS.fetch_add(1, Relaxed) };
+    }
+
+    #[inline]
+    pub fn bump_p8_argref_present() {
+        P8_ARGREF_PRESENT.fetch_add(1, Relaxed);
+    }
+
+    #[inline]
+    pub fn record_p8_args(n: u64) {
+        P8_CALLS.fetch_add(1, Relaxed);
+        P8_ARGS_TOTAL.fetch_add(n, Relaxed);
+        if n > 0 {
+            P8_ARGS_VEC_ALLOC.fetch_add(1, Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_p8_slot(spilled: bool) {
+        P8_SLOT_PROBED.fetch_add(1, Relaxed);
+        if spilled {
+            P8_SLOT_SPILLED.fetch_add(1, Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn bump_p8_try_saved() {
+        P8_TRY_SAVED.fetch_add(1, Relaxed);
+    }
+
+    pub fn p8_report() -> String {
+        let g = |c: &AtomicU64| c.load(Relaxed);
+        let calls = g(&P8_CALLS).max(1);
+        let pct = |v: u64| v as f64 / calls as f64 * 100.0;
+        format!(
+            "--- phase 8 sub-split census ({} Call-op executions) ---\n\
+             arg_sources RESOLVED:        {:>12}  ({:.1}%)\n\
+               .. memo miss (scan):       {:>12}\n\
+               .. by-ref writeback fired: {:>12}  ({:.1}%)\n\
+             args popped (total / per call): {:>9} / {:.2}\n\
+               .. calls allocating a Vec: {:>12}  ({:.1}%)\n\
+             slot-spill probe reached:    {:>12}  ({:.1}%)\n\
+               .. actually spilled:       {:>12}  ({:.1}%)\n\
+             try-stack saved+restored:    {:>12}  ({:.1}%)",
+            calls,
+            g(&P8_ARGSRC_HIT) + g(&P8_ARGSRC_MISS),
+            pct(g(&P8_ARGSRC_HIT) + g(&P8_ARGSRC_MISS)),
+            g(&P8_ARGSRC_MISS),
+            g(&P8_ARGREF_PRESENT), pct(g(&P8_ARGREF_PRESENT)),
+            g(&P8_ARGS_TOTAL), g(&P8_ARGS_TOTAL) as f64 / calls as f64,
+            g(&P8_ARGS_VEC_ALLOC), pct(g(&P8_ARGS_VEC_ALLOC)),
+            g(&P8_SLOT_PROBED), pct(g(&P8_SLOT_PROBED)),
+            g(&P8_SLOT_SPILLED), pct(g(&P8_SLOT_SPILLED)),
+            g(&P8_TRY_SAVED), pct(g(&P8_TRY_SAVED)),
         )
     }
 

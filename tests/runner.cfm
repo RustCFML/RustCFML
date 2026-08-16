@@ -98,6 +98,7 @@ include "harness.cfm";
 <!--- hasChanged() and with it every UPDATE statement. --->
 <cf_runtest file="core/test_builtin_data_shadow.cfm">
 <cf_runtest file="core/test_functions.cfm">
+<cf_runtest file="core/test_arg_ref_writeback_deferred.cfm">
 <cf_runtest file="core/test_arrow_functions.cfm">
 <cf_runtest file="core/test_comma_less_params.cfm">
 <cf_runtest file="core/test_required_param_with_default.cfm">

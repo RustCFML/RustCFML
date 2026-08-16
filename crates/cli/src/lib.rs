@@ -49,7 +49,7 @@ use cfml_codegen::compiler::CfmlCompiler;
 
 /// Labels for the `call-phases` prologue report, in phase order.
 #[cfg(feature = "call-phases")]
-const CALL_PHASE_LABELS: [&str; 24] = [
+const CALL_PHASE_LABELS: [&str; 29] = [
     "0 entry: fused-plan take, JIT probe, recursion guard",
     "1 allocate: locals map, operand stack, slots, declared_locals",
     "2 parent-scope seed copy",
@@ -74,6 +74,11 @@ const CALL_PHASE_LABELS: [&str; 24] = [
     "21     argument_scope_key_set build (fixed per frame)",
     "22     fused-env baseline read lock",
     "23     per-key diff loop",
+    "24   p8: arg_sources_cached (memo probe + Arc clone)",
+    "25   p8: args Vec alloc + stack pop + reverse",
+    "26   p8: func_ref pop, pending-field clears, slot-spill probe",
+    "27   p8: effective_locals (closure env clone or passthrough)",
+    "28   p8: try-stack isolation",
 ];
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::logging;
@@ -781,6 +786,8 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         );
         #[cfg(feature = "call-phases")]
         eprintln!("{}", cfml_common::perf_counters::call_phases::branch_report());
+        #[cfg(feature = "call-phases")]
+        eprintln!("{}", cfml_common::perf_counters::call_phases::p8_report());
     }
     match result {
         Ok(response) => {
@@ -1417,6 +1424,8 @@ fn run_server(
         );
         #[cfg(feature = "call-phases")]
         eprintln!("{}", cfml_common::perf_counters::call_phases::branch_report());
+        #[cfg(feature = "call-phases")]
+        eprintln!("{}", cfml_common::perf_counters::call_phases::p8_report());
     }
 
     #[cfg(all(feature = "memprofile", unix))]
@@ -2205,6 +2214,8 @@ async fn handle_request(
         );
         #[cfg(feature = "call-phases")]
         eprintln!("{}", cfml_common::perf_counters::call_phases::branch_report());
+        #[cfg(feature = "call-phases")]
+        eprintln!("{}", cfml_common::perf_counters::call_phases::p8_report());
     }
     response
 }
