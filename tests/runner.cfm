@@ -950,6 +950,11 @@ include "harness.cfm";
 <!--- class name, verified hits (GH #298). --->
 <cf_runtest file="oop/test_component_resolution_cache.cfm">
 
+<!--- Metadata executed-template cache: shared parents derive independently, a --->
+<!--- mutating caller cannot poison the memo, and instantiation still runs the --->
+<!--- pseudo-constructor every time (the cache is metadata-only by design). --->
+<cf_runtest file="oop/test_component_metadata_template_cache.cfm">
+
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">
 <cf_runtest file="tags/test_cfloop_list_literal.cfm">

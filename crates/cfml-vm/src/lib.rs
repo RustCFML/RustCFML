@@ -1288,6 +1288,33 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// case-SENSITIVELY, because the derived metadata can echo the name as written.
 type MetaMemoKey = (String, String, String, u64);
 
+/// RAII guard putting the VM in metadata-derivation mode; see
+/// [`CfmlVirtualMachine::meta_template_scope`]. Decrements on drop, so an
+/// early `return` or a `?` inside a derivation cannot leave the mode stuck on
+/// — which would let the instantiation path be served from a cached template.
+struct MetaTemplateScope<'a> {
+    vm: &'a mut CfmlVirtualMachine,
+}
+
+impl Drop for MetaTemplateScope<'_> {
+    fn drop(&mut self) {
+        self.vm.meta_template_depth = self.vm.meta_template_depth.saturating_sub(1);
+    }
+}
+
+impl std::ops::Deref for MetaTemplateScope<'_> {
+    type Target = CfmlVirtualMachine;
+    fn deref(&self) -> &Self::Target {
+        self.vm
+    }
+}
+
+impl std::ops::DerefMut for MetaTemplateScope<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.vm
+    }
+}
+
 /// `path` is an `Arc<str>` so a hit clones a pointer, not the path bytes.
 #[derive(Clone, Debug)]
 pub struct ComponentPathEntry {
@@ -2513,6 +2540,35 @@ pub struct CfmlVirtualMachine {
     /// under its declared SHORT name, so a dotted name can never be answered from
     /// `globals` and no later in-request definition can be shadowed by this cache.
     component_path_meta_cache: HashMap<MetaMemoKey, CfmlValue>,
+    /// Diagnostics only (`RUSTCFML_COUNTERS=1`): keys already resolved by
+    /// `resolve_component_template` this request, to size how often a template
+    /// EXECUTION is repeated rather than just its filename lookup.
+    resolved_template_keys_seen: std::collections::HashSet<u64>,
+    /// Request-scoped cache of EXECUTED component templates, consulted only
+    /// while deriving metadata (`meta_template_depth > 0`).
+    ///
+    /// The existing two-layer component cache memoizes only the resolved
+    /// FILENAME; every resolution still re-executes the pseudo-constructor and
+    /// re-walks the parent chain. Measured on a Preside boot, 73% of template
+    /// resolutions (9,317 of 12,776) repeat a key already resolved in the same
+    /// request — the repeats are the shared base classes that many components
+    /// extend.
+    ///
+    /// ⚠️ Deliberately NOT consulted on the instantiation path. CFML runs a
+    /// pseudo-constructor once per instantiation, so serving `createObject`
+    /// from one cached execution would skip its side effects and freeze
+    /// per-instance values (`this.created = now()`). Metadata is derived from
+    /// the class DEFINITION, which cannot change within a request — the same
+    /// freshness argument as `component_path_meta_cache`, and strictly closer
+    /// to Lucee, which does not execute a body to answer metadata at all.
+    ///
+    /// Entries are stored and returned as DEEP COPIES: callers mutate the
+    /// template (inheritance merges the parent into the child in place), so a
+    /// shared handle would let one derivation corrupt every later one.
+    component_meta_template_cache: HashMap<u64, CfmlValue>,
+    /// Depth of the current metadata derivation; `> 0` enables the cache above.
+    /// A counter rather than a bool because the builder recurses into parents.
+    meta_template_depth: u32,
     /// Phase C.3 (feature `component-instance`): per-`__source_file` cache of the
     /// class-invariant [`cfml_common::component::ClassBlueprint`], `Arc`-shared
     /// across every instance the producer builds. Request-scoped (rebuilt next
@@ -3126,6 +3182,9 @@ impl CfmlVirtualMachine {
             request_component_cache: HashMap::new(),
             component_inherit_meta_cache: HashMap::new(),
             component_path_meta_cache: HashMap::new(),
+            resolved_template_keys_seen: std::collections::HashSet::new(),
+            component_meta_template_cache: HashMap::new(),
+            meta_template_depth: 0,
             #[cfg(feature = "component-instance")]
             component_blueprints: HashMap::new(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -15996,29 +16055,58 @@ impl CfmlVirtualMachine {
                         // see `component_path_meta_cache` for the freshness argument.
                         let comp_name = arg.as_string();
                         let meta_key = self.component_path_meta_key(&comp_name, parent_locals);
+                        if meta_key.is_some() {
+                            cfml_common::perf_counters::META_PATH_CALLS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if let Some(ref key) = meta_key {
                             if let Some(hit) = self.component_path_meta_cache.get(key) {
+                                cfml_common::perf_counters::META_PATH_HITS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _t = cfml_common::perf_counters::ScopedNanos::new(
+                                    &cfml_common::perf_counters::META_PATH_HIT_NANOS,
+                                );
                                 return Ok(hit.deep_copy());
                             }
                         }
-                        if let Some(template) =
-                            self.resolve_component_template(&comp_name, parent_locals)
-                        {
-                            let resolved = self.resolve_inheritance(template, parent_locals)?;
+                        let _miss_timer = cfml_common::perf_counters::ScopedNanos::new(
+                            &cfml_common::perf_counters::META_PATH_MISS_NANOS,
+                        );
+                        // Everything from here to the end of this arm is pure
+                        // metadata derivation — no instance escapes — so the
+                        // executed-template cache is safe for the whole block.
+                        let mut mvm = self.meta_template_scope();
+                        let self_ = &mut *mvm;
+                        let _t_resolve = cfml_common::perf_counters::ScopedNanos::new(
+                            &cfml_common::perf_counters::META_MISS_RESOLVE_NANOS,
+                        );
+                        let resolved_tmpl =
+                            self_.resolve_component_template(&comp_name, parent_locals);
+                        drop(_t_resolve);
+                        if let Some(template) = resolved_tmpl {
+                            let _t_inh = cfml_common::perf_counters::ScopedNanos::new(
+                                &cfml_common::perf_counters::META_MISS_INHERIT_NANOS,
+                            );
+                            let resolved = self_.resolve_inheritance(template, parent_locals)?;
+                            drop(_t_inh);
                             if let CfmlValue::Struct(ref s) = resolved {
+                                let _t_snap = cfml_common::perf_counters::ScopedNanos::new(
+                                    &cfml_common::perf_counters::META_MISS_SNAPSHOT_NANOS,
+                                );
                                 let snap = s.snapshot_with_methods();
+                                drop(_t_snap);
                                 if matches!(
                                     snap.get("__is_interface"),
                                     Some(CfmlValue::Bool(true))
                                 ) {
                                     let mut visited = std::collections::HashSet::new();
-                                    let out = self.build_interface_metadata(
+                                    let out = self_.build_interface_metadata(
                                         &snap,
                                         &comp_name,
                                         parent_locals,
                                         &mut visited,
                                     );
-                                    return Ok(self.memo_path_metadata(meta_key, out));
+                                    return Ok(self_.memo_path_metadata(meta_key, out));
                                 }
                                 // Inheriting component (looked up by path): build the
                                 // RICH recursive metadata so `.extends` is a struct
@@ -16038,23 +16126,28 @@ impl CfmlVirtualMachine {
                                     };
                                     let chain = snap.get("__extends_chain").cloned();
                                     let mut visited = std::collections::HashSet::new();
-                                    if let Some(mut meta) = self.build_inheritance_metadata(
+                                    let _t_build = cfml_common::perf_counters::ScopedNanos::new(
+                                        &cfml_common::perf_counters::META_MISS_BUILD_NANOS,
+                                    );
+                                    let built = self_.build_inheritance_metadata(
                                         &name,
                                         src,
                                         parent_locals,
                                         &mut visited,
-                                    ) {
+                                    );
+                                    drop(_t_build);
+                                    if let Some(mut meta) = built {
                                         if let Some(chain @ CfmlValue::Array(_)) = chain {
                                             meta.insert("fullExtends".to_string(), chain);
                                         }
                                         let out = CfmlValue::strukt(meta);
-                                        return Ok(self.memo_path_metadata(meta_key, out));
+                                        return Ok(self_.memo_path_metadata(meta_key, out));
                                     }
                                 }
                                 let out = extract_component_meta(&snap, &comp_name);
-                                return Ok(self.memo_path_metadata(meta_key, out));
+                                return Ok(self_.memo_path_metadata(meta_key, out));
                             }
-                            return Ok(self.memo_path_metadata(meta_key, resolved));
+                            return Ok(self_.memo_path_metadata(meta_key, resolved));
                         }
                     }
                     return Ok(CfmlValue::strukt(ValueMap::default()));
@@ -28264,6 +28357,34 @@ impl CfmlVirtualMachine {
             (key, hit)
         };
 
+        // Metadata derivation only: serve the whole executed template from the
+        // request-scoped cache, skipping the pseudo-constructor and the parent
+        // chain walk below. Steps 1-3 already returned for any name shadowed by
+        // a local or defined in `globals`, so reaching here means the template
+        // is file-resolved and `cache_key` fully determines which file.
+        if self.meta_template_depth > 0 {
+            if let Some(hit) = self.component_meta_template_cache.get(&cache_key) {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::META_TEMPLATE_CACHE_HITS,
+                );
+                return Some(hit.deep_copy());
+            }
+        }
+
+        // Diagnostics: is this key one we have already fully resolved (and thus
+        // already executed the pseudo-constructor for) in this request?
+        if cfml_common::perf_counters::enabled() {
+            if self.resolved_template_keys_seen.insert(cache_key) {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::RESOLVE_TEMPLATE_DISTINCT,
+                );
+            } else {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::RESOLVE_TEMPLATE_REPEAT,
+                );
+            }
+        }
+
         let cfc_path: Arc<str> = if let Some(hit) = cached {
             cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CACHE_HITS);
             hit
@@ -29253,6 +29374,17 @@ impl CfmlVirtualMachine {
             // scopes on every member function of the assembled instance. CFC
             // members use __variables, not closures, so this is semantically inert
             // and lets the closure env (heavily aliased across method copies) drop.
+            //
+            // Metadata derivation only: bank the executed template so a later
+            // level of this walk (or a sibling class sharing this base) skips
+            // the pseudo-constructor entirely. Stored as a deep copy — the
+            // value handed back is mutated in place by inheritance merging.
+            if self.meta_template_depth > 0 {
+                if let Some(ref v) = result {
+                    self.component_meta_template_cache
+                        .insert(cache_key, v.deep_copy());
+                }
+            }
             return result;
         }
         None
@@ -29421,9 +29553,20 @@ impl CfmlVirtualMachine {
                 .unwrap_or_default();
             Some(self.meta_memo_key(name, ctx))
         };
+        cfml_common::perf_counters::META_INHERIT_CALLS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // This builder only ever derives metadata, so every template it
+        // resolves — at this level and every parent level it recurses into —
+        // may come from the executed-template cache. Callers that reach it
+        // outside the `getcomponentmetadata` arm (getMetadata on a marker
+        // component, the interface path) get the same benefit.
+        let mut mvm = self.meta_template_scope();
+        let self_ = &mut *mvm;
         if let Some(ref key) = memo_key {
-            if let Some(hit) = self.component_inherit_meta_cache.get(key) {
+            if let Some(hit) = self_.component_inherit_meta_cache.get(key) {
                 if let CfmlValue::Struct(s) = hit.deep_copy() {
+                    cfml_common::perf_counters::META_INHERIT_HITS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Some(s.snapshot());
                 }
             }
@@ -29432,12 +29575,12 @@ impl CfmlVirtualMachine {
 
         // Resolve the raw template with the component's own dir as the source
         // context so a sibling parent (`extends="Parent"`) resolves.
-        let prev_source = self.source_file.clone();
+        let prev_source = self_.source_file.clone();
         if let Some(src) = source_context {
-            self.source_file = Some(src);
+            self_.source_file = Some(src);
         }
-        let template = self.resolve_component_template(name, locals);
-        self.source_file = prev_source;
+        let template = self_.resolve_component_template(name, locals);
+        self_.source_file = prev_source;
 
         let snap = match template {
             Some(CfmlValue::Struct(s)) => s.snapshot(),
@@ -29469,7 +29612,7 @@ impl CfmlVirtualMachine {
                         Some(CfmlValue::String(s)) => Some((**s).clone()),
                         _ => None,
                     };
-                    match self.build_inheritance_metadata_memo(
+                    match self_.build_inheritance_metadata_memo(
                         &parent,
                         parent_src,
                         locals,
@@ -29495,10 +29638,19 @@ impl CfmlVirtualMachine {
         // `getInheritedMetaData` edits the struct it is given) cannot corrupt the
         // memo. Never cached when the walk had to break an `extends` cycle.
         if let (Some(key), false) = (memo_key, *cycle_hit) {
-            self.component_inherit_meta_cache
+            self_.component_inherit_meta_cache
                 .insert(key, CfmlValue::strukt(meta.clone()).deep_copy());
         }
         Some(meta)
+    }
+
+    /// Enter metadata-derivation mode for the duration of the returned guard,
+    /// enabling `component_meta_template_cache` in `resolve_component_template`.
+    /// Bind it to a `let` — a temporary would be dropped immediately and the
+    /// mode would never be active for the call it is meant to cover.
+    fn meta_template_scope(&mut self) -> MetaTemplateScope<'_> {
+        self.meta_template_depth += 1;
+        MetaTemplateScope { vm: self }
     }
 
     /// Build a [`MetaMemoKey`] for `name` resolved against source context `ctx`.

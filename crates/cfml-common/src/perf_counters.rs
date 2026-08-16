@@ -42,6 +42,84 @@ pub static PROBE_PRECOMPUTED: AtomicU64 = AtomicU64::new(0);
 /// lever has actually been captured.
 pub static PROBE_HASHED: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Component-metadata derivation. v0.596.0 added a REQUEST-scoped memo to both
+// the path-string form of `getComponentMetaData("a.b.C")` and the inheritance
+// walk behind it. These counters size what is LEFT: the memo is dropped with
+// the request VM, so every request re-pays the cold misses, and even a hit
+// pays a `deep_copy` (metadata structs are reference-typed and ColdBox mutates
+// what it is handed). Nanos are only taken when `RUSTCFML_COUNTERS=1`.
+// ---------------------------------------------------------------------------
+/// Path-string `getComponentMetaData("a.b.C")` calls that were memoizable.
+pub static META_PATH_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Of those, answered from the request memo (still pays the deep copy).
+pub static META_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds spent deriving path metadata on a memo MISS.
+pub static META_PATH_MISS_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds spent deep-copying a memo HIT out to the caller.
+pub static META_PATH_HIT_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Sub-split of `META_PATH_MISS_NANOS`, to find which stage of the miss
+/// actually costs. The suspicion under test is that stages 2+3 are pure waste:
+/// they materialise the whole merged component and then only four keys are
+/// read off it before `build_inheritance_metadata` re-derives everything from
+/// the raw templates. Splitting the phase BEFORE designing its fix is the rule
+/// here — the last phase diagnosed by inspection alone was wrong.
+pub static META_MISS_RESOLVE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static META_MISS_INHERIT_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static META_MISS_SNAPSHOT_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static META_MISS_BUILD_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// `resolve_component_template` calls whose (class, source dir, base template,
+/// mappings) key had ALREADY been resolved earlier in the same request — i.e.
+/// the pseudo-constructor was re-executed and the parent chain re-walked to
+/// rebuild a template this request had already built once. This is the number
+/// that decides whether an executed-template cache is worth building: the
+/// existing path cache only memoises the FILENAME, never the execution.
+pub static RESOLVE_TEMPLATE_REPEAT: AtomicU64 = AtomicU64::new(0);
+/// Distinct keys behind those calls (the floor an ideal cache could reach).
+pub static RESOLVE_TEMPLATE_DISTINCT: AtomicU64 = AtomicU64::new(0);
+/// Template resolutions served whole from the metadata executed-template
+/// cache — each one is a pseudo-constructor NOT run and a parent chain NOT
+/// walked.
+pub static META_TEMPLATE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Entries into the inheritance-metadata builder (per chain LEVEL).
+pub static META_INHERIT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Of those, answered from the request memo.
+pub static META_INHERIT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Adds its own lifetime, in nanoseconds, to `target` when dropped — so a
+/// block with several `return` paths is timed correctly without threading a
+/// stopwatch through each one. Construct it directly and bind it to a `let`;
+/// never build one behind `Option::then_some`, which evaluates (and instantly
+/// drops) its argument eagerly.
+/// Reads no clock at all unless `RUSTCFML_COUNTERS=1` — a timed phase should
+/// not make the shipped engine pay for an instrument nobody is reading.
+pub struct ScopedNanos<'a> {
+    target: &'a AtomicU64,
+    start: Option<std::time::Instant>,
+}
+
+impl<'a> ScopedNanos<'a> {
+    #[inline]
+    pub fn new(target: &'a AtomicU64) -> Self {
+        Self {
+            target,
+            start: enabled().then(std::time::Instant::now),
+        }
+    }
+}
+
+impl Drop for ScopedNanos<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            self.target
+                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
 /// Existence memo answers served without touching the filesystem.
 pub static EXISTS_MEMO_HITS: AtomicU64 = AtomicU64::new(0);
 /// Actual VFS existence probes (each is ≥1 `stat` syscall).
@@ -145,6 +223,20 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
            .. candidate probe walks:  {:>12}\n\
          exists memo hits:            {:>12}\n\
          exists FS probes (stats):    {:>12}\n\
+         --- component metadata (request-scoped memo) ---\n\
+         getComponentMetaData(path):  {:>12}\n\
+           .. memo hits:              {:>12}\n\
+           .. miss cost (ms):         {:>12}\n\
+           .. hit deep-copy (ms):     {:>12}\n\
+           .. miss: resolve tmpl (ms):{:>12}\n\
+           .. miss: resolve inh  (ms):{:>12}\n\
+           .. miss: snapshot     (ms):{:>12}\n\
+           .. miss: build meta   (ms):{:>12}\n\
+         template exec: distinct:     {:>12}\n\
+         template exec: REPEATS:      {:>12}\n\
+         template exec: meta-cached:  {:>12}\n\
+         inheritance builder levels:  {:>12}\n\
+           .. memo hits:              {:>12}\n\
          builtin CI lookups:          {:>12}\n\
            .. miscased (CI fallback): {:>12}\n\
            .. index-stale O(n) scans: {:>12}\n\
@@ -172,6 +264,19 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         g(&RESOLVE_PROBE_WALKS),
         g(&EXISTS_MEMO_HITS),
         g(&EXISTS_FS_PROBES),
+        g(&META_PATH_CALLS),
+        g(&META_PATH_HITS),
+        g(&META_PATH_MISS_NANOS) / 1_000_000,
+        g(&META_PATH_HIT_NANOS) / 1_000_000,
+        g(&META_MISS_RESOLVE_NANOS) / 1_000_000,
+        g(&META_MISS_INHERIT_NANOS) / 1_000_000,
+        g(&META_MISS_SNAPSHOT_NANOS) / 1_000_000,
+        g(&META_MISS_BUILD_NANOS) / 1_000_000,
+        g(&RESOLVE_TEMPLATE_DISTINCT),
+        g(&RESOLVE_TEMPLATE_REPEAT),
+        g(&META_TEMPLATE_CACHE_HITS),
+        g(&META_INHERIT_CALLS),
+        g(&META_INHERIT_HITS),
         g(&BUILTIN_LOOKUP_CI),
         g(&BUILTIN_LOOKUP_CI_MISCASED),
         g(&BUILTIN_LOOKUP_CI_SCAN),
