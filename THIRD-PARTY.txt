@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 517 crate(s)
+  MIT License (MIT) — 522 crate(s)
   Apache License 2.0 (Apache-2.0) — 53 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 8 crate(s)
@@ -190,6 +190,7 @@ Dependencies
   fraction 0.15.4 — https://github.com/dnsl48/fraction.git
   getopts 0.2.24 — https://github.com/rust-lang/getopts
   log 0.4.33 — https://github.com/rust-lang/log
+  num-bigint-dig 0.8.6 — https://github.com/dignifiedquire/num-bigint
   num-bigint 0.4.6 — https://github.com/rust-num/num-bigint
   num-complex 0.4.6 — https://github.com/rust-num/num-complex
   num-derive 0.4.2 — https://github.com/rust-num/num-derive
@@ -398,6 +399,8 @@ Dependencies
   cbc 0.1.2 — https://github.com/RustCrypto/block-modes
   cbc 0.2.1 — https://github.com/RustCrypto/block-modes
 [MIT]
+  signature 2.2.0 — https://github.com/RustCrypto/traits/tree/master/signature
+[MIT]
   try-lock 0.2.5 — https://github.com/seanmonstar/try-lock
 [MIT]
   aes 0.9.1 — https://github.com/RustCrypto/block-ciphers
@@ -455,6 +458,7 @@ Dependencies
   password-hash 0.5.0 — https://github.com/RustCrypto/traits/tree/master/password-hash
 [MIT]
   der 0.7.10 — https://github.com/RustCrypto/formats/tree/master/der
+  pkcs8 0.10.2 — https://github.com/RustCrypto/formats/tree/master/pkcs8
 [MIT]
   cpufeatures 0.2.17 — https://github.com/RustCrypto/utils
   cpufeatures 0.3.0 — https://github.com/RustCrypto/utils
@@ -469,6 +473,7 @@ Dependencies
 [MIT]
   tiberius 0.12.3 — https://github.com/prisma/tiberius
 [MIT]
+  pkcs1 0.7.5 — https://github.com/RustCrypto/formats/tree/master/pkcs1
   scrypt 0.11.0 — https://github.com/RustCrypto/password-hashes/tree/master/scrypt
   spki 0.7.3 — https://github.com/RustCrypto/formats/tree/master/spki
 [MIT]
@@ -727,6 +732,7 @@ Dependencies
 [MIT]
   unty 0.0.4 — https://github.com/bincode-org/unty
 [MIT]
+  rsa 0.9.10 — https://github.com/RustCrypto/RSA
   rustc-hash 2.1.2 — https://github.com/rust-lang/rustc-hash
 [MIT]
   adler2 2.0.1 — https://github.com/oyvindln/adler2
@@ -4425,6 +4431,7 @@ Applies to:
   - fraction 0.15.4
   - getopts 0.2.24
   - log 0.4.33
+  - num-bigint-dig 0.8.6
   - num-bigint 0.4.6
   - num-complex 0.4.6
   - num-derive 0.4.2
@@ -6792,6 +6799,39 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - signature 2.2.0
+================================================================================
+
+Copyright (c) 2018-2023 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - try-lock 0.2.5
 ================================================================================
 
@@ -7618,6 +7658,7 @@ MIT License (MIT)
 
 Applies to:
   - der 0.7.10
+  - pkcs8 0.10.2
 ================================================================================
 
 Copyright (c) 2020-2023 The RustCrypto Project Developers
@@ -7843,6 +7884,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - pkcs1 0.7.5
   - scrypt 0.11.0
   - spki 0.7.3
 ================================================================================
@@ -10386,6 +10428,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - rsa 0.9.10
   - rustc-hash 2.1.2
 ================================================================================
 

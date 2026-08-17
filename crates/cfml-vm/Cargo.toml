@@ -42,6 +42,12 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
+# Pure-Rust, wasm-safe RSA for the java.security.Signature/KeyFactory shims
+# (RSASSA-PKCS1-v1_5 verify + sign, the surface vendored JWT libraries reach
+# through createObject("java", …)). `getrandom` stays OFF: PKCS#1 v1.5 signing
+# is deterministic and verification needs no entropy, so the shim never draws
+# from an RNG and the wasm targets keep building without a random backend.
+rsa = { version = "0.9", default-features = false, features = ["std", "sha1", "sha2"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }

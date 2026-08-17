@@ -33,6 +33,7 @@ pub mod debug_footer;
 /// CLI so nothing thread-related reaches wasm.
 #[cfg(feature = "observability")]
 pub mod profiler;
+mod java_security;
 mod java_shims;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
 mod ops;
@@ -16309,6 +16310,13 @@ impl CfmlVirtualMachine {
                                 "java.security.messagedigest" => {
                                     handle_java_messagedigest("init", empty_args, &CfmlValue::Null)
                                 }
+                                // Signature/KeyFactory/key specs/BigInteger —
+                                // the RSA verify+sign surface vendored JWT
+                                // libraries construct up front (their
+                                // "can I do asymmetric crypto?" gate).
+                                other if java_security::is_java_security_class(other) => {
+                                    java_security::construct(other)
+                                }
                                 "java.util.uuid" => {
                                     handle_java_uuid("init", empty_args, &CfmlValue::Null)
                                 }
@@ -23302,6 +23310,22 @@ impl CfmlVirtualMachine {
                     }
                     "java.security.messagedigest" => {
                         handle_java_messagedigest(&m, all_args, object)
+                    }
+                    java_security::SIGNATURE_CLASS => {
+                        java_security::handle_java_signature(&m, all_args, object)
+                    }
+                    java_security::KEYFACTORY_CLASS => {
+                        java_security::handle_java_keyfactory(&m, all_args, object)
+                    }
+                    java_security::BIGINTEGER_CLASS => {
+                        java_security::handle_java_biginteger(&m, all_args, object)
+                    }
+                    java_security::X509_SPEC_CLASS
+                    | java_security::PKCS8_SPEC_CLASS
+                    | java_security::RSA_PUBLIC_SPEC_CLASS
+                    | java_security::PUBLIC_KEY_CLASS
+                    | java_security::PRIVATE_KEY_CLASS => {
+                        java_security::handle_java_key_object(&java_class, &m, all_args, object)
                     }
                     "java.util.uuid" => handle_java_uuid(&m, all_args, object),
                     "java.util.date" => handle_java_date(&m, all_args, object),
