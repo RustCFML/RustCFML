@@ -484,6 +484,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cffunction_output_true_body.cfm">
 <cf_runtest file="tags/test_getbasetag_functions.cfm">
 <cf_runtest file="tags/test_custom_tag_attribute_collection.cfm">
+<cf_runtest file="tags/test_cfthread_module_attributes.cfm">
 <cf_runtest file="tags/test_tags_customtag_lifecycle.cfm">
 <!--- - customtag_path_deep_search: a custom tag in a SUBDIRECTORY of a --->
 <!--- this.customtagpaths dir must resolve (Lucee with customTagDeepSearch --->

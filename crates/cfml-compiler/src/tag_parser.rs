@@ -933,6 +933,27 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 sig.push_str(&format!(" output=\"{}\"", output));
             }
             sig.push_str(" {\n");
+
+            // `output="true"` means the body is processed AS IF INSIDE
+            // <cfoutput>: `#expr#` interpolates and `##` collapses to a literal
+            // `#`, with no explicit cfoutput anywhere. This is how classic
+            // tag-based CFCs render whole screens, and it is a THIRD state — an
+            // OMITTED attribute emits the body raw (hashes uninterpolated), and
+            // `output="false"` suppresses it at runtime. So take this path only
+            // for an explicitly truthy attribute, consuming the body through
+            // `</cffunction>` and re-walking it in cfoutput mode.
+            let output_true = attrs.get("output").is_some_and(|v| {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") || v == "1"
+            });
+            if output_true {
+                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cffunction") {
+                    let body: String = chars[tag_end..end_tag_pos].iter().collect();
+                    let close_end = find_tag_end(chars, end_tag_pos, len);
+                    let body_script = tags_to_script_inner(&body, imports, true);
+                    return (format!("{}{}}}\n", sig, body_script), close_end - start);
+                }
+            }
             (sig, tag_end - start)
         }
         "cfargument" => {
@@ -1380,6 +1401,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfquery") {
                 let sql_raw: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
+
+                // Lucee strips CFML comments lexically wherever they appear, so
+                // annotating SQL with `<!--- ... --->` is idiomatic and never
+                // reaches the driver. Strip before ANY other body handling: the
+                // control-flow probe below must not see a commented-out `<cfif>`,
+                // and the runtime path's re-lowering must not re-emit the text.
+                // (A SQL `--` comment is data and deliberately survives.)
+                let sql_raw = strip_cfml_comments(&sql_raw);
 
                 // Scan for <cfqueryparam> tags — replace with ? and collect params
                 let (cleaned_sql, query_params) = scan_cfqueryparam_tags(&sql_raw);

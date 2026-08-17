@@ -2243,6 +2243,13 @@ pub struct CfmlVirtualMachine {
     /// between their start and end ops — the ancestry must also include
     /// self-closing tags and cfmodule invocations while their template runs.
     base_tag_stack: Vec<BaseTagEntry>,
+    /// `base_tag_stack` depth at the moment the running cfthread seeded its own
+    /// `attributes` scope (see `run_thread_body`). A custom tag or `<cfmodule>`
+    /// entered INSIDE the thread body pushes past this mark, and its own
+    /// attributes must then win over the thread's — without it, a module
+    /// invoked from a thread that carries attributes saw the THREAD's
+    /// attributes and lost its own (GH #324).
+    thread_attrs_tag_depth: usize,
     /// `cfexit` control-flow signal. `__cfexit` sets this to the lowered method
     /// ("exittag" / "exittemplate" / "loop"); the bytecode loop then unwinds the
     /// current function like reaching its end (preserving partial locals so a
@@ -3127,6 +3134,7 @@ impl CfmlVirtualMachine {
             app_local_mode_modern: false,
             custom_tag_stack: Vec::new(),
             base_tag_stack: Vec::new(),
+            thread_attrs_tag_depth: 0,
             pending_exit: None,
             last_exit_method: None,
             pending_tag_loop: false,
@@ -4319,9 +4327,12 @@ impl CfmlVirtualMachine {
             "thread".to_string(),
             CfmlValue::strukt(self.page_thread_scope.snapshot()),
         );
-        // Expose any passed attributes as the `attributes` scope.
+        // Expose any passed attributes as the `attributes` scope. The tag depth
+        // is stamped alongside so a custom tag / cfmodule entered inside the
+        // body can out-scope it (GH #324) — see `thread_attrs_tag_depth`.
         if let Some(attrs) = attributes {
             self.globals.insert("attributes".to_string(), attrs);
+            self.thread_attrs_tag_depth = self.base_tag_stack.len();
         }
         // Capture body output separately (same pattern as cfsavecontent).
         self.saved_output_buffers
@@ -7241,6 +7252,7 @@ impl CfmlVirtualMachine {
                         }
                     } else if name_lower == "attributes"
                         && self.globals.contains_key("attributes")
+                        && self.base_tag_stack.len() <= self.thread_attrs_tag_depth
                         && !(locals.contains_key("attributes")
                             && !inherited_or_param_keys.contains("attributes"))
                     {
@@ -7252,6 +7264,13 @@ impl CfmlVirtualMachine {
                         // A BODY-declared local `attributes` (present in locals but not
                         // inherited) still wins, so a custom tag's own body reads its
                         // own attributes normally (this arm is skipped for it).
+                        // A custom tag or `<cfmodule>` entered INSIDE the body pushes
+                        // the tag stack past the depth stamped when the thread seeded
+                        // its attributes; from there its OWN attributes win, because
+                        // the template's scope is nearer than the thread's (GH #324 —
+                        // Preside renders every email template through a `module`
+                        // call, and background tasks always carry thread attributes,
+                        // so every such render lost its `rendererVariables`).
                         self.globals.get("attributes").cloned().unwrap()
                     } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
