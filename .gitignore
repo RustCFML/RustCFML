@@ -82,3 +82,9 @@ sqlite::memory:
 # CFML log files written by <cflog>/writeLog() — the CLI's default log
 # directory is ./logs, so a test-suite run lands them here.
 /logs/
+
+# PGO training artifacts kept for provenance, NOT for the build.
+# The profile the build actually uses is pgo/rustcfml.profdata (tracked).
+# Everything under pgo/archive/ is historical evidence — tens of MB of
+# .profdata that must never enter git history. See pgo/archive/README.md.
+/pgo/archive/
