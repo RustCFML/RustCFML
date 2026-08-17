@@ -4,6 +4,12 @@
 
 RustCFML compiles to a native binary with no runtime VM overhead — it starts instantly and serves requests with a fraction of the memory of JVM-based CFML engines.
 
+> **Trying to speed up your own application?** This page is engine benchmarks.
+> For finding where *your* CFML actually spends its time — the debug footer, the
+> threshold-gated sampling profiler, `--profile` flamegraphs, OpenTelemetry —
+> see [debugging.md](debugging.md). To rebuild the engine optimised for your own
+> workload, see [pgo.md](pgo.md) and `scripts/pgo-train.sh`.
+
 ## Benchmark
 
 Serving a "Hello World" `.cfm` page in `--production` mode against a warmed Lucee 7, on the same machine (Apple M-series), same page, using Apache Bench with 8-second runs. Requests/sec, higher is better:

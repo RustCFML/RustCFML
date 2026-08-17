@@ -21,11 +21,11 @@ is ~1%, and is kept only because the profile was trained under it.
 
 ## The committed profile
 
-`pgo/rustcfml.profdata` — 5.3 MB (1.04 MB gzipped), `llvm-profdata merge --sparse`.
+`pgo/rustcfml.profdata` — ~16 MB, `llvm-profdata merge --sparse`, ~59k functions.
 Trained on two workloads:
 
 1. `tests/runner.cfm` via the CLI — broad language coverage
-2. a live Preside site: boot + 150 warm renders + `/admin/`
+2. a live Preside site: boot + 150 warm renders
 
 Training-set choice is measured, not assumed: suite-only training gives −11.88%
 (84% of the win with no site, no database, no fixtures), and adding the live-site
@@ -35,8 +35,20 @@ renders is worth the remaining ~2.3 points.
 built and rejected *for now*: that suite contributes ~59% of the total profile
 weight, more than the other two workloads combined, and PGO resolves conflicting
 hot paths by compromise — so it risks optimising test-suite code at the expense of
-the render path. It is unmeasured on request latency. See
-`/Users/alexskinner/rustcfml-pgo/README.md` (local, untracked) for the artifacts.
+the render path. It is unmeasured on request latency.
+
+⚠️ **Authenticated admin pages were added and rejected on measurement**
+(2026-08-17). The recipe used to end with "one `/admin/` hit" — which returns
+**401** when not logged in, so every profile ever trained learned an
+access-denied page rather than the admin. Fixing that properly (real form login,
+150 renders across 10 admin pages) added only **+28 functions**: the admin runs
+the *same* functions as the front end, just ~4x as often per render, so there was
+never a coverage hole, only a re-weighting. It measured **parity on admin pages
+themselves** (−0.54% mean, −0.49% adjacent-pair median, against a 4.84% A-to-A
+spread) and parity on the front end. Available behind `--admin-user/--admin-pass`
+for anyone who wants to re-test; off by default. **Check the function-count delta
+before spending an A/B on a new training workload** — a workload that adds no
+functions can only re-weight, and re-weighting has never cleared noise here.
 
 ## Regenerating the profile
 
@@ -44,22 +56,23 @@ Needed when: the pinned toolchain moves, the dispatch loop / codegen / hot stdli
 changes materially, or the coverage gate in `release.yml` starts complaining.
 
 ```bash
-DIR=/tmp/pgo-profraw
-rm -rf $DIR && mkdir -p $DIR
+scripts/pgo-train.sh --site /path/to/site            # writes pgo/rustcfml.profdata
+scripts/pgo-train.sh --site ... --out /tmp/cand.profdata   # candidate, don't overwrite
+```
 
-# 1. instrument
-RUSTFLAGS="-Cprofile-generate=$DIR" cargo build --release
+The script is mostly assertions, because **every PGO failure mode here is
+silent** — they all yield a profile that loads, passes the release gate, and is
+simply worse. It fails loudly if the suite produces no SUMMARY, the site never
+returns 200, the server ignores SIGINT, the serve phase adds no profile counts,
+or the merged profile carries fewer than 5000 functions (the same threshold
+`release.yml` enforces, so a bad profile fails locally rather than in CI).
 
-# 2. train — BOTH workloads
-target/release/rustcfml tests/runner.cfm
-cd /path/to/preside/site && .../target/release/rustcfml --serve . --port 8641 --production &
-#    ...boot, ~150 warm renders, one /admin/ hit, then:
-kill -INT <pid>            # SIGINT ONLY — see the traps below
+Then build and **A/B it** — a new profile is not automatically better; every
+retrain so far has measured within noise of its predecessor:
 
-# 3. merge (rustup's llvm-profdata, NOT Xcode's)
-PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata*' | head -1)
-$PROFDATA merge -o merged.profdata $DIR
-$PROFDATA merge --sparse -o pgo/rustcfml.profdata merged.profdata
+```bash
+RUSTFLAGS="-Cprofile-use=$PWD/pgo/rustcfml.profdata" \
+  cargo build --profile release-pgo -p rustcfml-cli
 ```
 
 ### ⚠️ Traps, each of which cost a full build cycle
@@ -78,7 +91,24 @@ $PROFDATA merge --sparse -o pgo/rustcfml.profdata merged.profdata
    merge rustc's `.profraw`.
 4. **Do not use missing-function warning counts as a staleness metric** on a
    `--sparse` profile: sparse deliberately drops never-executed functions, so they
-   must report missing.
+   must report missing. Confirmed empirically: a profile trained on the *exact*
+   source being built reports the **same 16,163 warnings, with identical
+   per-function counts**, as one trained four releases earlier. The number says
+   nothing about staleness.
+5. **`-Cprofile-use` never mis-optimises, it only decays.** LLVM matches a
+   profile to a function by name + CFG hash, so a changed function simply gets no
+   data and compiles un-profiled. That is why the hazard is silence, not
+   breakage — and why the training script asserts rather than trusts.
+
+### Known limitation — value-profiling counters are exhausted
+
+Instrumented builds emit `LLVM Profile Warning: Unable to track new values:
+Running out of static counters` many times. Value profiling (indirect-call target
+tracking) is therefore **truncated in every profile trained so far**. The profile
+is still valid and this is not fatal, but it is a plausible reason the measured
+win is smaller than it could be. Untested fix: raise the budget with
+`-Cllvm-args=-vp-counters-per-site=<n>` on the *instrumented* build. Worth its own
+A/B; do not fold it into an unrelated retrain.
 
 ## ⚠️ Do not put `shell: bash` on the Windows build step
 
