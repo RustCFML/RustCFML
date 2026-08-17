@@ -53,6 +53,20 @@ DEST="$DEST_DIR/$BIN_NAME"
 echo "==> Installing $SRC -> $DEST"
 install -m 0755 "$SRC" "$DEST"
 
+# macOS: copying over an existing binary invalidates its code signature, and the
+# kernel then SIGKILLs it on exec (exit 137, empty --version output). The bytes
+# are identical, so a checksum comparison reports a perfectly successful install
+# of a binary that cannot run. Re-sign ad-hoc.
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+  echo "==> Re-signing (ad-hoc) for macOS"
+  codesign --force -s - "$DEST"
+fi
+
 echo "==> Installed version now on PATH:"
 hash -r 2>/dev/null || true
-"$DEST" --version || true
+# Verify it actually EXECUTES — see the code-signing note above.
+if ! "$DEST" --version; then
+  echo "ERROR: installed binary failed to run (exit $?)." >&2
+  [[ "$(uname -s)" == "Darwin" ]] && echo "       On macOS this is usually a code-signing failure; try: codesign --force -s - '$DEST'" >&2
+  exit 1
+fi
