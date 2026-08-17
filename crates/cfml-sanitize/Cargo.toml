@@ -1,0 +1,22 @@
+[package]
+name = "cfml-sanitize"
+description = "Policy-driven HTML sanitiser for RustCFML. Parses OWASP AntiSamy policy XML and applies it over an html5ever parse tree, backing the org.owasp.validator.html.AntiSamy shim and the sanitizeHtml() BIF."
+keywords = ["cfml", "html", "sanitizer", "antisamy", "xss"]
+categories = ["web-programming"]
+readme = "../../README.md"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Not published to crates.io — see the note in cfml-vm/Cargo.toml.
+publish = false
+
+[dependencies]
+# Already in the tree via cfml-stdlib; kept on the same versions so the
+# workspace resolves one html5ever, not two.
+scraper = "0.22"
+ego-tree = "0.10"
+quick-xml = "0.36"
+regex = "1"

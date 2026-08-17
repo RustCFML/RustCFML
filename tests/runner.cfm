@@ -207,6 +207,9 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_jwt.cfm">
 <!--- java.security.Signature/KeyFactory shim surface (RS256 verify+sign) — the vendored jwt-cfml path; RustCFML's java.security stops at MessageDigest. --->
 <cf_runtest file="stdlib/test_java_security_signature.cfm">
+<!--- - html_sanitize: the org.owasp.validator.html.AntiSamy shim and the --->
+<!--- sanitizeHtml() BIF over the same policy-driven sanitiser (GH #325). --->
+<cf_runtest file="stdlib/test_html_sanitize.cfm">
 <cf_runtest file="stdlib/test_image.cfm">
 <cf_runtest file="stdlib/test_xmp.cfm">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">

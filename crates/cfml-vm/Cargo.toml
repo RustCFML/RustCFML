@@ -22,6 +22,7 @@ publish = false
 cfml-common = { workspace = true }
 cfml-config = { workspace = true }
 cfml-qoq = { workspace = true }
+cfml-sanitize = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-stdlib = { workspace = true, default-features = false, optional = true }
 indexmap = { workspace = true }

@@ -33,6 +33,7 @@ pub mod debug_footer;
 /// CLI so nothing thread-related reaches wasm.
 #[cfg(feature = "observability")]
 pub mod profiler;
+mod antisamy_shim;
 mod java_security;
 mod java_shims;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
@@ -13446,6 +13447,9 @@ impl CfmlVirtualMachine {
                 | "gettimezoneinfo"
                 | "dateconvert"
                 | "expandpath"
+                // sanitizeHtml resolves its policy path the same way
+                // expandPath does, so it must run where that context exists.
+                | "sanitizehtml"
                 | "isdefined"
                 | "setencoding"
                 | "__cfparam"
@@ -15295,6 +15299,66 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::string(result));
                 }
+                "sanitizehtml" => {
+                    // sanitizeHtml( html, policyPath ) — the public face of the
+                    // same sanitiser the AntiSamy shim runs on, for callers that
+                    // would rather not go through createObject("java", …).
+                    //
+                    // The policy is REQUIRED and is an AntiSamy policy XML path.
+                    // There is deliberately no built-in default: which tags and
+                    // attributes are safe is an application decision, and
+                    // inventing one here would put a security policy nobody
+                    // chose behind an innocuous-looking call.
+                    let html = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    let policy_arg = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                    if policy_arg.trim().is_empty() {
+                        return Err(self.wrap_error(CfmlError::runtime(
+                            "sanitizeHtml(html, policy) requires a policy: the path to an \
+                             OWASP AntiSamy policy XML file".to_string(),
+                        )));
+                    }
+                    // Resolve through the same helper every file BIF uses, so a
+                    // policy path follows the mapping and template-relative rules
+                    // callers already know. That helper leaves a non-mapped
+                    // leading-slash path alone (file BIFs read `/x` as
+                    // filesystem-absolute), so fall back to the WEBROOT reading —
+                    // which is what `/x` means to expandPath, and the spelling an
+                    // application is most likely to write.
+                    let mut resolved = self.resolve_template_relative(&policy_arg, true);
+                    if !std::path::Path::new(&resolved).is_file()
+                        && (policy_arg.starts_with('/') || policy_arg.starts_with('\\'))
+                    {
+                        let stripped = policy_arg.trim_start_matches(['/', '\\']);
+                        let webroot_relative = self
+                            .server_state
+                            .as_ref()
+                            .and_then(|s| s.webroot.as_ref())
+                            .map(|w| w.join(stripped))
+                            .or_else(|| {
+                                self.base_template_path.as_ref().map(|base| {
+                                    std::path::Path::new(base)
+                                        .parent()
+                                        .unwrap_or_else(|| std::path::Path::new("."))
+                                        .join(stripped)
+                                })
+                            });
+                        if let Some(candidate) = webroot_relative {
+                            if candidate.is_file() {
+                                resolved = candidate.to_string_lossy().to_string();
+                            }
+                        }
+                    }
+                    let policy = cfml_sanitize::policy_for_file(&resolved).map_err(|e| {
+                        self.wrap_error(CfmlError::runtime(format!(
+                            "sanitizeHtml: {}",
+                            e
+                        )))
+                    })?;
+                    let cleaned = cfml_sanitize::sanitize(&html, &policy).map_err(|e| {
+                        self.wrap_error(CfmlError::runtime(format!("sanitizeHtml: {}", e)))
+                    })?;
+                    return Ok(CfmlValue::string(cleaned));
+                }
                 "isdefined" => {
                     // Runtime isDefined: argument is a string variable name
                     let var_name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
@@ -16316,6 +16380,12 @@ impl CfmlVirtualMachine {
                                 // "can I do asymmetric crypto?" gate).
                                 other if java_security::is_java_security_class(other) => {
                                     java_security::construct(other)
+                                }
+                                // AntiSamy: the jar-path argument callers pass
+                                // is ignored — there is no JVM to load it into
+                                // and the sanitiser is native.
+                                other if antisamy_shim::is_antisamy_class(other) => {
+                                    antisamy_shim::construct(other)
                                 }
                                 "java.util.uuid" => {
                                     handle_java_uuid("init", empty_args, &CfmlValue::Null)
@@ -23310,6 +23380,15 @@ impl CfmlVirtualMachine {
                     }
                     "java.security.messagedigest" => {
                         handle_java_messagedigest(&m, all_args, object)
+                    }
+                    antisamy_shim::ANTISAMY_CLASS => {
+                        antisamy_shim::handle_antisamy(&m, all_args, object)
+                    }
+                    antisamy_shim::POLICY_CLASS => {
+                        antisamy_shim::handle_policy(&m, all_args, object)
+                    }
+                    antisamy_shim::CLEAN_RESULTS_CLASS => {
+                        antisamy_shim::handle_clean_results(&m, all_args, object)
                     }
                     java_security::SIGNATURE_CLASS => {
                         java_security::handle_java_signature(&m, all_args, object)

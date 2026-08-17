@@ -823,6 +823,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getTempFile".to_string(), fn_get_temp_file);
     f.insert("getFileInfo".to_string(), fn_get_file_info);
     f.insert("expandPath".to_string(), fn_expand_path);
+    f.insert("sanitizeHtml".to_string(), fn_sanitize_html);
     f.insert("fileReadBinary".to_string(), fn_file_read_binary);
     f.insert("fileGetMimeType".to_string(), fn_file_get_mime_type);
     f.insert("directoryRename".to_string(), fn_directory_rename);
@@ -8304,6 +8305,13 @@ fn fn_expand_path(_args: Vec<CfmlValue>) -> CfmlResult {
     // serve-mode webroot / CLI entry-template dir / this.mappings (it needs
     // VM state the plain builtin can't see). Registered only so the name
     // resolves as a known function; this body never runs.
+    Ok(CfmlValue::string(String::new()))
+}
+
+fn fn_sanitize_html(_args: Vec<CfmlValue>) -> CfmlResult {
+    // Stub — the VM intercepts sanitizeHtml so the policy path resolves through
+    // expandPath's mapping rules, which need VM state a plain builtin cannot
+    // see. Registered only so the name resolves; this body never runs.
     Ok(CfmlValue::string(String::new()))
 }
 

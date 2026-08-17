@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!--
+	A small OWASP AntiSamy policy for tests/stdlib/test_html_sanitize.cfm.
+
+	Written in the AntiSamy 1.4.4 schema (the format the real library and every
+	shipped policy use) and deliberately compact: it declares one rule of each
+	KIND the sanitiser has to honour, rather than a realistic allowlist —
+
+	  * a tag that is validated, one removed with its contents, one truncated
+	  * an attribute validated by a named common regexp (href)
+	  * an attribute validated by a literal-list (target), onInvalid=remove
+	  * an attribute whose failure removes the whole element (img@src)
+	  * global attributes allowed on any tag (class, style)
+	  * css-rules, which is where all `style=` validation lives
+
+	Not a recommendation: an application should use a policy written for its own
+	content. The six real 1.4.4 policies (preside, tinymce, slashdot, ebay,
+	myspace, anythinggoes) are what the crate's own tests diff against the real
+	Java library — see crates/cfml-sanitize/tests/real_policies.rs.
+-->
+<anti-samy-rules xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+	<directives>
+		<directive name="omitXmlDeclaration" value="true"/>
+		<directive name="omitDoctypeDeclaration" value="true"/>
+		<directive name="maxInputSize" value="200000"/>
+		<directive name="useXHTML" value="true"/>
+		<directive name="formatOutput" value="false"/>
+		<directive name="embedStyleSheets" value="false"/>
+	</directives>
+
+	<common-regexps>
+		<regexp name="anything" value=".*"/>
+		<regexp name="number" value="\d+"/>
+		<regexp name="htmlClass" value="[a-zA-Z0-9\s,\-_]+"/>
+		<regexp name="onsiteURL" value="([\p{L}\p{N}\\\.\#@\$%\+&amp;;\-_~,\?=/!]|\#(\w)+)*"/>
+		<regexp name="offsiteURL" value="(\s)*((ht|f)tp(s?)://|mailto:)[A-Za-z0-9]+[~a-zA-Z0-9-.@,;:_/?=&amp;#%$]*(\s)*"/>
+	</common-regexps>
+
+	<common-attributes>
+		<attribute name="href">
+			<regexp-list>
+				<regexp name="onsiteURL"/>
+				<regexp name="offsiteURL"/>
+			</regexp-list>
+		</attribute>
+		<attribute name="class">
+			<regexp-list><regexp name="htmlClass"/></regexp-list>
+		</attribute>
+		<attribute name="alt">
+			<regexp-list><regexp name="anything"/></regexp-list>
+		</attribute>
+		<attribute name="title">
+			<regexp-list><regexp name="anything"/></regexp-list>
+		</attribute>
+	</common-attributes>
+
+	<global-tag-attributes>
+		<attribute name="class"/>
+		<attribute name="style"/>
+		<attribute name="title"/>
+	</global-tag-attributes>
+
+	<tags-to-encode>
+		<tag>g</tag>
+	</tags-to-encode>
+
+	<tag-rules>
+		<tag name="script" action="remove"/>
+		<tag name="iframe" action="remove"/>
+		<tag name="object" action="remove"/>
+		<tag name="dd" action="truncate"/>
+
+		<tag name="b" action="validate"/>
+		<tag name="i" action="validate"/>
+		<tag name="em" action="validate"/>
+		<tag name="strong" action="validate"/>
+		<tag name="p" action="validate"/>
+		<tag name="br" action="validate"/>
+		<tag name="span" action="validate"/>
+		<tag name="div" action="validate">
+			<attribute name="align"/>
+		</tag>
+
+		<tag name="style" action="validate">
+			<attribute name="type">
+				<literal-list><literal value="text/css"/></literal-list>
+			</attribute>
+			<attribute name="media"/>
+		</tag>
+
+		<tag name="a" action="validate">
+			<attribute name="href"/>
+			<attribute name="name"/>
+			<attribute name="target" onInvalid="remove">
+				<literal-list>
+					<literal value="_blank"/>
+					<literal value="_self"/>
+					<literal value="_parent"/>
+					<literal value="_top"/>
+				</literal-list>
+			</attribute>
+		</tag>
+
+		<tag name="img" action="validate">
+			<attribute name="src" onInvalid="removeTag">
+				<regexp-list>
+					<regexp name="onsiteURL"/>
+					<regexp name="offsiteURL"/>
+				</regexp-list>
+			</attribute>
+			<attribute name="alt"/>
+			<attribute name="width"><regexp-list><regexp name="number"/></regexp-list></attribute>
+			<attribute name="height"><regexp-list><regexp name="number"/></regexp-list></attribute>
+		</tag>
+	</tag-rules>
+
+	<css-rules>
+		<property name="color">
+			<literal-list>
+				<literal value="red"/>
+				<literal value="blue"/>
+				<literal value="green"/>
+				<literal value="black"/>
+			</literal-list>
+			<regexp-list><regexp value="#[0-9a-fA-F]{3,6}"/></regexp-list>
+		</property>
+		<property name="text-align">
+			<literal-list>
+				<literal value="left"/>
+				<literal value="right"/>
+				<literal value="center"/>
+			</literal-list>
+		</property>
+		<property name="background-image">
+			<regexp-list><regexp value="url\(.*\)"/></regexp-list>
+		</property>
+		<property name="background-color">
+			<literal-list><literal value="red"/><literal value="white"/></literal-list>
+		</property>
+		<property name="background">
+			<shorthand-list>
+				<shorthand name="background-color"/>
+				<shorthand name="background-image"/>
+			</shorthand-list>
+		</property>
+	</css-rules>
+
+</anti-samy-rules>

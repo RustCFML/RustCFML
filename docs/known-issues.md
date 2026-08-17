@@ -1993,3 +1993,39 @@ intercepted creator to test — it is not a creator here at all. Untouched by th
 work; the existence cache is correct either way, since it never caches an answer
 the filesystem does not agree with. Fixing it means giving handles a real
 create-on-open, which also wants `fileClose()` to stop being a stub.
+
+## 50. AntiSamy sanitiser: cosmetic divergences from the Java library 🏗
+
+`org.owasp.validator.html.AntiSamy` and `sanitizeHtml()` run a native Rust
+sanitiser (`crates/cfml-sanitize`) rather than the Java library. Output was
+diffed against the real **AntiSamy 1.5.3 jar on Lucee 7.0.4** across 77 inputs ×
+the six shipped 1.4.4 policies (preside, tinymce, slashdot, ebay, myspace,
+anythinggoes) — 462 comparisons.
+
+**No security-relevant divergence remains**: every input where the two engines
+disagree produces output that is equally inert, and no OWASP filter-evasion
+vector survives on either engine. The differences that do remain are cosmetic:
+
+| Divergence | Cause |
+|---|---|
+| Output is not pretty-printed | The policies' `formatOutput=true` makes AntiSamy re-indent with newlines; we emit the markup as parsed |
+| No `<!DOCTYPE …>` is emitted | `omitDoctypeDeclaration=false` (tinymce et al.) makes AntiSamy prepend an XHTML doctype to a *fragment*; we never do |
+| `<style>` CSS is not reformatted | AntiSamy re-serialises through batik (`p {\n\tcolor: red;\n}`); we keep the declarations as written. Both filter identically — only the layout differs |
+| An emptied `<style>` reads `<![CDATA[/* */]]>` vs AntiSamy's `p {\n}` | Same cause: we drop the emptied rule, AntiSamy keeps the empty block |
+| `<scr<script>ipt>alert(1)</script>` leaves the text `ipt&gt;alert(1)` | html5ever and neko disagree about where the malformed tag ends. Both remove the script; we keep the leftover text, AntiSamy discards it |
+
+Two behaviours are deliberate and will not change:
+
+- **At-rules inside `<style>` are dropped wholesale.** `@import` must never be
+  honoured (`embedStyleSheets=false`, and a sanitiser that fetched remote
+  stylesheets would be a request-forgery primitive), and `@media`/`@supports`
+  nest further rule blocks that would need a full stylesheet parser to filter
+  safely. This loses some legitimate styling.
+- **`CleanResults.getErrorMessages()`/`getNumberOfErrors()` throw** rather than
+  reporting zero. We do not track per-change messages, and answering "no errors"
+  would falsely imply nothing was removed.
+
+Also worth knowing: `<tags-to-encode>` tags are **unwrapped, not encoded** —
+`<g>x</g>` becomes `x`. That reads backwards against the section name, but it is
+what the 1.5.3 jar does (measured across `<g>a</g>b`, `x<g>y`, `<g/>` and a
+nested case), and matching the library beats matching the label.
