@@ -6134,7 +6134,7 @@ pub fn handle_java_dateformat(
 }
 
 // ---------------------------------------------------------------------------
-// java.lang.Object / Comparable on simple values (docs/known-issues.md §33)
+// java.lang.Object / Comparable on simple values (added v0.558.0)
 //
 // Lucee boxes a CFML simple value as a Java object, so `equals`, `hashCode` and
 // `compareTo` are callable on it. These reproduce the JVM's exact answers over

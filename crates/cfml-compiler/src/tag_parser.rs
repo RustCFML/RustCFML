@@ -260,7 +260,7 @@ fn record_preprocess_error(msg: impl Into<String>) {
 ///
 /// The preprocessor used to return an empty string for these, so the tag **and
 /// its entire body vanished from the compiled output** — a compile-time construct
-/// that quietly deleted code (docs known-issues §28). Lucee 7.0.4 refuses to
+/// that quietly deleted code (refused since v0.556.0). Lucee 7.0.4 refuses to
 /// compile them: `No matching end tag found for tag [cflock]`, a template error.
 /// Probed per tag: NOT every body tag requires closing — `<cfhttp>`,
 /// `<cfexecute>`, `<cfmodule>` and `<cfthread>` are all legal unclosed on Lucee,

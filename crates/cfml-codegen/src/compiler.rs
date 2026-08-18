@@ -234,7 +234,7 @@ pub struct BytecodeFunction {
     /// `property name="x" type="numeric"` → `getX`/`setX`).
     ///
     /// Such a function carries a declared return type for metadata purposes but
-    /// must NOT have it enforced (docs/known-issues.md §29): Lucee reports
+    /// must NOT have it enforced (the v0.557.0 type rules): Lucee reports
     /// `numeric` on a generated `getNum()` and still returns `""` from it
     /// happily, and reports `void` on a generated `setX()` that in fact returns
     /// `this` for chaining. Enforcing either would break CFCs that are
@@ -684,7 +684,7 @@ impl BytecodeFunction {
 /// trivially-unconstrained forms are skipped (undeclared and `any`); every
 /// other name — including ones Lucee has no cast target for and therefore
 /// always rejects — reaches the VM, which owns the actual rules
-/// (`cfml-vm/src/type_check.rs`, docs/known-issues.md §29).
+/// (`cfml-vm/src/type_check.rs`; enforcement added v0.557.0).
 pub fn declared_type_is_checkable(param_type: Option<&str>) -> bool {
     match param_type {
         None => false,
@@ -1048,7 +1048,7 @@ pub enum BytecodeOp {
     /// `params`/`param_types`) against its CURRENT local value — emitted only
     /// inside the default-argument preamble, where the value came from the
     /// declared default rather than from the caller (a caller-supplied argument
-    /// is checked by the VM at bind time). docs/known-issues.md §29. No stack
+    /// is checked by the VM at bind time; enforcement added v0.557.0). No stack
     /// traffic.
     ValidateParamType(usize),
 

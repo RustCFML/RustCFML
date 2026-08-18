@@ -1,4 +1,4 @@
-//! Declared parameter / return-type enforcement (docs/known-issues.md §29).
+//! Declared parameter / return-type enforcement (unenforced until v0.557.0).
 //!
 //! `param_type`/`return_type` used to be carried all the way into
 //! `BytecodeFunction` and then read by nothing but `getMetadata()`, so
@@ -23,7 +23,7 @@
 //!    `function f( integer i )` throws on `f( 5 )`, and `f( email e )` throws
 //!    on `f( "a@b.com" )`. Lucee contradicts its own `isValid( "integer", 5 )`
 //!    here, but it is the reference and mirroring it is deliberate — see the
-//!    §29 note in docs/known-issues.md. (Nothing is lost by mirroring: on
+//!    v0.557.0 type-enforcement work. (Nothing is lost by mirroring: on
 //!    Lucee such a call is unconditionally fatal, so no Lucee-tested app can
 //!    contain a reachable one.)
 //!

@@ -280,7 +280,7 @@ pub struct RuntimeCfg {
     /// (RustCFML's own writes always invalidate). Only ever consulted in
     /// `--production`; dev serve mode and the CLI are always request-scoped, so a
     /// file created or deleted outside the engine is picked up on the next
-    /// request. See docs/known-issues.md §45.
+    /// request. Application-lifetime caching was closed in v0.598.0.
     #[serde(rename = "existenceCacheScope")]
     pub existence_cache_scope: String,
     #[serde(rename = "applicationTimeout")]

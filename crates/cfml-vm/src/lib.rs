@@ -1517,7 +1517,7 @@ pub struct ServerState {
     /// ([`EXISTS_FILE`] … [`ABSENT_ANY`]) and the same immutable-tree contract as
     /// `canonicalize_cache` / `component_path_cache`.
     ///
-    /// Sized before it was written (known-issues §45): on a warm live Preside
+    /// Sized before it was written (the existence-cache work, v0.598.0): on a warm live Preside
     /// homepage **15 of every 16 existence probes re-ask a question already
     /// answered**, and 14 of those 15 repeats cross a request boundary — so the
     /// request-scoped layer alone cannot see them, which is exactly why the

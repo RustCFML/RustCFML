@@ -1248,7 +1248,7 @@ fn splitmix64(x: u64) -> u64 {
 /// stream a linear function of the clock: `cfml_random() * u32::MAX` came out to
 /// exactly `nanos >> 32`, so `fn_create_uuid`'s `nanos ^ random_bits` cancelled
 /// its own high word and every process's FIRST `createUUID()` began `00000000`
-/// (docs/known-issues.md §34). Mixing the clock through splitmix64 — together
+/// (fixed in v0.558.0). Mixing the clock through splitmix64 — together
 /// with a per-thread distinguisher and a process-global counter, so two threads
 /// (or two processes) that start inside the same clock tick still diverge — and
 /// advancing once before use removes that correlation.

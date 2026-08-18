@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.574.0**.
+What RustCFML **does not fully do**, as of **v0.607.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
@@ -14,15 +14,16 @@ sequential.
 | 🌟 **divergence** | works, but deliberately differs from Lucee |
 | 🏗 **by design / edges** | implemented; the note records a scoping decision or a known corner |
 | 🌍 **environment** | restricted on a specific target (wasm, CLI) |
-| ✅ **resolved** | fixed; kept only as an upgrade note |
 
 Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything not marked
 *by design* is a gap against that target.
 
 > Maintenance: when you implement around a gap, or skip an attribute or setting, add it
-> here **in the same change**, in the group that matches its status — and move it to
-> Part F when it is fixed rather than editing the open entry in place. For the positive
-> "what *is* supported" view see `docs/configuration.md` and `docs/status.md`.
+> here **in the same change**, in the group that matches its status. When it is fixed,
+> **delete the section in the same change as the fix** — this document describes only what
+> is broken *now*. The history is not lost: section numbers are permanent, so a deleted
+> §n stays cited from its commit, and the tagged release commit carries the detail.
+> For the positive "what *is* supported" view see `docs/configuration.md` and `docs/status.md`.
 
 ---
 
@@ -73,6 +74,13 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [22](#22) | Within-request template freshness (GH #284) | 🏗 by design |
 | [26](#26) | Locale table is hand-maintained (GH #304) | 🏗 edges |
 | [38](#38) | Database exception `sqlState` is driver-dependent (GH #295) | 🏗 edges |
+| [41](#41) | `application` scope is live in-process, not across cluster nodes | 🏗 by design |
+| [46](#46) | Member-function dispatch lowercases the method name per call | 🏗 edges |
+| [47](#47) | Surplus built-in function arguments accepted, not rejected | 🏗 edges |
+| [48](#48) | Elvis operator accepts any left operand (Lucee restricts it) | 🏗 edges |
+| [49](#49) | `fileOpen( f, "write" )` does not create the file | 🏗 edges |
+| [50](#50) | AntiSamy sanitiser — cosmetic divergences from the Java library | 🏗 edges |
+| [51](#51) | Tag-mode `>` ends a tag unless bracketed or part of `=>` | 🏗 edges |
 
 **Part E — Environment-specific 🌍**
 
@@ -80,44 +88,23 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 |---|---|---|
 | [8](#8) | wasm / CLI restrictions | 🌍 |
 
-**Part F — Resolved (upgrade notes only) ✅**
-
-| § | Item | Status |
-|---|---|---|
-| [19](#19) | Mixed-in view helper vs host implicit accessors (GH #259) | ✅ v0.440.0 |
-| [27b](#27b) | Tag-attribute whitelists removed (`cfhttp`, `cfloop`, `cfdump`, …) | ✅ v0.543–0.555 |
-| [24](#24) | `writeLog`/`<cflog>` file logging (GH #286) | ✅ v0.528.0 |
-| [25](#25) | Member-function dispatch throws on unknown members (GH #307) | ✅ v0.549.0 |
-| [28](#28) | Unclosed body tags refused, not erased | ✅ v0.556.0 |
-| [29](#29) | Declared parameter / return types enforced | ✅ v0.557.0 |
-| [31](#31) | `<cflock>` `scope=` / `throwOnTimeout=` | ✅ v0.553.0 |
-| [32](#32) | Page-scope **function** variable visible inside functions | ✅ v0.558.0 |
-| [33](#33) | Java `Object` methods on simple values | ✅ v0.558.0 |
-| [34](#34) | `createUUID()` random from the first call, v4-shaped | ✅ v0.558.0 |
-| [35](#35) | §29 type enforcement rejected two legitimate values (Preside boot) | ✅ v0.560.0 |
-| [36](#36) | Built-in scope names were shadowable (ACF behaviour) — GH [#312](https://github.com/RustCFML/RustCFML/issues/312) | ✅ v0.561.0 |
-| [37](#37) | A non-SELECT statement returned metadata instead of an empty query | ✅ v0.562.0 |
-
 ### Is it getting better?
 
-Yes, and the trend is visible in the table above: Part F has grown by nine sections while
-Parts A, B and C shrank — §27's whitelists, §28's erased tag bodies, §29's unenforced
-types, §31's collapsed locks, §32's unreachable helpers, §33's missing `Object` methods
-and §34's half-zeroed UUIDs were all silent-or-destructive and are now gone. Part B is
-down to a single section, and §33's regression against a known-good baseline is closed:
-TestBox's own suite is back to 410 pass / 0 fail / 0 error.
+Yes. Resolved entries are **deleted** rather than archived here, so this document does not
+show the trend — `git log docs/known-issues.md` and the tagged release commits do. Between
+v0.440.0 and v0.607.0, eighteen sections were closed and removed, most of them from the
+silent (🔇) class, which is the one that matters: Part B is down to a single section.
 
 Two honest caveats, so the direction isn't oversold:
 
-- **New sections are usually old bugs being *found*, not new breakage.** §32, §33 and
-  §34 were all discovered while enforcing declared types (§29); none was caused by it,
-  and each was verified as pre-existing against an unmodified earlier binary before being
-  fixed. Doing the work is what surfaces them, so expect the list to keep growing at the
-  same time as it shrinks.
-- **Stale entries flatter the list too.** §19 sat in the open column for ~117 releases
-  after being fixed in v0.440.0, because nobody moved it when the issue was closed. If an
-  entry looks like it contradicts a workload you know runs, re-probe it before believing
-  it — that is what Part F's "move it, don't edit it" rule exists to prevent.
+- **New sections are usually old bugs being *found*, not new breakage.** Several past
+  entries were discovered while implementing an unrelated one, verified as pre-existing
+  against an earlier binary, and only then fixed. Doing the work is what surfaces them, so
+  expect this list to keep growing at the same time as it shrinks.
+- **Stale entries flatter the list.** One section sat here for ~117 releases after being
+  fixed, because nobody removed it when the issue closed. If an entry contradicts a
+  workload you know runs, **re-probe it before believing it** — and if it is fixed, delete
+  it.
 
 ---
 
@@ -150,7 +137,6 @@ Accepted but **ignored** (no error, no effect):
 
 | Setting | Notes |
 |---|---|
-
 
 | `this.applicationTimeout` | Per-app value ignored — **and so is the cfconfig `runtime.applicationTimeout`**. The key parses and is seeded into thread contexts, but nothing ever reads it: applications do not time out. (This row previously claimed the cfconfig key "IS applied". It never was.) |
 | `this.scriptProtect` | No script-protection filtering of scopes. |
@@ -907,9 +893,13 @@ behave as `en_US`. Extend the table rather than letting a caller's locale be dro
 
 ---
 
-<a id="38"></a>
+<a id="51"></a>
 
-## 39. Tag-mode expressions: `>` ends a tag unless it is bracketed or part of `=>` 🏗
+## 51. Tag-mode expressions: `>` ends a tag unless it is bracketed or part of `=>` 🏗
+
+> Renumbered from §39 (2026-08-18): the number had been claimed four days
+> earlier by the `.cfconfig.json` placeholder section above, so commit
+> `0e54157` cites this section as §39.
 
 A tag ends at the first `>` that is not inside a string, a CFML comment, or a
 bracketed sub-expression. That last clause exists because tag-mode expressions
@@ -935,6 +925,8 @@ A `>` comparison at the top level of a tag expression still needs bracketing or
 the word operator — `<cfset big = (a > b)>` or `<cfset big = a GT b>`. Bare
 `<cfset big = a > b>` ends at the comparison, as it always has.
 
+<a id="41"></a>
+
 ## 41. The `application` scope is live in-process, but NOT across cluster nodes 🏗 *(divergence, by construction)*
 
 Since v0.593.0 the `application` scope is a genuinely shared live structure: a write
@@ -956,32 +948,7 @@ a Durable Object, a distributed lock) rather than an application-scope key.
 Note the Durable Object backend serialises all requests through a single instance,
 so it is closer to correct than plain KV, but still snapshot-based.
 
-## 40. `<cflock>` `timeout="0"` fails immediately instead of waiting forever ✅ *(fixed in v0.593.0)*
-
-Lucee treats `timeout="0"` — and an **omitted** `timeout` — as *no timeout*: the
-request waits as long as it takes. RustCFML expired at the deadline, so
-`timeout="0"` failed at once and an omitted `timeout` expired after 5 seconds.
-Measured against **Lucee 7.0.4.34** with a background thread holding the lock:
-
-| case | Lucee | before | after |
-|---|---|---|---|
-| `timeout` omitted, 7 s holder | acquires after 6600 ms | threw at 5005 ms | acquires ✅ |
-| `timeout="0"`, 2 s holder | acquires after 1594 ms | threw at 0 ms | acquires ✅ |
-| `timeout="1"`, 3 s holder | throws, `LockOperation="Timeout"` | same | same ✅ |
-| `timeout="1" throwontimeout="false"` | `false` at 1011 ms | same | same ✅ |
-
-**Why this shipped a release later than the `LockOperation` half (v0.592.0).**
-Making lock losers *wait* is only safe once the `application` scope is live:
-Preside's `_reloadRequired()` is the guard-once idiom
-(`!StructKeyExists( application, "cbBootstrap" )`), and with a per-request
-snapshot scope every queued request decided a reload was still required and
-re-booted the whole framework — 8 concurrent cold requests went from 1 framework
-boot to **8** (~7 s each). Fail-fast had been accidentally *masking* that. With the
-live application scope in the same release, the same test gives **1 boot, 3/3**.
-
-Covered by `tests/tags/test_cflock_timeout_semantics.cfm` (15 assertions, green on
-both engines) and `tests/tags/test_application_scope_concurrency.cfm`.
-Note Lucee exposes **no** `lockName` member on this exception, and neither do we.
+<a id="38"></a>
 
 ## 38. Database exception members — `sqlState` is driver-dependent 🏗 *(GH [#295](https://github.com/RustCFML/RustCFML/issues/295))*
 
@@ -1018,104 +985,7 @@ Covered by `tests/database/test_query_error_sqlstate_members.cfm` (SQLite
 control gated on driver availability so it skips on Lucee; PostgreSQL, MySQL and
 SQL Server legs gated on `RUSTCFML_TEST_PG_DS` / `_MYSQL_DS` / `_MSSQL_DS`).
 
-## 45. Existence answers are cached for the life of the application ✅ *(fixed)*
-
-**Was:** `Vm::request_exists_cache` cached **positives only**, for one request. A
-path that did not exist was re-`stat`ed on every probe, forever. Measured on a
-live Preside admin site (`RUSTCFML_COUNTERS=1`, v0.595.1) that meant more real
-syscalls than cache hits — 11,938 probes against 7,387 hits on cold boot, 18,908
-against 9,862 cumulatively.
-
-**The sizing that explains two failed attempts.** A purpose-built census
-(`--features exists-census`, `cfml-common/src/perf_counters.rs`) classified every
-probe by outcome *and* by whether the path had been probed before. Boot and warm
-have opposite shapes, which is why each earlier attempt built one layer and then
-measured the workload the other layer serves:
-
-| | cold boot (28 epochs) | warm homepage (per request) |
-|---|---|---|
-| positive, first ever | 19.3% | 0.0 |
-| positive, repeat later request | 0.6% | 7.0 |
-| negative, first ever *(irreducible)* | 30.4% | 1.0 |
-| negative, repeat **same** request | 47.8% | 1.0 |
-| negative, repeat later request | 1.8% | 7.0 |
-| **total** | 11,944 probes | **16.0 probes, 15 recoverable** |
-
-Boot repetition is overwhelmingly *within* one request; warm repetition is
-overwhelmingly *across* requests (14 of 16). A request-scoped negative memo —
-built and measured at zero in 2026-08 — could only ever have recovered 1 of the
-16 warm probes. A cross-request *positive* layer — built and measured at −1.07% in
-2026-08 — could only reach 7.
-
-**Result on the same live Preside site:** warm probes fell from **16.0 to 1.0 per
-request** and boot probes from 11,944 to 6,036, while memo hits rose from 0.04 to
-14.3 per warm request. The single remaining warm probe is the irreducible
-"negative, first ever" — every recoverable class measured at zero.
-
-**Now:** two layers, both caching positive *and* negative answers.
-
-* Layer 1 `Vm::request_exists_cache` — every mode, request lifetime.
-* Layer 2 `ServerState::exists_cache` — `--production` only, application
-  lifetime, same immutable-tree contract as `canonicalize_cache` /
-  `component_path_cache` / `custom_tag_path_cache`. A layer-2 hit is promoted into
-  layer 1.
-
-Six bits per path (`EXISTS_FILE`/`DIR`/`ANY` plus `ABSENT_FILE`/`DIR`/`ANY`), with
-the implications wired in: "is a file" implies "exists", and "does not exist"
-implies neither-file-nor-directory, so one probe can answer questions of a
-different kind for free.
-
-**Invalidation is asymmetric, on purpose.** A cached positive is falsified only by
-a *removal*, which the engine can attribute to a path — so removals invalidate
-**by canonical path identity** and an unrelated write no longer discards the whole
-map (the `c9fa07f` bug: 861 flushes per Preside request, 835 of them from
-`fileClose`, which cannot remove anything). A cached negative is falsified by a
-*creation*, which has **no single choke point**: the `Vfs` trait is read-only, so
-writes reach `std::fs` from all over cfml-stdlib and the VM, and several creators
-(`cfdump output=`, `cfhttp file=`, the upload BIFs, `cfexecute`, `writeDump`) are
-**VM-intercepted and never pass the builtin dispatcher at all**. Enumerating them
-is what the 2026-08 attempt tried, missing four on the first pass. So negatives
-are instead guarded by a process-global generation
-(`EXISTS_NEG_GENERATION`): anything that may create a path bumps it via a drop
-guard taken at the single point every builtin-shaped call passes through, which
-retires every negative in O(1) while leaving every positive standing.
-
-`sleep()` and `threadJoin()` also retire negatives — but only for the paths *this
-request has already probed* (`retire_probed_negatives`). That is the property that
-makes negative caching safe at all: `while ( !fileExists( f ) ) { sleep( 50 ) }`
-is the standard poll for a file another actor is producing, and a held negative
-would turn it from a staleness trade-off into a hang. Scoping it to probed paths
-matters as much as having it: Preside calls `sleep()` ~2.7 times per render, so
-retiring every negative in the process on each one evicted the cross-request
-negatives on nearly every request and cost most of the benefit — warm probes sat
-at 5.8 per request until this was narrowed, against 1.0 after.
-
-Three things had to be right before any of it measured, and each was invisible to
-the correctness suite:
-
-* **`.then(|| guard)`, not `.then_some(guard)`.** `then_some` takes its argument by
-  value, so the guard was constructed and immediately dropped on *every* builtin
-  call — `fileExists` included — retiring negatives as fast as they were learned.
-* **Creators whose target path is knowable are attributed, not globalised.**
-  Preside does one `fileWrite` per request; while that fired the process-wide
-  retirement it wiped the negative cache every render.
-* **`fileClose` cannot create anything** and must not retire (835 spurious
-  retirements per boot) — the exact mirror of the positive-side bug in `c9fa07f`.
-
-**The trade-off, stated plainly.** In `--production`, an existence answer can
-survive a change made by a *different process* — a file deleted or created
-outside the engine may not be observed until something invalidates. That is the
-same bargain the three sibling path caches already strike, and RustCFML's own
-writes always invalidate. Dev serve mode and the CLI have no layer 2 at all, so
-they always see an external change on the next request. Opt out in production
-with `runtime.existenceCacheScope = "request"` (default `"application"`).
-
-Covered by `tests/stdlib/test_existence_cache.cfm` (36 assertions, including the
-VM-intercepted `cfdump output=` creator and the `threadJoin` yield point) and
-`crates/cfml-vm/tests/xreq_exists_cache.rs` (7 tests over the layer-2 contract:
-production holds a positive *and* a negative across requests, dev holds neither,
-the scope knob disables layer 2, own-writes invalidate in both directions, and an
-unrelated write does not discard a cached positive).
+<a id="46"></a>
 
 ## 46. Member-function dispatch lowercases the method name per call 🏗
 
@@ -1137,6 +1007,8 @@ through the `Cow` discriminant cost more than the allocation it saved
 (registry-cased `len` 186→210 ms/1M, `structKeyExists` 262→290 ms/1M). It was
 reverted, and a comment left at the site. The same trap may well apply here.
 
+<a id="47"></a>
+
 ## 47. Surplus built-in function arguments are accepted, not rejected 🏗
 
 RustCFML tolerates extra positional arguments to a built-in where Lucee raises a
@@ -1153,7 +1025,7 @@ was fixed in v0.596.0 (§42) — making arity strict across ~730 built-ins is a
 separate semantics project with a much wider blast radius, and a real risk of
 breaking working user code that happens to pass a stray argument.
 
-<a id="49"></a>
+<a id="48"></a>
 
 ## 48. The Elvis operator accepts any left operand, where Lucee restricts it 🏗
 
@@ -1187,788 +1059,7 @@ Covered from the runtime side by `tests/functions/test_elvis_error_scope.cfm`,
 which deliberately avoids the restricted shape so the suite compiles on both
 engines.
 
----
-
-# Part E — Environment-specific 🌍
-
-Restrictions that apply only on a particular target (wasm, CLI vs serve).
-
-<a id="8"></a>
-
-## 8. Environment-specific 🌍
-
-| Feature | Restriction |
-|---|---|
-| `<cfdirectory>` | Not supported on `wasm32` (no filesystem). |
-| `<cfzip>` | Not supported on `wasm32`. |
-| `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
-| `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
-| `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
-| `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads since v0.572.0 (GitHub #314): `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
-| `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
-
----
-
-# Part F — Resolved (upgrade notes only) ✅
-
-Fixed and shipped. Retained because each one changed behaviour an application could have
-been relying on, and because the numbers are cited from commits and issues. **Nothing in
-this part is an open problem.**
-
-<a id="19"></a>
-
-## 19. Mixed-in view helper could not resolve the host Renderer's implicit accessors ✅ *(fixed in v0.440.0, GH [#259](https://github.com/RustCFML/RustCFML/issues/259))*
-
-A ColdBox/Preside **view helper** mixed into the Renderer and then calling one of the
-Renderer's **implicit accessors** (e.g. `getController()`) got `null` back, so Preside's
-admin sitetree page died with `cannot call method [renderViewlet] on a null value` from
-`system/helpers/presideProxies.cfm`. The original diagnosis here blamed a missing `this`;
-the real cause was narrower and had nothing to do with `this`:
-
-1. **A bare call from an included template dropped page variables.**
-   `build_call_parent_scope` picked its inherited-key filter from the nearest *pushed*
-   function frame (`call_stack.last()`) — but `__main__`/template frames are never
-   pushed, so a bare call from inside an `include`d view (ColdBox's
-   `RendererEncapsulator.includeWrapper`) adopted an *outer* method's inherited set
-   (`renderViewComposite`) and discarded page vars the template legitimately held,
-   `controller` among them. So the mixed-in `getController()` read null. Fixed with a
-   `frame_ctx` stack recording the inherited set + is-template flag for **every** frame,
-   templates included, so a bare call filters against its true immediate caller. This
-   matches Railo's `UDFImpl._call` (never swaps the variables scope) and BoxLang's
-   `FunctionBoxContext` (see-through when not `isInClass()`).
-2. **`return x = expr` returned null** — a cascade blocker that only surfaced once (1)
-   was fixed. The return-value position never requested the assignment's value, so
-   Preside's `return alerts = obj.selectData( … )` in `getCriticalAlerts` returned null
-   and `criticalAlerts.recordCount` then threw undefined. Fixed in codegen.
-
-Regression tests, both cross-engine verified against Lucee 7:
-`tests/tags/test_seethrough_udf_variables.cfm` and
-`tests/core/test_return_assignment_expression.cfm`. Re-probed at v0.557.0: the minimal
-repro (helper `include`d into a component, called without `this`, reading an implicit
-accessor) returns the controller, and the GH #259 suite passes 2/2.
-
-<a id="27b"></a>
-
-## 27b. Tag-attribute whitelists already removed ✅ *(v0.543.0–v0.555.0)*
-
-The counterpart to §27 — the tags whose whitelist has been deleted, in the order they
-were taken. Every expectation was probed against
-Lucee 7.0.4 before being implemented, and the regression tests
-(`tests/tags/test_tags_cfhttp_name_file.cfm`,
-`tests/tags/test_tags_cfloop_query_window_group.cfm`,
-`tests/tags/test_script_transaction_attrs.cfm`, plus the lowering tests in
-`tag_parser.rs`) pass on **both** engines:
-
-- **`<cfhttp>`** — the ten-key whitelist is gone; every attribute is forwarded, as
-  `<cfquery>` already does. `name=` now parses the response body into a query
-  (`delimiter`, `textQualifier`, `firstRowAsHeaders`, `columns`; blank lines skipped,
-  a doubled qualifier is a literal one, a row whose field count differs from the
-  column count raises Lucee's own `Invalid CSV line size…` `application` error, and
-  cells stay strings so `007` survives). `file=`/`path=` write the body to disk —
-  filename derived from the URL when only `path=` is given, next to the calling
-  template when only `file=` is, an existing file overwritten, and a missing parent
-  directory reported as Lucee's `java.io.IOException`. `throwOnError` now raises the
-  `application`-typed `404 Not Found` Lucee raises instead of a generic `runtime`
-  error. `redirect`/`port`/`proxyPort`/`encodeURL` were already implemented and now
-  simply arrive. **One divergence remains:** `getMetadata(q).typeName` reports
-  `VARCHAR` for a numeric-looking column where Lucee reports `DOUBLE` — RustCFML
-  infers column types from cell values and has nowhere to record a declared type.
-  The cells themselves match Lucee exactly (strings).
-- **`<cfloop query=…>`** — `startrow`/`endrow` (and `maxrows`, which Lucee honours here
-  too) bound the iteration; a window past the end of the recordset yields nothing
-  rather than everything. `group=` does a real control break, with a **bare** nested
-  `<cfloop>` as the per-group detail block, recursing for multi-level grouping.
-  Grouping applies *after* the row window. This also corrected `groupCaseSensitive`,
-  which RustCFML defaulted to `true` (ACF's documented default) for `<cfoutput
-  group=>`: Lucee 7.0.4 merges `eng` with `ENG` unless `groupCaseSensitive="true"` is
-  given, so the default is now case-**in**sensitive on both tags.
-- **script-form `transaction`** — the block form (`transaction datasource="x" { … }`)
-  dropped `isolation` and `datasource` while the statement and tag forms forwarded
-  them. All three now emit `__cftransaction_start(action, isolation, datasource)` with
-  every position filled: they used to emit only the attributes present, which shifted
-  `isolation` into the datasource slot, so `<cftransaction isolation="serializable">`
-  with no datasource tried to open a connection to a datasource named *serializable*.
-  An inline datasource **struct** is also read properly now (as `queryExecute` reads
-  one) rather than stringified into a `{class: …}` blob that `parse_datasource` then
-  treated as a SQLite file name. Two notes: `datasource=` is a RustCFML **extension** —
-  Lucee rejects it at compile time on both forms (`valid attribute names are
-  [isolation, savepoint, action]`) — and Lucee's `savepoint=` is accepted-and-ignored
-  here, as `isolation` still is (§7).
-- **`<cfdump>`** — every attribute now reaches `writeDump`, not just
-  var/label/expand/top. `output="console"` keeps the dump out of the HTTP response
-  (only the script form did), `output="<path>"` writes the plain-text rendering to a
-  file and **appends** to an existing one (path resolved like ExpandPath — a relative
-  one against the *base* request template's directory, which is what Lucee does even
-  when the tag sits in an included file), a missing parent directory is Lucee's
-  `application`-typed `Parent directory for [x] doesn't exist`, and `abort="true"`
-  emits the dump and then ends the request. The plain-text dump *layout* still differs
-  from Lucee's (`Struct (2) / a = 1` vs `Struct / A number 1`) — a renderer
-  difference, not a dropped attribute.
-- **`<cffile action="copy"/"move">`** — `nameConflict=` is honoured: `overwrite` (also
-  the default), `skip` (destination untouched, no error), `error` (Lucee's
-  `application`-typed `Destination file [x] already exists`), and `makeunique` (leaves
-  the destination and writes `name-<unique>.ext` beside it). It rides as a third
-  argument to `fileCopy`/`fileMove`; a plain two-argument call still overwrites.
-- **`<cfinvoke webservice=…>`** — used to travel as a *method argument* with the
-  component resolving to `""`. There is no SOAP client in RustCFML, so it now throws
-  and says that. Deliberately a **runtime** throw: Lucee compiles the tag happily, so
-  an app that merely contains an unreached SOAP call must still start.
-- **`<cffile charset=>`** — this one was never only a lowering gap: the
-  `fileRead`/`fileWrite`/`fileAppend` BIFs ignored a charset argument too, and
-  `charsetEncode`/`charsetDecode` were pass-through no-ops, so *everything* was UTF-8
-  whatever the caller asked for. There is now a real encoding layer
-  (`cfml-common/src/charset.rs`) covering UTF-8, UTF-16 (BOM), UTF-16BE/LE,
-  ISO-8859-1, windows-1252 and US-ASCII, wired through all three file BIFs, the tag,
-  and `charsetEncode`/`charsetDecode`. Byte-for-byte Lucee 7.0.4 parity: `utf-16`
-  writes an `FE FF` BOM then big-endian units; the BE/LE forms write none; an
-  unmappable character becomes `?` on the single-byte encodings; a **BOM wins over the
-  requested charset** on read (which is what lets a `utf-16` file be read by a caller
-  who asks for `utf-8`, or for nothing); undecodable bytes become U+FFFD rather than
-  raising; `fileAppend` appends the full encoding, second BOM included. An
-  **unrecognised charset name is now an error** rather than a silent UTF-8 fallback.
-  Two things this surfaced along the way:
-    - `<cffile action="write"/"append">` appends the platform line separator **by
-      default** and takes `addNewLine="false"` to suppress it (Lucee writes 4 bytes for
-      `abc` from the tag, 3 from the `fileWrite()` BIF). RustCFML did neither — it wrote
-      3 from both and ignored `addNewLine` — so every file written through the tag was
-      a separator short of Lucee's. Fixed; the BIFs still write exact bytes.
-    - `fileReadBinary()` returns a `Binary`, where Lucee returns a byte **array**. So
-      `len()` agrees on both engines but `arrayLen()`/`b[1]` only work on Lucee. Not
-      touched here — it is a value-model difference, not an encoding one. 🌟
-
-`<cflock>` used to head this list — with `scope=` and `throwOnTimeout=` both discarded,
-every scope lock collapsed onto the single name `"default"` (unrelated scopes, and
-unrelated applications, serializing against each other) and a contended lock always
-threw. Fixed in v0.553.0: see §31. Note that the loss was in the **runtime**, not the
-lowering — all three `cflock` lowerings already forwarded every attribute, and
-`__cflock_start` simply never read them. Attribute plumbing is worth checking at both
-ends.
-
-<a id="24"></a>
-
-## 24. `writeLog` / `<cflog>` — file logging ✅ *(fixed in v0.528.0, GH [#286](https://github.com/RustCFML/RustCFML/issues/286))*
-
-Resolved. `<cflog>` / `writeLog()` now write to `<log-dir>/<name>.log` through cached,
-rotating file appenders, in Lucee 7's exact line layout:
-
-```
-"Severity","ThreadID","Date","Time","Context","Application","Message"
-"ERROR","tokio-rt-worker","07/26/2026","22:56:48","http://127.0.0.1:8500","MyApp","boom"
-```
-
-Log directory: `logging.logsDirectory` from `.cfconfig.json`, else `<webroot>/logs`
-under `--serve`, else `./logs` under the CLI. The resolved path is readable from CFML as
-`server.cfconfig.logging.logsDirectory`.
-
-Semantics verified against Lucee 7.0.4 and pinned in
-`tests/tags/test_cflog_file_logging.cfm`: `type=` → log4j2 severity (an unknown type is
-an error); no `file=`/`log=` targets the `application` log; `log=` names a *configured*
-logger and falls back to `application` when unknown, whereas `file=` creates the file; a
-path separator in `file=` is an error; `application="false"` blanks the Application
-column (the attribute defaults to true).
-
-Config knobs (all under `logging`): `logsDirectory`, `cfmlLevel` (default threshold),
-`loggers.<name>.level` (per-log threshold, `off` to mute), `maxFileSize` (default 10 MB),
-`maxFiles` (default 10 rotated generations), `flushEachLine` (default `true`, log4j2's
-`immediateFlush`; `false` batches until request end), `echoToStderr` (default `false` —
-Lucee doesn't echo to the console either; the `RUSTCFML_LOG_STDERR` env var forces it on).
-
-Rotation is size-based, rolling to `<name>.log.<n>.bak` at 10 MB — the naming and
-threshold Lucee's resource appender produces (confirmed by overflowing a log on Lucee
-7.0.4). Remaining gap: no time-based (daily) rolling policy.
-
-<a id="25"></a>
-
-## 25. Member-function dispatch — unknown members now throw ✅ *(fixed in v0.549.0, GH [#307](https://github.com/RustCFML/RustCFML/issues/307))*
-
-`call_member_function` used to end in a bare `Ok(CfmlValue::Null)`. Components (GH #220)
-and plain structs (GH #285) had each been tightened to throw, but **Array, String, Query,
-numeric, Boolean, Binary and TimeSpan receivers stayed lenient** — so every gap in the
-member tables was a *silent* no-op rather than an error.
-
-That is what made GH #307 dangerous: `filtered.add(x)` appended nothing and threw nothing,
-so calling code took the success path with an empty array (Preside's
-`TaskManagerService.listTasks()` returned `[]` for every call). Assigning the resulting
-Null also trips the PR #112 null-delete guard, so the failure typically resurfaced far
-away as a misleading `Variable 'X' is undefined`.
-
-Unknown members on those receivers now throw
-`The function [x] does not exist in the <Type>.`, matching Lucee. The missing members
-themselves were also wired up: the `java.util.List` passthroughs on arrays
-(`add`/`get`/`remove`/`removeAll`/`retainAll`/`subList`/`containsAll`/`indexOf`/
-`lastIndexOf`), the `java.util.Map` passthroughs on structs
-(`put`/`putIfAbsent`/`remove`/`containsKey`/`containsValue`/`keySet`/`values`/`entrySet`),
-the `java.lang.String` passthroughs (`charAt`/`substring`/`concat`/`equals`/
-`equalsIgnoreCase`/`compareTo`/`hashCode`/`replaceAll`/`isBlank`), and the CFML array
-members whose BIFs already existed but were never mapped (`pop`/`shift`/`unshift`/`swap`/
-`resize`/`set`/`splice`/`mid`/`median`/`toStruct`/`removeDuplicates`/`indexExists`/…).
-
-**Behaviour changes to be aware of when upgrading:**
-
-- `indexOf`/`lastIndexOf` on **both arrays and strings** are the Java methods:
-  **0-based, returning −1 when absent**. They were previously aliased onto `find`
-  (1-based, `0` when absent), which silently made `if ( x.indexOf(v) >= 0 )` always true
-  and every hit off by one. `find()` itself is unchanged and still 1-based.
-- `arrayResize` fills with **null**, not empty strings (Lucee parity).
-- `arraySet`/`arraySwap` **throw** on an under-supplied call instead of returning `false`
-  and mutating nothing.
-
-Remaining divergences in this area (all minor, all verified against Lucee 7.0.4):
-
-| Member | RustCFML | Lucee |
-|---|---|---|
-| `struct.values()` / `.keySet()` / `.entrySet()` | CFML array (iterable, castable) | live `java.util.Collection` views; the `Values` view can be neither cast nor looped |
-| `array.deleteNoCase(v)` | returns boolean "was it found" | returns the array |
-| `array.unshift(v)` | returns the array | returns the new length |
-| `date.noSuchMember()` | reports type `String` | reports type `Datetime` (RustCFML dates are strings) |
-
-<a id="28"></a>
-
-## 28. Unclosed body tags — refused, not erased ✅ *(fixed in v0.556.0)*
-
-A body-bearing tag with no closing tag used to make the preprocessor return an empty
-string for it, so **the tag *and its entire body* vanished from the compiled output** —
-a compile-time construct that quietly deleted code (the same failure mode as the
-`<cfloop>` fallback fixed in v0.550.0). `<cfsavecontent>` with a missing
-`</cfsavecontent>` dropped the content and never set its variable; `<cfmail>` sent an
-empty message; `<cfquery>` leaked its SQL into the *page* and ran nothing.
-
-Which tags require closing was probed per tag on Lucee 7.0.4 — the original inventory
-here was wrong in both directions:
-
-| Tag | Lucee | RustCFML now |
-|---|---|---|
-| `<cfoutput>`, `<cfsilent>`, `<cfstatic>`, `<cflock>`, `<cftransaction>`, `<cfsavecontent>`, `<cfmail>`, `<cfswitch>`, `<cfloop query=…>` | compile error: `No matching end tag found for tag [X]` | the same error, same wording |
-| `<cfquery>` | **compiles**, then fails at runtime — a cfquery with no body has no SQL: `You need to define the attribute [SQL] or define the SQL in the body of the tag.` | the same runtime error (so a template that merely *contains* the mistake still compiles) |
-| `<cfhttp>`, `<cfexecute>`, `<cfmodule>`, `<cfthread>` | **legal unclosed** — the tag runs attribute-only and the body stays page content | unchanged; already matched. These were wrongly listed as broken here |
-| `<cfscript>` | `invalid construct` | `Unclosed <cfscript> tag: missing </cfscript>` — errors, wording differs |
-
-Two things still outstanding:
-
-- `<cfif>`, `<cfloop>` (the non-query forms), `<cffunction>` and `<cftry>` lower to a
-  bare `{` opener, so an unclosed one surfaces as the script parser's generic
-  `Parse error` rather than Lucee's `No matching end tag found for tag [cfif]`. It
-  fails loudly either way — the message is just less useful. 🏗
-- `<cfspreadsheet action="write">` could not be probed: the reference Lucee here has no
-  spreadsheet extension installed (`undefined tag [cfspreadsheet]`). RustCFML currently
-  treats an unclosed one as attribute-only, like the `<cfhttp>` family. 🏗
-
-<a id="29"></a>
-
-## 29. Declared function types — now enforced ✅ *(fixed in v0.557.0)*
-
-`param_type` and `return_type` used to be carried through the parser and codegen into
-`BytecodeFunction` and then read by nothing but `getMetadata()` (plus a component-type
-check on arguments), so a declared primitive type was a comment:
-
-```cfml
-function f( required numeric n ) { return n; }
-f( "notanumber" );                    // -> "notanumber", no error (Lucee throws)
-
-function g() returntype="numeric" { return "abc"; }
-g();                                  // -> "abc", no error
-```
-
-Both are now `expression` errors, with Lucee's own wording, in argument and return
-position, for script and tag declarations, for closures and arrow functions, for
-named / positional / `argumentCollection` calls, and for an applied default. The
-rules live in `crates/cfml-vm/src/type_check.rs`; every one was probed against Lucee
-7.0.4 first and `tests/functions/test_fn_type_enforcement.cfm` (95 assertions) passes
-on both engines. Two properties of the reference behaviour are worth knowing:
-
-- **Validation, not coercion.** A `numeric` parameter given `"123"` receives the
-  *string* `"123"`. Nothing is converted, in either direction, ever.
-- **A type name with no cast target is treated as a component path**, so it rejects
-  *every* value: `integer`, `int`, `long`, `short`, `byte`, `char`, `float`, `double`,
-  `decimal`, `email`, `creditcard`, `url`, `base64`, `usdate`, `eurodate`, `hex`,
-  `path`, `node`, `closure`, `lambda` and `udf` all throw unconditionally —
-  `function f( integer i )` throws on `f( 5 )`, and `email` throws on `"a@b.com"` —
-  while Lucee's own `isValid( "integer", 5 )` says true. This is mirrored
-  deliberately: on Lucee such a call is unconditionally fatal, so no Lucee-tested app
-  can contain a reachable one, and diverging would mean accepting code the reference
-  engine rejects. The names that DO have a cast target: `any`, `string`, `numeric`,
-  `number`, `boolean`, `bool`, `date`/`datetime`/`time`, `timespan`, `array`,
-  `struct`, `query`, `binary`, `xml`, `function`, `uuid`, `guid`, `variablename`,
-  `component`, `object`, `void`, a CFC/interface path, and `T[]` (validated
-  element-by-element, recursively).
-
-Some acceptance cells are surprising and are Lucee's, not ours: a boolean satisfies
-`numeric`; any number satisfies `boolean`; a numerically-keyed (or empty) struct
-satisfies `array` while `{ a : 1 }` does not; a component satisfies `struct`; binary
-satisfies both `string` and `array`; and a numeric *string* satisfies `date`.
-
-Three things this surfaced on the way, all fixed here:
-
-- **Dotted return types were mangled.** `pkg.sub.Res function make( any a )` captured
-  its return type as `pkgsubResmakeany` — the capture loop peeked by index while
-  advancing the cursor, so it spliced in the function name and its first parameter
-  type. Invisible while the value only reached `getMetadata()`; fatal the moment the
-  type is enforced. A method declaring a package-qualified return type of its own
-  package now also accepts the instance it built (resolution may name that instance
-  webroot-relative rather than mapping-qualified; leaf names are compared in both
-  directions).
-- **Two declaration forms were being dropped.** `numeric function f()` at page scope
-  (the prefix form *without* an access modifier) lost its return type entirely, as did
-  `function f() returntype="numeric" {}` (the post-paren attribute form) and any
-  closure's `returntype=`. All three now carry it — so all three also report it in
-  `getMetadata()`, which they did not before.
-- **`isXml()` accepted an unclosed element** (`isXml("<a>")` was true, Lucee says
-  false) and **`isDate()` rejected slash-separated ISO order** (`2020/1/2`, which
-  Lucee accepts). Both are load-bearing for `xml`- and `date`-typed parameters.
-
-Remaining divergences, both consequences of the value model rather than of the check
-🌟:
-
-- RustCFML dates are **strings**, so a date value satisfies `string` and `binary`
-  (Lucee's DateTime does not) but not `numeric` (Lucee's does), and a date named in a
-  mismatch message reads `String [2026-08-03 22:36:31]` where Lucee reads
-  `Object type [DateTime]`.
-- A query column reached by dot notation is an **Array** here and a scalar there, so
-  `q.name` passed to a typed parameter is described as `Object type [Array]` rather
-  than by its single value.
-
-Engine-**generated** property accessors are exempt, as they are on Lucee: a generated
-`getNum()` on `property name="num" type="numeric"` reports `numeric` in metadata and
-still returns `""` happily, and a generated `setX()` reports `void` while returning
-`this` for chaining. Enforcing either would break CFCs that are legal on the reference
-engine. `cfparam`/`param` `type=` enforcement is separate — see §14.
-
-<a id="31"></a>
-
-## 31. `<cflock>` `scope=` and `throwOnTimeout=` ✅ *(fixed in v0.553.0)*
-
-Both attributes reached the compiler and were then dropped by the runtime, which read
-only `name`, `type` and `timeout`. Consequences: every `scope=` lock fell back to the
-literal lock name `"default"`, so `scope="application"` in one app serialized against
-`scope="session"` in another (a concurrency-correctness bug, not a missing option), and
-`throwOnTimeout="false"` still threw on contention.
-
-Now each scope gets its own lock, discriminated by *which* application / session /
-request it belongs to:
-
-| Form | Lock identity |
-|---|---|
-| `name="x"` | The name verbatim, process-wide (unchanged). |
-| `scope="server"` | One lock for the whole process, shared by every application. |
-| `scope="application"` | Per application — two apps do not contend. |
-| `scope="session"` | Per session, within the application. |
-| `scope="request"` | Per request — keyed on the request scope's backing store, so `<cfthread>` children (which share that scope) contend with their parent, and separate requests do not. |
-| neither | A single lock named `"default"`, distinct from every scope lock. Lucee also treats the bare form as its own lock. |
-
-`name=` and `scope=` are mutually exclusive and now raise Lucee's own error
-(`type="lock"`, "invalid attribute combination"), and a timeout raises a `lock`-typed
-exception with Lucee's wording — `a timeout occurred after 1 second trying to acquire a
-exclusive lock with name [x].` / `… a read-only [application] scope lock.` A sub-second
-timeout is expressed in milliseconds, as Lucee expresses it. Previously both were
-generic `runtime` errors, so `catch( lock e )` could not see them.
-
-Every one of those behaviours was probed against Lucee 7.0.4 before being implemented;
-`tests/tags/test_tags_cflock_scope.cfm` passes 7/7 on both engines.
-
-Two things to know:
-
-- **`scope="session"` with session management off** has no session to key on, so it
-  degrades to the application lock rather than silently becoming process-global. 🏗
-- **`throwOnTimeout="false"` skips the body.** That is the reference behaviour, but it
-  means the guarded work silently does not happen — the acquire result is not surfaced
-  to CFML, so there is no way to branch on it. Lucee has the same shape.
-
-<a id="32"></a>
-
-## 32. Page-scope variables holding a function ✅ *(fixed in v0.558.0)*
-
-A page-level variable whose value was a function EXPRESSION could not be reached from
-inside any function body — not bare, not as `variables.x`, from a named function or from
-a closure:
-
-```cfml
-cl = function( x ) { return "called:" & x; };
-
-outer = function()      { return cl( "v" ); };            // Variable 'cl' is undefined
-function reader()       { return cl( "n" ); }             // Variable 'cl' is undefined
-function scopedReader() { return variables.cl( "n" ); }   // Variable 'cl' is undefined
-```
-
-All three now resolve, as they always did on Lucee 7, including when the callee closure
-is declared *after* the function that calls it (the read happens at call time). So the
-very common "define helpers as closures at the top of a `.cfm`, use them lower down
-inside other functions" style works.
-
-The frame seed in `execute_function_body` skipped every `CfmlValue::Function` that
-carried a captured scope, reasoning that it was already reachable through
-`user_functions`. That is true of a *declared* function, but a function expression is
-registered under its synthetic `__closure_N` name rather than the variable it was
-assigned to, so it was simply dropped. Declared functions are still skipped, so a
-component with many methods does not re-seed them into every method frame.
-
-Carrying them exposed a second, opposite bug in `build_call_parent_scope`: its
-helper-function carve-out let a caller's OWN `var`-scoped function local past the
-caller-locals filter, which is dynamic scoping — Lucee reports `isDefined` false in the
-callee and throws on a bare call. It is now limited to the captured-scope-stripped
-values `closure_env_capture_value` produces (PR #198), which are genuinely unreachable
-otherwise. `tests/functions/test_page_function_vars.cfm` passes 13/13 on both engines.
-
-<a id="33"></a>
-
-## 33. Java `Object` methods on simple values ✅ *(fixed in v0.558.0)*
-
-Lucee boxes a CFML simple value as a Java object, so the `java.lang.Object` /
-`Comparable` methods are callable on it. RustCFML implemented them for `String` only;
-on every other receiver `equals`, `hashCode` and `compareTo` threw ("The function
-[equals] does not exist in the Numeric."). The methods were always missing — v0.549.0
-(§25) only made the gap loud by making unknown members throw instead of returning null.
-
-That cost **8 tests in TestBox's own suite**. `equalize()` compares numerics, arrays and
-structs itself and only falls through to `actual.equals( expected )` once the two have
-already differed — i.e. exactly the `isNotEqual` path — so a throw where Lucee returns
-`false` failed the assertion instead of passing it. TestBox's own suite is back to
-**410 pass / 0 fail / 0 error / 22 intentional skips**, its v0.493.0 baseline.
-
-`crates/cfml-vm/src/java_shims.rs` now carries Java-exact `java_equals` /
-`java_hash_code` / `java_compare_to`: type-strict equality with no CFML coercion (so
-`1.equals("1")` and `true.equals(1)` are both false, and a whole-number double is not an
-int), `Long`/`Double`/`Boolean`/`String` hashing, `java.util.List` hashing for `Array`,
-and `java.util.Map` hashing for `Struct` — the sum of per-entry `keyHash ^ valueHash`
-with keys hashed UPPER-cased, the casing Lucee's case-insensitive `Struct` stores them
-in, so `{a:1}.hashCode()` is 64 and not 96. Every value was read off Lucee 7.0.4 first;
-`Query` and `TimeSpan` are deliberately excluded rather than guessed, and components keep
-the Java IDENTITY semantics they already had (§25, ColdBox's `BaseProxy`).
-`tests/functions/test_java_object_methods.cfm` passes 48/48 on both engines.
-
-Two residual divergences, both deliberate: 🌟
-
-- **`compareTo` on mixed numerics compares numerically.** Lucee throws a raw JVM
-  `ClassCastException` ("class java.lang.Long cannot be cast to class java.lang.Double")
-  for `x = 1.5; x.compareTo( 2 )`, so this only affects inputs Lucee refuses outright.
-- **`hashCode` of a negative or large-magnitude integer literal differs**, because Lucee
-  boxes `-1` and `4294967296` as `Double`s while boxing `1` as a `Long`; RustCFML keeps
-  them integral. Each engine is self-consistent and Java-correct for its own boxing, so
-  only a hash compared *across* engines sees this.
-
-<a id="34"></a>
-
-## 34. `createUUID()` — random from the first call, and v4-shaped ✅ *(fixed in v0.558.0)*
-
-The first `createUUID()` in a process always returned a UUID whose first block was
-`00000000` (`00000000-CFC5-A584-879E7B7161971634`); every later call was random. So two
-processes that each generated exactly one could collide, and a caller using the leading
-block as a shard/prefix key got a hotspot. Separately, no UUID carried the RFC 4122
-version-4 nibble that Lucee's do, so nothing inspecting the version saw a v4 UUID.
-
-The zeroed block was a self-cancelling XOR, not weak entropy. `cfml_random()` lazily
-seeded from `now_unix_nanos()` and returned the raw seed as `(next >> 11) / 2^53`, so the
-first value of the stream multiplied by `u32::MAX` came out to exactly `nanos >> 32` —
-precisely the word `fn_create_uuid` XORed it against. Later calls were unaffected because
-`xorshift64` had already advanced the state off the clock.
-
-Seeding now mixes the clock through splitmix64, together with a per-thread distinguisher
-and a process-global counter so threads and processes starting inside the same tick still
-diverge, and advances once before first use. `createUUID` draws two full 64-bit words and
-stamps the version and variant bits, so its output is v4-shaped like Lucee's.
-`createUniqueID` shared the construction — its first four bytes collapsed the same way,
-showing up as a leading `AAAAA` — and now shares the generator. `randomize( seed )`
-reproducibility is untouched; only the lazy path changed.
-
-`tests/stdlib/test_uuid_shape.cfm` passes 14/14 on both engines. The
-first-call-in-a-process property cannot be observed from a suite that has already drawn
-from the PRNG, so it is pinned in `cfml-stdlib`'s `uuid_tests`, which spawns a fresh
-thread to get a fresh thread-local PRNG.
-
-One unrelated divergence this surfaced: `createUniqueID( "counter" )` advances on both
-engines but is **encoded** differently — Lucee base-36s the counter (`2q`, `2r`) where
-RustCFML emits decimal (`1`, `2`). 🌟
-
-<a id="35"></a>
-
-## 35. §29 type enforcement rejected two legitimate values ✅ *(fixed in v0.560.0)*
-
-Enforcing declared types (§29, v0.557.0) turned two long-standing internal
-representations into hard errors. Neither was a new bug — both had been invisible for
-as long as declared types were comments — and together they stopped **Preside booting**
-on the first release where a user actually ran an enforced build.
-
-**A self-typed method called from a pseudo-constructor.** A component's `this` carries
-the parser's `Anonymous` placeholder for as long as its pseudo-constructor body runs;
-the real name is stamped onto the finished instance afterwards. So a method declared to
-return its own type, *called from the pseudo-constructor*, returned an instance that
-could not name itself:
-
-```cfml
-component {
-    reset();                                      // called during construction
-    LogBoxConfig function reset() { return this; }
-}
-```
-
-→ `The function [reset] has an invalid return value , [Cannot cast Object type
-[Component Anonymous] to a value of type [LogBoxConfig]]`. That is ColdBox's
-`LogBoxConfig` verbatim. `getMetadata()` already compensated from the in-construction
-name stack (GH #212); the type checker now consults it too, and only for a value that
-cannot name itself — a component that *can* is matched normally, so an unrelated type
-still cannot slip through.
-
-**A query column against a simple declared type.** `q.col` is a `QueryColumn` — a proxy
-standing in for its current row's cell, not a collection. `isArray( q.col )` is false on
-Lucee 7 and here, and every scalar context (comparison, coercion, `Len`) already treated
-it as that one cell. The type checker was the one place that did not, so:
-
-```cfml
-string function getDbVersion() {
-    return versionRecord.version_hash;            // -> Object type [Array]
-}
-```
-
-was refused — Preside's `SqlSchemaVersioning.getDbVersion`. The checker now resolves a
-`QueryColumn` to the cell it proxies for every target except `array`, which keeps
-accepting the raw column exactly as before, so nothing that passed previously fails now.
-The mismatch *message* was wrong too: it named a `QueryColumn` "Object type [Array]", a
-type the value does not have. It is now named by the cell it stands for.
-
-Pinned in `tests/functions/test_pc_self_type.cfm` and
-`tests/types/test_querycolumn_declared_types.cfm` (11 assertions, green on both engines).
-
-The lesson for the remaining §29 surface: type enforcement is only as correct as the
-engine's internal value model is honest, and an internal representation that *behaves*
-like a scalar everywhere else has to satisfy a scalar declaration too. A representation
-that leaks through the checker will present as a Lucee incompatibility even though the
-declaration is being read correctly.
-
-<a id="36"></a>
-
-## 36. Built-in scope names are reserved for a bare read ✅ *(fixed in v0.561.0, GH [#312](https://github.com/RustCFML/RustCFML/issues/312))*
-
-A bare read of a built-in scope name inside a function resolved to a same-named
-parameter or `var` local instead of the scope. On Lucee 7 the scope names are **fully
-reserved**: bare `request` is always the request scope, and the shadowing value is
-reachable only through its explicit qualifier (`arguments.request`). Verified uniform
-across `request`, `cookie`, `url`, `form`, `cgi`, `session`, `application`, `server`
-and `variables`, and for a `var` / `local.` declaration as well as a parameter — there
-is no per-scope exception.
-
-This was an **ACF-vs-Lucee fork where RustCFML had taken the ACF route**, and it left
-two internal resolvers contradicting each other, which is worse than either answer:
-
-```cfml
-request.wheels = { tenant = { id = "FROM-SCOPE" } };
-
-function handler( required struct request ) {          // shadows the request scope
-    isDefined( "request.wheels.tenant" )              // true   — answered from the SCOPE
-    request.wheels.tenant.id                          // THROWS — answered from the ARGUMENT
-}
-```
-
-So a correctly guarded read still blew up. That is the Wheels middleware pipeline
-exactly — it hands core handlers a `required struct request` — and it accounted for
-**all 7** remaining non-passing Wheels specs (5 × `Variable 'tenant' is undefined`,
-2 × a cleanup `StructDelete` operating on the wrong object). Wheels is now **2740 pass
-/ 0 fail / 0 error**.
-
-Two things the fix had to keep intact:
-
-- **§256's `arguments.<name>` behaviour.** That issue — an omitted defaulted parameter
-  binding the live scope instead of its default — is a *different* path, and both
-  engines already agreed on it. Its store-side half stays too: `var cookie = …` writes
-  to `local`, never into the live scope, which is also what Lucee does. Note §256's
-  stated premise ("a scope name has no special meaning in a parameter list") is only
-  half true for Lucee 7 — true for `arguments.<name>`, false for a bare read. The
-  reporter was describing ACF, which is how the wrong fork got taken.
-- **The default-argument preamble.** Codegen seeded `arguments.<name>` from an applied
-  default by storing the value and then reading it back with `LoadLocal(param.name)`.
-  Once a bare scope name resolved to the scope, that read-back handed
-  `arguments.cookie` the live cookie scope. Now the freshly-evaluated value is kept on
-  the stack (`Dup`/`Swap`) instead of being re-read — fixed at all three sites that
-  emit the preamble (declared functions, closures, arrow functions).
-
-`tests/core/test_scope_named_default_param.cfm` was rewritten: it had asserted the ACF
-behaviour, and it **passed here while erroring on Lucee 7** (`Can't cast Complex Object
-Type [COOKIE scope] to String`). It now covers both rules and passes 33/33 on both
-engines — a test that fails on the reference engine being the clearest possible signal
-that the wrong fork was taken.
-
-<a id="37"></a>
-
-## 37. A non-SELECT statement returns an empty query ✅ *(fixed in v0.562.0)*
-
-`queryExecute()` on an INSERT / UPDATE / DELETE returned the **mutation-metadata
-struct** (`{recordCount, cached, sql, executionTime [, generatedKey]}`) as its value.
-Lucee returns an **empty query** — verified on Lucee 7.0.4 over MySQL, where all three
-statement kinds hand back `QUERY(recordCount=0)` and the affected-row count and
-generated key are exposed *only* through the `result=` struct.
-
-So a `query`-declared function wrapping a mutation failed §29 type enforcement:
-
-```cfml
-private query function _deleteSessionRecord( required string sessionId ) {
-    return sqlRunner.runSql(
-          sql = "delete from psys_session_storage where id = :id"
-        , dsn = _getSessionStorageDsn()
-        , params = [ { type="cf_sql_varchar", value=arguments.sessionId, name="id" } ]
-    );
-}
-```
-
-→ `The function [_deleteSessionRecord] has an invalid return value , [Cannot cast Object
-type [Struct] to a value of type [query]]`. That is Preside's `SessionStorage`, and it
-broke the admin route — the third §29 casualty after §35's two, and the same root shape:
-an internal representation that no declaration had ever been able to see.
-
-The conversion happens at the `queryExecute` return boundary rather than in the four
-drivers, because that struct is the internal carrier the `result=` / `name=` delivery
-reads `recordCount` and `generatedKey` out of — it has to survive until those are built.
-A `returntype="struct"` SELECT is also a struct and is deliberately *not* caught: the
-discriminator is the `executionTime` + `recordCount` + `cached` triple, which only the
-mutation metadata carries.
-
-`result=` is unchanged and still reports rows affected, which
-`tests/database/test_dml_returns_empty_query.cfm` pins alongside the return shapes
-(16 assertions). It runs on SQLite so no server is needed; Lucee ships no SQLite JDBC
-driver, so it skips there with a single informational pass rather than spraying false
-reds — the cross-engine evidence was taken on MySQL, where the two engines agree
-exactly, including `result.recordCount`.
-
----
-
-*This list is not exhaustive — it captures gaps identified to date. A periodic audit
-sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
-ignored tag attributes) should refresh it. The most recent such sweep was 2026-08-02;
-its findings have been merged into the sections above, and everything it identified as
-already-fixed or since-fixed (v0.549.0–v0.551.0) has been dropped rather than carried
-forward.*
-
-**Last re-probe: 2026-08-04 (v0.557.0)** — §2, §3 and §4 re-verified against the code
-and all rows still hold (`maxConcurrentRequests`, `http2`, `trustedCache`,
-`showExecutionTime`, `connectionLimit`, `idleTimeout`, `evictionPolicy` and
-`loggers[].appender` have no consumer outside the schema; the SMTP transport sets port
-and credentials but never a timeout; `security_flags()` is still a process-wide
-`OnceLock`; `onCFCRequest` is attached as a lifecycle name and never dispatched). Four
-corrections came out of it: §19 had been fixed for 117 releases (moved to Part F),
-`setTimeZone()` and `fileUpload()`/`fileUploadAll()` are no longer no-ops, and
-`writeDump(output="<path>")` writes the file (all three rows corrected or dropped from
-§7). One previously undocumented no-op was added to §3 — nothing enforces a request
-timeout by any route.
-
-> A caution learned from that sweep: an audit's "what Lucee does" column is a claim, not
-> a fact. Three of its entries were wrong (`System.arraycopy` — Lucee throws
-> `ArrayStoreException` rather than copying, because a CFML array is not a Java array;
-> `Optional.orElseGet` and `Files.write` — Lucee cannot express either call with CFML
-> types), and its largest section described work that had already shipped. Probe the
-> reference engine before acting on a compatibility claim.
----
-
-## 42. `duplicate( x, false )` deep-copied instead of shallow-copying ✅ *(fixed in v0.596.0)*
-
-`duplicate()` read only its first argument and always deep-copied, silently
-discarding the `deepCopy` flag. Code that deliberately asked for a cheap
-one-level copy got a full recursive clone of the whole object graph.
-
-Reference behaviour captured from **Lucee 7.0.4.34** over HTTP. The signature is
-`duplicate( object, deepCopy )`; the default is `true`; 0 or 3 arguments are
-**compile-time** errors, so the second parameter is genuinely declared with a max
-arity of 2. The `false` rule is uniform: **only the top-level container is
-copied, and everything inside it is shared by reference.** Every nested case was
-wrong here — struct, array, query, component, three levels down, and the
-string-truthy form `duplicate( s, "no" )`.
-
-Two things worth recording because they contradict the intuitive reading:
-
-- Lucee's **deep** `duplicate()` really does clone a nested *component* — so a
-  nested component is not a reference boundary on the deep path either. Our
-  existing deep behaviour was already correct and was left untouched.
-- `struct.duplicate()` as a member function did not exist at all here, raising
-  "Variable 'duplicate' is undefined" where Lucee returns a copy. Registered
-  alongside the existing `copy` → `structCopy` mapping.
-
-Covered by `tests/stdlib/test_duplicate_deepcopy_flag.cfm` (26 assertions, green
-on both engines) with fixture `tests/core/DuplicateFlagFixture.cfc`. Surplus-argument
-tolerance is **not** fixed — see §47.
-
-## 43. `getComponentMetaData( "dotted.path" )` was recomputed on every call ✅ *(fixed in v0.596.0)*
-
-The instance form `getMetaData( obj )` was blueprint-cached, but the path-string
-form was rebuilt from scratch every time: `resolve_component_template`
-re-executed the component's pseudo-constructor and deep-copied the resulting
-template, and `build_inheritance_metadata` re-resolved **once per inheritance
-level** while each level separately re-resolved its own parent — roughly D²
-pseudo-constructor executions for depth D.
-
-It surfaced through WireBox, whose `Mapping.cfc` uses the path-string form while
-ColdBox's own metadata cache defaults to off (`ioc/config/Binder.cfc` sets
-`metadataCache = ''`). One Preside admin request spent 21.1 ms across just 14
-calls to `Util.getInheritedMetaData()` — 1.5 ms each.
-
-Fixed with two request-scoped memos keyed on
-`(name, source context, base template path, mappings fingerprint)`, mirroring the
-existing `component_blueprints` scoping so an edited CFC is still picked up on the
-next request. Measured on a depth-3 chain, 200 calls: **0.185 ms → 0.0075 ms per
-call**, and `resolve_component calls` per request **2,803 → 17**. Genuine
-first-time filesystem work is untouched — `candidate probe walks` stayed at 5.
-
-Two notes for anyone extending this:
-
-- The memo key is **case-sensitive on purpose.** `component_leaf_metadata` falls
-  back to the name *as written* for `name`/`fullname`, so a lowercased key made
-  `getComponentMetaData( "OOP.X" )` and `getComponentMetaData( "oop.X" )` return
-  the same casing — a real regression, caught by diffing against a baseline build.
-- The shadow check that disables the memo when a local shadows the name is an
-  **exact** lookup, matching `resolve_component_template`'s own locals probe. If
-  that probe is ever made case-insensitive, this check must change in lockstep.
-
-Covered by `tests/oop/test_gcm_path_metadata_cache.cfm` and
-`crates/cfml-vm/tests/component_metadata_freshness.rs` (cross-request freshness
-and per-call independence), plus a live check that editing a CFC on disk is
-reflected on the next request in a running server.
-
-## 44. A miscased built-in name cost an O(n) scan of every built-in ✅ *(fixed in v0.596.0)*
-
-CFML is case-insensitive, but calling a built-in with a casing other than its
-registry spelling fell into a linear scan and cost **236–692 ns per call** — more
-than the entire cost of the call.
-
-The registry is keyed lowerCamel (only 2 of ~730 keys start uppercase), while
-large real codebases write UpperCamel: `Len`, `StructKeyExists`, `ReReplace`,
-`Duplicate`, `ListLast`. On a live Preside site **32% of all built-in lookups
-were miscased** — 533,183 of 1,684,616 during boot, and 1,410 of 4,427 on a warm
-homepage request.
-
-The actual cost site is worth recording, because the obvious suspect was wrong.
-A bare call compiles to `LoadGlobal(name)` + `Call`, and page scope is seeded with
-a first-class value for **every** built-in under its registry spelling. A miscased
-call therefore missed the exact `globals` probe and was answered by the
-case-insensitive linear scan of `globals` — over ~730 built-ins plus every page
-variable — never reaching the later builtin-resolution fallback at all. Telltale
-symptom: the penalty varied wildly between processes for the same function
-(`trim` +236 ns in one run, +636 ns in another), because the registry is a std
-`HashMap` whose iteration order — and hence each name's scan position — is
-randomised per process.
-
-Fixed by promoting the existing `builtin_names_lc` set to a
-`HashMap<lowercased, (canonical, fn ptr, ambiguous)>` maintained by
-`refresh_builtin_index`, plus a parallel `user_fn_lc` index, and resolving the
-canonical spelling in O(1) before probing. Measured penalty per call, PGO build
-vs PGO baseline: `len` 607→14 ns, `trim` 158→11 ns, `listLast` 584→9 ns,
-`structKeyExists` 443→16 ns, `reReplace` 437→10 ns. Registry-cased calls are
-unchanged.
-
-Notes:
-
-- The registry contains one genuine case-duplicate pair, `getContextRoot` /
-  `GetContextRoot`. Both map to the same implementation, so the duplication is
-  harmless, but only that lowercased slot keeps an exact-match-first probe.
-- The `globals` shortcut assumes built-ins are seeded into `globals` before any
-  page variable exists, so the canonical key is the earliest case-insensitively
-  matching entry. True for every in-tree embedder; it is an ordering assumption
-  rather than a mechanical guarantee.
-- Eliminating the per-call `to_lowercase()` was tried, measured **slower**, and
-  reverted — see §46.
-
-Covered by `tests/functions/test_builtin_name_ci_index.cfm` (+31 assertions:
-lowerCamel/UpperCamel/ALLCAPS/mixed for the measured functions, the VM-intercepted
-`duplicate` path, nested miscased calls, and UDF-vs-builtin precedence) and
-`crates/cfml-vm/tests/builtin_name_casing.rs` (5 tests, including native
-`register_native_fn` resolution in any casing and the unarmed-index fallback
-agreeing with the armed index). New counters `builtin CI lookups` /
-`miscased (CI fallback)` / `index-stale O(n) scans` are reported under
-`RUSTCFML_COUNTERS=1`.
+<a id="49"></a>
 
 ## 49. `fileOpen( f, "write" )` does not create the file 🏗
 
@@ -1993,6 +1084,8 @@ intercepted creator to test — it is not a creator here at all. Untouched by th
 work; the existence cache is correct either way, since it never caches an answer
 the filesystem does not agree with. Fixing it means giving handles a real
 create-on-open, which also wants `fileClose()` to stop being a stub.
+
+<a id="50"></a>
 
 ## 50. AntiSamy sanitiser: cosmetic divergences from the Java library 🏗
 
@@ -2029,3 +1122,26 @@ Also worth knowing: `<tags-to-encode>` tags are **unwrapped, not encoded** —
 `<g>x</g>` becomes `x`. That reads backwards against the section name, but it is
 what the 1.5.3 jar does (measured across `<g>a</g>b`, `x<g>y`, `<g/>` and a
 nested case), and matching the library beats matching the label.
+
+---
+
+# Part E — Environment-specific 🌍
+
+Restrictions that apply only on a particular target (wasm, CLI vs serve).
+
+<a id="8"></a>
+
+## 8. Environment-specific 🌍
+
+| Feature | Restriction |
+|---|---|
+| `<cfdirectory>` | Not supported on `wasm32` (no filesystem). |
+| `<cfzip>` | Not supported on `wasm32`. |
+| `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
+| `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
+| `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
+| `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads since v0.572.0 (GitHub #314): `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
+| `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
+
+---
+

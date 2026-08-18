@@ -4650,7 +4650,7 @@ impl Parser {
 
             // A type may also be a typed-array annotation — `string[] names`,
             // `pkg.Widget[][] grid` (Lucee validates such a parameter
-            // element-by-element; see docs/known-issues.md §29). Consume any
+            // element-by-element; see the v0.557.0 type rules). Consume any
             // run of `[]` pairs directly after the first word and keep them on
             // the type string; the name still follows.
             let mut first = first;
