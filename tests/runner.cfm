@@ -101,6 +101,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_arg_ref_writeback_deferred.cfm">
 <cf_runtest file="core/test_arrow_functions.cfm">
 <cf_runtest file="core/test_comma_less_params.cfm">
+<cf_runtest file="core/test_elvis_error_scope.cfm">
 <cf_runtest file="core/test_required_param_with_default.cfm">
 <cf_runtest file="core/test_self_named_default_arg.cfm">
 <cf_runtest file="core/test_member_index_incdec.cfm">
@@ -501,6 +502,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_customtag_path_deep_search.cfm">
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
 <cf_runtest file="tags/test_tags_cfexecute.cfm">
+<cf_runtest file="tags/test_cfexecute_argument_quoting.cfm">
 <cf_runtest file="tags/test_tags_cfmail.cfm">
 <cf_runtest file="tags/test_tags_cfcache.cfm">
 <cf_runtest file="tags/test_tags_cfstoredproc.cfm">
@@ -544,6 +546,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfquery_escaped_hash_interpolation.cfm">
 <cf_runtest file="tags/test_cfquery_sql_line_comments.cfm">
 <cf_runtest file="tags/test_cfquery_cfml_comments.cfm">
+<cf_runtest file="tags/test_cfqueryparam_list_array_value.cfm">
 <cf_runtest file="tags/test_cte_with_query.cfm">
 <cf_runtest file="tags/test_tags_cfquery_control_tags.cfm">
 <cf_runtest file="tags/test_cfquery_result_delivery.cfm">
