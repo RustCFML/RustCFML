@@ -984,6 +984,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_quotes.cfm">
+<cf_runtest file="tags/test_tag_unquoted_attr_literal.cfm">
 <!--- - cfargument_hash_struct_default: an UNQUOTED hash-wrapped tag --->
 <!--- attribute may hold a STRUCT LITERAL (default=#{ "type": "json_object" }#); --->
 <!--- Lucee evaluates it as the argument default. RustCFML rejects it at --->

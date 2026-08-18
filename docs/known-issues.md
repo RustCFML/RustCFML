@@ -80,7 +80,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [48](#48) | Elvis operator accepts any left operand (Lucee restricts it) | 🏗 edges |
 | [49](#49) | `fileOpen( f, "write" )` does not create the file | 🏗 edges |
 | [50](#50) | AntiSamy sanitiser — cosmetic divergences from the Java library | 🏗 edges |
-| [51](#51) | Tag-mode `>` ends a tag unless bracketed or part of `=>` | 🏗 edges |
+| [51](#51) | Tag-mode parsing — two constructs compile here that Lucee rejects | 🏗 edges |
 
 **Part E — Environment-specific 🌍**
 
@@ -865,31 +865,63 @@ behave as `en_US`. Extend the table rather than letting a caller's locale be dro
 
 <a id="51"></a>
 
-## 51. Tag-mode expressions: `>` ends a tag unless it is bracketed or part of `=>` 🏗
+## 51. Tag-mode parsing: two constructs compile here that Lucee rejects 🏗
+
+### 51a. Bracketed comparisons in tag mode
 
 A tag ends at the first `>` that is not inside a string, a CFML comment, or a
-bracketed sub-expression. That last clause exists because tag-mode expressions
-legitimately contain `>`:
+bracketed sub-expression. Lucee has no such bracket clause: in tag mode a bare
+`>` terminates the construct unconditionally, in an attribute *and* inside
+`#…#`, so a parenthesised comparison is a **compile error** there.
 
-```cfml
-<cfset total = arr.reduce((s, r) => s + r.count, 0)>   <!--- arrow, inside reduce( --->
-<cfset f     = (a) => a * 2>                           <!--- arrow, at top level --->
-```
+| tag-mode source | Lucee 7.0.4 | RustCFML |
+|---|---|---|
+| `<cfset big = a GT b>` | `true` | `true` |
+| `<cfset big = a > b>` | tag ends at `>`; `big = a`, ` b>` emitted as text | identical |
+| `<cfif a > b>YES</cfif>` | tag ends at `>`; ` b>` emitted, then `YES` | identical |
+| `<cfif cond>=5</cfif>` | outputs `=5` | identical |
+| `<cfset f = (x) => x * 2>` | ok | ok |
+| `<cfset t = arr.reduce((s, r) => s + r, 0)>` | ok | ok |
+| `<cfset big = (a > b)>` | **compile error** — `Invalid Syntax Closing [)] not found` | `true` |
+| `#(a > b)#` in a tag-mode body | **compile error**, same message | `true` |
 
-The scanner therefore ignores a `>` while any `(`/`[` is open, and ignores a
-literal `=>` anywhere (guarded so `>=`, `==>`, `!=>` and `<=>` are unaffected).
+So everything about the bare-`>` rule is shared with Lucee — including the
+`<cfif cond>=5</cfif>` resolution, where the tag still ends at `>` and `=5` is
+body text. Only the bracket clause is ours. The scanner ignores a `>` while any
+`(`/`[` is open, and ignores a literal `=>` anywhere (guarded so `>=`, `==>`,
+`!=>` and `<=>` are unaffected); the arrow handling matches Lucee, the
+bracketing does not.
 
-**The residual edge:** an *unquoted* attribute value whose last character is a
-bare `=`, immediately followed by the tag's `>`, is read as an arrow and the tag
-does not end there — e.g. `<cfhttp url=http://example.com/?a=>`. Quote the value
-(`url="http://example.com/?a="`), which is what every style guide asks for
-anyway. The reverse spelling is genuinely ambiguous and is resolved the other
-way: `<cfif cond>=5</cfif>` still outputs `=5`, because only `=` *before* `>`
-counts as an arrow.
+The consequence is one-directional and benign, like §48: tag-mode source written
+for Lucee always compiles here, but source written here may not compile on
+Lucee. **Write `<cfset big = a GT b>`** — the word operator is the only spelling
+both engines accept. Do not reach for brackets to disambiguate a tag-mode `>`;
+that is RustCFML-only.
 
-A `>` comparison at the top level of a tag expression still needs bracketing or
-the word operator — `<cfset big = (a > b)>` or `<cfset big = a GT b>`. Bare
-`<cfset big = a > b>` ends at the comparison, as it always has.
+### 51b. `#`, `"` or `'` inside an *unquoted* attribute value
+
+An unquoted tag attribute value is a literal string on both engines, terminated
+by whitespace, `>` or `/>` — `<cfparam name="z" default=a.b>` yields the three
+characters `a.b`, not a read of `a.b`. Lucee then makes a `#`, `"` or `'`
+*inside* such a value a hard compile error (`Simple attribute value can't
+contain [#]`); we accept it, interpolating `#…#` and quoting the rest:
+
+| unquoted attribute | Lucee 7.0.4 | RustCFML |
+|---|---|---|
+| `<cfparam name="z" default=a.b>` | `z = "a.b"` | `z = "a.b"` |
+| `<cfparam name="z" default=http://x/?a=>` | `z = "http://x/?a="` | same |
+| `<cfparam name="z" default=#a.b#>` | one whole `#…#` is an expression | same |
+| `<cfparam name="z" default=x#a.b#y>` | **compile error** | interpolates → `xSURPRISEy` |
+| `<cfparam name="z" default=len('ab')>` | **compile error** | literal `len('ab')` |
+
+Same one-directional shape as 51a: source written for Lucee always compiles
+here, source written here may not compile there. **Quote any attribute value
+that contains a `#` or a quote** — `default="x#a.b#y"` — which is portable.
+
+Covered by `tests/tags/test_tag_unquoted_attr_literal.cfm`, which is green on
+both engines.
+
+Measured against Lucee 7.0.4.34 (2026-08-18).
 
 <a id="41"></a>
 

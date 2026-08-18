@@ -2930,31 +2930,31 @@ fn decode_attr_escapes(raw: &str, quote: char) -> String {
 }
 
 /// Format an attribute value for emission inside a script struct literal.
-/// If the value came from a quoted attribute (e.g. `value="caller-ok"`), emit
-/// a proper script string literal, expanding `#expr#` segments to `&` concat.
-/// If it came from an unquoted attribute (e.g. `value=someExpr`), fall back to
-/// the legacy expression-or-literal heuristic in `quote_if_needed`.
+///
+/// A tag attribute value is a STRING, quoted or not — `#expr#` is the only way
+/// to make it dynamic. `<cfparam name="z" default=a.b>` yields the six
+/// characters `a.b`, not a lookup of `a.b` (GH #331, was known-issues §52).
+/// Lucee's transformer says exactly this: `attributeValue` →
+/// `transformAsString` tries, in order, a quoted string, then ONE whole `#…#`
+/// (`sharp()`), then `simple()` — a literal run terminated by whitespace, `>`
+/// or `/>`. It never reaches the expression parser. So both branches below are
+/// the same rule; only the paren-wrapping of a bare `#expr#` differs, because
+/// an unquoted value is emitted into contexts where precedence could leak.
+///
+/// We are deliberately a superset in one place: Lucee makes a `#`, `"` or `'`
+/// *inside* an unquoted value a compile error ("Simple attribute value can't
+/// contain [#]"), where we interpolate/quote it. That direction can only accept
+/// source Lucee rejects — it can never produce a different value.
 fn format_attr_value(raw: &str, was_quoted: bool) -> String {
-    if !was_quoted {
-        // An UNQUOTED value that is exactly one `#expr#` is an expression, and
-        // must keep its native type — `<cfargument default=#{ "a": 1 }#>` is a
-        // struct, not the string "{ \"a\": 1 }". `strip_hashes` +
-        // `quote_if_needed` used to quote it, so the argument arrived as text and
-        // any member access off it read empty. Same rule the quoted branch
-        // already applies below; parenthesised so precedence cannot leak.
-        if let Some(inner) = single_hash_expr(raw) {
-            return format!("({})", inner);
-        }
-        return quote_if_needed(&strip_hashes(raw));
-    }
     // Pure `#expr#` (whole value is one expression) — preserve native type
     // rather than coercing through string concat. Custom-tag attrs in
     // particular need this so attributeCollection="#someStruct#" arrives as
-    // a struct, not its stringified form.
+    // a struct, not its stringified form, and `<cfargument default=#{ "a": 1 }#>`
+    // is a struct rather than the string `{ "a": 1 }`.
     if let Some(inner) = single_hash_expr(raw) {
-        return inner;
+        return if was_quoted { inner } else { format!("({})", inner) };
     }
-    // Quoted attribute. Split into literal segments and `#...#` expressions.
+    // Split into literal segments and `#...#` expressions.
     let chars: Vec<char> = raw.chars().collect();
     let len = chars.len();
     let mut parts: Vec<String> = Vec::new();
@@ -3105,39 +3105,12 @@ fn escape_literal_segment(s: &str) -> String {
     s.replace('"', "\"\"").replace('#', "##")
 }
 
-/// Quote a string value if it's not already a number, boolean, expression, or quoted
-fn quote_if_needed(s: &str) -> String {
-    let s = s.trim();
-    // Already quoted
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        return s.to_string();
-    }
-    // Number
-    if s.parse::<f64>().is_ok() {
-        return s.to_string();
-    }
-    // Boolean/null keywords
-    let lower = s.to_lowercase();
-    if lower == "true" || lower == "false" || lower == "null" || lower == "yes" || lower == "no" {
-        return s.to_string();
-    }
-    // Contains operators or function calls - looks like an expression
-    // But paths like "/foo/bar.cfm" should still be quoted.
-    // Distinguish: if it starts with "/" and looks like a file path, quote it.
-    let looks_like_path = s.starts_with('/') && !s.contains('(')
-        && (s.contains('.') && s.split('/').all(|seg| seg.is_empty() || seg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')));
-    if looks_like_path {
-        return format!("\"{}\"", escape_for_string_literal(s));
-    }
-    if s.contains('(') || s.contains('+') || s.contains('-') || s.contains('*')
-        || s.contains('/') || s.contains('&') || s.contains('.') || s.contains('[')
-    {
-        return s.to_string();
-    }
-    // Otherwise, quote it. Embedded quotes are doubled (CFML escape), not
-    // backslash-escaped — the script lexer ends a string at a lone `"`.
-    format!("\"{}\"", escape_for_string_literal(s))
-}
+// NOTE: the old `quote_if_needed` expression-or-literal heuristic lived here.
+// It guessed whether an UNQUOTED attribute value was an expression by looking
+// for `(`, `.`, `/`, `[`, arithmetic operators etc., which is how
+// `default=a.b` silently became a variable read (GH #331). Tag attribute values
+// are always strings — `format_attr_value` now applies that rule uniformly, so
+// nothing needs to guess.
 
 fn strip_hashes(s: &str) -> String {
     let s = s.trim();
