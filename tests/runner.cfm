@@ -280,6 +280,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_xml.cfm">
 <cf_runtest file="stdlib/test_utility.cfm">
 <cf_runtest file="stdlib/test_encoding_functions.cfm">
+<cf_runtest file="stdlib/test_binarydecode_excess_padding.cfm">
 <cf_runtest file="stdlib/test_query_mutations.cfm">
 <cf_runtest file="stdlib/test_query_new_empty_addcolumn_metadata.cfm">
 <cf_runtest file="database/test_lucee_query_builder.cfm">
@@ -640,6 +641,8 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
 <cf_runtest file="java_shims/test_optional.cfm">
 <cf_runtest file="java_shims/test_masa_io_text_shims.cfm">
+<cf_runtest file="java_shims/test_java_date_shim_date_bifs.cfm">
+<cf_runtest file="java_shims/test_java_util_base64.cfm">
 
 <!--- --- Engine Compatibility --- --->
 <cf_runtest file="compat_engine/test_math_functions.cfm">
