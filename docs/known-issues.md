@@ -88,23 +88,6 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 |---|---|---|
 | [8](#8) | wasm / CLI restrictions | 🌍 |
 
-### Is it getting better?
-
-Yes. Resolved entries are **deleted** rather than archived here, so this document does not
-show the trend — `git log docs/known-issues.md` and the tagged release commits do. Between
-v0.440.0 and v0.607.0, eighteen sections were closed and removed, most of them from the
-silent (🔇) class, which is the one that matters: Part B is down to a single section.
-
-Two honest caveats, so the direction isn't oversold:
-
-- **New sections are usually old bugs being *found*, not new breakage.** Several past
-  entries were discovered while implementing an unrelated one, verified as pre-existing
-  against an earlier binary, and only then fixed. Doing the work is what surfaces them, so
-  expect this list to keep growing at the same time as it shrinks.
-- **Stale entries flatter the list.** One section sat here for ~117 releases after being
-  fixed, because nobody removed it when the issue closed. If an entry contradicts a
-  workload you know runs, **re-probe it before believing it** — and if it is fixed, delete
-  it.
 
 ---
 
@@ -123,12 +106,8 @@ Read today: `this.name`, `this.mappings`, `this.sessionManagement`, `this.sessio
 `this.sessioncookie` (secure/httponly/samesite/domain/path — see §12e),
 `this.timezone`, `this.locale`.
 
-`this.timezone` and `this.locale` were fixed in **v0.559.0** — they had been parsed
-into the application's settings struct and read by nothing, so
-`getApplicationSettings()` reported the declared value while every date and every
-`ls*` number stayed on the SERVER's zone and locale. Both now seed the same request
-state the cfconfig `runtime.*` keys use; Application.cfc overrides the server
-baseline, and `setTimeZone()`/`setLocale()` still override Application.cfc later in
+`this.timezone` and `this.locale` seed the same request state the cfconfig
+`runtime.*` keys use; Application.cfc overrides the server baseline, and `setTimeZone()`/`setLocale()` still override Application.cfc later in
 the request. An unusable id is ignored rather than fatal, which is Lucee's verified
 behaviour. Pinned in `tests/lifecycle/test_application_timezone_locale.cfm`
 (12 assertions, green on both engines).
@@ -138,10 +117,10 @@ Accepted but **ignored** (no error, no effect):
 | Setting | Notes |
 |---|---|
 
-| `this.applicationTimeout` | Per-app value ignored — **and so is the cfconfig `runtime.applicationTimeout`**. The key parses and is seeded into thread contexts, but nothing ever reads it: applications do not time out. (This row previously claimed the cfconfig key "IS applied". It never was.) |
+| `this.applicationTimeout` | Per-app value ignored — **and so is the cfconfig `runtime.applicationTimeout`**. The key parses and is seeded into thread contexts, but nothing ever reads it: applications do not time out. |
 | `this.scriptProtect` | No script-protection filtering of scopes. |
 | `this.secureJSON` / `this.secureJSONPrefix` | Per-app value ignored. cfconfig `security.secureJSON*` IS applied (process-global — see §4). |
-| `this.nullSupport` / `this.enableNullSupport` | Per-app value ignored — **and so is the cfconfig `runtime.nullSupport`**. The key parses and is seeded into thread contexts but has no consumer; with `"nullSupport": true` an unset variable still throws `expression` rather than returning null. (This row previously claimed the cfconfig key "IS applied". It never was.) |
+| `this.nullSupport` / `this.enableNullSupport` | Per-app value ignored — **and so is the cfconfig `runtime.nullSupport`**. The key parses and is seeded into thread contexts but has no consumer; with `"nullSupport": true` an unset variable still throws `expression` rather than returning null. |
 | `this.clientManagement`, `this.setClientCookies`, `this.setDomainCookies`, `this.clientStorage` | The **client scope is not implemented** at all. |
 | `this.invokeImplicitAccessor` | Ignored. |
 | `this.serialization`, `this.javaSettings`, `this.compileExtForCFCDirectory`, `this.blockedExtForFileUpload`, `this.triggerDataMember`, `this.sameFormFieldsAsArray`, `this.searchImplicitScopes`, `this.proxyServer`, `this.smtpServerSettings` | No references in the engine — accepted into the component, never consulted. |
@@ -156,9 +135,9 @@ never read — so nothing throws, but nothing happens either.
 | Method | Status |
 |---|---|
 | `onApplicationStart`, `onApplicationEnd`, `onRequestStart`, `onRequest`, `onRequestEnd`, `onSessionStart`, `onSessionEnd` | ✅ invoked |
-| `onError` | ✅ invoked. An uncaught exception in the target page / `onRequest` / `onRequestStart` is handed to `onError(exception, eventName)` (`eventName` is `""` for a target-page error, otherwise the running event method). If `onError` returns normally it owns the response (the engine's default error page is suppressed); if absent the error surfaces as the default error page. When `onError` handles an error, `onRequestEnd` is skipped. *(fixed v0.173.0, issue #145)* |
-| `onMissingTemplate` | ✅ invoked (serve mode). A request for a `.cfm`/`.cfc` template that doesn't exist on disk calls `onMissingTemplate(targetPage)` (`targetPage` is the web-root-relative requested path) after `onApplicationStart`/`onSessionStart`. Returning `true` (or nothing) handles the request and suppresses the default 404; returning `false` — or having no handler — falls through to the default 404. `onRequestStart`/`onRequest`/`onRequestEnd` are skipped (Adobe semantics). A throw inside the handler routes to `onError`. Non-CFML 404s (`.html`, images, directory requests) bypass the engine and never reach the handler. The cfconfig front-controller `fallback` remains available as an alternative. *(fixed v0.183.0)* |
-| `onAbort` | ✅ invoked on `<cfabort>` / `abort` — fired in place of `onRequestEnd`. `<cfabort showError="msg">` is a *catchable* error and is routed to `onError` instead (Adobe/Lucee parity), not `onAbort`. *(fixed v0.173.0)* |
+| `onError` | ✅ invoked. An uncaught exception in the target page / `onRequest` / `onRequestStart` is handed to `onError(exception, eventName)` (`eventName` is `""` for a target-page error, otherwise the running event method). If `onError` returns normally it owns the response (the engine's default error page is suppressed); if absent the error surfaces as the default error page. When `onError` handles an error, `onRequestEnd` is skipped. |
+| `onMissingTemplate` | ✅ invoked (serve mode). A request for a `.cfm`/`.cfc` template that doesn't exist on disk calls `onMissingTemplate(targetPage)` (`targetPage` is the web-root-relative requested path) after `onApplicationStart`/`onSessionStart`. Returning `true` (or nothing) handles the request and suppresses the default 404; returning `false` — or having no handler — falls through to the default 404. `onRequestStart`/`onRequest`/`onRequestEnd` are skipped (Adobe semantics). A throw inside the handler routes to `onError`. Non-CFML 404s (`.html`, images, directory requests) bypass the engine and never reach the handler. The cfconfig front-controller `fallback` remains available as an alternative. |
+| `onAbort` | ✅ invoked on `<cfabort>` / `abort` — fired in place of `onRequestEnd`. `<cfabort showError="msg">` is a *catchable* error and is routed to `onError` instead (Adobe/Lucee parity), not `onAbort`. |
 | `onCFCRequest` | 🔇 Not invoked (no CFC-over-HTTP / remote method dispatch). |
 
 <a id="3"></a>
@@ -173,16 +152,14 @@ These deserialize without error but have no runtime effect:
 | `server.http2` | Not wired to the HTTP server. |
 | `runtime.trustedCache` | Reserved; bytecode-cache trust is driven by `--production`, not this key. |
 | `debugging.showExecutionTime` | No timing output. |
-| `datasources[].connectionLimit` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. (`connectionTimeout` **is** applied — it reaches the pool builder — so it is no longer listed here.) |
+| `datasources[].connectionLimit` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. (`connectionTimeout` **is** applied — it reaches the pool builder.) |
 | `mailServers[].timeout` | Carried but not applied during send. |
 | `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | Region **defaults** not applied: a cache has no capacity bound and no eviction policy, and an entry stored with no explicit TTL never expires. A per-entry TTL — `cachePut( id, value, timespan )` — **is** honoured and does expire the entry, so this is narrower than it reads: it bites code that relies on the region's `defaultTimeout`/`maxObjects` instead of passing a TTL per put. |
 | `logging.format` | Only `"text"`; other values warn and fall back. |
 | `logging.loggers[].appender` | Logger name used; appender ignored. |
 
-**`server.requestTimeout` is enforced as of v0.559.0.** It, `<cfsetting
-requestTimeout=N>` and `getPageContext().setRequestTimeout()` all stored a value that
-nothing ever compared elapsed time against, so no request was ever aborted — a page
-that raised its own timeout expecting protection had none. An overrunning request now
+**`server.requestTimeout` is enforced.** It, `<cfsetting requestTimeout=N>` and
+`getPageContext().setRequestTimeout()` all set the limit. An overrunning request
 aborts with Lucee's own wording (`Request [<path>] has run into a timeout (timeout: N
 seconds) and has been stopped. The thread started Nms ago.`) and, like Lucee's
 `RequestTimeoutException`, is **not catchable** by `try { … } catch( any e )` — a
@@ -230,7 +207,7 @@ follow-up (mirrors the datasource work).
 | Function | Ignored argument(s) | Reason |
 |---|---|---|
 | `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
-| `fileUpload()` / `fileUploadAll()` | `accept` | **No longer a stub** — VM-intercepted, it reads the form scope's `tempFilePath`/`clientFile`, creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. The remaining gap is `accept`: the MIME/extension allow-list is parsed and discarded, so an upload is never rejected on content type. |
+| `fileUpload()` / `fileUploadAll()` | `accept` | **Implemented** — VM-intercepted, it reads the form scope's `tempFilePath`/`clientFile`, creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. The remaining gap is `accept`: the MIME/extension allow-list is parsed and discarded, so an upload is never rejected on content type. |
 | `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
 | `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
 | `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
@@ -244,9 +221,7 @@ follow-up (mirrors the datasource work).
 
 Several tags lower to a builtin by copying a **fixed list** of attributes. Anything
 outside that list is discarded at compile time: no error, no effect, and — because the
-attribute never reaches the runtime — no "unknown option" either. `<cfquery>`'s
-whitelist was removed in v0.543.0 (GH #294) in favour of forwarding every attribute;
-the tags below still have theirs.
+attribute never reaches the runtime — no "unknown option" either.
 
 | Tag | Survives lowering | Silently dropped |
 |---|---|---|
@@ -262,17 +237,17 @@ than guessed.
 
 ## 30. Java shims — remaining gaps 🛑/🔇
 
-The shim dispatch contract was reworked in v0.551.0 so that "this shim does not
-implement that method" travels out-of-band instead of as `Ok(null)`. A shim's `null` is
-now believed, and the operations that used to be silent no-ops (StringBuilder mutators,
+A shim signals "this shim does not implement that method" out-of-band rather than as
+`Ok(null)`, so a shim's `null` is believed. These operations do real work (StringBuilder
+mutators,
 `ConcurrentHashMap.replace`, `Collections.sort` on numbers, `TimeZone` offsets, `Date`
 comparisons, `File.renameTo`, `Files` I/O, `Optional.orElse*`, `GregorianCalendar`
-mutators, `Queue.contains`/`drainTo`, `InetAddress` resolution) do the work. What
+mutators, `Queue.contains`/`drainTo`, `InetAddress` resolution). What
 remains:
 
 | Shim | Status |
 |---|---|
-| `ConcurrentHashMap.compute` / `computeIfAbsent` / `computeIfPresent` / `merge` | 🛑 Throws. They take a remapping function, and these handlers are free functions with no VM handle, so a CFML closure cannot be invoked. Previously returned null and never wrote the entry — silently losing the computed value. Needs the VM-intercept treatment the higher-order builtins get. |
+| `ConcurrentHashMap.compute` / `computeIfAbsent` / `computeIfPresent` / `merge` | 🛑 Throws. They take a remapping function, and these handlers are free functions with no VM handle, so a CFML closure cannot be invoked. Needs the VM-intercept treatment the higher-order builtins get. |
 | `Queue.take()` | 🛑 Throws. It blocks until an element is available; the shim backs both `ConcurrentLinkedQueue` (no `take()` in Java) and the blocking queues (where it must block) and cannot tell them apart. Use `poll()`. |
 | `ChronoUnit.X.between(a, b)` | 🛑 Throws. `ChronoUnit` constants are plain strings, so `.between()` dispatches on a String. Making it work means representing the tokens as shims, which would break code comparing them as strings. |
 | `ProcessBuilder` / `Runtime.exec` | 🔇 `directory()`, `environment()`, `redirectOutput()`, `redirectErrorStream()`, `inheritIO()` are ignored; `Process.getInputStream()`/`getErrorStream()` return null so child stdout is unreadable and leaks to the engine console; `Runtime.exec` never launches. Implementing these is a new capability (process spawning with redirected stdio), not a bug fix — deliberately not done. |
@@ -301,7 +276,7 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cfimport>` without `taglib` | Throws — Java/JSP class imports unsupported (custom-tag taglibs work). |
 | `<cffile action="...">` outside the supported actions | Throws "not implemented". |
 | `<cfthread action="...">` outside run/join/terminate | Throws "not supported". |
-| `createObject("java", "…")` for a class outside the shimmed set | Throws "Java class […] is not supported" (RustCFML has no JVM; only a curated set of `java.*` standard-library classes are shimmed). Was previously a **silent null**, which surfaced downstream as a confusing "Variable X is undefined". |
+| `createObject("java", "…")` for a class outside the shimmed set | Throws "Java class […] is not supported" (RustCFML has no JVM; only a curated set of `java.*` standard-library classes are shimmed). |
 | Dynamically-loaded Java classes (`cbjavaloader` / `java.net.URLClassLoader`) | The classloader *plumbing* (`URLClassLoader`, `coldfusion.runtime.java.JavaProxy`, `Class.forName`, `java.lang.reflect.Array`, `array.iterator()`) is shimmed so ColdBox's `cbjavaloader` module boots, but **invoking a class it loads throws** — there is no JVM to load JAR bytecode. Runtime features that genuinely need a loaded class (e.g. GoogleAuthenticator 2FA) fail loudly when used, not at boot. |
 
 > **`evaluate()` is supported** (read-only). It compiles and runs each string
@@ -608,8 +583,8 @@ between the two stores.
 
 No session record, no `CFID` cookie, and no `onSessionStart` fire until code
 **writes** to the `session` scope. A request that only reads session (or never
-touches it) mints nothing — so crawlers and `curl` hits no longer persist empty
-sessions or receive a tracking cookie.
+touches it) mints nothing — so crawlers and `curl` hits neither persist an empty
+session nor receive a tracking cookie.
 
 This is **stricter than Lucee 7**, which still mints the cookie when a session
 is created by a mere read/check. Deferring the cookie until a write is a
@@ -649,7 +624,7 @@ Behaviour verified against Lucee (in-memory allows a CFC; #236, v0.397.0).
 
 ### 12d. Session expiry — background reaper + read-path exactness — *new*
 
-Expiry no longer rides on request handling. Two independent mechanisms:
+Expiry does not ride on request handling. Two independent mechanisms:
 
 **Read-path exactness (hard guarantee).** Every store's `get()` treats a record
 past `last_accessed + timeout` as absent the instant it expires, independent of
@@ -703,10 +678,8 @@ one-request process.
 
 The session `Set-Cookie` is rendered by a single shared builder
 (`cfml-common::session_cookie`) used by **both** the `--serve` HTTP layer and the
-Cloudflare Worker handler — previously each hand-rolled the header inline and they
-had drifted (Worker emitted `SameSite=Lax`, CLI emitted neither `SameSite` nor
-`Secure`). Per-application overrides via `this.sessioncookie` are now honoured on
-both runtimes:
+Cloudflare Worker handler, so the two cannot drift. Per-application overrides via
+`this.sessioncookie` are honoured on both runtimes:
 
 ```cfc
 this.sessioncookie = {
@@ -728,7 +701,7 @@ over a secure transport:
   `X-Forwarded-Proto: https`. A bare `http://` dev box (LAN IP, custom hostname)
   gets no `Secure` and the session survives; a deployment behind nginx/Caddy gets
   `Secure` automatically. The same header now also populates `cgi.https`
-  (`on`/`off`), which was previously absent.
+  (`on`/`off`).
 
 Lucee's spec default is `secure:false` everywhere, so the Worker-on default is a
 **deliberate divergence** — but confined to the *unspecified* case: an explicit
@@ -739,9 +712,7 @@ Lucee's spec default is `secure:false` everywhere, so the Worker-on default is a
 
 ## 13. `<cfoutput query>` / grouped output — implemented, with edges 🏗
 
-`<cfoutput query="q">` now drives row iteration (previously the `query` attribute
-and friends were **silently discarded** — the body ran once against page scope).
-Supported: per-row looping, `startrow`/`maxrows`, bare column refs (`#name#`,
+`<cfoutput query="q">` drives row iteration. Supported: per-row looping, `startrow`/`maxrows`, bare column refs (`#name#`,
 resolved by merging each row into the `variables` scope), `#q.col#` row scalars,
 and `#q.currentRow#`/`#q.recordCount#`/`#q.columnList#`. The query variable is
 restored to the full query after the loop. `group` (control-break) output with a
@@ -861,17 +832,13 @@ memo exists to avoid.
 **A template rewritten by rustcfml *itself* mid-request (`fileWrite`/`fileAppend`/
 `fileCopy`/`fileMove`/`fileDelete`, including the `<cffile>` forms) IS picked up on a
 subsequent `include` in the same request** — the write flushes that file's freshness memo
-and shared bytecode-cache entry by canonical path identity (fixes the v0.511.0 regression
-that broke Wheels' `?reload=true` / `$reincludeGlobals` hot-reload flow). Only rustcfml's
+and shared bytecode-cache entry by canonical path identity. Only rustcfml's
 own writes trigger the flush; external edits still defer to the next request as above.
 
-**Production mode behaves the same way as of v0.545.0**: it still never re-stats (immutable
-tree, restart to reload), but rustcfml's *own* mid-request write does flush, exactly as in
-dev. v0.521.0 gated the flush on `!production_mode`, which left production silently serving
-the stale compiled unit after a `fileWrite` + re-`include` in the same request — and left
-the GH #284 regression test red in `--serve --production` for 23 releases, unnoticed because
-the release gate only ever served the runner in dev. The immutable-tree contract covers
-*external* edits; a template this process just rewrote is not one.
+**Production mode behaves the same way**: it never re-stats (immutable tree, restart to
+reload), but rustcfml's *own* mid-request write does flush, exactly as in dev. The
+immutable-tree contract covers *external* edits; a template this process just rewrote is
+not one.
 
 <a id="26"></a>
 
@@ -896,10 +863,6 @@ behave as `en_US`. Extend the table rather than letting a caller's locale be dro
 <a id="51"></a>
 
 ## 51. Tag-mode expressions: `>` ends a tag unless it is bracketed or part of `=>` 🏗
-
-> Renumbered from §39 (2026-08-18): the number had been claimed four days
-> earlier by the `.cfconfig.json` placeholder section above, so commit
-> `0e54157` cites this section as §39.
 
 A tag ends at the first `>` that is not inside a string, a CFML comment, or a
 bracketed sub-expression. That last clause exists because tag-mode expressions
@@ -929,7 +892,7 @@ the word operator — `<cfset big = (a > b)>` or `<cfset big = a GT b>`. Bare
 
 ## 41. The `application` scope is live in-process, but NOT across cluster nodes 🏗 *(divergence, by construction)*
 
-Since v0.593.0 the `application` scope is a genuinely shared live structure: a write
+The `application` scope is a genuinely shared live structure: a write
 by one request is immediately visible to every other in-flight request on that
 node, matching Lucee. Guard-once idioms
 (`if ( !StructKeyExists( application, "x" ) ) { expensive(); … }`) are therefore
@@ -990,9 +953,7 @@ SQL Server legs gated on `RUSTCFML_TEST_PG_DS` / `_MYSQL_DS` / `_MSSQL_DS`).
 ## 46. Member-function dispatch lowercases the method name per call 🏗
 
 `obj.method()` dispatch normalises the method name with `to_lowercase()` on the
-call path (`crates/cfml-vm/src/lib.rs:24597`, and previously 2–3 such allocations
-per dispatch before v0.596.0 converted the member→BIF delegation lookup to the
-O(1) case-insensitive index).
+call path (`crates/cfml-vm/src/lib.rs:24597`).
 
 The remaining allocation is small individually but the call counts are not. One
 profiled Preside admin request showed `RequestService.getContext()` invoked 2,920
@@ -1020,8 +981,7 @@ RustCFML tolerates extra positional arguments to a built-in where Lucee raises a
 | `struct.copy( false )` | error, "too many arguments for function [structcopy] call" | accepted, arg ignored |
 
 This is general BIF arity tolerance rather than anything specific to those two
-functions, which is why it was left alone when the `duplicate()` deep-copy flag
-was fixed in v0.596.0 (§42) — making arity strict across ~730 built-ins is a
+functions — making arity strict across ~730 built-ins is a
 separate semantics project with a much wider blast radius, and a real risk of
 breaking working user code that happens to pass a stray argument.
 
@@ -1140,7 +1100,7 @@ Restrictions that apply only on a particular target (wasm, CLI vs serve).
 | `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
 | `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
 | `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
-| `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads since v0.572.0 (GitHub #314): `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
+| `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads: `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
 | `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
 
 ---
