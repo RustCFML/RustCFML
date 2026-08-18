@@ -132,7 +132,9 @@ fn concurrent_request_resolves_methods_of_a_component_published_mid_flight() {
         "component should be visible to the concurrent request (test would be \
          vacuous otherwise); got:\n{reader}"
     );
-    // The own method always worked (it heals against the receiver).
+    // The own method always worked (it heals against the receiver). Called from a
+    // plain template, so it has to be the PUBLIC one — a private method is
+    // invisible from outside the class (GH #330).
     assert!(
         reader.contains("own=[child-secret]"),
         "own method should dispatch; got:\n{reader}"

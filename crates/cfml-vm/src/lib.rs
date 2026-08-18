@@ -1795,6 +1795,32 @@ fn frame_exclusive_us(stack: &mut Vec<i64>, inclusive_us: i64) -> i64 {
     (inclusive_us - child_us).max(0)
 }
 
+/// Where a component-method call is coming from — the input to the `private` /
+/// `package` access gate (GH #330). This is the RustCFML analogue of Lucee's
+/// `PageContext.getActiveComponent()`, which Lucee derives from the executing
+/// frame's variables scope (`PageContextImpl.setVariablesScope`) and consults in
+/// `ComponentImpl.isPrivate`/`isPackage`.
+///
+/// Carried by reference and inspected ONLY when the resolved method is
+/// non-public, so an ordinary (public) dispatch pays nothing for it.
+#[derive(Clone, Copy)]
+enum DispatchCaller<'a> {
+    /// The calling frame's locals. A frame carrying a `this` is executing inside
+    /// that component — a component method, its pseudo-constructor, or a closure
+    /// minted inside one (the closure captures `this`, which is why Lucee's
+    /// `setVariablesScope` unwraps a `ClosureScope` to the component scope it came
+    /// from). A frame with no `this` is an external caller.
+    Frame(&'a ValueMap),
+    /// No CFML frame to consult — treated as external, so only `public` and
+    /// `remote` members resolve. (Lucee: `getActiveComponent() == null`.)
+    Outside,
+    /// Engine-internal dispatch — the Application.cfc lifecycle listeners and
+    /// `onMissingTemplate`, which Lucee invokes with `ACCESS_PRIVATE` explicitly
+    /// (`ModernApplicationContext.getMember`), so a lifecycle method declared
+    /// `private` still fires. Never gated.
+    Engine,
+}
+
 pub struct CfmlVirtualMachine {
     pub program: BytecodeProgram,
     pub globals: ValueMap,
@@ -10782,6 +10808,8 @@ impl CfmlVirtualMachine {
                                 method_name,
                                 &mut extra_args,
                                 method_arg_names,
+                                // This frame is the caller, for the access gate.
+                                DispatchCaller::Frame(&locals),
                             ),
                         };
                         self.try_stack = saved_try;
@@ -11791,6 +11819,7 @@ impl CfmlVirtualMachine {
                                 &method_name,
                                 &mut extra_args,
                                 computed_arg_names,
+                                DispatchCaller::Frame(&locals),
                             ),
                         };
                         self.try_stack = saved_try;
@@ -16913,6 +16942,12 @@ impl CfmlVirtualMachine {
                                     &method_name,
                                     &mut values,
                                     Some(&names),
+                                    // cfinvoke is gated with the CALLING frame's
+                                    // component context — Lucee routes it through
+                                    // the same pc-based `getMember`, so
+                                    // `invoke(this,"priv")` inside the component
+                                    // works and from outside it does not (#330).
+                                    DispatchCaller::Frame(parent_locals),
                                 );
                                 self.method_this_writeback = None;
                                 return r;
@@ -17089,6 +17124,9 @@ impl CfmlVirtualMachine {
                                 &method_name,
                                 &mut values,
                                 Some(&names),
+                                // Gated with the caller's component context (#330),
+                                // like cfinvoke above.
+                                DispatchCaller::Frame(parent_locals),
                             );
                             self.method_this_writeback = None;
                             return r;
@@ -23032,7 +23070,16 @@ impl CfmlVirtualMachine {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = object {
             let inst = inst.clone();
-            return self.call_instance_method(&inst, method, extra_args, arg_names);
+            // Access gate (GH #330): these non-bytecode entries (proxy SAM invoke,
+            // higher-order member callbacks, cfinvoke) carry the calling frame's
+            // locals, which is where the caller's component context lives.
+            return self.call_instance_method(
+                &inst,
+                method,
+                extra_args,
+                arg_names,
+                DispatchCaller::Frame(caller_locals),
+            );
         }
         #[cfg(feature = "observability")]
         {
@@ -27906,6 +27953,118 @@ impl CfmlVirtualMachine {
         cfml_common::component::make_instance_value(&s, blueprint, instance_id)
     }
 
+    /// The defining source file of the component a call is coming from, for the
+    /// class/package comparisons below. Handles both value shapes a `this` can
+    /// have: the flyweight `Instance` and the marker struct (an in-construction
+    /// `this`, or a mixin host).
+    #[cfg(feature = "component-instance")]
+    fn caller_source_file(caller_this: &CfmlValue) -> Option<String> {
+        match caller_this {
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let src = inst.read().class.source_file.clone();
+                (!src.is_empty()).then_some(src)
+            }
+            CfmlValue::Struct(s) => match s.get("__source_file") {
+                Some(CfmlValue::String(p)) if !p.is_empty() => Some(p.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Is `method` (already resolved to `func`) callable on `inst` by this caller?
+    ///
+    /// Mirrors Lucee's `ComponentImpl.isAccessible` + `isPrivate`/`isPackage`:
+    /// `public` and `remote` are callable from anywhere; `private` needs a caller
+    /// inside the same CLASS — Lucee compares the active component's top page
+    /// source, so a *sibling instance* of the same class qualifies (privacy is
+    /// class-level, as in Java, not instance-level); `package` needs a caller in
+    /// the same package, which Lucee derives from the dotted name minus its last
+    /// segment and we take from the source file's directory (the same notion, and
+    /// stable however the class happened to be named/resolved).
+    ///
+    /// A denied method is reported as ABSENT rather than refused, so the call
+    /// falls through to `onMissingMethod` and then to the "has no function with
+    /// name" error — again Lucee's shape (`_call` → `getMember` returns null).
+    #[cfg(feature = "component-instance")]
+    fn instance_method_accessible(
+        inst: &cfml_common::component::InstanceRef,
+        method: &str,
+        func: &CfmlValue,
+        caller: DispatchCaller<'_>,
+    ) -> bool {
+        use cfml_common::dynamic::CfmlAccess;
+        let access = match func {
+            CfmlValue::Function(f) => f.access.clone(),
+            // A non-function member reached through method dispatch is not gated.
+            _ => return true,
+        };
+        if matches!(access, CfmlAccess::Public | CfmlAccess::Remote) {
+            return true;
+        }
+        if Self::caller_is_within(inst, &access, caller) {
+            return true;
+        }
+        // Last resort, and the reason this is checked AFTER the caller: assigning a
+        // function into the public scope makes that member public whatever the
+        // access of the value assigned — see `has_injected_public_method`. Only an
+        // otherwise-denied call pays for the scan.
+        inst.read().has_injected_public_method(method)
+    }
+
+    /// The caller half of [`instance_method_accessible`]: is the code making this
+    /// call inside the receiver's class (for `private`) or its package (for
+    /// `package`)?
+    #[cfg(feature = "component-instance")]
+    fn caller_is_within(
+        inst: &cfml_common::component::InstanceRef,
+        access: &cfml_common::dynamic::CfmlAccess,
+        caller: DispatchCaller<'_>,
+    ) -> bool {
+        let frame = match caller {
+            // Lucee dispatches the Application.cfc listeners with ACCESS_PRIVATE.
+            DispatchCaller::Engine => return true,
+            DispatchCaller::Outside => return false,
+            DispatchCaller::Frame(locals) => locals,
+        };
+        // The component whose method is executing — Lucee's active component.
+        let caller_this = match frame.get(&*cfml_common::key::well_known::THIS) {
+            Some(this) if !matches!(this, CfmlValue::Null) => this,
+            // Not inside a component at all: an external caller.
+            _ => return false,
+        };
+        // Same instance — the common internal call (`this.priv()`, a sibling method
+        // reached through the instance). Pointer identity, no lock taken.
+        if let CfmlValue::Instance(c) = caller_this {
+            if Arc::ptr_eq(c, inst) {
+                return true;
+            }
+        }
+        let target_src = { inst.read().class.source_file.clone() };
+        let caller_src = match Self::caller_source_file(caller_this) {
+            Some(s) if !target_src.is_empty() => s,
+            // No source to compare (a synthetic/mixin host): treat as external.
+            _ => return false,
+        };
+        if caller_src.eq_ignore_ascii_case(&target_src) {
+            return true; // same class
+        }
+        if !matches!(access, cfml_common::dynamic::CfmlAccess::Package) {
+            return false;
+        }
+        // Same package == same directory on disk.
+        let dir = |p: &str| {
+            std::path::Path::new(p)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+        };
+        match (dir(&caller_src), dir(&target_src)) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+            _ => false,
+        }
+    }
+
     /// Phase C.3 — Slice 3: dispatch a method on a flyweight `Instance`.
     ///
     /// Self-contained (no marker hydration): resolves the method from the instance
@@ -27926,6 +28085,7 @@ impl CfmlVirtualMachine {
         method: &str,
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
+        caller: DispatchCaller<'_>,
     ) -> CfmlResult {
         // Debug-footer parity: fire a `template` hook for the flyweight Instance's
         // defining source, timed with EXCLUSIVE self-time. Every CFC method call
@@ -27949,14 +28109,14 @@ impl CfmlVirtualMachine {
                 if let Some(src) = src {
                     let start = std::time::Instant::now();
                     self.template_frame_begin();
-                    let r =
-                        self.call_instance_method_impl(inst, method, extra_args, arg_names);
+                    let r = self
+                        .call_instance_method_impl(inst, method, extra_args, arg_names, caller);
                     self.template_frame_end(&src, Some(method), start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
         }
-        self.call_instance_method_impl(inst, method, extra_args, arg_names)
+        self.call_instance_method_impl(inst, method, extra_args, arg_names, caller)
     }
 
     #[cfg(feature = "component-instance")]
@@ -27966,6 +28126,7 @@ impl CfmlVirtualMachine {
         method: &str,
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
+        caller: DispatchCaller<'_>,
     ) -> CfmlResult {
         let object = CfmlValue::Instance(inst.clone());
 
@@ -27984,6 +28145,17 @@ impl CfmlVirtualMachine {
                 g.this_members.contains_key_ci("onmissingmethod"),
             )
         };
+
+        // Access gate (GH #330): a `private`/`package` method is invisible to an
+        // external caller. Resolved-but-denied is NOT the same as unresolved — it
+        // must not fall into the lenient implicit-accessor synthesis below (a
+        // private `getFoo()` would hand out the data member it was hiding), so it
+        // goes straight to the onMissingMethod / no-such-function tail, which is
+        // where Lucee's `_call` sends it.
+        let denied = func
+            .as_ref()
+            .is_some_and(|f| !Self::instance_method_accessible(inst, method, f, caller));
+        let func = if denied { None } else { func };
 
         // 1. Direct dispatch — own / injected / (Slice-5: inherited) method.
         if let Some(func_ref) = func {
@@ -28065,12 +28237,12 @@ impl CfmlVirtualMachine {
         // accessors="true" for data CFCs; a component defining onMissingMethod
         // routes there instead, Lucee parity).
         let ml = method.to_lowercase();
-        if !defines_on_missing && ml.len() > 3 && ml.starts_with("get") {
+        if !denied && !defines_on_missing && ml.len() > 3 && ml.starts_with("get") {
             if let Some(v) = data_get(&method[3..]) {
                 return Ok(v);
             }
         }
-        if !defines_on_missing && ml.len() > 3 && ml.starts_with("set") {
+        if !denied && !defines_on_missing && ml.len() > 3 && ml.starts_with("set") {
             if let Some(value) = extra_args.first().cloned() {
                 this_members.insert(method[3..].to_string(), value);
                 return Ok(object.clone()); // setX returns `this` (fluent — Lucee)
@@ -33495,7 +33667,16 @@ impl CfmlVirtualMachine {
                     return Ok(false);
                 }
                 let mut extra = args;
-                self.call_instance_method(inst, method, &mut extra, None)?;
+                // Lifecycle listeners are engine-dispatched, so a `private
+                // onRequestStart()` still fires — Lucee reads them with
+                // ACCESS_PRIVATE (ModernApplicationContext).
+                self.call_instance_method(
+                    inst,
+                    method,
+                    &mut extra,
+                    None,
+                    DispatchCaller::Engine,
+                )?;
                 return Ok(true);
             }
             _ => return Ok(false),
@@ -33573,7 +33754,14 @@ impl CfmlVirtualMachine {
                     return Ok(None);
                 }
                 let mut extra = vec![target_page];
-                let r = self.call_instance_method(inst, "onmissingtemplate", &mut extra, None)?;
+                // Engine-dispatched, like the other lifecycle listeners.
+                let r = self.call_instance_method(
+                    inst,
+                    "onmissingtemplate",
+                    &mut extra,
+                    None,
+                    DispatchCaller::Engine,
+                )?;
                 return Ok(Some(r));
             }
             _ => return Ok(None),
@@ -33882,7 +34070,15 @@ impl CfmlVirtualMachine {
             };
             let prev_instance = self.current_ws_instance.replace(template.clone());
             let mut extra = args;
-            let result = self.call_instance_method(inst, &fname, &mut extra, None);
+            // NOT privileged: an inbound socket message is an external caller, so a
+            // channel handler has to be public to be reachable from the wire.
+            let result = self.call_instance_method(
+                inst,
+                &fname,
+                &mut extra,
+                None,
+                DispatchCaller::Outside,
+            );
             self.current_ws_instance = prev_instance;
             return result.map(Some);
         }

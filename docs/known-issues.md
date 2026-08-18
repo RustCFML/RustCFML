@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.607.0**.
+What RustCFML **does not fully do**, as of **v0.609.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§27`, …) are permanent IDs — they are cited from commits and issues, so
@@ -81,6 +81,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [49](#49) | `fileOpen( f, "write" )` does not create the file | 🏗 edges |
 | [50](#50) | AntiSamy sanitiser — cosmetic divergences from the Java library | 🏗 edges |
 | [51](#51) | Tag-mode parsing — two constructs compile here that Lucee rejects | 🏗 edges |
+| [53](#53) | `private`/`package` methods are gated on CALLS, not on member reads | 🏗 edges |
 
 **Part E — Environment-specific 🌍**
 
@@ -1117,6 +1118,36 @@ Also worth knowing: `<tags-to-encode>` tags are **unwrapped, not encoded** —
 `<g>x</g>` becomes `x`. That reads backwards against the section name, but it is
 what the 1.5.3 jar does (measured across `<g>a</g>b`, `x<g>y`, `<g/>` and a
 nested case), and matching the library beats matching the label.
+
+<a id="53"></a>
+
+## 53. `private`/`package` methods are gated on CALLS, not on member reads 🏗
+
+Access modifiers are enforced on component-method dispatch (GH
+[#330](https://github.com/RustCFML/RustCFML/issues/330)): `obj.priv()`,
+`obj["priv"]()`, `invoke( obj, "priv" )` and `<cfinvoke>` all report a
+`private`/`package` method as **absent** from outside the class, exactly as Lucee
+does — including the same fall-through to `onMissingMethod`. `tests/oop/test_method_access_gate.cfm`
+pins 26 scenarios that pass on both engines.
+
+What is *not* gated is reading the method as a **value**:
+
+| | Lucee 7.0.4 | RustCFML |
+|---|---|---|
+| `obj.priv()` from outside | throws "has no function with name [priv]" | throws (same shape) |
+| `f = obj.priv` from outside | throws "has no accessible Member with name [PRIV]" | returns the function |
+
+So an external caller can still reach a private method by extracting the
+reference first (`f = obj.priv; f()`). Closing that means gating member reads
+(`GetProperty`/`GetIndex` and the other `Instance::get_member` callers), which are
+the hottest ops in the engine and have no caller context threaded to them today —
+a separate change with a much wider blast radius than the dispatch gate, and one
+that would also have to cover the JIT's member-access inline caches to stay
+consistent. Treated as a follow-up rather than folded into the dispatch fix.
+
+Also worth knowing: the refusal is raised as error type `Runtime`, where Lucee
+uses `expression`. That is the type of every "no such method" error in this
+engine, not something specific to the access gate.
 
 ---
 

@@ -403,6 +403,27 @@ impl Instance {
             .or_else(|| self.variables_members.get_ci(name))
     }
 
+    /// Is `name` a runtime-INJECTED method on the PUBLIC (`this`) scope — a
+    /// mixin/proxy stub installed as `this.x = fn` — rather than a method declared
+    /// by the class?
+    ///
+    /// Lucee widens the access of a UDF assigned into a component scope to
+    /// `public` (`ComponentImpl._set`: "if (udf.getAccess() > ACCESS_PUBLIC) …
+    /// setAccess(ACCESS_PUBLIC)"), so the GH #330 access gate must let such a
+    /// member through even when the function VALUE that was assigned came from a
+    /// private method — the FW/1 beanProxy shape, where one private stub is
+    /// installed over every public method slot.
+    ///
+    /// Data-only on purpose: it must NOT see through to the shared class method
+    /// table, or every declared private method would look injected.
+    pub fn has_injected_public_method(&self, name: &str) -> bool {
+        self.this_members.with_map(|m| {
+            m.iter().any(|(k, v)| {
+                k.as_str().eq_ignore_ascii_case(name) && matches!(v, CfmlValue::Function(_))
+            })
+        })
+    }
+
     /// Resolve a callable method: an injected/mixin data-member function (public
     /// then private) shadows the shared blueprint table, exactly as `get_ci`'s
     /// map-before-table order gives us for free.

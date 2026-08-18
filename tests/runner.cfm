@@ -351,6 +351,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_instance_serialize_cycle.cfm">
 <cf_runtest file="oop/test_include_rewrite_freshness.cfm">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">
+<cf_runtest file="oop/test_method_access_gate.cfm">
 <cf_runtest file="oop/test_arg_type_validation.cfm">
 <cf_runtest file="oop/test_new_keyword_path.cfm">
 <!--- - component_internals_serialize_leak: iterating a component (for(k in obj)) --->
