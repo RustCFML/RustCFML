@@ -785,7 +785,7 @@ pub mod alloc_sites {
 }
 
 /// Existence-probe outcome census (`exists-census` builds only) — the sizing
-/// instrument for known-issues §45.
+/// instrument for the application-lifetime existence caching closed in v0.598.0.
 ///
 /// The shipped [`EXISTS_MEMO_HITS`] / [`EXISTS_FS_PROBES`] pair says the memo
 /// takes more real syscalls than it serves hits, but it cannot say *what to

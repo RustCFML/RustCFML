@@ -3,7 +3,7 @@
 What RustCFML **does not fully do**, as of **v0.607.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
-numbers (`§1`, `§29`, …) are permanent IDs — they are cited from commits and issues, so
+numbers (`§1`, `§27`, …) are permanent IDs — they are cited from commits and issues, so
 they are never renumbered or reused, which is why the numbering inside each group is not
 sequential.
 
@@ -228,10 +228,8 @@ attribute never reaches the runtime — no "unknown option" either.
 | `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
 | `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
 
-These two are the **only** rows left; the rest of the original inventory has shipped —
-see §27b. Both remaining rows are blocked on the same thing: a database the reference
-Lucee can also reach, so the expected precision/OUT-param behaviour can be probed rather
-than guessed.
+Both rows are blocked on the same thing: a database the reference Lucee can also
+reach, so the expected precision/OUT-param behaviour can be probed rather than guessed.
 
 <a id="30"></a>
 
@@ -254,6 +252,11 @@ remains:
 | `new SimpleDateFormat(pattern)` | 🔇 The pattern argument is discarded; `.format()` emits the Java MEDIUM style (`Jan 1, 1970`) regardless. |
 | `HttpServletRequest.setAttribute` / `getAttribute` / `getSession` | 🔇 Attributes are silently discarded — there is no real servlet state behind the bridge (see §11). |
 | Unknown method on a **known** shim class | 🔇 Still returns null rather than throwing. The shim correctly reports "not mine" and falls through to generic dispatch — which must stay, so property access like `system.out` keeps working — but a `__java_shim` struct whose member resolves nowhere does not reach the undefined-member error a plain struct gets. Making that loud is the remaining half of the D2 work. |
+
+Shims that **work** are not listed here — this document groups by status, so they
+appear under Part D with whatever edges they have: see [§50](#50) for the AntiSamy
+sanitiser's divergences from the Java library. For the full shimmed surface —
+which classes and methods exist at all — see `docs/java-shims.md`.
 
 ---
 
@@ -1039,10 +1042,8 @@ sequence above the path is invisible to `directoryList()` (a different code path
 from the existence memo) and absent on disk. `fileClose()` is itself a no-op stub
 in RustCFML, which is why nothing flushes a zero-byte file on close.
 
-Found while pinning §45's invalidation, where `fileOpen` was the natural second
-intercepted creator to test — it is not a creator here at all. Untouched by that
-work; the existence cache is correct either way, since it never caches an answer
-the filesystem does not agree with. Fixing it means giving handles a real
+The existence cache is unaffected either way, since it never caches an answer the
+filesystem does not agree with. Fixing it means giving handles a real
 create-on-open, which also wants `fileClose()` to stop being a stub.
 
 <a id="50"></a>
@@ -1050,7 +1051,9 @@ create-on-open, which also wants `fileClose()` to stop being a stub.
 ## 50. AntiSamy sanitiser: cosmetic divergences from the Java library 🏗
 
 `org.owasp.validator.html.AntiSamy` and `sanitizeHtml()` run a native Rust
-sanitiser (`crates/cfml-sanitize`) rather than the Java library. Output was
+sanitiser (`crates/cfml-sanitize`) rather than the Java library. The shimmed
+surface is listed in `docs/java-shims.md`; the remaining gaps in other shims are
+[§30](#30). Output was
 diffed against the real **AntiSamy 1.5.3 jar on Lucee 7.0.4** across 77 inputs ×
 the six shipped 1.4.4 policies (preside, tinymce, slashdot, ebay, myspace,
 anythinggoes) — 462 comparisons.
