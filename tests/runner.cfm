@@ -280,6 +280,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_xml.cfm">
 <cf_runtest file="stdlib/test_utility.cfm">
 <cf_runtest file="stdlib/test_encoding_functions.cfm">
+<cf_runtest file="stdlib/test_base64_hex_codec.cfm">
 <cf_runtest file="stdlib/test_query_mutations.cfm">
 <cf_runtest file="stdlib/test_query_new_empty_addcolumn_metadata.cfm">
 <cf_runtest file="database/test_lucee_query_builder.cfm">

@@ -5746,11 +5746,47 @@ impl CfmlVirtualMachine {
     /// Each distinct expression mints fresh process-stable `global_id`s, so a
     /// hot evaluate() loop slowly grows `fn_registry`; acceptable for the
     /// boot-time / config-time expressions this targets.
-    fn eval_expression_string(
-        &mut self,
+    /// Lex + parse + compile one CFML expression into a runnable single-function
+    /// program, memoised on `(source_file, expr)`.
+    ///
+    /// `evaluate()` / `iif()` recompile the same tiny expression on every call:
+    /// measured 2.4us for `evaluate("true && false")` at v0.609.0, essentially
+    /// all of it compiler time (Preside's `FeatureService._processComplexExpression`
+    /// ends in `Evaluate( compiled )`, so every feature expression pays it). Lucee
+    /// caches these too.
+    ///
+    /// The cache also plugs a slow leak: `next_global_fn_id()` is a process-wide
+    /// counter and `push_program_swap` registers each compiled function into
+    /// `fn_registry` by its `global_id`, so a fresh compile per call grew that
+    /// registry without bound for the life of the server. Reusing one compiled
+    /// program per expression means the ids are registered once.
+    ///
+    /// Keyed on the source file as well as the text because the compiler bakes
+    /// it into the program for error reporting. `BytecodeProgram` is a
+    /// `Vec<Arc<BytecodeFunction>>`, so a cache hit clones refcounts only.
+    fn compile_expression_string(
+        &self,
         expr: &str,
-        parent_locals: &ValueMap,
-    ) -> CfmlResult {
+    ) -> Result<cfml_codegen::compiler::BytecodeProgram, CfmlError> {
+        /// Bounded like `cfml-stdlib`'s `REGEX_CACHE`: dynamically-built
+        /// expression strings could otherwise grow this without limit, so on
+        /// exceeding the cap we clear wholesale and pay a rare cold rebuild.
+        const EXPR_CACHE_CAP: usize = 2048;
+        static EXPR_CACHE: std::sync::OnceLock<
+            std::sync::RwLock<
+                std::collections::HashMap<
+                    (Option<String>, String),
+                    cfml_codegen::compiler::BytecodeProgram,
+                >,
+            >,
+        > = std::sync::OnceLock::new();
+        let cache = EXPR_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let key = (self.source_file.clone(), expr.to_string());
+        if let Some(hit) = cache.read().unwrap().get(&key) {
+            return Ok(hit.clone());
+        }
+
         let source = format!("return ({});\n", expr);
         let ast = cfml_compiler::parser::Parser::new(source)
             .parse()
@@ -5763,6 +5799,23 @@ impl CfmlVirtualMachine {
         let program = cfml_codegen::compiler::CfmlCompiler::new()
             .with_source_file(self.source_file.clone())
             .compile(ast);
+
+        let mut w = cache.write().unwrap();
+        if w.len() >= EXPR_CACHE_CAP {
+            w.clear();
+        }
+        // Return the entry actually stored: a racing thread may have inserted
+        // first, and both callers should share one warm program (and therefore
+        // one set of `global_id`s) rather than each holding a private copy.
+        Ok(w.entry(key).or_insert(program).clone())
+    }
+
+    fn eval_expression_string(
+        &mut self,
+        expr: &str,
+        parent_locals: &ValueMap,
+    ) -> CfmlResult {
+        let program = self.compile_expression_string(expr)?;
         let old_program = self.push_program_swap(program);
         let main_idx = self
             .program

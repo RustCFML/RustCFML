@@ -1837,40 +1837,11 @@ fn fn_to_base64(args: Vec<CfmlValue>) -> CfmlResult {
             input_string.as_bytes()
         }
     };
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        result.push(alphabet[((n >> 18) & 63) as usize] as char);
-        result.push(alphabet[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 { result.push(alphabet[((n >> 6) & 63) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(alphabet[(n & 63) as usize] as char); } else { result.push('='); }
-    }
-    Ok(CfmlValue::string(result))
+    Ok(CfmlValue::string(base64_encode_bytes(bytes)))
 }
 
 fn fn_to_binary(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut bytes = Vec::new();
-    let chars: Vec<u8> = s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if i + 1 >= chars.len() { break; }
-        let b0 = table.iter().position(|&c| c == chars[i]).unwrap_or(0) as u32;
-        let b1 = table.iter().position(|&c| c == chars[i + 1]).unwrap_or(0) as u32;
-        let b2 = if i + 2 < chars.len() && chars[i + 2] != b'=' { table.iter().position(|&c| c == chars[i + 2]).unwrap_or(0) as u32 } else { 0 };
-        let b3 = if i + 3 < chars.len() && chars[i + 3] != b'=' { table.iter().position(|&c| c == chars[i + 3]).unwrap_or(0) as u32 } else { 0 };
-        let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        bytes.push(((triple >> 16) & 0xFF) as u8);
-        if i + 2 < chars.len() && chars[i + 2] != b'=' { bytes.push(((triple >> 8) & 0xFF) as u8); }
-        if i + 3 < chars.len() && chars[i + 3] != b'=' { bytes.push((triple & 0xFF) as u8); }
-        i += 4;
-    }
-    Ok(CfmlValue::Binary(bytes))
+    Ok(CfmlValue::Binary(base64_decode_bytes(&get_str(&args, 0))))
 }
 
 /// Magic header prefixing an `objectSave()` blob. Lets `objectLoad()` recognise
@@ -1904,9 +1875,17 @@ fn fn_object_save(args: Vec<CfmlValue>) -> CfmlResult {
 /// Accepts a Binary value (the normal case; ColdBox calls `toBinary()` on a
 /// base64 string first) or a String (treated as raw UTF-8 bytes) for leniency.
 fn fn_object_load(args: Vec<CfmlValue>) -> CfmlResult {
-    let bytes: Vec<u8> = match args.first() {
-        Some(CfmlValue::Binary(b)) => b.clone(),
-        Some(CfmlValue::String(s)) => s.as_bytes().to_vec(),
+    // Consume the argument rather than borrowing it: a `Binary` blob moves out
+    // instead of being deep-copied. `b.clone()` here duplicated the WHOLE blob
+    // (a ~100KB cached page, in ColdBox's DiskStore) purely to read it once.
+    let bytes: Vec<u8> = match args.into_iter().next() {
+        Some(CfmlValue::Binary(b)) => b,
+        // `CfmlValue::String` is an `Arc<String>`; take the buffer when we hold
+        // the only reference, copy only when it is genuinely shared.
+        Some(CfmlValue::String(s)) => match std::sync::Arc::try_unwrap(s) {
+            Ok(owned) => owned.into_bytes(),
+            Err(shared) => shared.as_bytes().to_vec(),
+        },
         Some(other) => other.as_string().into_bytes(),
         None => {
             return Err(CfmlError::runtime(
@@ -1936,25 +1915,8 @@ fn fn_binary_encode(args: Vec<CfmlValue>) -> CfmlResult {
     };
     let encoding = get_str(&args, 1).to_lowercase();
     match encoding.as_str() {
-        "hex" => {
-            let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
-            Ok(CfmlValue::string(hex))
-        }
-        "base64" => {
-            let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut result = String::new();
-            for chunk in bytes.chunks(3) {
-                let b0 = chunk[0] as u32;
-                let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-                let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-                let n = (b0 << 16) | (b1 << 8) | b2;
-                result.push(alphabet[((n >> 18) & 63) as usize] as char);
-                result.push(alphabet[((n >> 12) & 63) as usize] as char);
-                if chunk.len() > 1 { result.push(alphabet[((n >> 6) & 63) as usize] as char); } else { result.push('='); }
-                if chunk.len() > 2 { result.push(alphabet[(n & 63) as usize] as char); } else { result.push('='); }
-            }
-            Ok(CfmlValue::string(result))
-        }
+        "hex" => Ok(CfmlValue::string(hex_encode(&bytes))),
+        "base64" => Ok(CfmlValue::string(base64_encode_bytes(&bytes))),
         _ => Err(CfmlError::runtime(format!("Unsupported encoding: {}", encoding))),
     }
 }
@@ -1963,38 +1925,8 @@ fn fn_binary_decode(args: Vec<CfmlValue>) -> CfmlResult {
     let input = get_str(&args, 0);
     let encoding = get_str(&args, 1).to_lowercase();
     match encoding.as_str() {
-        "hex" => {
-            let hex = input.trim();
-            let mut bytes = Vec::new();
-            let chars: Vec<char> = hex.chars().collect();
-            let mut i = 0;
-            while i + 1 < chars.len() {
-                let high = chars[i].to_digit(16).unwrap_or(0) as u8;
-                let low = chars[i + 1].to_digit(16).unwrap_or(0) as u8;
-                bytes.push((high << 4) | low);
-                i += 2;
-            }
-            Ok(CfmlValue::Binary(bytes))
-        }
-        "base64" => {
-            let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut bytes = Vec::new();
-            let chars: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
-            let mut i = 0;
-            while i < chars.len() {
-                if i + 1 >= chars.len() { break; }
-                let b0 = table.iter().position(|&c| c == chars[i]).unwrap_or(0) as u32;
-                let b1 = table.iter().position(|&c| c == chars[i + 1]).unwrap_or(0) as u32;
-                let b2 = if i + 2 < chars.len() && chars[i + 2] != b'=' { table.iter().position(|&c| c == chars[i + 2]).unwrap_or(0) as u32 } else { 0 };
-                let b3 = if i + 3 < chars.len() && chars[i + 3] != b'=' { table.iter().position(|&c| c == chars[i + 3]).unwrap_or(0) as u32 } else { 0 };
-                let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-                bytes.push(((triple >> 16) & 0xFF) as u8);
-                if i + 2 < chars.len() && chars[i + 2] != b'=' { bytes.push(((triple >> 8) & 0xFF) as u8); }
-                if i + 3 < chars.len() && chars[i + 3] != b'=' { bytes.push((triple & 0xFF) as u8); }
-                i += 4;
-            }
-            Ok(CfmlValue::Binary(bytes))
-        }
+        "hex" => Ok(CfmlValue::Binary(hex_decode_bytes(&input))),
+        "base64" => Ok(CfmlValue::Binary(base64_decode_bytes(&input))),
         "utf-8" | "us-ascii" => {
             // Convert string directly to bytes
             Ok(CfmlValue::Binary(input.as_bytes().to_vec()))
@@ -2011,14 +1943,21 @@ fn fn_binary_decode(args: Vec<CfmlValue>) -> CfmlResult {
 //     i.e. application/x-www-form-urlencoded semantics; every JVM engine —
 //     Lucee 5/6/7, Adobe CF, BoxLang — encodes a space as `+`).
 fn url_encode_impl(s: &str, space_as_plus: bool) -> String {
-    let mut result = String::new();
+    // Most input is already URL-safe, so size for the input and let the rare
+    // escape grow it. The escape path writes the character's UTF-8 into a stack
+    // buffer and indexes a hex table: the previous version allocated a `String`
+    // per character (`c.to_string()`) plus another per byte (`format!`).
+    let mut result = String::with_capacity(s.len());
+    let mut buf = [0u8; 4];
     for c in s.chars() {
         match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => result.push(c),
             ' ' if space_as_plus => result.push('+'),
             _ => {
-                for b in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", b));
+                for &b in c.encode_utf8(&mut buf).as_bytes() {
+                    result.push('%');
+                    result.push(HEX_UPPER[(b >> 4) as usize] as char);
+                    result.push(HEX_UPPER[(b & 0x0F) as usize] as char);
                 }
             }
         }
@@ -14618,23 +14557,61 @@ fn fn_cffile(_args: Vec<CfmlValue>) -> CfmlResult {
 
 // ==== ENCODING HELPERS ====
 
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Reverse map: base64 character -> its 6-bit value; `B64_INVALID` for anything
+/// that isn't in the alphabet.
+///
+/// Built at compile time so decoding costs ONE array index per character. The
+/// previous implementation searched `B64_ALPHABET` linearly with
+/// `.position(|&c| c == ch)` — ~32 comparisons per character on average, four
+/// times per three output bytes. That made `toBinary()` **15.7x slower than
+/// `toBase64()` on identical data** (315us vs 20us for a 28KB blob, measured at
+/// v0.609.0), which showed up as ~1ms per request in ColdBox's cache
+/// `DiskStore`: every cached-page hit routes a base64 blob through
+/// `ObjectMarshaller.deserializeObject()` -> `toBinary()`.
+const B64_INVALID: u8 = 0xFF;
+static B64_REVERSE: [u8; 256] = {
+    let mut t = [B64_INVALID; 256];
+    let mut i = 0usize;
+    while i < 64 {
+        t[B64_ALPHABET[i] as usize] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// 6-bit value for a base64 character. Unknown characters decode as 0, which is
+/// what the previous `.position(..).unwrap_or(0)` did — preserved deliberately
+/// so malformed input keeps producing the same bytes it always has.
+#[inline]
+fn b64_val(c: u8) -> u32 {
+    let v = B64_REVERSE[c as usize];
+    if v == B64_INVALID {
+        0
+    } else {
+        v as u32
+    }
+}
+
 pub(crate) fn base64_encode_bytes(data: &[u8]) -> String {
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
+    // 4 output chars per 3 input bytes, rounded up — exact, so no reallocs.
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
         let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
         let n = (b0 << 16) | (b1 << 8) | b2;
-        result.push(alphabet[((n >> 18) & 63) as usize] as char);
-        result.push(alphabet[((n >> 12) & 63) as usize] as char);
+        result.push(B64_ALPHABET[((n >> 18) & 63) as usize] as char);
+        result.push(B64_ALPHABET[((n >> 12) & 63) as usize] as char);
         if chunk.len() > 1 {
-            result.push(alphabet[((n >> 6) & 63) as usize] as char);
+            result.push(B64_ALPHABET[((n >> 6) & 63) as usize] as char);
         } else {
             result.push('=');
         }
         if chunk.len() > 2 {
-            result.push(alphabet[(n & 63) as usize] as char);
+            result.push(B64_ALPHABET[(n & 63) as usize] as char);
         } else {
             result.push('=');
         }
@@ -14643,30 +14620,30 @@ pub(crate) fn base64_encode_bytes(data: &[u8]) -> String {
 }
 
 pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
-    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut bytes = Vec::new();
-    let chars: Vec<u8> = s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
+    // Strip the line breaks and spaces MIME-wrapped base64 carries. Grouping is
+    // positional over the FILTERED sequence, so this pass can't be fused into
+    // the decode loop below (the `i + 2` / `i + 3` lookaheads need the filtered
+    // length). One sized allocation instead of growth-by-doubling.
+    let mut chars: Vec<u8> = Vec::with_capacity(s.len());
+    chars.extend(s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' '));
+    let mut bytes = Vec::with_capacity(chars.len() / 4 * 3 + 3);
     let mut i = 0;
     while i < chars.len() {
-        if i + 1 >= chars.len() { break; }
-        let b0 = table.iter().position(|&c| c == chars[i]).unwrap_or(0) as u32;
-        let b1 = table.iter().position(|&c| c == chars[i + 1]).unwrap_or(0) as u32;
-        let b2 = if i + 2 < chars.len() && chars[i + 2] != b'=' {
-            table.iter().position(|&c| c == chars[i + 2]).unwrap_or(0) as u32
-        } else {
-            0
-        };
-        let b3 = if i + 3 < chars.len() && chars[i + 3] != b'=' {
-            table.iter().position(|&c| c == chars[i + 3]).unwrap_or(0) as u32
-        } else {
-            0
-        };
+        if i + 1 >= chars.len() {
+            break;
+        }
+        let b0 = b64_val(chars[i]);
+        let b1 = b64_val(chars[i + 1]);
+        let has2 = i + 2 < chars.len() && chars[i + 2] != b'=';
+        let has3 = i + 3 < chars.len() && chars[i + 3] != b'=';
+        let b2 = if has2 { b64_val(chars[i + 2]) } else { 0 };
+        let b3 = if has3 { b64_val(chars[i + 3]) } else { 0 };
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
         bytes.push(((triple >> 16) & 0xFF) as u8);
-        if i + 2 < chars.len() && chars[i + 2] != b'=' {
+        if has2 {
             bytes.push(((triple >> 8) & 0xFF) as u8);
         }
-        if i + 3 < chars.len() && chars[i + 3] != b'=' {
+        if has3 {
             bytes.push((triple & 0xFF) as u8);
         }
         i += 4;
@@ -14674,8 +14651,37 @@ pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
     bytes
 }
 
-fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02X}", b)).collect()
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Uppercase hex, two characters per byte. Table lookup rather than
+/// `format!("{:02X}")` per byte, which allocated a `String` for every single
+/// byte of every hash/HMAC/`binaryEncode` result.
+pub(crate) fn hex_encode(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for &b in data {
+        s.push(HEX_UPPER[(b >> 4) as usize] as char);
+        s.push(HEX_UPPER[(b & 0x0F) as usize] as char);
+    }
+    s
+}
+
+/// Decode a hex string to bytes. Odd trailing nibble is dropped and non-hex
+/// characters decode as 0 — both preserved from the previous inline
+/// `to_digit(16).unwrap_or(0)` implementation.
+pub(crate) fn hex_decode_bytes(s: &str) -> Vec<u8> {
+    let t = s.trim();
+    let mut bytes = Vec::with_capacity(t.len() / 2);
+    // Pair CHARACTERS, not bytes: the previous implementation collected a
+    // `Vec<char>` and indexed it, so a multi-byte character counted as one
+    // position. Kept identical (it only matters for malformed input, but
+    // "malformed input decodes the same as it always did" is the contract).
+    let mut it = t.chars();
+    while let (Some(hi), Some(lo)) = (it.next(), it.next()) {
+        let hi = hi.to_digit(16).unwrap_or(0) as u8;
+        let lo = lo.to_digit(16).unwrap_or(0) as u8;
+        bytes.push((hi << 4) | lo);
+    }
+    bytes
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {

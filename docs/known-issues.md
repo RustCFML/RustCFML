@@ -1151,6 +1151,44 @@ engine, not something specific to the access gate.
 
 ---
 
+<a id="54"></a>
+
+## 54. Codec divergences: malformed input is tolerated, and `-_.*` are not escaped 🏗
+
+RustCFML's base64/hex decoders accept malformed input and do something
+reasonable with it; Lucee rejects it. Two URL encoders also disagree on which
+characters are "safe". Measured against **Lucee 7.0.5.41**:
+
+| Expression | Lucee 7.0.5.41 | RustCFML |
+|---|---|---|
+| `binaryDecode( "DEADBEE", "hex" )` (odd length) | throws `lucee.runtime.coder.CoderException` | drops the trailing nibble → 3 bytes |
+| `binaryDecode( "DEADBEZZ", "hex" )` (non-hex char) | throws `lucee.runtime.coder.CoderException` | decodes the bad char as `0` → `DEADBE00` |
+| `toBinary( "QU*D" )` (non-alphabet char) | 2 bytes (`4140`) | 3 bytes (`414003`) |
+| `urlEncodedFormat( "Az09-_.*" )` | `Az09%2D%5F%2E%2A` | `Az09-_.*` |
+| `encodeForURL( "a b" )` | `a%20b` | `a+b` |
+
+All five predate the v0.611.0 codec rewrite (which was a pure speed change —
+`toBinary` went from a linear alphabet scan to a 256-entry reverse table, ~7.9x
+faster on a 28KB blob — and preserved the tolerant behaviour deliberately so no
+app's output moved).
+
+Everything the two engines *do* agree on is pinned by
+`tests/stdlib/test_base64_hex_codec.cfm`, which passes on both (32/32 on Lucee).
+The rows above are deliberately **not** asserted there: writing either answer into
+the suite would freeze one engine's behaviour as correct before the call is made.
+
+Notes for whoever picks this up:
+
+- The `encodeForURL` row contradicts the comment on `url_encode_impl` in
+  `crates/cfml-stdlib/src/builtins.rs`, which cites GH #283 and states that
+  "every JVM engine — Lucee 5/6/7, Adobe CF, BoxLang — encodes a space as `+`".
+  Lucee 7.0.5.41 returns `a%20b`. Re-measure across engines before changing it;
+  the `+` may have been correct for the version measured at the time.
+- Making the decoders throw is a behaviour change, not a bug fix, for any app
+  relying on the tolerance — `binaryDecode` currently never throws on content.
+
+---
+
 # Part E — Environment-specific 🌍
 
 Restrictions that apply only on a particular target (wasm, CLI vs serve).
