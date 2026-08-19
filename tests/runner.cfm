@@ -671,6 +671,9 @@ include "harness.cfm";
 <!--- harness via /tmp/rustcfml-s3-harness/run_live.sh (see docs/s3.md), or --->
 <!--- invoke a single file directly: --->
 <!--- cargo run -- tests/s3/test_s3_functions.cfm --->
+<!--- Exception: tests/s3/test_s3_presigned_url_lucee_compat.cfm is pure --->
+<!--- (explicit dummy credentials, no network) and runs the same way with no --->
+<!--- env setup at all. --->
 
 <!--- --- Cross-engine compatibility (Wheels framework gaps) --- --->
 <!--- These tests exercise CFML behaviors Wheels depends on that pass on Lucee --->
