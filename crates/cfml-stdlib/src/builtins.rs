@@ -3981,8 +3981,8 @@ fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
 #[cfg(not(feature = "image_support"))]
 fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     // isImage is a type predicate — always safe to answer "false".
-    f.insert("isImage", |_args| Ok(CfmlValue::Bool(false)));
-    f.insert("cfimage", fn_image_disabled);
+    f.insert("isImage".to_string(), |_args| Ok(CfmlValue::Bool(false)));
+    f.insert("cfimage".to_string(), fn_image_disabled);
     for name in IMAGE_TIER1_NAMES.iter().chain(IMAGE_TIER23_STUBS) {
         f.insert((*name).into(), fn_image_disabled);
     }

@@ -411,12 +411,20 @@ fn fmt_params_html(params: &[QueryParam]) -> String {
 // elements carry a group class and `display:none`, and a `+`/`−` link flips
 // them. One inline script serves the lot; no external assets.
 
-/// The single inline script backing every toggle. Emitted once per footer,
-/// guarded so a page carrying two footers doesn't redefine it.
+/// The single inline script backing every toggle and every sortable column.
+/// Emitted once per footer, guarded so a page carrying two footers doesn't
+/// redefine it.
 ///
 /// * `rcfmlTog(a, cls)` — flip everything in one group.
 /// * `rcfmlTogAll(a, rowCls, togCls)` — flip every group at once and re-sync
 ///   the individual toggles so their icons can't disagree with the screen.
+/// * `rcfmlSort(th, col)` — sort the table on a numeric column, toggling
+///   descending → ascending → descending. Rows move as BLOCKS: a file row drags
+///   its (collapsed) per-method sub-rows with it, and those sub-rows are sorted
+///   the same way inside the block, so the method breakdown always agrees with
+///   the direction shown in the header. Cells with no number (the query column
+///   on a method sub-row) sort last in both directions, and ties keep their
+///   original order.
 const TOGGLE_SCRIPT: &str = "<script>if(!window.rcfmlTog){\
 window.rcfmlSetTog=function(a,open){a.setAttribute('data-open',open?'1':'0');a.textContent=open?'\u{2212}':'+';};\
 window.rcfmlTog=function(a,c){\
@@ -428,7 +436,36 @@ var open=a.getAttribute('data-open')!=='1',\
 rows=document.getElementsByClassName(rc),togs=document.getElementsByClassName(tc),i;\
 for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
 for(i=0;i<togs.length;i++){window.rcfmlSetTog(togs[i],open);}\
-window.rcfmlSetTog(a,open);return false;};}</script>\n";
+window.rcfmlSetTog(a,open);return false;};\
+window.rcfmlKey=function(r,c){\
+var td=r.cells[c];if(!td)return null;\
+var t=td.textContent.replace(/,/g,'');if(t==='')return null;\
+var n=parseFloat(t);return isNaN(n)?null:n;};\
+window.rcfmlCmp=function(c,desc){return function(a,b){\
+var x=window.rcfmlKey(a.r,c),y=window.rcfmlKey(b.r,c);\
+if(x===null&&y===null)return a.i-b.i;\
+if(x===null)return 1;if(y===null)return -1;\
+if(x===y)return a.i-b.i;return desc?y-x:x-y;};};\
+window.rcfmlSort=function(th,c){\
+var t=th;while(t&&t.tagName!=='TABLE'){t=t.parentNode;}if(!t)return false;\
+var hdr=th.parentNode,ths=hdr.getElementsByTagName('th'),i,j,ind;\
+var desc=th.getAttribute('data-dir')!=='desc';\
+for(i=0;i<ths.length;i++){ths[i].removeAttribute('data-dir');\
+ind=ths[i].getElementsByClassName('rcfml-ind')[0];\
+if(ind){ind.textContent='\u{21C5}';ind.style.color='#999';}}\
+th.setAttribute('data-dir',desc?'desc':'asc');\
+ind=th.getElementsByClassName('rcfml-ind')[0];\
+if(ind){ind.textContent=desc?'\u{25BC}':'\u{25B2}';ind.style.color='';}\
+var body=t.tBodies[0]||t,rows=[],groups=[],g=null,r;\
+for(i=0;i<body.rows.length;i++){rows.push(body.rows[i]);}\
+for(i=0;i<rows.length;i++){r=rows[i];\
+if(r.cells.length&&r.cells[0].tagName==='TH')continue;\
+if(/(^|\\s)rcfml-sub(\\s|$)/.test(r.className)&&g){g.k.push({r:r,i:g.k.length});}\
+else{g={r:r,i:groups.length,k:[]};groups.push(g);}}\
+groups.sort(window.rcfmlCmp(c,desc));\
+for(i=0;i<groups.length;i++){g=groups[i];g.k.sort(window.rcfmlCmp(c,desc));\
+body.appendChild(g.r);for(j=0;j<g.k.length;j++){body.appendChild(g.k[j].r);}}\
+return false;};}</script>\n";
 
 const TOG_STYLE: &str =
     "text-decoration:none;color:#333;font-weight:bold;cursor:pointer;margin-right:4px";
@@ -447,6 +484,17 @@ fn tog_all_link(row_class: &str, tog_class: &str, title: &str) -> String {
     format!(
         "<a href=\"#\" data-open=\"0\" onclick=\"return window.rcfmlTogAll(this,'{}','{}')\" title=\"{}\" style=\"{}\">+</a>",
         row_class, tog_class, title, TOG_STYLE
+    )
+}
+
+/// A sortable column header. `col` is the cell index this header controls —
+/// clicking it sorts the table on that column, biggest-first, and clicking
+/// again flips to smallest-first. The trailing glyph is the state indicator:
+/// `⇅` idle, `▼` descending, `▲` ascending.
+fn sort_th(label: &str, col: usize) -> String {
+    format!(
+        "<th onclick=\"return window.rcfmlSort(this,{})\" title=\"sort by {}\" style=\"cursor:pointer;user-select:none\">{} <span class=\"rcfml-ind\" style=\"color:#999\">\u{21c5}</span></th>",
+        col, label, label
     )
 }
 
@@ -680,15 +728,22 @@ fn render_html(
         } else {
             String::new()
         };
+        // `app ms` used to sit between total and query; it's just total − query,
+        // and on the (common) query-free row it duplicated total exactly — so
+        // the column carried no information the eye couldn't do itself.
         s.push_str(&format!(
-            "<tr><th style=\"text-align:center;width:1em\">{}</th><th>total ms</th><th>app ms</th><th>query ms</th><th>count</th><th>avg ms</th><th>file</th></tr>\n",
-            all_toggle
+            "<tr><th style=\"text-align:center;width:1em\">{}</th>{}{}{}{}<th>file</th></tr>\n",
+            all_toggle,
+            sort_th("total ms", 1),
+            sort_th("query ms", 2),
+            sort_th("count", 3),
+            sort_th("avg ms", 4),
         ));
         for (idx, p) in pages.iter().enumerate() {
             let avg = if p.count > 0 { p.total / p.count } else { 0 };
             // Per-template query time: sum of queries issued from this file
             // (Lucee's per-page Query column), including any clipped from the
-            // Queries list by maxRecords. `app` = total − query.
+            // Queries list by maxRecords. Whatever's left of `total` is app time.
             let q_us: i64 = data
                 .queries
                 .iter()
@@ -700,7 +755,6 @@ fn render_html(
                     .get(&p.id)
                     .copied()
                     .unwrap_or(0);
-            let app_us = (p.total - q_us).max(0);
             // Files with a method breakdown get a `+` toggle in the leading
             // column; everything else gets an empty cell so the grid lines up.
             let grp = format!("rcfml-m{}", idx);
@@ -714,10 +768,9 @@ fn render_html(
                 )
             };
             s.push_str(&format!(
-                "<tr><td style=\"text-align:center;width:1em\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+                "<tr><td style=\"text-align:center;width:1em\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
                 toggle,
                 fmt_us(p.total),
-                fmt_us(app_us),
                 fmt_us(q_us),
                 p.count,
                 fmt_us(avg),
@@ -730,8 +783,11 @@ fn render_html(
             // otherwise be unreadable), revealed per file by the `+` above.
             for m in &p.methods {
                 let m_avg = if m.count > 0 { m.total / m.count } else { 0 };
+                // `rcfml-sub` marks the row as belonging to the file row above
+                // it, so a header-click sort moves the pair together and orders
+                // the methods the same way (see `rcfmlSort`).
                 s.push_str(&format!(
-                    "<tr class=\"{} rcfml-mrow\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td></td><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td style=\"padding-left:22px\">&#8627; {}()</td></tr>\n",
+                    "<tr class=\"{} rcfml-mrow rcfml-sub\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td style=\"padding-left:22px\">&#8627; {}()</td></tr>\n",
                     grp,
                     fmt_us(m.total),
                     m.count,
@@ -1279,6 +1335,42 @@ mod tests {
         assert!(html.contains("window.rcfmlTog(this.getElementsByTagName('a')[0],'rcfml-queries')"));
         assert!(html.contains("<div class=\"rcfml-files\" style=\"display:none\">"));
         assert!(html.contains("<div class=\"rcfml-queries\" style=\"display:none\">"));
+    }
+
+    #[test]
+    fn files_table_is_sortable_and_has_no_app_column() {
+        let html = sample_collector().render(&[], Some("/index.cfm"), &[]);
+        // `app ms` is gone — it was always total − query, and identical to
+        // total on the many rows that ran no query.
+        assert!(!html.contains("app ms"));
+        // Every numeric column heading sorts, in cell-index order, and carries
+        // the idle direction indicator.
+        for (label, col) in [("total ms", 1), ("query ms", 2), ("count", 3), ("avg ms", 4)] {
+            assert!(
+                html.contains(&format!(
+                    "<th onclick=\"return window.rcfmlSort(this,{col})\" title=\"sort by {label}\""
+                )),
+                "{label} header is not sortable"
+            );
+        }
+        assert_eq!(
+            html.matches("class=\"rcfml-ind\"").count(),
+            4,
+            "one direction indicator per sortable column"
+        );
+        assert!(html.contains("window.rcfmlSort=function"));
+        // Method rows are tagged as sub-rows so a sort drags them along with
+        // their file row instead of stranding them under a stranger.
+        assert_eq!(html.matches("rcfml-mrow rcfml-sub").count(), 2);
+        // Data rows are 6 cells wide, matching the 6 headers.
+        let file_row = html
+            .split("<tr>")
+            .find(|r| r.starts_with("<td style=\"text-align:center;width:1em\">"))
+            .expect("a file row")
+            .split("</tr>")
+            .next()
+            .unwrap();
+        assert_eq!(file_row.matches("<td").count(), 6, "row: {file_row}");
     }
 
     #[test]

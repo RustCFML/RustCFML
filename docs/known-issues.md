@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.609.0**.
+What RustCFML **does not fully do**, as of **v0.610.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§27`, …) are permanent IDs — they are cited from commits and issues, so
