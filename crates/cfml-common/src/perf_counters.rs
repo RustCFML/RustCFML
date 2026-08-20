@@ -385,7 +385,7 @@ pub mod op_census {
 pub mod call_phases {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub const N: usize = 29;
+    pub const N: usize = 32;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -554,6 +554,104 @@ pub mod call_phases {
             g(&WB_MAX_ARGKEYS),
             g(&WB_MAX_PROBES),
             g(&WB_MAX_PRODUCT),
+        )
+    }
+
+    /// Phase-4 sub-split census (arguments scope + param binding + required
+    /// check). Same design as the phase-8 split that found `arg_sources`: the
+    /// EXACT frequencies decide, the three sub-timers (phases 29-31) only
+    /// corroborate — at a ~17 ns clock floor a fine-grained split of a ~230 ns
+    /// phase measures its own instrument.
+    ///
+    /// The suspects, in code order:
+    ///  - two `global_id`-keyed HashMap memo probes (`arguments_scope_needed`,
+    ///    `arguments_scope_can_skip_tracking`) — SipHash per probe, per call,
+    ///    for bits that are pure functions of the bytecode (codegen could
+    ///    precompute both);
+    ///  - the eager `ValueMap::with_capacity` allocation;
+    ///  - the param-binding loop (+ a SECOND full loop for the required check);
+    ///  - the `arguments_params_cache` probe + markers on the eager tail;
+    ///  - the `CfmlStruct` alloc, tracked (cycle-GC log) vs untracked.
+    /// Calls that consulted the `arguments_scope_needed` memo (i.e. were not
+    /// short-circuited by template-frame / overflow-args).
+    pub static P4_NEEDED_PROBES: AtomicU64 = AtomicU64::new(0);
+    /// Calls that additionally consulted the Lever-C untracking memo.
+    pub static P4_UNTRACK_PROBES: AtomicU64 = AtomicU64::new(0);
+    /// Declared params iterated (NOTE: the binding loop and the required-check
+    /// loop each iterate all of them — the per-call work is 2x this rate).
+    pub static P4_PARAMS_ITER: AtomicU64 = AtomicU64::new(0);
+    /// Of those, actually supplied by the caller (bound into locals).
+    pub static P4_PARAMS_SUPPLIED: AtomicU64 = AtomicU64::new(0);
+    /// Supplied params that carried a declared type and ran the type check.
+    pub static P4_TYPECHECKS: AtomicU64 = AtomicU64::new(0);
+    /// Eager frames that probed `arguments_params_cache` (declared params > 0).
+    pub static P4_MARKER_PROBES: AtomicU64 = AtomicU64::new(0);
+    /// Eager arguments structs allocated tracked (cycle-GC logged) vs
+    /// untracked (Lever C fired).
+    pub static P4_STRUKT_TRACKED: AtomicU64 = AtomicU64::new(0);
+    pub static P4_STRUKT_UNTRACKED: AtomicU64 = AtomicU64::new(0);
+    /// `__main__` frames that seeded arguments from the parent (include bridge).
+    pub static P4_MAIN_SEEDS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn bump_p4_needed_probe() {
+        P4_NEEDED_PROBES.fetch_add(1, Relaxed);
+    }
+    #[inline]
+    pub fn bump_p4_untrack_probe() {
+        P4_UNTRACK_PROBES.fetch_add(1, Relaxed);
+    }
+    /// One call per frame, after the binding loop — aggregates locally first so
+    /// the loop body stays free of atomics.
+    #[inline]
+    pub fn record_p4_binding(params: u64, supplied: u64, typechecks: u64) {
+        P4_PARAMS_ITER.fetch_add(params, Relaxed);
+        P4_PARAMS_SUPPLIED.fetch_add(supplied, Relaxed);
+        P4_TYPECHECKS.fetch_add(typechecks, Relaxed);
+    }
+    #[inline]
+    pub fn record_p4_eager_tail(marker_probe: bool, untracked: bool, main_seed: bool) {
+        if marker_probe {
+            P4_MARKER_PROBES.fetch_add(1, Relaxed);
+        }
+        if untracked {
+            P4_STRUKT_UNTRACKED.fetch_add(1, Relaxed);
+        } else {
+            P4_STRUKT_TRACKED.fetch_add(1, Relaxed);
+        }
+        if main_seed {
+            P4_MAIN_SEEDS.fetch_add(1, Relaxed);
+        }
+    }
+
+    pub fn p4_report() -> String {
+        let g = |c: &AtomicU64| c.load(Relaxed);
+        let calls = CALLS.load(Relaxed).max(1);
+        let pct = |v: u64| v as f64 / calls as f64 * 100.0;
+        let eager = (g(&P4_STRUKT_TRACKED) + g(&P4_STRUKT_UNTRACKED)).max(1);
+        format!(
+            "--- phase 4 sub-split census ({} frames) ---\n\
+             needed-memo probes (HashMap):  {:>12}  ({:.1}% of frames)\n\
+             untrack-memo probes (HashMap): {:>12}  ({:.1}%)\n\
+             params iterated / frame:       {:>12}  ({:.2} — x2: bind + required loops)\n\
+               .. supplied (bound):         {:>12}  ({:.2}/frame)\n\
+               .. type-checked:             {:>12}\n\
+             eager tails:                   {:>12}  ({:.1}% of frames)\n\
+               .. marker-cache probes:      {:>12}  ({:.1}% of eager)\n\
+               .. strukt tracked (GC log):  {:>12}  ({:.1}% of eager)\n\
+               .. strukt untracked:         {:>12}\n\
+               .. __main__ parent seeds:    {:>12}",
+            calls,
+            g(&P4_NEEDED_PROBES), pct(g(&P4_NEEDED_PROBES)),
+            g(&P4_UNTRACK_PROBES), pct(g(&P4_UNTRACK_PROBES)),
+            g(&P4_PARAMS_ITER), g(&P4_PARAMS_ITER) as f64 / calls as f64,
+            g(&P4_PARAMS_SUPPLIED), g(&P4_PARAMS_SUPPLIED) as f64 / calls as f64,
+            g(&P4_TYPECHECKS),
+            eager, pct(eager),
+            g(&P4_MARKER_PROBES), g(&P4_MARKER_PROBES) as f64 / eager as f64 * 100.0,
+            g(&P4_STRUKT_TRACKED), g(&P4_STRUKT_TRACKED) as f64 / eager as f64 * 100.0,
+            g(&P4_STRUKT_UNTRACKED),
+            g(&P4_MAIN_SEEDS),
         )
     }
 

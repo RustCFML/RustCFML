@@ -180,6 +180,25 @@ pub struct BytecodeFunction {
     /// call; going through these means neither hashes, and binding inserts by
     /// cloning a key instead of allocating a `String`.
     pub param_keys: std::sync::OnceLock<Vec<cfml_common::key::Key>>,
+    /// Whether the body can observe the `arguments` scope (bare load, string
+    /// form, include, custom tag) — decides the eager-vs-lazy arguments build.
+    /// Computed ONCE per process from the bytecode (the analysis lives in the
+    /// VM, which is why this is a lazy cell rather than a `finalize()` field);
+    /// previously a per-VM `HashMap<global_id, bool>` re-scanned and re-probed
+    /// (SipHash) every request — ~0.9 probes per frame on a warm Preside
+    /// render, plus a full instruction re-scan per function per request.
+    pub args_needed: std::sync::OnceLock<bool>,
+    /// Lever C: whether the eager `arguments` struct provably cannot escape
+    /// the frame (⇒ allocated untracked, skipping cycle-GC logging). Same
+    /// once-per-process pattern as `args_needed`, for the same reason.
+    pub args_never_escapes: std::sync::OnceLock<bool>,
+    /// The `__arguments_params` positional-marker array (declared param names
+    /// as a CfmlArray), built once per process on first eager call. Previously
+    /// a per-VM `HashMap<global_id, CfmlValue>` — one more SipHash probe per
+    /// eager call, rebuilt every request. Shared exactly as widely as the
+    /// per-request cache shared it within a request: the marker is filtered
+    /// from user-visible introspection, so nothing can mutate it.
+    pub params_marker: std::sync::OnceLock<cfml_common::dynamic::CfmlValue>,
     /// Which params are required (parallel to `params`; true = required)
     pub required_params: Vec<bool>,
     /// Which params declare a default value (parallel to `params`; true = has
@@ -1412,6 +1431,9 @@ impl CfmlCompiler {
                     name: "__main__".to_string(),
                     params: Vec::new(),
                     param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: Vec::new(),
@@ -4018,6 +4040,9 @@ impl CfmlCompiler {
             name: func.name.clone(),
             params: func.params.iter().map(|p| p.name.clone()).collect(),
             param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
@@ -4297,6 +4322,9 @@ impl CfmlCompiler {
                     name: getter_name.clone(),
                     params: Vec::new(),
                     param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
@@ -4389,6 +4417,9 @@ impl CfmlCompiler {
                     name: setter_name.clone(),
                     params: vec![prop.name.clone()],
                     param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
                     required_params: vec![true],
                     has_default: vec![false],
                     instructions: setter_instructions,
@@ -4571,6 +4602,9 @@ impl CfmlCompiler {
                 name: "__cfc_static_init__".to_string(),
                 params: Vec::new(),
                 param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
                 required_params: Vec::new(),
                 has_default: Vec::new(),
                 instructions: static_instrs,
@@ -5566,6 +5600,9 @@ impl CfmlCompiler {
                     name: func_name.clone(),
                     params: closure.params.iter().map(|p| p.name.clone()).collect(),
                     param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
@@ -5651,6 +5688,9 @@ impl CfmlCompiler {
                     name: func_name.clone(),
                     params: arrow.params.iter().map(|p| p.name.clone()).collect(),
                     param_keys: Default::default(),
+                    args_needed: Default::default(),
+                    args_never_escapes: Default::default(),
+                    params_marker: Default::default(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,

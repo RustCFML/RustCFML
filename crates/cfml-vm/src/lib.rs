@@ -2331,42 +2331,9 @@ pub struct CfmlVirtualMachine {
     /// to the max `global_id` seen, i.e. the app's distinct-function count (cached
     /// programs reuse ids), not per-request growth.
     fn_registry: Vec<Option<Arc<BytecodeFunction>>>,
-    /// v0.442 (call-dispatch Lever 2) — memoized `__arguments_params` marker
-    /// array per function (`global_id` → the immutable `CfmlValue::Array` of
-    /// declared param-name strings). Built once and Arc-cloned into each call's
-    /// `arguments` scope, replacing the per-call rebuild (a `Vec` + one
-    /// `String` clone per param + a fresh `CfmlArray`) that ran on EVERY call.
-    /// The marker is a read-only engine sentinel — filtered out of every struct
-    /// introspection path (`structKeyList`/for-in/`structKeyExists`/append/
-    /// delete/dump/serialize) and only ever *read* by the two positional-access
-    /// sites — so sharing one backing `Arc` across invocations is safe. Keyed
-    /// by the process-stable `global_id`, so a cached entry stays valid across
-    /// requests in serve mode (a function's declared param names never change).
-    /// Paramless functions store nothing (the marker is omitted entirely —
-    /// absent is indistinguishable from an empty array at both read sites).
-    arguments_params_cache: HashMap<u32, CfmlValue>,
-    /// Call-dispatch Lever A — memoized per-function decision (`global_id` →
-    /// bool) of whether this function's `arguments` scope is ever OBSERVABLE.
-    /// Most functions use named params (read via `local`/bare names, which are
-    /// copied into `locals`) and never touch the `arguments` scope at all; for
-    /// those we skip building the per-call `arguments` `CfmlStruct` entirely
-    /// (one `Arc<RwLock<StructInner>>` heap alloc + a cycle-GC `log_push` in
-    /// serve mode, per call). The scope is built eagerly (unchanged behavior)
-    /// only when the body could observe it: an explicit `arguments` reference,
-    /// a `cfinclude` (the included template may read the caller's arguments —
-    /// GH #158), a custom-tag/`cfmodule` invocation (bridges the caller's
-    /// arguments into the tag frame), or — decided per-call, not cached — the
-    /// presence of overflow/extra args (values that live ONLY in the arguments
-    /// scope, e.g. ColdBox `rc`/`prc`) or a template frame. Keyed by the
-    /// process-stable `global_id`: a function's bytecode never changes, so a
-    /// cached entry stays valid across requests in serve mode.
-    arguments_scope_needed_cache: HashMap<u32, bool>,
-    /// Memoized companion to `arguments_scope_needed_cache` for call-dispatch
-    /// Lever C: `true` when the eagerly-built `arguments` scope struct provably
-    /// CANNOT escape its call frame, so it may be allocated *untracked* (skipping
-    /// the per-alloc cycle-GC `log_struct` / `LocalKey::with`). Keyed by the same
-    /// process-stable `global_id`. See `arguments_scope_can_skip_tracking`.
-    arguments_scope_untracked_cache: HashMap<u32, bool>,
+    /// (The v0.442/Lever-A/Lever-C per-VM memo caches that lived here moved
+    /// onto `BytecodeFunction` itself as `OnceLock` fields — computed once per
+    /// PROCESS instead of probed via SipHash per call and rebuilt per request.)
     /// Set whenever a `DefineFunction` op runs during a request. A new
     /// `CfmlValue::Function` can ONLY be born via that op (closures, arrows,
     /// component methods, and function references all compile to it), so if it
@@ -3173,9 +3140,6 @@ impl CfmlVirtualMachine {
             app_fn_gids: Vec::new(),
             pending_app_fns: Vec::new(),
             fn_registry: Vec::new(),
-            arguments_params_cache: HashMap::new(),
-            arguments_scope_needed_cache: HashMap::new(),
-            arguments_scope_untracked_cache: HashMap::new(),
             app_fn_table_dirty: false,
             cache: HashMap::new(),
             cache_hits: 0,
@@ -6274,12 +6238,11 @@ impl CfmlVirtualMachine {
     /// Memoized wrapper over [`function_needs_arguments_scope`], keyed by the
     /// process-stable `global_id` (a function's bytecode never changes).
     fn arguments_scope_needed(&mut self, func: &BytecodeFunction) -> bool {
-        if let Some(&b) = self.arguments_scope_needed_cache.get(&func.global_id) {
-            return b;
-        }
-        let b = Self::function_needs_arguments_scope(&func.instructions);
-        self.arguments_scope_needed_cache.insert(func.global_id, b);
-        b
+        // Once per PROCESS (the program is shared), then an atomic load — this
+        // replaced a per-VM HashMap that re-scanned and re-hashed every request.
+        *func
+            .args_needed
+            .get_or_init(|| Self::function_needs_arguments_scope(&func.instructions))
     }
 
     /// Call-dispatch **Lever C**: decide, from a function's bytecode alone,
@@ -6359,12 +6322,9 @@ impl CfmlVirtualMachine {
     /// Memoized wrapper over [`Self::arguments_scope_never_escapes`], keyed by the
     /// process-stable `global_id`.
     fn arguments_scope_can_skip_tracking(&mut self, func: &BytecodeFunction) -> bool {
-        if let Some(&b) = self.arguments_scope_untracked_cache.get(&func.global_id) {
-            return b;
-        }
-        let b = Self::arguments_scope_never_escapes(&func.instructions);
-        self.arguments_scope_untracked_cache.insert(func.global_id, b);
-        b
+        *func
+            .args_never_escapes
+            .get_or_init(|| Self::arguments_scope_never_escapes(&func.instructions))
     }
 
     /// Lever D1: take a per-call `locals` map from the free-list (pre-sized to
@@ -6839,10 +6799,15 @@ impl CfmlVirtualMachine {
                 .pending_extra_named_args
                 .as_ref()
                 .is_some_and(|e| !e.is_empty());
+        #[cfg(feature = "call-phases")]
+        let _p4_needed_probe = !is_template_frame && !has_overflow_args;
         let build_arguments_eager =
             is_template_frame || has_overflow_args || self.arguments_scope_needed(func);
         #[cfg(feature = "call-phases")]
         {
+            if _p4_needed_probe {
+                cfml_common::perf_counters::call_phases::bump_p4_needed_probe();
+            }
             cfml_common::perf_counters::call_phases::bump_calls_args(build_arguments_eager);
             if build_arguments_eager {
                 cfml_common::perf_counters::call_phases::bump_eager_reason(
@@ -6860,7 +6825,11 @@ impl CfmlVirtualMachine {
             && build_arguments_eager
             && !is_template_frame
             && !has_overflow_args
-            && self.arguments_scope_can_skip_tracking(func);
+            && {
+                #[cfg(feature = "call-phases")]
+                cfml_common::perf_counters::call_phases::bump_p4_untrack_probe();
+                self.arguments_scope_can_skip_tracking(func)
+            };
         // Pre-size (eager only): one entry per bound/overflow arg (whichever is
         // larger) plus the two `__arguments_*` markers. In the skip path this
         // stays an empty map that never allocates and is dropped unused.
@@ -6891,6 +6860,14 @@ impl CfmlVirtualMachine {
                 Default::default(),
             ))
         };
+        #[cfg(feature = "call-phases")]
+        let mut _p4_t = {
+            // phase 29: eagerness decision (memo probes) + containers alloc
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                29, _n.duration_since(_cp_t).as_nanos() as u64);
+            _n
+        };
         // Lucee/ACF/BoxLang: a value bound to a declared parameter appears in
         // the `arguments` scope under its parameter NAME — never under its
         // 1-based positional index. Positional access (`arguments[1]`) still
@@ -6902,6 +6879,8 @@ impl CfmlVirtualMachine {
         // hashing and the insert clones a key instead of allocating a `String`
         // per parameter per call (the phase-4b cost).
         let param_keys = func.param_keys();
+        #[cfg(feature = "call-phases")]
+        let (mut _p4_supplied, mut _p4_typechecks) = (0u64, 0u64);
         for (i, param_name) in func.params.iter().enumerate() {
             inherited_or_param_keys.insert(param_name);
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
@@ -6925,7 +6904,15 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
+                        #[cfg(feature = "call-phases")]
+                        {
+                            _p4_typechecks += 1;
+                        }
                         self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                    }
+                    #[cfg(feature = "call-phases")]
+                    {
+                        _p4_supplied += 1;
                     }
                     locals.insert(param_keys[i].clone(), value.clone());
                     if build_arguments_eager {
@@ -6963,6 +6950,16 @@ impl CfmlVirtualMachine {
                 ))));
             }
         }
+        #[cfg(feature = "call-phases")]
+        {
+            // phase 30: param binding loop + required-check loop
+            cfml_common::perf_counters::call_phases::record_p4_binding(
+                func.params.len() as u64, _p4_supplied, _p4_typechecks);
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                30, _n.duration_since(_p4_t).as_nanos() as u64);
+            _p4_t = _n;
+        }
         if build_arguments_eager {
             // Extras: named args from the callsite that didn't match a declared
             // param. Take the pending list (set by the named-args reorder) so a
@@ -6997,10 +6994,9 @@ impl CfmlVirtualMachine {
             // a `Vec` + one `String` clone per param + a fresh `CfmlArray` on every
             // single call.
             if !func.params.is_empty() {
-                let params_marker = self
-                    .arguments_params_cache
-                    .entry(func.global_id)
-                    .or_insert_with(|| {
+                let params_marker = func
+                    .params_marker
+                    .get_or_init(|| {
                         CfmlValue::array(
                             func.params
                                 .iter()
@@ -7020,9 +7016,15 @@ impl CfmlVirtualMachine {
             // reference would silently render blank (GitHub issue #158). Seed this
             // frame's `arguments` from the parent's so those entries are visible;
             // our freshly-built markers/params take precedence.
+            #[cfg(feature = "call-phases")]
+            let mut _p4_main_seed = false;
             if func.name == "__main__" {
                 if let Some(parent) = parent_scope {
                     if let Some(CfmlValue::Struct(parent_args)) = parent.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+                        #[cfg(feature = "call-phases")]
+                        {
+                            _p4_main_seed = true;
+                        }
                         for (k, v) in parent_args.snapshot() {
                             if !arguments_map.contains_key(&k) {
                                 arguments_map.insert(k, v);
@@ -7040,6 +7042,9 @@ impl CfmlVirtualMachine {
                     CfmlValue::strukt(arguments_map)
                 },
             );
+            #[cfg(feature = "call-phases")]
+            cfml_common::perf_counters::call_phases::record_p4_eager_tail(
+                !func.params.is_empty(), untrack_arguments_scope, _p4_main_seed);
         } else {
             // Skip path: the arguments scope is unobservable this call, so no
             // `CfmlStruct` is built. Still drain the extra-named-args handoff so
@@ -7050,8 +7055,11 @@ impl CfmlVirtualMachine {
 
         #[cfg(feature = "call-phases")]
         {
-            // phase 4: arguments scope build + param binding + required check
+            // phase 31: eager tail (extras, markers, __main__ seed, strukt+GC)
             let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                31, _n.duration_since(_p4_t).as_nanos() as u64);
+            // phase 4 (parent): the whole window, inflated by the 3 sub-clocks
             cfml_common::perf_counters::call_phases::add(
                 4, _n.duration_since(_cp_t).as_nanos() as u64);
             _cp_t = _n;

@@ -67,24 +67,37 @@ fn resolve<'a>(declared: &'a str) -> Target<'a> {
     if let Some(inner) = t.strip_suffix("[]") {
         return Target::TypedArray(inner);
     }
-    match t.to_ascii_lowercase().as_str() {
-        "" | "any" => Target::Any,
-        "string" => Target::Str,
-        "numeric" | "number" => Target::Numeric,
-        "boolean" | "bool" => Target::Boolean,
-        "date" | "datetime" | "time" => Target::DateTime,
-        "timespan" => Target::TimeSpan,
-        "array" => Target::Array,
-        "struct" => Target::Struct,
-        "query" => Target::Query,
-        "binary" => Target::Binary,
-        "xml" => Target::Xml,
-        "function" => Target::Function,
-        "uuid" => Target::Uuid,
-        "guid" => Target::Guid,
-        "variablename" => Target::VariableName,
-        "component" | "object" => Target::AnyComponent,
-        "void" => Target::Void,
+    // Allocation-free keyword match. This runs per supplied typed parameter on
+    // the hot call path (Preside: ~4,900 checks/render), where the previous
+    // `to_ascii_lowercase()` was a heap alloc per call — and `satisfies` used
+    // to resolve twice more, tripling it. The longest keyword is
+    // "variablename" (12 bytes); anything longer is a component path by
+    // definition, so a 16-byte stack buffer covers every keyword.
+    if t.len() > 16 {
+        return Target::ComponentPath;
+    }
+    let mut buf = [0u8; 16];
+    for (i, b) in t.bytes().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    match &buf[..t.len()] {
+        b"" | b"any" => Target::Any,
+        b"string" => Target::Str,
+        b"numeric" | b"number" => Target::Numeric,
+        b"boolean" | b"bool" => Target::Boolean,
+        b"date" | b"datetime" | b"time" => Target::DateTime,
+        b"timespan" => Target::TimeSpan,
+        b"array" => Target::Array,
+        b"struct" => Target::Struct,
+        b"query" => Target::Query,
+        b"binary" => Target::Binary,
+        b"xml" => Target::Xml,
+        b"function" => Target::Function,
+        b"uuid" => Target::Uuid,
+        b"guid" => Target::Guid,
+        b"variablename" => Target::VariableName,
+        b"component" | b"object" => Target::AnyComponent,
+        b"void" => Target::Void,
         _ => Target::ComponentPath,
     }
 }
@@ -268,11 +281,12 @@ pub fn satisfies(value: &CfmlValue, declared: &str, env: &Env<'_>) -> bool {
     //
     // Resolved for every target EXCEPT `array`, which keeps accepting the raw
     // QueryColumn as it always did, so nothing that passed before now fails.
-    let value = match resolve(declared) {
+    let target = resolve(declared);
+    let value = match &target {
         Target::Array => value,
         _ => value.query_column_scalar(),
     };
-    match resolve(declared) {
+    match target {
         Target::Any => true,
         // Simple values only. Binary is accepted (Lucee casts bytes to a
         // string); every container, component and function is not.
