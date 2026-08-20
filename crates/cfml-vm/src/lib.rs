@@ -8302,12 +8302,6 @@ impl CfmlVirtualMachine {
                         .builtin_lookup_ci(name.as_str(), &name_lower)
                         .and_then(|(canonical, _)| self.globals.get(canonical))
                         .cloned()
-                        .or_else(|| {
-                            self.globals
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                                .map(|(_, v)| v.clone())
-                        })
                     {
                         stack.push(val);
                     // 3. Check builtins/user_functions (exact, then CI). The
@@ -20797,19 +20791,16 @@ impl CfmlVirtualMachine {
         if let Some(v) = self.globals.get(name) {
             return Some(v.clone());
         }
-        if let Some((_, v)) = locals
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
-        {
-            return Some(v.clone());
-        }
-        if let Some((_, v)) = self
-            .globals
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
-        {
-            return Some(v.clone());
-        }
+        // NO case-insensitive fallback scan here. Both `locals` and `globals`
+        // are `ValueMap`s keyed by an interned `Key`, whose equality already
+        // folds ASCII case (v0.599) — so the probes above answer every casing
+        // the two `.iter().find(eq_ignore_ascii_case)` sweeps that used to sit
+        // here could ever have answered. Counted on live Preside (boot + 30
+        // renders): they ran 5,358 times each, walked 3,934,578 entries, and
+        // found something ZERO times. Removing them is ~0.2% on framework-style
+        // code (below the noise floor) but ~4x on the call cost of bare
+        // user-function calls, where the scan covered all ~730 seeded builtins
+        // plus every page variable on every call.
         // CFML unscoped scope cascade: after local -> arguments -> variables, a
         // bare name falls through to the request web scopes (Lucee "standard"
         // cascading: cgi -> url -> form -> cookie). This is how Preside's

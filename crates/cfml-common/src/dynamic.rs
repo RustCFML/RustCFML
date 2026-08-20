@@ -1678,13 +1678,17 @@ pub enum CfmlValue {
     /// `CfmlVirtualMachine::register_native_class`. Method dispatch goes
     /// through the `CfmlNative` trait.
     NativeObject(Arc<RwLock<dyn CfmlNative>>),
-    /// Flyweight CFC instance (Phase C.2 prototype, feature-gated OFF by
-    /// default). A thin per-instance value sharing its class-invariant bulk
-    /// (methods + metadata) via an `Arc<ClassBlueprint>`, replacing the marker
-    /// `Struct` representation for allowlisted classes. When the
-    /// `component-instance` feature is off this variant does not exist, so a
-    /// default build is byte-identical and no match arm changes. See
-    /// COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
+    /// Flyweight CFC instance: a thin per-instance value sharing its
+    /// class-invariant bulk (methods + metadata) via an `Arc<ClassBlueprint>`,
+    /// replacing the marker `Struct` representation.
+    ///
+    /// Gated on the `component-instance` feature, which has been **ON by
+    /// default for native builds since v0.519.0** (`90cf11dd`) — the two flip
+    /// blockers were an `Instance`↔`Instance` cycle-GC leak and a Wheels boot
+    /// failure via the `variables.this` alias, both fixed in v0.517–518. The
+    /// gate is kept so the wasm targets (which omit it) and a bisect can still
+    /// build the marker representation; with the feature off this variant does
+    /// not exist and no match arm changes.
     #[cfg(feature = "component-instance")]
     Instance(crate::component::InstanceRef),
 }

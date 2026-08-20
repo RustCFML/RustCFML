@@ -22,7 +22,8 @@
 use crate::dynamic::{CfmlStruct, CfmlValue};
 
 // ---------------------------------------------------------------------------
-// Phase C.2 prototype: flyweight backing (feature-gated, OFF by default).
+// Flyweight backing (`component-instance` feature — default-ON for native
+// builds since v0.519.0; off for wasm targets).
 //
 // `ClassBlueprint` is built once per CFC and shared (Arc) across ALL instances;
 // `Instance` is the thin per-instance value. The current marker-struct
