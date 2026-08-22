@@ -7194,6 +7194,20 @@ impl CfmlVirtualMachine {
             // it can't leak into the next call (it is empty here — any extras
             // would have set `has_overflow_args` and taken the eager path).
             self.pending_extra_named_args.take();
+            // INVARIANT: `locals[__arguments_scope]` is always THIS frame's own
+            // scope, never the caller's. The eager branch above guarantees that
+            // by construction; on this lazy path the parent copy-in may have
+            // carried the CALLER's arguments struct in as an ordinary data key,
+            // and a `CfmlStruct` is an Arc handle — so every downstream site
+            // that treats the key as "my arguments" was reading, and worse
+            // WRITING, the caller's scope. `function f( numeric n ){ n = 7; }`
+            // called with no argument took StoreLocal's param→arguments sync
+            // straight into the caller's struct, leaving `n` readable in the
+            // caller and inherited by the next callee — Lucee 7.0.5 throws
+            // `variable [N] doesn't exist` there. Drop the inherited handle so
+            // the lazy frame is honestly argument-scope-less; `arguments_supplied`
+            // is the authority for presence on this path.
+            locals.shift_remove(&*cfml_common::key::well_known::ARGUMENTS_SCOPE);
         }
 
         #[cfg(feature = "call-phases")]
