@@ -1051,6 +1051,23 @@ pub enum BytecodeOp {
     Include(String),  // Include and execute a file (static path)
     IncludeDynamic,   // Include: pop path from stack (dynamic expression)
 
+    /// Compile-time-bound builtin call: args are already on the stack, the
+    /// (already-lowercased) builtin name is baked in. Replaces the
+    /// `LoadGlobal(name)` + `Call(n)` pair for pure, non-VM-intercepted
+    /// builtins.
+    ///
+    /// This is the shape Lucee emits: it resolves a BIF's implementing class and
+    /// arg types at COMPILE time and emits a typed direct call — "no name
+    /// lookup, no Object[], no map probe at runtime"
+    /// (`VariableImpl._writeOutFirstBIF`). Ours still probes one lowercase index,
+    /// but skips the `LoadGlobal` op, the locals/__variables/globals chain walk,
+    /// the per-call `to_lowercase` HEAP ALLOCATION, and the ~825-line intercept
+    /// chain in `call_function`.
+    ///
+    /// Only names that `cfml_common::builtins_meta::is_pure_builtin` accepts are
+    /// lowered — registered builtins the VM never intercepts. Named/spread args never lower.
+    CallBuiltin(Name, u8),
+
     // Null handling
     IsNull,                // Pop value, push bool (true if Null)
     JumpIfNotNull(usize),  // Pop value, jump if not null (pushes value back)
@@ -1294,11 +1311,12 @@ impl BytecodeOp {
             Self::ArrayAppendSlot(..) => 118,
             Self::CallNamed(..) => 119,
             Self::CallRustSuperCtor(..) => 120,
+            Self::CallBuiltin(..) => 121,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 121] = [
+    pub const CENSUS_NAMES: [&'static str; 122] = [
         "Null",
         "True",
         "False",
@@ -1420,7 +1438,25 @@ impl BytecodeOp {
         "ArrayAppendSlot",
         "CallNamed",
         "CallRustSuperCtor",
+        "CallBuiltin",
     ];
+}
+
+/// True if `name` is a registered builtin the VM does not intercept, i.e. safe to bind at
+/// compile time via [`BytecodeOp::CallBuiltin`].
+///
+/// This replaced a hand-curated 19-name allowlist. The curated list could only ever cover
+/// names someone had personally verified against `call_function`'s 7,496-line intercept
+/// chain — and that chain contains traps: `arrayFindNoCase` looks exactly like a pure list
+/// helper and IS intercepted. Deriving the answer from
+/// [`cfml_common::builtins_meta`] covers all ~541 non-intercepted builtins instead of 19,
+/// and both of its lists are guarded by tests against the real registration table and the
+/// real chain, so they cannot silently rot.
+#[inline]
+fn is_direct_builtin(name: &str) -> bool {
+    // `name` arrives in source casing; the declared lists are lowercase.
+    let lower = name.to_ascii_lowercase();
+    cfml_common::builtins_meta::is_pure_builtin(&lower)
 }
 
 impl CfmlCompiler {
@@ -5297,6 +5333,33 @@ impl CfmlCompiler {
                     }
                     instructions.push(BytecodeOp::CallNamed(names, call.arguments.len()));
                 } else {
+                    // Compile-time-bound builtin: skip the LoadGlobal + generic
+                    // Call dispatch entirely. Preside's warm admin render makes
+                    // 33,484 builtin calls, 62% of them type/existence
+                    // predicates (structKeyExists alone is 28%), and Part 1
+                    // measured the cost as the CALL BOUNDARY (~105-150 ns) not
+                    // the body — the worst Lucee ratios are on body-free
+                    // predicates. Same shape Lucee emits (see
+                    // `VariableImpl._writeOutFirstBIF`).
+                    let direct = match &*call.name {
+                        Expression::Identifier(ident)
+                            if call.arguments.len() <= u8::MAX as usize
+                                && is_direct_builtin(&ident.name) =>
+                        {
+                            Some(ident.name.to_lowercase())
+                        }
+                        _ => None,
+                    };
+                    if let Some(lower) = direct {
+                        for arg in &call.arguments {
+                            self.compile_expression(arg, instructions);
+                        }
+                        instructions.push(BytecodeOp::CallBuiltin(
+                            Name::from(&lower),
+                            call.arguments.len() as u8,
+                        ));
+                        return;
+                    }
                     // Push function reference first
                     if let Expression::Identifier(ident) = &*call.name {
                         instructions.push(BytecodeOp::LoadGlobal(Name::from(&ident.name)));

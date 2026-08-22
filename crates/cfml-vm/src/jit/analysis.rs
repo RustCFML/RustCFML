@@ -633,6 +633,18 @@ pub fn analyze(
                 // candidate. The actual cache binding is resolved by the
                 // udf_resolver at the matching Call(n) when arg kinds are
                 // known. Names that match neither reject the function.
+                // v0.614.0 — compile-time-bound builtin call. Same admission
+                // rule as `LoadGlobal(builtin)` + `Call(n)`: the name must be
+                // shim-backed, otherwise the function is rejected (there is no
+                // UDF fallback — codegen only emits this for real builtins).
+                BytecodeOp::CallBuiltin(name, _) => {
+                    match builtins::canonical_name(name.as_str()) {
+                        Some(n) => {
+                            referenced_builtins.insert(n);
+                        }
+                        None => return None,
+                    }
+                }
                 BytecodeOp::LoadGlobal(name) => {
                     if let Some(n) = builtins::canonical_name(name) {
                         referenced_builtins.insert(n);
@@ -1152,7 +1164,25 @@ fn simulate_block(
                     stack.push(Kind::UdfRef(idx));
                 }
             }
-            BytecodeOp::Call(n) => {
+            // `CallBuiltin(name, n)` is `LoadGlobal(name)` + `Call(n)` fused, so
+            // it arrives WITHOUT the fn-ref marker this arm expects. Synthesize
+            // the marker underneath the args and share the identical body rather
+            // than duplicating overload resolution.
+            BytecodeOp::Call(_) | BytecodeOp::CallBuiltin(..) => {
+                let n = match &code[ip] {
+                    BytecodeOp::Call(n) => *n,
+                    BytecodeOp::CallBuiltin(name, argc) => {
+                        let argc = *argc as usize;
+                        let canon = builtins::canonical_name(name.as_str())?;
+                        if stack.len() < argc {
+                            return None;
+                        }
+                        let at = stack.len() - argc;
+                        stack.insert(at, Kind::Builtin(canon));
+                        argc
+                    }
+                    _ => unreachable!(),
+                };
                 // Stack shape (top first): arg_n, …, arg_1, fn-ref marker.
                 if stack.len() < n + 1 {
                     return None;

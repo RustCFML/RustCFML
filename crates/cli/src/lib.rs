@@ -773,7 +773,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     // Op census for a plain script run (probe builds only). Must happen here:
     // the error arm below `exit(1)`s, and `run()`'s worker thread never rejoins
     // on that path.
-    #[cfg(any(feature = "op-census", feature = "call-phases"))]
+    #[cfg(any(feature = "op-census", feature = "call-phases", feature = "bif-census"))]
     if cfml_common::perf_counters::enabled() {
         #[cfg(feature = "op-census")]
         eprintln!(
@@ -793,6 +793,12 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         eprintln!("{}", cfml_common::perf_counters::call_phases::p8_report());
         #[cfg(feature = "call-phases")]
         eprintln!("{}", cfml_common::perf_counters::call_phases::p4_report());
+        #[cfg(feature = "bif-census")]
+        eprintln!("{}", cfml_common::perf_counters::bif_census::report(40));
+        // Raw dump too: the human report above truncates and shows CUMULATIVE
+        // shares, so only a diff of two raw dumps yields one request's real mix.
+        #[cfg(feature = "bif-census")]
+        eprintln!("{}", cfml_common::perf_counters::bif_census::report_raw());
     }
     match result {
         Ok(response) => {
@@ -1433,6 +1439,12 @@ fn run_server(
         eprintln!("{}", cfml_common::perf_counters::call_phases::p8_report());
         #[cfg(feature = "call-phases")]
         eprintln!("{}", cfml_common::perf_counters::call_phases::p4_report());
+        #[cfg(feature = "bif-census")]
+        eprintln!("{}", cfml_common::perf_counters::bif_census::report(40));
+        // Raw dump too: the human report above truncates and shows CUMULATIVE
+        // shares, so only a diff of two raw dumps yields one request's real mix.
+        #[cfg(feature = "bif-census")]
+        eprintln!("{}", cfml_common::perf_counters::bif_census::report_raw());
     }
 
     #[cfg(all(feature = "memprofile", unix))]
@@ -2225,6 +2237,12 @@ async fn handle_request(
         eprintln!("{}", cfml_common::perf_counters::call_phases::p8_report());
         #[cfg(feature = "call-phases")]
         eprintln!("{}", cfml_common::perf_counters::call_phases::p4_report());
+        #[cfg(feature = "bif-census")]
+        eprintln!("{}", cfml_common::perf_counters::bif_census::report(40));
+        // Raw dump too: the human report above truncates and shows CUMULATIVE
+        // shares, so only a diff of two raw dumps yields one request's real mix.
+        #[cfg(feature = "bif-census")]
+        eprintln!("{}", cfml_common::perf_counters::bif_census::report_raw());
     }
     response
 }

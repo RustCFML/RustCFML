@@ -12,6 +12,98 @@ pub static STRUCT_NEW: AtomicU64 = AtomicU64::new(0);
 /// `CfmlStruct::new_untracked` calls (frame-confined scopes, Lever C opt 1).
 pub static STRUCT_NEW_UNTRACKED: AtomicU64 = AtomicU64::new(0);
 
+/// Flyweight CFC instances produced (`make_instance_value`) — the single
+/// instantiation choke point. Part 1 Step 0.5: the shape-based instance track
+/// (roadmap 3B) is sold on FOOTPRINT, so it has to be gated on how many
+/// instances actually exist and how wide they are, not on a profile share.
+pub static INSTANCES_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Public (`this`) data members across every instance produced — divide by
+/// [`INSTANCES_CREATED`] for the mean declared width a shape would replace.
+pub static INSTANCE_THIS_KEYS: AtomicU64 = AtomicU64::new(0);
+/// Private (`variables`) data members across every instance produced.
+pub static INSTANCE_VARS_KEYS: AtomicU64 = AtomicU64::new(0);
+
+/// Eager-vs-lazy `arguments` scope per frame (Lever A, v0.512-517, was -7.7%).
+/// `function_needs_arguments_scope` forces the EAGER path on any function whose
+/// bytecode contains a `LoadLocal("arguments")` — and the default-parameter
+/// preamble emits exactly that op (`compiler.rs` ~4008), so a single defaulted
+/// param opts the whole function out of Lever A for every call, whether or not
+/// the default ever fires. These size that.
+pub static FRAMES_ARGS_EAGER: AtomicU64 = AtomicU64::new(0);
+/// Frames that took the lazy skip path (Lever A working as intended).
+pub static FRAMES_ARGS_LAZY: AtomicU64 = AtomicU64::new(0);
+/// Eager frames whose callee declares at least one defaulted parameter — the
+/// upper bound on "forced eager by a default".
+pub static FRAMES_ARGS_EAGER_WITH_DEFAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Parameter binding shape per call frame. The Part 1 reconciliation priced
+/// frames from a ZERO-ARG callee (257 ns), but frame cost scales hard with
+/// arity — measured +78 ns per positional argument, and a Preside-shaped
+/// `required string` / defaulted / typed 4-param callee costs 1,637 ns, 6.4x
+/// the zero-arg frame. These say which of those two numbers the real workload
+/// looks like.
+pub static BIND_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Declared parameters summed over every bound frame.
+pub static BIND_PARAMS_DECLARED: AtomicU64 = AtomicU64::new(0);
+/// Arguments actually supplied, summed over every bound frame.
+pub static BIND_ARGS_SUPPLIED: AtomicU64 = AtomicU64::new(0);
+/// Declared-type validations performed, summed over every bound frame.
+pub static BIND_TYPECHECKS: AtomicU64 = AtomicU64::new(0);
+
+/// Return-time parent-scope DIFF ("diff-out") volume — the second half of the
+/// copy-in/diff-out scope model that Part 3A proposes replacing with a frame
+/// arena. Copy-in was already sized at ~0.88 ms/render (97% of seeded keys are
+/// the four structural names, read 33:1 never). Diff-out has never been sized,
+/// and it is the half that decides whether 3A is a ~2 ms bundle deliverable in
+/// stages or a multi-week arena migration. Counter-first, per Part 6's rule:
+/// these run before any ablation so the A/B has a predicted magnitude to hit.
+pub static WB_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Frames that reached the diff and were skipped by the v0.600.0 futility guard
+/// (locals untouched since entry) — already-harvested win, not available again.
+pub static WB_SKIPPED_FUTILE: AtomicU64 = AtomicU64::new(0);
+/// Locals entries walked by the diff, summed over every frame that ran one.
+pub static WB_KEYS_SCANNED: AtomicU64 = AtomicU64::new(0);
+/// Entries that survived the filters and cost a `values_equal_shallow` compare.
+pub static WB_KEYS_COMPARED: AtomicU64 = AtomicU64::new(0);
+/// Entries that actually propagated to the caller — the diff's real output.
+pub static WB_KEYS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock nanoseconds spent inside the diff, summed over both exit paths.
+/// Timing is affordable HERE (unlike per-op) because the diff runs only ~1,462
+/// times per warm render: at the ~17 ns instrument floor the two `Instant::now()`
+/// calls contribute ~0.025 ms, several times below the expected signal. The
+/// ablation route was tried first and is not viable — removing the diff stops
+/// Preside booting (`COLDBOX_APP_MAPPING` is one of the 26 values it propagates).
+pub static WB_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Copy-in ("parent-scope seed") frames and nanoseconds — 3A's FIRST half, the
+/// one already sized at ~0.88 ms/render by counters + the call-phases clock back
+/// in 2026-08-14. Re-measured here with the same instrument as WB_NANOS so both
+/// halves of 3A carry a same-version, same-method number, which is what 3A's own
+/// gate demands before the migration is started.
+pub static SEED_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub static SEED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Bare-name scope-chain resolution depth (`lookup_name_in_scopes`). The Part 1
+/// verdict sized an unslotted by-name access at ~33 ns over a slot read when it
+/// hits `locals` on the first probe, and ~53 ns when it has to reach
+/// `__variables`. Which of those applies to the 30,289 by-name accesses in a
+/// warm render decides whether any slotting work is worth doing — a name that
+/// resolves past `locals` can never become a slot, because there is no local to
+/// slot. Counter-first: these split the population before anything is designed.
+pub static SCOPE_LOOKUP_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Resolved by the first `locals.get(name)` probe — the slottable population.
+pub static SCOPE_HIT_LOCALS: AtomicU64 = AtomicU64::new(0);
+/// Resolved in the `arguments` struct (extra/`argumentCollection` args only —
+/// declared params are already copied into `locals`).
+pub static SCOPE_HIT_ARGUMENTS: AtomicU64 = AtomicU64::new(0);
+/// Resolved in a web request scope (url/form/cgi/cookie) via globals.
+pub static SCOPE_HIT_WEBSCOPE: AtomicU64 = AtomicU64::new(0);
+/// Resolved in `__variables` — the component/page scope. NOT slottable.
+pub static SCOPE_HIT_VARIABLES: AtomicU64 = AtomicU64::new(0);
+/// Resolved in `globals` (page scope / builtins).
+pub static SCOPE_HIT_GLOBALS: AtomicU64 = AtomicU64::new(0);
+/// Walked the whole chain and found nothing.
+pub static SCOPE_MISS: AtomicU64 = AtomicU64::new(0);
+
 /// Entries into `resolve_component_template`.
 pub static RESOLVE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Resolutions answered by the two-layer path cache (request or production).
@@ -218,6 +310,36 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         "=== RUSTCFML_COUNTERS ===\n\
          struct_new (tracked):        {:>12}\n\
          struct_new_untracked:        {:>12}\n\
+         --- arguments scope: eager vs lazy (Lever A) ---\n\
+         frames eager:                {:>12}\n\
+           .. callee has a default:   {:>12}\n\
+         frames lazy (Lever A skip):  {:>12}\n\
+         --- param binding shape (per bound frame) ---\n\
+         bound frames:                {:>12}\n\
+           .. params declared:        {:>12}\n\
+           .. args supplied:          {:>12}\n\
+           .. type validations:       {:>12}\n\
+         --- return-time parent-scope diff (3A second half) ---\n\
+         frames reaching the diff:    {:>12}\n\
+           .. skipped futile:         {:>12}\n\
+           .. locals entries scanned: {:>12}\n\
+           .. entries compared:       {:>12}\n\
+           .. entries written back:   {:>12}\n\
+           .. total time (us):        {:>12}\n\
+         --- parent-scope seed copy (3A first half) ---\n\
+         frames seeding:              {:>12}\n\
+           .. total time (us):        {:>12}\n\
+         --- bare-name scope-chain resolution depth ---\n\
+         lookups (total):             {:>12}\n\
+           .. hit locals (slottable): {:>12}\n\
+           .. hit arguments struct:   {:>12}\n\
+           .. hit web scope:          {:>12}\n\
+           .. hit __variables:        {:>12}\n\
+           .. hit globals:            {:>12}\n\
+           .. resolved nothing:       {:>12}\n\
+         instances created:           {:>12}\n\
+           .. `this` data keys:       {:>12}\n\
+           .. `variables` data keys:  {:>12}\n\
          resolve_component calls:     {:>12}\n\
            .. path-cache hits:        {:>12}\n\
            .. candidate probe walks:  {:>12}\n\
@@ -259,6 +381,31 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
            .. of those, has params:   {:>12}",
         g(&STRUCT_NEW),
         g(&STRUCT_NEW_UNTRACKED),
+        g(&FRAMES_ARGS_EAGER),
+        g(&FRAMES_ARGS_EAGER_WITH_DEFAULTS),
+        g(&FRAMES_ARGS_LAZY),
+        g(&BIND_FRAMES),
+        g(&BIND_PARAMS_DECLARED),
+        g(&BIND_ARGS_SUPPLIED),
+        g(&BIND_TYPECHECKS),
+        g(&WB_FRAMES),
+        g(&WB_SKIPPED_FUTILE),
+        g(&WB_KEYS_SCANNED),
+        g(&WB_KEYS_COMPARED),
+        g(&WB_KEYS_WRITTEN),
+        g(&WB_NANOS) / 1_000,
+        g(&SEED_FRAMES),
+        g(&SEED_NANOS) / 1_000,
+        g(&SCOPE_LOOKUP_TOTAL),
+        g(&SCOPE_HIT_LOCALS),
+        g(&SCOPE_HIT_ARGUMENTS),
+        g(&SCOPE_HIT_WEBSCOPE),
+        g(&SCOPE_HIT_VARIABLES),
+        g(&SCOPE_HIT_GLOBALS),
+        g(&SCOPE_MISS),
+        g(&INSTANCES_CREATED),
+        g(&INSTANCE_THIS_KEYS),
+        g(&INSTANCE_VARS_KEYS),
         g(&RESOLVE_CALLS),
         g(&RESOLVE_CACHE_HITS),
         g(&RESOLVE_PROBE_WALKS),
@@ -1078,4 +1225,244 @@ pub mod exists_census {
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RUSTCFML_COUNTERS").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Per-BIF call census WITH ARGUMENT SHAPES (`bif-census` builds only).
+///
+/// Part 1 Step 0 of the performance plan: a cross-engine per-BIF benchmark is
+/// only honest if it feeds each BIF the arguments the real workload feeds it.
+/// Benching `len()` with a 3-char literal when Preside calls it with 4 KB of
+/// rendered HTML is how a microbench lies (the rule that cost a build: a
+/// microbench said the intercept chain was 44% of a call; live Preside said
+/// 6.8%). So this records, per builtin name: the call count, the arity
+/// histogram, and — per argument position — a type histogram plus size
+/// statistics (string lengths, array/struct element counts).
+///
+/// ⚠️ The instrument that preceded this one was WRONG because `record_name()`
+/// took a Mutex and allocated a String INSIDE a timing window, tripling the
+/// phase it was sizing. There is deliberately NO timing here: this census
+/// answers "what is called, with what", never "how long did it take". Timing
+/// belongs to `call-phases` / the flamegraph, whose windows this must never
+/// enter. Call [`record`] outside any measured region.
+#[cfg(feature = "bif-census")]
+pub mod bif_census {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Argument positions tracked in detail. Beyond this, only arity is kept.
+    pub const POSITIONS: usize = 4;
+    /// Value-shape buckets, indexed by [`kind_of`].
+    pub const KINDS: usize = 11;
+    pub const KIND_NAMES: [&str; KINDS] = [
+        "null", "bool", "int", "double", "string", "array", "struct", "query", "fn",
+        "binary", "other",
+    ];
+
+    /// Per-argument-position shape accumulator.
+    #[derive(Default, Clone)]
+    pub struct ArgShape {
+        /// How many calls supplied an argument at this position.
+        pub seen: u64,
+        /// Type histogram, indexed by [`kind_of`].
+        pub kinds: [u64; KINDS],
+        /// Sum of the "size" measure (string byte length, array/struct element
+        /// count) over the sized kinds only.
+        pub size_sum: u64,
+        /// Largest size seen, so a mean of 12 that hides a 40 KB outlier is
+        /// visible rather than averaged away.
+        pub size_max: u64,
+        /// Calls whose argument had a size measure at all (the divisor for the
+        /// mean — an `int` argument contributes to `seen` but not to this).
+        pub size_n: u64,
+    }
+
+    #[derive(Default, Clone)]
+    pub struct BifStat {
+        pub calls: u64,
+        /// Arity histogram, 0..=7 with 8 = "8 or more".
+        pub arity: [u64; 9],
+        pub args: [ArgShape; POSITIONS],
+    }
+
+    static TABLE: Mutex<Option<HashMap<String, BifStat>>> = Mutex::new(None);
+
+    /// Classify one value into a [`KIND_NAMES`] bucket and, where the notion
+    /// applies, its size. Returns `(kind, Some(size))`.
+    ///
+    /// The size probe takes the container's own short read lock — safe here
+    /// because the census runs at a dispatch site that holds no struct/array
+    /// guard, but it is the reason this must never be called from inside a
+    /// closure that already borrowed the same container
+    /// (`bug_parking_lot_iflet_read_guard_deadlock`).
+    pub fn classify(v: &crate::dynamic::CfmlValue) -> (usize, Option<u64>) {
+        use crate::dynamic::CfmlValue as V;
+        match v {
+            V::Null => (0, None),
+            V::Bool(_) => (1, None),
+            V::Int(_) => (2, None),
+            V::Double(_) | V::TimeSpan(_) => (3, None),
+            V::String(s) => (4, Some(s.len() as u64)),
+            V::Array(a) => (5, Some(a.len() as u64)),
+            V::QueryColumn(c, _) => (5, Some(c.len() as u64)),
+            V::Struct(s) => (6, Some(s.len() as u64)),
+            V::Query(q) => (7, Some(q.row_count() as u64)),
+            V::Function(_) | V::Closure(_) => (8, None),
+            V::Binary(b) => (9, Some(b.len() as u64)),
+            _ => (10, None),
+        }
+    }
+
+    /// Record one builtin invocation. `name` is the resolved registry spelling;
+    /// the table folds case so `Len` and `len` land in one row.
+    pub fn record(name: &str, args: &[crate::dynamic::CfmlValue]) {
+        let mut g = match TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let map = g.get_or_insert_with(HashMap::new);
+        // Fold case so `Len` and `len` are one row. Two probes rather than one
+        // `entry()`: the hit path must not allocate a String per call, and this
+        // is a probe build where a second hash is free.
+        let lowered;
+        let key: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            lowered = name.to_ascii_lowercase();
+            &lowered
+        } else {
+            name
+        };
+        if !map.contains_key(key) {
+            map.insert(key.to_string(), BifStat::default());
+        }
+        let e = map.get_mut(key).expect("just inserted");
+        e.calls += 1;
+        e.arity[args.len().min(8)] += 1;
+        for (i, a) in args.iter().take(POSITIONS).enumerate() {
+            let (kind, size) = classify(a);
+            let s = &mut e.args[i];
+            s.seen += 1;
+            s.kinds[kind] += 1;
+            if let Some(n) = size {
+                s.size_sum += n;
+                s.size_n += 1;
+                s.size_max = s.size_max.max(n);
+            }
+        }
+    }
+
+    /// Machine-readable dump of EVERY row's raw accumulators, one line per
+    /// builtin, for exact diffing of two cumulative snapshots.
+    ///
+    /// The human [`report`] cannot be diffed honestly: it truncates to the top
+    /// `n` and prints shapes as percentages of the CUMULATIVE totals, which
+    /// boot dominates. A warm render's real mix only appears when two dumps are
+    /// subtracted — and the boot-vs-warm mixes genuinely differ (`compareNoCase`
+    /// is 19% of boot and absent from the warm top 12), so the subtraction is
+    /// not a nicety. Consumed by `scripts/perf/bif_census_diff.py`.
+    ///
+    /// Format (tab-separated, one line per builtin):
+    /// `BIFRAW <name> <calls> <arity0..8 csv> <arg1 fields csv> .. <arg4 ..>`
+    /// where each arg's fields are `seen,k0..k10,size_sum,size_n,size_max`.
+    pub fn report_raw() -> String {
+        let g = match TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let map = match g.as_ref() {
+            Some(m) => m,
+            None => return String::new(),
+        };
+        let mut rows: Vec<(&String, &BifStat)> = map.iter().collect();
+        rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.calls));
+        let mut out = String::from("--- BIFRAW BEGIN ---");
+        for (name, s) in rows {
+            out.push_str(&format!("\nBIFRAW\t{}\t{}\t", name, s.calls));
+            out.push_str(
+                &s.arity.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","),
+            );
+            for a in &s.args {
+                let mut f = vec![a.seen.to_string()];
+                f.extend(a.kinds.iter().map(|c| c.to_string()));
+                f.push(a.size_sum.to_string());
+                f.push(a.size_n.to_string());
+                f.push(a.size_max.to_string());
+                out.push('\t');
+                out.push_str(&f.join(","));
+            }
+        }
+        out.push_str("\n--- BIFRAW END ---");
+        out
+    }
+
+    /// Descending report of the top `n` builtins by call count, each followed
+    /// by the argument shapes it was really called with — the input to the
+    /// per-BIF cross-engine bench.
+    pub fn report(n: usize) -> String {
+        let g = match TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let map = match g.as_ref() {
+            Some(m) => m,
+            None => return "--- BIF census: no calls recorded ---".to_string(),
+        };
+        let mut rows: Vec<(&String, &BifStat)> = map.iter().collect();
+        let total: u64 = rows.iter().map(|(_, s)| s.calls).sum();
+        rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.calls));
+        let mut out = format!(
+            "--- BIF census: {} calls across {} distinct builtins (top {}) ---",
+            total,
+            rows.len(),
+            n.min(rows.len())
+        );
+        let mut cum = 0u64;
+        for (name, s) in rows.iter().take(n) {
+            cum += s.calls;
+            let arity: Vec<String> = s
+                .arity
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(a, c)| format!("{}:{}", a, c))
+                .collect();
+            out.push_str(&format!(
+                "\n{:>10} {:>6.2}% {:>6.2}%cum  {:<24} arity[{}]",
+                s.calls,
+                s.calls as f64 / total.max(1) as f64 * 100.0,
+                cum as f64 / total.max(1) as f64 * 100.0,
+                name,
+                arity.join(" "),
+            ));
+            for (i, a) in s.args.iter().enumerate() {
+                if a.seen == 0 {
+                    continue;
+                }
+                let kinds: Vec<String> = a
+                    .kinds
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c > 0)
+                    .map(|(k, c)| {
+                        format!("{}={:.0}%", KIND_NAMES[k], *c as f64 / a.seen as f64 * 100.0)
+                    })
+                    .collect();
+                let size = if a.size_n > 0 {
+                    format!(
+                        "  size mean {:.1} max {}",
+                        a.size_sum as f64 / a.size_n as f64,
+                        a.size_max
+                    )
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "\n{:>28}arg{}: {}{}",
+                    "",
+                    i + 1,
+                    kinds.join(" "),
+                    size
+                ));
+            }
+        }
+        out
+    }
 }

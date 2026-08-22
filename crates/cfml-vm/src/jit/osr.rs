@@ -520,6 +520,19 @@ pub fn analyze_loop(
                 BytecodeOp::Call(_) => {
                     total_calls += 1; // builtin Calls add to useful_ops post-simulate
                 }
+                // v0.614.0 — `CallBuiltin(name, n)` is the fused `LoadGlobal` + `Call`.
+                // OSR is a SECOND translator (this file) alongside `translate.rs`; a new
+                // op must be taught to BOTH or OSR silently declines every loop containing
+                // it. That is how `compile_loop_with_abs_builtin` went red.
+                BytecodeOp::CallBuiltin(name, _) => {
+                    match builtins::canonical_name(name.as_str()) {
+                        Some(canon) => {
+                            referenced_builtins.insert(canon);
+                        }
+                        None => return None,
+                    }
+                    total_calls += 1;
+                }
 
                 _ => return None,
             }
@@ -865,7 +878,23 @@ fn simulate_block(
                     stack.push(Kind::UdfRef(idx));
                 }
             }
-            BytecodeOp::Call(n) => {
+            BytecodeOp::Call(_) | BytecodeOp::CallBuiltin(..) => {
+                // `CallBuiltin` arrives without the fn-ref marker this arm pops from
+                // underneath the args; synthesize it and share the identical body.
+                let n = match &code[ip] {
+                    BytecodeOp::Call(n) => *n,
+                    BytecodeOp::CallBuiltin(name, argc) => {
+                        let argc = *argc as usize;
+                        let canon = builtins::canonical_name(name.as_str())?;
+                        if stack.len() < argc {
+                            return None;
+                        }
+                        let at = stack.len() - argc;
+                        stack.insert(at, Kind::Builtin(canon));
+                        argc
+                    }
+                    _ => unreachable!(),
+                };
                 if stack.len() < n + 1 {
                     return None;
                 }
@@ -1481,7 +1510,23 @@ pub fn compile_loop(
                             stack.push((placeholder, Kind::UdfRef(0)));
                         }
                     }
-                    BytecodeOp::Call(n) => {
+                    BytecodeOp::Call(_) | BytecodeOp::CallBuiltin(..) => {
+                        let n = match op {
+                            BytecodeOp::Call(n) => *n,
+                            BytecodeOp::CallBuiltin(name, argc) => {
+                                let argc = *argc as usize;
+                                let canon = builtins::canonical_name(name.as_str())
+                                    .ok_or("osr: CallBuiltin of a non-shimmed builtin")?;
+                                if stack.len() < argc {
+                                    return Err("osr: stack underflow on CallBuiltin".into());
+                                }
+                                let placeholder = b.ins().iconst(I64, 0);
+                                let at = stack.len() - argc;
+                                stack.insert(at, (placeholder, Kind::Builtin(canon)));
+                                argc
+                            }
+                            _ => unreachable!(),
+                        };
                         if stack.len() < n + 1 {
                             return Err("osr: stack underflow on Call".into());
                         }
@@ -1556,7 +1601,7 @@ pub fn compile_loop(
                                     crate::jit::BindingRet::Boxed => 2,
                                 };
                                 let erk = b.ins().iconst(I64, erk_code);
-                                let nargs_v = b.ins().iconst(I64, *n as i64);
+                                let nargs_v = b.ins().iconst(I64, n as i64);
                                 let call = b.ins().call(
                                     udf_dispatch_ref,
                                     &[gid, sig, erk, args_addr, nargs_v, bp],

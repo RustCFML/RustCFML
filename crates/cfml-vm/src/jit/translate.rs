@@ -1082,7 +1082,31 @@ impl Backend {
                                 stack.push((placeholder, Kind::UdfRef(0)));
                             }
                         }
-                        BytecodeOp::Call(n) => {
+                        // `CallBuiltin(name, n)` is the fused
+                        // `LoadGlobal(name)` + `Call(n)`; it arrives without the
+                        // fn-ref marker. Synthesize the marker underneath the
+                        // args (its Value is a placeholder — the Builtin arm
+                        // below reads the NAME from the Kind, never the Value)
+                        // and share the existing body.
+                        BytecodeOp::Call(_) | BytecodeOp::CallBuiltin(..) => {
+                            let n = match &func.instructions[ip] {
+                                BytecodeOp::Call(n) => *n,
+                                BytecodeOp::CallBuiltin(name, argc) => {
+                                    let argc = *argc as usize;
+                                    let canon = builtins::canonical_name(name.as_str())
+                                        .ok_or("jit: CallBuiltin of a non-shimmed builtin")?;
+                                    if stack.len() < argc {
+                                        return Err(
+                                            "jit: stack underflow on CallBuiltin".into()
+                                        );
+                                    }
+                                    let placeholder = b.ins().iconst(I64, 0);
+                                    let at = stack.len() - argc;
+                                    stack.insert(at, (placeholder, Kind::Builtin(canon)));
+                                    argc
+                                }
+                                _ => unreachable!(),
+                            };
                             if stack.len() < n + 1 {
                                 return Err("jit: stack underflow on Call".into());
                             }
@@ -1177,7 +1201,7 @@ impl Backend {
                                         crate::jit::BindingRet::Boxed => 2,
                                     };
                                     let erk = b.ins().iconst(I64, erk_code);
-                                    let nargs_v = b.ins().iconst(I64, *n as i64);
+                                    let nargs_v = b.ins().iconst(I64, n as i64);
                                     let call = b.ins().call(
                                         udf_dispatch_ref,
                                         &[gid, sig, erk, args_addr, nargs_v, bp],

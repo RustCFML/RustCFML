@@ -36,6 +36,14 @@ probe-sites = []
 # the mix Preside really runs instead of the static op-weight scan. Probe builds
 # only; a default build has no counter and no branch. See PERFORMANCE_ROADMAP P3.
 op-census = []
+# Per-BIF call census with ARGUMENT SHAPES (performance plan Part 1 Step 0).
+# Records, per builtin name, the call count + arity histogram + per-position
+# type/size statistics, so a cross-engine per-BIF benchmark feeds each builtin
+# the arguments the real workload feeds it. Records NO timings — the previous
+# incarnation of this instrument took a Mutex inside a timing window and
+# tripled the phase it was sizing. Probe builds only: a Mutex'd map bump per
+# builtin call.
+bif-census = []
 # UDF call-prologue phase attribution (the 2026-08-11 lever: ~640ns of frame
 # setup per call). Times each prologue phase with a real clock, so it perturbs
 # the very thing it measures — read it for SHARES, never as an absolute. Probe

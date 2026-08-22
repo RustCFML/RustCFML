@@ -397,6 +397,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_component_mapping_paths.cfm">
 <cf_runtest file="functions/test_dynamic_named_args.cfm">
 <cf_runtest file="functions/test_builtin_name_ci_index.cfm">
+<cf_runtest file="functions/test_direct_builtin_lowering.cfm">
 <cf_runtest file="functions/test_arguments_scope_lever_c.cfm">
 <cf_runtest file="oop/test_component_method_named_args.cfm">
 <cf_runtest file="oop/test_component_method_precedence.cfm">

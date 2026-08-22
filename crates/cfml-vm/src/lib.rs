@@ -19,6 +19,11 @@ type AppFnIdSet = HashSet<i64, ValueBuildHasher>;
 /// `(kind tag, Arc pointer)` cycle guard for the same walk.
 type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 
+mod intercepts_common;
+mod intercepts_deferred;
+mod intercepts_querydir;
+mod intercepts_output;
+mod intercepts_realtime;
 pub mod application_store;
 pub mod async_kernel;
 pub mod dump;
@@ -48,6 +53,33 @@ pub mod jit;
 #[cfg(feature = "s3")]
 mod s3_vfs;
 pub mod session_store;
+/// Measurement-only gate for the Part 3A scope-model timers (`RCFML_WB_COUNTERS=1`).
+///
+/// Arms the copy-in and diff-out counters + timers reported by
+/// `RUSTCFML_COUNTERS=1`. Off by default; costs one cached bool load per frame.
+///
+/// Timing is affordable at THESE two sites (unlike per-op) because the counts are
+/// low — 8,115 seeding frames and 1,462 diff frames per warm render — so the
+/// ~17 ns instrument floor contributes ~0.16 ms against a ~0.6 ms signal.
+///
+/// An ABLATION was tried first and abandoned: removing the return-time diff stops
+/// Preside booting outright (`COLDBOX_APP_MAPPING` is one of the 26 values it
+/// propagates per render), so the subsystem cannot be A/B'd by removal. Profiling
+/// was rejected too — the SIGPROF sampler sees only ~30% of this process's CPU,
+/// which is how `stat` at 23% and the mimalloc arena at 27% both turned out to be
+/// artifacts. Direct timing at a low-count site is the one instrument left.
+pub mod ablate {
+    use std::sync::OnceLock;
+
+    /// Arm the Part 3A copy-in / diff-out counters and timers.
+    pub fn wb_counters() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("RCFML_WB_COUNTERS").is_ok_and(|v| v == "1")
+        })
+    }
+}
+
 /// Measurement-only counters for the call-parent seeding paths (perf plan 3.2
 /// stage 2 sizing). Enabled with `RCFML_FUSED_COUNTERS=1`; the CLI serve loop
 /// prints a per-request delta. Zero overhead when disabled beyond one cached
@@ -4730,6 +4762,93 @@ impl CfmlVirtualMachine {
     ///
     /// `name_lower` must be `name.to_lowercase()`.
     #[inline]
+    /// Route a call error into the innermost `try`/`catch`, mirroring what the
+    /// `BytecodeOp::Call` arm does inline.
+    ///
+    /// Returns `Ok(Some(catch_ip))` when a handler took the error (the interpreter must
+    /// jump there), `Ok(None)` never, and `Err(e)` when it must propagate.
+    ///
+    /// This exists because [`BytecodeOp::CallBuiltin`] originally used `?` on the builtin
+    /// result, which propagated straight out of the op and **escaped any enclosing
+    /// `try {}`** — `try { hash("abc","BOGUS-ALG") } catch (any e) {}` aborted the whole
+    /// template instead of being caught. Error routing is not something a call site may
+    /// re-implement or skip; both call ops share this.
+    fn route_call_error(
+        &mut self,
+        e: CfmlError,
+        stack: &mut Vec<CfmlValue>,
+    ) -> Result<usize, CfmlError> {
+        if Self::is_control_flow_error(&e) {
+            return Err(e);
+        }
+        self.pending_result_writeback = None;
+        let Some(handler) = self.try_stack.pop() else {
+            return Err(e);
+        };
+        while stack.len() > handler.stack_depth {
+            stack.pop();
+        }
+        self.restore_capture_state(&handler);
+        // Use last_exception only if it was set by this call (e.g. an inner throw); build
+        // from the CfmlError otherwise, so a stale exception from a previous catch block
+        // is not reused.
+        let error_val = self.resolve_catch_error_val(&e);
+        stack.push(error_val);
+        Ok(handler.catch_ip)
+    }
+
+    /// Handler for [`BytecodeOp::CallBuiltin`] — a compile-time-bound builtin call.
+    ///
+    /// Codegen guarantees the name is already lowercase and on
+    /// `cfml_codegen::compiler::DIRECT_BUILTINS` (pure, fixed-arity, never
+    /// VM-intercepted). Relative to `LoadGlobal` + `Call` this skips the
+    /// `LoadGlobal` op, the locals/`__variables`/globals chain walk, the
+    /// per-call `to_lowercase` heap allocation, and `call_function`'s intercept
+    /// chain — the ~105-150 ns call boundary Part 1 measured, which dominates
+    /// these body-free predicates.
+    ///
+    /// Falls back to the generic path if the name is not registered (an embedder
+    /// can remove builtins), so behaviour is never worse than before.
+    fn op_call_builtin(
+        &mut self,
+        stack: &mut Vec<CfmlValue>,
+        name: &cfml_common::name::Name,
+        argc: u8,
+    ) -> Result<(), CfmlError> {
+        let mut args = Vec::with_capacity(argc as usize);
+        for _ in 0..argc {
+            args.push(stack.pop().unwrap_or(CfmlValue::Null));
+        }
+        args.reverse();
+        // Single probe on the lowercase index; the name is already lowercased at
+        // compile time, so there is no `to_lowercase` allocation here.
+        let resolved = if self.builtin_lc_src_len == self.builtins.len() {
+            self.builtin_names_lc.get(name.as_str()).map(|(_, f, _)| *f)
+        } else {
+            // Index not armed (embedder mutated `builtins` directly) — fall back
+            // to the same case-insensitive resolution the generic path uses.
+            self.builtin_lookup_ci(name.as_str(), name.as_str()).map(|(_, f)| f)
+        };
+        match resolved {
+            Some(f) => {
+                #[cfg(feature = "bif-census")]
+                cfml_common::perf_counters::bif_census::record(name.as_str(), &args);
+                // NB: the error is returned, NOT `?`-propagated — the caller routes it
+                // through `route_call_error` so an enclosing `try {}` still catches it.
+                let out = f(args)?;
+                stack.push(out);
+                Ok(())
+            }
+            // Every `DIRECT_BUILTINS` name is unconditionally registered by
+            // `get_builtin_functions()`, so this is only reachable if an
+            // embedder removed one. Report it rather than silently no-op.
+            None => Err(CfmlError::runtime(format!(
+                "Function [{}] not found",
+                name.as_str()
+            ))),
+        }
+    }
+
     fn builtin_lookup_ci(&self, name: &str, name_lower: &str) -> Option<(&str, BuiltinFunction)> {
         if self.builtin_lc_src_len == self.builtins.len() {
             let (canonical, f, ambiguous) = match self.builtin_names_lc.get(name_lower) {
@@ -6658,6 +6777,7 @@ impl CfmlVirtualMachine {
                 1, _n.duration_since(_cp_t).as_nanos() as u64);
             _cp_t = _n;
         }
+        let _seed_t0 = ablate::wb_counters().then(std::time::Instant::now);
         if let Some(plan) = fused_plan {
             // Fused path (perf plan 3.2 stage 1): `parent_scope` is the RAW
             // caller locals; merge (captured env ∪ filtered caller) straight
@@ -6746,6 +6866,11 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        if let Some(t0) = _seed_t0 {
+            use cfml_common::perf_counters as pc;
+            pc::add(&pc::SEED_NANOS, t0.elapsed().as_nanos() as u64);
+            pc::bump(&pc::SEED_FRAMES);
+        }
         let inherited_from_parent = inherited_from_parent.into_shared();
         #[cfg(feature = "call-phases")]
         {
@@ -6803,6 +6928,17 @@ impl CfmlVirtualMachine {
         let _p4_needed_probe = !is_template_frame && !has_overflow_args;
         let build_arguments_eager =
             is_template_frame || has_overflow_args || self.arguments_scope_needed(func);
+        if cfml_common::perf_counters::enabled() {
+            use cfml_common::perf_counters as pc;
+            if build_arguments_eager {
+                pc::bump(&pc::FRAMES_ARGS_EAGER);
+                if func.has_default.iter().any(|d| *d) {
+                    pc::bump(&pc::FRAMES_ARGS_EAGER_WITH_DEFAULTS);
+                }
+            } else {
+                pc::bump(&pc::FRAMES_ARGS_LAZY);
+            }
+        }
         #[cfg(feature = "call-phases")]
         {
             if _p4_needed_probe {
@@ -6879,7 +7015,9 @@ impl CfmlVirtualMachine {
         // hashing and the insert clones a key instead of allocating a `String`
         // per parameter per call (the phase-4b cost).
         let param_keys = func.param_keys();
-        #[cfg(feature = "call-phases")]
+        // Read by BOTH the `call-phases` phase-30 record and the always-compiled
+        // param-binding census below, so these are unconditional: two u64 adds in
+        // a loop that already inserts into a map and may validate a declared type.
         let (mut _p4_supplied, mut _p4_typechecks) = (0u64, 0u64);
         for (i, param_name) in func.params.iter().enumerate() {
             inherited_or_param_keys.insert(param_name);
@@ -6904,16 +7042,10 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                        #[cfg(feature = "call-phases")]
-                        {
-                            _p4_typechecks += 1;
-                        }
+                        _p4_typechecks += 1;
                         self.check_declared_param_type(func, i, param_name, ptype, &value)?;
                     }
-                    #[cfg(feature = "call-phases")]
-                    {
-                        _p4_supplied += 1;
-                    }
+                    _p4_supplied += 1;
                     locals.insert(param_keys[i].clone(), value.clone());
                     if build_arguments_eager {
                         arguments_map.insert(param_keys[i].clone(), value);
@@ -6949,6 +7081,17 @@ impl CfmlVirtualMachine {
                     param_name, func.name
                 ))));
             }
+        }
+        // Param-binding shape census (diagnostics only, `RUSTCFML_COUNTERS=1`).
+        // The tallies above are computed unconditionally; only the reporting is
+        // gated, so this adds four relaxed adds per frame when asked and nothing
+        // otherwise.
+        if cfml_common::perf_counters::enabled() {
+            use cfml_common::perf_counters as pc;
+            pc::bump(&pc::BIND_FRAMES);
+            pc::add(&pc::BIND_PARAMS_DECLARED, func.params.len() as u64);
+            pc::add(&pc::BIND_ARGS_SUPPLIED, _p4_supplied);
+            pc::add(&pc::BIND_TYPECHECKS, _p4_typechecks);
         }
         #[cfg(feature = "call-phases")]
         {
@@ -9943,9 +10086,18 @@ impl CfmlVirtualMachine {
                     if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
                         // See `locals_version_at_entry`: an untouched locals map
                         // has nothing that could diff against the parent.
+                        if ablate::wb_counters()
+                            && !effective_local_mode_modern
+                            && locals.version() == locals_version_at_entry
+                        {
+                            cfml_common::perf_counters::bump(
+                                &cfml_common::perf_counters::WB_SKIPPED_FUTILE);
+                        }
                         if !effective_local_mode_modern
                             && locals.version() != locals_version_at_entry
                         {
+                            let _wb_t0 = ablate::wb_counters()
+                                .then(std::time::Instant::now);
                             #[cfg(feature = "call-phases")]
                             let mut _cp_wb = std::time::Instant::now();
                             let arg_scope = Self::arguments_scope_struct(&locals);
@@ -10021,6 +10173,13 @@ impl CfmlVirtualMachine {
                                     arg_scope.map_or(0, |a| a.with_map(|m| m.len() as u64)),
                                     _wb_probes,
                                 );
+                            }
+                            if let Some(t0) = _wb_t0 {
+                                use cfml_common::perf_counters as pc;
+                                pc::add(&pc::WB_NANOS, t0.elapsed().as_nanos() as u64);
+                                pc::bump(&pc::WB_FRAMES);
+                                pc::add(&pc::WB_KEYS_SCANNED, locals.len() as u64);
+                                pc::add(&pc::WB_KEYS_WRITTEN, writeback.len() as u64);
                             }
                             if !writeback.is_empty() {
                                 self.closure_parent_writeback = Some(writeback);
@@ -12003,6 +12162,11 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::GetKeys => { ops::access::op_get_keys(&mut stack); }
 
+                BytecodeOp::CallBuiltin(name, argc) => {
+                    if let Err(e) = self.op_call_builtin(&mut stack, name, *argc) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
                 BytecodeOp::IsNull => ops::value::op_is_null(&mut stack),
 
                 BytecodeOp::JumpIfNotNull(target) => { ops::effect::op_jump_if_not_null(&stack, &mut ip, *target); }
@@ -12476,7 +12640,17 @@ impl CfmlVirtualMachine {
             // Same futility guard as the early-return path: if the body never
             // mutated `locals`, this diff has nothing to find. See
             // `locals_version_at_entry`.
-            if !effective_local_mode_modern && locals.version() != locals_version_at_entry {
+            if ablate::wb_counters()
+                && !effective_local_mode_modern
+                && locals.version() == locals_version_at_entry
+            {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::WB_SKIPPED_FUTILE);
+            }
+            if !effective_local_mode_modern
+                && locals.version() != locals_version_at_entry
+            {
+                let _wb_t0 = ablate::wb_counters().then(std::time::Instant::now);
                 let arg_scope = Self::arguments_scope_struct(&locals);
                 let fused_env_guard =
                     fused_env_baseline.as_ref().and_then(|e| e.read().ok());
@@ -12511,6 +12685,13 @@ impl CfmlVirtualMachine {
                     } else {
                         writeback.insert(k.clone(), v.clone());
                     }
+                }
+                if let Some(t0) = _wb_t0 {
+                    use cfml_common::perf_counters as pc;
+                    pc::add(&pc::WB_NANOS, t0.elapsed().as_nanos() as u64);
+                    pc::bump(&pc::WB_FRAMES);
+                    pc::add(&pc::WB_KEYS_SCANNED, locals.len() as u64);
+                    pc::add(&pc::WB_KEYS_WRITTEN, writeback.len() as u64);
                 }
                 if !writeback.is_empty() {
                     self.closure_parent_writeback = Some(writeback);
@@ -12849,491 +13030,29 @@ impl CfmlVirtualMachine {
             }
 
             // writeOutput/writeDump must be handled before the builtin lookup
-            // so output goes to output_buffer (not stdout via the builtin fn)
-            if name_lower == "writeoutput" || name_lower == "echo" {
-                // Lucee parity: writeOutput/echo of a complex value throws a
-                // catchable `expression` error rather than dumping it.
-                for arg in &args {
-                    let s = arg.to_string_strict().map_err(|e| self.wrap_error(e))?;
-                    self.output_buffer.push_str(&s);
+            // Domain intercepts, extracted from this function (roadmap Part -1 / P2).
+            // Order preserved from the original chain. Each `handles()` check is cheap and
+            // `args` only moves into the branch that will consume it.
+            if intercepts_realtime::handles(&name_lower) {
+                match self.dispatch_realtime(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
                 }
-                return Ok(CfmlValue::Null);
             }
-
-            // ── Realtime / WebSocket BIFs (emit-from-anywhere, design P1) ──
-            // `io([channel])` → a scoped emitter NativeObject; `wsPublish(...)`
-            // → fan-out to a channel/room. Both reach the registry on
-            // ServerState so they work from any .cfm, cfthread, or scheduled
-            // task — not just inside a socket handler.
-            if name_lower == "io" {
-                let named = self.pending_ws_named.take();
-                let channel = self
-                    .ws_arg(&args, &named, "channel", 0)
-                    .map(|v| v.as_string())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| self.current_ws_channel.clone());
-                let channel = match channel {
-                    Some(c) => c,
-                    None => {
-                        return Err(self.wrap_error(CfmlError::runtime(
-                            "io() needs a channel argument outside a socket handler"
-                                .to_string(),
-                        )))
-                    }
-                };
-                let registry = match self.server_state.as_ref() {
-                    Some(ss) => ss.websocket.clone(),
-                    None => {
-                        return Err(self.wrap_error(CfmlError::runtime(
-                            "io() is only available in serve mode".to_string(),
-                        )))
-                    }
-                };
-                let emitter = crate::websocket::ServerEmitter::new(channel, registry);
-                return Ok(CfmlValue::NativeObject(std::sync::Arc::new(
-                    std::sync::RwLock::new(emitter),
-                )));
-            }
-            if name_lower == "wspublish" {
-                let named = self.pending_ws_named.take();
-                let channel = self
-                    .ws_arg(&args, &named, "channel", 0)
-                    .map(|v| v.as_string())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| self.current_ws_channel.clone())
-                    .unwrap_or_default();
-                let event = self.ws_arg(&args, &named, "event", 1).map(|v| v.as_string());
-                let data = self.ws_arg(&args, &named, "data", 2).unwrap_or(CfmlValue::Null);
-                let to = self
-                    .ws_arg(&args, &named, "to", 3)
-                    .map(|v| v.as_string())
-                    .filter(|s| !s.is_empty());
-                let except = self
-                    .ws_arg(&args, &named, "except", 4)
-                    .map(|v| v.as_string())
-                    .filter(|s| !s.is_empty());
-
-                // Always record for connection-free testing (P14).
-                let mut entry = ValueMap::default();
-                entry.insert("channel".to_string(), CfmlValue::string(channel.clone()));
-                entry.insert(
-                    "event".to_string(),
-                    event.clone().map(CfmlValue::string).unwrap_or(CfmlValue::Null),
-                );
-                entry.insert("data".to_string(), data.clone());
-                entry.insert(
-                    "to".to_string(),
-                    to.clone().map(CfmlValue::string).unwrap_or(CfmlValue::Null),
-                );
-                entry.insert(
-                    "except".to_string(),
-                    except.clone().map(CfmlValue::string).unwrap_or(CfmlValue::Null),
-                );
-                self.ws_test_log.push(CfmlValue::strukt(entry));
-
-                // Deliver if a live registry is present.
-                if let Some(ss) = self.server_state.as_ref() {
-                    let registry = ss.websocket.clone();
-                    let frame = registry.msg(&channel, event, data);
-                    match &to {
-                        Some(room) => {
-                            registry.to_room(&channel, room, frame, except.as_deref())
-                        }
-                        None => registry.broadcast(&channel, frame, except.as_deref()),
-                    }
-                }
-                return Ok(CfmlValue::Null);
-            }
-            // assertBroadcast(channel, event[, predicate]) — test helper. True
-            // iff a recorded wsPublish matched channel (+event when given), and
-            // — when `predicate` is a closure — the closure returns true for its
-            // data payload.
-            if name_lower == "assertbroadcast" {
-                let want_channel = args.first().map(|v| v.as_string()).unwrap_or_default();
-                let want_event = args.get(1).map(|v| v.as_string()).filter(|s| !s.is_empty());
-                let predicate = args.get(2).cloned();
-                let log = self.ws_test_log.clone();
-                for entry in &log {
-                    let s = match entry {
-                        CfmlValue::Struct(s) => s,
-                        _ => continue,
-                    };
-                    let ch = s.get("channel").map(|v| v.as_string()).unwrap_or_default();
-                    if !ch.eq_ignore_ascii_case(&want_channel) {
-                        continue;
-                    }
-                    if let Some(ref we) = want_event {
-                        let ev = s.get("event").map(|v| v.as_string()).unwrap_or_default();
-                        if !ev.eq_ignore_ascii_case(we) {
-                            continue;
-                        }
-                    }
-                    match &predicate {
-                        Some(p @ CfmlValue::Function(_)) => {
-                            let data = s.get("data").unwrap_or(CfmlValue::Null);
-                            let r = self.call_function(p, vec![data], &ValueMap::default())?;
-                            if r.is_true() {
-                                return Ok(CfmlValue::Bool(true));
-                            }
-                        }
-                        _ => return Ok(CfmlValue::Bool(true)),
-                    }
-                }
-                return Ok(CfmlValue::Bool(false));
-            }
-            // wsSubscribe/wsUnsubscribe — Phase 2 surface; accepted as no-ops so
-            // feature-detecting code doesn't error (clients join rooms only via
-            // server-side socket.join, design principle P6).
-            if matches!(name_lower.as_str(), "wssubscribe" | "wsunsubscribe") {
-                return Ok(CfmlValue::Null);
-            }
-            // wsPresence([channel]) — flat accessor for the presence roster
-            // (parallel to wsPublish). Returns `{}` when no registry/channel.
-            if name_lower == "wspresence" {
-                let named = self.pending_ws_named.take();
-                let channel = self
-                    .ws_arg(&args, &named, "channel", 0)
-                    .map(|v| v.as_string())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| self.current_ws_channel.clone());
-                return match (channel, self.server_state.as_ref()) {
-                    (Some(channel), Some(ss)) => Ok(ss.websocket.presence_state(&channel)),
-                    _ => Ok(CfmlValue::strukt(ValueMap::default())),
-                };
-            }
-
-            // ── socket.io-lucee compat BIFs ($sio*) ───────────────────────
-            // The flat seam the imperative SocketIoServer/Namespace/Socket CFCs
-            // call instead of socket.io-lucee's embedded Java server. They store
-            // handlers in the process-wide `socketio_compat` store and fan out
-            // through the shared `WebSocketRegistry` — same engine as the fluent
-            // `io()`/`wsPublish` API, different CFML surface.
-            if name_lower.starts_with("$sio") {
-                let compat = crate::socketio_compat::compat();
-                let arg_s = |i: usize| args.get(i).map(|v| v.as_string()).unwrap_or_default();
-                let arg_v = |i: usize| args.get(i).cloned().unwrap_or(CfmlValue::Null);
-                match name_lower.as_str() {
-                    "$sioregisternamespace" => {
-                        compat.register_namespace(&arg_s(0));
-                        return Ok(CfmlValue::Null);
-                    }
-                    "$sioregisterednamespaces" => {
-                        return Ok(CfmlValue::array(
-                            compat
-                                .registered_namespaces()
-                                .into_iter()
-                                .map(CfmlValue::string)
-                                .collect(),
-                        ));
-                    }
-                    // ($sioRegisterNsHandler ns, event, callback)
-                    "$sioregisternshandler" => {
-                        let cb = arg_v(2);
-                        let fns = self.collect_reachable_fn_arcs(&cb);
-                        compat.set_ns_handler(
-                            &arg_s(0),
-                            crate::socketio_compat::Handler { event: arg_s(1), callback: cb, fns },
-                        );
-                        return Ok(CfmlValue::Null);
-                    }
-                    // ($sioRegisterSocketHandler socketId, event, callback)
-                    "$sioregistersockethandler" => {
-                        let cb = arg_v(2);
-                        let fns = self.collect_reachable_fn_arcs(&cb);
-                        compat.set_socket_handler(
-                            &arg_s(0),
-                            crate::socketio_compat::Handler { event: arg_s(1), callback: cb, fns },
-                        );
-                        return Ok(CfmlValue::Null);
-                    }
-                    // ($sioBroadcast event, data, rooms, namespace, socketId)
-                    // namespace set → broadcast to the whole namespace; socketId
-                    // set → broadcast to the sender's namespace excluding it.
-                    // rooms (array|string|empty) narrows to those rooms.
-                    "$siobroadcast" => {
-                        let event = arg_s(0);
-                        let data = arg_v(1);
-                        let rooms = sio_room_list(&arg_v(2));
-                        let namespace = arg_s(3);
-                        let socket_id = arg_s(4);
-                        if let Some(ss) = self.server_state.as_ref() {
-                            let registry = ss.websocket.clone();
-                            let (channel, except) = if !namespace.is_empty() {
-                                (namespace, None)
-                            } else if !socket_id.is_empty() {
-                                let ch = registry.channel_of(&socket_id).unwrap_or_default();
-                                (ch, Some(socket_id))
-                            } else {
-                                (String::new(), None)
-                            };
-                            if !channel.is_empty() {
-                                if rooms.is_empty() {
-                                    let frame = registry.msg(
-                                        &channel,
-                                        Some(event),
-                                        data,
-                                    );
-                                    registry.broadcast(&channel, frame, except.as_deref());
-                                } else {
-                                    for room in &rooms {
-                                        let frame = registry.msg(
-                                            &channel,
-                                            Some(event.clone()),
-                                            data.clone(),
-                                        );
-                                        registry.to_room(
-                                            &channel,
-                                            room,
-                                            frame,
-                                            except.as_deref(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    // ($sioSend socketId, event, data) — direct to one client.
-                    "$siosend" => {
-                        let socket_id = arg_s(0);
-                        let event = arg_s(1);
-                        let data = arg_v(2);
-                        if let Some(ss) = self.server_state.as_ref() {
-                            let registry = ss.websocket.clone();
-                            let channel = registry.channel_of(&socket_id).unwrap_or_default();
-                            let frame = registry.msg(&channel, Some(event), data);
-                            registry.emit_to(&socket_id, frame);
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    "$siojoinroom" => {
-                        if let Some(ss) = self.server_state.as_ref() {
-                            ss.websocket.join(&arg_s(0), &arg_s(1));
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    "$sioleaveroom" => {
-                        if let Some(ss) = self.server_state.as_ref() {
-                            ss.websocket.leave(&arg_s(0), &arg_s(1));
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    // Leave every room except the connection's own id-room (which
-                    // the registry auto-joins so "send to this socket" works).
-                    "$sioleaveallrooms" => {
-                        let socket_id = arg_s(0);
-                        if let Some(ss) = self.server_state.as_ref() {
-                            let registry = ss.websocket.clone();
-                            for room in registry.rooms_of(&socket_id) {
-                                if room != socket_id {
-                                    registry.leave(&socket_id, &room);
-                                }
-                            }
-                        }
-                        return Ok(CfmlValue::Null);
-                    }
-                    "$siodisconnect" => {
-                        let socket_id = arg_s(0);
-                        if let Some(ss) = self.server_state.as_ref() {
-                            ss.websocket.close_conn(&socket_id, 1000, String::new());
-                        }
-                        compat.drop_conn(&socket_id);
-                        return Ok(CfmlValue::Null);
-                    }
-                    "$siogetdata" => {
-                        return Ok(CfmlValue::strukt(compat.get_data(&arg_s(0))));
-                    }
-                    // ($sioSetData socketId, data-struct)
-                    "$siosetdata" => {
-                        let data = match arg_v(1) {
-                            CfmlValue::Struct(s) => s.snapshot(),
-                            _ => ValueMap::default(),
-                        };
-                        compat.set_data(&arg_s(0), data);
-                        return Ok(CfmlValue::Null);
-                    }
-                    "$siosocketcount" => {
-                        let n = self
-                            .server_state
-                            .as_ref()
-                            .map(|ss| ss.websocket.channel_count(&arg_s(0)))
-                            .unwrap_or(0);
-                        return Ok(CfmlValue::Int(n as i64));
-                    }
-                    _ => {
-                        return Err(self.wrap_error(CfmlError::runtime(format!(
-                            "Unknown socket.io compat function [{}]",
-                            func.name
-                        ))))
-                    }
+            if intercepts_output::handles(&name_lower) {
+                match self.dispatch_output(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
                 }
             }
 
-            // __writeText: same as writeOutput but suppressed when enableCFOutputOnly > 0
-            if name_lower == "__writetext" {
-                if self.enable_cfoutput_only <= 0 {
-                    for arg in &args {
-                        // §3.5: the copy was pure waste — the text is immediately
-                        // pushed into the output buffer and dropped.
-                        self.output_buffer.push_str(&arg.as_str_cow());
-                    }
-                }
-                return Ok(CfmlValue::Null);
-            }
-            if name_lower == "writedump" || name_lower == "dump" || name_lower == "cfdump" {
-                let named = self.pending_dump_named.take();
-                // Resolve the value to dump and the options. Named args (when
-                // present) take precedence; otherwise fall back to positional
-                // (var is the first positional arg).
-                let mut opts = dump::DumpOptions::default();
-                let mut var: Option<CfmlValue> = None;
-                let mut output: Option<String> = None;
-                let mut abort_after = false;
-                if let Some(pairs) = &named {
-                    for (k, v) in pairs {
-                        match k.to_lowercase().as_str() {
-                            "var" => var = Some(v.clone()),
-                            "label" => opts.label = Some(v.as_string()),
-                            "expand" => opts.expand = v.is_true(),
-                            "top" => {
-                                let n = v.as_string().parse::<i64>().unwrap_or(0);
-                                if n > 0 {
-                                    opts.top = Some(n as usize);
-                                }
-                            }
-                            "output" => output = Some(v.as_string()),
-                            "abort" => abort_after = v.is_true(),
-                            _ => {}
-                        }
-                    }
-                }
-                let value = var.or_else(|| args.into_iter().next()).unwrap_or(CfmlValue::Null);
-                // output="console" sends a plain-text dump to the server console
-                // (stdout), leaving the page / HTTP response untouched (issue #207
-                // — Lucee/ACF parity). TestBox/ColdBox use this for non-fatal
-                // diagnostics; routing it into the response polluted reporter output.
-                if output
-                    .as_deref()
-                    .map(|o| o.eq_ignore_ascii_case("console"))
-                    .unwrap_or(false)
-                {
-                    let rendered = dump::render(&value, &opts, false, false);
-                    print!("{}", rendered);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                    return self.finish_dump(abort_after);
-                }
-                // `output="<path>"` writes the dump to a FILE and keeps the
-                // response clean. Lucee uses the plain-text rendering (the same
-                // one `output="console"` emits), APPENDS to an existing file, and
-                // resolves the path the way ExpandPath does — leading slash =
-                // web root, otherwise relative to the calling template (all
-                // probed on 7.0.4). A missing parent directory is an
-                // `application` error with Lucee's wording, not a silent skip.
-                if let Some(path) = output
-                    .as_deref()
-                    .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("browser"))
-                {
-                    let resolved = self.resolve_template_relative(path, false);
-                    let target = std::path::Path::new(&resolved);
-                    match target.parent() {
-                        Some(dir) if !dir.as_os_str().is_empty() && !dir.is_dir() => {
-                            return Err(CfmlError::new(
-                                format!(
-                                    "Parent directory for [{}] doesn't exist",
-                                    target.display()
-                                ),
-                                CfmlErrorType::Application,
-                            ));
-                        }
-                        _ => {}
-                    }
-                    let rendered = dump::render(&value, &opts, false, false);
-                    use std::io::Write;
-                    let appended = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(target)
-                        .and_then(|mut f| f.write_all(rendered.as_bytes()));
-                    if let Err(e) = appended {
-                        return Err(CfmlError::new(
-                            format!("cannot write dump to [{}]: {}", target.display(), e),
-                            CfmlErrorType::Application,
-                        ));
-                    }
-                    return self.finish_dump(abort_after);
-                }
-                let include_assets = self.web_context && !self.dump_assets_emitted;
-                let rendered = dump::render(&value, &opts, self.web_context, include_assets);
-                if include_assets {
-                    self.dump_assets_emitted = true;
-                }
-                self.output_buffer.push_str(&rendered);
-                return self.finish_dump(abort_after);
-            }
-
-            if matches!(name_lower.as_str(), "cfdirectory" | "__cfdirectory") {
-                if let Some(CfmlValue::Struct(opts)) = args.first() {
-                    let action = opts
-                        .get_ci("action")
-                        .map(|v| v.as_string().to_lowercase())
-                        .unwrap_or_else(|| "list".to_string());
-                    if action == "list" {
-                        return self.cfdirectory_list_from_opts(opts);
-                    }
+            if intercepts_querydir::handles(&name_lower) {
+                match self.dispatch_querydir(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
                 }
             }
 
-            // queryAppend: mutates the first query in-place (reference-typed —
-            // the shared handle propagates to the caller), returns boolean.
-            if name_lower == "queryappend" {
-                if let (Some(CfmlValue::Query(q1)), Some(CfmlValue::Query(q2))) =
-                    (args.first(), args.get(1))
-                {
-                    let q2_data: cfml_common::dynamic::CfmlQueryData =
-                        q2.with_read(|d| d.clone());
-                    q1.with_write(|d| d.append_query(&q2_data));
-                    return Ok(CfmlValue::Bool(true));
-                }
-                return Ok(CfmlValue::Bool(false));
-            }
-
-            // querySetRow: mutates query in-place, returns boolean.
-            if name_lower == "querysetrow" {
-                if let (Some(CfmlValue::Query(q)), Some(row_pos), Some(CfmlValue::Struct(new_row))) =
-                    (args.first(), args.get(1), args.get(2))
-                {
-                    let pos = match row_pos {
-                        CfmlValue::Int(i) => *i as usize,
-                        CfmlValue::Double(d) => *d as usize,
-                        _ => 0,
-                    };
-                    let new_row = new_row.snapshot();
-                    let ok = q.with_write(|d| {
-                        if pos >= 1 && pos <= d.row_count() {
-                            for ci in 0..d.columns.len() {
-                                let col_name = d.columns[ci].clone();
-                                let val = new_row
-                                    .iter()
-                                    .find(|(k, _)| k.eq_ignore_ascii_case(&col_name))
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or(CfmlValue::Null);
-                                std::sync::Arc::make_mut(&mut d.data[ci])[pos - 1] = val;
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    return Ok(CfmlValue::Bool(ok));
-                }
-                return Ok(CfmlValue::Bool(false));
-            }
-
-            // In-place array mutators that return boolean (matches Lucee):
-            // arrayDelete, arrayDeleteNoCase. Mutate the caller's array via
-            // arg_ref_writeback and return true/false based on whether the
-            // element was found.
             if name_lower == "arraydelete" || name_lower == "arraydeletenocase" {
                 if let Some(CfmlValue::Array(arr)) = args.first() {
                     let target = args.get(1).map(|v| v.as_string()).unwrap_or_default();
@@ -13457,157 +13176,10 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::Int(0));
                 }
-                "arraymap"
-                | "arrayfilter"
-                | "arrayreduce"
-                | "arrayeach"
-                | "arraysome"
-                | "arrayevery"
-                | "arrayfindall"
-                | "arrayfindallnocase"
-                | "structeach"
-                | "structmap"
-                | "structfilter"
-                | "structreduce"
-                | "structsome"
-                | "structevery"
-                | "listeach"
-                | "listmap"
-                | "listfilter"
-                | "listreduce"
-                | "listsome"
-                | "listevery"
-                | "listreduceright"
-                | "stringeach"
-                | "stringmap"
-                | "stringfilter"
-                | "stringreduce"
-                | "stringsome"
-                | "stringevery"
-                | "stringsort"
-                | "collectioneach"
-                | "collectionmap"
-                | "collectionfilter"
-                | "collectionreduce"
-                | "collectionsome"
-                | "collectionevery"
-                | "each"
-                | "queryeach"
-                | "querymap"
-                | "queryfilter"
-                | "queryreduce"
-                | "querysort"
-                | "querysome"
-                | "queryevery"
-                | "queryaddrow"
-                | "querysetcell"
-                | "createobject"
-                | "getcurrenttemplatepath"
-                | "getmetadata"
-                | "getcomponentmetadata"
-                | "getcomponentstaticscope"
-                | "getapplicationmetadata"
-                | "getapplicationsettings"
-                | "__cfheader"
-                | "__cfapplication"
-                | "__cfcontent"
-                | "__cflocation"
-                | "__cfabort"
-                | "__cfexit"
-                | "__cfhtmlhead"
-                | "__cfhtmlbody"
-                | "gethttprequestdata"
-                | "__cfinvoke"
-                | "__cfsavecontent_start"
-                | "__cfsavecontent_end"
-                | "invoke"
-                | "getbasetemplatepath"
-                | "getfunctioncalledname"
-                | "gettimezone"
-                | "sleep"
-                | "settimezone"
-                | "getlocale"
-                | "setlocale"
-                | "gettimezoneinfo"
-                | "dateconvert"
-                | "expandpath"
-                // sanitizeHtml resolves its policy path the same way
-                // expandPath does, so it must run where that context exists.
-                | "sanitizehtml"
-                | "isdefined"
-                | "setencoding"
-                | "__cfparam"
-                | "queryexecute"
-                | "cfdbinfo"
-                | "dbinfo"
-                // cfhttp is intercepted for `name=` (body → query, delivered
-                // into the caller's scope) and `file=`/`path=` (body → disk,
-                // with a relative path resolved against the calling template).
-                | "cfhttp"
-                | "queryregisterfunction"
-                | "__cftransaction_start"
-                | "__cftransaction_commit"
-                | "__cftransaction_rollback"
-                | "__cftransaction_end"
-                | "__writetext"
-                | "__cflog"
-                | "writelog"
-                | "__cfsetting"
-                | "__cflock_start"
-                | "__cflock_end"
-                | "__cfcookie"
-                | "fileupload"
-                | "fileuploadall"
-                | "__cffile_upload"
-                | "sessioninvalidate"
-                | "sessionrotate"
-                | "sessioncommit"
-                | "sessiongetmetadata"
-                | "applicationstop"
-                | "getauthuser"
-                | "csrfgeneratetoken"
-                | "csrfverifytoken"
-                | "isuserinrole"
-                | "isuserloggedin"
-                | "__cfloginuser"
-                | "__cflogout"
-                | "setvariable"
-                | "getvariable"
-                | "throw"
-                | "__cfcustomtag"
-                | "__cfmodule"
-                | "__cfcustomtag_start"
-                | "__cfcustomtag_end"
-                | "cacheput"
-                | "cacheget"
-                | "cachedelete"
-                | "cacheclear"
-                | "cachekeyexists"
-                | "cachecount"
-                | "cachegetall"
-                | "cachegetallids"
-                | "cachegetproperties"
-                | "__cfcache"
-                | "__cfloop_file_lines"
-                | "__cfexecute"
-                | "__cfthread_run"
-                | "__cfthread_join"
-                | "__cfthread_terminate"
-                | "threadjoin"
-                | "threadterminate"
-                | "runasync"
-                | "_schedule"
-                | "createdynamicproxy"
-                | "callstackget"
-                | "callstackdump"
-                | "isinthread"
-                | "getpagecontext"
-                | "getbasetaglist"
-                | "getbasetagdata"
-                | "evaluate"
-                | "precisionevaluate" => {
-                    // Will be handled at the end of this function (needs VM access)
-                }
+                // Names resolved further down this function (they need VM access).
+                // Listed as data in `intercepts_deferred` rather than as 149 lines of
+                // `| "name"` patterns; matching here still falls through, as before.
+                _ if intercepts_deferred::is_deferred(&name_lower) => {}
                 // Debug-footer BIFs (Phase 1). Need VM access (the per-request
                 // collector + live scopes), so they are VM-intercepted. When the
                 // `observability` feature is off they fall through to the no-op
@@ -13694,6 +13266,11 @@ impl CfmlVirtualMachine {
                         // Preside hot-reload). Still skipped in CLI mode
                         // (`server_state.is_none()`), which holds no persistent
                         // bytecode cache — each include recompiles there anyway.
+                        // Part 1 Step 0 census — recorded once here, BEFORE the
+                        // two `builtin(args)` arms below consume `args`, so each
+                        // call is counted exactly once whichever arm runs.
+                        #[cfg(feature = "bif-census")]
+                        cfml_common::perf_counters::bif_census::record(&name_lower, &args);
                         if write_targets.is_empty() {
                             let result = builtin(args);
                             // No knowable target: a removal has to fall back to a
@@ -17451,6 +17028,11 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.to_lowercase() == "queryexecute")
                             .map(|(_, v)| *v)
                         {
+                            #[cfg(feature = "bif-census")]
+                            cfml_common::perf_counters::bif_census::record(
+                                "queryexecute",
+                                &args,
+                            );
                             builtin(args)?
                         } else {
                             return Err(CfmlError::runtime(
@@ -17809,6 +17391,11 @@ impl CfmlVirtualMachine {
                                 "cfhttp: HTTP support is not enabled in this build".to_string(),
                             )
                         })?;
+                    #[cfg(feature = "bif-census")]
+                    cfml_common::perf_counters::bif_census::record(
+                        "cfhttp",
+                        std::slice::from_ref(&arg),
+                    );
                     let result = builtin(vec![arg])?;
                     if write_target.is_some() || name_attr.is_some() {
                         let body = result
@@ -20727,12 +20314,32 @@ impl CfmlVirtualMachine {
     ) -> Option<CfmlValue> {
         // Bare `arguments` resolves to the scope stored under the reserved key
         // (independent of any user `local.arguments` var at the literal key).
+        // Scope-depth census (diagnostics only, `RUSTCFML_COUNTERS=1`). This is
+        // the hottest read path in the engine, so the bumps are gated on the env
+        // flag rather than left unconditional — an always-on atomic here would
+        // perturb the very cost being attributed.
+        let depth_census = cfml_common::perf_counters::enabled();
+        if depth_census {
+            cfml_common::perf_counters::bump(
+                &cfml_common::perf_counters::SCOPE_LOOKUP_TOTAL,
+            );
+        }
         if name_lower == "arguments" {
             if let Some(v) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+                if depth_census {
+                    cfml_common::perf_counters::bump(
+                        &cfml_common::perf_counters::SCOPE_HIT_LOCALS,
+                    );
+                }
                 return Some(v.clone());
             }
         }
         if let Some(v) = locals.get(name) {
+            if depth_census {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::SCOPE_HIT_LOCALS,
+                );
+            }
             return Some(v.clone());
         }
         // The `arguments` scope is part of the bare-name search chain (CFML
@@ -20750,6 +20357,11 @@ impl CfmlVirtualMachine {
         if name_lower != "arguments" {
             if let Some(CfmlValue::Struct(args)) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
                 if let Some(v) = args.get(name) {
+                    if depth_census {
+                        cfml_common::perf_counters::bump(
+                            &cfml_common::perf_counters::SCOPE_HIT_ARGUMENTS,
+                        );
+                    }
                     return Some(v.clone());
                 }
                 // Pure key comparison + one value clone — no need to copy the
@@ -20761,6 +20373,11 @@ impl CfmlVirtualMachine {
                         })
                         .map(|(_, v)| v.clone())
                 }) {
+                    if depth_census {
+                        cfml_common::perf_counters::bump(
+                            &cfml_common::perf_counters::SCOPE_HIT_ARGUMENTS,
+                        );
+                    }
                     return Some(v);
                 }
             }
@@ -20774,6 +20391,11 @@ impl CfmlVirtualMachine {
         // `variables` scope (Masa front-controller infinite redirect loop).
         if Self::is_web_request_scope(name_lower) {
             if let Some(v) = self.globals.get(name) {
+                if depth_census {
+                    cfml_common::perf_counters::bump(
+                        &cfml_common::perf_counters::SCOPE_HIT_WEBSCOPE,
+                    );
+                }
                 return Some(v.clone());
             }
         }
@@ -20785,10 +20407,20 @@ impl CfmlVirtualMachine {
             // on a warm Preside page: 25% of all entries copied engine-wide, the
             // second-largest snapshot site.
             if let Some(v) = vars.get_ci(name) {
+                if depth_census {
+                    cfml_common::perf_counters::bump(
+                        &cfml_common::perf_counters::SCOPE_HIT_VARIABLES,
+                    );
+                }
                 return Some(v);
             }
         }
         if let Some(v) = self.globals.get(name) {
+            if depth_census {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::SCOPE_HIT_GLOBALS,
+                );
+            }
             return Some(v.clone());
         }
         // NO case-insensitive fallback scan here. Both `locals` and `globals`
@@ -20814,9 +20446,17 @@ impl CfmlVirtualMachine {
         for scope_name in ["cgi", "url", "form", "cookie"] {
             if let Some(CfmlValue::Struct(scope)) = self.globals.get(scope_name) {
                 if let Some(v) = scope.get_ci(name) {
+                    if depth_census {
+                        cfml_common::perf_counters::bump(
+                            &cfml_common::perf_counters::SCOPE_HIT_WEBSCOPE,
+                        );
+                    }
                     return Some(v);
                 }
             }
+        }
+        if depth_census {
+            cfml_common::perf_counters::bump(&cfml_common::perf_counters::SCOPE_MISS);
         }
         None
     }
@@ -21701,6 +21341,8 @@ impl CfmlVirtualMachine {
     fn call_named_builtin(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         let nl = name.to_lowercase();
         if let Some((_, b)) = self.builtin_lookup_ci(name, &nl) {
+            #[cfg(feature = "bif-census")]
+            cfml_common::perf_counters::bif_census::record(&nl, &args);
             return b(args);
         }
         Err(CfmlError::runtime(format!(
@@ -25232,6 +24874,8 @@ impl CfmlVirtualMachine {
             // Look up the builtin (exact spelling first, then case-insensitive)
             let name_lower = name.to_lowercase();
             if let Some((_, builtin)) = self.builtin_lookup_ci(name, &name_lower) {
+                #[cfg(feature = "bif-census")]
+                cfml_common::perf_counters::bif_census::record(&name_lower, &args);
                 return builtin(args);
             }
         }
@@ -35707,6 +35351,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::Return => (0, 1),
         // Call: pops func + N args, pushes 1 result
         BytecodeOp::Call(n) => (1, n + 1),
+        BytecodeOp::CallBuiltin(_, n) => (1, *n as usize),
         BytecodeOp::CallNamed(_, n) => (1, n + 1),
         BytecodeOp::CallSpread => (1, 3), // func, array, count — approximate
         // Collections

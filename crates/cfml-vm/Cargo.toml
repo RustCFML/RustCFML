@@ -101,6 +101,9 @@ real-threads = []
 s3 = ["dep:cfml-stdlib", "cfml-stdlib/s3"]
 # Dynamic op census — see cfml-common's `op-census`. Probe builds only.
 op-census = ["cfml-common/op-census"]
+# Per-BIF call + argument-shape census — see cfml-common's `bif-census`.
+# Probe builds only.
+bif-census = ["cfml-common/bif-census"]
 # Call-prologue phase attribution — see cfml-common's `call-phases`.
 call-phases = ["cfml-common/call-phases"]
 # Existence-probe outcome census — see cfml-common's `exists-census`. Probe

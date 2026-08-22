@@ -133,9 +133,35 @@ crates/
 2. Implement as `fn fn_name(args: Vec<CfmlValue>) -> CfmlResult`
 
 **VM-intercepted (needs access to VM state like output_buffer, globals, closures):**
-1. Register a stub in `builtins.rs` that returns an error
-2. Add the function name (lowercase) to the intercept list in `lib.rs` `call_function()` (~line 1718)
-3. Add the handler in `call_function()` after the intercept check
+
+> 🚨 **DO NOT append another `if name_lower == "..."` branch to `call_function`.** That
+> instruction is what this recipe used to say, and following it faithfully grew
+> `call_function` to **7,497 lines — 20% of `cfml-vm/src/lib.rs`** — with ~190 name
+> comparisons interleaved with `sandbox_intercept` / `s3_intercept` /
+> `resolve_file_bif_paths`. Nothing ever removed a branch, so "is this name intercepted?"
+> became unanswerable without reading the whole function, which in turn blocked
+> compile-time builtin binding: a wrong answer there does not run slow, it **bypasses the
+> sandbox**. (This doc still said the list was at "~line 1718" when it was at ~12,990.)
+
+1. Register in `builtins.rs` as usual. A stub returning an error is only needed if the
+   function cannot work at all outside the VM; otherwise give it a sensible CLI-mode body
+   (`writeOutput` prints to stdout, for instance).
+2. **Declare it** in `cfml-common/src/builtins_meta.rs` → `VM_INTERCEPTED`. This is the
+   single enumerable source of truth; codegen reads it to decide which builtins may be
+   compile-time bound. Over-declaring is safe (the name just keeps the slower generic
+   dispatch); **under-declaring is a correctness/security bug**.
+3. Put the handler in the matching `crates/cfml-vm/src/intercepts_*.rs` module — or add a
+   new one — and add the name to that module's `handles()`. `call_function` consults these
+   as a short list of guards.
+4. If your handler does **not** return for every call it claims (e.g. `cfdirectory` handles
+   `action="list"` and defers the rest), end the dispatch with
+   `intercepts_common::unhandled()`; the caller turns that back into fall-through. Do NOT
+   try to predict fall-through inside `handles()` — that duplicates each branch's inner
+   conditions somewhere they will drift.
+
+You cannot silently get this wrong: `crates/cfml-vm/tests/intercept_declaration_guard.rs`
+scans the VM source and **fails the build** if any dispatched-on name is undeclared, and
+`cfml-stdlib` asserts `BUILTIN_NAMES` matches the registration table exactly.
 
 Examples of VM-intercepted: `writeOutput`, `writeDump`, `sleep`, `include`, all higher-order functions (arrayMap, structFilter, etc.), savecontent, cfthread.
 

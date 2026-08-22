@@ -484,6 +484,18 @@ pub fn make_instance_value(
     instance_id: u64,
 ) -> CfmlValue {
     let inst = Instance::from_marker(marker, class, instance_id);
+    // Step 0.5 footprint sizing: instances produced and how wide they are.
+    // Read BEFORE the handle is wrapped so no lock is held (`len()` on the two
+    // data maps takes their own short read guards).
+    crate::perf_counters::bump(&crate::perf_counters::INSTANCES_CREATED);
+    crate::perf_counters::add(
+        &crate::perf_counters::INSTANCE_THIS_KEYS,
+        inst.this_members.len() as u64,
+    );
+    crate::perf_counters::add(
+        &crate::perf_counters::INSTANCE_VARS_KEYS,
+        inst.variables_members.len() as u64,
+    );
     let handle: InstanceRef = std::sync::Arc::new(parking_lot::RwLock::new(inst));
     // Register the Instance Arc as a cycle-GC node so `Instance↔Instance` (and
     // Instance↔struct) reference cycles are reclaimable at request end. Its data

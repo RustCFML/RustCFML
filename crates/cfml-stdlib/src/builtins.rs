@@ -19295,3 +19295,46 @@ mod uuid_tests {
         assert_eq!(draw(), draw());
     }
 }
+
+#[cfg(test)]
+mod builtins_meta_guard {
+    /// The declared `BUILTIN_NAMES` list must equal the registration table exactly.
+    ///
+    /// Without this, the list rots the moment someone registers a builtin — and a builtin
+    /// missing from it silently loses compile-time binding (slow but correct), while a
+    /// stale entry claims a name that no longer exists. This is one half of the closing
+    /// mechanism that the old append-only intercept chain never had.
+    #[test]
+    fn declared_builtin_names_match_registration() {
+        let mut actual: Vec<String> = super::get_builtin_functions()
+            .keys()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
+        actual.sort();
+        actual.dedup();
+        let declared: Vec<String> = cfml_common::builtins_meta::BUILTIN_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let missing: Vec<&String> = actual.iter().filter(|n| !declared.contains(n)).collect();
+        let stale: Vec<&String> = declared.iter().filter(|n| !actual.contains(n)).collect();
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "cfml_common::builtins_meta::BUILTIN_NAMES is out of date.\n\
+             Registered but not declared: {missing:?}\n\
+             Declared but not registered: {stale:?}"
+        );
+    }
+
+    /// Every declared intercept that is also a registered builtin must be excluded from
+    /// compile-time binding. Guards the safety asymmetry: under-declaring bypasses the VM.
+    #[test]
+    fn intercepted_builtins_are_never_pure() {
+        for name in cfml_common::builtins_meta::VM_INTERCEPTED {
+            assert!(
+                !cfml_common::builtins_meta::is_pure_builtin(name),
+                "{name} is declared VM-intercepted but is_pure_builtin() accepted it"
+            );
+        }
+    }
+}

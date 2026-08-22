@@ -108,6 +108,9 @@ obs-pprof = ["dep:pprof"]
 alloc-sizing = ["cfml-common/alloc-sizing"]
 probe-sites = ["cfml-common/probe-sites"]
 op-census = ["cfml-common/op-census", "cfml-vm/op-census"]
+# Per-BIF call + argument-shape census (performance plan Part 1 Step 0) — see
+# cfml-common/Cargo.toml. Sizing builds only.
+bif-census = ["cfml-common/bif-census", "cfml-vm/bif-census"]
 call-phases = ["cfml-common/call-phases", "cfml-vm/call-phases"]
 # Existence-probe outcome census (known-issues §45 sizing) — see
 # cfml-common/Cargo.toml. Sizing builds only.
