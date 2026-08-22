@@ -463,7 +463,7 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
 pub mod op_census {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    /// Room for every `BytecodeOp` variant (121 today) plus headroom, so adding
+    /// Room for every `BytecodeOp` variant (123 today) plus headroom, so adding
     /// an op cannot silently start writing out of bounds.
     pub const SLOTS: usize = 192;
 

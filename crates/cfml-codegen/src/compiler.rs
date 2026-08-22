@@ -492,6 +492,7 @@ impl BytecodeFunction {
                 BytecodeOp::StoreGlobal(n)
                 | BytecodeOp::SetLastExceptionFromLocal(n)
                 | BytecodeOp::JumpIfArgPresent(n, _)
+                | BytecodeOp::SeedArgumentKey(n)
                 | BytecodeOp::LoadVariablesKey(n) => {
                     excluded.insert(n.lower().to_string());
                 }
@@ -1079,6 +1080,20 @@ pub enum BytecodeOp {
     // expression reads a same-named outer variable (`function f(x = x)`) is not
     // shadowed by its own not-yet-initialized slot (GitHub #240). No stack traffic.
     JumpIfArgPresent(Name, usize),
+    /// Seed the frame's own `arguments` scope with an applied default parameter
+    /// value (popped from the stack). Replaces the four-op round-trip
+    /// `LoadLocal("arguments"); Swap; SetProperty(n); StoreLocal("arguments")`
+    /// that the default-parameter preamble used to emit.
+    ///
+    /// The round-trip was not just slower — that `LoadLocal("arguments")` is
+    /// what `function_needs_arguments_scope` keys on, so ONE defaulted parameter
+    /// forced every call of the function onto the eager `arguments` path,
+    /// opting it out of Lever A's lazy `arguments` whether the default ever
+    /// fired or not. With the load gone the function stays lazy, and this op
+    /// becomes a no-op on frames that never build an arguments struct (nothing
+    /// can observe it there — any reference to `arguments` puts the function
+    /// back on the eager path by construction).
+    SeedArgumentKey(Name),
 
     /// Enforce the declared type of param `N` (index into the function's
     /// `params`/`param_types`) against its CURRENT local value — emitted only
@@ -1312,11 +1327,12 @@ impl BytecodeOp {
             Self::CallNamed(..) => 119,
             Self::CallRustSuperCtor(..) => 120,
             Self::CallBuiltin(..) => 121,
+            Self::SeedArgumentKey(..) => 122,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 122] = [
+    pub const CENSUS_NAMES: [&'static str; 123] = [
         "Null",
         "True",
         "False",
@@ -1439,6 +1455,7 @@ impl BytecodeOp {
         "CallNamed",
         "CallRustSuperCtor",
         "CallBuiltin",
+        "SeedArgumentKey",
     ];
 }
 
@@ -4036,14 +4053,14 @@ impl CfmlCompiler {
                 // wrong for a parameter named after a built-in scope: since GH #312 a bare
                 // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
                 // seeded `arguments.cookie` with the live cookie scope instead of "D".
-                // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
-                // documented "Load s, Swap, SetProperty -> modified s" pattern.
+                // `Dup` keeps the freshly-evaluated value on the stack for
+                // `SeedArgumentKey`, which consumes it: the local is stored by name
+                // (so slot behaviour is untouched) and the frame's OWN `arguments`
+                // scope gets the same value. Emitting `LoadLocal("arguments")` here
+                // is what used to force the whole function onto the eager path.
                 func_instructions.push(BytecodeOp::Dup);
                 func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
-                func_instructions.push(BytecodeOp::LoadLocal(Name::intern("arguments")));
-                func_instructions.push(BytecodeOp::Swap);
-                func_instructions.push(BytecodeOp::SetProperty(Name::from(&param.name)));
-                func_instructions.push(BytecodeOp::StoreLocal(Name::intern("arguments")));
+                func_instructions.push(BytecodeOp::SeedArgumentKey(Name::from(&param.name)));
                 // A DEFAULT is type-checked exactly like a supplied argument
                 // (Lucee: `function f( numeric n = "abc" )` throws on `f()`).
                 // A supplied argument is checked by the VM at bind time, which
@@ -5632,14 +5649,14 @@ impl CfmlCompiler {
                         // wrong for a parameter named after a built-in scope: since GH #312 a bare
                         // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
                         // seeded `arguments.cookie` with the live cookie scope instead of "D".
-                        // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
-                        // documented "Load s, Swap, SetProperty -> modified s" pattern.
+                        // `Dup` keeps the freshly-evaluated value on the stack for
+                        // `SeedArgumentKey`, which consumes it: the local is stored by name
+                        // (so slot behaviour is untouched) and the frame's OWN `arguments`
+                        // scope gets the same value. Emitting `LoadLocal("arguments")` here
+                        // is what used to force the whole function onto the eager path.
                         func_instructions.push(BytecodeOp::Dup);
                         func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
-                        func_instructions.push(BytecodeOp::LoadLocal(Name::intern("arguments")));
-                        func_instructions.push(BytecodeOp::Swap);
-                        func_instructions.push(BytecodeOp::SetProperty(Name::from(&param.name)));
-                        func_instructions.push(BytecodeOp::StoreLocal(Name::intern("arguments")));
+                        func_instructions.push(BytecodeOp::SeedArgumentKey(Name::from(&param.name)));
                         // Type-check the applied default (see compile_function_decl).
                         if declared_type_is_checkable(param.param_type.as_deref()) {
                             func_instructions.push(BytecodeOp::ValidateParamType(idx));
@@ -5723,14 +5740,14 @@ impl CfmlCompiler {
                         // wrong for a parameter named after a built-in scope: since GH #312 a bare
                         // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
                         // seeded `arguments.cookie` with the live cookie scope instead of "D".
-                        // Dup/Swap keeps the freshly-evaluated value on the stack instead — the
-                        // documented "Load s, Swap, SetProperty -> modified s" pattern.
+                        // `Dup` keeps the freshly-evaluated value on the stack for
+                        // `SeedArgumentKey`, which consumes it: the local is stored by name
+                        // (so slot behaviour is untouched) and the frame's OWN `arguments`
+                        // scope gets the same value. Emitting `LoadLocal("arguments")` here
+                        // is what used to force the whole function onto the eager path.
                         func_instructions.push(BytecodeOp::Dup);
                         func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
-                        func_instructions.push(BytecodeOp::LoadLocal(Name::intern("arguments")));
-                        func_instructions.push(BytecodeOp::Swap);
-                        func_instructions.push(BytecodeOp::SetProperty(Name::from(&param.name)));
-                        func_instructions.push(BytecodeOp::StoreLocal(Name::intern("arguments")));
+                        func_instructions.push(BytecodeOp::SeedArgumentKey(Name::from(&param.name)));
                         // Type-check the applied default (see compile_function_decl).
                         if declared_type_is_checkable(param.param_type.as_deref()) {
                             func_instructions.push(BytecodeOp::ValidateParamType(idx));

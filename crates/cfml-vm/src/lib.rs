@@ -12186,6 +12186,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::JumpIfNotNull(target) => { ops::effect::op_jump_if_not_null(&stack, &mut ip, *target); }
 
                 BytecodeOp::JumpIfArgPresent(name, target) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, &arguments_supplied, name, *target); }
+                BytecodeOp::SeedArgumentKey(name) => { ops::locals::op_seed_argument_key(&mut stack, &mut locals, name); }
 
                 BytecodeOp::ValidateParamType(index) => { ops::locals::op_validate_param_type(self, func, &locals, *index)?; }
 
@@ -35423,6 +35424,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::IsNull => (1, 1),
         BytecodeOp::JumpIfNotNull(_) => (1, 1), // pops, pushes back if not null
         BytecodeOp::JumpIfArgPresent(_, _) => (0, 0), // pure control flow, no stack traffic
+        BytecodeOp::SeedArgumentKey(_) => (1, 0), // pops the applied default value
         BytecodeOp::ValidateParamType(_) => (0, 0),   // reads a local, throws or nothing
         // Output
         BytecodeOp::Print => (0, 1),

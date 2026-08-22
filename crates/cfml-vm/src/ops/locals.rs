@@ -208,6 +208,41 @@ pub(crate) fn op_jump_if_arg_present(
     }
 }
 
+/// `SeedArgumentKey`
+///
+/// Default-parameter preamble tail: the applied default is on the stack (a
+/// `Dup` of the value the preceding `StoreLocal`/`StoreSlot` bound to the named
+/// local); publish it on the frame's `arguments` scope so `arguments.p` reads
+/// the default, exactly as a supplied argument would.
+///
+/// Replaces `LoadLocal("arguments"); Swap; SetProperty(p); StoreLocal("arguments")`.
+/// That `LoadLocal("arguments")` was load-bearing in the worst way: it is what
+/// `function_needs_arguments_scope` scans for, so a single defaulted parameter
+/// opted every call of the function out of Lever A's lazy `arguments` path —
+/// whether or not the default ever fired.
+///
+/// On a lazy frame there is no `arguments` struct and this is a plain pop. That
+/// is not a dropped write: a body that can observe `arguments` at all (by name,
+/// through `argumentCollection`, an include, a custom tag, or a string that
+/// mentions it) puts the function back on the eager path by construction, so a
+/// frame reaching here without a scope has no way to read what we would write.
+/// The key is never sought in the CALLER's scope — a frame's `arguments` is its
+/// own, and the lazy path drops any inherited handle at frame setup.
+#[inline]
+pub(crate) fn op_seed_argument_key(
+    stack: &mut Vec<CfmlValue>,
+    locals: &mut ValueMap,
+    name: &Name,
+) {
+    let value = stack.pop().unwrap_or(CfmlValue::Null);
+    if let Some(args) = locals
+        .get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+        .and_then(|v| v.as_cfml_struct())
+    {
+        args.insert(name, value);
+    }
+}
+
 /// `Increment`
 #[inline]
 pub(crate) fn op_increment(
