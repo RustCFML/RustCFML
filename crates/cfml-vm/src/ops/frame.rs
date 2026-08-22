@@ -236,7 +236,7 @@ pub(crate) fn op_set_index(
         // DATA map in place (shared Arc → persists on the instance).
         #[cfg(feature = "component-instance")]
         CfmlValue::Instance(inst) => {
-            inst.read().this_members.insert(index.as_string(), value);
+            inst.read().set_public_member(index.as_string(), value);
         }
         _ => {}
     }

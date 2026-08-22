@@ -528,7 +528,7 @@ impl NodeHandle {
             NodeHandle::Instance(a) => {
                 let maps = a
                     .try_read()
-                    .map(|g| (g.this_members.clone(), g.variables_members.clone()));
+                    .map(|g| (g.public_map_handle(), g.private_map_handle()));
                 if let Some((this_m, vars_m)) = maps {
                     this_m.with_read(|m| {
                         for v in m.values() {
@@ -570,8 +570,7 @@ impl NodeHandle {
             #[cfg(feature = "component-instance")]
             NodeHandle::Instance(a) => {
                 if let Some(g) = a.try_write() {
-                    g.this_members.with_write(|m| m.clear());
-                    g.variables_members.with_write(|m| m.clear());
+                    g.clear_all_members();
                 }
             }
         }

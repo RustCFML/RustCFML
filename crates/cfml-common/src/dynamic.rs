@@ -2252,7 +2252,7 @@ impl CfmlValue {
             // generic `deep_set` through a component node persists instead of no-oping.
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
-                inst.read().this_members.insert(key, value);
+                inst.read().set_public_member(key, value);
             }
             _ => {}
         }
@@ -2422,10 +2422,10 @@ impl CfmlValue {
                 if let Some(ref stat) = g.class.static_scope {
                     variables_members.insert("__static".to_string(), stat.clone());
                 }
-                for (k, v) in g.this_members.snapshot() {
+                for (k, v) in g.public_entries() {
                     this_members.insert(k, v);
                 }
-                for (k, v) in g.variables_members.snapshot() {
+                for (k, v) in g.private_entries() {
                     if k.eq_ignore_ascii_case("__static") {
                         continue; // shared, already attached
                     }
@@ -2598,11 +2598,11 @@ impl CfmlValue {
                 // maps are untracked, reached via the Instance node walk).
                 crate::cycle_gc::log_instance(&new_inst);
                 seen.insert(ptr, CfmlValue::Instance(new_inst.clone()));
-                for (k, v) in g.this_members.snapshot() {
+                for (k, v) in g.public_entries() {
                     let dv = v.deep_copy_guarded(seen, share_nested_components, false);
                     this_members.insert(k, dv);
                 }
-                for (k, v) in g.variables_members.snapshot() {
+                for (k, v) in g.private_entries() {
                     if k.eq_ignore_ascii_case("__static") {
                         continue; // shared, already attached
                     }
@@ -3400,7 +3400,7 @@ impl serde::Serialize for CfmlValue {
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
                 let g = inst.read();
-                let snap = g.this_members.snapshot();
+                let snap = g.public_entries();
                 let mut map = s.serialize_map(Some(snap.len()))?;
                 for (k, v) in snap.iter() {
                     map.serialize_entry(k, v)?;

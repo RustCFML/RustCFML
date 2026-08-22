@@ -122,9 +122,13 @@ pub struct Instance {
     /// Shared blueprint — zero per-instance copy.
     pub class: std::sync::Arc<ClassBlueprint>,
     /// Public DATA members only (Lucee `_data`); no methods, no `__*` metadata.
-    pub this_members: CfmlStruct,
+    /// 3B-S0: `pub(crate)`, NOT `pub`. The accessor layer below is the only way in
+    /// from outside this crate, so the compiler — not a convention — is what keeps the
+    /// by-name channels enumerable for 3B-S2. Widening this back to `pub` silently
+    /// reopens the hazard that cost slot-locals two infinite-loop hunts.
+    pub(crate) this_members: CfmlStruct,
     /// Private DATA members only (Lucee `shadow`); independent map (see §core).
-    pub variables_members: CfmlStruct,
+    pub(crate) variables_members: CfmlStruct,
     /// Logical identity for `duplicate()` disambiguation / fluent-chain guards.
     pub instance_id: u64,
     /// Accessor-`property` names whose VALUES live in `this_members` but must stay
@@ -385,6 +389,95 @@ impl Instance {
             accessor_private: parking_lot::RwLock::new(accessor_private),
             native_parent,
         }
+    }
+
+    // ================= 3B stage 0 — member-access encapsulation =================
+    //
+    // `this_members` / `variables_members` used to be poked as public fields from 30
+    // sites outside this module. Stage 3B replaces them with a per-class shape plus a
+    // `Vec<CfmlValue>` of slots (see PERFORMANCE_ROADMAP.md Part 3B), and the hazard
+    // that work inherits from slot-locals (v0.584/585) is stated there as an invariant:
+    //
+    //   ANY code that reads or writes members BY NAME cannot see slot storage.
+    //
+    // Slot-locals paid for that lesson with two infinite-loop hunts. So the point of
+    // this layer is NOT tidiness — it is to make every by-name channel into the
+    // instance a named, greppable method instead of an anonymous field borrow, so that
+    // S2 has an enumerable list of sites to convert rather than a whole-tree audit.
+    //
+    // Accessors come in two grades, and the distinction is the whole point:
+    //   * NARROW  (`set_public_member`, `public_entries`, …) — the operation is fully
+    //     described, so S2 can reimplement it against slots with no caller change.
+    //   * ESCAPING (`*_map_handle`) — hands the raw backing map to a caller that then
+    //     does anything it likes with it. These CANNOT be transparently reimplemented
+    //     and every one must be revisited in S2. They are named `_map_handle` so
+    //     `rg 'map_handle'` is exactly the S2 worklist.
+
+    /// Public (`this`) DATA members, by value.
+    #[inline]
+    pub fn public_entries(&self) -> crate::dynamic::ValueMap {
+        self.this_members.snapshot()
+    }
+
+    /// Private (`variables`) DATA members, by value.
+    #[inline]
+    pub fn private_entries(&self) -> crate::dynamic::ValueMap {
+        self.variables_members.snapshot()
+    }
+
+    /// Write a public (`this`) data member. Returns the previous value, if any.
+    #[inline]
+    pub fn set_public_member(
+        &self,
+        name: impl crate::dynamic::IntoKey,
+        value: CfmlValue,
+    ) -> Option<CfmlValue> {
+        self.this_members.insert(name, value)
+    }
+
+    /// Is `name` present as a public (`this`) member? Case-insensitive.
+    #[inline]
+    pub fn has_public_member(&self, name: &str) -> bool {
+        self.this_members.contains_key_ci(name)
+    }
+
+    /// Delete `name` from the public (`this`) members. Case-insensitive.
+    #[inline]
+    pub fn remove_public_member(&self, name: &str) -> Option<CfmlValue> {
+        self.this_members.remove_ci(name)
+    }
+
+    /// Delete `name` from the private (`variables`) members. Case-insensitive.
+    #[inline]
+    pub fn remove_private_member(&self, name: &str) -> Option<CfmlValue> {
+        self.variables_members.remove_ci(name)
+    }
+
+    /// Drop every data member in both scopes. Used by cycle-GC when it breaks a
+    /// detected cycle: the instance stays alive but stops retaining its members.
+    #[inline]
+    pub fn clear_all_members(&self) {
+        self.this_members.with_write(|m| m.clear());
+        self.variables_members.with_write(|m| m.clear());
+    }
+
+    /// 🚨 **ESCAPING ACCESSOR — S2 worklist.** Hands out the raw public-member map, so
+    /// the caller can subsequently read and write it BY NAME, outside anything this
+    /// type can intercept. Kept because several callers legitimately need the map as a
+    /// *scope* (it is pushed as `this` into a call frame). When 3B-S2 lands slots this
+    /// must either materialise a view or keep the instance permanently de-slotted —
+    /// decide per call site. Do not add new callers.
+    #[inline]
+    pub fn public_map_handle(&self) -> CfmlStruct {
+        self.this_members.clone()
+    }
+
+    /// 🚨 **ESCAPING ACCESSOR — S2 worklist.** Private-member equivalent of
+    /// [`Self::public_map_handle`]; this one is pushed as the `__variables` scope of a
+    /// method frame, which is why instance state mutations persist across calls.
+    #[inline]
+    pub fn private_map_handle(&self) -> CfmlStruct {
+        self.variables_members.clone()
     }
 
     /// Read a member for property access (`obj.name` / `obj["name"]`): public data

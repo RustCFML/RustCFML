@@ -191,7 +191,7 @@ pub(crate) fn op_get_property(
                             if f.captured_scope.is_none() {
                                 let g = inst.read();
                                 let vars = CfmlValue::Struct(
-                                    g.variables_members.clone(),
+                                    g.private_map_handle(),
                                 );
                                 let mut bound: ValueMap = ValueMap::default();
                                 bound.insert("this".to_string(), obj.clone());
@@ -488,7 +488,7 @@ pub(crate) fn op_set_property(
                 match handled {
                     Some(result) => result?,
                     None => {
-                        inst.read().this_members.insert(name.to_string(), value);
+                        inst.read().set_public_member(name.to_string(), value);
                     }
                 }
                 stack.push(obj);

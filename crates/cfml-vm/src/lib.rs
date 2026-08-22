@@ -10378,7 +10378,7 @@ impl CfmlVirtualMachine {
                                 match handled {
                                     Some(result) => result?,
                                     None => {
-                                        inst.read().this_members.insert(prop_name.to_string(), value);
+                                        inst.read().set_public_member(prop_name.to_string(), value);
                                     }
                                 }
                                 continue;
@@ -10627,7 +10627,7 @@ impl CfmlVirtualMachine {
                                     let g = inst.read();
                                     init_locals.insert(
                                         "__variables".to_string(),
-                                        CfmlValue::Struct(g.variables_members.clone()),
+                                        CfmlValue::Struct(g.private_map_handle()),
                                     );
                                     if let Some(stat) = g.class.static_scope.clone() {
                                         init_locals.insert("__static".to_string(), stat);
@@ -11232,7 +11232,7 @@ impl CfmlVirtualMachine {
                                             let g = inst.read();
                                             method_locals.insert(
                                                 "__variables".to_string(),
-                                                CfmlValue::Struct(g.variables_members.clone()),
+                                                CfmlValue::Struct(g.private_map_handle()),
                                             );
                                             if let Some(stat) = g.class.static_scope.clone() {
                                                 method_locals
@@ -20736,7 +20736,7 @@ impl CfmlVirtualMachine {
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {
                         let ns = CfmlValue::strukt(ValueMap::default());
-                        inst.read().this_members.insert((*k).to_string(), ns.clone());
+                        inst.read().set_public_member((*k).to_string(), ns.clone());
                         ns
                     }
                 },
@@ -20749,7 +20749,7 @@ impl CfmlVirtualMachine {
                 s.insert((*leaf).to_string(), value);
             }
             CfmlValue::Instance(inst) => {
-                inst.read().this_members.insert((*leaf).to_string(), value);
+                inst.read().set_public_member((*leaf).to_string(), value);
             }
             _ => {}
         }
@@ -20966,8 +20966,8 @@ impl CfmlVirtualMachine {
                         #[cfg(feature = "component-instance")]
                         if let CfmlValue::Instance(ref inst) = obj {
                             let g = inst.read();
-                            g.this_members.remove_ci(leaf);
-                            g.variables_members.remove_ci(leaf);
+                            g.remove_public_member(leaf);
+                            g.remove_private_member(leaf);
                             return;
                         }
                         if let Some(s) = obj.as_cfml_struct() {
@@ -21008,8 +21008,8 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             if let CfmlValue::Instance(ref inst) = cur {
                 let g = inst.read();
-                g.this_members.remove_ci(leaf);
-                g.variables_members.remove_ci(leaf);
+                g.remove_public_member(leaf);
+                g.remove_private_member(leaf);
                 self.scope_aware_store(scope, root, locals, modern);
                 return;
             }
@@ -26966,8 +26966,8 @@ impl CfmlVirtualMachine {
                 let (this_m, vars_m, methods, super_handle, super_map, static_scope) = {
                     let g = inst.read();
                     (
-                        g.this_members.clone(),
-                        g.variables_members.clone(),
+                        g.public_map_handle(),
+                        g.private_map_handle(),
                         g.class.method_values.clone(),
                         g.class.super_handle.clone(),
                         g.class.super_map.clone(),
@@ -27835,10 +27835,10 @@ impl CfmlVirtualMachine {
             let g = inst.read();
             (
                 g.lookup_method(method),
-                CfmlValue::Struct(g.variables_members.clone()),
-                g.this_members.clone(),
-                g.variables_members.clone(),
-                g.this_members.contains_key_ci("onmissingmethod"),
+                CfmlValue::Struct(g.private_map_handle()),
+                g.public_map_handle(),
+                g.private_map_handle(),
+                g.has_public_member("onmissingmethod"),
             )
         };
 
@@ -33743,7 +33743,7 @@ impl CfmlVirtualMachine {
         // place → no writeback).
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(ref inst) = template {
-            let view = inst.read().this_members.clone();
+            let view = inst.read().public_map_handle();
             let func = match Self::resolve_ws_handler(&view, method, event) {
                 Some(f) => f,
                 None => return Ok(None),

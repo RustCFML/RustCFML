@@ -273,7 +273,7 @@ fn render_html(
             let ptr = std::sync::Arc::as_ptr(inst) as *const () as usize;
             let (name, snap) = {
                 let g = inst.read();
-                (g.class.name.clone(), g.this_members.snapshot())
+                (g.class.name.clone(), g.public_entries())
             };
             box_open(out, "k-comp", &format!("Component {}", esc(&name)), &snap.len().to_string(), opts.expand);
             if recursion_guard(out, visited, ptr) { return; }
@@ -516,7 +516,7 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
             visited.push(ptr);
             let (name, snap) = {
                 let g = inst.read();
-                (g.class.name.clone(), g.this_members.snapshot())
+                (g.class.name.clone(), g.public_entries())
             };
             out.push_str(&format!("Component {} ({})\n", name, snap.len()));
             for (k, v) in snap.iter() {
