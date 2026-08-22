@@ -42,6 +42,88 @@ use crate::dynamic::{CfmlStruct, CfmlValue};
 #[cfg(feature = "component-instance")]
 pub type InstanceRef = std::sync::Arc<parking_lot::RwLock<Instance>>;
 
+/// 3B stage 1 — the per-class member **shape**: declared member name -> slot index.
+///
+/// This is the piece 3B was missing, and its absence is why the interpreter
+/// inline-cache work (Fable §3.3) was measured dead at v0.577. `StructInner::shape_id`
+/// looks like a hidden class but is drawn from a GLOBAL counter per struct instance at
+/// construction, so it is an object *identity*: two instances of one class have
+/// different ids, and a `(shape, index)` cache could therefore only hit when a call
+/// site revisited the very same object — 38% of Preside reads, and 1.6% of writes.
+///
+/// A shape hung off [`ClassBlueprint`] fixes that by construction rather than by
+/// convention: every instance of a class holds the same `Arc<ClassBlueprint>`, so they
+/// necessarily agree on the shape and an index resolved against one instance is valid
+/// for all of them. No transition table and no per-insert rehash — the shape is built
+/// once, from the class's DECLARED members, and never mutates.
+///
+/// Coverage is why the static (transition-free) form is enough. Census of the
+/// readyintelligence webroot, Preside core + site + extensions, 2026-08-22: 1,861 CFCs,
+/// 1,137 `property … inject=` declarations over the 501 CFCs that use them = **2.27
+/// declared members per class**. The runtime counter at `make_instance_value`
+/// independently measured **2.3 data members per instance** (0.6 public + 1.7 private).
+/// Those agree to two decimal places, so the declared set essentially IS the instance
+/// state and the overflow map stays near-empty. Dynamic keys (WireBox mixins inject
+/// both data and UDFs at runtime) still MUST fall back to it — that is not optional.
+#[cfg(feature = "component-instance")]
+#[derive(Debug, Default)]
+pub struct Shape {
+    /// Declared member name -> slot index, in declaration order. The `Key` is the
+    /// interned case-insensitive key, so a probe is a hash compare with no folding.
+    slots: indexmap::IndexMap<crate::key::Key, u32>,
+}
+
+#[cfg(feature = "component-instance")]
+impl Shape {
+    /// Build from the blueprint's `__properties` array (the declared
+    /// `property name=…` list, already merged with inherited properties at
+    /// inheritance-merge time — see `ClassBlueprint::properties`).
+    pub fn from_properties(properties: Option<&CfmlValue>) -> Self {
+        let mut slots = indexmap::IndexMap::new();
+        if let Some(CfmlValue::Array(props)) = properties {
+            for prop in props.iter() {
+                if let Some(name) = prop
+                    .as_cfml_struct()
+                    .and_then(|ps| ps.get_ci("name"))
+                    .map(|n| n.as_string())
+                {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let next = slots.len() as u32;
+                    // `entry` not `insert`: a child redeclaring an inherited property
+                    // must keep the parent's index, or an index resolved against the
+                    // parent's shape would point at the wrong slot.
+                    slots.entry(crate::key::Key::new(&name)).or_insert(next);
+                }
+            }
+        }
+        Shape { slots }
+    }
+
+    /// Slot index for `name`, if it is a declared member. Case-insensitive.
+    #[inline]
+    pub fn slot_of(&self, name: &str) -> Option<u32> {
+        self.slots.get(&crate::key::Key::new(name)).copied()
+    }
+
+    /// Number of declared member slots.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Declared member names in slot order.
+    pub fn names(&self) -> impl Iterator<Item = &crate::key::Key> {
+        self.slots.keys()
+    }
+}
+
 /// One per CFC file. Immutable after build; `Arc`-shared across every instance
 /// and request. Holds the class-invariant bulk (methods + metadata) that the
 /// marker-struct representation currently copies into each instance.
@@ -112,6 +194,10 @@ pub struct ClassBlueprint {
     /// `super(args)` (`CallRustSuperCtor`) can reconstruct the parent with args.
     /// `None` for a pure-CFC class.
     pub rust_extends: Option<String>,
+    /// 3B stage 1 — the per-class member shape (see [`Shape`]). Shared by every
+    /// instance of this class because the blueprint itself is, which is exactly the
+    /// property `StructInner::shape_id` could never provide.
+    pub shape: std::sync::Arc<Shape>,
 }
 
 /// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
@@ -311,6 +397,7 @@ impl ClassBlueprint {
             super_handle,
             super_map,
             source_names,
+            shape: std::sync::Arc::new(Shape::from_properties(properties.as_ref())),
             properties,
             rust_extends,
         }
@@ -1484,5 +1571,69 @@ mod producer_tests {
             ),
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "component-instance"))]
+mod shape_tests {
+    use super::Shape;
+    use crate::dynamic::{CfmlValue, ValueMap};
+
+    fn props(names: &[&str]) -> CfmlValue {
+        CfmlValue::array(
+            names
+                .iter()
+                .map(|n| {
+                    let mut m = ValueMap::default();
+                    m.insert("name".to_string(), CfmlValue::string(n.to_string()));
+                    CfmlValue::strukt(m)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn slots_are_assigned_in_declaration_order() {
+        let s = Shape::from_properties(Some(&props(&["alpha", "beta", "gamma"])));
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.slot_of("alpha"), Some(0));
+        assert_eq!(s.slot_of("beta"), Some(1));
+        assert_eq!(s.slot_of("gamma"), Some(2));
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive() {
+        // CFML identifiers are case-insensitive, and `variables.MyProp` must land on
+        // the same slot as a `property name="myprop"` declaration.
+        let s = Shape::from_properties(Some(&props(&["myProp"])));
+        assert_eq!(s.slot_of("MYPROP"), Some(0));
+        assert_eq!(s.slot_of("myprop"), Some(0));
+    }
+
+    #[test]
+    fn a_redeclared_inherited_property_keeps_the_parents_slot() {
+        // `properties` arrives already merged with the parent's declarations, so a
+        // child that redeclares one appears TWICE. If the second occurrence took a
+        // fresh index, a slot index resolved against the parent's shape would read
+        // the wrong member. This is the rule `entry().or_insert()` encodes.
+        let s = Shape::from_properties(Some(&props(&["id", "label", "ID", "extra"])));
+        assert_eq!(s.len(), 3, "redeclaration must not create a second slot");
+        assert_eq!(s.slot_of("id"), Some(0));
+        assert_eq!(s.slot_of("label"), Some(1));
+        assert_eq!(s.slot_of("extra"), Some(2));
+    }
+
+    #[test]
+    fn a_class_with_no_declared_properties_has_an_empty_shape() {
+        // Every member of such a class lands in the stage-2 overflow map. That is a
+        // supported shape, not a bug: 73% of the CFCs censused declare none.
+        assert!(Shape::from_properties(None).is_empty());
+        assert!(Shape::from_properties(Some(&props(&[]))).is_empty());
+    }
+
+    #[test]
+    fn unknown_names_have_no_slot() {
+        let s = Shape::from_properties(Some(&props(&["known"])));
+        assert_eq!(s.slot_of("unknown"), None);
     }
 }
