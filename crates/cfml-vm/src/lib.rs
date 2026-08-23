@@ -2903,7 +2903,25 @@ struct InheritedKeys {
     /// Non-structural inherited keys (page vars, helpers, params where the
     /// caller tracks them here). `None` until the first insert — the common
     /// structural-only frame never allocates.
-    other: Option<std::collections::HashSet<String>>,
+    ///
+    /// Keyed by the interned [`Key`], not `String`. Two reasons, one measured
+    /// and one correctness:
+    ///
+    /// * **Allocation.** DHAT prices a synthetic `function leaf(a,b){return a+b}`
+    ///   frame at ~23 allocations, of which `InheritedKeys::insert` was **11** —
+    ///   a `k.to_string()` per key plus hashbrown growth. Every hot insert site
+    ///   already holds a `&Key` (it is iterating a `ValueMap`), and cloning a
+    ///   `Key` is an `Arc` refcount bump, so those allocations simply go away.
+    ///   On live Preside the String path ran **2.06 times per frame**.
+    /// * **Case.** `Key` compares case-insensitively by construction, which is
+    ///   what CFML identifiers are. The `HashSet<String>` this replaces was
+    ///   case-SENSITIVE, so `contains("thread")` could miss a stored `Thread` —
+    ///   the reason `remove_ci` existed as a separate linear-scan method at all.
+    ///
+    /// `IndexSet` rather than `HashSet` because indexmap's `Equivalent` lets a
+    /// `&str` caller probe with a borrowed `KeyRef` and pay nothing; `std`'s
+    /// `Borrow` bound cannot express a folded-hash probe.
+    other: Option<indexmap::IndexSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>>,
 }
 
 impl InheritedKeys {
@@ -2920,14 +2938,50 @@ impl InheritedKeys {
         }
     }
 
+    /// Insert from a `&Key` — the hot path. No allocation: `Key::clone` is an
+    /// `Arc` refcount bump, and the set itself is only built once per frame that
+    /// actually has a non-structural key (0.80 of Preside frames).
+    #[inline]
+    fn insert_key(&mut self, k: &cfml_common::key::Key) {
+        if let Some(bit) = Self::structural_bit(k.as_str()) {
+            if cfml_common::perf_counters::enabled() {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::IK_INSERT_STRUCTURAL);
+            }
+            self.structural |= bit;
+        } else {
+            if cfml_common::perf_counters::enabled() {
+                use cfml_common::perf_counters as pc;
+                pc::bump(&pc::IK_INSERT_STRING);
+                if self.other.is_none() {
+                    pc::bump(&pc::IK_SET_CREATED);
+                }
+            }
+            self.other.get_or_insert_with(Default::default).insert(k.clone());
+        }
+    }
+
+    /// Insert from a bare `&str`. Allocates a `Key`; kept for the handful of
+    /// sites that genuinely have no interned key to hand.
     #[inline]
     fn insert(&mut self, k: &str) {
         if let Some(bit) = Self::structural_bit(k) {
+            if cfml_common::perf_counters::enabled() {
+                cfml_common::perf_counters::bump(
+                    &cfml_common::perf_counters::IK_INSERT_STRUCTURAL);
+            }
             self.structural |= bit;
         } else {
+            if cfml_common::perf_counters::enabled() {
+                use cfml_common::perf_counters as pc;
+                pc::bump(&pc::IK_INSERT_STRING);
+                if self.other.is_none() {
+                    pc::bump(&pc::IK_SET_CREATED);
+                }
+            }
             self.other
-                .get_or_insert_with(std::collections::HashSet::new)
-                .insert(k.to_string());
+                .get_or_insert_with(Default::default)
+                .insert(cfml_common::key::Key::new(k));
         }
     }
 
@@ -2936,7 +2990,9 @@ impl InheritedKeys {
         if let Some(bit) = Self::structural_bit(k) {
             self.structural & bit != 0
         } else {
-            self.other.as_ref().is_some_and(|s| s.contains(k))
+            self.other
+                .as_ref()
+                .is_some_and(|s| s.contains(&cfml_common::key::KeyRef::new(k)))
         }
     }
 
@@ -2945,13 +3001,16 @@ impl InheritedKeys {
         if let Some(bit) = Self::structural_bit(k) {
             self.structural &= !bit;
         } else if let Some(s) = self.other.as_mut() {
-            s.remove(k);
+            s.swap_remove(&cfml_common::key::KeyRef::new(k));
         }
     }
 
-    /// Case-insensitive reclaim: remove every member matching `name` under
-    /// CFML case-insensitivity (the `DeclareLocal` GH #243 semantics, which
-    /// used `retain(|k| !k.eq_ignore_ascii_case(name))`).
+    /// Case-insensitive reclaim (the `DeclareLocal` GH #243 semantics). With a
+    /// `Key`-keyed set this is `remove` — `Key` equality already folds case, so
+    /// there can be at most one member matching `name` and the old
+    /// `retain(|k| !k.eq_ignore_ascii_case(name))` linear scan is gone. Kept as
+    /// a distinct method because the structural half still has to fold: the
+    /// bitmask is matched on exact lowercase names by `structural_bit`.
     fn remove_ci(&mut self, name: &str) {
         for s in Self::STRUCTURAL_NAMES {
             if s.eq_ignore_ascii_case(name) {
@@ -2959,7 +3018,7 @@ impl InheritedKeys {
             }
         }
         if let Some(set) = self.other.as_mut() {
-            set.retain(|k| !k.eq_ignore_ascii_case(name));
+            set.swap_remove(&cfml_common::key::KeyRef::new(name));
         }
     }
 
@@ -6867,9 +6926,9 @@ impl CfmlVirtualMachine {
                         .as_ref()
                         .is_none_or(|s| !s.contains(k.as_str()))
                     {
-                        inherited_or_param_keys.insert(k);
+                        inherited_or_param_keys.insert_key(k);
                     }
-                    inherited_from_parent.insert(k);
+                    inherited_from_parent.insert_key(k);
                 }
             }
         }
@@ -7027,7 +7086,13 @@ impl CfmlVirtualMachine {
         // a loop that already inserts into a map and may validate a declared type.
         let (mut _p4_supplied, mut _p4_typechecks) = (0u64, 0u64);
         for (i, param_name) in func.params.iter().enumerate() {
-            inherited_or_param_keys.insert(param_name);
+            // `param_keys` is the function's interned parameter names, built
+            // once per function — so this marks the param inherited without
+            // allocating a `Key` from `param_name`'s `String`.
+            match param_keys.get(i) {
+                Some(pk) => inherited_or_param_keys.insert_key(pk),
+                None => inherited_or_param_keys.insert(param_name),
+            }
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
             // A Null arg value counts as "not supplied": CFML has no way to pass
             // an explicit null, and the named-argument rebinder pads omitted
@@ -20282,9 +20347,9 @@ impl CfmlVirtualMachine {
                     }
                     locals.insert(k.clone(), v.clone());
                     if share_local_keys.is_none_or(|s| !s.contains(k.as_str())) {
-                        inherited_or_param_keys.insert(k);
+                        inherited_or_param_keys.insert_key(k);
                     }
-                    inherited_from_parent.insert(k);
+                    inherited_from_parent.insert_key(k);
                 }
             }
         }
@@ -20317,9 +20382,9 @@ impl CfmlVirtualMachine {
                     }
                     locals.insert(k.clone(), v.clone());
                     if share_local_keys.is_none_or(|s| !s.contains(k.as_str())) {
-                        inherited_or_param_keys.insert(k);
+                        inherited_or_param_keys.insert_key(k);
                     }
-                    inherited_from_parent.insert(k);
+                    inherited_from_parent.insert_key(k);
                 }
             }
         }

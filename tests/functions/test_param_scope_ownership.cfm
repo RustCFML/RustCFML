@@ -60,5 +60,26 @@ assert("mutated supplied param returns the new value", mutatesSupplied( 1 ), 2);
 assert("mutated supplied param does not reach the next callee",
        readsSuppliedName(), "absent");
 
+// --- 7. inherited page vars are NOT part of the callee's `local` view, under
+//        ANY casing. The frame's inherited-key set is keyed by the interned
+//        case-insensitive `Key`; it used to be a case-SENSITIVE HashSet<String>,
+//        so a probe in different casing could miss and mis-classify an inherited
+//        page variable as a frame local. Verified identical on Lucee 7.0.5. ---
+MyPageVar = "page";
+function inheritedNotLocal() {
+    return structKeyExists( local, "mypagevar" )
+        || structKeyExists( local, "MyPageVar" )
+        || structKeyExists( local, "MYPAGEVAR" );
+}
+assertFalse("an inherited page var is not in `local` under any casing",
+            inheritedNotLocal());
+
+function realLocalIsLocal() {
+    var RealLocal = 1;
+    return structKeyExists( local, "reallocal" ) && structKeyExists( local, "RealLocal" );
+}
+assertTrue("a genuine var-declared local IS in `local` under any casing",
+           realLocalIsLocal());
+
 suiteEnd();
 </cfscript>

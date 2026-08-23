@@ -58,6 +58,23 @@ pub static BIND_TYPECHECKS: AtomicU64 = AtomicU64::new(0);
 /// stages or a multi-week arena migration. Counter-first, per Part 6's rule:
 /// these run before any ablation so the A/B has a predicted magnitude to hit.
 pub static WB_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// `InheritedKeys` inserts that took the ZERO-ALLOCATION structural bitmask path
+/// (`this` / `__variables` / `super` / `variables`).
+///
+/// Sizes the per-frame inherited-key set. DHAT prices a synthetic
+/// `function leaf(a,b){return a+b}` frame at ~23 allocations, of which
+/// **`InheritedKeys::insert` is 11** — a `HashSet<String>` that pays a
+/// `k.to_string()` per key and re-grows from empty every frame. But the
+/// synthetic's page frame inherits real page variables, while Preside is mostly
+/// CFC methods whose inherited keys may be almost entirely structural and
+/// therefore already free. These two counters decide whether the lever exists on
+/// the workload that matters, before any of it is built.
+pub static IK_INSERT_STRUCTURAL: AtomicU64 = AtomicU64::new(0);
+/// `InheritedKeys` inserts that allocated: a `String` per key, plus hashbrown
+/// growth. This is the number the lever would remove.
+pub static IK_INSERT_STRING: AtomicU64 = AtomicU64::new(0);
+/// Frames that created the backing `HashSet` at all (first non-structural key).
+pub static IK_SET_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Frames that reached the diff and were skipped by the v0.600.0 futility guard
 /// (locals untouched since entry) — already-harvested win, not available again.
 pub static WB_SKIPPED_FUTILE: AtomicU64 = AtomicU64::new(0);
@@ -319,6 +336,10 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
            .. params declared:        {:>12}\n\
            .. args supplied:          {:>12}\n\
            .. type validations:       {:>12}\n\
+         --- inherited-key set (per frame) ---\n\
+         inserts, structural (free):  {:>12}\n\
+         inserts, String (allocates): {:>12}\n\
+         frames creating the set:     {:>12}\n\
          --- return-time parent-scope diff (3A second half) ---\n\
          frames reaching the diff:    {:>12}\n\
            .. skipped futile:         {:>12}\n\
@@ -388,6 +409,9 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         g(&BIND_PARAMS_DECLARED),
         g(&BIND_ARGS_SUPPLIED),
         g(&BIND_TYPECHECKS),
+        g(&IK_INSERT_STRUCTURAL),
+        g(&IK_INSERT_STRING),
+        g(&IK_SET_CREATED),
         g(&WB_FRAMES),
         g(&WB_SKIPPED_FUTILE),
         g(&WB_KEYS_SCANNED),
