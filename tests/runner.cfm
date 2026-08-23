@@ -952,7 +952,7 @@ include "harness.cfm";
 <!--- for-in already do). A struct built via structAppend(s, arguments) otherwise --->
 <!--- leaks them into JSON; breaks Wheels helpers that serialize copied arg structs. --->
 <cf_runtest file="core/test_serializejson_arguments_sentinels.cfm">
-<cf_runtest file="core/test_closure_finally_isolation.cfm">
+<cf_runtest file="core/test_closure_finally_isolation.cfm" rustcfmlOnly="true" why="LUCEE DEFECT: `variables.x` is unreachable inside a finally block there (unscoped works); nothing to fix here">
 <!--- - closures read the LIVE variables scope: a SCOPED write (variables.x = …) --->
 <!--- must reach closures created earlier, exactly as the unscoped form already --->
 <!--- did, and a closure must be able to call itself by the name it was assigned --->

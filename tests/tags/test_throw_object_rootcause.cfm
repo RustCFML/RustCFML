@@ -47,27 +47,36 @@ try {
 }
 assert("plain throw message", plain.message, "plain");
 
-// --- every exception carries a rootCause (Lucee/ACF parity) ---
+// --- every exception carries a rootCause ---
+// A RustCFML/ACF extension, NOT Lucee parity: measured on Lucee 7.1.0.204,
+// cfcatch has no rootCause key at all — not for a plain throw, not for an
+// engine error, not even when `cause=` is passed explicitly. The comment here
+// used to claim Lucee parity; it does not hold, so these are guarded as the
+// superset they are rather than reported as a Lucee failure.
 rc = "";
 try {
 	throw(type = "Custom.T3", message = "m3", extendedInfo = "ext3");
 } catch (any e) {
 	rc = e;
 }
-assertTrue("exception has rootCause", structKeyExists(rc, "rootCause"));
-assert("rootCause.type matches", rc.rootCause.type, "Custom.T3");
-assert("rootCause.message matches", rc.rootCause.message, "m3");
-assert("rootCause.extendedInfo matches", rc.rootCause.extendedInfo, "ext3");
-assertFalse("rootCause does not nest a rootCause", structKeyExists(rc.rootCause, "rootCause"));
+if ( isRustCFML() ) {
+	assertTrue("exception has rootCause", structKeyExists(rc, "rootCause"));
+	assert("rootCause.type matches", rc.rootCause.type, "Custom.T3");
+	assert("rootCause.message matches", rc.rootCause.message, "m3");
+	assert("rootCause.extendedInfo matches", rc.rootCause.extendedInfo, "ext3");
+	assertFalse("rootCause does not nest a rootCause", structKeyExists(rc.rootCause, "rootCause"));
+}
 
-// runtime errors also get a rootCause
+// runtime errors also get a rootCause (same RustCFML/ACF extension)
 divErr = "";
 try {
 	dummy = 1 / 0;
 } catch (any e) {
 	divErr = e;
 }
-assertTrue("runtime error has rootCause", structKeyExists(divErr, "rootCause"));
+if ( isRustCFML() ) {
+	assertTrue("runtime error has rootCause", structKeyExists(divErr, "rootCause"));
+}
 
 tagObjErr = "";
 tagExtErr = "";

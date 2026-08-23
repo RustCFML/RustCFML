@@ -103,13 +103,21 @@ assert("flat array -> one row", qOneRow.recordCount, 1);
 assert("flat array row width scalar", qOneRow.width, 100);
 assert("flat array row height scalar", qOneRow.height, 200);
 assertTrue("flat array width isNumeric", isNumeric(qOneRow.width));
+// Chunking a FLAT array into rows-of-columns is a RustCFML behaviour: Lucee
+// makes a single row from [1,2,3,4] regardless of column count. The one-row
+// case above agrees on both engines; only the multi-row chunk diverges.
 qTwoRows = queryNew("a,b", "int,int", [1, 2, 3, 4]);
-assert("flat array -> two rows", qTwoRows.recordCount, 2);
-assert("row1 a", queryGetRow(qTwoRows, 1).a, 1);
-assert("row2 b", queryGetRow(qTwoRows, 2).b, 4);
-// Single-column shortcut still yields one row per scalar (unchanged behaviour).
+if ( isRustCFML() ) {
+    assert("flat array -> two rows", qTwoRows.recordCount, 2);
+    assert("row1 a", queryGetRow(qTwoRows, 1).a, 1);
+    assert("row2 b", queryGetRow(qTwoRows, 2).b, 4);
+}
+// Single-column shortcut yields one row per scalar — same RustCFML flat-array
+// handling as above; Lucee makes a single row from any flat array.
 qSingleCol = queryNew("id", "int", [1, 2, 3]);
-assert("single-column flat array -> row per value", qSingleCol.recordCount, 3);
+if ( isRustCFML() ) {
+    assert("single-column flat array -> row per value", qSingleCol.recordCount, 3);
+}
 // Array-of-arrays (explicit rows) and array-of-structs unaffected.
 qRows = queryNew("a,b", "int,int", [[10, 20], [30, 40]]);
 assert("array-of-arrays -> two rows", qRows.recordCount, 2);
