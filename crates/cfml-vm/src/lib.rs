@@ -39,6 +39,7 @@ pub mod debug_footer;
 #[cfg(feature = "observability")]
 pub mod profiler;
 mod antisamy_shim;
+mod cmdline;
 mod java_security;
 mod java_shims;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
@@ -18974,11 +18975,11 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.to_lowercase() == "body")
                             .map(|(_, v)| v.as_string());
 
-                        let cmd_args: Vec<&str> = if arguments.is_empty() {
-                            Vec::new()
-                        } else {
-                            arguments.split_whitespace().collect()
-                        };
+                        // Lucee tokenizes this string shell-style: a quoted
+                        // span is ONE argument with the quotes stripped. See
+                        // `cmdline` for the rules and why a whitespace split
+                        // breaks every conventionally-quoted call site.
+                        let cmd_args: Vec<String> = cmdline::tokenize_arguments(&arguments);
 
                         let mut command = std::process::Command::new(&cmd_name);
                         command.args(&cmd_args);

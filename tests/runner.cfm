@@ -507,6 +507,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_customtag_path_deep_search.cfm">
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
 <cf_runtest file="tags/test_tags_cfexecute.cfm">
+<cf_runtest file="tags/test_cfexecute_argument_quoting.cfm">
 <cf_runtest file="tags/test_tags_cfmail.cfm">
 <cf_runtest file="tags/test_tags_cfcache.cfm">
 <cf_runtest file="tags/test_tags_cfstoredproc.cfm">
