@@ -1466,3 +1466,260 @@ pub mod bif_census {
         out
     }
 }
+
+/// ⭐ Per-frame **EXCLUSIVE** accounting — the instrument roadmap rank 1 asks for.
+///
+/// Attribution says a Preside frame costs **1,276 ns** against a synthetic
+/// frame's **780 ns**, a **+496 ns surcharge** worth 28% of a warm admin render.
+/// Nothing has explained it, and nothing could: the `call-phases` table measures
+/// the call PROLOGUE (and reports Preside as *cheaper* there — 618 ns vs 872),
+/// while its body phase recursively contains every nested frame, so summing it
+/// double-counts. Neither instrument can say what a frame spends *on its own
+/// behalf*, and every microbenchmark aimed at the gap has missed it.
+///
+/// This measures exactly that. Each frame records wall time, allocation count,
+/// allocated bytes and executed ops at entry and exit, then **subtracts what its
+/// children consumed**, leaving the frame's own cost. Totals are aggregated per
+/// function (`global_id`), so the surcharge can be attributed to real Preside
+/// functions and then read, rather than guessed at from a microbench.
+///
+/// Allocations are the primary signal, not nanoseconds: this is an instrumented
+/// build, so its timings are inflated (see `feedback_measure_cpu_time_not_wall_
+/// clock_on_busy_box` and the standing rule never to time on a census build).
+/// Allocation COUNTS are exact and comparable across builds, and the one lever
+/// class that has ever converted on this engine is allocation, not instructions.
+///
+/// Enabled by the `frame-census` cargo feature; every call site vanishes without
+/// it. `note_alloc` is called from the counting global allocator in the binary
+/// crate, so it must stay allocation-free itself — the thread-locals are
+/// const-initialised `Cell`s with no destructors, which is what keeps TLS access
+/// from re-entering the allocator.
+pub mod frame_census {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    thread_local! {
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+        static BYTES:  Cell<u64> = const { Cell::new(0) };
+        static OPS:    Cell<u64> = const { Cell::new(0) };
+        static STACK:  RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+        static LOCAL:  RefCell<Vec<Acct>>  = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Bumped by the counting global allocator. Must not allocate.
+    #[inline(always)]
+    pub fn note_alloc(size: usize) {
+        ALLOCS.with(|c| c.set(c.get().wrapping_add(1)));
+        BYTES.with(|c| c.set(c.get().wrapping_add(size as u64)));
+    }
+
+    /// Bumped once per executed bytecode op.
+    #[inline(always)]
+    pub fn note_op() {
+        OPS.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    struct Frame {
+        id: u32,
+        t0: Instant,
+        a0: u64,
+        b0: u64,
+        o0: u64,
+        child_ns: u64,
+        child_allocs: u64,
+        child_bytes: u64,
+        child_ops: u64,
+    }
+
+    #[derive(Default, Clone, Copy)]
+    pub struct Acct {
+        pub calls: u64,
+        pub self_ns: u64,
+        pub incl_ns: u64,
+        pub self_allocs: u64,
+        pub self_bytes: u64,
+        pub self_ops: u64,
+    }
+
+    static GLOBAL: Mutex<Vec<Acct>> = Mutex::new(Vec::new());
+    static NAMES: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
+
+    /// RAII frame marker. Declare it FIRST in the frame function so it drops
+    /// LAST — after the frame's `locals` map — and therefore includes scope
+    /// teardown, which no existing phase covers.
+    pub struct Guard {
+        _priv: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            exit();
+        }
+    }
+
+    pub fn enter(id: u32, name: &str) -> Guard {
+        {
+            let mut n = NAMES.lock().unwrap();
+            let m = n.get_or_insert_with(HashMap::new);
+            if !m.contains_key(&id) {
+                m.insert(id, name.to_string());
+            }
+        }
+        let (a0, b0, o0) = (
+            ALLOCS.with(|c| c.get()),
+            BYTES.with(|c| c.get()),
+            OPS.with(|c| c.get()),
+        );
+        STACK.with(|s| {
+            s.borrow_mut().push(Frame {
+                id,
+                t0: Instant::now(),
+                a0,
+                b0,
+                o0,
+                child_ns: 0,
+                child_allocs: 0,
+                child_bytes: 0,
+                child_ops: 0,
+            })
+        });
+        Guard { _priv: () }
+    }
+
+    fn exit() {
+        let now = Instant::now();
+        let (a1, b1, o1) = (
+            ALLOCS.with(|c| c.get()),
+            BYTES.with(|c| c.get()),
+            OPS.with(|c| c.get()),
+        );
+        let (frame, empty) = STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            let f = st.pop();
+            (f, st.is_empty())
+        });
+        let Some(f) = frame else { return };
+        let incl_ns = now.duration_since(f.t0).as_nanos() as u64;
+        let acct = Acct {
+            calls: 1,
+            incl_ns,
+            self_ns: incl_ns.saturating_sub(f.child_ns),
+            self_allocs: (a1 - f.a0).saturating_sub(f.child_allocs),
+            self_bytes: (b1 - f.b0).saturating_sub(f.child_bytes),
+            self_ops: (o1 - f.o0).saturating_sub(f.child_ops),
+        };
+        // Charge this frame's INCLUSIVE cost to the parent's child tally, so the
+        // parent's self-cost excludes everything this subtree did.
+        STACK.with(|s| {
+            if let Some(p) = s.borrow_mut().last_mut() {
+                p.child_ns += incl_ns;
+                p.child_allocs += a1 - f.a0;
+                p.child_bytes += b1 - f.b0;
+                p.child_ops += o1 - f.o0;
+            }
+        });
+        LOCAL.with(|l| {
+            let mut v = l.borrow_mut();
+            let i = f.id as usize;
+            if v.len() <= i {
+                v.resize(i + 1, Acct::default());
+            }
+            let a = &mut v[i];
+            a.calls += acct.calls;
+            a.self_ns += acct.self_ns;
+            a.incl_ns += acct.incl_ns;
+            a.self_allocs += acct.self_allocs;
+            a.self_bytes += acct.self_bytes;
+            a.self_ops += acct.self_ops;
+        });
+        // Top-level frame just ended (one request in serve mode): fold this
+        // thread's tallies into the process-wide table. Doing it here rather
+        // than per frame keeps the mutex off the hot path, and doing it at all
+        // is what makes the report visible from the reporting thread.
+        if empty {
+            merge_thread_local();
+        }
+    }
+
+    fn merge_thread_local() {
+        LOCAL.with(|l| {
+            let mut v = l.borrow_mut();
+            if v.is_empty() {
+                return;
+            }
+            let mut g = GLOBAL.lock().unwrap();
+            if g.len() < v.len() {
+                g.resize(v.len(), Acct::default());
+            }
+            for (i, a) in v.iter().enumerate() {
+                if a.calls == 0 {
+                    continue;
+                }
+                let t = &mut g[i];
+                t.calls += a.calls;
+                t.self_ns += a.self_ns;
+                t.incl_ns += a.incl_ns;
+                t.self_allocs += a.self_allocs;
+                t.self_bytes += a.self_bytes;
+                t.self_ops += a.self_ops;
+            }
+            v.clear();
+        });
+    }
+
+    /// Descending report by SELF allocations, with self-ns and self-ops beside
+    /// them. `top` rows plus a totals line.
+    pub fn report(top: usize) -> String {
+        merge_thread_local();
+        let g = GLOBAL.lock().unwrap();
+        let names = NAMES.lock().unwrap();
+        let empty = HashMap::new();
+        let names = names.as_ref().unwrap_or(&empty);
+        let mut rows: Vec<(u32, Acct)> = g
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.calls > 0)
+            .map(|(i, a)| (i as u32, *a))
+            .collect();
+        let tot_calls: u64 = rows.iter().map(|(_, a)| a.calls).sum();
+        let tot_ns: u64 = rows.iter().map(|(_, a)| a.self_ns).sum();
+        let tot_al: u64 = rows.iter().map(|(_, a)| a.self_allocs).sum();
+        let tot_by: u64 = rows.iter().map(|(_, a)| a.self_bytes).sum();
+        let tot_ops: u64 = rows.iter().map(|(_, a)| a.self_ops).sum();
+        let mut out = format!(
+            "--- frame census: {} frames across {} functions ---\n\
+             TOTAL  self_ns {}  self_allocs {}  self_bytes {}  self_ops {}\n\
+             PER FRAME  {:.0} ns  {:.2} allocs  {:.0} bytes  {:.1} ops",
+            tot_calls,
+            rows.len(),
+            tot_ns,
+            tot_al,
+            tot_by,
+            tot_ops,
+            tot_ns as f64 / tot_calls.max(1) as f64,
+            tot_al as f64 / tot_calls.max(1) as f64,
+            tot_by as f64 / tot_calls.max(1) as f64,
+            tot_ops as f64 / tot_calls.max(1) as f64,
+        );
+        rows.sort_by_key(|(_, a)| std::cmp::Reverse(a.self_allocs));
+        out.push_str(&format!(
+            "\n{:>9} {:>11} {:>10} {:>9} {:>9} {:>8}  {}",
+            "calls", "self_allocs", "al/frame", "self_ns", "ns/frame", "ops/fr", "function"
+        ));
+        for (id, a) in rows.iter().take(top) {
+            out.push_str(&format!(
+                "\n{:>9} {:>11} {:>10.2} {:>9} {:>9.0} {:>8.1}  {}",
+                a.calls,
+                a.self_allocs,
+                a.self_allocs as f64 / a.calls as f64,
+                a.self_ns,
+                a.self_ns as f64 / a.calls as f64,
+                a.self_ops as f64 / a.calls as f64,
+                names.get(id).map(|s| s.as_str()).unwrap_or("<unknown>"),
+            ));
+        }
+        out
+    }
+}

@@ -38,6 +38,60 @@ pub type DefaultAlloc = mimalloc::MiMalloc;
 ))]
 pub const DEFAULT_ALLOC: DefaultAlloc = mimalloc::MiMalloc;
 
+/// Counting global allocator for `frame-census` probe builds: forwards every
+/// request to mimalloc and bumps a thread-local allocation tally that
+/// `cfml_common::perf_counters::frame_census` reads at frame entry and exit.
+///
+/// Exact counts, not sampled stacks. The sampling profiler already in the tree
+/// attributes allocations to SITES; this attributes them to FRAMES, which is the
+/// axis the +496 ns/frame Preside surcharge lives on — and it does so without a
+/// backtrace, so it cannot repeat the "27% allocator share" artifact that a
+/// sampling profile produced on this workload.
+///
+/// `note_alloc` must not allocate: the thread-locals it touches are
+/// const-initialised `Cell<u64>`s with no destructors, so TLS access never
+/// re-enters the allocator.
+#[cfg(all(
+    feature = "frame-census",
+    feature = "mimalloc",
+    not(feature = "dhat-heap"),
+    not(all(feature = "memprofile", unix))
+))]
+pub struct CountingAlloc;
+
+#[cfg(all(
+    feature = "frame-census",
+    feature = "mimalloc",
+    not(feature = "dhat-heap"),
+    not(all(feature = "memprofile", unix))
+))]
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        cfml_common::perf_counters::frame_census::note_alloc(layout.size());
+        std::alloc::GlobalAlloc::alloc(&mimalloc::MiMalloc, layout)
+    }
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::alloc::GlobalAlloc::dealloc(&mimalloc::MiMalloc, ptr, layout)
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        cfml_common::perf_counters::frame_census::note_alloc(layout.size());
+        std::alloc::GlobalAlloc::alloc_zeroed(&mimalloc::MiMalloc, layout)
+    }
+    #[inline]
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        cfml_common::perf_counters::frame_census::note_alloc(new_size);
+        std::alloc::GlobalAlloc::realloc(&mimalloc::MiMalloc, ptr, layout, new_size)
+    }
+}
+
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
@@ -773,8 +827,16 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     // Op census for a plain script run (probe builds only). Must happen here:
     // the error arm below `exit(1)`s, and `run()`'s worker thread never rejoins
     // on that path.
-    #[cfg(any(feature = "op-census", feature = "call-phases", feature = "bif-census"))]
+    #[cfg(any(feature = "op-census", feature = "call-phases", feature = "bif-census", feature = "frame-census"))]
     if cfml_common::perf_counters::enabled() {
+        #[cfg(feature = "frame-census")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::frame_census::report(
+                std::env::var("RCFML_FRAME_CENSUS_TOP").ok()
+                    .and_then(|v| v.parse().ok()).unwrap_or(40)
+            )
+        );
         #[cfg(feature = "op-census")]
         eprintln!(
             "{}",
@@ -1421,6 +1483,14 @@ fn run_server(
 
     if cfml_common::perf_counters::enabled() {
         eprintln!("{}", cfml_common::perf_counters::report());
+        #[cfg(feature = "frame-census")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::frame_census::report(
+                std::env::var("RCFML_FRAME_CENSUS_TOP").ok()
+                    .and_then(|v| v.parse().ok()).unwrap_or(40)
+            )
+        );
         #[cfg(feature = "op-census")]
         eprintln!(
             "{}",
@@ -2219,6 +2289,14 @@ async fn handle_request(
     // reports. Diagnostics only, opt-in via RUSTCFML_COUNTERS=1.
     if cfml_common::perf_counters::enabled() {
         eprintln!("{}", cfml_common::perf_counters::report());
+        #[cfg(feature = "frame-census")]
+        eprintln!(
+            "{}",
+            cfml_common::perf_counters::frame_census::report(
+                std::env::var("RCFML_FRAME_CENSUS_TOP").ok()
+                    .and_then(|v| v.parse().ok()).unwrap_or(40)
+            )
+        );
         #[cfg(feature = "op-census")]
         eprintln!(
             "{}",

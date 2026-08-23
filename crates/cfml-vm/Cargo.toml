@@ -106,6 +106,8 @@ op-census = ["cfml-common/op-census"]
 bif-census = ["cfml-common/bif-census"]
 # Call-prologue phase attribution — see cfml-common's `call-phases`.
 call-phases = ["cfml-common/call-phases"]
+# Per-frame exclusive accounting — see cfml-common's `frame-census`.
+frame-census = ["cfml-common/frame-census"]
 # Existence-probe outcome census — see cfml-common's `exists-census`. Probe
 # builds only.
 exists-census = ["cfml-common/exists-census"]

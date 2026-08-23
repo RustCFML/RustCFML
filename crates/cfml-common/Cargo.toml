@@ -49,6 +49,11 @@ bif-census = []
 # the very thing it measures — read it for SHARES, never as an absolute. Probe
 # builds only.
 call-phases = []
+# Per-frame EXCLUSIVE accounting (self ns / allocations / bytes / ops per
+# function, children subtracted) — the instrument for the +496 ns/frame Preside
+# frame surcharge. Probe builds only; pairs with the counting global allocator
+# in the `cli` crate.
+frame-census = []
 # Existence-probe outcome census (known-issues §45 sizing). The shipped
 # EXISTS_MEMO_HITS / EXISTS_FS_PROBES pair cannot answer the question that
 # decides the fix, because the memo holds POSITIVES ONLY: a negative probe can

@@ -6481,6 +6481,13 @@ impl CfmlVirtualMachine {
         args: Vec<CfmlValue>,
         parent_scope: Option<&ValueMap>,
     ) -> CfmlResult {
+        // Per-frame EXCLUSIVE accounting (`frame-census` probe builds only).
+        // FIRST binding in the function on purpose: Rust drops in reverse
+        // declaration order, so this guard drops LAST — after `locals` — and
+        // the frame's scope teardown lands inside the measured window. No
+        // existing phase covers teardown.
+        #[cfg(feature = "frame-census")]
+        let _fc = cfml_common::perf_counters::frame_census::enter(func.global_id, &func.name);
         // Take the fused parent plan unconditionally at entry — a JIT
         // fast-path early return below must not leave a stale plan behind for
         // an unrelated later call. When set, `parent_scope` is the RAW caller
@@ -7314,6 +7321,8 @@ impl CfmlVirtualMachine {
             // mix the workload really runs rather than the static op-weight scan.
             #[cfg(feature = "op-census")]
             cfml_common::perf_counters::op_census::bump(op.census_index());
+            #[cfg(feature = "frame-census")]
+            cfml_common::perf_counters::frame_census::note_op();
 
             match op {
                 BytecodeOp::Null => ops::value::op_null(&mut stack),

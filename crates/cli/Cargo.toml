@@ -112,6 +112,9 @@ op-census = ["cfml-common/op-census", "cfml-vm/op-census"]
 # cfml-common/Cargo.toml. Sizing builds only.
 bif-census = ["cfml-common/bif-census", "cfml-vm/bif-census"]
 call-phases = ["cfml-common/call-phases", "cfml-vm/call-phases"]
+# Per-frame exclusive accounting. Also swaps in a counting global allocator
+# (wrapping mimalloc) so allocations can be attributed per frame.
+frame-census = ["cfml-common/frame-census", "cfml-vm/frame-census"]
 # Existence-probe outcome census (known-issues §45 sizing) — see
 # cfml-common/Cargo.toml. Sizing builds only.
 exists-census = ["cfml-common/exists-census", "cfml-vm/exists-census"]

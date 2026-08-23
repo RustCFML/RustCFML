@@ -33,11 +33,24 @@ static ALLOC: rustcfml_cli::memprofile::SamplingAlloc = rustcfml_cli::memprofile
 // heap profile must keep getting one.
 #[cfg(all(
     feature = "mimalloc",
+    not(feature = "frame-census"),
     not(feature = "dhat-heap"),
     not(all(feature = "memprofile", unix))
 ))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Counting allocator (feature `frame-census`). Wraps mimalloc and tallies every
+// allocation into a thread-local the per-frame census reads, so allocations can
+// be attributed to the frame that made them. Probe builds only.
+#[cfg(all(
+    feature = "frame-census",
+    feature = "mimalloc",
+    not(feature = "dhat-heap"),
+    not(all(feature = "memprofile", unix))
+))]
+#[global_allocator]
+static ALLOC: rustcfml_cli::CountingAlloc = rustcfml_cli::CountingAlloc;
 
 fn main() {
     #[cfg(feature = "dhat-heap")]
