@@ -368,7 +368,7 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
             result.push_str(&script);
             i += consumed;
         } else if !imports.is_empty() && chars[i] == '<' && is_import_tag_start(&chars, i, len, imports) {
-            let (script, consumed) = parse_import_tag(&chars, i, len, imports);
+            let (script, consumed) = parse_import_tag(&chars, i, len, imports, in_cfoutput);
             result.push_str(&script);
             i += consumed;
         } else if in_cfoutput && chars[i] == '#' && i + 1 < len && chars[i + 1] != '#' {
@@ -473,7 +473,7 @@ fn is_import_tag_start(chars: &[char], pos: usize, len: usize, imports: &std::co
 }
 
 /// Parse an import prefix tag: <prefix:tagname attrs> or </prefix:tagname>
-fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std::collections::HashMap<String, String>) -> (String, usize) {
+fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std::collections::HashMap<String, String>, in_cfoutput: bool) -> (String, usize) {
     let is_closing = chars.get(start + 1) == Some(&'/');
     let name_start = if is_closing { start + 2 } else { start + 1 };
 
@@ -523,7 +523,7 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
     if let Some(body_start) = find_closing_tag(chars, tag_end, len, &full_tag) {
         let body_chars = &chars[tag_end..body_start];
         let body_source: String = body_chars.iter().collect();
-        let body_script = tags_to_script_impl(&body_source, imports);
+        let body_script = tags_to_script_inner(&body_source, imports, in_cfoutput);
         let close_end = find_tag_end(chars, body_start, len);
         let result = format!(
             "__cfcustomtag_start({}, {});\n{}\n__cfcustomtag_end();\n",
@@ -2144,7 +2144,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Body tag: emit start, recursively preprocess body, then end marker
                 let body_chars = &chars[tag_end..body_start];
                 let body_source: String = body_chars.iter().collect();
-                let body_script = tags_to_script_impl(&body_source, imports);
+                let body_script = tags_to_script_inner(&body_source, imports, in_cfoutput);
                 let close_end = find_tag_end(chars, body_start, len);
                 let result = format!(
                     "__cfcustomtag_start({}, {});\n{}\n__cfcustomtag_end();\n",

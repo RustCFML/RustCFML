@@ -490,6 +490,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_customtag.cfm">
 <cf_runtest file="tags/test_custom_tag_caller_cfc_method.cfm">
 <cf_runtest file="tags/test_customtag_caller_semantics.cfm">
+<cf_runtest file="tags/test_customtag_body_cfoutput.cfm">
 <cf_runtest file="tags/test_getbasetag_instance_numbers.cfm">
 <cf_runtest file="tags/test_cffunction_output_true_body.cfm">
 <cf_runtest file="tags/test_getbasetag_functions.cfm">
