@@ -13380,16 +13380,6 @@ impl CfmlVirtualMachine {
                     // path argument is an `s3://` URL.
                     #[cfg(feature = "s3")]
                     {
-                        // The `s3*()` builtins take only a Vec<CfmlValue>, so
-                        // they cannot receive an application context. Publish
-                        // `this.s3` for them here, immediately before dispatch,
-                        // so it always matches the running application (GH
-                        // #334). Cheap: the name test rejects everything else.
-                        if name_lower.starts_with("s3") || name_lower == "storegetmetadata" {
-                            cfml_stdlib::s3::set_app_s3_settings(
-                                self.s3_app_config().map(|c| c.settings),
-                            );
-                        }
                         if let Some(result) = self.s3_intercept(&name_lower, &args) {
                             return result;
                         }

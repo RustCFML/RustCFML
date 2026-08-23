@@ -77,6 +77,9 @@ assert( "an out-of-range group number throws, never returns empty",
 assert( "an unknown group NAME throws, never returns empty",
         tryIt( function(){ return "ab".replaceAll( "(a)(b)", "${nope}" ); } ),
         "THREW: No group with name {nope}" );
+assert( "a trailing backslash has nothing to escape",
+        tryIt( function(){ return "x".replaceAll( "x", "a" & chr(92) ); } ),
+        "THREW: character to be escaped is missing" );
 
 // ── end to end: the exact Preside idiom, including a value that carries both
 //    characters quoteReplacement exists to protect

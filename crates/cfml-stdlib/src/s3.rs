@@ -416,17 +416,17 @@ fn build_client(cfg: &S3Config) -> Client {
     Client::from_conf(builder.build())
 }
 
-/// The current application's `this.s3` settings.
-///
-/// The `s3*()` BIFs are plain `fn(Vec<CfmlValue>)` builtins with no access to
-/// VM state, so there is nowhere in their signature for an application context
-/// to arrive — which is why `this.s3` was previously reachable only by
-/// duplicating every value into process environment variables. That workaround
-/// is per-process where `this.s3` is per-application, so a container could only
-/// ever hold one credential set.
-///
-/// The VM republishes this immediately before dispatching any `s3*` builtin,
-/// so it always reflects the application that is actually running.
+// The current application's `this.s3` settings.
+//
+// The `s3*()` BIFs are plain `fn(Vec<CfmlValue>)` builtins with no access to VM
+// state, so there is nowhere in their signature for an application context to
+// arrive — which is why `this.s3` was previously reachable only by duplicating
+// every value into process environment variables. That workaround is
+// per-process where `this.s3` is per-application, so a container could only
+// ever hold one credential set.
+//
+// The VM republishes this immediately before dispatching any `s3*` builtin, so
+// it always reflects the application that is actually running.
 thread_local! {
     static APP_S3_SETTINGS: std::cell::RefCell<Option<ValueMap>> =
         const { std::cell::RefCell::new(None) };

@@ -1184,6 +1184,8 @@ never throws on content.
 policies, verified character-by-character against Lucee and pinned by
 `tests/stdlib/test_url_encoder_policies.cfm`.)*
 
+---
+
 ## 55. Presigned S3 URLs spell a key's own leading slash differently 🏗
 
 An object key that itself begins with a slash — what `objectName="//a/b.txt"`
@@ -1202,8 +1204,6 @@ slash as a path character; matching Lucee byte-for-byte would mean hand-rolling
 SigV4 presigning instead. Everything else about the URL — virtual-host
 addressing, key normalisation, `httpMethod`, and the `X-Amz-Expires` window —
 matches, and is pinned by `tests/s3/test_s3_presigned_url_lucee_compat.cfm`.
-
----
 
 ---
 

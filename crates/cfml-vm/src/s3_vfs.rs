@@ -89,6 +89,22 @@ impl CfmlVirtualMachine {
     /// `s3://...` URL (or maps to one via `this.mappings`). Returns `None`
     /// when the call should fall through to the regular on-disk dispatcher.
     pub(crate) fn s3_intercept(&self, name: &str, args: &[CfmlValue]) -> Option<CfmlResult> {
+        // The `s3*()` builtins take only a Vec<CfmlValue>, so there is nowhere
+        // in their signature for an application context to arrive. Publish
+        // `this.s3` for them here — this runs on the way to every builtin, so
+        // the settings always match the application actually running (GH
+        // #334). They are all declared VM-intercepted, so none of them is
+        // compile-time bound past this point. Cheap: the name test rejects
+        // everything else immediately.
+        //
+        // This deliberately lives here rather than in `call_function`: the
+        // intercept-declaration guard scans that function for dispatched-on
+        // names, and a `starts_with` prefix there reads to it as a dispatch on
+        // the literal name "s3", which is not a builtin.
+        if name.starts_with("s3") || name == "storegetmetadata" {
+            cfml_stdlib::s3::set_app_s3_settings(self.s3_app_config().map(|c| c.settings));
+        }
+
         match name {
             "fileread" | "filereadbinary" | "fileexists" | "filedelete"
             | "filewrite" | "fileappend" | "filemove" | "filecopy"

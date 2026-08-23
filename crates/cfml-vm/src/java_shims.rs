@@ -4369,6 +4369,7 @@ pub fn java_replacement_to_rust(
                 }
                 i += 2;
             }
+            '\\' => return Err("character to be escaped is missing".to_string()),
             '$' if i + 1 < chars.len() && chars[i + 1] == '{' => {
                 let close = chars[i + 2..]
                     .iter()
