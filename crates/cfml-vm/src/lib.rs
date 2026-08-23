@@ -369,6 +369,16 @@ pub struct ApplicationState {
 pub struct CfmlMapping {
     pub name: String, // Normalized: leading+trailing "/" e.g. "/taffy/"
     pub path: String, // Absolute filesystem directory
+    /// True when this mapping came from the APPLICATION — `this.mappings` in
+    /// Application.cfc, or a runtime `application action="update" mappings=`.
+    /// False for server-level ones: `.cfconfig.json` mappings and the implicit
+    /// webroot `/`.
+    ///
+    /// The distinction exists because `action="update"` REPLACES the
+    /// application's mapping set rather than merging into it (Lucee parity),
+    /// and replacing the server-level ones too would take out `/` — which
+    /// `expandPath("/")` depends on.
+    pub from_application: bool,
 }
 
 /// Session data for a single user session.
@@ -17785,6 +17795,18 @@ impl CfmlVirtualMachine {
                                 _ => None,
                             });
                         if let Some(m) = mapping_struct {
+                            // Lucee REPLACES the application's mapping set here
+                            // rather than merging into it: after an update, a
+                            // mapping declared in Application.cfc no longer
+                            // resolves unless it was passed in again. Merging
+                            // instead is a silent divergence — it hides from
+                            // the caller that they have just dropped every
+                            // other mapping on the reference engine.
+                            //
+                            // Server-level mappings (.cfconfig.json, the
+                            // implicit webroot `/`) are NOT the application's
+                            // and survive, as they do on Lucee.
+                            self.mappings.retain(|mp| !mp.from_application);
                             for (raw_name, v) in m.iter() {
                                 let mut name = raw_name.as_str().to_string();
                                 if !name.starts_with('/') {
@@ -17800,8 +17822,13 @@ impl CfmlVirtualMachine {
                                     .find(|mp| mp.name.eq_ignore_ascii_case(&name))
                                 {
                                     slot.path = path;
+                                    slot.from_application = true;
                                 } else {
-                                    self.mappings.push(CfmlMapping { name: name.as_str().to_string(), path });
+                                    self.mappings.push(CfmlMapping {
+                                        name: name.as_str().to_string(),
+                                        path,
+                                        from_application: true,
+                                    });
                                 }
                             }
                             // Keep longest-prefix-first so the most specific
@@ -32724,7 +32751,7 @@ impl CfmlVirtualMachine {
             }
             existing.push(name.to_lowercase());
             let path = self.expand_context_path(&base, raw_path);
-            self.mappings.push(CfmlMapping { name, path });
+            self.mappings.push(CfmlMapping { name, path, from_application: false });
         }
         // Longest prefix first, matching every other mapping-set writer.
         self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
@@ -32798,6 +32825,7 @@ impl CfmlVirtualMachine {
                     self.mappings.push(CfmlMapping {
                         name,
                         path: raw_path.clone(),
+                        from_application: false,
                     });
                 }
             }
@@ -32816,6 +32844,7 @@ impl CfmlVirtualMachine {
                 self.mappings.push(CfmlMapping {
                     name: "/".to_string(),
                     path: app_dir,
+                    from_application: false,
                 });
             }
             self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
@@ -33229,6 +33258,7 @@ impl CfmlVirtualMachine {
                 early_mappings.push(CfmlMapping {
                     name: "/".to_string(),
                     path: app_cfc_dir.to_string_lossy().to_string(),
+                    from_application: false,
                 });
             }
             self.mappings = early_mappings;
@@ -33361,7 +33391,11 @@ impl CfmlVirtualMachine {
                         _ => None,
                     };
                     if let Some(path) = path {
-                        mappings.push(CfmlMapping { name: name.as_str().to_string(), path });
+                        mappings.push(CfmlMapping {
+                            name: name.as_str().to_string(),
+                            path,
+                            from_application: true,
+                        });
                     }
                 }
             }
@@ -34312,6 +34346,7 @@ impl CfmlVirtualMachine {
                 mappings.push(CfmlMapping {
                     name,
                     path: raw_path.clone(),
+                    from_application: false,
                 });
             }
             // customTagPaths: cfconfig paths appended after Application.cfc's
@@ -34425,6 +34460,7 @@ impl CfmlVirtualMachine {
             mappings.push(CfmlMapping {
                 name: "/".to_string(),
                 path: root_dir,
+                from_application: false,
             });
         }
         self.mappings = mappings;

@@ -25,6 +25,7 @@ if (!structKeyExists(request, "_test_totalPassed")) {
     // records these so an aborted file can never masquerade as a green run.
     request._test_totalErrors  = 0;
     request._test_erroredFiles = [];
+    request._test_skippedFiles = [];
 
     // Per-suite state
     request._test_suiteName   = "";
@@ -103,6 +104,21 @@ function suiteAbort(required string file, required string message) {
     request._test_totalErrors = request._test_totalErrors + 1;
     arrayAppend(request._test_erroredFiles, arguments.file & " | " & arguments.message);
     writeOutput("ERROR | " & arguments.file & " | " & arguments.message & chr(10));
+}
+
+// ---- suiteSkip(file, why) ----
+// A whole test file that cannot run on THIS engine. Used for RustCFML-only
+// features (extensions, supersets, and syntax Lucee's parser rejects outright)
+// so a cross-engine run reports them as skipped rather than as failures — a
+// permanently-red Lucee run cannot tell you anything, which is the whole point
+// of having one.
+//
+// Nothing is ever skipped on RustCFML itself, so this cannot weaken the release
+// gate. Skips are counted and listed in the summary rather than passed off as
+// successes.
+function suiteSkip(required string file, required string why) {
+    arrayAppend(request._test_skippedFiles, arguments.file & " | " & arguments.why);
+    writeOutput("SKIP | " & arguments.file & " | " & arguments.why & chr(10));
 }
 
 // ---- assert(label, actual, expected) ----
@@ -187,6 +203,13 @@ function printSummary() {
     if (request._test_totalErrors > 0) {
         writeOutput("ERRORED: " & request._test_totalErrors
             & " test file(s) aborted before completion" & chr(10));
+    }
+    if (arrayLen(request._test_skippedFiles) > 0) {
+        writeOutput("SKIPPED: " & arrayLen(request._test_skippedFiles)
+            & " test file(s) not applicable to this engine" & chr(10));
+        for (var sk in request._test_skippedFiles) {
+            writeOutput("  SKIP: " & sk & chr(10));
+        }
     }
 
     if (request._test_totalFailed > 0 || request._test_totalErrors > 0) {

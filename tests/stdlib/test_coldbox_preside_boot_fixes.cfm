@@ -66,8 +66,37 @@ assertTrue("injected method getFunctionCalledName is the injected name",
 // (cross-engine path). Register a module mapping at runtime and confirm it
 // resolves for both createObject and expandPath.
 modDir = getDirectoryFromPath(getCurrentTemplatePath()) & "bootfix/mod";
-newMaps = { "/bootfixmod" = modDir };
-application action="update" mappings="#newMaps#";
+
+// action="update" REPLACES the application's mapping set; it does NOT merge
+// into it. That is asserted here rather than assumed, because it is the reason
+// the merge idiom below is mandatory rather than stylistic — a bare update
+// drops every mapping the application declared, and nothing warns you.
+//
+// This suite used to do exactly that. It was invisible while this engine
+// merged, and on Lucee it silently took out /oop, /core and /tags for the rest
+// of the request: 67 later test files aborted with "can't find component".
+priorMaps = getApplicationMetadata().mappings;
+application action="update" mappings="#{ '/bootfixmod' = modDir }#";
+assertFalse("action=update REPLACES the set: a mapping not passed stops resolving",
+    directoryExists(expandPath("/wheelsmapprobe/")));
+assertTrue("action=update leaves the server-level webroot mapping alone",
+    directoryExists(expandPath("/")));
+
+// Restore by merging, which is what real code has to do — and what ColdBox's
+// LuceeMappingHelper.addMapping does: read the current set, add to it, write
+// the whole thing back.
+priorMaps[ "/bootfixmod" ] = modDir;
+application action="update" mappings="#priorMaps#";
+assertTrue("the merge idiom brings a previously declared mapping back",
+    directoryExists(expandPath("/wheelsmapprobe/")));
+
+// An update that does not mention mappings at all must leave them alone —
+// otherwise the replace above would make every unrelated action=update
+// destructive. Verified on Lucee 7.1.0.204.
+application action="update" sessionTimeout="#createTimeSpan(0,0,45,0)#";
+assertTrue("action=update without a mappings attribute leaves mappings alone",
+    directoryExists(expandPath("/wheelsmapprobe/")));
+
 mapWidget = createObject("component", "bootfixmod.Widget");
 assert("runtime mapping resolves createObject", mapWidget.hello(), "widget-hello");
 assertTrue("runtime mapping resolves expandPath", fileExists(expandPath("/bootfixmod/Widget.cfc")));

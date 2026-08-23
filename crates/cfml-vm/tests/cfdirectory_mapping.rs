@@ -43,6 +43,7 @@ fn run_page(source: &str) -> String {
     vm.mappings = vec![CfmlMapping {
         name: "/lib/".to_string(),
         path: format!("{}/lib", VROOT),
+        from_application: true,
     }];
     vm.refresh_mappings_fingerprint();
     for (name, value) in get_builtins() {

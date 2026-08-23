@@ -236,6 +236,21 @@ falling back to an in-memory SQLite database.
 Layered underneath `Application.cfc this.mappings` — the app file wins on
 conflict.
 
+Runtime registration goes through `application action="update" mappings={...}`
+(the path ColdBox's `LuceeMappingHelper.addMapping` uses). That call **replaces
+the application's whole mapping set** rather than merging into it, as Lucee
+does, so adding one mapping means reading the current set first:
+
+```cfml
+maps = getApplicationMetadata().mappings;   // a detached copy
+maps[ "/mymodule" ] = expandPath( "./modules/mymodule" );
+application action="update" mappings="#maps#";
+```
+
+Passing only the new mapping drops every mapping the application declared, and
+nothing warns you. Server-level mappings — the ones above and the implicit
+webroot `/` — are not the application's and are unaffected.
+
 ### `customTagPaths`
 
 ```jsonc

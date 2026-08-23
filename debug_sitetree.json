@@ -1,0 +1,351 @@
+{
+  "headings": [
+    "Edit filter",
+    "Filter library (drag and drop to add)",
+    "RustCFML v0.598.0 Debug — total 101.567 ms",
+    "Execution Time",
+    "+Files (Templates/Tags/CFCs) (11196 executed)",
+    "+Queries (10)",
+    "+cgi scope",
+    "+CFConfig (16)",
+    "+Environment variables (49)",
+    "+Runtime flags (5)"
+  ],
+  "summary": [
+    "Title | Type | Status | Public access | URL",
+    "Home\n\t\t\t\t\n\n\t\t\t\t\n\t\t\t\t\t\n\t\t\t\t\t\t\n\t\t\t\t\t\n\n\t\t\t\t\t\n\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\n\t\t\t\t\t\n\n\t\t\t\t\t\n\n\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\n\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tView history\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tCMS permissions\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tSort child pages\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tFlush page cache | Homepage | Published | Unrestricted | /"
+  ],
+  "topFiles": [
+    {
+      "raw": [
+        "+",
+        "total ms",
+        "app ms",
+        "query ms",
+        "count",
+        "avg ms",
+        "file"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "101.567",
+        "101.567",
+        "0.000",
+        "1",
+        "101.567",
+        "/Users/alexskinner/Projects/Websites/readyintelligencewebsite/website/index.cfm"
+      ]
+    },
+    {
+      "raw": [
+        "+",
+        "0.021",
+        "0.021",
+        "0.000",
+        "2",
+        "0.010",
+        "/Users/alexskinner/Repos/opensource/Preside-CMS/system/services/maintenanceMode/MaintenanceModeService.cfc"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.015",
+        "",
+        "",
+        "1",
+        "0.015",
+        "↳ showMaintenancePageIfActive()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.006",
+        "",
+        "",
+        "1",
+        "0.006",
+        "↳ isMaintenanceModeActive()"
+      ]
+    },
+    {
+      "raw": [
+        "+",
+        "0.127",
+        "0.127",
+        "0.000",
+        "6",
+        "0.021",
+        "/Users/alexskinner/Repos/opensource/Preside-CMS/system/coldboxModifications/Bootstrap.cfc"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.097",
+        "",
+        "",
+        "1",
+        "0.097",
+        "↳ onRequestStart()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.020",
+        "",
+        "",
+        "1",
+        "0.020",
+        "↳ isfwReinit()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.010",
+        "",
+        "",
+        "4",
+        "0.002",
+        "↳ getController()"
+      ]
+    },
+    {
+      "raw": [
+        "+",
+        "3.523",
+        "3.523",
+        "0.000",
+        "982",
+        "0.003",
+        "/Users/alexskinner/Repos/opensource/Preside-CMS/system/coldboxModifications/Controller.cfc"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "1.407",
+        "",
+        "",
+        "36",
+        "0.039",
+        "↳ runEvent()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.749",
+        "",
+        "",
+        "12",
+        "0.062",
+        "↳ renderViewlet()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.401",
+        "",
+        "",
+        "332",
+        "0.001",
+        "↳ getRequestContext()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.365",
+        "",
+        "",
+        "97",
+        "0.003",
+        "↳ getSetting()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.358",
+        "",
+        "",
+        "65",
+        "0.005",
+        "↳ handlerExists()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.110",
+        "",
+        "",
+        "251",
+        "0.000",
+        "↳ getRequestService()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.079",
+        "",
+        "",
+        "153",
+        "0.000",
+        "↳ getInterceptorService()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.025",
+        "",
+        "",
+        "2",
+        "0.012",
+        "↳ viewletExists()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.013",
+        "",
+        "",
+        "15",
+        "0.000",
+        "↳ getWirebox()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.006",
+        "",
+        "",
+        "12",
+        "0.000",
+        "↳ getRenderer()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.004",
+        "",
+        "",
+        "2",
+        "0.002",
+        "↳ getCache()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.002",
+        "",
+        "",
+        "1",
+        "0.002",
+        "↳ getCacheBox()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.001",
+        "",
+        "",
+        "1",
+        "0.001",
+        "↳ getModuleService()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.001",
+        "",
+        "",
+        "1",
+        "0.001",
+        "↳ getUtil()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.001",
+        "",
+        "",
+        "1",
+        "0.001",
+        "↳ getRoutingService()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.001",
+        "",
+        "",
+        "1",
+        "0.001",
+        "↳ getConfigSettings()"
+      ]
+    },
+    {
+      "raw": [
+        "+",
+        "0.558",
+        "0.558",
+        "0.000",
+        "262",
+        "0.002",
+        "/Users/alexskinner/Repos/opensource/Preside-CMS/system/config/WireBox.cfc"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.320",
+        "",
+        "",
+        "164",
+        "0.001",
+        "↳ mappingExists()"
+      ]
+    },
+    {
+      "raw": [
+        "",
+        "0.238",
+        "",
+        "",
+        "98",
+        "0.002",
+        "↳ getMapping()"
+      ]
+    },
+    {
+      "raw": [
+        "+",
+        "0.296",
+        "0.296",
+        "0.000",
+        "392",
+        "0.000",
+        "/Users/alexskinner/Repos/opensource/Preside-CMS/system/externals/coldbox/system/ioc/config/Mapping.cfc"
+      ]
+    }
+  ],
+  "queries": []
+}

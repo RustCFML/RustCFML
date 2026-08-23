@@ -98,6 +98,21 @@ box server stop                      # shut it down
 - The test runner includes `harness.cfm` once at the top. Individual test files must NOT re-include it, because the harness body resets `request._test_total*` counters and masks the grand summary.
 - HTTP-dependent tests (`tests/tags/test_tags_cfscript_statements.cfm`) discover the port from `cgi.server_port` (set by the server at request-time) and skip the HTTP subtests when the runner is invoked from the CLI with no server available. Don't hardcode a port.
 - Lucee and RustCFML both run through the same `tests/runner.cfm`, so a green run on both is the compatibility bar.
+- **A file Lucee cannot run is marked in the runner, not left to fail:**
+  `<cf_runtest file="stdlib/test_xmp.cfm" rustcfmlOnly="true">`. It runs on
+  RustCFML and reports `SKIP` elsewhere, with a `SKIPPED:` block in the summary.
+  Nothing is skipped on RustCFML, so the release gate is unaffected. Use it only
+  when the file's *purpose* is RustCFML-only; a file with one superset assertion
+  should guard that line with `isRustCFML()` and keep its cross-engine value —
+  unless Lucee rejects it at PARSE time, where an in-file guard is too late.
+- **Do not leave the application altered for the tests that follow.**
+  `application action="update" mappings={...}` REPLACES the application's mapping
+  set (Lucee parity). A test that registers a mapping must merge — read
+  `getApplicationMetadata().mappings`, add, write back. Getting this wrong is
+  invisible on RustCFML and silently cost 67 aborted files on Lucee for months.
+- Don't call a BIF via `argumentCollection` with mixed-case argument names —
+  Lucee uppercases struct keys and its BIF lookup is case-sensitive, so it fails
+  there naming the very argument you passed.
 
 ## Architecture
 

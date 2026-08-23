@@ -38,6 +38,7 @@ fn build(index: &str, cfc_name: &str, cfc_body: &str) -> CfmlVirtualMachine {
     vm.mappings = vec![CfmlMapping {
         name: "/lib/".to_string(),
         path: format!("{}/lib", VROOT),
+        from_application: true,
     }];
     vm.refresh_mappings_fingerprint();
     for (name, value) in get_builtins() {

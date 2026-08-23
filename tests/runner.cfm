@@ -9,7 +9,7 @@ include "harness.cfm";
 
 <!--- --- cfconfig --- --->
 <cf_runtest file="config/test_cfconfig_loading.cfm">
-<cf_runtest file="config/test_cfconfig_datasource.cfm">
+<cf_runtest file="config/test_cfconfig_datasource.cfm" rustcfmlOnly="true">
 <cf_runtest file="config/test_cfconfig_security.cfm">
 <cf_runtest file="config/test_app_datasources.cfm">
 
@@ -101,7 +101,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_functions.cfm">
 <cf_runtest file="core/test_arg_ref_writeback_deferred.cfm">
 <cf_runtest file="core/test_arrow_functions.cfm">
-<cf_runtest file="core/test_comma_less_params.cfm">
+<cf_runtest file="core/test_comma_less_params.cfm" rustcfmlOnly="true">
 <cf_runtest file="core/test_required_param_with_default.cfm">
 <cf_runtest file="core/test_self_named_default_arg.cfm">
 <cf_runtest file="core/test_member_index_incdec.cfm">
@@ -146,12 +146,12 @@ include "harness.cfm";
 <!--- create(), stale dirty-state after update()). Runtime-level: fails 3 --->
 <!--- assertions, does NOT abort the run. --->
 <cf_runtest file="core/test_this_dot_call_detaches_writes.cfm">
-<cf_runtest file="core/test_server_scope.cfm">
+<cf_runtest file="core/test_server_scope.cfm" rustcfmlOnly="true">
 <cf_runtest file="core/test_scope_writeback_masa_fixes.cfm">
 <cf_runtest file="core/test_web_scope_no_component_leak.cfm">
 <cf_runtest file="core/test_setencoding_masa.cfm">
 <cf_runtest file="core/test_pagecontext_request_response.cfm">
-<cf_runtest file="core/test_localmode.cfm">
+<cf_runtest file="core/test_localmode.cfm" rustcfmlOnly="true">
 <cf_runtest file="core/test_error_context.cfm">
 <cf_runtest file="core/test_null_coalescing.cfm">
 
@@ -166,7 +166,7 @@ include "harness.cfm";
 <cf_runtest file="types/test_array_append_grow.cfm">
 <cf_runtest file="types/test_array_reference_semantics.cfm">
 <cf_runtest file="types/test_struct.cfm">
-<cf_runtest file="types/test_struct_literal_yesno_null_enum.cfm">
+<cf_runtest file="types/test_struct_literal_yesno_null_enum.cfm" rustcfmlOnly="true">
 <cf_runtest file="types/test_struct_reference_semantics.cfm">
 <cf_runtest file="types/test_ordered_struct_literals.cfm">
 <cf_runtest file="types/test_dotted_key_struct_literals.cfm">
@@ -197,7 +197,7 @@ include "harness.cfm";
 <cf_runtest file="functions/test_string_position_unicode.cfm">
 <cf_runtest file="stdlib/test_string_split_member.cfm">
 <cf_runtest file="stdlib/test_regex_backspace_in_class.cfm">
-<cf_runtest file="stdlib/test_regex_lookaround.cfm">
+<cf_runtest file="stdlib/test_regex_lookaround.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_inetaddress_loopback.cfm">
 <cf_runtest file="stdlib/test_java_fileoutputstream_shim.cfm">
 <cf_runtest file="stdlib/test_java_files_shims.cfm">
@@ -211,8 +211,8 @@ include "harness.cfm";
 <!--- - html_sanitize: the org.owasp.validator.html.AntiSamy shim and the --->
 <!--- sanitizeHtml() BIF over the same policy-driven sanitiser (GH #325). --->
 <cf_runtest file="stdlib/test_html_sanitize.cfm">
-<cf_runtest file="stdlib/test_image.cfm">
-<cf_runtest file="stdlib/test_xmp.cfm">
+<cf_runtest file="stdlib/test_image.cfm" rustcfmlOnly="true">
+<cf_runtest file="stdlib/test_xmp.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
 <cf_runtest file="stdlib/test_encode_for_html_esapi.cfm">
 <cf_runtest file="stdlib/test_string_functions_encoding.cfm">
@@ -287,11 +287,11 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_query_mutations.cfm">
 <cf_runtest file="stdlib/test_query_new_empty_addcolumn_metadata.cfm">
 <cf_runtest file="database/test_lucee_query_builder.cfm">
-<cf_runtest file="database/test_datasource_list_maxrows.cfm">
-<cf_runtest file="database/test_sqlite_datasource_paths.cfm">
-<cf_runtest file="database/test_cfquery_tag_forwards_columnkey_maxrows.cfm">
-<cf_runtest file="database/test_duplicate_result_columns.cfm">
-<cf_runtest file="database/test_update_affected_rows_matched.cfm">
+<cf_runtest file="database/test_datasource_list_maxrows.cfm" rustcfmlOnly="true">
+<cf_runtest file="database/test_sqlite_datasource_paths.cfm" rustcfmlOnly="true">
+<cf_runtest file="database/test_cfquery_tag_forwards_columnkey_maxrows.cfm" rustcfmlOnly="true">
+<cf_runtest file="database/test_duplicate_result_columns.cfm" rustcfmlOnly="true">
+<cf_runtest file="database/test_update_affected_rows_matched.cfm" rustcfmlOnly="true">
 
 <!--- A non-SELECT statement returns an empty query (docs/known-issues.md §37). --->
 <cf_runtest file="database/test_dml_returns_empty_query.cfm">
@@ -302,7 +302,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
-<cf_runtest file="stdlib/test_cache_properties.cfm">
+<cf_runtest file="stdlib/test_cache_properties.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_higher_order_functions.cfm">
 <cf_runtest file="stdlib/test_bitmask_functions.cfm">
 <cf_runtest file="stdlib/test_xml_dom_functions.cfm">
@@ -475,7 +475,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cffunction_hoisting.cfm">
 <cf_runtest file="tags/test_tags_cfargument_namespaced_attr.cfm">
 <cf_runtest file="tags/test_tags_savecontent.cfm">
-<cf_runtest file="tags/test_tags_param.cfm">
+<cf_runtest file="tags/test_tags_param.cfm" rustcfmlOnly="true">
 <cf_runtest file="tags/test_tags_param_dynamic.cfm">
 <!--- - cfparam_bracket_key_colon: cfparam name= is an lvalue path whose --->
 <!--- bracket segment holds a quoted string key -- including one with a --->
@@ -987,7 +987,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfloop_list_literal.cfm">
 <cf_runtest file="tags/test_cfloop_times.cfm">
 <cf_runtest file="tags/test_cfoutput_encodefor.cfm">
-<cf_runtest file="tags/test_script_loop.cfm">
+<cf_runtest file="tags/test_script_loop.cfm" rustcfmlOnly="true">
 <cf_runtest file="tags/test_cfloop_query_currentrow.cfm">
 <cf_runtest file="tags/test_tags_cfloop_query_window_group.cfm">
 <!--- - cfloop_query_bare_column: inside <cfloop query>, a BARE column --->
@@ -1019,7 +1019,7 @@ include "harness.cfm";
 <!--- work (in-suite controls). Fixture-contained (parse errors escape --->
 <!--- try/catch). Found running titan (Moopa) on v0.574.0. --->
 <cf_runtest file="tags/test_tag_mode_arrow_function.cfm">
-<cf_runtest file="tags/test_cfspreadsheet.cfm">
+<cf_runtest file="tags/test_cfspreadsheet.cfm" rustcfmlOnly="true">
 
 <!--- --- Query of Queries --- --->
 <cf_runtest file="qoq/test_qoq_select.cfm">
@@ -1040,7 +1040,7 @@ include "harness.cfm";
 
 <!--- Observability: classic CF debug-footer BIFs. Footer activation/render --->
 <!--- (serve-only) is covered by Rust gate tests in cfml-vm/src/lib.rs. --->
-<cf_runtest file="observe/test_debug_footer.cfm">
+<cf_runtest file="observe/test_debug_footer.cfm" rustcfmlOnly="true">
 <cf_runtest file="observe/test_profiler.cfm">
 
 <!--- Declared parameter/return types are enforced (docs/known-issues.md §29). --->
