@@ -169,5 +169,104 @@ memberQ = queryNew("ColA", "integer", [[1]]);
 memberQ.addColumn("ColB", [2]);
 assert("member addColumn adds the column", memberQ.columnList, "COLA,COLB");
 
+// --- GH #345: querySort takes a COLUMN NAME, not just a comparator ---
+// Lucee's common spelling is querySort(q, "col" [, "asc|desc"]); the closure
+// form is the rarer one. Both sort the shared query handle IN PLACE and the
+// FUNCTION returns a boolean — verified on Lucee 7.1.0.204. Storing the return
+// value back over the query would therefore clobber it, which is why querySort
+// is NOT in codegen's is_mutating_standalone_call list.
+sortQ = queryNew("ColA,fullName", "integer,varchar", [[2, "b"], [1, "a"], [3, "c"]]);
+sortRet = querySort(sortQ, "ColA");
+assert("querySort by column sorts ascending", valueList(sortQ.ColA), "1,2,3");
+assert("querySort returns a boolean", sortRet, true);
+querySort(sortQ, "ColA", "desc");
+assert("querySort desc", valueList(sortQ.ColA), "3,2,1");
+querySort(sortQ, "cola", "DESC");
+assert("querySort column and direction are case-insensitive", valueList(sortQ.ColA), "3,2,1");
+querySort(sortQ, "ColA", "");
+assert("querySort blank direction is ascending", valueList(sortQ.ColA), "1,2,3");
+// The direction list is PARALLEL to the column list — one entry per column, not
+// a suffix on each name. Lucee reads "b desc" as a column literally called
+// "b desc" and says so.
+twoColQ = queryNew("a,b", "integer,integer", [[1, 2], [1, 1], [0, 9]]);
+querySort(twoColQ, "a,b", "asc,desc");
+assert("querySort multi-column a", valueList(twoColQ.a), "0,1,1");
+assert("querySort multi-column b tie-break", valueList(twoColQ.b), "9,2,1");
+assertThrows("querySort rejects a direction count mismatch", function() {
+    var d = queryNew("a,b", "integer,integer", [[1, 2]]);
+    querySort(d, "a,b", "desc");
+});
+assertThrows("querySort rejects an unknown column", function() {
+    var d = queryNew("a", "integer", [[1]]);
+    querySort(d, "nope");
+});
+assertThrows("querySort rejects a bad direction", function() {
+    var d = queryNew("a", "integer", [[1]]);
+    querySort(d, "a", "sideways");
+});
+sortErrType = "";
+try {
+    badSortQ = queryNew("a", "integer", [[1]]);
+    querySort(badSortQ, "nope");
+} catch (any e) {
+    sortErrType = e.type;
+}
+assert("querySort errors are type=database", sortErrType, "database");
+// Sorting is stable, and empty/null cells sort first ascending (a plain
+// reversal puts them last descending — not a nulls-last rule).
+stableQ = queryNew("a,b", "integer,varchar", [[1, "x"], [1, "y"], [0, "z"]]);
+querySort(stableQ, "a");
+assert("querySort is stable", valueList(stableQ.b), "z,x,y");
+nullQ = queryNew("a", "integer", [[2], [""], [1]]);
+querySort(nullQ, "a");
+assert("querySort puts empties first ascending", valueList(nullQ.a), ",1,2");
+querySort(nullQ, "a", "desc");
+assert("querySort puts empties last descending", valueList(nullQ.a), "2,1,");
+// An all-numeric column sorts numerically; one non-numeric value makes the
+// whole column sort as text. The decision is per COLUMN, not per comparison.
+numQ = queryNew("a", "", [["10"], ["9"], ["100"]]);
+querySort(numQ, "a");
+assert("all-numeric column sorts numerically", valueList(numQ.a), "9,10,100");
+mixedQ = queryNew("a", "", [["10"], ["b"], ["2"]]);
+querySort(mixedQ, "a");
+assert("a non-numeric value makes the column sort as text", valueList(mixedQ.a), "10,2,b");
+// Text order is case-SENSITIVE on Lucee: "B" sorts before "a".
+caseQ = queryNew("s", "varchar", [["B"], ["a"]]);
+querySort(caseQ, "s");
+assert("querySort text order is case-sensitive", valueList(caseQ.s), "B,a");
+// The member form takes a column too — and unlike the function it returns the
+// QUERY, so it can be chained (Lucee does the same).
+memberSortQ = queryNew("a", "integer", [[2], [1]]);
+memberSortRet = memberSortQ.sort("a", "desc");
+assert("member sort by column", valueList(memberSortQ.a), "2,1");
+assertTrue("member sort returns the query", isQuery(memberSortRet));
+// The comparator form still works, and also returns a boolean.
+cbQ = queryNew("a", "integer", [[2], [1], [3]]);
+cbRet = querySort(cbQ, function(x, y) { return compare(x.a, y.a); });
+assert("querySort comparator form still sorts", valueList(cbQ.a), "1,2,3");
+assert("querySort comparator form returns a boolean", cbRet, true);
+emptySortQ = queryNew("a", "integer");
+assert("querySort on an empty query is a no-op", querySort(emptySortQ, "a"), true);
+
+// --- GH #345: queryColumnArray returns the column NAMES ---
+// It was registered as a plain alias of queryColumnData, so the documented
+// 1-argument form read a column named "" and handed back an empty array.
+namesQ = queryNew("ColA,fullName", "integer,varchar");
+assert("queryColumnArray returns the column names", arrayToList(queryColumnArray(namesQ)), "ColA,fullName");
+assert("member columnArray returns the column names", arrayToList(namesQ.columnArray()), "ColA,fullName");
+
+// --- GH #345: queryColumnList preserves casing; the PROPERTY uppercases ---
+// Lucee draws this line deliberately: `q.columnList` is the legacy cfquery
+// pseudo-column (upper on every engine), `queryColumnList(q)` and the
+// `q.columnList()` member CALL are the modern accessors and keep the casing.
+// Do not "fix" the property to match the function.
+assert("queryColumnList preserves casing", queryColumnList(namesQ), "ColA,fullName");
+assert("queryColumnList takes a delimiter", queryColumnList(namesQ, "|"), "ColA|fullName");
+assert("member columnList() preserves casing", namesQ.columnList(), "ColA,fullName");
+assert("member columnList() takes a delimiter", namesQ.columnList("|"), "ColA|fullName");
+assert("the columnList PROPERTY still uppercases", namesQ.columnList, "COLA,FULLNAME");
+assert("getColumnList(false) preserves casing", namesQ.getColumnList(false), "ColA,fullName");
+assert("getColumnList(true) uppercases", namesQ.getColumnList(true), "COLA,FULLNAME");
+
 suiteEnd();
 </cfscript>

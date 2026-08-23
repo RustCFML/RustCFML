@@ -714,7 +714,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("queryGetResult".to_string(), fn_query_get_result as BuiltinFunction);
     f.insert("queryKeyExists".to_string(), fn_query_column_exists as BuiltinFunction);  // alias
     f.insert("queryColumnData".to_string(), fn_query_column_data as BuiltinFunction);
-    f.insert("queryColumnArray".to_string(), fn_query_column_data as BuiltinFunction);  // alias
+    f.insert("queryColumnArray".to_string(), fn_query_column_array as BuiltinFunction);
     f.insert("queryCurrentRow".to_string(), fn_query_current_row as BuiltinFunction);
     f.insert("__querySetRow".to_string(), fn_query_move_cursor as BuiltinFunction);
     // QoQ custom-function registration (VM-intercepted).
@@ -6865,11 +6865,48 @@ fn fn_query_column_count(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// `queryColumnList( query [, delimiter ] )` — GH #345.
+///
+/// The FUNCTION preserves the column names' original casing; the `q.columnList`
+/// PROPERTY uppercases them. Lucee 7.1.0.204 draws that line too, and it is not
+/// a slip on either side: the property is the legacy `cfquery` pseudo-column
+/// (upper on every engine since CF5), the function is the modern accessor. The
+/// 2026-06-01 commit that uppercased both was half right — do not "fix" the
+/// property to match this.
 fn fn_query_column_list(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        // columnList reports column names uppercased, matching Lucee/ACF.
-        Some(CfmlValue::Query(q)) => Ok(CfmlValue::string(q.column_list())),
+        Some(CfmlValue::Query(q)) => {
+            let delim = args
+                .get(1)
+                .map(|d| d.as_string())
+                .unwrap_or_else(|| ",".to_string());
+            Ok(CfmlValue::string(q.columns().join(&delim)))
+        }
         _ => Ok(CfmlValue::string(String::new())),
+    }
+}
+
+/// `queryColumnArray( query )` — GH #345: the column NAMES, casing preserved.
+///
+/// This was registered as a plain alias of `queryColumnData`, so the documented
+/// 1-argument form read a column named "" and returned an empty array. Lucee's
+/// signature is strictly `queryColumnArray(query):array` — it rejects a second
+/// argument at COMPILE time — so the `(query, column)` spelling below cannot
+/// exist in portable code; it is kept only so anything that grew against the old
+/// aliased behaviour keeps working.
+fn fn_query_column_array(args: Vec<CfmlValue>) -> CfmlResult {
+    match args.first() {
+        Some(CfmlValue::Query(q)) => {
+            if args.len() > 1 {
+                return fn_query_column_data(args);
+            }
+            Ok(CfmlValue::array(
+                q.columns().into_iter().map(CfmlValue::string).collect(),
+            ))
+        }
+        _ => Err(CfmlError::runtime(
+            "queryColumnArray() requires a query".to_string(),
+        )),
     }
 }
 

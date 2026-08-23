@@ -80,11 +80,18 @@ suiteEnd();
 suiteBegin("Lucee7: QueryColumnArray/QueryColumnCount");
 q = queryNew("a,b,c");
 assert("queryColumnCount", queryColumnCount(q), 3);
-// queryColumnArray returns column names
+// queryColumnArray returns column NAMES. A one-column query cannot tell the
+// names apart from the values — arrayLen is 1 either way — so this pinned GH
+// #345 (the function was aliased to queryColumnData and returned an empty
+// array) rather than catching it. Assert the contents, on a query whose column
+// names and cell values differ.
 q2 = buildQuery("x", "varchar", ["test"]);
 cols = queryColumnArray(q2);
 assertTrue("queryColumnArray is array", isArray(cols));
 assert("queryColumnArray length", arrayLen(cols), 1);
+assert("queryColumnArray holds the name, not the value", cols[1], "x");
+q2b = queryNew("ColA,fullName", "integer,varchar");
+assert("queryColumnArray lists every column, casing intact", arrayToList(queryColumnArray(q2b)), "ColA,fullName");
 suiteEnd();
 
 // ============================================================

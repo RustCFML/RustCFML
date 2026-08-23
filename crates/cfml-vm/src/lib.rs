@@ -14911,6 +14911,16 @@ impl CfmlVirtualMachine {
                 "querysort" => {
                     if let (Some(q_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Query(q) = q_val {
+                            // GH #345: Lucee's far more common spelling is a
+                            // COLUMN NAME (plus an optional direction), not a
+                            // comparator. Anything that isn't callable is one.
+                            if !matches!(callback, CfmlValue::Closure(_) | CfmlValue::Function(_)) {
+                                let cols = callback.as_string();
+                                let dirs = args.get(2).map(|d| d.as_string()).unwrap_or_default();
+                                query_sort_by_columns(q, &cols, &dirs)?;
+                                self.arg_ref_writeback = None;
+                                return Ok(CfmlValue::Bool(true));
+                            }
                             let callback = callback.clone();
                             let mut rows = q.rows();
                             // Bubble sort (closure calls can't be used with sort_by)
@@ -14937,14 +14947,18 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            // querySort sorts IN PLACE (reference-typed): write the
-                            // ordered rows back to the shared handle, return it.
+                            // querySort sorts IN PLACE (reference-typed): write
+                            // the ordered rows back to the shared handle. The
+                            // FUNCTION returns a boolean on Lucee, not the query
+                            // — verified on 7.1.0.204 for both the comparator and
+                            // the column form. (The `q.sort()` MEMBER does return
+                            // the query, for chaining; that arm is separate.)
                             q.with_write(|d| {
                                 let cols = d.columns.clone();
                                 *d = cfml_common::dynamic::CfmlQueryData::from_named_rows(cols, rows);
                             });
                             self.arg_ref_writeback = None;
-                            return Ok(CfmlValue::Query(q.clone()));
+                            return Ok(CfmlValue::Bool(true));
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -24828,8 +24842,17 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Int(q.row_count() as i64));
                 }
                 "columnlist" => {
-                    // Uppercase column names, matching Lucee/ACF columnList.
-                    return Ok(CfmlValue::string(q.column_list()));
+                    // GH #345: the columnList *property* uppercases (see the
+                    // Query arm of member_access) but the member CALL preserves
+                    // the original casing and takes an optional delimiter, the
+                    // same as the queryColumnList() function. Verified on Lucee
+                    // 7.1.0.204: `q.columnList` -> COLA,FULLNAME whereas
+                    // `q.columnList()` -> ColA,fullName.
+                    let delim = extra_args
+                        .first()
+                        .map(|d| d.as_string())
+                        .unwrap_or_else(|| ",".to_string());
+                    return Ok(CfmlValue::string(q.columns().join(&delim)));
                 }
                 "getcolumnlist" => {
                     // Lucee query member `getColumnList(boolean upperCase)`:
@@ -24855,9 +24878,14 @@ impl CfmlVirtualMachine {
                 // null-assignment unsets the var) — which surfaced as "Variable
                 // 'validValues' is undefined" in Preside's
                 // ObjectPicker._removeInvalidValues (widget/image picker
-                // prefill). NB Lucee's `columnArray` is NOT an alias — it errors
-                // on a column arg — so it is deliberately not mapped here.
+                // prefill).
                 "columndata" => Some("queryColumnData"),
+                // GH #345: `q.columnArray()` is the member spelling of
+                // queryColumnArray — the column NAMES. It is NOT an alias of
+                // columnData (Lucee errors if you pass it a column), so it maps
+                // to the names builtin; without this arm it fell through to
+                // `_ => None` and quietly returned Null.
+                "columnarray" => Some("queryColumnArray"),
                 "addrow" => Some("queryAddRow"),
                 // Lucee exposes queryAddColumn as a member too; without this arm
                 // `q.addColumn(...)` threw "does not exist in the Query."
@@ -24950,6 +24978,14 @@ impl CfmlVirtualMachine {
                 }
                 "sort" => {
                     if let Some(callback) = extra_args.first().cloned() {
+                        // GH #345: the member form takes a column name too.
+                        if !matches!(callback, CfmlValue::Closure(_) | CfmlValue::Function(_)) {
+                            let cols = callback.as_string();
+                            let dirs =
+                                extra_args.get(1).map(|d| d.as_string()).unwrap_or_default();
+                            query_sort_by_columns(q, &cols, &dirs)?;
+                            return Ok(object.clone());
+                        }
                         let mut rows = q.rows();
                         let n = rows.len();
                         for i in 0..n {
@@ -36409,6 +36445,158 @@ fn precision_evaluate_expr(expr: &str) -> Result<String, CfmlError> {
     // Normalize: remove trailing zeros for display
     let s = result.normalize().to_string();
     Ok(s)
+}
+
+
+// ---------------------------------------------------------------------------
+// querySort( query, columnList [, directionList] ) — GH #345
+// ---------------------------------------------------------------------------
+
+/// Is this cell CFML-empty? Null and the empty string sort LOWEST — Lucee puts
+/// them first ascending and last descending, i.e. a plain reversal rather than a
+/// nulls-last rule.
+fn query_sort_is_empty(v: &CfmlValue) -> bool {
+    match v {
+        CfmlValue::Null => true,
+        CfmlValue::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+fn query_sort_numeric(v: &CfmlValue) -> Option<f64> {
+    match v {
+        CfmlValue::Int(i) => Some(*i as f64),
+        CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Some(*d),
+        CfmlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        CfmlValue::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Order two cell values the way Lucee's query sort does. `numeric` is decided
+/// once per COLUMN, not per pair: Lucee sorts `["10","b","2"]` to `10,2,b`, so a
+/// single non-numeric value makes the whole column sort as text — a pairwise
+/// rule would put `2` before `10` there and disagree. Text comparison is
+/// case-SENSITIVE: Lucee sorts `["B","a"]` to `B,a`, not `a,B`.
+///
+/// DIVERGENCE (docs/known-issues.md §59): Lucee picks numeric-vs-text from the
+/// column's declared SQL type, we infer it from the values. We store no column
+/// types, so a column declared `varchar` but holding only numeric strings sorts
+/// numerically here and textually on Lucee. Every other case agrees, including
+/// the far more common untyped column.
+fn query_sort_cell_cmp(a: &CfmlValue, b: &CfmlValue, numeric: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (query_sort_is_empty(a), query_sort_is_empty(b)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    if numeric {
+        if let (Some(x), Some(y)) = (query_sort_numeric(a), query_sort_numeric(b)) {
+            return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+        }
+    }
+    a.as_string().cmp(&b.as_string())
+}
+
+/// Sort `q` in place by one or more column names, Lucee's `querySort` column
+/// form. `directions` is a PARALLEL list — one entry per column — not a suffix
+/// on each column name (`"a desc"` is a column called `a desc` to Lucee, and it
+/// says so). A blank or absent direction list means all-ascending.
+///
+/// The sort is stable, so equal keys keep their original row order and a
+/// multi-column sort behaves as its tie-breaks describe.
+fn query_sort_by_columns(
+    q: &CfmlQuery,
+    column_list: &str,
+    directions: &str,
+) -> Result<(), CfmlError> {
+    let cols: Vec<String> = column_list
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if cols.is_empty() {
+        return Ok(());
+    }
+    let dirs: Vec<String> = directions
+        .split(',')
+        .map(|d| d.trim().to_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !dirs.is_empty() && dirs.len() != cols.len() {
+        return Err(CfmlError::database(
+            "column names and directions has not the same count".to_string(),
+        ));
+    }
+    let mut descending = Vec::with_capacity(cols.len());
+    for d in &dirs {
+        match d.as_str() {
+            "asc" => descending.push(false),
+            "desc" => descending.push(true),
+            other => {
+                return Err(CfmlError::database(format!(
+                    "argument direction of function querySort must be \"asc\" or \"desc\", now \"{}\"",
+                    other
+                )))
+            }
+        }
+    }
+    descending.resize(cols.len(), false);
+
+    // Resolve every column up front so a typo throws before any reordering.
+    let existing = q.columns();
+    let mut indexes = Vec::with_capacity(cols.len());
+    for name in &cols {
+        match existing.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+            Some(i) => indexes.push(i),
+            None => {
+                return Err(CfmlError::database(format!(
+                    "Column [{}] not found in query, Columns are [{}]",
+                    name,
+                    existing
+                        .iter()
+                        .map(|c| c.to_uppercase())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        }
+    }
+
+    q.with_write(|d| {
+        let row_count = d.row_count();
+        if row_count < 2 {
+            return;
+        }
+        // One numeric-vs-text decision per sort column — see query_sort_cell_cmp.
+        let numeric: Vec<bool> = indexes
+            .iter()
+            .map(|&col| {
+                d.data[col]
+                    .iter()
+                    .all(|v| query_sort_is_empty(v) || query_sort_numeric(v).is_some())
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..row_count).collect();
+        order.sort_by(|&x, &y| {
+            for (slot, &col) in indexes.iter().enumerate() {
+                let column = &d.data[col];
+                let ord = query_sort_cell_cmp(&column[x], &column[y], numeric[slot]);
+                let ord = if descending[slot] { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        for column in d.data.iter_mut() {
+            let src = column.clone();
+            *column = std::sync::Arc::new(order.iter().map(|&i| src[i].clone()).collect());
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1723,13 +1723,15 @@ impl CfmlCompiler {
                 // shared struct handle in place AND returns a BOOLEAN (Lucee/ACF
                 // semantics), so storing its return value back over the first
                 // arg would clobber the struct variable with `true`/`false`.
+                // querySort is absent for exactly the same reason (GH #345): it
+                // sorts the shared query handle in place and returns a boolean.
                 return matches!(name_lower.as_str(),
                     "structappend" | "structinsert" | "structupdate" |
                     "structclear" | "arrayclear" | "arrayappend" | "arrayprepend" |
                     "arrayinsert" | "arrayinsertat" | "arraydeleteat" | "arraysort" |
                     "arrayresize" | "arrayswap" | "arrayreverse" | "arrayset" |
                     "queryaddcolumn" |
-                    "querydeleterow" | "querydeletecolumn" | "querysort"
+                    "querydeleterow" | "querydeletecolumn"
                 ) && !call.arguments.is_empty();
             }
         }

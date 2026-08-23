@@ -1275,6 +1275,36 @@ the scope is stored.
 
 ---
 
+## 59. `querySort()` infers numeric-vs-text ordering from the values, not a declared column type 🏗
+
+Lucee decides whether a query column sorts numerically or as text from the
+column's declared SQL type. We store no column types — `queryNew`'s type argument
+is accepted and ignored — so `querySort` infers it: a column sorts numerically
+when every non-empty cell parses as a number, and as text otherwise.
+
+The two rules agree everywhere except one case — a column declared as a string
+type that happens to hold only numeric strings:
+
+```cfml
+q = queryNew( "a", "varchar", [ [ "10" ], [ "9" ], [ "100" ] ] );
+querySort( q, "a" );
+valueList( q.a )   // Lucee: 10,100,9   RustCFML: 9,10,100
+```
+
+An untyped column of the same values sorts `9,10,100` on both engines, as does a
+column with any non-numeric value in it (`["10","b","2"]` → `10,2,b` on both).
+Everything else about the sort matches Lucee 7.1.0.204: stability, empty/null
+first ascending, case-sensitive text order, multi-column tie-breaks, and the
+three `database`-typed error messages.
+
+Closing this means storing column types on `CfmlQueryData` — worth doing for
+`getMetaData()` too, which currently infers `typeName` the same way — but it is a
+schema change across `queryNew`, the DB result-set builders and QoQ, so it is
+tracked rather than bundled into GH
+[#345](https://github.com/RustCFML/RustCFML/issues/345).
+
+---
+
 # Part E — Environment-specific 🌍
 
 Restrictions that apply only on a particular target (wasm, CLI vs serve).
