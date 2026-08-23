@@ -24859,6 +24859,9 @@ impl CfmlVirtualMachine {
                 // on a column arg — so it is deliberately not mapped here.
                 "columndata" => Some("queryColumnData"),
                 "addrow" => Some("queryAddRow"),
+                // Lucee exposes queryAddColumn as a member too; without this arm
+                // `q.addColumn(...)` threw "does not exist in the Query."
+                "addcolumn" => Some("queryAddColumn"),
                 "getrow" => Some("queryGetRow"),
                 "each" => {
                     if let Some(callback) = extra_args.first().cloned() {

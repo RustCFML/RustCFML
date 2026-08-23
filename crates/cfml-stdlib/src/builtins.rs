@@ -6643,6 +6643,18 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Array(arr) => arr.iter().map(|v| v.as_string()).collect(),
         _ => Vec::new(),
     };
+    // GH #344: reject a duplicate column name up front, as Lucee does — see the
+    // note in fn_query_add_column. The check is case-insensitive (CFML column
+    // names are) and the message names the LATER, offending occurrence exactly
+    // as the caller spelled it, matching Lucee's wording.
+    for (i, name) in columns.iter().enumerate() {
+        if columns[..i].iter().any(|prev| prev.eq_ignore_ascii_case(name)) {
+            return Err(CfmlError::database(format!(
+                "invalid parameter for query, ambiguous/duplicate column name [{}]",
+                name
+            )));
+        }
+    }
     let mut rows: Vec<ValueMap> = Vec::new();
     // 3rd arg: initial data as array of arrays, array of structs, or a flat
     // array of scalars.
@@ -6770,8 +6782,25 @@ fn fn_query_add_column(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
             let col_name = args[1].as_string();
-            let values: Vec<CfmlValue> = match args.get(2) {
-                Some(CfmlValue::Array(arr)) => arr.snapshot(),
+            // GH #344: a query with two same-named columns has no well-defined
+            // semantics for `q.ColA`, valueList, serialisation or QoQ, so Lucee
+            // refuses to create one. Column names are case-insensitive, so
+            // adding "COLA" to a query that has "ColA" is the SAME column and
+            // must throw too. Lucee reports it as a `database` exception naming
+            // the column exactly as the caller spelled it.
+            if q.has_column_ci(&col_name) {
+                return Err(CfmlError::database(format!(
+                    "Column name [{}] already exists",
+                    col_name
+                )));
+            }
+            // Lucee's signature is queryAddColumn(query, name, [datatype], array)
+            // — the datatype is optional and sits BEFORE the values. Reading the
+            // array from position 2 only meant the 4-argument spelling silently
+            // added an all-null column.
+            let values: Vec<CfmlValue> = match (args.get(2), args.get(3)) {
+                (_, Some(CfmlValue::Array(arr))) => arr.snapshot(),
+                (Some(CfmlValue::Array(arr)), _) => arr.snapshot(),
                 _ => Vec::new(),
             };
             // Mutate the shared handle IN PLACE (CFML by-reference): callers that

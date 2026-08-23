@@ -123,5 +123,51 @@ qRows = queryNew("a,b", "int,int", [[10, 20], [30, 40]]);
 assert("array-of-arrays -> two rows", qRows.recordCount, 2);
 assert("array-of-arrays row2 a", queryGetRow(qRows, 2).a, 30);
 
+// --- GH #344: duplicate column names are refused (both entry points) ---
+// A query with two same-named columns has no well-defined semantics for
+// `q.ColA`, valueList, serialisation or QoQ, so Lucee refuses to build one and
+// so do we. Column names are case-insensitive, so the differing-case spelling
+// is the SAME column and must throw as well. Lucee surfaces both as
+// type="database", verified on 7.1.0.204.
+assertThrows("queryAddColumn rejects an exact duplicate", function() {
+    var d = queryNew("ColA", "integer", [[1]]);
+    queryAddColumn(d, "ColA", [2]);
+});
+assertThrows("queryAddColumn rejects a differing-case duplicate", function() {
+    var d = queryNew("ColA", "integer", [[1]]);
+    queryAddColumn(d, "COLA", [2]);
+});
+assertThrows("queryNew rejects a duplicate in the column list", function() {
+    queryNew("ColA,COLA", "integer,integer");
+});
+assertThrows("queryNew rejects a duplicate in a column array", function() {
+    queryNew(["ColA", "COLA"]);
+});
+dupErrType = "";
+try {
+    dupQ = queryNew("ColA", "integer", [[1]]);
+    queryAddColumn(dupQ, "cola", [2]);
+} catch (any e) {
+    dupErrType = e.type;
+}
+assert("duplicate column error is type=database", dupErrType, "database");
+// A genuinely new column is of course still fine.
+okQ = queryNew("ColA", "integer", [[1]]);
+queryAddColumn(okQ, "ColB", [2]);
+assert("distinct column still added", okQ.columnList, "COLA,COLB");
+
+// --- queryAddColumn's optional datatype argument ---
+// Lucee's signature is queryAddColumn(query, name, [datatype], array): the type
+// sits BEFORE the values. Reading the array from the third position only meant
+// the four-argument spelling silently added an all-null column.
+typedQ = queryNew("ColA", "integer", [[1]]);
+queryAddColumn(typedQ, "ColB", "integer", [2]);
+assert("4-arg queryAddColumn keeps the values", queryGetRow(typedQ, 1).ColB, 2);
+
+// --- addColumn is available as a query member function ---
+memberQ = queryNew("ColA", "integer", [[1]]);
+memberQ.addColumn("ColB", [2]);
+assert("member addColumn adds the column", memberQ.columnList, "COLA,COLB");
+
 suiteEnd();
 </cfscript>
