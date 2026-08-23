@@ -663,6 +663,189 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
     }
 }
 
+/// The three base64 alphabets `java.util.Base64` exposes. Basic and MIME share
+/// an alphabet and differ only in line wrapping; URL-safe swaps the last two
+/// characters so the output is safe in a URL or filename.
+#[derive(Clone, Copy, PartialEq)]
+enum B64Variant {
+    Basic,
+    Url,
+    Mime,
+}
+
+impl B64Variant {
+    fn from_tag(tag: &str) -> Self {
+        match tag {
+            "url" => B64Variant::Url,
+            "mime" => B64Variant::Mime,
+            _ => B64Variant::Basic,
+        }
+    }
+    fn tag(self) -> &'static str {
+        match self {
+            B64Variant::Url => "url",
+            B64Variant::Mime => "mime",
+            B64Variant::Basic => "basic",
+        }
+    }
+    fn alphabet(self) -> &'static [u8; 64] {
+        match self {
+            B64Variant::Url => b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+            _ => b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+        }
+    }
+}
+
+/// Encode `data`, padding unless `pad` is false. The MIME encoder wraps at 76
+/// characters with CRLF, as the JDK's does.
+fn b64_encode(data: &[u8], variant: B64Variant, pad: bool) -> String {
+    let alpha = variant.alphabet();
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(alpha[((n >> 18) & 63) as usize] as char);
+        out.push(alpha[((n >> 12) & 63) as usize] as char);
+        match chunk.len() {
+            1 => {
+                if pad {
+                    out.push_str("==");
+                }
+            }
+            2 => {
+                out.push(alpha[((n >> 6) & 63) as usize] as char);
+                if pad {
+                    out.push('=');
+                }
+            }
+            _ => {
+                out.push(alpha[((n >> 6) & 63) as usize] as char);
+                out.push(alpha[(n & 63) as usize] as char);
+            }
+        }
+    }
+    if variant == B64Variant::Mime && out.len() > 76 {
+        let mut wrapped = String::with_capacity(out.len() + out.len() / 76 * 2);
+        for (i, c) in out.chars().enumerate() {
+            if i > 0 && i % 76 == 0 {
+                wrapped.push_str("\r\n");
+            }
+            wrapped.push(c);
+        }
+        return wrapped;
+    }
+    out
+}
+
+/// Decode `s`, accepting both alphabets so a URL-safe decoder also reads a
+/// standard string (the JDK is strict here; being lenient only ever turns a
+/// throw into the right answer). Characters outside the alphabet are skipped,
+/// which is what makes the MIME decoder tolerate its own line breaks.
+fn b64_decode(s: &str) -> Vec<u8> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let filtered: Vec<u32> = s.bytes().filter_map(val).collect();
+    let mut out = Vec::with_capacity(filtered.len() / 4 * 3 + 3);
+    for group in filtered.chunks(4) {
+        if group.len() < 2 {
+            break;
+        }
+        let n = (group[0] << 18)
+            | (group[1] << 12)
+            | (group.get(2).copied().unwrap_or(0) << 6)
+            | group.get(3).copied().unwrap_or(0);
+        out.push(((n >> 16) & 0xFF) as u8);
+        if group.len() > 2 {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if group.len() > 3 {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// `java.util.Base64` and the Encoder/Decoder it hands out.
+///
+/// The JWK-to-PEM idiom every JWKS verifier ends with is
+/// `Base64.getEncoder().encodeToString(publicKey.getEncoded())`, so this class
+/// is reached immediately after the v0.606.0 KeyFactory shim succeeds.
+pub fn handle_java_base64(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    let field = |k: &str| -> Option<CfmlValue> {
+        match object {
+            CfmlValue::Struct(s) => s.get(k),
+            _ => None,
+        }
+    };
+    let variant = B64Variant::from_tag(
+        &field("__b64_variant")
+            .map(|v| v.as_string())
+            .unwrap_or_default(),
+    );
+    // withoutPadding() is the only mutator, and it only ever turns padding off.
+    let pad = field("__b64_pad").map(|v| v.is_true()).unwrap_or(true);
+
+    let make = |class: &str, variant: B64Variant, pad: bool| -> CfmlValue {
+        let mut shim = ValueMap::default();
+        shim.insert(
+            "__java_class".to_string(),
+            CfmlValue::string(class.to_string()),
+        );
+        shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+        shim.insert(
+            "__b64_variant".to_string(),
+            CfmlValue::string(variant.tag().to_string()),
+        );
+        shim.insert("__b64_pad".to_string(), CfmlValue::Bool(pad));
+        CfmlValue::strukt(shim)
+    };
+
+    match method {
+        "init" => Ok(make("java.util.base64", B64Variant::Basic, true)),
+        // Statics handing out the six encoders/decoders.
+        "getencoder" => Ok(make("java.util.base64$encoder", B64Variant::Basic, true)),
+        "geturlencoder" => Ok(make("java.util.base64$encoder", B64Variant::Url, true)),
+        "getmimeencoder" => Ok(make("java.util.base64$encoder", B64Variant::Mime, true)),
+        "getdecoder" => Ok(make("java.util.base64$decoder", B64Variant::Basic, true)),
+        "geturldecoder" => Ok(make("java.util.base64$decoder", B64Variant::Url, true)),
+        "getmimedecoder" => Ok(make("java.util.base64$decoder", B64Variant::Mime, true)),
+        // Encoder
+        "withoutpadding" => Ok(make("java.util.base64$encoder", variant, false)),
+        "encodetostring" => {
+            let data = java_byte_array(args.first().unwrap_or(&CfmlValue::Null));
+            Ok(CfmlValue::string(b64_encode(&data, variant, pad)))
+        }
+        // encode() returns a byte[] of the ASCII encoding, not a String.
+        "encode" => {
+            let data = java_byte_array(args.first().unwrap_or(&CfmlValue::Null));
+            Ok(CfmlValue::Binary(
+                b64_encode(&data, variant, pad).into_bytes(),
+            ))
+        }
+        // Decoder. The argument is a String on the JVM but a byte[] overload
+        // exists too, so accept either.
+        "decode" => {
+            let text = match args.first() {
+                Some(CfmlValue::Binary(b)) => String::from_utf8_lossy(b).into_owned(),
+                Some(other) => other.as_string(),
+                None => String::new(),
+            };
+            Ok(CfmlValue::Binary(b64_decode(&text)))
+        }
+        _ => Err(CfmlError::shim_unhandled(method)),
+    }
+}
+
 pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     // java.util.Date shim. Lucee/Adobe commonly construct it from epoch millis
     // (`new Date(0)` as a UTC base date for date math) and read `getTime()`.

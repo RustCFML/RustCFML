@@ -14681,6 +14681,16 @@ pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
         if i + 1 >= chars.len() {
             break;
         }
+        // `=` is end-of-data, so a group that opens with padding carries no
+        // bits at all. Decoding it anyway fabricated a trailing NUL byte:
+        // b64_val('=') is 0, and the first byte of a group is always pushed.
+        // jwt-cfml pads with `repeatString('=', 4 - (len % 4))`, i.e. a whole
+        // surplus `====` quad whenever the length is already a multiple of 4,
+        // so the NUL landed in the middle of decoded JWT JSON. Two characters
+        // are the minimum for one byte, hence checking both.
+        if chars[i] == b'=' || chars[i + 1] == b'=' {
+            break;
+        }
         let b0 = b64_val(chars[i]);
         let b1 = b64_val(chars[i + 1]);
         let has2 = i + 2 < chars.len() && chars[i + 2] != b'=';

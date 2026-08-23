@@ -281,6 +281,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_utility.cfm">
 <cf_runtest file="stdlib/test_encoding_functions.cfm">
 <cf_runtest file="stdlib/test_url_encoder_policies.cfm">
+<cf_runtest file="stdlib/test_binarydecode_excess_padding.cfm">
 <cf_runtest file="stdlib/test_base64_hex_codec.cfm">
 <cf_runtest file="stdlib/test_query_mutations.cfm">
 <cf_runtest file="stdlib/test_query_new_empty_addcolumn_metadata.cfm">
@@ -633,6 +634,8 @@ include "harness.cfm";
 <!--- --- Java Shims --- --->
 <cf_runtest file="java_shims/test_all.cfm">
 <cf_runtest file="java_shims/test_java_regex_quote_and_replacement.cfm">
+<cf_runtest file="java_shims/test_java_date_shim_date_bifs.cfm">
+<cf_runtest file="java_shims/test_java_util_base64.cfm">
 <cf_runtest file="java_shims/test_comprehensive.cfm">
 <cf_runtest file="java_shims/test_more.cfm">
 <cf_runtest file="java_shims/test_security.cfm">

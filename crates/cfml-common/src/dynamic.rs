@@ -764,6 +764,24 @@ fn java_shim_string(s: &CfmlStruct) -> Option<String> {
         }
         return Some(uuid);
     }
+    // java.util.Date -> the engine's own datetime form, so the CFML date BIFs
+    // accept it. On the JVM a java.util.Date IS a date: isDate() is true and
+    // dateAdd/dateDiff/dateCompare/dateTimeFormat all take one. Rendering the
+    // class name instead made every one of them fail with "Invalid date:
+    // java.util.date" — which bites hardest on jwt-cfml, whose epoch-claim
+    // conversion anchors on `Date(0)` and does date maths against it.
+    // Local time, as Java's Date.toString() uses the default zone.
+    if let Some(ms) = s.get("__millis") {
+        let millis = match &ms {
+            CfmlValue::Int(n) => *n,
+            CfmlValue::Double(d) => *d as i64,
+            other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+        };
+        if let Some(utc) = chrono::DateTime::from_timestamp_millis(millis) {
+            let local: chrono::DateTime<chrono::Local> = utc.into();
+            return Some(local.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+    }
     // java.lang.StringBuilder / StringBuffer -> buffered contents.
     if let Some(b) = s.get("__buffer") {
         return Some(b.as_string());

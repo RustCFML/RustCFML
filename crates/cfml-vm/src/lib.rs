@@ -16349,6 +16349,9 @@ impl CfmlVirtualMachine {
                                 "java.util.regex.matcher" => {
                                     handle_java_pattern("__init_matcher", empty_args, &CfmlValue::Null)
                                 }
+                                "java.util.base64" => {
+                                    java_shims::handle_java_base64("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.util.locale" => {
                                     java_shims::handle_java_locale("init", empty_args, &CfmlValue::Null)
                                 }
@@ -23396,6 +23399,11 @@ impl CfmlVirtualMachine {
                     "java.lang.process" => handle_java_process(&m, all_args, object),
                     "java.util.regex.pattern" | "java.util.regex.matcher" => {
                         handle_java_pattern(&m, all_args, object)
+                    }
+                    "java.util.base64"
+                    | "java.util.base64$encoder"
+                    | "java.util.base64$decoder" => {
+                        java_shims::handle_java_base64(&m, all_args, object)
                     }
                     "java.lang.class" => handle_java_class(&m, all_args, object),
                     "java.lang.runtime" => {
