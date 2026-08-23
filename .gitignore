@@ -90,24 +90,9 @@ sqlite::memory:
 /pgo/archive/
 
 # Private working docs — plans, reviews, investigation notes and scratch
-# patches that live in the repo root for convenience but must NEVER be
-# published. These were swept into v0.621.0 by a `git add -A` running under
-# ALLOW_MD=1 (the token authorised CLAUDE.md/docs/*.md in the same commit and
-# blanket-allowed these too) and removed again in v0.625.0. Ignoring them means
-# a future blanket add cannot repeat it.
-/ANTISAMY_SHIM_PLAN.md
-/ColdboxIssues.md
-/Compatibility.md
-/NATIVE_EXTENSIONS_PLAN.md
-/OBSCURA_BROWSER_PLAN.md
-/PERFORMANCE_ROADMAP.md
-/PRESIDE_BOOT_JAVA_NOOPS.md
-/PRESIDE_CFCONCURRENT_PLAN.md
-/PRESIDE_JAVA_SURFACE.md
-/PRESIDE_UPSTREAM_HANDLERSERVICE_ISSUES.md
-/QwenReview.md
-/REFERENCE_SEMANTICS_PLAN.md
-/lockissue.md
-/lspplan.md
-/presideWireBoxDIIssue.md
-/*.patch
+# patches. They live in the repo for convenience but are not part of the
+# published project. Twelve of them were swept into v0.621.0 by a `git add -A`
+# running under ALLOW_MD=1 (that token authorised CLAUDE.md/docs/*.md in the
+# same commit and blanket-allowed these too). Keeping them under one ignored
+# directory means a future blanket add cannot repeat it.
+/planning/
