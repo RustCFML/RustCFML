@@ -632,6 +632,7 @@ include "harness.cfm";
 
 <!--- --- Java Shims --- --->
 <cf_runtest file="java_shims/test_all.cfm">
+<cf_runtest file="java_shims/test_java_regex_quote_and_replacement.cfm">
 <cf_runtest file="java_shims/test_comprehensive.cfm">
 <cf_runtest file="java_shims/test_more.cfm">
 <cf_runtest file="java_shims/test_security.cfm">

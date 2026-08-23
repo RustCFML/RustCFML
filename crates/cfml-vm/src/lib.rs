@@ -16346,6 +16346,9 @@ impl CfmlVirtualMachine {
                                 "java.util.regex.pattern" => {
                                     handle_java_pattern("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.util.regex.matcher" => {
+                                    handle_java_pattern("__init_matcher", empty_args, &CfmlValue::Null)
+                                }
                                 "java.util.locale" => {
                                     java_shims::handle_java_locale("init", empty_args, &CfmlValue::Null)
                                 }
@@ -23702,10 +23705,24 @@ impl CfmlVirtualMachine {
                     let rust_pat = java_shims::java_regex_to_rust(&pat);
                     return match java_shims::java_cached_regex(&rust_pat) {
                         Ok(re) => {
+                            // Java and the regex crate disagree on replacement
+                            // syntax (`$1` vs `${1}`, `\$` vs `$$`), so the
+                            // string has to be translated — see
+                            // java_replacement_to_rust. Without this,
+                            // Matcher.quoteReplacement output is meaningless
+                            // here: its backslashes stay in the text and `$b`
+                            // reads as a group reference.
+                            let rust_rep = match java_shims::java_replacement_to_rust(&rep, &re)
+                            {
+                                Ok(r) => r,
+                                Err(msg) => {
+                                    return Err(self.wrap_error(CfmlError::runtime(msg)));
+                                }
+                            };
                             let out = if method_lower == "replacefirst" {
-                                re.replace(&s, rep.as_str())
+                                re.replace(&s, rust_rep.as_str())
                             } else {
-                                re.replace_all(&s, rep.as_str())
+                                re.replace_all(&s, rust_rep.as_str())
                             };
                             Ok(CfmlValue::string(out.into_owned()))
                         }

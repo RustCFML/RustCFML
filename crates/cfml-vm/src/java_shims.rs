@@ -4104,6 +4104,28 @@ pub fn java_regex_to_rust(pattern: &str) -> String {
         let c = chars[i];
         if c == '\\' && i + 1 < chars.len() {
             let n = chars[i + 1];
+            if n == 'Q' {
+                // `\Q…\E` quotes a literal region: everything up to the next
+                // `\E` matches verbatim, backslashes included, and an unclosed
+                // `\Q` runs to the end of the pattern. Java callers reach for
+                // this exactly where an interpolated value must be matched
+                // literally, so it turns up in the code most likely to run
+                // through these shims — Preside's email token substitution
+                // builds `(?i)\Q${param}\E` for every parameter.
+                let mut j = i + 2;
+                let mut literal = String::new();
+                while j < chars.len() {
+                    if chars[j] == '\\' && j + 1 < chars.len() && chars[j + 1] == 'E' {
+                        break;
+                    }
+                    literal.push(chars[j]);
+                    j += 1;
+                }
+                out.push_str(&regex::escape(&literal));
+                // Skip the closing `\E` when there is one.
+                i = if j < chars.len() { j + 2 } else { j };
+                continue;
+            }
             if n == 'u'
                 && i + 6 <= chars.len()
                 && chars[i + 2..i + 6].iter().all(|h| h.is_ascii_hexdigit())
@@ -4122,6 +4144,124 @@ pub fn java_regex_to_rust(pattern: &str) -> String {
         }
         out.push(c);
         i += 1;
+    }
+    out
+}
+
+/// Translate a Java *replacement* string into the `regex` crate's dialect.
+///
+/// These are two different languages and they collide on `$`:
+///
+/// | intent | Java | `regex` crate |
+/// |---|---|---|
+/// | group 1 | `$1` | `${1}` |
+/// | named group | `${name}` | `${name}` |
+/// | literal `$` | `\$` | `$$` |
+/// | literal `\` | `\\` | `\` |
+///
+/// So the two dialects disagree on the very thing `Matcher.quoteReplacement`
+/// produces: it escapes with backslashes, which the `regex` crate does not
+/// read as escapes at all. Handing its output straight to `replace_all` would
+/// leave the backslashes in the text and then read `$b` as a group reference.
+///
+/// Everything the JVM rejects is rejected here with the JVM's own message,
+/// because the `regex` crate's answer to a bad reference is an empty string —
+/// silent data loss where Java fails loudly.
+pub fn java_replacement_to_rust(
+    replacement: &str,
+    re: &regex::Regex,
+) -> Result<String, String> {
+    let group_count = re.captures_len().saturating_sub(1);
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut out = String::with_capacity(replacement.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            // Java's backslash escape: the next character is always literal.
+            '\\' if i + 1 < chars.len() => {
+                if chars[i + 1] == '$' {
+                    out.push_str("$$");
+                } else {
+                    out.push(chars[i + 1]);
+                }
+                i += 2;
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                let close = chars[i + 2..]
+                    .iter()
+                    .position(|&c| c == '}')
+                    .map(|p| i + 2 + p)
+                    .ok_or_else(|| "Unclosed group name".to_string())?;
+                let name: String = chars[i + 2..close].iter().collect();
+                if !re.capture_names().flatten().any(|n| n == name) {
+                    return Err(format!("No group with name {{{}}}", name));
+                }
+                out.push_str(&format!("${{{}}}", name));
+                i = close + 1;
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                let mut j = i + 1;
+                // The first digit is always part of the reference; Java then
+                // extends greedily only while the number is still a real group,
+                // so with two groups `$12` is group 1 followed by a literal `2`.
+                let mut num = chars[j] as usize - '0' as usize;
+                j += 1;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    let next = num * 10 + (chars[j] as usize - '0' as usize);
+                    if next > group_count {
+                        break;
+                    }
+                    num = next;
+                    j += 1;
+                }
+                if num > group_count {
+                    return Err(format!("No group {}", num));
+                }
+                out.push_str(&format!("${{{}}}", num));
+                i = j;
+            }
+            '$' if i + 1 < chars.len() => return Err("Illegal group reference".to_string()),
+            '$' => return Err("Illegal group reference: group index is missing".to_string()),
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `java.util.regex.Pattern.quote` — wrap `s` so the whole string matches
+/// literally. An embedded `\E` has to be broken out of the quoted region and
+/// re-quoted, or it would end the region early.
+pub fn java_pattern_quote(s: &str) -> String {
+    if !s.contains("\\E") {
+        return format!("\\Q{}\\E", s);
+    }
+    let mut out = String::from("\\Q");
+    let mut rest = s;
+    while let Some(idx) = rest.find("\\E") {
+        out.push_str(&rest[..idx]);
+        out.push_str("\\E\\\\E\\Q");
+        rest = &rest[idx + 2..];
+    }
+    out.push_str(rest);
+    out.push_str("\\E");
+    out
+}
+
+/// `java.util.regex.Matcher.quoteReplacement` — escape every `\` and `$` so the
+/// string is used verbatim as a replacement rather than read as group syntax.
+pub fn java_quote_replacement(s: &str) -> String {
+    if !s.contains('\\') && !s.contains('$') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c == '\\' || c == '$' {
+            out.push('\\');
+        }
+        out.push(c);
     }
     out
 }
@@ -4253,6 +4393,26 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             add_flag_consts(&mut shim);
             Ok(CfmlValue::strukt(shim))
         }
+        // createObject("java","java.util.regex.Matcher") — a class handle. Only
+        // the statics are reachable this way; a real Matcher comes from
+        // Pattern.matcher(). Preside's EmailTemplateService takes exactly this
+        // route to reach the static quoteReplacement.
+        "__init_matcher" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.util.regex.matcher".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Statics. Callable on either class handle, as they are on the JVM.
+        "quote" => Ok(CfmlValue::string(java_pattern_quote(
+            &args.first().map(|a| a.as_string()).unwrap_or_default(),
+        ))),
+        "quotereplacement" => Ok(CfmlValue::string(java_quote_replacement(
+            &args.first().map(|a| a.as_string()).unwrap_or_default(),
+        ))),
         "pattern" | "tostring" => Ok(CfmlValue::string(object_regex())),
         // Pattern.matcher(input) — create a Matcher positioned before the first
         // match. find()/matches()/lookingAt() (handled inline in the VM so they
