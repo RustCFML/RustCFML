@@ -14,7 +14,7 @@
 //! verbatim, and matching what a Tier-0 shim would hand over anyway.
 
 use crate::{
-    cfml_compare, cfml_equal, CfmlVirtualMachine, InheritedKeys, TryHandler,
+    cfml_compare, cfml_equal, CfmlVirtualMachine, DeclaredLocals, InheritedKeys, TryHandler,
 };
 use cfml_codegen::{BytecodeFunction, BytecodeOp, CmpOp};
 use cfml_common::dynamic::{CfmlValue, ValueMap};
@@ -110,7 +110,7 @@ pub(crate) fn op_store_global(
 /// `DeclareLocal`
 #[inline]
 pub(crate) fn op_declare_local(
-    declared_locals: &mut std::collections::HashSet<String>,
+    declared_locals: &mut DeclaredLocals,
     inherited_or_param_keys: &mut InheritedKeys,
     name: &Name,
 ) {
@@ -118,19 +118,15 @@ pub(crate) fn op_declare_local(
     // marks the name local + reclaims inherited keys. The slot
     // itself activates at the first StoreSlot (see there) so
     // read-before-first-store keeps today's exact semantics.
-    // Mark this variable as function-local (var keyword). Record
-    // BOTH the original casing and the lowercased form (mirrors the
-    // param path in `apply_pending_result_writeback`): CFML
-    // identifiers are case-insensitive, so a `var flashPath` must
-    // be recognised as declared-local when a later `flashpath = …`
-    // (different casing) is assigned — otherwise the write leaks to
-    // the `variables` scope (ColdBox's Router.buildFlashScope). The
-    // original-case entry keeps the `local`-view visibility filter
-    // (which checks `contains(k)` with the key's own casing) intact.
-    declared_locals.insert(name.to_string());
-    if !name.is_lowercase() {
-        declared_locals.insert(name.lower().to_string());
-    }
+    // Mark this variable as function-local (var keyword). ONE entry, in the
+    // original casing: `DeclaredLocals` folds case on both insert and probe, so
+    // a `var flashPath` is recognised when a later `flashpath = …` is assigned
+    // (otherwise the write leaks to `variables` — ColdBox's
+    // Router.buildFlashScope), and equally when the write-back loops probe with
+    // the casing the CALLER seeded the key under. That third casing is the one
+    // the old two-entry `HashSet<String>` could not cover, and is why
+    // `var fileName` used to overwrite a caller's `filename`.
+    declared_locals.insert(name.as_str());
     // PR #93: a `var x` / `local.x` declaration RECLAIMS the
     // name into THIS frame's `local` scope, shadowing any
     // same-named key inherited from the caller. Removing it
@@ -656,7 +652,7 @@ pub(crate) fn op_array_append_local(
     locals: &mut ValueMap,
     slots: &mut [Option<CfmlValue>],
     closure_env: &Option<Arc<RwLock<ValueMap>>>,
-    declared_locals: &std::collections::HashSet<String>,
+    declared_locals: &DeclaredLocals,
     effective_local_mode_modern: bool,
     is_inside_function: bool,
     op: &BytecodeOp,
@@ -711,7 +707,6 @@ pub(crate) fn op_array_append_local(
     let val = CfmlValue::array(vec![value]);
     if locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
         && !declared_locals.contains(name.as_str())
-        && !declared_locals.contains(name_lower)
         && !locals.contains_key(name)
         && !effective_local_mode_modern
         // A declared parameter is local, never the component scope —
@@ -728,7 +723,6 @@ pub(crate) fn op_array_append_local(
         locals.insert(name, val.clone());
         if is_inside_function
             && !declared_locals.contains(name.as_str())
-            && !declared_locals.contains(name_lower)
             && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
         {
             if let Some(args) =

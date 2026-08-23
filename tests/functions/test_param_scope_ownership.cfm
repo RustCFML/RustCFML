@@ -93,22 +93,49 @@ function reclaimsInherited() {
 assertTrue("a var-declared name that was inherited becomes a real local, whatever the casing",
            reclaimsInherited());
 
-// --- 9. ...and being a real local, it must NOT be written back to the caller.
-//        Lucee 7.1.0 returns "page" for BOTH of these. We currently return
-//        "page" only when the casings match: `declared_locals` is a
-//        case-SENSITIVE HashSet<String>, while the writeback loop probes it
-//        with the key's casing as stored in `locals` -- which is the CALLER's
-//        casing, a third variant `op_declare_local` never inserted. So
-//        `var fileName` fails to shield a caller's `filename`.
-//
-//        Only the agreed case is asserted here; the divergent one is left to
-//        the fix that makes `declared_locals` case-insensitive, which is where
-//        its regression test belongs. Do NOT "fix" this file by asserting the
-//        current behaviour -- that would pin the bug. ---
+// --- 9. ...and being a real local, it must NOT be written back to the caller,
+//        WHATEVER the casings. `declared_locals` used to be a case-SENSITIVE
+//        HashSet<String> holding the name as written plus its lowercase form --
+//        two casings, where three are in play. The write-back loops probe with
+//        the key's casing as stored in `locals`, which is the casing the CALLER
+//        seeded it with, so `var fileName` failed to shield a caller's
+//        `filename` and silently overwrote it on exit. All four verified
+//        byte-identical against Lucee 7.1.0. ---
 sameCasing = "page";
 function declaresSameCasing() { var sameCasing = "mine"; return 1; }
 declaresSameCasing();
 assert("a var-declared local is not written back to the caller", sameCasing, "page");
+
+DiffCasing = "page";
+function declaresDiffCasing() { var diffcasing = "mine"; return 1; }
+declaresDiffCasing();
+assert("...nor when the declaration's casing differs from the caller's",
+       DiffCasing, "page");
+
+MiXeD = "page";
+function declaresMixed() { var mIxEd = "mine"; return 1; }
+declaresMixed();
+assert("...nor for arbitrary mixed casing", MiXeD, "page");
+
+// CONTROL: the fix must not swallow a genuine unscoped write (classic
+// localMode), which is the whole reason the write-back loop exists.
+function unscopedStillPropagates() { notDeclared8 = 42; return 1; }
+unscopedStillPropagates();
+assert("a genuine unscoped write still reaches the caller", notDeclared8, 42);
+
+// --- 10. `var` in one casing then assignment in ANOTHER stays local and does
+//         not leak to `variables` (ColdBox Router.buildFlashScope). This is what
+//         the removed second `declared_locals` entry used to buy; the
+//         case-folding set covers it by construction. ---
+function declareThenAssignOtherCasing() {
+    var flashPath8 = "x";
+    flashpath8 = "y";
+    return flashPath8;
+}
+assert("a write in different casing hits the var-declared local, not variables",
+       declareThenAssignOtherCasing(), "y");
+assertFalse("...and does not leak the name into the caller's scope",
+            isDefined("flashpath8"));
 
 suiteEnd();
 </cfscript>

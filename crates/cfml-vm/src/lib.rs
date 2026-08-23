@@ -3098,6 +3098,65 @@ impl InheritedKeys {
     }
 }
 
+/// The names a frame has declared function-local (`var x`, `local.x`). Consulted
+/// by every classic-localMode write-back to keep a real local out of the caller's
+/// scope, and by the `local` scope view.
+///
+/// **Case-insensitive by construction**, which is the entire reason the type
+/// exists. It replaced a `HashSet<String>` that stored the name as written plus
+/// its lowercase form — two casings, where three are in play. The write-back
+/// loops probe with the key's casing **as stored in `locals`**, and that is the
+/// casing the CALLER seeded it with, which neither insert covers. So
+/// `var fileName` failed to shield a caller's `filename`: the miss made the local
+/// look like an ordinary unscoped write and it silently overwrote the caller's
+/// variable on exit. Lucee 7.1.0 returns the caller's value whatever the casings;
+/// we only matched when they happened to agree.
+///
+/// Same `hashbrown::HashTable<Key>` shape as [`InheritedKeys::other`] and for the
+/// same reasons: `Key` equality already folds case, `Key` carries its own folded
+/// hash, and a `&str` probe costs one [`fold_hash`] and no allocation — where the
+/// old set's `contains(&name.to_lowercase())` fallbacks allocated a `String` on
+/// every probe.
+///
+/// [`fold_hash`]: cfml_common::key::fold_hash
+#[derive(Debug, Default, Clone)]
+struct DeclaredLocals {
+    set: hashbrown::HashTable<cfml_common::key::Key>,
+}
+
+impl DeclaredLocals {
+    #[inline]
+    fn insert(&mut self, name: &str) {
+        self.set
+            .entry(
+                cfml_common::key::fold_hash(name),
+                |e| e.as_str().eq_ignore_ascii_case(name),
+                cfml_common::key::Key::hash_value,
+            )
+            .or_insert_with(|| cfml_common::key::Key::new(name));
+    }
+
+    #[inline]
+    fn contains(&self, name: &str) -> bool {
+        if self.set.is_empty() {
+            // Most frames declare nothing; checked before hashing.
+            return false;
+        }
+        self.set
+            .find(cfml_common::key::fold_hash(name), |e| {
+                e.as_str().eq_ignore_ascii_case(name)
+            })
+            .is_some()
+    }
+
+    /// Declared names in their original casing. Iteration order is unspecified —
+    /// the one consumer (`CLOSURE_OWN_KEYS`) builds a set from it.
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.set.iter().map(|k| k.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CallFrame {
     function_name: String,
@@ -6820,8 +6879,7 @@ impl CfmlVirtualMachine {
         let mut slot_blocked: u64 = 0;
         let mut ip = 0;
         // Track variables declared with `var` (function-local, not written back to parent)
-        let mut declared_locals: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut declared_locals = DeclaredLocals::default();
         // Shared closure environment: all closures defined within this function
         // invocation share one Rc<RefCell<HashMap>>. Lazily created on first DefineFunction.
         let mut closure_env: Option<Arc<RwLock<ValueMap>>> = None;
@@ -7498,8 +7556,7 @@ impl CfmlVirtualMachine {
                     // byte-for-byte unchanged.
                     let scope_name_shadow_attempt = (is_inside_function
                         && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
-                        || declared_locals.contains(name.as_str())
-                        || declared_locals.contains(name_lower);
+                        || declared_locals.contains(name.as_str());
                     let val = if name_lower == "local" {
                         // `local` is strictly per-call (PR #93): only keys
                         // established in THIS frame are visible — inherited
@@ -7875,8 +7932,7 @@ impl CfmlVirtualMachine {
                             continue;
                         }
                         if slot_blocked & (1u64 << idx) == 0
-                            && (declared_locals.contains(name.as_str())
-                                || declared_locals.contains(name.lower()))
+                            && declared_locals.contains(name.as_str())
                         {
                             if !locals.contains_key(name)
                                 && !locals
@@ -7967,7 +8023,6 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "variables"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             // A declared param named after a scope is inherently
                             // local (see the twin guards in the __variables and
                             // LoadLocal arms) — its default-value store must NOT
@@ -8050,7 +8105,6 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "request"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Same declared-local guard as `variables`: a user
@@ -8067,7 +8121,6 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "application"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
@@ -8081,7 +8134,6 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "session"
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
@@ -8111,7 +8163,6 @@ impl CfmlVirtualMachine {
                         } else if name_lower == "arguments"
                             && is_inside_function
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                         {
                             // Storing the `arguments` SCOPE (bare `arguments = …`
                             // or an `arguments.x = …` round-trip). A user
@@ -8160,7 +8211,6 @@ impl CfmlVirtualMachine {
                                     // clobber the local (see
                                     // tests/core/test_local_shadows_arguments.cfm #8).
                                     if declared_locals.contains(k.as_str())
-                                        || declared_locals.contains(&k.to_lowercase())
                                     {
                                         continue;
                                     }
@@ -8181,7 +8231,6 @@ impl CfmlVirtualMachine {
                             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
                         } else if Self::is_web_request_scope(&name_lower)
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Web request scopes (url/form/cgi/cookie) are always
@@ -8196,7 +8245,6 @@ impl CfmlVirtualMachine {
                             // genuine `var url` frame-local is guarded out above.
                             self.globals.insert(name_lower.to_string(), val);
                         } else if !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
@@ -8227,7 +8275,6 @@ impl CfmlVirtualMachine {
                             }
                         } else if locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
                             && !declared_locals.contains(name.as_str())
-                            && !declared_locals.contains(name_lower)
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
                             && name_lower != "cfcatch"
@@ -8297,7 +8344,6 @@ impl CfmlVirtualMachine {
                             // resolving to the passed value / declared default.
                             if is_inside_function
                                 && !declared_locals.contains(name.as_str())
-                                && !declared_locals.contains(name_lower)
                                 && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                             {
                                 if let Some(args) =
@@ -8327,8 +8373,7 @@ impl CfmlVirtualMachine {
                                 // NOT in declared_locals — force-stripping its captured_scope
                                 // into the env would break its `variables`-scope capture when
                                 // read back (regressed test_include_scope_capture).
-                                let is_own_closure = (declared_locals.contains(name.as_str())
-                                    || declared_locals.contains(name_lower))
+                                let is_own_closure = declared_locals.contains(name.as_str())
                                     && matches!(
                                         &val,
                                         CfmlValue::Function(f)
@@ -11062,7 +11107,7 @@ impl CfmlVirtualMachine {
                                     .params
                                     .iter()
                                     .cloned()
-                                    .chain(declared_locals.iter().cloned())
+                                    .chain(declared_locals.iter().map(str::to_string))
                                     .map(CfmlValue::string)
                                     .collect();
                                 Self::set_closure_parent_link(&mut seed, parent, own_keys);
@@ -21231,7 +21276,7 @@ impl CfmlVirtualMachine {
         &mut self,
         locals: &mut ValueMap,
         inherited_or_param_keys: &mut InheritedKeys,
-        declared_locals: &mut std::collections::HashSet<String>,
+        declared_locals: &mut DeclaredLocals,
         local_mode_modern: bool,
     ) {
         if let Some(sets) = self.pending_result_writeback.take() {
@@ -21252,8 +21297,7 @@ impl CfmlVirtualMachine {
                     // successful save leaked local.rv=true over the parent loop's
                     // running `local.rv=false`, so a FAILED child validation no
                     // longer rolled the parent/child PKs back (nestedpropertiesSpec).
-                    declared_locals.insert(parts[1].to_string());
-                    declared_locals.insert(parts[1].to_lowercase());
+                    declared_locals.insert(parts[1]);
                 } else if parts.len() == 1 && locals.contains_key(parts[0]) {
                     inherited_or_param_keys.remove(parts[0]);
                 }
@@ -26261,7 +26305,7 @@ impl CfmlVirtualMachine {
     fn closure_env_capture_value(
         name: &str,
         value: &CfmlValue,
-        declared_locals: &std::collections::HashSet<String>,
+        declared_locals: &DeclaredLocals,
         params: &[String],
     ) -> Option<CfmlValue> {
         match value {
@@ -26292,7 +26336,6 @@ impl CfmlVirtualMachine {
                 // re-capturing it would reintroduce the leak cycle. Capture only
                 // when var-scoped (PR #198), stripping the scope to break it.
                 let is_var_scoped = declared_locals.contains(name)
-                    || declared_locals.contains(&name.to_lowercase())
                     || params.iter().any(|p| p.eq_ignore_ascii_case(name));
                 if !is_var_scoped {
                     return None;
@@ -26385,10 +26428,17 @@ impl CfmlVirtualMachine {
         // (those are frozen per-invocation; see CLOSURE_OWN_KEYS).
         let keys: Vec<String> = {
             let e = env.read().unwrap();
-            let own: std::collections::HashSet<String> = match e.get(Self::CLOSURE_OWN_KEYS) {
-                Some(CfmlValue::Array(a)) => a.snapshot().iter().map(|v| v.as_string()).collect(),
-                _ => std::collections::HashSet::new(),
-            };
+            // CASE-INSENSITIVE, like the `DeclaredLocals` this list is built
+            // from: `e`'s keys carry whatever casing they were seeded with, so a
+            // case-sensitive probe here would refresh a param or `var`-local
+            // whose casing merely differs — exactly the miss that let
+            // `var fileName` escape the write-back filter.
+            let mut own = DeclaredLocals::default();
+            if let Some(CfmlValue::Array(a)) = e.get(Self::CLOSURE_OWN_KEYS) {
+                for v in a.snapshot().iter() {
+                    own.insert(&v.as_string());
+                }
+            }
             e.keys()
                 .filter(|k| {
                     k.as_str() != Self::CLOSURE_PARENT_KEY && k.as_str() != Self::CLOSURE_OWN_KEYS
