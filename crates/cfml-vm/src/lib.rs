@@ -22,6 +22,7 @@ type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 mod intercepts_common;
 mod intercepts_deferred;
 mod intercepts_querydir;
+mod intercepts_varpath;
 mod intercepts_output;
 mod intercepts_realtime;
 pub mod application_store;
@@ -406,6 +407,29 @@ pub struct SessionData {
 /// struct with a `__variables` scope plus a `this`/`__name` marker is a
 /// component instance, not user data. Used to suppress engine internals during
 /// for-in iteration and serialization.
+/// The first element of an XML named-child GROUP, if `arr` is one.
+///
+/// `x.Root.Kid` is modelled here as an array of every `<Kid>` child, because that
+/// is what indexing (`Kid[2]`) and iteration need. But CFML also reads a member
+/// straight off it — `x.Root.Kid.xmlText` — and means the FIRST child. Lucee gets
+/// both from one object (`XMLMultiElementStruct` wraps the element list and
+/// delegates every non-integer key to element 1); we keep the array and delegate
+/// at the access site instead.
+///
+/// Detection is by element shape, so only genuine node groups delegate: an
+/// ordinary array of structs keeps returning Null for a member read, as before.
+pub(crate) fn xml_group_first(arr: &cfml_common::dynamic::CfmlArray) -> Option<CfmlValue> {
+    let first = arr.get(0)?;
+    match &first {
+        CfmlValue::Struct(s)
+            if s.contains_key("xmlName") && s.contains_key("xmlChildren") =>
+        {
+            Some(first)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool {
     // Delegates to the single source of truth in the component facade
     // (Phase C.1). Kept as a thin local alias so the many existing call sites
@@ -1846,6 +1870,18 @@ fn frame_exclusive_us(stack: &mut Vec<i64>, inclusive_us: i64) -> i64 {
 ///
 /// Carried by reference and inspected ONLY when the resolved method is
 /// non-public, so an ordinary (public) dispatch pays nothing for it.
+/// One segment of a reflective variable path (`structGet`/`getVariable`).
+///
+/// Kept apart from the compiler's member-access AST because these paths arrive
+/// as runtime STRINGS: there is no compile-time node to reuse.
+#[derive(Debug, Clone)]
+enum VarPathSeg {
+    /// A named member: `a`, `.b`, or a quoted subscript `['b']`.
+    Key(String),
+    /// A bare integer subscript: `[2]`.
+    Index(i64),
+}
+
 #[derive(Clone, Copy)]
 enum DispatchCaller<'a> {
     /// The calling frame's locals. A frame carrying a `this` is executing inside
@@ -2537,6 +2573,16 @@ pub struct CfmlVirtualMachine {
     /// so static members are shared per-type. Lives for the VM's lifetime (one
     /// request in serve mode; the whole run in CLI mode).
     pub static_stores: HashMap<String, CfmlStruct>,
+    /// Component types whose PSEUDO-CONSTRUCTOR frame is seeded with the shared
+    /// `__static` handle — i.e. those that declare their own `static {}` block or
+    /// inherit one.
+    ///
+    /// Every type has a static scope (GH #347), but only these need the handle in
+    /// the instance frame: method frames take `__static` from the shared class
+    /// blueprint, which tops itself up from [`Self::static_stores`]. Seeding it
+    /// unconditionally cost ~500 ns on EVERY component construction (+7.8% on a
+    /// construction-dense loop) to no effect — the whole suite passes without it.
+    pub static_ctor_types: std::collections::HashSet<String>,
     /// Cached static "holder" per component name (lowercased) — a built template
     /// instance whose `__variables.__static` is the shared static scope. Lets the
     /// `::` operator reach static members/methods without re-instantiating.
@@ -3389,6 +3435,7 @@ impl CfmlVirtualMachine {
             live_threads: HashMap::new(),
             cancel_flag: None,
             static_stores: HashMap::new(),
+            static_ctor_types: std::collections::HashSet::new(),
             static_holders: HashMap::new(),
             class_meta_cache: HashMap::new(),
             request_component_cache: HashMap::new(),
@@ -5776,7 +5823,7 @@ impl CfmlVirtualMachine {
     /// Extract `obj.name` semantics — identical to the BytecodeOp::GetProperty
     /// logic but operates on a borrowed CfmlValue so the caller avoids a
     /// stack push/pop round-trip. Used by LoadLocalProperty.
-    fn lookup_property(obj: &CfmlValue, name: &str) -> CfmlValue {
+    pub(crate) fn lookup_property(obj: &CfmlValue, name: &str) -> CfmlValue {
         match obj {
             CfmlValue::Struct(s) => {
                 // get_ci does exact-then-CI under one read lock, cloning only the
@@ -5805,6 +5852,9 @@ impl CfmlVirtualMachine {
             CfmlValue::Array(arr) => {
                 if name.eq_ignore_ascii_case("len") || name.eq_ignore_ascii_case("length") {
                     CfmlValue::Int(arr.len() as i64)
+                } else if let Some(first) = xml_group_first(arr) {
+                    // XML named-child group: address the first element (GH #343).
+                    Self::lookup_property(&first, name)
                 } else {
                     CfmlValue::Null
                 }
@@ -13249,6 +13299,15 @@ impl CfmlVirtualMachine {
                 }
             }
 
+            // Reflective variable paths need the CALLING frame's scope chain, so
+            // they take `parent_locals` on top of the usual (name, args).
+            if intercepts_varpath::handles(&name_lower) {
+                match self.dispatch_varpath(&name_lower, args.clone(), parent_locals) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
+                }
+            }
+
             if name_lower == "arraydelete" || name_lower == "arraydeletenocase" {
                 if let Some(CfmlValue::Array(arr)) = args.first() {
                     let target = args.get(1).map(|v| v.as_string()).unwrap_or_default();
@@ -18530,86 +18589,6 @@ impl CfmlVirtualMachine {
                             session.auth_roles.clear();
                             state.sessions.set(app, sid, session);
                         }
-                    }
-                    return Ok(CfmlValue::Null);
-                }
-                "getvariable" => {
-                    // getVariable(name) — walk scope chain to find variable
-                    let var_name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let var_lower = var_name.to_lowercase();
-
-                    // Handle dotted names like "variables.foo" or "request.bar"
-                    if var_lower.contains('.') {
-                        let parts: Vec<&str> = var_lower.splitn(2, '.').collect();
-                        let scope_name = parts[0];
-                        let key = parts.get(1).copied().unwrap_or("");
-                        match scope_name {
-                            "request" => {
-                                if let Some(val) = self.request_scope.get_ci(key) {
-                                    return Ok(val);
-                                }
-                                return Ok(CfmlValue::Null);
-                            }
-                            "session" => {
-                                if let CfmlValue::Struct(s) = self.get_session_scope() {
-                                    if let Some(val) = s
-                                        .iter()
-                                        .find(|(k, _)| k.eq_ignore_ascii_case(&key))
-                                        .map(|(_, v)| v.clone())
-                                    {
-                                        return Ok(val);
-                                    }
-                                }
-                                return Ok(CfmlValue::Null);
-                            }
-                            "application" => {
-                                if let Some(ref app_scope) = self.application_scope {
-                                    if let Some(val) = app_scope.get_ci(key) {
-                                        return Ok(val);
-                                    }
-                                }
-                                return Ok(CfmlValue::Null);
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Check parent_locals
-                    if let Some(val) = parent_locals
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&var_lower))
-                        .map(|(_, v)| v.clone())
-                    {
-                        return Ok(val);
-                    }
-                    // Request scope
-                    if let Some(val) = self.request_scope.get_ci(&var_lower) {
-                        return Ok(val);
-                    }
-                    // Session scope
-                    if let CfmlValue::Struct(s) = self.get_session_scope() {
-                        if let Some(val) = s
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&var_lower))
-                            .map(|(_, v)| v.clone())
-                        {
-                            return Ok(val);
-                        }
-                    }
-                    // Application scope
-                    if let Some(ref app_scope) = self.application_scope {
-                        if let Some(val) = app_scope.get_ci(&var_lower) {
-                            return Ok(val);
-                        }
-                    }
-                    // Globals
-                    if let Some(val) = self
-                        .globals
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&var_lower))
-                        .map(|(_, v)| v.clone())
-                    {
-                        return Ok(val);
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -26081,6 +26060,434 @@ impl CfmlVirtualMachine {
         true
     }
 
+
+    // ==== Reflective variable paths (structGet / getVariable) ====
+    //
+    // `structGet("a.b[2].c")` and `getVariable("a.b")` take a variable path as a
+    // RUNTIME STRING, so neither can go through the compiler's normal member
+    // lowering. Lucee routes both through `VariableInterpreter`; these three
+    // functions are that interpreter's read half plus the auto-vivifying write
+    // half `structGet` needs.
+    //
+    // Before this existed `getVariable` understood exactly one shape —
+    // `<scope>.<key>` — and `structGet` understood nothing at all (it built a
+    // nested struct out of the path string and walked back down it, so every
+    // call returned a fresh empty struct: GH #346).
+
+    /// One segment of a reflective variable path.
+    ///
+    /// `a.b[2]['k']` parses to `[Key("a"), Key("b"), Index(2), Key("k")]`.
+    /// A quoted subscript is a Key, not an Index, so `s['1']` reads the key
+    /// `1` from a struct rather than indexing an array.
+    fn parse_variable_path(path: &str) -> Result<Vec<VarPathSeg>, CfmlError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            // Lucee: "invalid variable name declaration []"
+            return Err(CfmlError::runtime(format!(
+                "invalid variable name declaration [{}]",
+                path
+            )));
+        }
+        let mut segs: Vec<VarPathSeg> = Vec::new();
+        let chars: Vec<char> = trimmed.chars().collect();
+        let mut i = 0usize;
+        let mut cur = String::new();
+        while i < chars.len() {
+            match chars[i] {
+                '.' => {
+                    if !cur.is_empty() {
+                        segs.push(VarPathSeg::Key(std::mem::take(&mut cur)));
+                    }
+                    i += 1;
+                }
+                '[' => {
+                    if !cur.is_empty() {
+                        segs.push(VarPathSeg::Key(std::mem::take(&mut cur)));
+                    }
+                    i += 1;
+                    // Scan to the matching ']', honouring a quoted subscript so
+                    // that `s['a]b']` is one key rather than a truncated one.
+                    let mut inner = String::new();
+                    let mut quote: Option<char> = None;
+                    let mut closed = false;
+                    while i < chars.len() {
+                        let c = chars[i];
+                        match quote {
+                            Some(q) => {
+                                if c == q {
+                                    quote = None;
+                                } else {
+                                    inner.push(c);
+                                }
+                            }
+                            None => {
+                                if c == '\'' || c == '"' {
+                                    quote = Some(c);
+                                } else if c == ']' {
+                                    closed = true;
+                                    i += 1;
+                                    break;
+                                } else {
+                                    inner.push(c);
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        return Err(CfmlError::runtime(format!(
+                            "invalid variable name declaration [{}]",
+                            path
+                        )));
+                    }
+                    let inner_t = inner.trim().to_string();
+                    // A bare integer subscript indexes; anything else is a key.
+                    // `a[2]` on a struct still falls back to the key "2" during
+                    // the walk, so this only decides the PREFERRED reading.
+                    match inner_t.parse::<i64>() {
+                        Ok(n) => segs.push(VarPathSeg::Index(n)),
+                        Err(_) => segs.push(VarPathSeg::Key(inner_t)),
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    i += 1;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            segs.push(VarPathSeg::Key(cur));
+        }
+        if segs.is_empty() {
+            return Err(CfmlError::runtime(format!(
+                "invalid variable name declaration [{}]",
+                path
+            )));
+        }
+        Ok(segs)
+    }
+
+    /// Resolve the ROOT segment of a reflective path against the scope chain.
+    ///
+    /// Deliberately mirrors [`Self::is_variable_defined`]'s root handling: the
+    /// two answer the same question ("where does this name start?") and a
+    /// divergence between them would make `isDefined(p)` and `getVariable(p)`
+    /// disagree about the same string.
+    fn resolve_path_root(&self, root: &str, locals: &ValueMap) -> Option<CfmlValue> {
+        let root_lower = root.to_lowercase();
+        match root_lower.as_str() {
+            "local" => Some(CfmlValue::strukt(locals.clone())),
+            "variables" => match locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                Some(v) => Some(v.clone()),
+                None => Some(CfmlValue::strukt(locals.clone())),
+            },
+            "arguments" => locals
+                .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                .cloned(),
+            "request" => Some(CfmlValue::Struct(self.request_scope.clone())),
+            "session" => Some(self.get_session_scope()),
+            "application" => self
+                .application_scope
+                .as_ref()
+                .map(|a| CfmlValue::Struct(a.clone())),
+            "server" => Some(CfmlValue::Struct(self.live_server_scope())),
+            "cookie" => self.globals.get("cookie").cloned(),
+            "static" => self.find_static_scope(locals).map(CfmlValue::Struct),
+            _ => {
+                // Unscoped: locals (exact then CI), the component `variables`
+                // scope, request, then globals — the variable READ order.
+                locals
+                    .get(root)
+                    .cloned()
+                    .or_else(|| {
+                        locals
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&root_lower))
+                            .map(|(_, v)| v.clone())
+                    })
+                    .or_else(|| {
+                        locals
+                            .get(&*cfml_common::key::well_known::VARIABLES)
+                            .and_then(|v| v.as_cfml_struct())
+                            .and_then(|s| s.get_ci(&root_lower))
+                    })
+                    .or_else(|| self.request_scope.get_ci(&root_lower))
+                    .or_else(|| self.globals.get(root).cloned())
+                    .or_else(|| {
+                        self.globals
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&root_lower))
+                            .map(|(_, v)| v.clone())
+                    })
+            }
+        }
+    }
+
+    /// Read a reflective variable path, or `None` if any segment is missing.
+    ///
+    /// `Err` is reserved for a path that is not a legal variable name at all
+    /// (Lucee throws for those rather than reporting "not found").
+    fn resolve_variable_path(
+        &self,
+        path: &str,
+        locals: &ValueMap,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        let segs = Self::parse_variable_path(path)?;
+        let VarPathSeg::Key(ref root) = segs[0] else {
+            // A leading subscript (`[1].x`) has no scope to start from.
+            return Err(CfmlError::runtime(format!(
+                "invalid variable name declaration [{}]",
+                path
+            )));
+        };
+        let Some(mut current) = self.resolve_path_root(root, locals) else {
+            return Ok(None);
+        };
+        for seg in &segs[1..] {
+            let next = match seg {
+                VarPathSeg::Key(k) => Self::path_step_key(&current, k),
+                VarPathSeg::Index(n) => Self::path_step_index(&current, *n),
+            };
+            match next {
+                Some(v) => current = v,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(current))
+    }
+
+    /// One key step of a path walk. Mirrors the container types
+    /// [`Self::path_defined_from`] accepts, so a path that `isDefined` reports
+    /// as present is a path this can read.
+    fn path_step_key(current: &CfmlValue, key: &str) -> Option<CfmlValue> {
+        match current {
+            CfmlValue::Struct(s) => s.get_ci(key),
+            CfmlValue::Query(q) => {
+                // `q.col` is the column's values (Lucee), matching the
+                // compiled `q.col` member read.
+                if q.has_column_ci(key) {
+                    q.column_values_ci(key)
+                        .map(|vals| CfmlValue::array((*vals).clone()))
+                } else {
+                    None
+                }
+            }
+            CfmlValue::NativeObject(obj) => obj.read().ok().and_then(|g| g.get_property(key)),
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => inst.read().get_member(&key.to_lowercase()),
+            _ => None,
+        }
+    }
+
+    /// One subscript step. An integer subscript indexes an array; on a struct it
+    /// falls back to the literal key (`s[1]` reads the key `1`), which is what
+    /// CFML's own bracket access does.
+    fn path_step_index(current: &CfmlValue, n: i64) -> Option<CfmlValue> {
+        match current {
+            CfmlValue::Array(a) => {
+                if n < 1 {
+                    return None;
+                }
+                a.get((n - 1) as usize)
+            }
+            _ => Self::path_step_key(current, &n.to_string()),
+        }
+    }
+
+
+    /// The reference-typed container an unscoped or `variables`-scoped write
+    /// lands in: inside a CFC method that is the component's `__variables`
+    /// handle, at page level there is none (the caller writes `globals`).
+    fn variables_container(locals: &ValueMap) -> Option<CfmlStruct> {
+        locals
+            .get(&*cfml_common::key::well_known::VARIABLES)
+            .and_then(|v| v.as_cfml_struct().cloned())
+    }
+
+    /// Create a reflective variable path as nested structs and return the
+    /// (live) leaf struct — Lucee's `pc.setVariable(path, new StructImpl())`,
+    /// which `structGet` falls back to when the path does not resolve.
+    ///
+    /// The returned handle is the one that was stored, not a copy, so the
+    /// documented `s = structGet("a.b"); s.x = 1` get-or-create idiom writes
+    /// through.
+    fn create_variable_path(&mut self, path: &str, locals: &ValueMap) -> CfmlResult {
+        let segs = Self::parse_variable_path(path)?;
+        let VarPathSeg::Key(ref root) = segs[0] else {
+            return Err(CfmlError::runtime(format!(
+                "invalid variable name declaration [{}]",
+                path
+            )));
+        };
+        // Only dotted paths can be auto-vivified: creating `a[3]` would have to
+        // invent array elements 1..2 as well, and Lucee's own bracket-path
+        // creation is expression-evaluated rather than name-based. Erroring is
+        // deliberate — silently returning a detached struct is how GH #346
+        // stayed invisible for 300 releases.
+        if segs.iter().any(|s| matches!(s, VarPathSeg::Index(_))) {
+            return Err(CfmlError::runtime(format!(
+                "structGet: cannot create the missing path [{}] because it addresses an array index",
+                path
+            )));
+        }
+        let keys: Vec<String> = segs
+            .iter()
+            .map(|s| match s {
+                VarPathSeg::Key(k) => k.clone(),
+                VarPathSeg::Index(n) => n.to_string(),
+            })
+            .collect();
+        let root_lower = root.to_lowercase();
+
+        /// Where the create-walk begins.
+        enum Start {
+            /// A reference-typed scope handle: writes land in place.
+            Handle(CfmlStruct),
+            /// The page-level `variables` scope, a plain map on the VM.
+            Globals,
+            /// The session scope, snapshot-backed, committed after the walk.
+            Session,
+        }
+        // (start container, how many leading path keys it accounts for)
+        let (start, consumed): (Start, usize) = match root_lower.as_str() {
+            "variables" => (
+                match Self::variables_container(locals) {
+                    Some(h) => Start::Handle(h),
+                    None => Start::Globals,
+                },
+                1,
+            ),
+            "request" => (Start::Handle(self.request_scope.clone()), 1),
+            "application" => match self.application_scope.clone() {
+                Some(h) => (Start::Handle(h), 1),
+                None => {
+                    return Err(CfmlError::runtime(
+                        "structGet: no application scope in this context".to_string(),
+                    ))
+                }
+            },
+            "server" => (Start::Handle(self.live_server_scope()), 1),
+            "static" => match self.find_static_scope(locals) {
+                Some(h) => (Start::Handle(h), 1),
+                None => {
+                    return Err(CfmlError::runtime(
+                        "structGet: no static scope in this context".to_string(),
+                    ))
+                }
+            },
+            "session" => (Start::Session, 1),
+            // `local` and `arguments` are the CALLING frame, which a builtin
+            // cannot mutate from here (the same limit runtime `param` has) — say
+            // so rather than creating the path in some other scope.
+            "local" | "arguments" => {
+                return Err(CfmlError::runtime(format!(
+                    "structGet: cannot create [{}] — the {} scope of the calling frame is not writable from a function",
+                    path, root_lower
+                )))
+            }
+            // Unscoped. Descend into the root the READ chain resolves, so a
+            // partially-existing path is completed in the scope a subsequent read
+            // will actually look in. Choosing a container up-front instead put
+            // `structGet("Deep.Nested.X")` into a fresh `Deep` in the component
+            // variables scope while `Deep` itself lived in page globals — the
+            // created path then SHADOWED the real one.
+            _ => match self.resolve_path_root(root, locals) {
+                Some(CfmlValue::Struct(h)) => (Start::Handle(h), 1),
+                Some(other) if keys.len() > 1 => {
+                    return Err(CfmlError::runtime(format!(
+                        "Can't assign value to an Object of this type [{}] with key [{}] (path [{}])",
+                        other.type_name(),
+                        keys[1],
+                        path
+                    )))
+                }
+                _ => (
+                    match Self::variables_container(locals) {
+                        Some(h) => Start::Handle(h),
+                        None => Start::Globals,
+                    },
+                    0,
+                ),
+            },
+        };
+        let rest = &keys[consumed..];
+        if rest.is_empty() {
+            // The path names a scope and nothing else — but a bare scope always
+            // resolves, so creation is never reached for one.
+            return Err(CfmlError::runtime(format!(
+                "invalid variable name declaration [{}]",
+                path
+            )));
+        }
+
+        // Walk/create the remaining segments and hand back the leaf. A non-struct
+        // intermediate is an error, exactly as in Lucee ("Can't assign value to an
+        // Object of this type"), rather than silently overwriting a live value.
+        fn descend(start: CfmlStruct, segs: &[String], path: &str) -> CfmlResult {
+            let mut cur = start;
+            for (i, seg) in segs.iter().enumerate() {
+                match cur.get_ci(seg) {
+                    Some(CfmlValue::Struct(s)) => cur = s,
+                    // Present, not a struct, and something still has to hang off
+                    // it: there is nowhere to put the rest of the path.
+                    Some(other) if i + 1 < segs.len() && !matches!(other, CfmlValue::Null) => {
+                        return Err(CfmlError::runtime(format!(
+                            "Can't assign value to an Object of this type [{}] with key [{}] (path [{}])",
+                            other.type_name(),
+                            segs[i + 1],
+                            path
+                        )))
+                    }
+                    _ => {
+                        let fresh = CfmlStruct::empty();
+                        cur.insert(seg.clone(), CfmlValue::Struct(fresh.clone()));
+                        cur = fresh;
+                    }
+                }
+            }
+            Ok(CfmlValue::Struct(cur))
+        }
+
+        match start {
+            Start::Handle(h) => descend(h, rest, path),
+            Start::Globals => {
+                // Root the walk at a struct held in `globals`, creating it first
+                // if absent. That struct is Arc-backed, so everything below it
+                // writes through with no store-back.
+                let first = &rest[0];
+                let root_struct = match self.globals.get(first) {
+                    Some(CfmlValue::Struct(s)) => s.clone(),
+                    Some(other) if rest.len() > 1 => {
+                        return Err(CfmlError::runtime(format!(
+                            "Can't assign value to an Object of this type [{}] with key [{}] (path [{}])",
+                            other.type_name(),
+                            rest[1],
+                            path
+                        )))
+                    }
+                    _ => {
+                        let s = CfmlStruct::empty();
+                        self.globals
+                            .insert(first.clone(), CfmlValue::Struct(s.clone()));
+                        s
+                    }
+                };
+                descend(root_struct, &rest[1..], path)
+            }
+            Start::Session => {
+                // Snapshot-backed: build inside the loaded copy, then commit the
+                // whole scope back the way `scope_aware_store` does for `session`.
+                let sess = match self.get_session_scope() {
+                    CfmlValue::Struct(s) => s,
+                    _ => CfmlStruct::empty(),
+                };
+                let leaf = descend(sess.clone(), rest, path)?;
+                let _ = self.set_session_scope(sess.snapshot());
+                Ok(leaf)
+            }
+        }
+    }
+
     /// Shallow equality check for CfmlValues — avoids recursing into captured
     /// scopes (which could cause infinite recursion with shared environments).
     fn values_equal_shallow(a: &CfmlValue, b: &CfmlValue) -> bool {
@@ -29036,8 +29443,17 @@ impl CfmlVirtualMachine {
                         let _ = self.execute_function_with_args(&initfn, Vec::new(), Some(&seed));
                         let caps = self.captured_locals.take().unwrap_or_default();
                         for (k, v) in caps {
+                            // `static` itself is the SCOPE, not a member of it:
+                            // a scoped write inside the block (`static.Seed = s`)
+                            // leaves the scope reference behind in the init
+                            // frame's locals, and capturing it put a self-
+                            // referential `static` key in every seeded static
+                            // scope, so `for (k in static)` iterated a phantom
+                            // entry (GH #347). Filtered alongside `this` for the
+                            // same reason.
                             if k.starts_with("__")
                                 || k.eq_ignore_ascii_case("this")
+                                || k.eq_ignore_ascii_case("static")
                                 || k == ARGUMENTS_SCOPE_KEY
                             {
                                 continue;
@@ -29048,15 +29464,44 @@ impl CfmlVirtualMachine {
                     } else {
                         false
                     };
-                    if has_own || inherited {
-                        self.static_stores.insert(static_key.to_string(), h.clone());
-                        Some(h)
-                    } else {
+                    // Register the store for EVERY component type, not just the
+                    // ones that declare a `static {}` block. A component with no
+                    // block still has a static scope in Lucee — `static.X = v`
+                    // from a method persists and is shared across instances — and
+                    // gating on a declaration made that write land in the method's
+                    // own locals and vanish at frame exit, reporting success the
+                    // whole way (GH #347: silent data loss).
+                    //
+                    // Cost is per TYPE, not per instance: `static_stores` is keyed
+                    // by source path, so this is one empty struct the first time a
+                    // type is constructed. `has_own`/`inherited` are still what
+                    // decide whether the block RAN, they just no longer decide
+                    // whether the scope EXISTS.
+                    if static_key.is_empty() {
+                        // No source path to key a shared store by (a hand-built
+                        // component struct) — better no scope than one silently
+                        // shared between unrelated types.
                         None
+                    } else {
+                        self.static_stores.insert(static_key.to_string(), h.clone());
+                        if has_own || inherited {
+                            self.static_ctor_types.insert(static_key.to_string());
+                        }
+                        Some(h)
                     }
                 };
+            // One probe per construction, shared by the two seeding sites below.
+            let static_declared = static_handle.is_some()
+                && self.static_ctor_types.contains(static_key);
             let mut injected_scope = injected_scope;
-            if let Some(ref h) = static_handle {
+            // Seed the pseudo-constructor frame ONLY for types that declare or
+            // inherit a `static {}` block. Method frames get `__static` from the
+            // shared class blueprint (`build_bp` tops it up from `static_stores`),
+            // so a type that merely WRITES `static.X` from a method needs no
+            // per-instance key — and paying one on every construction of every
+            // component measured ~500 ns each with the suite fully green without
+            // it. Kept for declaring types so their behaviour is byte-identical.
+            if let (true, Some(ref h)) = (static_declared, &static_handle) {
                 injected_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
             }
 
@@ -29666,7 +30111,7 @@ impl CfmlVirtualMachine {
                 }
                 // Expose the shared `static` scope to method frames: a CFC method
                 // resolves `static` via its `__variables.__static` handle.
-                if let Some(ref h) = static_handle {
+                if let (true, Some(ref h)) = (static_declared, &static_handle) {
                     vars_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
                 }
                 if !vars_scope.is_empty() {

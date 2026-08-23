@@ -37,7 +37,7 @@ pub(crate) const DEFERRED_TO_VM: &[&str] = &[
     "__cffile_upload", "sessioninvalidate", "sessionrotate", "sessioncommit",
     "sessiongetmetadata", "applicationstop", "getauthuser", "csrfgeneratetoken",
     "csrfverifytoken", "isuserinrole", "isuserloggedin", "__cfloginuser",
-    "__cflogout", "setvariable", "getvariable", "throw",
+    "__cflogout", "setvariable", "throw",
     "__cfcustomtag", "__cfmodule", "__cfcustomtag_start", "__cfcustomtag_end",
     "cacheput", "cacheget", "cachedelete", "cacheclear",
     "cachekeyexists", "cachecount", "cachegetall", "cachegetallids",

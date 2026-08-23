@@ -126,7 +126,16 @@ pub(crate) fn op_get_property(
                     "len" | "length" => {
                         stack.push(CfmlValue::Int(arr.len() as i64));
                     }
-                    _ => stack.push(CfmlValue::Null),
+                    // An XML named-child group reads its members off the FIRST
+                    // element — `x.Root.Kid.xmlText` (GH #343). Anything that is
+                    // not a node group keeps returning Null.
+                    _ => match crate::xml_group_first(arr) {
+                        Some(first) => {
+                            let v = CfmlVirtualMachine::lookup_property(&first, name.as_str());
+                            stack.push(v);
+                        }
+                        None => stack.push(CfmlValue::Null),
+                    },
                 }
             }
             CfmlValue::String(s) => {

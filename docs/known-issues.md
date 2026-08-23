@@ -1205,6 +1205,74 @@ SigV4 presigning instead. Everything else about the URL — virtual-host
 addressing, key normalisation, `httpMethod`, and the `X-Amz-Expires` window —
 matches, and is pinned by `tests/s3/test_s3_presigned_url_lucee_compat.cfm`.
 
+## 56. XML: a named child is an ARRAY, where Lucee reports a single node 🏗
+
+`x.Root.Kid` is an array of every `<Kid>` child here. Lucee returns one object
+(`XMLMultiElementStruct`) that wraps the same list and delegates member reads to
+the first element, so it reports as a struct while still indexing like an array.
+
+Member reads and indexing now agree on both engines — `x.Root.Kid.xmlText`,
+`x.Root.Kid[2].xmlText` and `arrayLen( x.Root.Kid )` all return the same thing
+(GH [#343](https://github.com/RustCFML/RustCFML/issues/343)). What still differs
+is the value's *type identity* and its key list:
+
+| | Lucee 7 | RustCFML |
+|---|---|---|
+| `isArray( x.Root.Kid )` | `false` | `true` |
+| `isStruct( x.Root.Kid )` | `true` | `false` |
+| `structKeyList( x.Root )` | `Kid,Kid,Solo` (one entry per child) | `xmlName,xmlType,xmlText,xmlChildren,xmlAttributes,Kid` |
+
+So the reserved node properties are real keys here and virtual on Lucee, and
+`for ( k in node )` iterates them before reaching the child names. Closing this
+means giving XML nodes their own value type rather than modelling them as plain
+structs; the read paths that matter behave the same in the meantime.
+
+---
+
+## 57. `structGet()` cannot create a path rooted in `local` or `arguments` 🏗
+
+`structGet( p )` resolves `p` and, when it does not exist, creates it and returns
+the new struct (Lucee's `StructGet`, GH
+[#346](https://github.com/RustCFML/RustCFML/issues/346)). Creation writes into
+the scope the read chain would look in — `variables`, `request`, `application`,
+`server`, `session` or the component's `variables`.
+
+Two inputs throw here instead of creating:
+
+  * a path rooted in the CALLING frame's `local` or `arguments` scope, which a
+    builtin cannot write to from inside a function (the same limit runtime
+    `param` has, and it reports the same way rather than creating the path in
+    some other scope);
+  * a path with an array subscript (`structGet( "a[3].b" )`), since creating it
+    would have to invent elements 1..2 as well.
+
+Resolution of both forms is unaffected — only creation-on-miss is. Erroring is
+deliberate: returning a detached struct is exactly how the original no-op stayed
+invisible for 300 releases.
+
+---
+
+## 58. A `static` write in a pseudo-constructor is discarded 🏗
+
+Every component has a static scope, and `static.X = v` from a METHOD persists and
+is shared across instances (GH
+[#347](https://github.com/RustCFML/RustCFML/issues/347)). A write in the
+component BODY — the pseudo-constructor, outside any `static {}` block — is still
+lost:
+
+```cfml
+component {
+    static.FromCtor = "ctor";                       // Lucee: persists
+    function get() { return static.FromCtor ?: "(null)"; }
+}
+new PseudoStatic().get()   // Lucee: ctor    RustCFML: (null)
+```
+
+Nothing throws, so this has the same silent shape as the method-write bug it was
+found alongside. Use a `static { }` block, which works on both engines. Tracked
+separately — the fix is in how the pseudo-constructor frame is seeded, not in how
+the scope is stored.
+
 ---
 
 # Part E — Environment-specific 🌍

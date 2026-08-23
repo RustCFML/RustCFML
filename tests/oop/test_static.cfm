@@ -45,6 +45,42 @@ t = new oop.StaticTagForm();
 assert("cfstatic scoped write", t.scoped(), "from-cfstatic");
 assert("cfstatic unscoped write", t.plainVal(), 7);
 
+// --- a static scope exists WITHOUT a static block (GH #347) --------------
+// Lucee: every component has a static scope. Writing to it from a method
+// persists and is shared by every instance of that type, whether or not the
+// component declares `static { }`. Gating the scope's existence on the
+// declaration made the write silently vanish — `setIt()` returned "set-ok" and
+// the value was gone, which is the damaging shape: nothing throws, so a static
+// counter or cache built this way just never accumulates.
+noneA = new oop.StaticNone();
+assert("write to an undeclared static scope reports success", noneA.setIt(), "set-ok");
+assert("...and the value is still there", noneA.getIt(), "v");
+assert("...and a FRESH instance sees it (per-type, not per-instance)", new oop.StaticNone().getIt(), "v");
+assertTrue("static key list contains X", listFindNoCase( noneA.keyList(), "X" ) gt 0);
+// A counter is the case that made the loss visible: it must accumulate across
+// instances rather than restart at 1 every call. Measured as a DELTA, not an
+// absolute — a static scope outlives the request, so the starting value depends
+// on how many times this suite has already run in this server (Lucee and our own
+// serve mode both persist it; only a fresh CLI process starts at zero).
+bumpBase = new oop.StaticNone().bump();
+new oop.StaticNone().bump();
+assert("static counter accumulates across instances", new oop.StaticNone().bump(), bumpBase + 2);
+
+// An EMPTY block is not a declaration of any key, and behaves the same way.
+emptyA = new oop.StaticEmptyBlock();
+assert("write to an empty static block reports success", emptyA.setIt(), "set-ok");
+assert("...and the value is still there", emptyA.getIt(), "v");
+
+// A scope written through `static.X` in the block must not end up containing a
+// self-referential `static` entry — `for ( k in static )` iterated a phantom key.
+seeded = new oop.StaticSeeded();
+assert("seeded static block still works", seeded.setIt(), "set-ok");
+assert("seeded static value readable", seeded.getIt(), "v");
+assertTrue("seeded scope keeps its declared key", listFindNoCase( seeded.keyList(), "Seed" ) gt 0);
+assertTrue("seeded scope keeps the written key", listFindNoCase( seeded.keyList(), "X" ) gt 0);
+assertFalse("static scope has no phantom 'static' key",
+            listFindNoCase( seeded.keyList(), "static" ) gt 0);
+
 // --- static inheritance -------------------------------------------------
 kid = new oop.StaticKid();
 assert("child reads own static", kid.ownValue(), "kid-only");

@@ -264,10 +264,42 @@ assertFalse("structEvery not all even", structEvery(sev2, function(k, v) {
 // ============================================================
 // StructGet (from Lucee StructGet.cfc)
 // ============================================================
-// structGet returns the deepest struct in the path
+// structGet(path) RESOLVES the path, and only creates it when it is missing.
+// These two assertions alone passed against an implementation that returned a
+// fresh empty struct for EVERY input and never touched a scope (GH #346) — the
+// path here does not exist, so "empty struct" was right for the wrong reason.
+// Everything below distinguishes the two.
 sg = structGet("_sgTest.nested.deep");
 assertTrue("structGet returns struct", isStruct(sg));
 assertTrue("structGet returns empty struct", structIsEmpty(sg));
+
+// ...and the miss CREATED the path, so it is now addressable.
+assertTrue("structGet created the missing path", isDefined("_sgTest.nested.deep"));
+// The struct handed back IS the stored one, so the documented get-or-create
+// idiom (`s = structGet(p); s.k = v`) writes through.
+sg.marker = "written";
+assertTrue("structGet result writes through", isDefined("_sgTest.nested.deep.marker"));
+assert("structGet write-through value", _sgTest.nested.deep.marker, "written");
+
+// An EXISTING path resolves to its value rather than to an empty struct.
+_sgDeep = { nested = 1 };
+_sgTwo  = { a = { b = 2 } };
+_sgArr  = [ 10, 20 ];
+assert("structGet resolves a scalar leaf", structGet("_sgDeep.nested"), 1);
+assert("structGet resolves a nested scalar", structGet("_sgTwo.a.b"), 2);
+assertTrue("structGet resolves a struct", isStruct(structGet("_sgTwo.a")));
+assert("structGet struct leaf key", structGet("_sgTwo.a").b, 2);
+// A scope-qualified path and a bracket subscript both resolve.
+assert("structGet honours a scope prefix", structGet("variables._sgDeep.nested"), 1);
+assert("structGet honours a bracket index", structGet("_sgArr[1]"), 10);
+assertTrue("structGet returns an array as-is", isArray(structGet("_sgArr")));
+// A path THROUGH a scalar has nowhere to put the rest of itself.
+assertThrows("structGet cannot create through a scalar", function() {
+    return structGet("_sgDeep.nested.x");
+});
+assertThrows("structGet rejects an empty name", function() {
+    return structGet("");
+});
 
 // ============================================================
 // StructValueArray (from Lucee structValueArray.cfc)
