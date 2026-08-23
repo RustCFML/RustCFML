@@ -1153,58 +1153,36 @@ engine, not something specific to the access gate.
 
 <a id="54"></a>
 
-## 54. Codec divergences: malformed input is tolerated, and `-_.*` are not escaped 🏗
+## 54. Codec divergences: malformed input is tolerated 🏗
 
 RustCFML's base64/hex decoders accept malformed input and do something
-reasonable with it; Lucee rejects it. Two URL encoders also disagree on which
-characters are "safe". Measured against **Lucee 7.0.5.41**:
+reasonable with it; Lucee rejects it. Measured against **Lucee 7.1.0.204**:
 
-| Expression | Lucee 7.0.5.41 | RustCFML |
+| Expression | Lucee | RustCFML |
 |---|---|---|
 | `binaryDecode( "DEADBEE", "hex" )` (odd length) | throws `lucee.runtime.coder.CoderException` | drops the trailing nibble → 3 bytes |
 | `binaryDecode( "DEADBEZZ", "hex" )` (non-hex char) | throws `lucee.runtime.coder.CoderException` | decodes the bad char as `0` → `DEADBE00` |
 | `toBinary( "QU*D" )` (non-alphabet char) | 2 bytes (`4140`) | 3 bytes (`414003`) |
 
-The URL encoders diverge in their own right, tracked as GH
-[#336](https://github.com/RustCFML/RustCFML/issues/336) — a full
-character-by-character sweep of all three, plus the Lucee source that defines
-each one:
-
-| Input | Function | Lucee 7.0.5.41 | RustCFML |
-|---|---|---|---|
-| `-` `_` `.` `*` | `urlEncodedFormat` | `%2D` `%5F` `%2E` `%2A` | unescaped |
-| `" "` (space) | `urlEncode` | `+` | `%20` |
-| `" "` (space) | `encodeForURL` | `%20` | `+` |
-| `*` | `encodeForURL` | `%2A` | `*` |
-| `~` | `encodeForURL` | `~` | `%7E` |
-
-The space rows are the notable ones: RustCFML has `urlEncode` and `encodeForURL`
-**the wrong way round**. Lucee's `URLEncode.java` is a bare
-`java.net.URLEncoder.encode` (x-www-form-urlencoded, so space → `+`), while
-`URLEncodedFormat.java` wraps it and then replaces `+`→`%20` and escapes
-`*`,`-`,`.`,`_`. The comment on `url_encode_impl` in
-`crates/cfml-stdlib/src/builtins.rs` attributes the `+` to `encodeForURL`,
-citing GH #283; that is the one function of the three where Lucee emits `%20`.
-`encodeForURL` comes from Lucee's ESAPI *extension* rather than core, so its
-row is live-measured only and may move with the extension version.
-
-The codec rows predate the v0.611.0 codec rewrite (which was a pure speed change
-— `toBinary` went from a linear alphabet scan to a 256-entry reverse table, ~7.9x
-faster on a 28KB blob — and preserved the tolerant behaviour deliberately so no
-app's output moved).
+These rows predate the v0.611.0 codec rewrite (a pure speed change — `toBinary`
+went from a linear alphabet scan to a 256-entry reverse table, ~7.9x faster on a
+28KB blob — which preserved the tolerant behaviour deliberately so no app's
+output moved).
 
 Everything the two engines *do* agree on is pinned by
-`tests/stdlib/test_base64_hex_codec.cfm`, which passes on both (32/32 on Lucee).
-The rows above are deliberately **not** asserted there: writing either answer into
-the suite would freeze one engine's behaviour as correct before the call is made.
+`tests/stdlib/test_base64_hex_codec.cfm`, which passes on both. The rows above
+are deliberately **not** asserted there: writing either answer into the suite
+would freeze one engine's behaviour as correct before the call is made.
 
-Notes for whoever picks this up:
+Note for whoever picks this up: making the decoders throw is a behaviour change,
+not a bug fix, for any app relying on the tolerance — `binaryDecode` currently
+never throws on content.
 
-- Making the decoders throw is a behaviour change, not a bug fix, for any app
-  relying on the tolerance — `binaryDecode` currently never throws on content.
-- Likewise for `urlEncodedFormat`: escaping `-_.*` changes every URL the engine
-  emits for a typical slug (`my-page_v2.html` → `my%2Dpage%5Fv2%2Ehtml`). Correct
-  per Lucee, but not a silent fix.
+*(The URL-encoder half of this section was resolved in GH
+[#336](https://github.com/RustCFML/RustCFML/issues/336): `urlEncode`,
+`urlEncodedFormat` and `encodeForURL` now carry three distinct character
+policies, verified character-by-character against Lucee and pinned by
+`tests/stdlib/test_url_encoder_policies.cfm`.)*
 
 ---
 

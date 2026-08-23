@@ -78,16 +78,18 @@ assertTrue("encodeForXMLAttribute encodes lt", find("&lt;", xmlAttr) > 0);
 efHtml = encodeForHTML("<b>bold</b>");
 assertTrue("encodeForHTML encodes lt", find("&lt;", efHtml) > 0);
 
-// GH #283: encodeForURL and urlEncodedFormat have DIFFERENT space encodings.
-// encodeForURL uses form-encoding semantics (ESAPI / java.net.URLEncoder), so a
-// space is `+` — matching Lucee 5/6/7, Adobe CF and BoxLang. urlEncodedFormat /
-// urlEncode use `%20` (GH #270). The two must not share one encoder.
+// GH #336: the three URL encoders are three DIFFERENT encoders. `urlEncode` is
+// form encoding (space `+`); `urlEncodedFormat` and `encodeForURL` both use
+// `%20`. GH #283 put the `+` on encodeForURL, which is the one function of the
+// three where Lucee emits `%20` — these values are measured on Lucee 7.1.0.204.
 efUrl = encodeForURL("hello world");
-assert("encodeForURL encodes space as +", efUrl, "hello+world");
+assert("encodeForURL encodes space as %20", efUrl, "hello%20world");
 assert("urlEncodedFormat encodes space as %20", urlEncodedFormat("hello world"), "hello%20world");
-// A '+' in the input round-trips to %2B on both.
-assert("encodeForURL escapes a literal plus", encodeForURL("a b+c"), "a+b%2Bc");
+assert("urlEncode encodes space as + (form encoding)", urlEncode("hello world"), "hello+world");
+// A '+' in the input round-trips to %2B on all three.
+assert("encodeForURL escapes a literal plus", encodeForURL("a b+c"), "a%20b%2Bc");
 assert("urlEncodedFormat escapes a literal plus", urlEncodedFormat("a b+c"), "a%20b%2Bc");
+assert("urlEncode escapes a literal plus", urlEncode("a b+c"), "a+b%2Bc");
 
 efJs = encodeForJavaScript("alert()");
 assertTrue("encodeForJavaScript returns string", len(efJs) > 0);
@@ -132,8 +134,9 @@ assert("decodeFromURL special chars", urlDecoded3, "<>&");
 // urlEncode
 // ========================================
 urlEnc = urlEncode("hello world");
-// GH #270: space encodes as %20 (Lucee/ACF), not `+`.
-assertTrue("urlEncode encodes space as %20", find("%20", urlEnc) > 0);
+// GH #336: urlEncode is a bare java.net.URLEncoder in Lucee, so a space is `+`.
+// (urlEncodedFormat is the one that emits %20 — see the encodeForURL block above.)
+assert("urlEncode encodes space as +", urlEnc, "hello+world");
 
 urlEnc2 = urlEncode("a&b=c");
 assertTrue("urlEncode encodes amp", find("%26", urlEnc2) > 0);

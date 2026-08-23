@@ -360,7 +360,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("toBinary".to_string(), fn_to_binary);
     f.insert("binaryEncode".to_string(), fn_binary_encode);
     f.insert("binaryDecode".to_string(), fn_binary_decode);
-    f.insert("urlEncodedFormat".to_string(), fn_url_encode);
+    f.insert("urlEncodedFormat".to_string(), fn_url_encoded_format);
     f.insert("urlDecode".to_string(), fn_url_decode);
     f.insert("htmlEditFormat".to_string(), fn_html_edit_format);
     f.insert("htmlCodeFormat".to_string(), fn_html_code_format);
@@ -1935,14 +1935,62 @@ fn fn_binary_decode(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-// Shared percent-encoder. `space_as_plus` selects between the two CFML
-// reference behaviours (GH #270 / GH #283):
-//   * urlEncodedFormat / urlEncode → space is `%20` (path-style; matches
-//     Lucee/ACF `URLEncodedFormat`).
-//   * encodeForURL → space is `+` (ESAPI routes through `java.net.URLEncoder`,
-//     i.e. application/x-www-form-urlencoded semantics; every JVM engine —
-//     Lucee 5/6/7, Adobe CF, BoxLang — encodes a space as `+`).
-fn url_encode_impl(s: &str, space_as_plus: bool) -> String {
+// The three CFML URL encoders are three DIFFERENT encoders in Lucee, not one
+// encoder with a flag — they disagree on the space AND on which punctuation
+// survives, so each needs its own character policy (GH #336, known-issues 54).
+//
+// Measured character-by-character against Lucee 7.1.0.204 and confirmed in
+// Lucee's source:
+//
+//   | char  | urlEncodedFormat | urlEncode | encodeForURL |
+//   |-------|------------------|-----------|--------------|
+//   | space | %20              | +         | %20          |
+//   | `*`   | %2A              | *         | %2A          |
+//   | `-`   | %2D              | -         | -            |
+//   | `.`   | %2E              | .         | .            |
+//   | `_`   | %5F              | _         | _            |
+//   | `~`   | %7E              | %7E       | ~            |
+//
+// Everything else agrees across all three.
+#[derive(Clone, Copy)]
+enum UrlEncoding {
+    /// `urlEncode` — `URLEncode.java` is a bare `java.net.URLEncoder.encode`,
+    /// i.e. application/x-www-form-urlencoded: alphanumerics plus `-_.*`
+    /// survive and a space becomes `+`.
+    Form,
+    /// `urlEncodedFormat` — `URLEncodedFormat.java` runs the form encoder,
+    /// turns `+` back into `%20`, then explicitly escapes `*`, `-`, `.` and
+    /// `_`, so only alphanumerics survive.
+    Strict,
+    /// `encodeForURL` — the ESAPI extension's RFC 3986 unreserved set:
+    /// alphanumerics plus `-_.~`. Note this is the one encoder that escapes
+    /// `*` and the one that leaves `~` alone. It comes from an extension
+    /// rather than Lucee core, so these rows are live-measured only.
+    Unreserved,
+}
+
+impl UrlEncoding {
+    /// Characters emitted as themselves rather than percent-escaped.
+    #[inline]
+    fn is_safe(self, c: char) -> bool {
+        if c.is_ascii_alphanumeric() {
+            return true;
+        }
+        match self {
+            UrlEncoding::Form => matches!(c, '-' | '_' | '.' | '*'),
+            UrlEncoding::Strict => false,
+            UrlEncoding::Unreserved => matches!(c, '-' | '_' | '.' | '~'),
+        }
+    }
+
+    /// Only the form encoder writes a space as `+`; the others percent-escape it.
+    #[inline]
+    fn space_as_plus(self) -> bool {
+        matches!(self, UrlEncoding::Form)
+    }
+}
+
+fn url_encode_impl(s: &str, encoding: UrlEncoding) -> String {
     // Most input is already URL-safe, so size for the input and let the rare
     // escape grow it. The escape path writes the character's UTF-8 into a stack
     // buffer and indexes a hex table: the previous version allocated a `String`
@@ -1951,8 +1999,8 @@ fn url_encode_impl(s: &str, space_as_plus: bool) -> String {
     let mut buf = [0u8; 4];
     for c in s.chars() {
         match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => result.push(c),
-            ' ' if space_as_plus => result.push('+'),
+            _ if encoding.is_safe(c) => result.push(c),
+            ' ' if encoding.space_as_plus() => result.push('+'),
             _ => {
                 for &b in c.encode_utf8(&mut buf).as_bytes() {
                     result.push('%');
@@ -1965,8 +2013,9 @@ fn url_encode_impl(s: &str, space_as_plus: bool) -> String {
     result
 }
 
-fn fn_url_encode(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), false)))
+/// `urlEncodedFormat` — alphanumerics only, space as `%20`.
+fn fn_url_encoded_format(args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), UrlEncoding::Strict)))
 }
 
 fn fn_url_decode(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8287,10 +8336,9 @@ fn fn_get_component_static_scope(_args: Vec<CfmlValue>) -> CfmlResult {
 // ADDITIONAL BUILTINS (Feature 3)
 // ===============================================
 
+/// `encodeForURL` — the RFC 3986 unreserved set, space as `%20`.
 fn fn_encode_for_url(args: Vec<CfmlValue>) -> CfmlResult {
-    // GH #283: encodeForURL encodes a space as `+` (form-encoding semantics),
-    // unlike urlEncodedFormat which uses `%20`.
-    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), true)))
+    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), UrlEncoding::Unreserved)))
 }
 
 fn fn_encode_for_css(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8552,8 +8600,9 @@ fn fn_decode_from_url(args: Vec<CfmlValue>) -> CfmlResult {
     fn_url_decode(args)
 }
 
+/// `urlEncode` — form encoding, space as `+`.
 fn fn_url_encode_alias(args: Vec<CfmlValue>) -> CfmlResult {
-    fn_url_encode(args)
+    Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), UrlEncoding::Form)))
 }
 
 fn fn_canonicalize(args: Vec<CfmlValue>) -> CfmlResult {

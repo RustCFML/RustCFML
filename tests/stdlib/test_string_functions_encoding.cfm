@@ -11,11 +11,12 @@ assert("toBase64 round-trip", decoded, "hello");
 urlEncoded = urlEncodedFormat("hello world");
 assertTrue("urlEncodedFormat encodes space", find("+", urlEncoded) > 0 || find("%20", urlEncoded) > 0);
 assert("urlDecode round-trip", urlDecode(urlEncodedFormat("hello world")), "hello world");
-// GH #270: urlEncodedFormat space must encode as %20 (Lucee/ACF), never `+`.
+// GH #270/#336: urlEncodedFormat space encodes as %20, never `+`.
 assert("urlEncodedFormat space is %20", urlEncodedFormat("My app"), "My%20app");
-// GH #283: encodeForURL uses form-encoding (ESAPI) semantics — space is `+`,
-// NOT %20 — on every JVM engine. It must NOT share urlEncodedFormat's encoder.
-assert("encodeForURL space is +", encodeForURL("My app"), "My+app");
+// GH #336: encodeForURL also uses %20 — it is `urlEncode` that carries the
+// form-encoding `+`. Measured on Lucee 7.1.0.204.
+assert("encodeForURL space is %20", encodeForURL("My app"), "My%20app");
+assert("urlEncode space is +", urlEncode("My app"), "My+app");
 assert("urlEncodedFormat + is %2B", urlEncodedFormat("a+b"), "a%2Bb");
 // urlDecode still tolerates + as space (form-encoded input).
 assert("urlDecode tolerates +", urlDecode("My+app"), "My app");
