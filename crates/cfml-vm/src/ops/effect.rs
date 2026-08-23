@@ -31,8 +31,13 @@ pub(crate) fn op_div(
     ip: &mut usize,
 ) -> Result<(), CfmlError> {
     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-        let x = crate::to_arith_number(&a).unwrap_or(0.0);
-        let y = crate::to_arith_number(&b).unwrap_or(1.0);
+        // A non-numeric operand throws rather than becoming 0.0/1.0, which
+        // used to make `"foo" / "bar"` quietly produce 0 (GH #350).
+        // Divisor first: Lucee reports the RIGHT operand when both are
+        // non-numeric ("foo" / "bar" names [bar]), presumably because it needs
+        // the divisor for the zero check.
+        let y = crate::arith_operand(&b)?;
+        let x = crate::arith_operand(&a)?;
         if y == 0.0 {
             // CFML throws on division by zero
             let mut exception = ValueMap::default();

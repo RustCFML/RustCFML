@@ -15,10 +15,11 @@
 //! LLVM's judgement, which declined for good reason on the big handlers.
 
 use crate::{
-    binary_op, cfml_compare, cfml_equal, cfml_strict_equal, compare_op, numeric_op,
-    to_arith_number, to_number, CfmlVirtualMachine,
+    arith_binary_op, arith_numeric_op, arith_operand, binary_op, cfml_compare, cfml_equal,
+    cfml_strict_equal, compare_op, to_number, CfmlVirtualMachine,
 };
 use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::vm::CfmlError;
 
 // ---------------------------------------------------------------------------
 // Literals
@@ -83,70 +84,59 @@ pub(crate) fn op_swap(stack: &mut Vec<CfmlValue>) {
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn op_add(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| match (&a, &b) {
-        (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i + j),
-        (CfmlValue::Double(x), CfmlValue::Double(y)) => CfmlValue::Double(x + y),
-        (CfmlValue::Int(i), CfmlValue::Double(d)) => CfmlValue::Double(*i as f64 + d),
-        (CfmlValue::Double(d), CfmlValue::Int(i)) => CfmlValue::Double(d + *i as f64),
-        // CFML `+` is ARITHMETIC ONLY (`&` is concatenation), so two
-        // numeric strings like "2" + "1" must ADD to 3, not
-        // concatenate to "21". There is deliberately no String+String
-        // short-circuit — numeric strings fall through to coercion
-        // below; only genuinely non-numeric operands concatenate.
-        _ => {
-            let a_num = to_arith_number(&a);
-            let b_num = to_arith_number(&b);
-            match (a_num, b_num) {
-                (Some(x), Some(y)) => CfmlValue::Double(x + y),
-                _ => CfmlValue::string(format!("{}{}", a.as_string(), b.as_string())),
-            }
-        }
-    });
+pub(crate) fn op_add(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    arith_binary_op(stack, |a, b| {
+        Ok(match (&a, &b) {
+            (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i + j),
+            (CfmlValue::Double(x), CfmlValue::Double(y)) => CfmlValue::Double(x + y),
+            (CfmlValue::Int(i), CfmlValue::Double(d)) => CfmlValue::Double(*i as f64 + d),
+            (CfmlValue::Double(d), CfmlValue::Int(i)) => CfmlValue::Double(d + *i as f64),
+            // CFML `+` is ARITHMETIC ONLY — `&` concatenates — so "2" + "1"
+            // adds to 3 and a non-numeric operand THROWS rather than falling
+            // back to concatenation (GH #350). See `arith_operand`.
+            _ => CfmlValue::Double(arith_operand(&a)? + arith_operand(&b)?),
+        })
+    })
 }
 
 #[inline]
-pub(crate) fn op_sub(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| numeric_op(&a, &b, |x, y| x - y));
+pub(crate) fn op_sub(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    arith_binary_op(stack, |a, b| arith_numeric_op(&a, &b, |x, y| x - y))
 }
 
 #[inline]
-pub(crate) fn op_mul(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| numeric_op(&a, &b, |x, y| x * y));
+pub(crate) fn op_mul(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    arith_binary_op(stack, |a, b| arith_numeric_op(&a, &b, |x, y| x * y))
 }
 
 #[inline]
-pub(crate) fn op_mod(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| match (&a, &b) {
-        (CfmlValue::Int(i), CfmlValue::Int(j)) if *j != 0 => CfmlValue::Int(i % j),
-        _ => {
-            let x = to_number(&a).unwrap_or(0.0);
-            let y = to_number(&b).unwrap_or(1.0);
-            CfmlValue::Double(x % y)
-        }
-    });
+pub(crate) fn op_mod(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    arith_binary_op(stack, |a, b| {
+        Ok(match (&a, &b) {
+            (CfmlValue::Int(i), CfmlValue::Int(j)) if *j != 0 => CfmlValue::Int(i % j),
+            _ => CfmlValue::Double(arith_operand(&a)? % arith_operand(&b)?),
+        })
+    })
 }
 
 #[inline]
-pub(crate) fn op_pow(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| {
-        let x = to_number(&a).unwrap_or(0.0);
-        let y = to_number(&b).unwrap_or(0.0);
-        CfmlValue::Double(x.powf(y))
-    });
+pub(crate) fn op_pow(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    arith_binary_op(stack, |a, b| {
+        Ok(CfmlValue::Double(arith_operand(&a)?.powf(arith_operand(&b)?)))
+    })
 }
 
 #[inline]
-pub(crate) fn op_int_div(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| {
-        let x = to_number(&a).unwrap_or(0.0) as i64;
-        let y = to_number(&b).unwrap_or(1.0) as i64;
-        if y == 0 {
+pub(crate) fn op_int_div(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    arith_binary_op(stack, |a, b| {
+        let x = arith_operand(&a)? as i64;
+        let y = arith_operand(&b)? as i64;
+        Ok(if y == 0 {
             CfmlValue::Int(0)
         } else {
             CfmlValue::Int(x / y)
-        }
-    });
+        })
+    })
 }
 
 #[inline(always)]

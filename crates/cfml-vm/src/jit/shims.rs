@@ -389,9 +389,8 @@ pub extern "C" fn cfml_jit_concat_boxed(a: i64, b: i64) -> i64 {
 /// both sides; if both succeed, produce `Double(x + y)`; otherwise fall
 /// back to string concat.
 ///
-/// `bail` is currently unused (the operation never throws — fall-through
-/// to string concat covers every non-numeric case). Reserved for future
-/// strict-mode arithmetic.
+/// Bails on a non-numeric operand so the interpreter can throw (GH #350).
+/// CFML `+` is arithmetic only; `&` concatenates.
 #[no_mangle]
 pub extern "C" fn cfml_jit_add_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
     // v0.99.6 — SMI fast path: both inputs are inline Ints. Decode and
@@ -412,11 +411,16 @@ pub extern "C" fn cfml_jit_add_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
         // CFML `+` is arithmetic only; no String+String concat short-circuit (must
         // mirror the interpreter's Add op — numeric strings add, not concatenate).
         _ => {
-            let x = to_number(&va);
-            let y = to_number(&vb);
-            match (x, y) {
+            // A non-numeric operand THROWS (GH #350). The JIT has no error
+            // path, so bail to the interpreter and let its Add op raise —
+            // exactly how a zero divisor is already handled. Bailing rather
+            // than duplicating the check keeps hot and cold code identical.
+            match (crate::to_arith_number(&va), crate::to_arith_number(&vb)) {
                 (Some(x), Some(y)) => CfmlValue::Double(x + y),
-                _ => CfmlValue::string(format!("{}{}", va.as_string(), vb.as_string())),
+                _ => {
+                    unsafe { *_bail = 1 };
+                    return 0;
+                }
             }
         }
     };
@@ -444,8 +448,14 @@ pub extern "C" fn cfml_jit_sub_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
     let result: CfmlValue = match (&va, &vb) {
         (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i.wrapping_sub(*j)),
         _ => {
-            let x = to_number(&va).unwrap_or(0.0);
-            let y = to_number(&vb).unwrap_or(0.0);
+            // Non-numeric operand: bail so the interpreter throws (GH #350).
+            let (x, y) = match (crate::to_arith_number(&va), crate::to_arith_number(&vb)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => {
+                    unsafe { *_bail = 1 };
+                    return 0;
+                }
+            };
             CfmlValue::Double(x - y)
         }
     };
@@ -456,7 +466,7 @@ pub extern "C" fn cfml_jit_sub_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
 /// interpreter's `BytecodeOp::Mul`. Int×Int wraps via `wrapping_mul`; mixed
 /// or non-numeric coerces to `Double` via `to_number().unwrap_or(0.0)`.
 ///
-/// `bail` is currently unused (Mul never throws).
+/// Bails on a non-numeric operand so the interpreter can throw (GH #350).
 #[no_mangle]
 pub extern "C" fn cfml_jit_mul_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
     if boxed::is_smi_int(a) && boxed::is_smi_int(b) {
@@ -470,8 +480,15 @@ pub extern "C" fn cfml_jit_mul_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
     let result: CfmlValue = match (&va, &vb) {
         (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i.wrapping_mul(*j)),
         _ => {
-            let x = to_number(&va).unwrap_or(0.0);
-            let y = to_number(&vb).unwrap_or(0.0);
+            // Non-numeric operand: bail so the interpreter throws (GH #350).
+            // Previously this produced 0 — a plausible-looking wrong number.
+            let (x, y) = match (crate::to_arith_number(&va), crate::to_arith_number(&vb)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => {
+                    unsafe { *_bail = 1 };
+                    return 0;
+                }
+            };
             CfmlValue::Double(x * y)
         }
     };
@@ -628,24 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn sub_non_numeric_coerces_to_zero() {
-        // Sub on two non-numeric strings: to_number returns None, falls back
-        // to 0.0 - 0.0 = 0.0 (Double). Matches interpreter `numeric_op`.
-        let mut arena = Arena::new();
-        let _g = ArenaGuard::install(&mut arena);
-        let a = boxed::box_value(CfmlValue::string("hello")) as i64;
-        let b = boxed::box_value(CfmlValue::string("world")) as i64;
-        let mut bail = 0i64;
-        let r = cfml_jit_sub_boxed(a, b, &mut bail);
-        let v = unsafe { materialize(r) };
-        assert!(matches!(v, CfmlValue::Double(d) if d.abs() < 1e-9));
-        drop(_g);
-        drop(unsafe { boxed::reclaim_tagged(a as usize) });
-        drop(unsafe { boxed::reclaim_tagged(b as usize) });
-        arena.drain_except(None);
-    }
-
-    #[test]
     fn member_set_cold_then_warm_via_set_at_index() {
         // v0.100.0 — first call populates IC via cold path (existing key);
         // value-overwrites in place (no shape bump). Second call hits the
@@ -762,16 +761,40 @@ mod tests {
         arena.drain_except(None);
     }
 
+    /// Non-numeric operands must BAIL, not concatenate: CFML `+` is arithmetic
+    /// only and the interpreter throws (GH #350). This test previously asserted
+    /// the concatenation, which is how the divergence survived — if the shim
+    /// silently kept concatenating, hot code would disagree with cold code.
     #[test]
-    fn add_string_string_no_number_falls_back_to_concat() {
+    fn add_string_string_no_number_bails_to_interpreter() {
         let mut arena = Arena::new();
         let _g = ArenaGuard::install(&mut arena);
         let a = boxed::box_value(CfmlValue::string("hello")) as i64;
         let b = boxed::box_value(CfmlValue::string(" world")) as i64;
         let mut bail = 0i64;
         let r = cfml_jit_add_boxed(a, b, &mut bail);
-        let v = unsafe { materialize(r) };
-        assert!(matches!(v, CfmlValue::String(t) if t.as_str() == "hello world"));
+        assert_eq!(bail, 1, "non-numeric add must deopt so the interpreter throws");
+        assert_eq!(r, 0, "bailing returns a placeholder, not a value");
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(a as usize) });
+        drop(unsafe { boxed::reclaim_tagged(b as usize) });
+        arena.drain_except(None);
+    }
+
+    /// The same for Sub and Mul, whose old fallback was 0.0 — a plausible
+    /// wrong number rather than a visible wrong string.
+    #[test]
+    fn sub_and_mul_non_numeric_bail_to_interpreter() {
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let a = boxed::box_value(CfmlValue::string("foo")) as i64;
+        let b = boxed::box_value(CfmlValue::string("bar")) as i64;
+        let mut bail = 0i64;
+        assert_eq!(cfml_jit_sub_boxed(a, b, &mut bail), 0);
+        assert_eq!(bail, 1, "non-numeric sub must deopt");
+        bail = 0;
+        assert_eq!(cfml_jit_mul_boxed(a, b, &mut bail), 0);
+        assert_eq!(bail, 1, "non-numeric mul must deopt");
         drop(_g);
         drop(unsafe { boxed::reclaim_tagged(a as usize) });
         drop(unsafe { boxed::reclaim_tagged(b as usize) });

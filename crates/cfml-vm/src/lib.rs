@@ -8888,13 +8888,13 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Swap => ops::value::op_swap(&mut stack),
 
                 // Arithmetic
-                BytecodeOp::Add => ops::value::op_add(&mut stack),
-                BytecodeOp::Sub => ops::value::op_sub(&mut stack),
-                BytecodeOp::Mul => ops::value::op_mul(&mut stack),
+                BytecodeOp::Add => ops::value::op_add(&mut stack)?,
+                BytecodeOp::Sub => ops::value::op_sub(&mut stack)?,
+                BytecodeOp::Mul => ops::value::op_mul(&mut stack)?,
                 BytecodeOp::Div => { ops::effect::op_div(self, &mut stack, &mut ip)?; }
-                BytecodeOp::Mod => ops::value::op_mod(&mut stack),
-                BytecodeOp::Pow => ops::value::op_pow(&mut stack),
-                BytecodeOp::IntDiv => ops::value::op_int_div(&mut stack),
+                BytecodeOp::Mod => ops::value::op_mod(&mut stack)?,
+                BytecodeOp::Pow => ops::value::op_pow(&mut stack)?,
+                BytecodeOp::IntDiv => ops::value::op_int_div(&mut stack)?,
                 BytecodeOp::Negate => ops::value::op_negate(&mut stack),
 
                 // String concatenation
@@ -35190,6 +35190,19 @@ where
     }
 }
 
+/// `binary_op` for the arithmetic ops, which can now throw. The boolean ops
+/// keep the infallible `binary_op`.
+#[inline]
+pub(crate) fn arith_binary_op<F>(stack: &mut Vec<CfmlValue>, op: F) -> Result<(), CfmlError>
+where
+    F: FnOnce(CfmlValue, CfmlValue) -> Result<CfmlValue, CfmlError>,
+{
+    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+        stack.push(op(a, b)?);
+    }
+    Ok(())
+}
+
 pub(crate) fn compare_op<F>(stack: &mut Vec<CfmlValue>, op: F)
 where
     F: FnOnce(&CfmlValue, &CfmlValue) -> bool,
@@ -35244,6 +35257,28 @@ pub(crate) fn to_arith_number(val: &CfmlValue) -> Option<f64> {
     None
 }
 
+/// `numeric_op` for the arithmetic ops: identical, except a non-numeric
+/// operand throws instead of silently becoming 0.0 (GH #350).
+pub(crate) fn arith_numeric_op<F>(
+    a: &CfmlValue,
+    b: &CfmlValue,
+    op: F,
+) -> Result<CfmlValue, CfmlError>
+where
+    F: FnOnce(f64, f64) -> f64,
+{
+    if let (CfmlValue::Int(i), CfmlValue::Int(j)) = (a, b) {
+        let result = op(*i as f64, *j as f64);
+        return Ok(if result == (result as i64 as f64) && result.abs() < i64::MAX as f64 {
+            CfmlValue::Int(result as i64)
+        } else {
+            CfmlValue::Double(result)
+        });
+    }
+    // Date-aware, so `date - date` (days between) still works.
+    Ok(CfmlValue::Double(op(arith_operand(a)?, arith_operand(b)?)))
+}
+
 pub(crate) fn numeric_op<F>(a: &CfmlValue, b: &CfmlValue, op: F) -> CfmlValue
 where
     F: FnOnce(f64, f64) -> f64,
@@ -35268,6 +35303,46 @@ where
             CfmlValue::Double(op(x, y))
         }
     }
+}
+
+/// Coerce an arithmetic operand to a number, or produce Lucee's error.
+///
+/// CFML arithmetic is numeric-only (`&` concatenates), and Lucee refuses an
+/// operand it cannot read as a number rather than inventing one. This engine
+/// used to invent: `+` fell back to string concatenation and `-`/`*`/`/` to
+/// 0.0, so `"foo" * "bar"` quietly produced `0` — a plausible-looking number
+/// that hides the mistake completely (GH #350).
+///
+/// Coerces, matching Lucee: numbers, numeric strings (trimmed), booleans,
+/// boolean-literal strings (`yes`/`no`/`true`/`false`) and dates. Everything
+/// else throws, with Lucee's own three messages — an empty string, a
+/// non-numeric string, and a complex type each read differently.
+pub(crate) fn arith_operand(v: &CfmlValue) -> Result<f64, CfmlError> {
+    if let Some(n) = to_arith_number(v) {
+        return Ok(n);
+    }
+    // Lucee coerces boolean-literal strings in arithmetic too: `"yes" + 1` is 2.
+    if let CfmlValue::String(s) = v.query_column_scalar() {
+        if let Some(n) = bool_literal_to_num(s) {
+            return Ok(n);
+        }
+    }
+    Err(CfmlError::runtime(match v.query_column_scalar() {
+        CfmlValue::Array(_) => {
+            "Can't cast Complex Object Type [Array] to a number value".to_string()
+        }
+        CfmlValue::Struct(_) | CfmlValue::Component(..) => {
+            "can't cast Complex Object Type [Struct] to a number value".to_string()
+        }
+        other => {
+            let raw = other.as_string();
+            if raw.trim().is_empty() {
+                "can't cast empty string to a number value".to_string()
+            } else {
+                format!("can't cast [{}] string to a number value", raw)
+            }
+        }
+    }))
 }
 
 /// A boolean-literal string (`true`/`false`/`yes`/`no`, case-insensitive,

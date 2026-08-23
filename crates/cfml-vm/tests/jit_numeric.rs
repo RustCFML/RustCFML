@@ -1147,21 +1147,26 @@ fn add_mixed_int_and_struct_int_member_smi() {
 }
 
 #[test]
-fn add_boxed_smi_slow_path_string_member_concats_per_interpreter() {
-    // v0.99.6 — `obj.s + obj.t` where both members are Strings. The
-    // shim's SMI tag-check fails; the slow path falls through to
-    // cfml_jit_add_boxed which, per interpreter parity, string-concats
-    // two String operands (gotcha #18).
+fn add_boxed_smi_slow_path_numeric_strings_add_per_interpreter() {
+    // v0.99.6 — `obj.s + obj.t` where both members are Strings, so the shim's
+    // SMI tag-check fails and the slow path takes cfml_jit_add_boxed.
+    //
+    // The operands are NUMERIC strings: CFML `+` is arithmetic, so this must
+    // ADD to 5, not concatenate to "23". (This test used to use "foo"/"bar"
+    // and assert concatenation; non-numeric operands now bail to the
+    // interpreter, which throws — GH #350 — so they no longer exercise the
+    // slow path's arithmetic at all.)
     let src = r##"
         function combine(p) { return p.s + p.t; }
         out = "";
-        rec = {s: "foo", t: "bar"};
+        rec = {s: "2", t: "3"};
         for (k = 1; k <= 40; k++) { out = out & combine(rec) & ";"; }
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
     let (out, compiled) = run(src);
-    assert_eq!(out, oracle, "String + String slow path must match interpreter");
+    assert_eq!(out, oracle, "numeric-String + slow path must match interpreter");
+    assert!(out.starts_with("5;"), "numeric strings must ADD, got {out}");
     assert!(compiled >= 1, "expected combine() to be JIT-compiled, got {compiled}");
 }
 
@@ -1216,19 +1221,21 @@ fn sub_mul_chain_on_struct_member_kernel_matches_interpreter() {
 }
 
 #[test]
-fn sub_boxed_slow_path_string_coerces_to_zero_per_interpreter() {
-    // Non-numeric Sub: interpreter's numeric_op falls back to 0.0 - 0.0 = 0
-    // (Double); the JIT slow shim must mirror that.
+fn sub_boxed_slow_path_numeric_strings_per_interpreter() {
+    // Sub through the Boxed slow shim. Numeric strings, because a non-numeric
+    // operand now bails to the interpreter to throw (GH #350) rather than
+    // coercing to 0.0 — which is what this test used to assert.
     let src = r##"
         function diff(p) { return p.s - p.t; }
-        rec = {s: "hello", t: "world"};
+        rec = {s: "9", t: "4"};
         out = "";
         for (k = 1; k <= 40; k++) { out = out & diff(rec) & ";"; }
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
     let (out, compiled) = run(src);
-    assert_eq!(out, oracle, "Sub non-numeric slow path must match interpreter");
+    assert_eq!(out, oracle, "Sub numeric-String slow path must match interpreter");
+    assert!(out.starts_with("5;"), "9 - 4 must be 5, got {out}");
     assert!(compiled >= 1, "expected diff() to be JIT-compiled, got {compiled}");
 }
 
