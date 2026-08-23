@@ -54,6 +54,17 @@ component {
     // customTagDeepSearch=true in .CFConfig.json.
     this.customTagDeepSearch = true;
 
+    // Per-application S3 settings (Lucee parity, GitHub #334). Deliberately a
+    // NON-RESOLVING host with the AWS documentation example keypair: presigning
+    // is pure offline computation, so tests/s3/test_s3_app_config.cfm can prove
+    // these values reach the S3 layer without a bucket, a network call, or any
+    // environment variable. Nothing else in the suite touches S3.
+    this.s3 = {
+          accessKeyId  = "AKIAIOSFODNN7EXAMPLE"
+        , awsSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        , host         = "app-config-probe.example.com"
+    };
+
     // Per-application datasources (Lucee/BoxLang parity). Scoped to THIS
     // application and resolved by cfquery/queryExecute ahead of the global
     // cfconfig registry. Exercised by tests/config/test_app_datasources.cfm.

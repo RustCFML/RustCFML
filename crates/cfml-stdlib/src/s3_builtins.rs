@@ -314,15 +314,55 @@ pub fn fn_s3_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
 /// S3GeneratePresignedURL(bucket, object [, expires=60, method="GET", accessKeyId, secretKey, host])
 ///
 /// `expires` is in **minutes** (Lucee convention).
+/// Lucee's default presign window is 15 minutes.
+const PRESIGN_DEFAULT_SECS: u64 = 900;
+
+/// How long a presigned URL should live, from the `expireDate` argument.
+///
+/// Lucee types this argument `datetime` and signs the window between now and
+/// that instant. This engine's own positional API documented it as a plain
+/// number of MINUTES, so both spellings are accepted: a value that parses as a
+/// datetime is treated as an absolute expiry, anything numeric as minutes.
+/// The two cannot be confused — a CFML datetime never looks like a bare number
+/// here — and dropping the numeric form would silently shorten every existing
+/// positional caller's URL.
+fn presign_expiry_secs(v: Option<&CfmlValue>) -> u64 {
+    let Some(v) = v else {
+        return PRESIGN_DEFAULT_SECS;
+    };
+    match v {
+        CfmlValue::Null => PRESIGN_DEFAULT_SECS,
+        CfmlValue::Int(i) if *i > 0 => (*i as u64) * 60,
+        CfmlValue::Double(d) if *d > 0.0 => (*d as u64) * 60,
+        other => {
+            let raw = other.as_string();
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return PRESIGN_DEFAULT_SECS;
+            }
+            if let Ok(mins) = trimmed.parse::<u64>() {
+                return mins.saturating_mul(60);
+            }
+            match crate::builtins::parse_datetime_to_epoch_secs(trimmed) {
+                // Lucee measures the window from the call, so an expiry
+                // already in the past yields no window rather than a wrap.
+                Some(target) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (target - now).max(0) as u64
+                }
+                None => PRESIGN_DEFAULT_SECS,
+            }
+        }
+    }
+}
+
 pub fn fn_s3_generate_presigned_url(args: Vec<CfmlValue>) -> CfmlResult {
     let bucket = arg_string(&args, 0)?;
     let object = arg_string(&args, 1)?;
-    let expires_min: u64 = match args.get(2) {
-        Some(CfmlValue::Int(i)) => *i as u64,
-        Some(CfmlValue::Double(d)) => *d as u64,
-        Some(CfmlValue::String(s)) => s.parse::<u64>().unwrap_or(60),
-        _ => 60,
-    };
+    let expires_secs = presign_expiry_secs(args.get(2));
     let method = arg_opt_string(&args, 3).unwrap_or_else(|| "GET".to_string());
     let (k, s, h) = cred_args(&args, 4);
     let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
@@ -330,7 +370,7 @@ pub fn fn_s3_generate_presigned_url(args: Vec<CfmlValue>) -> CfmlResult {
         &client,
         &bucket,
         &cfg.full_key(&object),
-        expires_min * 60,
+        expires_secs,
         &method,
     )?;
     Ok(CfmlValue::string(url))

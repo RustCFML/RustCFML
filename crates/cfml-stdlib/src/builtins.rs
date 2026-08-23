@@ -4681,6 +4681,19 @@ fn parse_odbc_literal(s: &str) -> Option<NaiveDateTime> {
 }
 
 /// Central date parser: tries ODBC, ISO 8601, common US/EU formats, time-only, date serial
+/// Parse a CFML datetime and return it as epoch seconds in the LOCAL zone —
+/// the zone CFML dates are naive in, so `now()` round-trips.
+pub(crate) fn parse_datetime_to_epoch_secs(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let naive = parse_cfml_date(s)?;
+    match chrono::Local.from_local_datetime(&naive) {
+        chrono::offset::LocalResult::Single(dt) => Some(dt.timestamp()),
+        // Ambiguous or skipped instants (DST boundaries) — take the earlier.
+        chrono::offset::LocalResult::Ambiguous(dt, _) => Some(dt.timestamp()),
+        chrono::offset::LocalResult::None => Some(naive.and_utc().timestamp()),
+    }
+}
+
 fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
     let s = s.trim();
     if s.is_empty() { return None; }

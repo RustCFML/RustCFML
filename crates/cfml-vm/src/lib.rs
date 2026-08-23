@@ -13380,6 +13380,16 @@ impl CfmlVirtualMachine {
                     // path argument is an `s3://` URL.
                     #[cfg(feature = "s3")]
                     {
+                        // The `s3*()` builtins take only a Vec<CfmlValue>, so
+                        // they cannot receive an application context. Publish
+                        // `this.s3` for them here, immediately before dispatch,
+                        // so it always matches the running application (GH
+                        // #334). Cheap: the name test rejects everything else.
+                        if name_lower.starts_with("s3") || name_lower == "storegetmetadata" {
+                            cfml_stdlib::s3::set_app_s3_settings(
+                                self.s3_app_config().map(|c| c.settings),
+                            );
+                        }
                         if let Some(result) = self.s3_intercept(&name_lower, &args) {
                             return result;
                         }
@@ -21511,13 +21521,29 @@ impl CfmlVirtualMachine {
                 "type" => 5,
                 _ => return None,
             }),
+            // Lucee's S3 extension declares this one entirely by name, and
+            // every real caller writes it that way — `objectName=`,
+            // `httpMethod=`, `expireDate=`. Without a signature those landed
+            // in source order, so `accessKeyId` became the expiry and the
+            // method was never seen: every URL was GET-signed with the wrong
+            // window. Alias sets are Lucee's own, from getFunctionData.
+            "s3generatepresignedurl" => Some(match arg_lc {
+                "bucketnameorpath" | "bucket" | "bucketname" | "path" => 0,
+                "objectname" | "object" | "key" => 1,
+                "expiredate" | "expire" | "expires" | "expiresminutes" => 2,
+                "httpmethod" | "method" => 3,
+                "accesskeyid" | "accesskey" | "awsaccesskeyid" | "awsaccesskey" => 4,
+                "secretaccesskey" | "secretkey" | "awssecretkey" | "awssecretaccesskey" => 5,
+                "host" | "provider" | "server" => 6,
+                _ => return None,
+            }),
             _ => None,
         }
     }
 
     /// Whether `builtin_named_arg_index` knows a signature for this BIF.
     fn builtin_has_named_sig(builtin_lc: &str) -> bool {
-        matches!(builtin_lc, "directorylist")
+        matches!(builtin_lc, "directorylist" | "s3generatepresignedurl")
     }
 
     /// Route legacy `org.mindrot.jbcrypt.BCrypt` instance methods onto the native

@@ -174,6 +174,11 @@ pub struct S3Config {
     /// `accessKeyId`/`secretKey`/`host` function args): inline creds = explicit
     /// addressing, so the script controls the full path itself.
     pub key_prefix: Option<String>,
+    /// Force path-style addressing (`https://host/bucket/key`) instead of the
+    /// virtual-host default. Needed by MinIO and any provider that does not
+    /// serve bucket subdomains. Source precedence: `this.s3.usePathStyle` →
+    /// `RUSTCFML_S3_PATH_STYLE` / `LUCEE_S3_PATH_STYLE`.
+    pub use_path_style: bool,
 }
 
 impl S3Config {
@@ -266,20 +271,45 @@ impl S3Config {
                 .map(normalize_prefix)
         };
 
+        let truthy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on");
+        let use_path_style = app_s3
+            .and_then(|m| {
+                m.iter()
+                    .find(|(ak, _)| {
+                        ak.eq_ignore_ascii_case("usePathStyle")
+                            || ak.eq_ignore_ascii_case("pathStyle")
+                    })
+                    .map(|(_, v)| match v {
+                        CfmlValue::Bool(b) => *b,
+                        other => truthy(&other.as_string()),
+                    })
+            })
+            .or_else(|| {
+                env_get(&["RUSTCFML_S3_PATH_STYLE", "LUCEE_S3_PATH_STYLE"]).map(|v| truthy(&v))
+            })
+            .unwrap_or(false);
+
         Ok(S3Config {
             access_key,
             secret_key,
             region,
             endpoint_url,
             key_prefix,
+            use_path_style,
         })
     }
 
     /// Prepend the configured key prefix to a script-supplied object key.
     /// Returns the key unchanged when no prefix is configured.
     pub fn full_key(&self, key: &str) -> String {
+        // Exactly ONE leading slash is dropped, as Lucee's S3 resource does:
+        // an object stored through Lucee as "/a/b.txt" lives at "a/b.txt", so
+        // signing or fetching the slash verbatim addresses "bucket//a/b.txt",
+        // a key that exists nowhere. Two slashes therefore leave one behind,
+        // which is a real (if unusual) key — hence strip_prefix, not trim.
+        let key = key.strip_prefix('/').unwrap_or(key);
         match &self.key_prefix {
-            Some(p) => format!("{}{}", p, key.trim_start_matches('/')),
+            Some(p) => format!("{}{}", p, key),
             None => key.to_string(),
         }
     }
@@ -301,8 +331,9 @@ impl S3Config {
             self.access_key,
             self.region,
             self.endpoint_url.as_deref().unwrap_or(""),
-            // include secret hash so different secrets get separate clients
-            self.secret_key.len()
+            // include secret hash so different secrets get separate clients,
+            // and the addressing style so the two never share a cached client
+            format!("{}:{}", self.secret_key.len(), self.use_path_style)
         )
     }
 }
@@ -371,10 +402,44 @@ fn build_client(cfg: &S3Config) -> Client {
     let mut builder = aws_sdk_s3::config::Builder::from(&conf);
     if let Some(ep) = &cfg.endpoint_url {
         builder = builder.endpoint_url(ep);
-        // Most S3-compatible providers (R2, MinIO) require path-style addressing.
+    }
+    // Virtual-host addressing (`https://bucket.host/key`) is what Lucee emits,
+    // including against a custom host, so it is the default here too. A custom
+    // endpoint used to force path style unconditionally, which made every URL
+    // this engine produced differ in shape from the same call on Lucee.
+    // MinIO (and any provider not serving bucket subdomains) still needs path
+    // style, so it stays available through `this.s3.usePathStyle` or
+    // RUSTCFML_S3_PATH_STYLE / LUCEE_S3_PATH_STYLE.
+    if cfg.use_path_style {
         builder = builder.force_path_style(true);
     }
     Client::from_conf(builder.build())
+}
+
+/// The current application's `this.s3` settings.
+///
+/// The `s3*()` BIFs are plain `fn(Vec<CfmlValue>)` builtins with no access to
+/// VM state, so there is nowhere in their signature for an application context
+/// to arrive — which is why `this.s3` was previously reachable only by
+/// duplicating every value into process environment variables. That workaround
+/// is per-process where `this.s3` is per-application, so a container could only
+/// ever hold one credential set.
+///
+/// The VM republishes this immediately before dispatching any `s3*` builtin,
+/// so it always reflects the application that is actually running.
+thread_local! {
+    static APP_S3_SETTINGS: std::cell::RefCell<Option<ValueMap>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish (or clear) the current application's `this.s3` settings.
+pub fn set_app_s3_settings(settings: Option<ValueMap>) {
+    APP_S3_SETTINGS.with(|c| *c.borrow_mut() = settings);
+}
+
+/// The current application's `this.s3` settings, if any.
+pub fn app_s3_settings() -> Option<ValueMap> {
+    APP_S3_SETTINGS.with(|c| c.borrow().clone())
 }
 
 pub type SharedS3Clients = Arc<S3Clients>;
@@ -822,7 +887,16 @@ pub fn client_and_config(
     inline_host: Option<&str>,
     app: Option<&S3AppConfig>,
 ) -> Result<(Client, S3Config), CfmlError> {
-    let cfg = resolve_config(inline_key, inline_secret, inline_host, app)?;
+    // Callers that have an explicit app config (the s3:// VFS intercept) pass
+    // it; the plain `s3*()` builtins cannot, so fall back to whatever the VM
+    // published for the running application.
+    let published = if app.is_none() {
+        app_s3_settings().map(|settings| S3AppConfig { settings })
+    } else {
+        None
+    };
+    let effective = app.or(published.as_ref());
+    let cfg = resolve_config(inline_key, inline_secret, inline_host, effective)?;
     let client = global_clients().get_or_create(&cfg);
     Ok((client, cfg))
 }
