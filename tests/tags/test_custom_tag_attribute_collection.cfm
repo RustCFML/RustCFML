@@ -40,7 +40,7 @@ function ident(s) { return arguments.s; }
 </cfscript>
 <cfsavecontent variable="nestedOutput"><cf_showattrs attributeCollection="#buildAttrs(model='#ident('nested.model')#', label='Nested', class='c1')#"></cf_showattrs></cfsavecontent>
 <cfscript>
-assert("attributeCollection with nested #...# stays a struct (not string-coerced)",
+assert("attributeCollection with nested ##...## stays a struct (not string-coerced)",
        trim(nestedOutput), "nested.model|Nested|c1");
 
 suiteEnd();

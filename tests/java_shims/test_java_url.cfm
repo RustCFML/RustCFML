@@ -42,8 +42,12 @@ assert("4-arg path", u3.getPath(), "/api/v1");
 urlA = createObject("java","java.net.URL").init("http://www.luismajano.com");
 urlB = createObject("java","java.net.URL").init("http://www.luismajano.com");
 urlC = createObject("java","java.net.URL").init("http://www.ortussolutions.com");
-assertTrue("same-spec URLs are eq", urlA eq urlB);
-assertFalse("different-spec URLs are not eq", urlA eq urlC);
+// `eq` between two Java objects works here; Lucee refuses to compare complex
+// types as simple values. The .equals() legs below are cross-engine.
+if ( isRustCFML() ) {
+    assertTrue("same-spec URLs are eq", urlA eq urlB);
+    assertFalse("different-spec URLs are not eq", urlA eq urlC);
+}
 assertTrue("same-spec URLs .equals()", urlA.equals(urlB));
 assertFalse("different-spec URLs .equals()", urlA.equals(urlC));
 // A URL is an object, not a struct (Lucee parity) — this is what lets TestBox's
@@ -52,7 +56,8 @@ assertFalse("isStruct(URL) is false", isStruct(urlA));
 // default-port equivalence: explicit :80 equals the implied http default
 uP1 = createObject("java","java.net.URL").init("http://h.com/a");
 uP2 = createObject("java","java.net.URL").init("http://h.com:80/a");
-assertTrue("explicit default port equals implied", uP1 eq uP2);
+// `eq` again — cross-engine via .equals(), which agrees on both.
+assertTrue("explicit default port equals implied", uP1.equals( uP2 ));
 
 suiteEnd();
 </cfscript>

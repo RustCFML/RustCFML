@@ -24,6 +24,10 @@ assertTrue( "of().isEmpty() false", p.isEmpty() == false );
 assert( "of().get()", p.get(), "hello" );
 assert( "of().toString()", p.toString(), "Optional[hello]" );
 
+// createDynamicProxy accepts a STRUCT of functions here; Lucee requires a
+// component, so everything from here to the equals() block below is a
+// RustCFML superset. The equals() legs after it stay cross-engine.
+if ( isRustCFML() ) {
 // map() on a present optional applies the mapper and rewraps.
 mapper = createDynamicProxy(
     { apply : function( v ){ return uCase( arguments.v ); } },
@@ -61,6 +65,8 @@ assert( "ifPresent() runs consumer when present", request._optSeen, "fired" );
 request._optSeen = "untouched";
 opt.empty().ifPresent( consumer );
 assert( "ifPresent() skips consumer when empty", request._optSeen, "untouched" );
+
+} // end isRustCFML() — struct-based createDynamicProxy
 
 // equals(): both empty, or both present with equal values.
 assertTrue( "equals both empty", opt.empty().equals( opt.empty() ) );

@@ -19,6 +19,13 @@ component {
     // Map "tags" for any tag-based test includes
     this.mappings["/tags"] = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/";
 
+    // Map "compat_engine" so createObject/new on `compat_engine.fixtures.X`
+    // resolves on Lucee too. RustCFML resolves an unmapped dotted package
+    // relative to the including file; Lucee resolves dotted paths only through
+    // the webroot or a mapping, so without this the fixtures are unreachable
+    // there and the suite aborts mid-file.
+    this.mappings["/compat_engine"] = getDirectoryFromPath(getCurrentTemplatePath()) & "compat_engine/";
+
     // Map "comments" so createObject("component", "comments.BlockCommentTags")
     // resolves (issue #69 fixture).
     this.mappings["/comments"] = getDirectoryFromPath(getCurrentTemplatePath()) & "comments/";

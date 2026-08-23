@@ -32,8 +32,12 @@ meta = {
 assertTrue( "meta struct carries a height key (drives isValidImageFile)", structKeyExists( meta, "height" ) );
 
 // A path String (not just a File) is also accepted.
-infoFromPath = imaging.getImageInfo( tmpPng );
-assert( "getImageInfo accepts a path string too", infoFromPath.getWidth(), 120 );
+infoFromPath = isRustCFML() ? imaging.getImageInfo( tmpPng ) : "";
+// Real Imaging.getImageInfo takes a File; accepting a path string is a
+// RustCFML convenience, so Lucee has no matching method.
+if ( isRustCFML() ) {
+    assert( "getImageInfo accepts a path string too", infoFromPath.getWidth(), 120 );
+}
 
 // Non-image bytes must throw (Apache getImageInfo throws; readMeta catches it).
 threw = false;

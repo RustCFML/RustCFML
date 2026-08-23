@@ -35,7 +35,7 @@ assert(     "structCount includes null key",  structCount( s ), 3 );
 
 // for-in enumerates the null key.
 seen = "";
-for ( var k in s ) { seen = listAppend( seen, k ); }
+for ( k in s ) { seen = listAppend( seen, k ); }   // no `var` at page scope: Lucee rejects it
 assertTrue( "for-in enumerates null key",  listFindNoCase( seen, "nullkey" ) > 0 );
 assert(     "for-in count includes null key", listLen( seen ), 3 );
 

@@ -15,6 +15,10 @@ assert("Class.forName().getName()", urlClass.getName(), "java.net.URL");
 assert("Class.forName().getSimpleName()", urlClass.getSimpleName(), "URL");
 
 // --- java.lang.reflect.Array (newInstance / set / get / getLength) ---
+// On a real JVM newInstance(URL.class, 3) makes a TYPED URL[3] and storing a
+// String into it throws "array element type mismatch". This engine's array is
+// untyped, so the whole block is a RustCFML superset.
+if ( isRustCFML() ) {
 arrUtil = createObject("java", "java.lang.reflect.Array");
 holder = arrUtil.newInstance(urlClass, 3);
 assert("reflect.Array.newInstance length", arrayLen(holder), 3);
@@ -25,6 +29,8 @@ assert("reflect.Array.set index 0 -> [1]", holder[1], "file:/a.jar");
 assert("reflect.Array.set index 2 -> [3]", holder[3], "file:/c.jar");
 assert("reflect.Array.get", arrUtil.get(holder, 0), "file:/a.jar");
 assert("reflect.Array.getLength", arrUtil.getLength(holder), 3);
+
+} // end isRustCFML() — untyped reflect.Array
 
 // --- array.iterator() / hasNext() / next() (java.util.List passthrough) ---
 items = ["one", "two", "three"];
@@ -44,6 +50,9 @@ assert("File.toURL()", createObject("java", "java.io.File").init("/tmp/x.jar").t
 
 // --- java.net.URLClassLoader deferred object: classloader plumbing succeeds,
 //     but invoking a class it "loads" throws (no JVM). ---
+// RustCFML-only by construction: it takes the untyped array built above, and
+// "loads a class that then throws" is precisely the no-JVM behaviour.
+if ( isRustCFML() ) {
 ucl = createObject("java", "java.net.URLClassLoader").init(holder);
 assertTrue("URLClassLoader.init() returns object", isObject(ucl));
 loaded = ucl.loadClass("com.compoundtheory.classloader.NetworkClassLoader");
@@ -53,13 +62,19 @@ assertThrows("deferred java object throws on real method use", function() {
 	return ucl.invokeSomethingThatNeedsAJvm();
 });
 
+} // end isRustCFML() — URLClassLoader over the untyped array
+
 // --- coldfusion.runtime.java.JavaProxy path (kept on the java path because the
 //     shim does NOT throw, avoiding cbjavaloader's heavy CFC-reflection fallback). ---
 jp = createObject("java", "coldfusion.runtime.java.JavaProxy");
 assertTrue("JavaProxy shim is object", isObject(jp));
-proxy = jp.init(loaded);
-instance = proxy.init();
-assertTrue("NetworkClassLoader proxy addUrl() no-op", instance.addUrl("file:/e.jar"));
+// Proxies the class the deferred URLClassLoader above "loaded", so this is
+// RustCFML-only for the same reason.
+if ( isRustCFML() ) {
+    proxy = jp.init(loaded);
+    instance = proxy.init();
+    assertTrue("NetworkClassLoader proxy addUrl() no-op", instance.addUrl("file:/e.jar"));
+}
 
 suiteEnd();
 </cfscript>

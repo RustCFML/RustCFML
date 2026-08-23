@@ -35,9 +35,13 @@ assertTrue( "dest.keyExists() works after append-from-component", settings.keyEx
 // (ColdBox's async BaseProxy calls hashCode() on proxied components.)
 o1 = new concurrenttest.SampleCallable();
 o2 = new concurrenttest.SampleCallable();
-assertTrue( "component hashCode() is numeric", isNumeric( o1.hashCode() ) );
-assertTrue( "component equals() itself", o1.equals( o1 ) );
-assertFalse( "component not equals a different instance", o1.equals( o2 ) );
+// RustCFML gives every CFC the java.lang.Object methods; Lucee does not, so
+// these two are supersets. The rest of the suite is cross-engine.
+if ( isRustCFML() ) {
+    assertTrue( "component hashCode() is numeric", isNumeric( o1.hashCode() ) );
+    assertTrue( "component equals() itself", o1.equals( o1 ) );
+    assertFalse( "component not equals a different instance", o1.equals( o2 ) );
+}
 
 // ---- java.time shim basics ----
 dur = createObject( "java", "java.time.Duration" ).ofSeconds( 5 );

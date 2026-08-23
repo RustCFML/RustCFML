@@ -30,7 +30,12 @@ assert("quotedValueList custom delimiter", quotedValueList(q.name, "|"), "'Alice
 
 // Empty query
 emptyQ = queryNew("name", "varchar");
-assert("valueList empty query", valueList(emptyQ.name), "");
+// On an empty query Lucee degrades the column to an Array, which valueList
+// refuses; here it stays a column and yields "". Guarded so the valueArray
+// suite below still runs cross-engine.
+if ( isRustCFML() ) {
+    assert("valueList empty query", valueList(emptyQ.name), "");
+}
 
 suiteEnd();
 
@@ -47,8 +52,11 @@ assert("valueArray(q,col) joined", arrayToList(va), "Alice,Bob,Charlie");
 // valueArray(query.column) — the dot-access already yields a column.
 assert("valueArray(q.column) joined", arrayToList(valueArray(q.age)), "30,25,35");
 
-// valueArray of a plain array returns its values.
-assert("valueArray(array)", arrayToList(valueArray([1,2,3])), "1,2,3");
+// valueArray of a plain array returns its values — a RustCFML superset;
+// Lucee's valueArray takes a query column only.
+if ( isRustCFML() ) {
+    assert("valueArray(array)", arrayToList(valueArray([1,2,3])), "1,2,3");
+}
 
 // Empty query column.
 assert("valueArray empty query", arrayLen(valueArray(emptyQ, "name")), 0);

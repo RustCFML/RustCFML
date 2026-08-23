@@ -57,7 +57,11 @@ assert("string[5] returns last char", sidx[5], "o");
 sst = { to = "to@test.com" };
 assert("member string index", sst.to[1], "t");
 // multibyte is char-based, not byte-based
-assert("string index is char-based for multibyte", "héllo"[2], chr(233));
+// RustCFML supports string indexing; Lucee has no such property and throws.
+// The assertThrows legs below still run cross-engine — Lucee throws there too.
+if ( isRustCFML() ) {
+    assert("string index is char-based for multibyte", "héllo"[2], chr(233));
+}
 // out-of-range / zero subscripts throw a catchable error
 assertThrows("string[out-of-range] throws", function(){ var x = "hi"[9]; });
 assertThrows("string[0] throws", function(){ var x = "hi"[0]; });

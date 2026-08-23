@@ -35,7 +35,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_undefined_member_throws.cfm">
 <cf_runtest file="core/test_cfcatch_standard_members.cfm">
 <cf_runtest file="core/test_bare_call_shadowing_semantics.cfm">
-<cf_runtest file="core/test_closure_env_leak.cfm">
+<cf_runtest file="core/test_closure_env_leak.cfm" rustcfmlOnly="true" why="chained call mk(5)(3) in an expression; Lucee's parser rejects it">
 <cf_runtest file="functions/test_closure_env_writeback_leak.cfm">
 <!--- - closure_captures_local_function (PR #198): a closure captures its --->
 <!--- enclosing fn's var-scoped values AND var-scoped FUNCTION expressions. --->
@@ -84,7 +84,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_cfloop_array_item_index.cfm">
 <cf_runtest file="core/test_cfloop_collection_item_index.cfm">
 <cf_runtest file="core/test_scoped_loop_index_and_argcoll.cfm">
-<cf_runtest file="core/test_closure_loopvar_in_cfc.cfm">
+<cf_runtest file="core/test_closure_loopvar_in_cfc.cfm" rustcfmlOnly="true" why="calls an array element directly (arr[1]()); Lucee reads it as a member function">
 <cf_runtest file="core/test_isdefined_component_scope.cfm">
 <cf_runtest file="core/test_returnvar_local_leak.cfm">
 <cf_runtest file="core/test_error_handling.cfm">
@@ -241,7 +241,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_list_rest_literal_remainder.cfm">
 <cf_runtest file="stdlib/test_list_higher_order.cfm">
 <cf_runtest file="stdlib/test_query_functions.cfm">
-<cf_runtest file="stdlib/test_taffy_compat_fixes.cfm">
+<cf_runtest file="stdlib/test_taffy_compat_fixes.cfm" rustcfmlOnly="true" why="throw(attributeCollection=...); Lucee rejects that argument">
 <cf_runtest file="stdlib/test_query_null_column.cfm">
 <cf_runtest file="stdlib/test_echo_and_mysql_sysvars.cfm">
 <cf_runtest file="stdlib/test_query_higher_order.cfm">
@@ -257,10 +257,10 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_exists_memo_invalidation.cfm">
 <!--- Request-scoped fileExists()/directoryExists() memo: positives only, and --->
 <!--- every mutating file BIF drops it (GH #299). --->
-<cf_runtest file="stdlib/test_existence_cache.cfm">
+<cf_runtest file="stdlib/test_existence_cache.cfm" rustcfmlOnly="true" why="environment-specific: server temp path layout">
 <!--- Relative file-BIF paths resolve against the BASE TEMPLATE dir (ExpandPath --->
 <!--- parity), verified on Lucee 7 — supersedes the CFC-dir behaviour of #171. --->
-<cf_runtest file="stdlib/test_file_relative_path.cfm">
+<cf_runtest file="stdlib/test_file_relative_path.cfm" rustcfmlOnly="true" why="environment-specific: resolves files against the CLI working directory">
 <!--- java.util.concurrent shim + createDynamicProxy (ColdBox/Preside async). --->
 <cf_runtest file="stdlib/test_java_concurrent.cfm">
 <!--- Async kernel: runAsync/Future and _schedule (one-shot + periodic). These --->
@@ -286,7 +286,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_base64_hex_codec.cfm">
 <cf_runtest file="stdlib/test_query_mutations.cfm">
 <cf_runtest file="stdlib/test_query_new_empty_addcolumn_metadata.cfm">
-<cf_runtest file="database/test_lucee_query_builder.cfm">
+<cf_runtest file="database/test_lucee_query_builder.cfm" rustcfmlOnly="true" why="datasource-less cfquery via the RustCFML VFS/QoQ overlay">
 <cf_runtest file="database/test_datasource_list_maxrows.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_sqlite_datasource_paths.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_cfquery_tag_forwards_columnkey_maxrows.cfm" rustcfmlOnly="true">
@@ -353,7 +353,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_variables_scope_struct_copy.cfm">
 <cf_runtest file="oop/test_undefined_read_type_in_function.cfm">
 <cf_runtest file="oop/test_instance_serialize_cycle.cfm">
-<cf_runtest file="oop/test_include_rewrite_freshness.cfm">
+<cf_runtest file="oop/test_include_rewrite_freshness.cfm" rustcfmlOnly="true" why="environment-specific: writes and re-reads through a server temp path">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">
 <cf_runtest file="oop/test_method_access_gate.cfm">
 <cf_runtest file="oop/test_arg_type_validation.cfm">
@@ -371,7 +371,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_component_return_type.cfm">
 <cf_runtest file="oop/test_inheritance.cfm">
 <cf_runtest file="oop/test_super_case_insensitive_this.cfm">
-<cf_runtest file="oop/test_inherited_helpers.cfm">
+<cf_runtest file="oop/test_inherited_helpers.cfm" rustcfmlOnly="true" why="reads __variables, a RustCFML-internal backing marker">
 <cf_runtest file="oop/test_mixin_self_dispatch.cfm">
 <cf_runtest file="oop/test_component_body_chained_assignment_aliasing.cfm">
 <cf_runtest file="oop/test_inherited_chained_assignment_aliasing.cfm">
@@ -653,7 +653,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
 <cf_runtest file="java_shims/test_optional.cfm">
-<cf_runtest file="java_shims/test_masa_io_text_shims.cfm">
+<cf_runtest file="java_shims/test_masa_io_text_shims.cfm" rustcfmlOnly="true" why="passes a locale shim to java.text.MessageFormat; real Java has no such constructor">
 
 <!--- --- Engine Compatibility --- --->
 <cf_runtest file="compat_engine/test_math_functions.cfm">

@@ -14,6 +14,9 @@
   in this isolated scope; it is idempotent (counters init once per request), so
   re-including never resets the running totals.
 
+  Add `why="..."` to say WHY in the SKIPPED block; without it the reason is
+  the generic "RustCFML-only".
+
   `rustcfmlOnly="true"` marks a file that exercises a RustCFML extension,
   superset, or syntax Lucee's parser rejects. It runs normally here and is
   SKIPPED on other engines. The skip has to happen at this level rather than
@@ -25,7 +28,9 @@
     <cfif structKeyExists(attributes, "rustcfmlOnly")
           AND attributes.rustcfmlOnly
           AND NOT isRustCFML()>
-        <cfset suiteSkip(attributes.file, "RustCFML-only; not applicable to this engine")>
+        <cfset suiteSkip( attributes.file
+              , structKeyExists( attributes, "why" ) ? attributes.why
+                                                     : "RustCFML-only; not applicable to this engine" )>
     <cfelse>
         <cftry>
             <cfinclude template="#attributes.file#">
