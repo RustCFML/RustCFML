@@ -15,6 +15,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_elvis_error_scope.cfm">
 <cf_runtest file="core/test_arguments_scope_dispatch.cfm">
 <cf_runtest file="core/test_unscoped_scope_cascade.cfm">
 <cf_runtest file="core/test_return_assignment_expression.cfm">
@@ -510,6 +511,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
 <cf_runtest file="tags/test_tags_cfexecute.cfm">
 <cf_runtest file="tags/test_cfexecute_argument_quoting.cfm">
+<cf_runtest file="tags/test_cfqueryparam_list_array_value.cfm">
 <cf_runtest file="tags/test_tags_cfmail.cfm">
 <cf_runtest file="tags/test_tags_cfcache.cfm">
 <cf_runtest file="tags/test_tags_cfstoredproc.cfm">

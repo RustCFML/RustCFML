@@ -10794,11 +10794,12 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                                 values.push(CfmlValue::Null);
                                 type_hints.push(cfsqltype);
                             } else if is_list {
-                                // Expand list value into multiple params
-                                let val_str = value.as_string();
-                                for part in val_str.split(&*separator) {
-                                    let trimmed = part.trim();
-                                    values.push(coerce_by_sqltype(trimmed, &cfsqltype));
+                                // An ARRAY value is already one bind per
+                                // element; only a string gets split.
+                                for part in
+                                    cfml_common::dynamic::expand_list_param(&value, &separator)
+                                {
+                                    values.push(coerce_by_sqltype_value(&part, &cfsqltype));
                                     type_hints.push(cfsqltype.clone());
                                 }
                             } else {
@@ -10845,9 +10846,15 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
                             .unwrap_or_else(|| ",".to_string());
                         let value = s.iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                            .map(|(_, v)| v.as_string())
-                            .unwrap_or_default();
-                        value.split(&*separator).filter(|s| !s.trim().is_empty()).count().max(1)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(CfmlValue::Null);
+                        // Must agree with the expansion in the builder below,
+                        // or the `?` count and the bind count drift apart.
+                        cfml_common::dynamic::expand_list_param(&value, &separator)
+                            .iter()
+                            .filter(|v| !v.as_string().trim().is_empty())
+                            .count()
+                            .max(1)
                     } else {
                         1
                     }
@@ -11774,11 +11781,7 @@ fn expand_sqlite_param_values(v: &CfmlValue) -> Vec<CfmlValue> {
                     .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
                     .map(|(_, val)| val.as_string())
                     .unwrap_or_else(|| ",".to_string());
-                return value
-                    .as_string()
-                    .split(&*separator)
-                    .map(|part| CfmlValue::string(part.trim().to_string()))
-                    .collect();
+                return cfml_common::dynamic::expand_list_param(&value, &separator);
             }
             return vec![value];
         }
@@ -11985,10 +11988,9 @@ fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
                     .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
                     .map(|(_, val)| val.as_string())
                     .unwrap_or_else(|| ",".to_string());
-                return value
-                    .as_string()
-                    .split(&*separator)
-                    .map(|part| coerce_by_sqltype(part.trim(), &cfsqltype))
+                return cfml_common::dynamic::expand_list_param(&value, &separator)
+                    .iter()
+                    .map(|part| coerce_by_sqltype_value(part, &cfsqltype))
                     .collect();
             }
             return vec![coerce_by_sqltype_value(&value, &cfsqltype)];

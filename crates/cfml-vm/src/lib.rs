@@ -35956,10 +35956,10 @@ fn build_qoq_params(arg: &CfmlValue) -> cfml_qoq::QoQParams {
 }
 
 /// Unwrap a `cfqueryparam` struct (`{value: x, cfsqltype: …}`) to its value.
-/// A `list=true` param splits its delimited value into an array of values, which
-/// the QoQ `IN` evaluator expands into a value list (`IN (:ids)` -> `IN (1,2,3)`,
-/// Lucee/ACF parity). The delimiter defaults to "," and honours `separator`/
-/// `delimiter`.
+/// A `list=true` param expands into an array of values, which the QoQ `IN`
+/// evaluator turns into a value list (`IN (:ids)` -> `IN (1,2,3)`, Lucee/ACF
+/// parity). A string value is split on `separator`/`delimiter` (default ","); an
+/// ARRAY value is already one value per element and is used as-is.
 fn unwrap_query_param(v: &CfmlValue) -> CfmlValue {
     if let CfmlValue::Struct(s) = v {
         if let Some(inner) = s.get_ci("value") {
@@ -35971,12 +35971,7 @@ fn unwrap_query_param(v: &CfmlValue) -> CfmlValue {
                     .map(|x| x.as_string())
                     .filter(|x| !x.is_empty())
                     .unwrap_or_else(|| ",".to_string());
-                let parts: Vec<CfmlValue> = inner
-                    .as_string()
-                    .split(&sep)
-                    .map(|p| CfmlValue::string(p.to_string()))
-                    .collect();
-                return CfmlValue::array(parts);
+                return CfmlValue::array(cfml_common::dynamic::expand_list_param(&inner, &sep));
             }
             return inner;
         }

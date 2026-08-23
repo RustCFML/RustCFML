@@ -3620,3 +3620,23 @@ mod component_backing_render {
         assert_eq!(s.matches("<Component>").count(), 50, "each ref collapses to a bounded token");
     }
 }
+
+/// Expand a `cfqueryparam list="true"` value into one bind value per element.
+///
+/// Lucee accepts an **array** here as readily as a delimited string —
+/// `value="#someArray#"` inside `IN (...)` is a standard idiom — and binds one
+/// parameter per element. Stringifying an array first and splitting on the
+/// separator instead produced a single bogus bind, and the failure mode was
+/// driver-dependent: PostgreSQL rejected the serialised form outright, while
+/// Query-of-Queries silently matched zero rows, so a search screen just looked
+/// empty. Only strings are split; array elements are already the values.
+pub fn expand_list_param(value: &CfmlValue, separator: &str) -> Vec<CfmlValue> {
+    match value {
+        CfmlValue::Array(a) => a.snapshot(),
+        other => other
+            .as_string()
+            .split(separator)
+            .map(|part| CfmlValue::string(part.trim().to_string()))
+            .collect(),
+    }
+}
