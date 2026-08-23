@@ -23,7 +23,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.617.0"
+version = "0.618.0"
 authors = ["RustCFML Team"]
 edition = "2021"
 rust-version = "1.75.0"
@@ -32,20 +32,24 @@ homepage = "https://github.com/RustCFML/RustCFML"
 license = "MIT"
 
 [workspace.dependencies]
-cfml-common = { path = "crates/cfml-common", version = "0.617.0" }
-cfml-config = { path = "crates/cfml-config", version = "0.617.0" }
-cfml-compiler = { path = "crates/cfml-compiler", version = "0.617.0" }
-cfml-codegen = { path = "crates/cfml-codegen", version = "0.617.0" }
-cfml-vm = { path = "crates/cfml-vm", version = "0.617.0" }
-cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.617.0", default-features = false }
-cfml-qoq = { path = "crates/cfml-qoq", version = "0.617.0" }
-cfml-sanitize = { path = "crates/cfml-sanitize", version = "0.617.0" }
+cfml-common = { path = "crates/cfml-common", version = "0.618.0" }
+cfml-config = { path = "crates/cfml-config", version = "0.618.0" }
+cfml-compiler = { path = "crates/cfml-compiler", version = "0.618.0" }
+cfml-codegen = { path = "crates/cfml-codegen", version = "0.618.0" }
+cfml-vm = { path = "crates/cfml-vm", version = "0.618.0" }
+cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.618.0", default-features = false }
+cfml-qoq = { path = "crates/cfml-qoq", version = "0.618.0" }
+cfml-sanitize = { path = "crates/cfml-sanitize", version = "0.618.0" }
 
 log = "0.4"
 thiserror = "1.0"
 anyhow = "1.0"
 parking_lot = "0.12"
 indexmap = "2.0"
+# The raw table behind indexmap, taken directly for `InheritedKeys` (see
+# `cfml-vm`). Same version and same `default-features = false` indexmap
+# already requests, so this adds no crate and no feature to the graph.
+hashbrown = { version = "0.17", default-features = false }
 num-traits = "0.2"
 rustc-hash = "1.1"
 # IANA timezone database for chrono. Pure generated data — compiles on

@@ -2901,8 +2901,9 @@ struct InheritedKeys {
     /// Bitmask over STRUCTURAL_NAMES (this/__variables/super/variables).
     structural: u8,
     /// Non-structural inherited keys (page vars, helpers, params where the
-    /// caller tracks them here). `None` until the first insert — the common
-    /// structural-only frame never allocates.
+    /// caller tracks them here). Empty — and unallocated, `HashTable::new()`
+    /// being a non-allocating `const fn` — for the common structural-only
+    /// frame, so no `Option` wrapper is needed to keep that case free.
     ///
     /// Keyed by the interned [`Key`], not `String`. Two reasons, one measured
     /// and one correctness:
@@ -2918,10 +2919,24 @@ struct InheritedKeys {
     ///   case-SENSITIVE, so `contains("thread")` could miss a stored `Thread` —
     ///   the reason `remove_ci` existed as a separate linear-scan method at all.
     ///
-    /// `IndexSet` rather than `HashSet` because indexmap's `Equivalent` lets a
-    /// `&str` caller probe with a borrowed `KeyRef` and pay nothing; `std`'s
-    /// `Borrow` bound cannot express a folded-hash probe.
-    other: Option<indexmap::IndexSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>>,
+    /// A bare `hashbrown::HashTable` rather than a set type, because every set
+    /// available here does strictly more work for this access pattern:
+    ///
+    /// * `IndexSet` keeps an insertion-ordered `Vec` of entries beside the hash
+    ///   table, so it costs a **second allocation** on first insert and adds an
+    ///   indirection to every probe. This set is never iterated (only insert /
+    ///   contains / remove / is_empty), so that ordering buys nothing.
+    /// * `std::collections::HashSet` cannot express a case-folded probe from a
+    ///   `&str` at all: its `Borrow` bound requires the borrowed form to hash
+    ///   identically, and `str`'s own `Hash` is case-sensitive.
+    ///
+    /// `HashTable` takes the hash as a plain argument, and a `Key` already
+    /// carries its folded hash, so lookups by `&Key` do **no hashing whatever**
+    /// and lookups by `&str` call [`fold_hash`] once with no `BuildHasher`
+    /// round-trip. That is the whole reason this type exists in hashbrown.
+    ///
+    /// [`fold_hash`]: cfml_common::key::fold_hash
+    other: hashbrown::HashTable<cfml_common::key::Key>,
 }
 
 impl InheritedKeys {
@@ -2938,9 +2953,18 @@ impl InheritedKeys {
         }
     }
 
-    /// Insert from a `&Key` — the hot path. No allocation: `Key::clone` is an
-    /// `Arc` refcount bump, and the set itself is only built once per frame that
-    /// actually has a non-structural key (0.80 of Preside frames).
+    /// The rehash closure `hashbrown::HashTable` needs when it grows. A `Key`
+    /// already knows its folded hash, so this never touches the string.
+    #[inline]
+    fn key_hash(k: &cfml_common::key::Key) -> u64 {
+        k.hash_value()
+    }
+
+    /// Insert from a `&Key` — the hot path. No allocation and **no hashing**:
+    /// `Key::clone` is an `Arc` refcount bump and the hash is already computed,
+    /// so the whole insert is one table probe. The table itself is built once
+    /// per frame that actually has a non-structural key (0.80 of Preside
+    /// frames); the rest never allocate here at all.
     #[inline]
     fn insert_key(&mut self, k: &cfml_common::key::Key) {
         if let Some(bit) = Self::structural_bit(k.as_str()) {
@@ -2953,11 +2977,13 @@ impl InheritedKeys {
             if cfml_common::perf_counters::enabled() {
                 use cfml_common::perf_counters as pc;
                 pc::bump(&pc::IK_INSERT_STRING);
-                if self.other.is_none() {
+                if self.other.is_empty() {
                     pc::bump(&pc::IK_SET_CREATED);
                 }
             }
-            self.other.get_or_insert_with(Default::default).insert(k.clone());
+            self.other
+                .entry(k.hash_value(), |e| e == k, Self::key_hash)
+                .or_insert_with(|| k.clone());
         }
     }
 
@@ -2975,13 +3001,17 @@ impl InheritedKeys {
             if cfml_common::perf_counters::enabled() {
                 use cfml_common::perf_counters as pc;
                 pc::bump(&pc::IK_INSERT_STRING);
-                if self.other.is_none() {
+                if self.other.is_empty() {
                     pc::bump(&pc::IK_SET_CREATED);
                 }
             }
             self.other
-                .get_or_insert_with(Default::default)
-                .insert(cfml_common::key::Key::new(k));
+                .entry(
+                    cfml_common::key::fold_hash(k),
+                    |e| e.as_str().eq_ignore_ascii_case(k),
+                    Self::key_hash,
+                )
+                .or_insert_with(|| cfml_common::key::Key::new(k));
         }
     }
 
@@ -2989,10 +3019,33 @@ impl InheritedKeys {
     fn contains(&self, k: &str) -> bool {
         if let Some(bit) = Self::structural_bit(k) {
             self.structural & bit != 0
+        } else if self.other.is_empty() {
+            // The overwhelmingly common shape. Checked before hashing so an
+            // empty set costs a load and a branch, as it did when this field
+            // was an `Option`.
+            false
         } else {
             self.other
-                .as_ref()
-                .is_some_and(|s| s.contains(&cfml_common::key::KeyRef::new(k)))
+                .find(cfml_common::key::fold_hash(k), |e| {
+                    e.as_str().eq_ignore_ascii_case(k)
+                })
+                .is_some()
+        }
+    }
+
+    /// Drop `k` from the data half only. Split out because `remove_ci` must run
+    /// it even for a name that `structural_bit` matches: a key inserted in a
+    /// different casing (`THIS`) misses the bitmask and lands here, and the
+    /// `HashSet<String>` original cleared both halves unconditionally.
+    #[inline]
+    fn remove_data(&mut self, k: &str) {
+        if self.other.is_empty() {
+            return;
+        }
+        if let Ok(entry) = self.other.find_entry(cfml_common::key::fold_hash(k), |e| {
+            e.as_str().eq_ignore_ascii_case(k)
+        }) {
+            entry.remove();
         }
     }
 
@@ -3000,8 +3053,8 @@ impl InheritedKeys {
     fn remove(&mut self, k: &str) {
         if let Some(bit) = Self::structural_bit(k) {
             self.structural &= !bit;
-        } else if let Some(s) = self.other.as_mut() {
-            s.swap_remove(&cfml_common::key::KeyRef::new(k));
+        } else {
+            self.remove_data(k);
         }
     }
 
@@ -3017,14 +3070,12 @@ impl InheritedKeys {
                 self.structural &= !Self::structural_bit(s).unwrap();
             }
         }
-        if let Some(set) = self.other.as_mut() {
-            set.swap_remove(&cfml_common::key::KeyRef::new(name));
-        }
+        self.remove_data(name);
     }
 
     #[inline]
     fn has_data_keys(&self) -> bool {
-        self.other.as_ref().is_some_and(|s| !s.is_empty())
+        !self.other.is_empty()
     }
 
     /// Arc this set for `frame_ctx`. Structural-only shapes (the overwhelmingly
@@ -3039,7 +3090,7 @@ impl InheritedKeys {
             std::array::from_fn(|i| {
                 Arc::new(InheritedKeys {
                     structural: i as u8,
-                    other: None,
+                    other: hashbrown::HashTable::new(),
                 })
             })
         });

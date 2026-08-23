@@ -61,19 +61,23 @@ pub static WB_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// `InheritedKeys` inserts that took the ZERO-ALLOCATION structural bitmask path
 /// (`this` / `__variables` / `super` / `variables`).
 ///
-/// Sizes the per-frame inherited-key set. DHAT prices a synthetic
-/// `function leaf(a,b){return a+b}` frame at ~23 allocations, of which
-/// **`InheritedKeys::insert` is 11** — a `HashSet<String>` that pays a
-/// `k.to_string()` per key and re-grows from empty every frame. But the
-/// synthetic's page frame inherits real page variables, while Preside is mostly
-/// CFC methods whose inherited keys may be almost entirely structural and
-/// therefore already free. These two counters decide whether the lever exists on
-/// the workload that matters, before any of it is built.
+/// These three sized the per-frame inherited-key set, and are kept because they
+/// are how any further change to it gets checked. What they found: DHAT priced a
+/// synthetic `function leaf(a,b){return a+b}` frame at ~23 allocations, of which
+/// the then-`HashSet<String>` `InheritedKeys::insert` was **11** — a
+/// `k.to_string()` per key, re-grown from empty every frame. ⚠️ That synthetic
+/// **overstated the site by 6×**: its page frame inherits real page variables,
+/// whereas Preside is mostly CFC methods whose inherited keys are largely
+/// structural and so already free (6.21 structural against 2.06 String inserts
+/// per frame). Never size this from a synthetic alone.
 pub static IK_INSERT_STRUCTURAL: AtomicU64 = AtomicU64::new(0);
-/// `InheritedKeys` inserts that allocated: a `String` per key, plus hashbrown
-/// growth. This is the number the lever would remove.
+/// `InheritedKeys` inserts that went to the hash table rather than the bitmask.
+/// No longer one allocation each — v0.617.0 made the table hold interned `Key`s,
+/// so an insert from a `&Key` is a refcount bump — but still the count that
+/// decides whether the table is built for a frame at all.
 pub static IK_INSERT_STRING: AtomicU64 = AtomicU64::new(0);
-/// Frames that created the backing `HashSet` at all (first non-structural key).
+/// Frames that populated the backing table at all (first non-structural key),
+/// which is exactly the frames that pay its one allocation.
 pub static IK_SET_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Frames that reached the diff and were skipped by the v0.600.0 futility guard
 /// (locals untouched since entry) — already-harvested win, not available again.

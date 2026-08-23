@@ -26,6 +26,7 @@ cfml-sanitize = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-stdlib = { workspace = true, default-features = false, optional = true }
 indexmap = { workspace = true }
+hashbrown = { workspace = true }
 cfml-codegen = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

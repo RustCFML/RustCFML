@@ -81,5 +81,34 @@ function realLocalIsLocal() {
 assertTrue("a genuine var-declared local IS in `local` under any casing",
            realLocalIsLocal());
 
+// --- 8. `var`-declaring a name that was INHERITED reclaims it as a real local
+//        (GH #243), and does so case-insensitively. This is the one path that
+//        REMOVES from the inherited-key set rather than probing it, so it is the
+//        half case 7 cannot cover. Verified on Lucee 7.1.0. ---
+Shadowed = "page";
+function reclaimsInherited() {
+    var shadowed = "mine";
+    return structKeyExists( local, "Shadowed" ) && local.SHADOWED == "mine";
+}
+assertTrue("a var-declared name that was inherited becomes a real local, whatever the casing",
+           reclaimsInherited());
+
+// --- 9. ...and being a real local, it must NOT be written back to the caller.
+//        Lucee 7.1.0 returns "page" for BOTH of these. We currently return
+//        "page" only when the casings match: `declared_locals` is a
+//        case-SENSITIVE HashSet<String>, while the writeback loop probes it
+//        with the key's casing as stored in `locals` -- which is the CALLER's
+//        casing, a third variant `op_declare_local` never inserted. So
+//        `var fileName` fails to shield a caller's `filename`.
+//
+//        Only the agreed case is asserted here; the divergent one is left to
+//        the fix that makes `declared_locals` case-insensitive, which is where
+//        its regression test belongs. Do NOT "fix" this file by asserting the
+//        current behaviour -- that would pin the bug. ---
+sameCasing = "page";
+function declaresSameCasing() { var sameCasing = "mine"; return 1; }
+declaresSameCasing();
+assert("a var-declared local is not written back to the caller", sameCasing, "page");
+
 suiteEnd();
 </cfscript>
