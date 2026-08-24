@@ -60,8 +60,18 @@ pub struct DatasourceStore {
     /// request that changes nothing skips the DB round-trip until ~25% of the
     /// timeout has elapsed. Keyed by partition so two apps sharing a CFID don't
     /// share a throttle entry.
+    /// Entries are dropped when the record is removed, rotated or reaped —
+    /// but the reaper can be switched off (`reapIntervalSecs = 0`), so the
+    /// map is also bounded by [`TOUCH_CACHE_MAX`] below.
     touch_cache: Mutex<HashMap<String, (u64, u64)>>,
 }
+
+/// Upper bound on the touch-throttle cache. It holds pure optimisation state,
+/// so the cheapest safe eviction is to drop the lot: the next `set` for each
+/// live session performs one write it might have skipped, and the cache
+/// refills. Without this the map grows one entry per session ever written on
+/// a server whose reaper is disabled.
+const TOUCH_CACHE_MAX: usize = 10_000;
 
 impl DatasourceStore {
     /// Construct a datasource session store. `table` is sanitised to a safe
@@ -177,6 +187,29 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// Change-detection hash over a record's CONTENT — deliberately excluding the
+/// access timestamps.
+///
+/// Hashing the whole serialised `SessionData` (what this used to do) made the
+/// touch-write throttle in `set` dead code: every caller stamps
+/// `last_accessed_secs = now` immediately before writing, so any two requests
+/// more than a second apart produced different hashes and the UPDATE always
+/// ran (issue #361). Sliding expiry is not lost by ignoring the timestamps —
+/// that is exactly what the `exp - prev_exp >= quarter` check alongside this
+/// is for.
+///
+/// `fallback_json` is the full serialisation the caller already computed; it
+/// carries the timestamps, so falling back to it can only ever force a write.
+fn content_hash(data: &SessionData, fallback_json: &str) -> u64 {
+    let mut probe = data.clone();
+    probe.created_secs = 0;
+    probe.last_accessed_secs = 0;
+    match serde_json::to_string(&probe) {
+        Ok(j) => hash_str(&j),
+        Err(_) => hash_str(fallback_json),
+    }
+}
+
 /// Read the single `data` cell out of an `array`-returntype query result.
 fn first_data_cell(result: CfmlResult) -> Option<String> {
     let val = result.ok()?;
@@ -216,6 +249,12 @@ impl SessionStore for DatasourceStore {
         true
     }
 
+    // Every `get` is a SQL round trip — the VM must memo the record per
+    // request rather than re-read it (issue #361).
+    fn reads_are_cheap(&self) -> bool {
+        false
+    }
+
     fn get(&self, app: &str, id: &str) -> Option<SessionData> {
         self.ensure_schema();
         let part = self.part(app);
@@ -248,7 +287,7 @@ impl SessionStore for DatasourceStore {
         };
         size_guard(id, &json);
         let exp = expires_at(&data);
-        let new_hash = hash_str(&json);
+        let new_hash = content_hash(&data, &json);
         let ck = Self::cache_key(&part, id);
 
         // Throttle: if neither the data nor a meaningful slice of the timeout
@@ -299,6 +338,9 @@ impl SessionStore for DatasourceStore {
         }
 
         if let Ok(mut cache) = self.touch_cache.lock() {
+            if cache.len() >= TOUCH_CACHE_MAX && !cache.contains_key(&ck) {
+                cache.clear();
+            }
             cache.insert(ck, (exp, new_hash));
         }
     }
@@ -558,6 +600,104 @@ mod tests {
         assert!(store.take_expired(now).is_empty());
         // The live session survives.
         assert!(store.get("shop", "live").is_some());
+    }
+
+    /// Overwrite a row's `data` cell behind the store's back, so a later
+    /// `store.get()` tells us whether the store's own UPDATE ran.
+    fn poke_data(store: &DatasourceStore, app: &str, id: &str, data: &SessionData) {
+        let json = serde_json::to_string(data).unwrap();
+        let sql = format!(
+            "UPDATE {t} SET data = ? WHERE cfid = ? AND app_name = ?",
+            t = store.table
+        );
+        store
+            .run(
+                &sql,
+                vec![
+                    CfmlValue::string(json),
+                    CfmlValue::string(id.to_string()),
+                    CfmlValue::string(app.to_string()),
+                ],
+                "query",
+            )
+            .expect("poke update should run");
+    }
+
+    /// Issue #361: the touch-write throttle must actually fire. It never did,
+    /// because the change-detection hash covered the whole serialised record —
+    /// including `last_accessed_secs`, which every caller stamps to `now`
+    /// immediately before the write.
+    #[test]
+    fn touch_only_write_is_throttled() {
+        let store = store_for("throttle");
+        let now = now_secs();
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(3))], now, 1800));
+
+        // Sentinel written behind the store's back.
+        poke_data(&store, "appA", "sid", &session(&[("cart", CfmlValue::string("SENTINEL"))], now, 1800));
+
+        // Same content, later access stamp, well inside a quarter of the
+        // timeout (1800 / 4 = 450s) → must NOT hit the database.
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(3))], now + 60, 1800));
+
+        assert_eq!(
+            store.get("appA", "sid").unwrap().variables.get("cart").unwrap().as_string(),
+            "SENTINEL",
+            "a touch-only set must be skipped, leaving the row untouched"
+        );
+    }
+
+    #[test]
+    fn changed_data_defeats_the_throttle() {
+        let store = store_for("throttle_data");
+        let now = now_secs();
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(3))], now, 1800));
+        poke_data(&store, "appA", "sid", &session(&[("cart", CfmlValue::string("SENTINEL"))], now, 1800));
+
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(9))], now + 60, 1800));
+
+        assert_eq!(
+            store.get("appA", "sid").unwrap().variables.get("cart").unwrap().as_string(),
+            "9",
+            "a real data change must always be written"
+        );
+    }
+
+    #[test]
+    fn sliding_expiry_still_writes_past_a_quarter_of_the_timeout() {
+        let store = store_for("throttle_slide");
+        let now = now_secs();
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(3))], now, 1800));
+        poke_data(&store, "appA", "sid", &session(&[("cart", CfmlValue::string("SENTINEL"))], now, 1800));
+
+        // Unchanged content, but the expiry has moved by more than 1800/4 —
+        // the write must go through so the row does not silently time out.
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(3))], now + 500, 1800));
+
+        assert_eq!(
+            store.get("appA", "sid").unwrap().variables.get("cart").unwrap().as_string(),
+            "3",
+            "the sliding-expiry refresh must still reach the database"
+        );
+    }
+
+    /// The auth fields are content, not bookkeeping — a login with otherwise
+    /// identical `variables` must not be throttled away.
+    #[test]
+    fn auth_change_defeats_the_throttle() {
+        let store = store_for("throttle_auth");
+        let now = now_secs();
+        store.set("appA", "sid", session(&[("cart", CfmlValue::Int(3))], now, 1800));
+
+        let mut logged_in = session(&[("cart", CfmlValue::Int(3))], now + 1, 1800);
+        logged_in.auth_user = Some("alice".to_string());
+        store.set("appA", "sid", logged_in);
+
+        assert_eq!(
+            store.get("appA", "sid").unwrap().auth_user.as_deref(),
+            Some("alice"),
+            "a cflogin must always be written"
+        );
     }
 
     #[test]

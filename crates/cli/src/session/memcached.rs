@@ -60,6 +60,12 @@ mod inner {
             true
         }
 
+        // Every `get` is a network round trip — the VM must memo the record
+        // per request rather than re-read it (issue #361).
+        fn reads_are_cheap(&self) -> bool {
+            false
+        }
+
         fn get(&self, app: &str, id: &str) -> Option<SessionData> {
             let raw: Option<String> = self.client.get(&self.key(app, id)).ok().flatten();
             raw.and_then(|s| serde_json::from_str(&s).ok())

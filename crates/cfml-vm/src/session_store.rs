@@ -32,6 +32,25 @@ pub trait SessionStore: Send + Sync + 'static {
     fn contains(&self, app: &str, id: &str) -> bool {
         self.get(app, id).is_some()
     }
+
+    /// Whether `get` is an in-process lookup a caller may repeat freely.
+    ///
+    /// True for the default memory store and the cluster store (a mutex and a
+    /// map read). False for the stores that charge a network round trip per
+    /// read — datasource and memcached — where the request path must load the
+    /// record once and reuse it (issue #361: a logged-in request was issuing
+    /// one SELECT per `isUserLoggedIn`, plus three more for the touch, the
+    /// scope attach and the end-of-request persist).
+    ///
+    /// The VM keys its per-request session memo off this, so a store that
+    /// answers `true` keeps the pre-existing behaviour of re-reading the record
+    /// at every use — which slightly narrows the window in which a concurrent
+    /// request's `cflogin` can be clobbered. Stores that answer `false` are
+    /// already documented last-write-wins whole-blob, so the memo does not
+    /// change their concurrency model.
+    fn reads_are_cheap(&self) -> bool {
+        true
+    }
     /// Drain all sessions whose `last_accessed_secs` age exceeds their
     /// `timeout_secs`, returning `(app_name, id, variables)` per drained
     /// session so callers can route `onSessionEnd` to the owning application.

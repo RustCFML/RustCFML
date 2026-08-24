@@ -2132,6 +2132,24 @@ pub struct CfmlVirtualMachine {
     /// session is established and synced back at request end. `None` until a
     /// session exists this request.
     session_scope: Option<CfmlStruct>,
+    /// Per-request memo of the session STORE record for `(application, session
+    /// id)` — `None` = not yet loaded, `Some((app, sid, record))` = loaded, with
+    /// an inner `None` meaning "no such record".
+    ///
+    /// The out-of-process stores (datasource, cluster) go over the wire for
+    /// every `get()`, and a single request reads the same record over and over:
+    /// the start-of-request touch, the scope attach, every
+    /// `isUserLoggedIn`/`isUserInRole`/`getAuthUser`/`sessionGetMetadata` call,
+    /// and the end-of-request persist. Before this memo a logged-in Preside
+    /// request could issue dozens of identical SELECTs (issue #361).
+    ///
+    /// A fresh VM is built per request, so this lives exactly as long as the
+    /// request. It is behind a `Mutex` only so the `&self` read paths
+    /// (`get_session_scope`) can use it; contention is impossible in practice.
+    /// Every write path refreshes it, so it never serves a value this request
+    /// itself has superseded. Cross-request staleness is not a new risk: these
+    /// stores are documented last-write-wins whole-blob.
+    session_record_cache: Mutex<Option<(String, String, Option<SessionData>)>>,
     /// Set when `applicationStop()` has torn down the attached application during
     /// this request, so the end-of-request writeback does not resurrect it.
     application_stopped: bool,
@@ -3347,6 +3365,7 @@ impl CfmlVirtualMachine {
             application_scope: None,
             server_scope: CfmlStruct::empty(),
             session_scope: None,
+            session_record_cache: Mutex::new(None),
             current_application_name: None,
             application_stopped: false,
             server_state: None,
@@ -18485,6 +18504,7 @@ impl CfmlVirtualMachine {
                     {
                         state.sessions.remove(self.current_application_name.as_deref().unwrap_or(""), sid);
                     }
+                    self.invalidate_session_record_cache();
                     // Drop the live scope so subsequent reads see an empty session.
                     self.session_scope = None;
                     return Ok(CfmlValue::Null);
@@ -18501,6 +18521,7 @@ impl CfmlVirtualMachine {
                         state.sessions.rotate(self.current_application_name.as_deref().unwrap_or(""), old_sid, &new_sid);
                         self.session_id = Some(new_sid);
                     }
+                    self.invalidate_session_record_cache();
                     self.session_scope = None;
                     self.attach_session_scope();
                     return Ok(CfmlValue::Null);
@@ -18516,9 +18537,8 @@ impl CfmlVirtualMachine {
                 }
                 "sessiongetmetadata" => {
                     let mut meta = ValueMap::default();
-                    if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
-                    {
-                        if let Some(session) = state.sessions.get(self.current_application_name.as_deref().unwrap_or(""), sid) {
+                    if let Some(sid) = self.session_id.clone() {
+                        if let Some(session) = self.session_record() {
                             let now = now_epoch_secs();
                             meta.insert(
                                 "sessionId".to_string(),
@@ -18538,12 +18558,9 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "getauthuser" => {
-                    if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
-                    {
-                        if let Some(session) = state.sessions.get(self.current_application_name.as_deref().unwrap_or(""), sid) {
-                            if let Some(ref user) = session.auth_user {
-                                return Ok(CfmlValue::string(user.clone()));
-                            }
+                    if let Some(session) = self.session_record() {
+                        if let Some(ref user) = session.auth_user {
+                            return Ok(CfmlValue::string(user.clone()));
                         }
                     }
                     return Ok(CfmlValue::string(String::new()));
@@ -18652,11 +18669,8 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(found));
                 }
                 "isuserloggedin" => {
-                    if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
-                    {
-                        if let Some(session) = state.sessions.get(self.current_application_name.as_deref().unwrap_or(""), sid) {
-                            return Ok(CfmlValue::Bool(session.auth_user.is_some()));
-                        }
+                    if let Some(session) = self.session_record() {
+                        return Ok(CfmlValue::Bool(session.auth_user.is_some()));
                     }
                     return Ok(CfmlValue::Bool(false));
                 }
@@ -18665,13 +18679,9 @@ impl CfmlVirtualMachine {
                         .get(0)
                         .map(|v| v.as_string().to_lowercase())
                         .unwrap_or_default();
-                    if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
-                    {
-                        if let Some(session) = state.sessions.get(self.current_application_name.as_deref().unwrap_or(""), sid) {
-                            let has_role =
-                                session.auth_roles.iter().any(|r| r.to_lowercase() == role);
-                            return Ok(CfmlValue::Bool(has_role));
-                        }
+                    if let Some(session) = self.session_record() {
+                        let has_role = session.auth_roles.iter().any(|r| r.to_lowercase() == role);
+                        return Ok(CfmlValue::Bool(has_role));
                     }
                     return Ok(CfmlValue::Bool(false));
                 }
@@ -18704,11 +18714,10 @@ impl CfmlVirtualMachine {
                         .collect();
                     // Treat login as a session write → lazy-init.
                     self.lazy_init_session_if_pending();
-                    if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
-                    {
+                    if self.session_key().is_some() {
                         let now = now_epoch_secs();
                         let app = self.current_application_name.clone().unwrap_or_default();
-                        let mut session = state.sessions.get(&app, sid).unwrap_or_else(|| SessionData {
+                        let mut session = self.session_record().unwrap_or_else(|| SessionData {
                             variables: ValueMap::default(),
                             created_secs: now,
                             last_accessed_secs: now,
@@ -18719,19 +18728,15 @@ impl CfmlVirtualMachine {
                         });
                         session.auth_user = Some(name);
                         session.auth_roles = roles;
-                        state.sessions.set(&app, sid, session);
+                        self.store_session_record(session);
                     }
                     return Ok(CfmlValue::Null);
                 }
                 "__cflogout" => {
-                    if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
-                    {
-                        let app = self.current_application_name.as_deref().unwrap_or("");
-                        if let Some(mut session) = state.sessions.get(app, sid) {
-                            session.auth_user = None;
-                            session.auth_roles.clear();
-                            state.sessions.set(app, sid, session);
-                        }
+                    if let Some(mut session) = self.session_record() {
+                        session.auth_user = None;
+                        session.auth_roles.clear();
+                        self.store_session_record(session);
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -28304,31 +28309,25 @@ impl CfmlVirtualMachine {
         }
         self.session_lazy_initializing = true;
 
-        let sid = match self.session_id.clone() {
-            Some(s) if !s.is_empty() => s,
-            _ => {
-                let new_sid = uuid::Uuid::new_v4().to_string();
-                self.session_id = Some(new_sid.clone());
-                new_sid
-            }
-        };
+        // Mint an id if the request carried none — `store_session_record`
+        // keys off `self.session_id`, and the embedder reads it back to emit
+        // the Set-Cookie.
+        if !matches!(self.session_id, Some(ref s) if !s.is_empty()) {
+            self.session_id = Some(uuid::Uuid::new_v4().to_string());
+        }
 
-        if let Some(state) = self.server_state.clone() {
+        if self.server_state.is_some() {
             let now = now_epoch_secs();
             let app = self.current_application_name.clone().unwrap_or_default();
-            state.sessions.set(
-                &app,
-                &sid,
-                SessionData {
-                    variables: ValueMap::default(),
-                    created_secs: now,
-                    last_accessed_secs: now,
-                    auth_user: None,
-                    auth_roles: Vec::new(),
-                    timeout_secs: self.session_timeout_secs,
-                    app_name: app.clone(),
-                },
-            );
+            self.store_session_record(SessionData {
+                variables: ValueMap::default(),
+                created_secs: now,
+                last_accessed_secs: now,
+                auth_user: None,
+                auth_roles: Vec::new(),
+                timeout_secs: self.session_timeout_secs,
+                app_name: app.clone(),
+            });
         }
         self.session_record_created = true;
         self.session_lazy_pending = false;
@@ -28343,6 +28342,69 @@ impl CfmlVirtualMachine {
 
         self.session_lazy_initializing = false;
         true
+    }
+
+    /// Application partition + session id for the current request, when both
+    /// are established. The pair every session-store call is keyed by.
+    fn session_key(&self) -> Option<(String, String)> {
+        let sid = self.session_id.as_ref()?;
+        if sid.is_empty() {
+            return None;
+        }
+        Some((
+            self.current_application_name.clone().unwrap_or_default(),
+            sid.clone(),
+        ))
+    }
+
+    /// Read the current request's session-store record, going to the store at
+    /// most once per request. See [`session_record_cache`] — the out-of-process
+    /// stores charge a network round trip per `get()` and the request path asks
+    /// for the same record many times over (issue #361).
+    fn session_record(&self) -> Option<SessionData> {
+        let state = self.server_state.as_ref()?;
+        let (app, sid) = self.session_key()?;
+        // Stores whose reads are free keep re-reading, exactly as before —
+        // the memo exists to save round trips, not to change semantics.
+        if state.sessions.reads_are_cheap() {
+            return state.sessions.get(&app, &sid);
+        }
+        if let Ok(cache) = self.session_record_cache.lock() {
+            if let Some((c_app, c_sid, rec)) = cache.as_ref() {
+                if *c_app == app && *c_sid == sid {
+                    return rec.clone();
+                }
+            }
+        }
+        let rec = state.sessions.get(&app, &sid);
+        if let Ok(mut cache) = self.session_record_cache.lock() {
+            *cache = Some((app, sid, rec.clone()));
+        }
+        rec
+    }
+
+    /// Write the current request's session-store record and refresh the memo,
+    /// so a later read this request sees what we just wrote rather than
+    /// re-fetching it.
+    fn store_session_record(&self, data: SessionData) {
+        let Some(state) = self.server_state.as_ref() else {
+            return;
+        };
+        let Some((app, sid)) = self.session_key() else {
+            return;
+        };
+        state.sessions.set(&app, &sid, data.clone());
+        if let Ok(mut cache) = self.session_record_cache.lock() {
+            *cache = Some((app, sid, Some(data)));
+        }
+    }
+
+    /// Forget the memo. Called when the record is destroyed or re-keyed
+    /// (`sessionInvalidate`, `sessionRotate`) so the next read re-resolves.
+    fn invalidate_session_record_cache(&self) {
+        if let Ok(mut cache) = self.session_record_cache.lock() {
+            *cache = None;
+        }
     }
 
     /// Load the live session scope from the session store into `session_scope`
@@ -28363,18 +28425,10 @@ impl CfmlVirtualMachine {
         // empty struct and writes through the "scope pointer" pattern
         // (`var p = session; p[k]=v; … session[k]`) vanished — WireBox
         // session-scoped singletons never cached.
-        let vars = if let (Some(ref state), Some(ref sid)) =
-            (&self.server_state, &self.session_id)
-        {
-            let app = self.current_application_name.as_deref().unwrap_or("");
-            state
-                .sessions
-                .get(app, sid)
-                .map(|s| s.variables)
-                .unwrap_or_default()
-        } else {
-            ValueMap::default()
-        };
+        let vars = self
+            .session_record()
+            .map(|s| s.variables)
+            .unwrap_or_default();
         self.session_scope = Some(CfmlStruct::new(vars));
     }
 
@@ -28404,10 +28458,10 @@ impl CfmlVirtualMachine {
         if self.session_store_serializes() {
             validate_session_data_only(&snap)?;
         }
-        if let (Some(state), Some(sid)) = (self.server_state.clone(), self.session_id.clone()) {
+        if self.server_state.is_some() && self.session_key().is_some() {
             let now = now_epoch_secs();
             let app = self.current_application_name.clone().unwrap_or_default();
-            let existing = state.sessions.get(&app, &sid);
+            let existing = self.session_record();
             // Read-only access must NOT materialise a record (the Preside-CMS
             // defensive-read pattern). Reading `session` now attaches an empty
             // live scope; if nothing was written into it and no record exists,
@@ -28430,7 +28484,7 @@ impl CfmlVirtualMachine {
             });
             session.variables = snap;
             session.last_accessed_secs = now;
-            state.sessions.set(&app, &sid, session);
+            self.store_session_record(session);
         }
         Ok(())
     }
@@ -28442,11 +28496,8 @@ impl CfmlVirtualMachine {
         if let Some(ref ss) = self.session_scope {
             return CfmlValue::Struct(ss.clone());
         }
-        if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
-            let app = self.current_application_name.as_deref().unwrap_or("");
-            if let Some(session) = state.sessions.get(app, sid) {
-                return CfmlValue::strukt(session.variables.clone());
-            }
+        if let Some(session) = self.session_record() {
+            return CfmlValue::strukt(session.variables.clone());
         }
         CfmlValue::strukt(ValueMap::default())
     }
@@ -35382,18 +35433,20 @@ impl CfmlVirtualMachine {
             // `self.session_timeout_secs`, which otherwise keeps the 1800s
             // default and ignores `this.sessionTimeout`.
             self.session_timeout_secs = session_timeout;
-            if let Some(ref server_state) = self.server_state.clone() {
+            if self.server_state.is_some() {
                 let sid = self.session_id.clone().unwrap_or_default();
                 let has_sid = !sid.is_empty();
-                let record_exists = has_sid && server_state.sessions.contains(&app_name, &sid);
+                // ONE read, not `contains()` + `get()`. On the datasource store
+                // `contains()` is literally `get(..).is_some()`, so the pair was
+                // two identical SELECTs — a wasted network round trip on every
+                // request that carried a cookie (issue #361).
+                let existing = if has_sid { self.session_record() } else { None };
 
-                if record_exists {
+                if let Some(mut session) = existing {
                     // Existing session: bump last_accessed, no lifecycle fire.
-                    if let Some(mut session) = server_state.sessions.get(&app_name, &sid) {
-                        session.last_accessed_secs = now_epoch_secs();
-                        session.timeout_secs = session_timeout;
-                        server_state.sessions.set(&app_name, &sid, session);
-                    }
+                    session.last_accessed_secs = now_epoch_secs();
+                    session.timeout_secs = session_timeout;
+                    self.store_session_record(session);
                 } else if lazy_session_creation {
                     // Lazy: defer record creation + onSessionStart until
                     // the first write to session scope. Keep any cookie
@@ -35404,27 +35457,19 @@ impl CfmlVirtualMachine {
                     // Mint a fresh id if the embedder didn't supply one
                     // (e.g. a request with no CFID cookie). The embedder
                     // reads `vm.session_id` back to emit Set-Cookie.
-                    let sid = if has_sid {
-                        sid
-                    } else {
-                        let new_sid = uuid::Uuid::new_v4().to_string();
-                        self.session_id = Some(new_sid.clone());
-                        new_sid
-                    };
+                    if !has_sid {
+                        self.session_id = Some(uuid::Uuid::new_v4().to_string());
+                    }
                     let now = now_epoch_secs();
-                    server_state.sessions.set(
-                        &app_name,
-                        &sid,
-                        SessionData {
-                            variables: ValueMap::default(),
-                            created_secs: now,
-                            last_accessed_secs: now,
-                            auth_user: None,
-                            auth_roles: Vec::new(),
-                            timeout_secs: session_timeout,
-                            app_name: app_name.clone(),
-                        },
-                    );
+                    self.store_session_record(SessionData {
+                        variables: ValueMap::default(),
+                        created_secs: now,
+                        last_accessed_secs: now,
+                        auth_user: None,
+                        auth_roles: Vec::new(),
+                        timeout_secs: session_timeout,
+                        app_name: app_name.clone(),
+                    });
                     self.session_record_created = true;
                     let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
                 }
