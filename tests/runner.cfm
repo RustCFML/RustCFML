@@ -328,6 +328,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_spreadsheet.cfm">
 <cf_runtest file="stdlib/test_member_function_coverage.cfm">
 <cf_runtest file="stdlib/test_locale_state.cfm">
+<cf_runtest file="stdlib/test_binary_as_array.cfm">
 
 <!--- --- Function References --- --->
 <cf_runtest file="functions/test_function_references.cfm">
@@ -712,6 +713,7 @@ include "harness.cfm";
 <!--- modes fail their assertions without taking down the run. --->
 <cf_runtest file="core/test_classic_localmode_writeback.cfm">
 <cf_runtest file="core/test_local_at_template_scope.cfm">
+<cf_runtest file="core/test_local_at_page_scope.cfm">
 <!--- - local_scope_absence_leak: a callee that never declares `local.rv` must --->
 <!--- get a fresh, EMPTY local — StructKeyExists(local, "rv") false and --->
 <!--- isNull(local.rv) true even when the caller holds a same-named local.rv. --->

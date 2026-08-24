@@ -2311,6 +2311,29 @@ impl CfmlValue {
         CfmlValue::Struct(CfmlStruct::new_untracked(m))
     }
 
+    /// GH #340 — a binary viewed as an array.
+    ///
+    /// On Lucee a `Binary` IS a Java `byte[]`, so the array BIFs operate on it
+    /// directly and its elements are **signed** bytes (`0xFF` reads back as
+    /// `-1`, not `255`). This is the same shape `String.getBytes()` already
+    /// returns here (GH #271, `java_shims::bytes_to_signed_array`).
+    ///
+    /// Returns the equivalent `CfmlValue::Array`, or `None` when `self` is not
+    /// `Binary` — so a caller can write `v.binary_as_byte_array().unwrap_or(v)`
+    /// and leave every other type untouched.
+    ///
+    /// This is a fresh COPY, not a view: mutating the result does not write
+    /// back into the binary. Lucee's in-place `b[1] = 99` element write is
+    /// therefore still a divergence (see `docs/known-issues.md`).
+    pub fn binary_as_byte_array(&self) -> Option<CfmlValue> {
+        match self {
+            CfmlValue::Binary(b) => Some(CfmlValue::array(
+                b.iter().map(|byte| CfmlValue::Int(*byte as i8 as i64)).collect(),
+            )),
+            _ => None,
+        }
+    }
+
     /// Borrow the shared array handle (no copy). Mutating through it is visible
     /// to all aliases. Returns `None` for non-arrays (QueryColumn excluded).
     pub fn as_cfml_array(&self) -> Option<&CfmlArray> {

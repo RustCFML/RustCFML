@@ -468,7 +468,12 @@ pub(crate) fn op_try_load_local(
     // Safe load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
     // Same zero-alloc lowercase guard as LoadLocal.
     let name_lower: &str = name.lower();
-    let val = if name_lower == "local" {
+    // GH #351: `local` names the SCOPE only in a frame that owns one. At page
+    // level / in a pseudo-constructor the "locals" map IS the page `variables`
+    // scope, so building a scope view here handed back every page variable — and
+    // for `local.x = v`'s TryLoadLocal base it handed back a map that already
+    // contained the `local` key itself, nesting it one level deeper per write.
+    let val = if name_lower == "local" && vm.current_frame_has_local_scope() {
         // PR #93: per-frame `local` — only keys established here.
         CfmlValue::strukt(CfmlVirtualMachine::build_local_scope_view(
             &locals,
@@ -524,6 +529,38 @@ pub(crate) fn op_load_local_key(
             stack.push(v.clone());
             return Ok(());
         }
+    }
+    // GH #351 — a frame with NO function `local` scope (a top-level page, a CFC
+    // pseudo-constructor) has no local view to read a key out of: there `local`
+    // is an ordinary variable, so `local.foo` is a member read of whatever that
+    // variable holds. Codegen cannot tell the two apart (a template `include`d
+    // from inside a function compiles as `__main__` but DOES share the caller's
+    // scope), so it emits this op at every depth and the decision is made here.
+    if !vm.current_frame_has_local_scope() {
+        let base = vm.lookup_name_in_scopes(
+            &cfml_common::name::Name::intern("local"),
+            "local",
+            locals,
+        );
+        let val = base.as_ref().and_then(|b| match b {
+            CfmlValue::Struct(st) => st.get_ci(prop_name.as_str()),
+            _ => None,
+        });
+        match val {
+            Some(v) => stack.push(v),
+            // Same throw/Null split as the local-scope path below: the strict op
+            // reports the missing member, the Try* twin reads Null.
+            None if matches!(
+                op,
+                BytecodeOp::LoadLocalKey(_) | BytecodeOp::LoadSlotKey(..)
+            ) =>
+            {
+                let cip = vm.raise_undefined_member(prop_name, stack)?;
+                *ip = cip;
+            }
+            None => stack.push(CfmlValue::Null),
+        }
+        return Ok(());
     }
     // Fused LoadLocal("local") + GetProperty for an explicit
     // `local.foo` read. Reads the single member directly from
@@ -1007,3 +1044,59 @@ pub(crate) fn op_load_super(
     Ok(())
 }
 
+/// `StoreLocalScopeKey` — `local.X = v` compiled at template level (GH #351).
+///
+/// See the opcode's own docs for why the choice cannot be made at compile time.
+/// When the frame owns a function `local` scope this is exactly what a function
+/// body compiles `local.X = v` to (declare the name frame-private, then store);
+/// when it does not, `local` is an ordinary variable that this write has to
+/// auto-vivify as a struct — which is what Lucee does when it creates
+/// `variables.local`.
+#[inline]
+pub(crate) fn op_store_local_scope_key(
+    vm: &mut CfmlVirtualMachine,
+    stack: &mut Vec<CfmlValue>,
+    locals: &mut ValueMap,
+    declared_locals: &mut DeclaredLocals,
+    inherited_or_param_keys: &mut InheritedKeys,
+    frame_has_local_scope: bool,
+    prop_name: &Name,
+) {
+    let Some(value) = stack.pop() else { return };
+    if frame_has_local_scope {
+        op_declare_local(declared_locals, inherited_or_param_keys, prop_name);
+        crate::scope_insert_ci_pub(locals, prop_name.as_str(), value);
+        return;
+    }
+    // No local scope: read-modify-write the ordinary `local` variable. In such a
+    // frame `locals` IS the page / component `variables` scope, so that variable
+    // lives right here.
+    match vm.lookup_local_name(locals, "local") {
+        Some(CfmlValue::Struct(st)) => {
+            // A live handle — mutate in place so aliases see the write, exactly
+            // as `s.x = v` on any other struct variable does. `insert` is
+            // case-insensitive (Key compares CI), matching CFML.
+            st.insert(prop_name.as_str().to_string(), value);
+        }
+        _ => {
+            let mut m = ValueMap::default();
+            m.insert(prop_name.as_str().to_string(), value);
+            let fresh = CfmlValue::strukt(m);
+            // Store where a bare `variables` READ resolves in this frame: the
+            // component scope under `__variables` when there is one (a CFC
+            // pseudo-constructor), otherwise the frame's own map (a page). Getting
+            // this wrong is invisible to `variables.local.x`, which walks the
+            // chain and finds it either way — but `structKeyExists( variables,
+            // "local" )` reads the materialized scope and would miss it.
+            match locals
+                .get_mut(&*cfml_common::key::well_known::VARIABLES)
+                .and_then(|v| v.as_cfml_struct())
+            {
+                Some(vars) => {
+                    vars.insert("local".to_string(), fresh);
+                }
+                None => crate::scope_insert_ci_pub(locals, "local", fresh),
+            }
+        }
+    }
+}

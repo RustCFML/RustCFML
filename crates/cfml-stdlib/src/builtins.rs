@@ -2341,11 +2341,38 @@ fn fn_cjustify(args: Vec<CfmlValue>) -> CfmlResult {
 // ARRAY FUNCTIONS
 // ===============================================
 
+/// GH #340 — let the read-only array BIFs see a binary as the `byte[]` it is on
+/// Lucee, with SIGNED elements (`0xFF` → `-1`).
+///
+/// Applied as the first line of each participating function rather than at a
+/// dispatch site, because there is no single dispatch site: `op_call_builtin`,
+/// `call_function`, member-function lookup and the higher-order intercepts all
+/// resolve builtins independently, and a coercion table duplicated across them
+/// would drift. One greppable line per function keeps the set enumerable.
+///
+/// Cost on the non-binary path is a single enum discriminant compare.
+///
+/// MUTATING array BIFs (`arrayAppend`, `arrayDeleteAt`, `arraySet`, …) are
+/// deliberately NOT in the set: a Java `byte[]` is fixed-size, so Lucee's
+/// `arrayAppend(binary, x)` leaves the value a 3-byte binary rather than
+/// growing it. Coercing there would silently turn the binary into a real array.
+#[inline]
+fn binary_arg0_as_array(mut args: Vec<CfmlValue>) -> Vec<CfmlValue> {
+    if let Some(v) = args.first() {
+        if let Some(arr) = v.binary_as_byte_array() {
+            args[0] = arr;
+        }
+    }
+    args
+}
+
 fn fn_array_new(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::array(Vec::new()))
 }
 
 fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.first() {
         Some(CfmlValue::Array(a)) => Ok(CfmlValue::Int(a.len() as i64)),
         // Lucee@7 parity: arrayLen(q.col) errors — column proxies are NOT arrays.
@@ -2531,6 +2558,8 @@ fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
 }
 
 fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let Some(arr) = args[0].as_array() {
             return Ok(CfmlValue::Bool(
@@ -2542,6 +2571,8 @@ fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_contains_no_case(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let Some(arr) = args[0].as_array() {
             return Ok(CfmlValue::Bool(
@@ -2553,6 +2584,8 @@ fn fn_array_contains_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
             for (i, v) in arr.iter().enumerate() {
@@ -2566,6 +2599,8 @@ fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
             for (i, v) in arr.iter().enumerate() {
@@ -2610,6 +2645,8 @@ fn fn_array_sort(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         // In-place reverse on the shared handle.
         arr.with_write(|v| v.reverse());
@@ -2620,6 +2657,8 @@ fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         // Pure: produces a new array.
         let snap = arr.snapshot();
@@ -2650,6 +2689,8 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_to_list(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         let delimiter = get_delimiter(&args, 1);
         let items: Vec<String> = arr.iter().map(|v| v.as_string()).collect();
@@ -2660,6 +2701,8 @@ fn fn_array_to_list(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_merge(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let (CfmlValue::Array(a), CfmlValue::Array(b)) = (&args[0], &args[1]) {
             // Pure: produces a new array (does not mutate either operand).
@@ -2692,6 +2735,8 @@ fn fn_array_clear(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         let idx = get_int(&args, 1) as usize;
         match &args[0] {
@@ -2761,6 +2806,8 @@ fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_min(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         let mut min = f64::INFINITY;
         for v in arr.iter() {
@@ -2774,6 +2821,8 @@ fn fn_array_min(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_max(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         let mut max = f64::NEG_INFINITY;
         for v in arr.iter() {
@@ -2787,6 +2836,8 @@ fn fn_array_max(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_avg(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         if arr.is_empty() { return Ok(CfmlValue::Int(0)); }
         let sum: f64 = arr.iter().map(|v| get_float(&[v.clone()], 0)).sum();
@@ -2797,6 +2848,8 @@ fn fn_array_avg(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_sum(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         let sum: f64 = arr.iter().map(|v| get_float(&[v.clone()], 0)).sum();
         Ok(CfmlValue::Double(sum))
@@ -2824,8 +2877,12 @@ fn fn_is_array(args: Vec<CfmlValue>) -> CfmlResult {
     // array (it is a hybrid array/struct): isArray(arguments) is true for
     // positional, named, and empty arg lists alike. Gated on the private
     // `__arguments_scope` marker so a plain numeric-keyed struct stays a struct.
+    // GH #340: a `Binary` IS a Java `byte[]` on Lucee, so `isArray(binary)` is
+    // true there — and `isBinary(binary)` stays true as well; the two are not
+    // exclusive. Existing `isArray(x) ? … : …` guards therefore take the array
+    // branch for a binary, which is the Lucee-faithful branch.
     let is = match args.first() {
-        Some(CfmlValue::Array(_)) => true,
+        Some(CfmlValue::Array(_)) | Some(CfmlValue::Binary(_)) => true,
         Some(CfmlValue::Struct(s)) => s.contains_key("__arguments_scope"),
         _ => false,
     };
@@ -2833,6 +2890,8 @@ fn fn_is_array(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.first() {
         Some(CfmlValue::Array(arr)) => Ok(CfmlValue::Bool(arr.is_empty())),
         _ => Ok(CfmlValue::Bool(true)),
@@ -2857,6 +2916,8 @@ fn fn_array_delete(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_find_all(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
             let indices: Vec<CfmlValue> = arr.iter().enumerate()
@@ -2870,6 +2931,8 @@ fn fn_array_find_all(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
             let indices: Vec<CfmlValue> = arr.iter().enumerate()
@@ -2883,6 +2946,8 @@ fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_first(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.first() {
         Some(CfmlValue::Array(arr)) => Ok(arr.first().unwrap_or(CfmlValue::Null)),
         _ => Err(CfmlError::runtime("arrayFirst: argument must be an array".to_string())),
@@ -2890,6 +2955,8 @@ fn fn_array_first(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_last(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.first() {
         Some(CfmlValue::Array(arr)) => Ok(arr.last().unwrap_or(CfmlValue::Null)),
         _ => Err(CfmlError::runtime("arrayLast: argument must be an array".to_string())),
@@ -16271,6 +16338,8 @@ fn fn_new_line(_args: Vec<CfmlValue>) -> CfmlResult {
 // ---- Array functions ----
 
 fn fn_array_index_exists(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             let idx = get_int(&args, 1) as usize;
@@ -16299,6 +16368,8 @@ fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_median(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             if arr.is_empty() {
@@ -16324,6 +16395,8 @@ fn fn_array_median(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             let snap = arr.snapshot();
@@ -16391,6 +16464,8 @@ fn fn_array_range(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_to_struct(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
+    let args = binary_arg0_as_array(args);
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             let mut map = ValueMap::default();

@@ -128,6 +128,13 @@ pub struct CfmlCompiler {
     /// but inside a function body `variables` refers to the local-scope merge or
     /// a CFC's `__variables` struct — different semantics entirely.
     function_depth: usize,
+    /// Nesting depth of code that owns a function `local` scope (GH #351).
+    ///
+    /// Bumped by declared functions AND by closure / arrow bodies, which
+    /// `function_depth` deliberately does not track. `local` is a reserved SCOPE
+    /// name only where this is > 0; at page level and in a CFC
+    /// pseudo-constructor it is an ordinary variable, exactly as on Lucee.
+    local_scope_depth: usize,
     /// Declared `localMode` of the function currently being compiled. Used so
     /// that closures defined inside that function inherit its declared mode
     /// when the closure itself doesn't carry an explicit attribute. `None` =
@@ -941,6 +948,26 @@ pub enum BytecodeOp {
     /// receiver variable OR a missing member reads as Null instead of throwing.
     TryLoadLocalProperty(Name, Name),
     TryLoadLocalKey(Name),
+    /// `local.X = v` compiled at TEMPLATE level (GH #351).
+    ///
+    /// Whether the frame owns a function `local` scope cannot be decided at
+    /// compile time: a template `include`d from INSIDE a function compiles as
+    /// `__main__` yet shares the caller's `local` scope at run time, while a
+    /// top-level page and a CFC pseudo-constructor have none at all. So this op
+    /// carries the decision to the VM:
+    ///
+    /// - frame HAS a local scope → identical to `DeclareLocal` + `StoreLocal`,
+    ///   the fast frame-key write a function body compiles directly.
+    /// - frame has NONE → `local` is an ordinary variable, so auto-vivify it as a
+    ///   struct and set the member (Lucee creates `variables.local`).
+    ///
+    /// Deliberately NOT lowered to the generic `LoadLocal("local")` /
+    /// `SetProperty` / `StoreLocal("local")` trio, which was the first attempt:
+    /// that round-trips the WHOLE scope view through a struct on every write,
+    /// spilling the frame's slots and re-syncing the closure env — the pattern
+    /// behind several historic Wheels stale-value bugs, and Wheels has hundreds
+    /// of `local.` sites in `.cfm` templates. It cost 75 spec errors there.
+    StoreLocalScopeKey(Name),
     SetProperty(Name), // Set object.property = value
     /// Mark a property name as accessor-private on the current frame's `this`
     /// component: its value was written by a generated `setX()` accessor, so
@@ -1328,11 +1355,12 @@ impl BytecodeOp {
             Self::CallRustSuperCtor(..) => 120,
             Self::CallBuiltin(..) => 121,
             Self::SeedArgumentKey(..) => 122,
+            Self::StoreLocalScopeKey(..) => 123,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 123] = [
+    pub const CENSUS_NAMES: [&'static str; 124] = [
         "Null",
         "True",
         "False",
@@ -1456,6 +1484,7 @@ impl BytecodeOp {
         "CallRustSuperCtor",
         "CallBuiltin",
         "SeedArgumentKey",
+        "StoreLocalScopeKey",
     ];
 }
 
@@ -1474,6 +1503,30 @@ fn is_direct_builtin(name: &str) -> bool {
     // `name` arrives in source casing; the declared lists are lowercase.
     let lower = name.to_ascii_lowercase();
     cfml_common::builtins_meta::is_pure_builtin(&lower)
+}
+
+
+impl CfmlCompiler {
+    /// GH #351 — is `local` a SCOPE in the code currently being compiled?
+    ///
+    /// Only inside a function body. At page level, and in a CFC
+    /// pseudo-constructor, Lucee has no `local` scope at all: `local` is an
+    /// ordinary variable name, so `local.foo = 1` creates a `variables.local`
+    /// struct and reading `local` before that throws "variable [local] doesn't
+    /// exist". The `local.X` fast paths below all compile the member to a
+    /// *frame* key (`StoreLocal`/`LoadLocalKey`), which at page level wrote
+    /// straight into page `variables` — code written that way worked here and
+    /// broke on the reference engine.
+    ///
+    /// When this is false the callers fall through to the generic
+    /// `LoadLocal("local")` path, which the VM resolves against the frame's
+    /// real local-scope status (`current_frame_has_local_scope`). That runtime
+    /// check is what keeps a template `include`d from INSIDE a function working:
+    /// it compiles as `__main__` (depth 0) but does own a shared `local` scope
+    /// at run time.
+    fn local_is_scope(&self) -> bool {
+        self.local_scope_depth > 0
+    }
 }
 
 impl CfmlCompiler {
@@ -1511,6 +1564,7 @@ impl CfmlCompiler {
             finally_stack: Vec::new(),
             catch_var_stack: Vec::new(),
             function_depth: 0,
+            local_scope_depth: 0,
             current_fn_local_mode: None,
             in_component_method: false,
             need_assign_value: false,
@@ -1793,6 +1847,15 @@ impl CfmlCompiler {
     }
 
     /// Scope keywords that must never be treated as plain mutable variables.
+    ///
+    /// ⚠️ This is the NARROWER of two lists with the same name. The free
+    /// [`is_reserved_scope_name`] at the top of this file additionally covers
+    /// `attributes`, `caller`, `cfthread`, `flash` and `thistag`. They are NOT
+    /// interchangeable: routing an `attributes.x` read through this one lowers it
+    /// to `TryLoadLocalProperty("attributes", "x")`, which reads a *local named
+    /// `attributes`* — inside a cfthread body nested in a custom tag that silently
+    /// picks up the custom tag's attributes instead of the thread's. Check which
+    /// one a call site uses before touching it.
     fn is_reserved_scope_name(name: &str) -> bool {
         matches!(name.to_lowercase().as_str(),
             "local" | "variables" | "arguments" | "this" | "super" | "request" |
@@ -2112,6 +2175,10 @@ impl CfmlCompiler {
                 // filter as the materialized-view read below, minus the clone —
                 // and slot-resolvable, see `emit_load_for_writeback`).
                 if let Expression::Identifier(ref ident) = **obj {
+                    // GH #351: emitted at EVERY depth. The op itself resolves
+                    // `local` against the frame's real local-scope status, so a
+                    // template included from inside a function keeps the caller's
+                    // scope while a true page reads the ordinary `local` variable.
                     if ident.name.eq_ignore_ascii_case("local") {
                         instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&member)));
                         return;
@@ -2170,6 +2237,10 @@ impl CfmlCompiler {
                 // TryLoadLocalProperty). Reserved-scope and nested roots recurse
                 // then TryGetProperty.
                 if let Expression::Identifier(ref ident) = *access.object {
+                    // GH #351: emitted at EVERY depth. The op itself resolves
+                    // `local` against the frame's real local-scope status, so a
+                    // template included from inside a function keeps the caller's
+                    // scope while a true page reads the ordinary `local` variable.
                     if ident.name.eq_ignore_ascii_case("local") {
                         instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&access.member)));
                         return;
@@ -2239,8 +2310,13 @@ impl CfmlCompiler {
                 // arm one level up, which is exactly the right write for it.
                 if let Expression::Identifier(ref ident) = *access.object {
                     if ident.name.eq_ignore_ascii_case("local") {
-                        instructions.push(BytecodeOp::DeclareLocal(Name::from(&access.member)));
-                        instructions.push(BytecodeOp::StoreLocal(Name::from(&access.member)));
+                        if self.local_is_scope() {
+                            instructions.push(BytecodeOp::DeclareLocal(Name::from(&access.member)));
+                            instructions.push(BytecodeOp::StoreLocal(Name::from(&access.member)));
+                        } else {
+                            // GH #351: template level — the VM decides.
+                            instructions.push(BytecodeOp::StoreLocalScopeKey(Name::from(&access.member)));
+                        }
                         return;
                     }
                 }
@@ -2299,6 +2375,10 @@ impl CfmlCompiler {
                 // and it has a slot twin, so a `local.a.b = v` write-back keeps
                 // the frame's slots alive.
                 if let Expression::Identifier(ref ident) = *access.object {
+                    // GH #351: emitted at EVERY depth. The op itself resolves
+                    // `local` against the frame's real local-scope status, so a
+                    // template included from inside a function keeps the caller's
+                    // scope while a true page reads the ordinary `local` variable.
                     if ident.name.eq_ignore_ascii_case("local") {
                         instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&access.member)));
                         return;
@@ -2515,8 +2595,14 @@ impl CfmlCompiler {
                 // over-ran (Lucee runs it fine). Only a single-segment key is
                 // normalized; deeper paths (`var local.a.b`, `var foo.bar`) are left
                 // untouched.
+                // GH #351: the `local.` strip is a FUNCTION-scope normalisation.
+                // At template level `local` is an ordinary variable and `var` is
+                // not legal there on Lucee anyway, so the strip only applies
+                // inside a function body.
                 let name = match var.name.to_lowercase().strip_prefix("local.") {
-                    Some(rest) if !rest.contains('.') => var.name[6..].to_string(),
+                    Some(rest) if !rest.contains('.') && self.local_is_scope() => {
+                        var.name[6..].to_string()
+                    }
                     _ => var.name.clone(),
                 };
                 instructions.push(BytecodeOp::DeclareLocal(Name::from(&name)));
@@ -2683,13 +2769,21 @@ impl CfmlCompiler {
                             if !is_reserved_scope_name(&ident.name) {
                                 instructions.push(BytecodeOp::StoreLocalProperty(Name::from(&ident.name),Name::from(&member),
                                 ));
-                            } else if ident.name.eq_ignore_ascii_case("local") {
+                            } else if ident.name.eq_ignore_ascii_case("local") && self.local_is_scope() {
+                                // GH #351: only inside a function body — see the
+                                // depth-0 branch below for why.
                                 // `local.X = v` is identical to `var X = v` in CFML —
                                 // function-frame scope, must NOT propagate to caller at
                                 // return. Compile to DeclareLocal + StoreLocal so the
                                 // classic-localmode writeback loop skips it (same as `var`).
                                 instructions.push(BytecodeOp::DeclareLocal(Name::from(&member)));
                                 instructions.push(BytecodeOp::StoreLocal(Name::from(&member)));
+                            } else if ident.name.eq_ignore_ascii_case("local") {
+                                // GH #351: template level — whether this frame
+                                // owns a `local` scope is a RUNTIME question, so
+                                // hand the decision to StoreLocalScopeKey rather
+                                // than guessing here.
+                                instructions.push(BytecodeOp::StoreLocalScopeKey(Name::from(&member)));
                             } else {
                                 self.compile_expression(obj, instructions);
                                 instructions.push(BytecodeOp::Swap);
@@ -3543,6 +3637,20 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
         instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
         instructions.push(BytecodeOp::GetIndex);
+        // GH #351: `for ( local.X in … )` at TEMPLATE level. `local` is an
+        // ordinary variable there, so the loop variable is `variables.local.X`
+        // and stripping the prefix would write a bare `X` that the body's
+        // `local.X` read never finds. That is exactly what broke Wheels'
+        // `WheelsTest.cfc` pseudo-constructor — `for (local.method in
+        // local.methods)` silently iterated with an unset `local.method`, so it
+        // injected NO methods into the spec and 75 specs failed with missing
+        // methods far from here. Hand the decision to the VM, as the assignment
+        // form does.
+        let template_local_key: Option<String> = for_in
+            .variable
+            .strip_prefix("local.")
+            .filter(|rest| !rest.contains('.') && !self.local_is_scope())
+            .map(|rest| rest.to_string());
         // Strip a leading `local.` prefix from the loop variable so it stores
         // as a simple local rather than a literal key containing a dot. A
         // subsequent `local.X` read resolves to that local via the normal
@@ -3552,7 +3660,9 @@ impl CfmlCompiler {
         } else {
             for_in.variable.clone()
         };
-        if loop_var_name.contains('.') {
+        if let Some(key) = template_local_key {
+            instructions.push(BytecodeOp::StoreLocalScopeKey(Name::from(&key)));
+        } else if loop_var_name.contains('.') {
             // Member-path loop variable (e.g. `ctx.item`, `this.wheels.folder`).
             // Lucee/ACF/BoxLang assign the iterated value through the path each
             // iteration. Emit a struct write-back chain: load the deepest
@@ -4017,6 +4127,8 @@ impl CfmlCompiler {
         let mut func_instructions = Vec::new();
 
         self.function_depth += 1;
+        // GH #351: a declared function body owns a `local` scope.
+        self.local_scope_depth += 1;
 
         // Save/restore the surrounding function's declared localMode so nested
         // closures inherit *this* function's mode rather than something further
@@ -4085,6 +4197,7 @@ impl CfmlCompiler {
         func_instructions.push(BytecodeOp::Return);
 
         self.function_depth -= 1;
+        self.local_scope_depth -= 1;
         self.current_fn_local_mode = prev_fn_local_mode;
         self.finally_stack = saved_finally;
         self.loop_stack = saved_loops;
@@ -4855,7 +4968,8 @@ impl CfmlCompiler {
                                     }
                                     instructions.push(BytecodeOp::StoreLocalProperty(Name::from(&ident.name),Name::from(&access.member),
                                     ));
-                                } else if ident.name.eq_ignore_ascii_case("local") {
+                                } else if ident.name.eq_ignore_ascii_case("local") && self.local_is_scope() {
+                                    // GH #351: only inside a function body.
                                     // `local.X = v` is identical to `var X = v` —
                                     // function-frame scope, must NOT propagate to
                                     // caller at return. Same fix as the
@@ -4865,6 +4979,12 @@ impl CfmlCompiler {
                                     }
                                     instructions.push(BytecodeOp::DeclareLocal(Name::from(&access.member)));
                                     instructions.push(BytecodeOp::StoreLocal(Name::from(&access.member)));
+                                } else if ident.name.eq_ignore_ascii_case("local") {
+                                    // GH #351: see the Statement::Assignment twin.
+                                    if want_value {
+                                        instructions.push(BytecodeOp::Dup);
+                                    }
+                                    instructions.push(BytecodeOp::StoreLocalScopeKey(Name::from(&access.member)));
                                 } else {
                                     // SetProperty needs [obj, value].
                                     self.compile_expression(&access.object, instructions);
@@ -5176,6 +5296,10 @@ impl CfmlCompiler {
                         // key directly instead of materializing the whole per-call
                         // `local` scope view (see LoadLocalKey docs). Reads only —
                         // `local.foo = x` writes go through the assignment path.
+                        // GH #351: emitted at EVERY depth. The op itself resolves
+                        // `local` against the frame's real local-scope status, so a
+                        // template included from inside a function keeps the caller's
+                        // scope while a true page reads the ordinary `local` variable.
                         if ident.name.eq_ignore_ascii_case("local") {
                             instructions
                                 .push(BytecodeOp::LoadLocalKey(Name::from(&access.member)));
@@ -5625,6 +5749,13 @@ impl CfmlCompiler {
                 let effective_declared = closure_declared.or(self.current_fn_local_mode);
                 let prev_fn_local_mode = self.current_fn_local_mode;
                 self.current_fn_local_mode = effective_declared;
+                // A closure/arrow body owns a `local` scope, exactly like a
+                // declared function's. Tracked SEPARATELY from `function_depth`
+                // (which closures deliberately do not bump — it also gates the
+                // `variables.foo` → LoadVariablesKey peephole, and changing that
+                // for closure bodies broke `attributes` resolution inside a
+                // cfthread body nested in a custom tag).
+                self.local_scope_depth += 1;
 
                 // Function boundary: isolate finally/loop stacks for the closure
                 // body (see compile_function_decl for why).
@@ -5716,6 +5847,7 @@ impl CfmlCompiler {
                 self.push_function(bc_func);
                 instructions.push(BytecodeOp::DefineFunction(global_id));
                 self.current_fn_local_mode = prev_fn_local_mode;
+                self.local_scope_depth -= 1;
             }
             Expression::ArrowFunction(arrow) => {
                 // Arrow functions inherit enclosing function's mode too
@@ -5723,6 +5855,13 @@ impl CfmlCompiler {
                 let arrow_effective = self.current_fn_local_mode;
                 let prev_fn_local_mode = self.current_fn_local_mode;
                 self.current_fn_local_mode = arrow_effective;
+                // A closure/arrow body owns a `local` scope, exactly like a
+                // declared function's. Tracked SEPARATELY from `function_depth`
+                // (which closures deliberately do not bump — it also gates the
+                // `variables.foo` → LoadVariablesKey peephole, and changing that
+                // for closure bodies broke `attributes` resolution inside a
+                // cfthread body nested in a custom tag).
+                self.local_scope_depth += 1;
                 // Function boundary: isolate finally/loop stacks for the body.
                 let saved_finally = std::mem::take(&mut self.finally_stack);
                 let saved_loops = std::mem::take(&mut self.loop_stack);
@@ -5796,6 +5935,7 @@ impl CfmlCompiler {
                 self.push_function(bc_func);
                 instructions.push(BytecodeOp::DefineFunction(global_id));
                 self.current_fn_local_mode = prev_fn_local_mode;
+                self.local_scope_depth -= 1;
             }
             Expression::This(_) => {
                 instructions.push(BytecodeOp::LoadLocal(Name::intern("this")));

@@ -2007,6 +2007,17 @@ pub struct CfmlVirtualMachine {
     /// mixed-in `renderViewlet()`). Maintained in lockstep with `call_stack` via
     /// `execute_function_with_args`'s truncate-to-entry-depth epilogue.
     frame_ctx: Vec<(std::sync::Arc<InheritedKeys>, bool)>,
+    /// Does the frame currently executing own a function `local` scope?
+    /// (GH #351 — see [`Self::current_frame_has_local_scope`].)
+    ///
+    /// Set by `execute_function_body` from its own `frame_has_local_scope`, and
+    /// restored to the caller's value by `execute_function_with_args`'s
+    /// guaranteed epilogue, so it is exact on every exit path including an
+    /// exception unwind. Deliberately NOT derived from `frame_ctx`: that stack is
+    /// `truncate`d to a recorded depth rather than popped per frame, so
+    /// `frame_ctx.last()` is not guaranteed to describe the frame that is actually
+    /// running — and a wrong answer here silently changes what `local` means.
+    frame_has_local_scope: bool,
     /// Call-dispatch Lever D1 (scope pooling) — free-list of emptied per-call
     /// `locals` maps. `execute_function_body` pops one at entry (pre-sized) and
     /// pushes it back (cleared) at a non-escaping success exit, so warm calls
@@ -2909,6 +2920,12 @@ const _: fn() = || {
 /// declares `var flashPath` then assigns `flashpath` inside a switch). The
 /// The probe keeps hot loops O(1) and allocation-free (overwrite in place, no
 /// key clone); a key is only allocated for a genuinely new entry.
+/// `scope_insert_ci` for the `ops` modules (GH #351's `StoreLocalScopeKey`).
+#[inline]
+pub(crate) fn scope_insert_ci_pub(map: &mut ValueMap, name: &str, val: CfmlValue) {
+    scope_insert_ci(map, name, val)
+}
+
 #[inline]
 fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
     // v0.599 — one probe. This used to fall back to a linear
@@ -3308,6 +3325,7 @@ impl CfmlVirtualMachine {
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
+            frame_has_local_scope: false,
             #[cfg(feature = "scope-pool")]
             locals_pool: Vec::new(),
             try_stack: Vec::new(),
@@ -6418,6 +6436,21 @@ impl CfmlVirtualMachine {
         let _cp_wrap = std::time::Instant::now();
         let call_depth_before = self.call_stack.len();
         let frame_ctx_before = self.frame_ctx.len();
+        // GH #351 — restored unconditionally in the epilogue below, so the flag
+        // describes the CALLER again the instant this call returns, on the error
+        // path as well as the normal one.
+        //
+        // Set HERE rather than in `execute_function_body` next to the local of the
+        // same name: the body has early returns before that point (the JIT
+        // fast-path `try_call`, the recursion guard), and a frame that took one of
+        // them would have run with the CALLER's flag — a CFC method invoked from a
+        // pseudo-constructor would then be told it has no `local` scope. This
+        // wrapper always runs. The inputs are exactly the body's: the function's
+        // own template-ness, plus a pending shared-`local` hand-off from an
+        // enclosing `<cfinclude>` (which the body `take()`s after this).
+        let frame_has_local_scope_before = self.frame_has_local_scope;
+        self.frame_has_local_scope =
+            !func.is_template_frame || self.include_share_local_keys.is_some();
         let try_depth_before = self.try_stack.len();
         let saved_buffers_before = self.saved_output_buffers.len();
 
@@ -6476,6 +6509,7 @@ impl CfmlVirtualMachine {
         // (len < before) are both untouched; only a leaked frame is reclaimed.
         self.call_stack.truncate(call_depth_before);
         self.frame_ctx.truncate(frame_ctx_before);
+        self.frame_has_local_scope = frame_has_local_scope_before;
         self.try_stack.truncate(try_depth_before);
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
@@ -7124,6 +7158,10 @@ impl CfmlVirtualMachine {
         // `execute_function_with_args` (robust to `__main__`'s early pop). GH #259.
         self.frame_ctx
             .push((inherited_from_parent.clone(), is_template_frame));
+        // NB `self.frame_has_local_scope` — the same value, published for the
+        // helpers that resolve `local` outside this function — is set by
+        // `execute_function_with_args` BEFORE this body runs, so that the early
+        // returns above cannot skip it. See the comment there.
         #[cfg(feature = "call-phases")]
         {
             // phase 3: frame_ctx push
@@ -7618,11 +7656,22 @@ impl CfmlVirtualMachine {
                     let scope_name_shadow_attempt = (is_inside_function
                         && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
                         || declared_locals.contains(name.as_str());
-                    let val = if name_lower == "local" {
+                    let val = if name_lower == "local" && frame_has_local_scope {
                         // `local` is strictly per-call (PR #93): only keys
                         // established in THIS frame are visible — inherited
                         // parent vars (page `variables`, CFC bridge keys) and
                         // function params are excluded.
+                        //
+                        // GH #351: gated on `frame_has_local_scope`. A top-level
+                        // page and a CFC pseudo-constructor have NO local scope
+                        // on Lucee — their "locals" map IS the page/component
+                        // `variables` scope, so treating `local` as a scope
+                        // there aliased every page variable as `local.*`. Code
+                        // written that way worked here and threw on Lucee. When
+                        // the frame has no local scope, fall through to the
+                        // ordinary lookup below: `local` is then just a variable
+                        // name, undefined until something assigns it (Lucee
+                        // stores `local.foo = 1` as `variables.local.foo`).
                         CfmlValue::strukt(Self::build_local_scope_view(
                             &locals,
                             &inherited_or_param_keys,
@@ -8031,10 +8080,18 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
-                        if name_lower == "local" {
-                            // `local.X = Y` — write back into the function's locals
-                            // (or the template-scope locals when called outside a function),
+                        if name_lower == "local" && frame_has_local_scope {
+                            // `local.X = Y` — write back into the function's locals,
                             // NOT __variables (which is the component scope in CFC methods).
+                            //
+                            // GH #351: gated on `frame_has_local_scope` for the
+                            // same reason as the read above. At page scope /in a
+                            // pseudo-constructor the merge below would splice the
+                            // struct's keys straight into page `variables`, so
+                            // `local.foo = 1` silently set `variables.foo`. Lucee
+                            // instead creates an ordinary `variables.local`
+                            // struct; falling through to the generic store does
+                            // exactly that.
                             //
                             // T3.1: this whole-scope merge writes keys by NAME
                             // into the map. A slotted key updated through the
@@ -12435,6 +12492,7 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::JumpIfArgPresent(name, target) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, &arguments_supplied, name, *target); }
                 BytecodeOp::SeedArgumentKey(name) => { ops::locals::op_seed_argument_key(&mut stack, &mut locals, name); }
+                BytecodeOp::StoreLocalScopeKey(prop_name) => { ops::locals::op_store_local_scope_key(self, &mut stack, &mut locals, &mut declared_locals, &mut inherited_or_param_keys, frame_has_local_scope, prop_name); }
 
                 BytecodeOp::ValidateParamType(index) => { ops::locals::op_validate_param_type(self, func, &locals, *index)?; }
 
@@ -13597,6 +13655,20 @@ impl CfmlVirtualMachine {
             if let Some(user_func) = user_match {
                 self.pending_fused_parent = Some(self.fused_call_parent_plan(func));
                 return self.execute_function_with_args(&user_func, args, Some(parent_locals));
+            }
+
+            // GH #340: on Lucee a binary IS a Java `byte[]`, so the higher-order
+            // array BIFs iterate it as SIGNED bytes. Coerce once here rather than
+            // inside every `if let CfmlValue::Array(arr) = arr_val` arm below —
+            // the pure-builtin half of the same set is handled by
+            // `binary_arg0_as_array` in cfml-stdlib. Gated on the value being a
+            // binary first, so the common path costs one discriminant compare.
+            if matches!(args.first(), Some(CfmlValue::Binary(_)))
+                && name_lower.starts_with("array")
+            {
+                if let Some(arr) = args[0].binary_as_byte_array() {
+                    args[0] = arr;
+                }
             }
 
             // Higher-order standalone functions (arrayMap, arrayFilter, arrayReduce, etc.)
@@ -15691,18 +15763,33 @@ impl CfmlVirtualMachine {
                             meta.insert(key.to_string(), default);
                         }
                     }
-                    // Reflect the *effective* runtime mappings (cfconfig +
-                    // this.mappings + any registered via `application
-                    // action="update"`) as a fresh COPY — matching Lucee, where
-                    // mutating the returned `mappings` struct (e.g. ColdBox's ACF
-                    // CFMappingHelper doing `getApplicationMetadata().mappings[x]=y`)
-                    // does NOT register a live mapping. Runtime registration is done
-                    // via `application action="update" mappings={...}` (the
-                    // LuceeMappingHelper path), which writes the real `self.mappings`
-                    // table. Names use the Lucee "/HTMLHelper" form (no trailing
-                    // slash); "/" stays as-is.
+                    // Reflect the APPLICATION's mappings (this.mappings plus
+                    // anything registered via `application action="update"`) as a
+                    // fresh COPY — matching Lucee, where mutating the returned
+                    // `mappings` struct (e.g. ColdBox's ACF CFMappingHelper doing
+                    // `getApplicationMetadata().mappings[x]=y`) does NOT register a
+                    // live mapping. Runtime registration is done via `application
+                    // action="update" mappings={...}` (the LuceeMappingHelper path),
+                    // which writes the real `self.mappings` table.
+                    //
+                    // GH #348: server-level mappings (the implicit webroot `/`, any
+                    // `.cfconfig.json` CFMappings) are deliberately EXCLUDED. They
+                    // are not the application's, and Lucee does not list them here.
+                    // Including them broke the standard add-a-mapping idiom, which
+                    // since v0.621.0 (where `action="update"` REPLACES the
+                    // application's set, as on Lucee) is a read-modify-write:
+                    //
+                    //     maps = getApplicationMetadata().mappings;
+                    //     maps["/mymodule"] = expandPath("./modules/mymodule");
+                    //     application action="update" mappings="##maps##";
+                    //
+                    // With server mappings in the read, that round-trip re-registered
+                    // them as APPLICATION mappings, so a later `action="update"`
+                    // would drop them where on Lucee it would not.
+                    //
+                    // Names use the Lucee "/HTMLHelper" form (no trailing slash).
                     let mut map_struct = ValueMap::default();
-                    for mp in &self.mappings {
+                    for mp in self.mappings.iter().filter(|mp| mp.from_application) {
                         let key = if mp.name == "/" {
                             "/".to_string()
                         } else {
@@ -20277,7 +20364,10 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
         let name_lower = name.to_lowercase();
-        if name_lower == "local" {
+        // GH #351: only a frame that owns a function `local` scope resolves the
+        // name as a SCOPE. At page level / in a pseudo-constructor Lucee has no
+        // local scope, and `local` is an ordinary variable name — fall through.
+        if name_lower == "local" && self.current_frame_has_local_scope() {
             // `local` is always the function-local scope. Strip the internal
             // bridge keys (`__variables`, the `arguments` scope under
             // ARGUMENTS_SCOPE_KEY, …) — they are not local variables.
@@ -20462,6 +20552,24 @@ impl CfmlVirtualMachine {
     /// Reading `call_stack.last()` here was the GH #259 bug: a bare call from
     /// inside an `include`d template found the nearest *pushed* function frame
     /// and applied ITS inherited set, dropping page vars the template held.
+    /// GH #351 — does the frame currently executing own a function `local`
+    /// scope?
+    ///
+    /// False for a top-level page and for a CFC pseudo-constructor: on Lucee
+    /// neither has a `local` scope at all, and `local` there is an ordinary
+    /// variable name in `variables`. True for a real function/method frame, and
+    /// for a template `include`d from inside one (the caller's `local` scope
+    /// propagates down the whole include chain).
+    ///
+    /// Answers for the frame currently executing, including the
+    /// `__main__`/`__cfc_body__` template frames that `call_stack` deliberately
+    /// omits — exactly the frames this has to answer "no" for. Backed by
+    /// [`Self::frame_has_local_scope`], which see for why it is not derived from
+    /// `frame_ctx`.
+    pub(crate) fn current_frame_has_local_scope(&self) -> bool {
+        self.frame_has_local_scope
+    }
+
     fn fused_call_parent_plan(
         &self,
         func_ref: &cfml_common::dynamic::CfmlFunction,
@@ -20606,6 +20714,13 @@ impl CfmlVirtualMachine {
     /// every probe below reuses the key hash built at compile time. This is
     /// the single hottest keyed-lookup site in the engine (15.7% of all
     /// remaining hashing probes on a warm Preside render before the change).
+    /// Resolve a bare name through the frame's own scope chain (GH #351 —
+    /// `StoreLocalScopeKey` / the no-local-scope `local.X` read need to reach the
+    /// ordinary variable named `local` from the `ops` modules).
+    pub(crate) fn lookup_local_name(&self, locals: &ValueMap, name: &str) -> Option<CfmlValue> {
+        self.lookup_name_in_scopes(&cfml_common::name::Name::intern(name), name, locals)
+    }
+
     fn lookup_name_in_scopes(
         &self,
         name: &cfml_common::name::Name,
@@ -20835,7 +20950,9 @@ impl CfmlVirtualMachine {
         modern: bool,
     ) {
         let name_lower = name.to_lowercase();
-        if name_lower == "local" {
+        // GH #351: see `scope_aware_load` — at page level `local` is a plain
+        // variable, so the whole-scope merge below must not fire there.
+        if name_lower == "local" && self.current_frame_has_local_scope() {
             // `local` is always the function-local scope — merge into locals, NOT __variables.
             if let CfmlValue::Struct(s) = val {
                 let saved_vars = locals.get(&*cfml_common::key::well_known::VARIABLES).cloned();
@@ -26059,7 +26176,11 @@ impl CfmlVirtualMachine {
         // map. Probe it directly instead of materializing an O(frame) struct
         // copy of every local per isDefined() call — frameworks probe these
         // in per-request hot paths (`isDefined("local.x")` guards).
-        if root == "local" {
+        // GH #351: a page/pseudo-constructor frame has no `local` scope on
+        // Lucee, so `isDefined("local")` is false there until something assigns
+        // an ordinary `variables.local`. Falling through leaves that lookup to
+        // the normal chain below, which finds the variable if it exists.
+        if root == "local" && self.current_frame_has_local_scope() {
             return Self::path_defined_from_map(locals, rest);
         }
         if root == "variables" {
@@ -26326,7 +26447,13 @@ impl CfmlVirtualMachine {
     fn resolve_path_root(&self, root: &str, locals: &ValueMap) -> Option<CfmlValue> {
         let root_lower = root.to_lowercase();
         match root_lower.as_str() {
-            "local" => Some(CfmlValue::strukt(locals.clone())),
+            // GH #351: only a real function frame has a `local` scope. At page
+            // level `local` is an ordinary variable — fall through to the
+            // unscoped resolution so `getVariable("local")` and
+            // `isDefined("local")` keep agreeing (the contract this fn documents).
+            "local" if self.current_frame_has_local_scope() => {
+                Some(CfmlValue::strukt(locals.clone()))
+            }
             "variables" => match locals.get(&*cfml_common::key::well_known::VARIABLES) {
                 Some(v) => Some(v.clone()),
                 None => Some(CfmlValue::strukt(locals.clone())),
@@ -36348,6 +36475,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::JumpIfNotNull(_) => (1, 1), // pops, pushes back if not null
         BytecodeOp::JumpIfArgPresent(_, _) => (0, 0), // pure control flow, no stack traffic
         BytecodeOp::SeedArgumentKey(_) => (1, 0), // pops the applied default value
+        BytecodeOp::StoreLocalScopeKey(_) => (0, 1), // pops the value, pushes nothing
         BytecodeOp::ValidateParamType(_) => (0, 0),   // reads a local, throws or nothing
         // Output
         BytecodeOp::Print => (0, 1),

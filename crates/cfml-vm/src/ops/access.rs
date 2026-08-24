@@ -266,6 +266,27 @@ pub(crate) fn op_get_index(
             let idx = one_based_to_zero(&index);
             stack.push(arr.get(idx).unwrap_or(CfmlValue::Null));
         }
+        // GH #340: a binary IS a Java `byte[]` on Lucee, so `b[1]` reads byte 1
+        // as a SIGNED value (`0xFF` → `-1`). Out of range throws there rather
+        // than reading back empty — "Key [4] doesn't exist in Native Array" —
+        // and an empty read is exactly the silent-wrong-answer this fixes.
+        CfmlValue::Binary(bytes) => {
+            let idx = one_based_to_zero(&index);
+            match bytes.get(idx) {
+                Some(b) => stack.push(CfmlValue::Int(*b as i8 as i64)),
+                // Routed through `raise_catchable`, NOT returned as a bare
+                // `Err`: `GetIndex` is dispatched with `?`, so an `Err` here
+                // would skip an enclosing `try {}` in the same frame entirely.
+                None => {
+                    let msg = format!(
+                        "Key [{}] doesn't exist in Native Array",
+                        index.as_string()
+                    );
+                    *ip = vm.raise_catchable(stack, &msg, "expression")?;
+                    return Ok(());
+                }
+            }
+        }
         CfmlValue::QueryColumn(arr, _) => {
             let idx = one_based_to_zero(&index);
             stack.push(arr.get(idx).cloned().unwrap_or(CfmlValue::Null));

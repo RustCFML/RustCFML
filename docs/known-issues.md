@@ -1280,6 +1280,70 @@ schema change across `queryNew`, the DB result-set builders and QoQ, so it is
 tracked rather than bundled into GH
 [#345](https://github.com/RustCFML/RustCFML/issues/345).
 
+## 60. `throw( object=e, … )` merges the explicit attributes; Lucee discards the object 🏗 *(GH [#352](https://github.com/RustCFML/RustCFML/issues/352))*
+
+**Deliberate divergence.** Measured against Lucee 7.1.0.204.
+
+```cfml
+try { throw( type="Custom.T2", message="m2", detail="d2" ); } catch ( any e ) { orig = e; }
+```
+
+| call | Lucee 7.1.0.204 | RustCFML |
+|---|---|---|
+| `throw( object=orig )` | `Custom.T2` / `m2` / `d2` | same — agrees |
+| `throw( object=orig, message="overridden" )` | `application` / `overridden` / *(empty)* | `Custom.T2` / `overridden` / `d2` |
+| `throw( object=orig, type="New.T" )` | `Custom.T2` / `m2` — the `type=` is ignored | `New.T` / `m2` |
+
+We **merge**: the object supplies the base and any explicit attribute overrides
+it. Lucee gives `message` outright precedence over `object`, and `object`
+outright precedence over `type`/`detail`.
+
+Lucee's behaviour is a deliberate ordering, not an accident — `Throw.java`'s
+`doStartTag()` runs `_doStartTag(message)` *before* `_doStartTag(object)`, and
+the first non-empty one throws a **fresh** `CustomTypeException` built from the
+tag's own attributes, whose `type` defaults to `"application"`. The caught
+exception's type and detail are simply never consulted.
+
+Copying it was considered and rejected: silently discarding a caught exception's
+type and detail because the caller also wanted to reword the message loses
+information for no stated benefit, and no code has been found that depends on
+the reset. Our merge is a superset — `throw( object=e )` alone is identical on
+both engines, so the only programs affected are those that pass an object *and*
+an override, which on Lucee cannot be doing anything deliberate with the object.
+
+`tests/tags/test_throw_object_rootcause.cfm` guards the three overriding
+assertions with `isRustCFML()` so the cross-engine run stays green while the
+shared behaviour keeps its cross-engine value.
+
+## 61. A binary participates in the READ-ONLY array BIFs only 🏗 *(GH [#340](https://github.com/RustCFML/RustCFML/issues/340))*
+
+A `Binary` is a Java `byte[]` on Lucee, so the array BIFs operate on it and its
+elements are signed bytes. That now holds here for every **read**: `arrayLen`,
+`isArray`, `b[1]`, `arrayToList`/`Slice`/`Mid`/`Find`/`Reverse`/`First`/`Last`/
+`Min`/`Max`/`Sum`/`Avg`/`ToStruct`/`Merge`/`IsEmpty`/`IsDefined`/`IndexExists`,
+`for ( x in b )`, and `arrayMap`/`Filter`/`Reduce`/`Each` — all measured against
+Lucee 7.1.0.204, with `0xFF` reading back as `-1` on both.
+
+Two **write** behaviours still diverge, because the conversion produces a copy
+rather than a view onto the binary's bytes:
+
+| | Lucee 7.1.0.204 | RustCFML |
+|---|---|---|
+| `b[1] = 99` | mutates the byte in place; `b` stays a 3-byte binary | the write is dropped; `b` is unchanged |
+| `arrayAppend( b, 68 )` | no-op — a `byte[]` is fixed size, so `b` stays a 3-byte binary | `b` becomes a 1-element ARRAY |
+
+The mutating array BIFs are deliberately excluded from the conversion for the
+second reason: coercing there would silently turn a binary into a real array,
+which is further from Lucee than leaving them alone. Closing this properly means
+a byte-backed array view rather than a per-call copy.
+
+Two neighbouring divergences found while measuring this are NOT specific to
+binaries and are tracked separately: `arrayContains`/`arrayContainsNoCase` return
+a boolean where Lucee returns the 1-based index (for ordinary arrays too), and
+`serializeJSON( binary )` yields `null` where Lucee yields the base64 string.
+
+---
+
 ---
 
 # Part E — Environment-specific 🌍

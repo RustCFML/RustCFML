@@ -29,14 +29,36 @@ assert("throw object preserves detail", rethrown.detail, "d2");
 assert("throw object preserves extendedInfo", rethrown.extendedInfo, "ext2");
 
 // --- explicit attrs override the object ---
-override = "";
-try {
-	throw(object = orig, message = "overridden");
-} catch (any e) {
-	override = e;
+// A DELIBERATE divergence, so guarded rather than reported as a Lucee failure
+// (GH #352, known-issues.md §60). We merge: the object supplies the base and an
+// explicit attribute overrides it. Lucee's `Throw.java` instead processes
+// `message` BEFORE `object` and throws a fresh exception built only from the
+// tag's own attributes, so supplying `message=` there discards the object
+// entirely — the type resets to `application` and the detail is lost.
+// `throw( object=e )` on its own is identical on both engines and is asserted
+// unguarded above.
+if ( isRustCFML() ) {
+	override = "";
+	try {
+		throw(object = orig, message = "overridden");
+	} catch (any e) {
+		override = e;
+	}
+	assert("throw object message override", override.message, "overridden");
+	assert("throw object keeps type under override", override.type, "Custom.T2");
+	assert("throw object keeps detail under override", override.detail, "d2");
+
+	// The mirror case: an explicit `type=` alongside an object. Lucee ignores it
+	// (the object wins outright); we let it override.
+	typeOverride = "";
+	try {
+		throw(object = orig, type = "New.T");
+	} catch (any e) {
+		typeOverride = e;
+	}
+	assert("throw object type override", typeOverride.type, "New.T");
+	assert("throw object keeps message under type override", typeOverride.message, "m2");
 }
-assert("throw object message override", override.message, "overridden");
-assert("throw object keeps type under override", override.type, "Custom.T2");
 
 // --- plain throw still works ---
 plain = "";
