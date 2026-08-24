@@ -181,6 +181,49 @@ Passing `--production` (or setting `RUSTCFML_PRODUCTION=1`) enables three in-mem
 
 Net effect: requests pay zero filesystem IO once the cache is warm — typically a 3–4× throughput gain on an app with `Application.cfc` + cfincludes. Files added or modified on disk are not picked up until the server is restarted. See **[Performance](performance.md)** for measured numbers.
 
+## Memory footprint (allocator tuning)
+
+Since v0.590.0 the release binary uses **mimalloc** as its global allocator, which
+is worth roughly 15% on a warm request. mimalloc retains OS arenas rather than
+returning them promptly, so a server's resident size settles at a plateau above
+its live data — a rounding error on a large application, but visible on a small
+one, where it can roughly double the idle footprint.
+
+Two stock mimalloc options recover most of that. They are read by the allocator
+itself, so they work on the binary as shipped, with no rebuild:
+
+```bash
+MIMALLOC_ARENA_EAGER_COMMIT=0   # don't commit arena memory up front
+MIMALLOC_PURGE_DELAY=0          # purge freed memory immediately, not after 10ms
+```
+
+**They are not the default, and the trade-off is real.** `PURGE_DELAY=0` hands
+every freed block back to the OS immediately, which is exactly what an
+allocation-heavy request does constantly — large query results, report
+generation, big JSON. Measured here on macOS arm64, `--production`, `ab -c4`,
+three interleaved rounds:
+
+| workload | | req/s | server CPU | RSS |
+|---|---|---|---|---|
+| 4k-row query → structs → JSON → 3k-line report | defaults | **178** | 6.58 s | 190 MiB |
+| | both options | **122** | 9.59 s | 191 MiB |
+| trivial page | defaults | **6541** | 0.10 s | 69 MiB |
+| | both options | **5846** | 0.17 s | 69 MiB |
+
+That is −31% throughput and +46% CPU on the allocation-heavy workload, with no
+RSS saving at all on that shape — and −11% even on a trivial page.
+
+The saving is equally workload-dependent in the other direction: the same two
+options took a large, long-lived workload (the engine's own test suite in serve
+mode) from 501 MiB to 453 MiB, and GH
+[#354](https://github.com/RustCFML/RustCFML/issues/354) reports 156 → 101 MiB on
+a routing-heavy application on Linux with throughput unchanged.
+
+So: reach for them when idle RSS is the constraint and the application is
+routing- or IO-bound, and measure your own allocation-heavy endpoints before
+committing. Both are ordinary environment variables, so they can be set per
+deployment without touching the binary.
+
 ## Sandbox / virtual filesystem (web and CLI)
 
 Self-contained binaries can run in **sandbox mode**, which completely isolates the application from the host filesystem. Sandbox mode also enables production caching automatically, since the embedded VFS is immutable at runtime.
