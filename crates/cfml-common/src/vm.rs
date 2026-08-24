@@ -90,6 +90,14 @@ impl CfmlError {
         Self::new(message, CfmlErrorType::Custom("lock".to_string()))
     }
 
+    /// A catchable `application`-typed exception, matching how Lucee surfaces a
+    /// failure to launch an external process from `<cfexecute>`. CFML code does
+    /// `catch( application e )` around a shell-out, so a missing or
+    /// non-executable binary must not arrive as a generic `runtime` error.
+    pub fn application(message: String) -> Self {
+        Self::new(message, CfmlErrorType::Custom("application".to_string()))
+    }
+
     /// A catchable `template`-typed exception, matching Lucee's
     /// `lucee.runtime.exp.TemplateException` — raised when a tag is used in a
     /// context that cannot support it (e.g. `<cfexit method="loop">` outside a

@@ -8860,6 +8860,23 @@ impl CfmlVirtualMachine {
                             | "cfhtmlbody"
                             | "cfcache"
                             | "cfmodule"
+                            // `cfexecute(name=…, arguments=…, variable=…)` — the
+                            // function-call form — routes to `__cfexecute`. Without
+                            // it the name resolved to nothing and the call threw
+                            // "Variable 'cfexecute' is undefined", which reads like
+                            // a typo in user code rather than a missing script form
+                            // (GH #341).
+                            | "cfexecute"
+                            // Tags whose statement form already worked but whose
+                            // function-call form resolved to nothing and threw
+                            // "Variable 'cfX' is undefined" — the same GH #341
+                            // gap as cfexecute, found by censusing every
+                            // attribute-driven tag against Lucee rather than
+                            // fixing the one that was reported.
+                            | "cfapplication"
+                            | "cfexit"
+                            | "cfloginuser"
+                            | "cflogout"
                     ) {
                         // Script-style tag calls: `cfcontent(reset=true)` routes to `__cfcontent`.
                         // `cfmodule(template=…, attr=…)` — the function-call form of
@@ -16710,11 +16727,18 @@ impl CfmlVirtualMachine {
                     // (preserving partial locals) and the owning template frame
                     // hands the method off to `last_exit_method`. Unlike an
                     // exception this is invisible to user `try`/`catch`.
-                    let method = args
-                        .get(0)
-                        .map(|v| v.as_string().to_lowercase())
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or_else(|| "exittemplate".to_string());
+                    // Either shape: a bare positional method (the tag lowering)
+                    // or a bundled options struct (the script forms `exit
+                    // method=…;` and `cfexit(method=…)`).
+                    let method = match args.get(0) {
+                        Some(CfmlValue::Struct(opts)) => opts
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("method"))
+                            .map(|(_, v)| v.as_string().to_lowercase()),
+                        other => other.map(|v| v.as_string().to_lowercase()),
+                    }
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| "exittemplate".to_string());
                     // `loop` re-executes the body of the custom tag, so it is
                     // only meaningful while a custom tag's END phase is running.
                     // Lucee raises here, at the `cfexit` itself, rather than
@@ -18566,8 +18590,26 @@ impl CfmlVirtualMachine {
                 }
                 "__cfloginuser" => {
                     // cfloginuser name="..." password="..." roles="..."
-                    let name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let roles_str = args.get(2).map(|v| v.as_string()).unwrap_or_default();
+                    // Either shape — positional (tag lowering) or one options
+                    // struct (the script call form). Reading position 2 for the
+                    // roles is why the struct shape has to be handled explicitly:
+                    // `cfloginuser(roles=…, name=…)` binds by call order, so a
+                    // caller who reorders the arguments would silently lose them.
+                    let (name, roles_str) = match args.get(0) {
+                        Some(CfmlValue::Struct(opts)) => {
+                            let get = |k: &str| {
+                                opts.iter()
+                                    .find(|(ok, _)| ok.eq_ignore_ascii_case(k))
+                                    .map(|(_, v)| v.as_string())
+                                    .unwrap_or_default()
+                            };
+                            (get("name"), get("roles"))
+                        }
+                        _ => (
+                            args.get(0).map(|v| v.as_string()).unwrap_or_default(),
+                            args.get(2).map(|v| v.as_string()).unwrap_or_default(),
+                        ),
+                    };
                     let roles: Vec<String> = roles_str
                         .split(',')
                         .map(|r| r.trim().to_string())
@@ -18987,15 +19029,42 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.to_lowercase() == "arguments")
                             .map(|(_, v)| v.as_string())
                             .unwrap_or_default();
-                        let has_variable = opts
+                        // `variable` arrives in one of two shapes. The TAG
+                        // lowering emits `variable: true` — a capture flag — and
+                        // does the caller-scope assignment itself in generated
+                        // script. The SCRIPT forms (`execute … variable="out";`
+                        // and `cfexecute(variable="out")`) pass the target NAME
+                        // through as a string, and the write-back has to happen
+                        // here (GH #341/#355). Distinguish by shape, and treat a
+                        // literal "true"/"false" string as the flag so the tag
+                        // path is unchanged.
+                        let variable_attr = opts
                             .iter()
                             .find(|(k, _)| k.to_lowercase() == "variable")
-                            .map(|(_, v)| match v {
-                                CfmlValue::Bool(b) => b,
-                                CfmlValue::String(s) => s.to_lowercase() == "true",
-                                _ => false,
-                            })
-                            .unwrap_or(false);
+                            .map(|(_, v)| v);
+                        let mut out_target: Option<String> = None;
+                        let has_variable = match variable_attr {
+                            Some(CfmlValue::Bool(b)) => b,
+                            Some(CfmlValue::String(s)) => {
+                                let t = s.trim();
+                                if t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("false")
+                                {
+                                    t.eq_ignore_ascii_case("true")
+                                } else if t.is_empty() {
+                                    false
+                                } else {
+                                    out_target = Some(t.to_string());
+                                    true
+                                }
+                            }
+                            _ => false,
+                        };
+                        let err_target = opts
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == "errorvariable")
+                            .map(|(_, v)| v.as_string())
+                            .filter(|t| !t.trim().is_empty())
+                            .map(|t| t.trim().to_string());
                         let body = opts
                             .iter()
                             .find(|(k, _)| k.to_lowercase() == "body")
@@ -19031,7 +19100,21 @@ impl CfmlVirtualMachine {
                                             String::from_utf8_lossy(&output.stdout).to_string();
                                         let stderr =
                                             String::from_utf8_lossy(&output.stderr).to_string();
-                                        if has_variable {
+                                        if let Some(target) = out_target {
+                                            // Script form: deliver stdout (and
+                                            // stderr, if asked) straight into the
+                                            // caller's scope, matching the tag
+                                            // form's generated assignment. Lucee
+                                            // keeps the trailing newline.
+                                            let mut deliveries =
+                                                vec![(target, CfmlValue::string(stdout))];
+                                            if let Some(et) = err_target {
+                                                deliveries
+                                                    .push((et, CfmlValue::string(stderr)));
+                                            }
+                                            self.pending_result_writeback = Some(deliveries);
+                                            return Ok(CfmlValue::Null);
+                                        } else if has_variable {
                                             let mut result = ValueMap::default();
                                             result.insert(
                                                 "output".to_string(),
@@ -19056,8 +19139,13 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             Err(e) => {
-                                return Err(CfmlError::runtime(format!(
-                                    "cfexecute: failed to spawn '{}': {}",
+                                // Lucee raises this as `application`, and code
+                                // shelling out writes `catch( application e )`.
+                                // As a generic `runtime` error it was uncatchable
+                                // by type. The detail is kept in the message,
+                                // which Lucee does not supply.
+                                return Err(CfmlError::application(format!(
+                                    "Error invoking external process: failed to spawn '{}': {}",
                                     cmd_name, e
                                 )));
                             }
@@ -21470,6 +21558,24 @@ impl CfmlVirtualMachine {
                 // The statement form `module attr=…;` (a lone positional struct)
                 // is folded by Pass 1's positional-struct handling above.
                 | "__cfmodule"
+                // cfexecute's function-call form `cfexecute(name=…, arguments=…)`
+                // bundles its named args into the single options struct the
+                // __cfexecute intercept consumes. NB its write-back attribute
+                // list is EMPTY (see tag_call_writeback_attr): `name` is the
+                // binary to run, not a caller-scope target, so the default
+                // ["name","variable"] would try to write the result into a
+                // variable called "/bin/echo".
+                | "__cfexecute"
+                // Same GH #341 census: these intercepts read a single options
+                // struct (or, for exit/loginuser, either shape), so their
+                // function-call forms must bundle too. Their write-back lists
+                // are empty — `cfapplication`'s `name` is the application name
+                // and `cfloginuser`'s is the username, neither a caller-scope
+                // target.
+                | "__cfapplication"
+                | "__cfexit"
+                | "__cfloginuser"
+                | "__cflogout"
                 // writeLog() is a BIF, not a tag, but it needs the same
                 // bundling: its intercept has no declared params, so the
                 // generic reorder path binds named args by CALL ORDER, making
@@ -21501,8 +21607,13 @@ impl CfmlVirtualMachine {
             // caller-scope target.
             // cfmodule's `name` attribute is the module dot-path, not a
             // caller-scope write-back target — keep it in the options struct.
+            // cfexecute's `name` is the binary to run and its `variable` names a
+            // target the intercept writes itself (it delivers stdout, not the
+            // whole return struct, and has an errorVariable to place too), so
+            // neither is a generic write-back attribute here.
             "cfheader" | "cfcontent" | "cflocation" | "cfcookie" | "cflog"
             | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" | "cfcache" | "cfmodule"
+            | "cfexecute" | "cfapplication" | "cfexit" | "cfloginuser" | "cflogout"
             | "writelog" => &[],
             _ => &["name", "variable"],
         }

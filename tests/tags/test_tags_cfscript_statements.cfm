@@ -196,5 +196,86 @@ savecontent variable="__dumpSink" {
 }
 assertTrue("dump statement + cfdump() call forms run", len(__dumpSink) >= 0);
 
+// ============================================================
+// execute / cfexecute — GH #341 (function form threw) and GH #355 (the
+// statement form was a SILENT no-op: nothing spawned, nothing written, nothing
+// raised). Both spellings must reach the same intercept the tag form uses.
+// /bin/echo is present on both CI targets; Windows would need a different
+// binary, hence the guard.
+// ============================================================
+
+if (fileExists("/bin/echo")) {
+    execute name="/bin/echo" arguments="stmt-form" timeout=10 variable="execStmtOut";
+    assert("execute statement form writes its variable", trim(execStmtOut), "stmt-form");
+
+    cfexecute(name="/bin/echo", arguments="fn-form", timeout=10, variable="execFnOut");
+    assert("cfexecute() call form writes its variable", trim(execFnOut), "fn-form");
+
+    // The written value is raw stdout, trailing newline and all.
+    execute name="/bin/echo" arguments="raw" timeout=10 variable="execRaw";
+    assert("execute keeps the trailing newline", execRaw, "raw" & chr(10));
+
+    // A scoped target resolves; it is not a variable literally named "local.x".
+    (function() {
+        execute name="/bin/echo" arguments="scoped" timeout=10 variable="local.eo";
+        assert("execute writes a scoped target", trim(local.eo), "scoped");
+    })();
+
+    // errorVariable takes stderr while variable takes stdout.
+    if (fileExists("/bin/sh")) {
+        execute name="/bin/sh" arguments='-c "echo to-err 1>&2"' timeout=10
+                variable="execOut2" errorVariable="execErr2";
+        assert("execute variable is stdout only", trim(execOut2), "");
+        assert("execute errorVariable is stderr", trim(execErr2), "to-err");
+    }
+
+    // With no variable=, output goes to the response, same as the tag form.
+    savecontent variable="execDirect" {
+        execute name="/bin/echo" arguments="to-buffer" timeout=10;
+    }
+    assert("execute with no variable writes to output", trim(execDirect), "to-buffer");
+
+    // A binary that cannot be launched raises an `application` exception on
+    // Lucee — code shelling out writes `catch( application e )`, so a generic
+    // runtime error would be uncatchable by type.
+    execTypedCatch = false;
+    try {
+        execute name="/no/such/binary_rustcfml_probe" arguments="x" timeout=10 variable="never";
+    } catch (application e) {
+        execTypedCatch = true;
+    } catch (any e) {
+        execTypedCatch = false;
+    }
+    assertTrue("a failed spawn is catchable as type='application'", execTypedCatch);
+}
+
+// ============================================================
+// Other script forms found missing by censusing every attribute-driven tag
+// against Lucee rather than only fixing the reported one (GH #341).
+// ============================================================
+
+// `exit method=…;` is control flow — as a no-op the template just ran on.
+request._exitProbe = "";
+include "exit_statement_target.cfm";
+assert("exit statement form stops the template", request._exitProbe, "before");
+
+// `image action="info" …;` silently set nothing.
+imgProbePath = getTempDirectory() & "/rustcfml_img_stmt_probe.png";
+fileWrite(imgProbePath, toBinary("iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAEklEQVR4nGP4z8CAB+GTG8HSALfKY52fTcuYAAAAAElFTkSuQmCC"));
+image action="info" source=imgProbePath structname="imgStmtInfo";
+assert("image statement form populates structname", imgStmtInfo.width, 10);
+fileDelete(imgProbePath);
+
+// These function-call forms resolved to nothing and threw
+// "Variable 'cfX' is undefined"; their statement forms already worked.
+// NB `cfapplication(name=…)` is deliberately NOT exercised here: starting a
+// differently-named application REPLACES the application's mapping set, and on
+// Lucee that aborted 15 later files in this runner. Its call form is covered by
+// the cross-engine probe, not by the shared suite.
+cfloginuser(name="probeUser", password="pw", roles="probeRole");
+assertTrue("cfloginuser() call form runs", true);
+cflogout();
+assertTrue("cflogout() call form runs", true);
+
 suiteEnd();
 </cfscript>

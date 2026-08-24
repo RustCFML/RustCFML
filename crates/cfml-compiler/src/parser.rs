@@ -651,8 +651,40 @@ impl Parser {
                 location: stmt_loc.clone(),
             }));
 
+            // `result="local.r"` names a SCOPED target. As a bare
+            // AssignTarget::Variable the whole dotted string became one
+            // identifier, so the struct was written to a variable literally
+            // called "local.r" and `local.r` read back undefined — while the
+            // function form `cfhttp(result="local.r")`, which resolves the
+            // target at runtime, worked. Split it into struct accesses so both
+            // spellings land in the same place (GH #341 census).
+            let mut target = AssignTarget::Variable(result_var.clone());
+            if result_var.contains('.') {
+                let mut parts = result_var.split('.');
+                let root = parts.next().unwrap_or_default().to_string();
+                let mut expr = Expression::Identifier(Identifier {
+                    name: root,
+                    location: stmt_loc.clone(),
+                });
+                let rest: Vec<&str> = parts.collect();
+                for (i, part) in rest.iter().enumerate() {
+                    if i + 1 == rest.len() {
+                        target = AssignTarget::StructAccess(
+                            Box::new(expr.clone()),
+                            part.to_string(),
+                        );
+                    } else {
+                        expr = Expression::MemberAccess(Box::new(MemberAccess {
+                            object: Box::new(expr),
+                            member: part.to_string(),
+                            null_safe: false,
+                            location: stmt_loc.clone(),
+                        }));
+                    }
+                }
+            }
             return Ok(CfmlNode::Statement(Statement::Assignment(Assignment {
-                target: AssignTarget::Variable(result_var),
+                target,
                 value: cfhttp_call,
                 operator: AssignOp::Equal,
                 location: stmt_loc,
@@ -875,6 +907,29 @@ impl Parser {
                     // nothing — Preside renders every view via
                     // `module attributeCollection=…`, so every view came out empty.
                     "module" => Some(TagStmt::StructArg("__cfmodule")),
+                    // Script-form `execute name=… arguments=… variable=…;`.
+                    // Preside's VipsImageSizingService._exec() is written this
+                    // way; without it the statement parsed as a bare `execute`
+                    // identifier plus an `name=…` assignment, so nothing was
+                    // ever spawned, nothing was written to `variable`, and
+                    // nothing was raised (GH #355). The intercept resolves a
+                    // STRING `variable` to a caller-scope write-back target,
+                    // which is what tells it apart from the tag lowering's
+                    // `variable: true` capture flag.
+                    "execute" => Some(TagStmt::StructArg("__cfexecute")),
+                    // `exit method="exittemplate";` was parsed as a bare `exit`
+                    // identifier plus an assignment, so the template ran on —
+                    // a silent no-op of a CONTROL-FLOW tag, the worst shape of
+                    // the GH #355 class.
+                    "exit" => Some(TagStmt::StructArg("__cfexit")),
+                    // `image action="info" source=… structname="rv";` silently
+                    // set nothing. It routes to the same `cfimage` intercept the
+                    // function form already used, so the write-back target
+                    // (structname/name) comes from tag_call_writeback_attr.
+                    // NB `http` is NOT here: it has its own dedicated statement
+                    // path further up (it has to collect `httpparam` children),
+                    // and that path runs first, so an entry here would be dead.
+                    "image" => Some(TagStmt::NamedCall("cfimage")),
                     "directory" => Some(TagStmt::NamedCall("cfdirectory")),
                     "file" => Some(TagStmt::NamedCall("cffile")),
                     "zip" => Some(TagStmt::NamedCall("cfzip")),
