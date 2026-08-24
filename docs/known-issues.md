@@ -1252,29 +1252,6 @@ invisible for 300 releases.
 
 ---
 
-## 58. A `static` write in a pseudo-constructor is discarded 🏗
-
-Every component has a static scope, and `static.X = v` from a METHOD persists and
-is shared across instances (GH
-[#347](https://github.com/RustCFML/RustCFML/issues/347)). A write in the
-component BODY — the pseudo-constructor, outside any `static {}` block — is still
-lost:
-
-```cfml
-component {
-    static.FromCtor = "ctor";                       // Lucee: persists
-    function get() { return static.FromCtor ?: "(null)"; }
-}
-new PseudoStatic().get()   // Lucee: ctor    RustCFML: (null)
-```
-
-Nothing throws, so this has the same silent shape as the method-write bug it was
-found alongside. Use a `static { }` block, which works on both engines. Tracked
-separately — the fix is in how the pseudo-constructor frame is seeded, not in how
-the scope is stored.
-
----
-
 ## 59. `querySort()` infers numeric-vs-text ordering from the values, not a declared column type 🏗
 
 Lucee decides whether a query column sorts numerically or as text from the

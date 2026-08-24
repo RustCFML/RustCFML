@@ -87,5 +87,23 @@ assert("child reads own static", kid.ownValue(), "kid-only");
 assert("child reads inherited static", kid.inheritedGreeting(), "hello");
 assert("inherited static via ::", oop.StaticKid::GREETING, "hello");
 
+// --- GH #353: a write from the PSEUDO-CONSTRUCTOR ------------------------
+// `static.X = v` in the component body is an ordinary statement, not a member
+// modifier. It used to be swallowed by the parser: `static` was consumed as a
+// modifier whatever followed, so the write vanished silently and the read came
+// back null. Both the dotted and the bracket spelling must land, and every
+// legal use of `static` as a real modifier must keep working.
+pseudoOnly = new oop.StaticPseudoCtorOnly();
+assert("pseudo-constructor static write persists", pseudoOnly.get(), "ctor");
+// Shared across instances, like any other static member.
+assert("...and is shared with a second instance", new oop.StaticPseudoCtorOnly().get(), "ctor");
+
+pseudo = new oop.StaticPseudoCtor();
+assert("body write alongside a static block", pseudo.readCtor(), "ctor");
+assert("bracket-form body write", pseudo.readBracket(), "bracket");
+assert("the static block still runs", pseudo.readBlock(), "block");
+assert("static modifiers still parse in every position",
+       pseudo.callModifiers(), "sf/stf/psf");
+
 suiteEnd();
 </cfscript>

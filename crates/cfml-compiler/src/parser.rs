@@ -4315,7 +4315,24 @@ impl Parser {
                 AccessModifier::Public
             };
 
-            let is_static = self.match_token(&Token::Static);
+            // `static` at the head of a component-body member is a MODIFIER
+            // (`static function`, `static property`, `static { … }`) — but it is
+            // also the name of the static SCOPE, and `static.X = v` /
+            // `static["X"] = v` in the pseudo-constructor are ordinary
+            // statements. Consuming the token unconditionally ate the scope
+            // reference and left `.X = v` to parse as junk, so the write
+            // vanished without a word (GH #353). A following `.`, `[` or `=`
+            // means it is the scope, not a modifier.
+            let is_static = if matches!(self.peek(0), Token::Static)
+                && !matches!(
+                    self.peek(1),
+                    Token::Dot | Token::LBracket | Token::Equal
+                ) {
+                self.advance();
+                true
+            } else {
+                false
+            };
 
             // `static { ... }` class-initialization block (BoxLang/Lucee). The
             // body runs once per component type to populate the shared `static`
