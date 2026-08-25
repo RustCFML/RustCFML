@@ -522,6 +522,7 @@ include "harness.cfm";
 <!--- in tests/Application.cfc. Reduced from the titan (Moopa) codebase port. --->
 <cf_runtest file="tags/test_customtag_path_deep_search.cfm">
 <cf_runtest file="tags/test_customtag_hyphenated_attributes.cfm">
+<cf_runtest file="tags/test_customtag_prefix_body_output.cfm">
 <cf_runtest file="tags/test_tags_buffer_recovery.cfm">
 <cf_runtest file="tags/test_tags_cfexecute.cfm">
 <cf_runtest file="tags/test_cfexecute_argument_quoting.cfm">
