@@ -358,6 +358,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("stripCr".to_string(), fn_strip_cr);
     f.insert("toBase64".to_string(), fn_to_base64);
     f.insert("toBinary".to_string(), fn_to_binary);
+    f.insert("csvFormatRow".to_string(), fn_csv_format_row);
     f.insert("binaryEncode".to_string(), fn_binary_encode);
     f.insert("binaryDecode".to_string(), fn_binary_decode);
     f.insert("urlEncodedFormat".to_string(), fn_url_encoded_format);
@@ -894,6 +895,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cfloop_file_lines".to_string(), fn_cfloop_file_lines_stub);
     f.insert("__cfexecute".to_string(), fn_cfexecute_stub);
     f.insert("__cfmail".to_string(), fn_cfmail);
+    // Gated with its implementation: the SMTP probe needs `lettre`, which the
+    // wasm targets do not build.
+    #[cfg(feature = "smtp")]
+    f.insert("smtpConnectionTest".to_string(), fn_smtp_connection_test);
 
     // ---- Whitespace/output control functions (VM-intercepted) ----
     f.insert("__writeText".to_string(), fn_write_text_stub);
@@ -993,6 +998,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
         f.insert("argon2CheckHash".to_string(), fn_argon2_check_hash);
         f.insert("csrfGenerateToken".to_string(), fn_csrf_generate_token);
         f.insert("csrfVerifyToken".to_string(), fn_csrf_verify_token);
+        f.insert("randomBytes".to_string(), fn_random_bytes);
     }
 
     // ---- YAML functions (BoxLang-compatible names) ----
@@ -1130,6 +1136,37 @@ fn get_arg(args: &[CfmlValue], idx: usize) -> &CfmlValue {
 
 fn get_str(args: &[CfmlValue], idx: usize) -> String {
     args.get(idx).map(|v| v.as_string()).unwrap_or_default()
+}
+
+/// Coerce argument `idx` to the raw bytes a Java `byte[]` parameter would carry.
+///
+/// The crypto BIFs used to read every argument through [`get_str`], which runs
+/// `as_string()` — lossy UTF-8 for a `Binary`, and a decimal *rendering* for an
+/// array of signed bytes. So `hmac( binaryData, binaryKey )` did not hash the
+/// bytes it was given; it hashed a mangled text form of them, silently. Anything
+/// carrying bytes is now taken verbatim:
+///
+/// - `Binary` — as-is;
+/// - `Array` of signed byte ints — what `String.getBytes()` and the
+///   `ByteArrayOutputStream`/`ByteBuffer` shims hand back; each element masked to
+///   its low 8 bits;
+/// - anything else — its UTF-8 string form, which is the historical behaviour and
+///   what a CFML caller passing a plain string means.
+fn get_bytes(args: &[CfmlValue], idx: usize) -> Vec<u8> {
+    match args.get(idx) {
+        Some(CfmlValue::Binary(b)) => b.clone(),
+        Some(CfmlValue::Array(a)) => a
+            .snapshot()
+            .iter()
+            .map(|e| match e {
+                CfmlValue::Int(i) => (*i & 0xFF) as u8,
+                CfmlValue::Double(d) => (*d as i64 & 0xFF) as u8,
+                other => other.as_string().trim().parse::<i64>().unwrap_or(0) as u8,
+            })
+            .collect(),
+        Some(other) => other.as_string().into_bytes(),
+        None => Vec::new(),
+    }
 }
 
 fn get_int(args: &[CfmlValue], idx: usize) -> i64 {
@@ -1905,6 +1942,88 @@ fn fn_object_load(args: Vec<CfmlValue>) -> CfmlResult {
     };
     serde_json::from_slice::<CfmlValue>(body)
         .map_err(|e| CfmlError::runtime(format!("objectLoad: failed to deserialize value: {e}")))
+}
+
+/// `csvFormatRow( values [, delimiter [, quoteChar [, escapeChar [, quoteAll ]]]] )`
+///
+/// Encode an array as one CSV record — **without** a line terminator, so the
+/// caller chooses `\n` or `\r\n`. Defaults follow RFC 4180: comma-separated,
+/// double-quoted, an embedded quote doubled.
+///
+/// CFML has `listToArray`/`arrayToList`, but a delimiter-joined list is not CSV:
+/// it corrupts any value containing the delimiter, a quote, or a newline. Getting
+/// that right is why callers reached for opencsv through
+/// `createObject("java", "com.opencsv.CSVWriter")`; this is the same encoding
+/// under a CFML name, and the CSVWriter shim is a thin adapter over it.
+///
+/// - `quoteAll` (default `true`) quotes every field, which is what opencsv's
+///   `writeNext( String[] )` does. Set it false to quote only the fields that
+///   need it — a value containing the delimiter, the quote character, `\r` or `\n`.
+/// - `escapeChar` defaults to the quote character, i.e. `"` doubles to `""`.
+///   Set it to a backslash for the `\"` dialect some tools emit.
+/// - A null element is written as an empty, unquoted field.
+fn fn_csv_format_row(args: Vec<CfmlValue>) -> CfmlResult {
+    let values: Vec<CfmlValue> = match args.first() {
+        Some(CfmlValue::Array(a)) => a.snapshot(),
+        Some(CfmlValue::Null) | None => {
+            return Err(CfmlError::runtime(
+                "csvFormatRow: first argument must be an array of values".to_string(),
+            ))
+        }
+        // A single scalar is a one-column row; that is unambiguous and saves
+        // callers a wrapper array.
+        Some(other) => vec![other.clone()],
+    };
+
+    let one_char = |idx: usize, default: char| -> char {
+        match args.get(idx) {
+            Some(CfmlValue::Null) | None => default,
+            Some(v) => v.as_string().chars().next().unwrap_or(default),
+        }
+    };
+    let delimiter = one_char(1, ',');
+    let quote = one_char(2, '"');
+    let escape = one_char(3, quote);
+    let quote_all = match args.get(4) {
+        Some(CfmlValue::Bool(b)) => *b,
+        Some(CfmlValue::Null) | None => true,
+        Some(other) => {
+            let s = other.as_string();
+            !(s.eq_ignore_ascii_case("false") || s == "0")
+        }
+    };
+
+    let mut out = String::new();
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(delimiter);
+        }
+        // opencsv skips a null element entirely, yielding an empty unquoted
+        // field. Matching that keeps a round-trip through the shim byte-identical.
+        if matches!(v, CfmlValue::Null) {
+            continue;
+        }
+        let field = v.as_string();
+        let needs_quotes = quote_all
+            || field.contains(delimiter)
+            || field.contains(quote)
+            || field.contains('\n')
+            || field.contains('\r');
+
+        if needs_quotes {
+            out.push(quote);
+        }
+        for c in field.chars() {
+            if c == quote || (c == escape && escape != quote) {
+                out.push(escape);
+            }
+            out.push(c);
+        }
+        if needs_quotes {
+            out.push(quote);
+        }
+    }
+    Ok(CfmlValue::string(out))
 }
 
 fn fn_binary_encode(args: Vec<CfmlValue>) -> CfmlResult {
@@ -4129,6 +4248,7 @@ fn register_spreadsheet_functions(f: &mut HashMap<String, BuiltinFunction>) {
     f.insert("spreadsheetMergeCells".to_string(), ss::fn_spreadsheet_merge_cells);
     f.insert("spreadsheetAddFreezePane".to_string(), ss::fn_spreadsheet_add_freeze_pane);
     f.insert("spreadsheetSetColumnWidth".to_string(), ss::fn_spreadsheet_set_column_width);
+    f.insert("spreadsheetAutoSizeColumn".to_string(), ss::fn_spreadsheet_auto_size_column);
     f.insert("spreadsheetSetRowHeight".to_string(), ss::fn_spreadsheet_set_row_height);
     f.insert("spreadsheetDeleteRow".to_string(), ss::fn_spreadsheet_delete_row);
     f.insert("spreadsheetDeleteRows".to_string(), ss::fn_spreadsheet_delete_rows);
@@ -15162,44 +15282,48 @@ fn fn_hmac(args: Vec<CfmlValue>) -> CfmlResult {
     use sha1::Sha1;
     use md5::Md5;
 
-    let message = get_str(&args, 0);
-    let key = get_str(&args, 1);
+    // Bytes, not text: a Binary message/key (or a signed-byte array from
+    // String.getBytes() / ByteArrayOutputStream.toByteArray()) must be hashed
+    // verbatim. Reading these through as_string() mangled them — see `get_bytes`.
+    let message = get_bytes(&args, 0);
+    let key = get_bytes(&args, 1);
     let algorithm = if args.len() >= 3 {
         get_str(&args, 2).to_uppercase()
     } else {
         "HMACSHA256".to_string()
     };
-    // encoding param (4th) -- we always return hex, matching CFML default
+    // encoding param (4th) is the input charset (Lucee); output is always
+    // uppercase hex, matching CFML.
 
     let hex_result = match algorithm.as_str() {
         "HMACMD5" | "HMAC-MD5" => {
-            let mut mac = Hmac::<Md5>::new_from_slice(key.as_bytes())
+            let mut mac = Hmac::<Md5>::new_from_slice(&key)
                 .map_err(|e| CfmlError::runtime(format!("HMAC init error: {}", e)))?;
-            mac.update(message.as_bytes());
+            mac.update(&message);
             hex_encode(&mac.finalize().into_bytes())
         }
         "HMACSHA1" | "HMAC-SHA1" => {
-            let mut mac = Hmac::<Sha1>::new_from_slice(key.as_bytes())
+            let mut mac = Hmac::<Sha1>::new_from_slice(&key)
                 .map_err(|e| CfmlError::runtime(format!("HMAC init error: {}", e)))?;
-            mac.update(message.as_bytes());
+            mac.update(&message);
             hex_encode(&mac.finalize().into_bytes())
         }
         "HMACSHA256" | "HMAC-SHA256" | "" => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+            let mut mac = Hmac::<Sha256>::new_from_slice(&key)
                 .map_err(|e| CfmlError::runtime(format!("HMAC init error: {}", e)))?;
-            mac.update(message.as_bytes());
+            mac.update(&message);
             hex_encode(&mac.finalize().into_bytes())
         }
         "HMACSHA384" | "HMAC-SHA384" => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(key.as_bytes())
+            let mut mac = Hmac::<Sha384>::new_from_slice(&key)
                 .map_err(|e| CfmlError::runtime(format!("HMAC init error: {}", e)))?;
-            mac.update(message.as_bytes());
+            mac.update(&message);
             hex_encode(&mac.finalize().into_bytes())
         }
         "HMACSHA512" | "HMAC-SHA512" => {
-            let mut mac = Hmac::<Sha512>::new_from_slice(key.as_bytes())
+            let mut mac = Hmac::<Sha512>::new_from_slice(&key)
                 .map_err(|e| CfmlError::runtime(format!("HMAC init error: {}", e)))?;
-            mac.update(message.as_bytes());
+            mac.update(&message);
             hex_encode(&mac.finalize().into_bytes())
         }
         _ => return Err(CfmlError::runtime(format!("Unsupported HMAC algorithm: {}", algorithm)))
@@ -15423,6 +15547,42 @@ fn fn_jwt_decode(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 #[cfg(feature = "security")]
+/// `randomBytes( count )` — `count` cryptographically secure random bytes, as a
+/// Binary.
+///
+/// CFML has no primitive for this: `generateSecretKey()` only yields cipher-shaped
+/// key lengths and returns base64 text, and `rand()`/`randRange()` are not
+/// cryptographic. Callers that needed raw entropy — a PBKDF2 salt, a nonce, an
+/// opaque token — had to reach for `createObject("java", "java.security.SecureRandom")`.
+/// This is that capability under a CFML name; the `SecureRandom` shim is a thin
+/// adapter over it.
+///
+/// Backed by `rand::rngs::OsRng`, i.e. the operating system CSPRNG (`getrandom`).
+#[cfg(feature = "security")]
+fn fn_random_bytes(args: Vec<CfmlValue>) -> CfmlResult {
+    use rand::RngCore;
+
+    let count = get_int(&args, 0);
+    if count <= 0 {
+        return Err(CfmlError::runtime(
+            "randomBytes: count must be greater than 0".to_string(),
+        ));
+    }
+    // A hard ceiling so a typo (`randomBytes( someHugeNumber )`) fails loudly
+    // instead of trying to allocate the machine's memory.
+    const MAX: i64 = 16 * 1024 * 1024;
+    if count > MAX {
+        return Err(CfmlError::runtime(format!(
+            "randomBytes: count must be at most {} ({} requested)",
+            MAX, count
+        )));
+    }
+
+    let mut buf = vec![0u8; count as usize];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    Ok(CfmlValue::Binary(buf))
+}
+
 fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
     use rand::RngCore;
 
@@ -17346,6 +17506,106 @@ fn fn_cfexecute_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 // unreachable by design — the code must still compile so the smtp build
 // stays warning-free, so allow the lint rather than cfg-ing out the tail.
 #[cfg_attr(not(feature = "smtp"), allow(unreachable_code))]
+/// `smtpConnectionTest( host [, port [, username [, password [, useTls [, useSsl
+/// [, timeout ]]]]]] )` → `{ success, authFailed, message }`
+///
+/// Open a connection to an SMTP server, optionally authenticate, and hang up
+/// without sending anything. This is the "are these mail settings correct?" check
+/// an admin screen runs after someone types in a host and a password — the one
+/// thing `<cfmail>` cannot do, because it must send a message to find out.
+///
+/// `authFailed` is reported separately from a general failure because the two
+/// need different messages in a UI: wrong password is the user's to fix, an
+/// unreachable host usually is not. Callers previously distinguished these by
+/// catching `javax.mail.AuthenticationFailedException` from a hand-built
+/// `javax.mail.Session`; that shim now calls this.
+///
+/// Defaults: port 25, STARTTLS on (`useTls`), implicit TLS off (`useSsl`),
+/// timeout 10 seconds. `success` is false whenever `message` is non-empty.
+#[cfg(feature = "smtp")]
+fn fn_smtp_connection_test(args: Vec<CfmlValue>) -> CfmlResult {
+    use lettre::transport::smtp::authentication::Credentials;
+    // `test_connection()` is inherent on SmtpTransport, so the Transport trait
+    // is not needed here (importing it is an unused-import warning).
+    use lettre::SmtpTransport;
+
+    let host = get_str(&args, 0);
+    if host.trim().is_empty() {
+        return Err(CfmlError::runtime(
+            "smtpConnectionTest: host is required".to_string(),
+        ));
+    }
+    let port = match args.get(1) {
+        Some(CfmlValue::Null) | None => 25u16,
+        Some(v) => v.as_string().trim().parse::<u16>().unwrap_or(25),
+    };
+    let username = get_str(&args, 2);
+    let password = get_str(&args, 3);
+    let flag = |i: usize, default: bool| -> bool {
+        match args.get(i) {
+            Some(CfmlValue::Bool(b)) => *b,
+            Some(CfmlValue::Null) | None => default,
+            Some(other) => {
+                let s = other.as_string();
+                !(s.eq_ignore_ascii_case("false") || s == "0" || s.is_empty())
+            }
+        }
+    };
+    let use_tls = flag(4, true);
+    let use_ssl = flag(5, false);
+    let timeout = match args.get(6) {
+        Some(CfmlValue::Null) | None => 10u64,
+        Some(v) => v.as_string().trim().parse::<u64>().unwrap_or(10),
+    };
+
+    let mut result = ValueMap::default();
+    let finish = |result: &mut ValueMap, ok: bool, auth: bool, msg: String| -> CfmlResult {
+        result.insert("success".to_string(), CfmlValue::Bool(ok));
+        result.insert("authFailed".to_string(), CfmlValue::Bool(auth));
+        result.insert("message".to_string(), CfmlValue::string(msg));
+        Ok(CfmlValue::strukt(std::mem::take(result)))
+    };
+
+    // Same TLS ladder <cfmail> uses: implicit TLS, else STARTTLS, else plaintext.
+    // A requested-but-unavailable TLS is a failure, never a silent downgrade.
+    let builder = if use_ssl {
+        SmtpTransport::relay(&host)
+    } else if use_tls {
+        SmtpTransport::starttls_relay(&host)
+    } else {
+        Ok(SmtpTransport::builder_dangerous(&host))
+    };
+    let mut builder = match builder {
+        Ok(b) => b.port(port).timeout(Some(std::time::Duration::from_secs(timeout))),
+        Err(e) => return finish(&mut result, false, false, e.to_string()),
+    };
+    if !username.is_empty() {
+        builder = builder.credentials(Credentials::new(username, password));
+    }
+
+    match builder.build().test_connection() {
+        Ok(true) => finish(&mut result, true, false, String::new()),
+        // A clean connection that reports "not usable" — no error to quote.
+        Ok(false) => finish(
+            &mut result,
+            false,
+            false,
+            format!("{}:{} did not accept the connection", host, port),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            // 535/534/538 are the SMTP AUTH rejection codes; lettre surfaces the
+            // server's reply text, so match on the code rather than on wording
+            // that varies by server.
+            let auth = msg.contains("535")
+                || msg.contains("534")
+                || msg.contains("538")
+                || msg.to_ascii_lowercase().contains("authentication");
+            finish(&mut result, false, auth, msg)
+        }
+    }
+}
+
 fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     let opts = match args.into_iter().next() {
         Some(CfmlValue::Struct(s)) => s,
@@ -18116,8 +18376,12 @@ fn fn_generate_pbkdf_key(args: Vec<CfmlValue>) -> CfmlResult {
     }
 
     let algorithm = get_str(&args, 0).to_uppercase();
-    let passphrase = get_str(&args, 1);
-    let salt = get_str(&args, 2);
+    // Bytes, not text. A PBKDF2 salt is conventionally raw random bytes (Java's
+    // PBEKeySpec takes a byte[]), and reading one through as_string() replaced
+    // every non-UTF-8 byte with U+FFFD — a different, weaker salt than the caller
+    // generated. Strings still work: they are taken as their UTF-8 bytes.
+    let passphrase = get_bytes(&args, 1);
+    let salt = get_bytes(&args, 2);
     let iterations = get_int(&args, 3) as u32;
     let key_size_bits = get_int(&args, 4) as usize;
     let key_size_bytes = key_size_bits / 8;
@@ -18134,24 +18398,24 @@ fn fn_generate_pbkdf_key(args: Vec<CfmlValue>) -> CfmlResult {
     match algorithm.as_str() {
         "PBKDF2WITHHMACSHA1" | "PBKDF2WITHSHA1" => {
             pbkdf2_hmac::<Sha1>(
-                passphrase.as_bytes(),
-                salt.as_bytes(),
+                &passphrase,
+                &salt,
                 iterations,
                 &mut derived_key,
             );
         }
         "PBKDF2WITHHMACSHA256" | "PBKDF2WITHSHA256" => {
             pbkdf2_hmac::<Sha256>(
-                passphrase.as_bytes(),
-                salt.as_bytes(),
+                &passphrase,
+                &salt,
                 iterations,
                 &mut derived_key,
             );
         }
         "PBKDF2WITHHMACSHA512" | "PBKDF2WITHSHA512" => {
             pbkdf2_hmac::<Sha512>(
-                passphrase.as_bytes(),
-                salt.as_bytes(),
+                &passphrase,
+                &salt,
                 iterations,
                 &mut derived_key,
             );

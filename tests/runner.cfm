@@ -664,6 +664,16 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
+
+<!--- Adobe XMPCore, the JCE crypto surface, opencsv + java.io writers,
+     java.util.StringTokenizer/Properties and JavaMail's connection probe. --->
+<cf_runtest file="java_shims/test_xmp_core.cfm" rustcfmlOnly="true" why="asserts RustCFML's XMPCore adapter; Lucee needs the real xmpcore.jar, which the test deliberately does not supply">
+<cf_runtest file="java_shims/test_javax_crypto.cfm" rustcfmlOnly="true" why="asserts the JCE adapter and the randomBytes() BIF, neither of which exists on Lucee (it has the real JVM classes)">
+<cf_runtest file="java_shims/test_opencsv_writer.cfm" rustcfmlOnly="true" why="asserts the opencsv adapter and the csvFormatRow() BIF; Lucee needs the real opencsv jar">
+<cf_runtest file="java_shims/test_stringtokenizer_properties.cfm" rustcfmlOnly="true" why="asserts RustCFML's StringTokenizer/Properties shims; Lucee has the real java.util classes and differs on null handling">
+<cf_runtest file="java_shims/test_javax_mail_probe.cfm" rustcfmlOnly="true" why="asserts the JavaMail adapter and the smtpConnectionTest() BIF, which is RustCFML-only">
+<cf_runtest file="java_shims/test_poi_spreadsheet.cfm" rustcfmlOnly="true" why="asserts the POI-over-native-spreadsheet adapter; Lucee has no POI on the classpath here">
+<cf_runtest file="java_shims/test_osgi_inert.cfm" rustcfmlOnly="true" why="asserts that RustCFML's OSGi plumbing is inert; on Lucee it is real and installs bundles">
 <cf_runtest file="java_shims/test_optional.cfm">
 <cf_runtest file="java_shims/test_masa_io_text_shims.cfm" rustcfmlOnly="true" why="passes a locale shim to java.text.MessageFormat; real Java has no such constructor">
 

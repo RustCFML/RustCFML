@@ -43,6 +43,12 @@ mod antisamy_shim;
 mod cmdline;
 mod java_security;
 mod java_shims;
+mod xmp_shim;
+mod javax_crypto_shim;
+mod io_csv_shim;
+mod javax_mail_shim;
+mod osgi_shim;
+mod poi_shim;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
 mod ops;
 mod java_time;
@@ -5144,6 +5150,35 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
             .map(|(k, f)| (k.as_str(), *f))
+    }
+
+    /// Call a registered builtin by name, from a Java-shim handler.
+    ///
+    /// Every shim in this crate that needs a *capability* (parse XMP, rasterise
+    /// SVG, derive a key, …) reaches it through the corresponding BIF rather than
+    /// re-implementing it: the BIF is the single implementation, exposed to CFML
+    /// callers under its own name, and the shim is the Java-shaped adapter over
+    /// it. That keeps the heavy dependencies in `cfml-stdlib` (an *optional* dep
+    /// of this crate) and guarantees the two surfaces can never drift.
+    ///
+    /// Returns `None` when the builtin is not registered — which happens when the
+    /// owning `cfml-stdlib` feature is compiled out. Callers turn that into a
+    /// clear "not available in this build" error rather than a wrong answer.
+    fn call_bif(&self, name: &str, args: Vec<CfmlValue>) -> Option<CfmlResult> {
+        let lower = name.to_ascii_lowercase();
+        self.builtin_lookup_ci(name, &lower).map(|(_, f)| f(args))
+    }
+
+    /// `call_bif`, with the "feature compiled out" case turned into an error that
+    /// names both the Java class the caller asked for and the BIF that backs it.
+    fn require_bif(&self, java_class: &str, bif: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        self.call_bif(bif, args).unwrap_or_else(|| {
+            Err(CfmlError::runtime(format!(
+                "createObject(\"java\", \"{}\") is backed by the {}() builtin, which is not \
+                 present in this build (its cfml-stdlib feature is disabled)",
+                java_class, bif
+            )))
+        })
     }
 
     /// Record `name` in the lowercased `user_functions` index. MUST be called
@@ -16430,6 +16465,54 @@ impl CfmlVirtualMachine {
                                 other if antisamy_shim::is_antisamy_class(other) => {
                                     antisamy_shim::construct(other)
                                 }
+                                // Adobe XMPCore (xmpcore.jar). Like AntiSamy, the
+                                // jar-path argument is ignored — the parser is the
+                                // native xmpParse() builtin.
+                                other if xmp_shim::is_xmp_class(other) => {
+                                    xmp_shim::construct(other)
+                                }
+                                // JCE (javax.crypto.*) + java.security.SecureRandom:
+                                // the HMAC / PBKDF2 / entropy surface, backed by the
+                                // hmac(), generatePBKDFKey() and randomBytes() BIFs.
+                                other if javax_crypto_shim::is_crypto_class(other) => {
+                                    javax_crypto_shim::construct(other)
+                                }
+                                // Character writers + opencsv's CSVWriter, backed
+                                // by the csvFormatRow() BIF. The jar-path argument
+                                // callers pass for opencsv is ignored.
+                                other if io_csv_shim::is_writer_class(other) => {
+                                    io_csv_shim::construct(other)
+                                }
+                                // JavaMail's connection probe, backed by the
+                                // smtpConnectionTest() BIF.
+                                other if javax_mail_shim::is_mail_class(other) => {
+                                    javax_mail_shim::construct(other)
+                                }
+                                // Lucee's OSGi bundle plumbing, inert: it exists so a
+                                // library's bundle ceremony can complete and reach the
+                                // class it actually wants.
+                                other if osgi_shim::is_osgi_class(other) => {
+                                    osgi_shim::construct(other)
+                                }
+                                // Apache POI, mapped onto the native spreadsheet
+                                // engine (the Spreadsheet* builtins).
+                                other if poi_shim::is_poi_class(other) => {
+                                    poi_shim::construct(other)
+                                }
+                                "java.util.stringtokenizer" => {
+                                    java_shims::handle_java_stringtokenizer(
+                                        "init",
+                                        empty_args,
+                                        &CfmlValue::Null,
+                                    )
+                                }
+                                "java.util.properties" | "java.util.hashtable" => {
+                                    java_shims::handle_java_properties(
+                                        "init",
+                                        empty_args,
+                                        &CfmlValue::Null,
+                                    )
+                                }
                                 "java.util.uuid" => {
                                     handle_java_uuid("init", empty_args, &CfmlValue::Null)
                                 }
@@ -23574,6 +23657,99 @@ impl CfmlVirtualMachine {
                     }
                     antisamy_shim::ANTISAMY_CLASS => {
                         antisamy_shim::handle_antisamy(&m, all_args, object)
+                    }
+                    xmp_shim::FACTORY_CLASS => {
+                        let parse = |a: Vec<CfmlValue>| {
+                            self.require_bif(
+                                "com.adobe.xmp.XMPMetaFactory",
+                                "xmpParse",
+                                a,
+                            )
+                        };
+                        xmp_shim::handle_factory(&m, all_args, parse)
+                    }
+                    xmp_shim::META_CLASS => xmp_shim::handle_meta(&m, all_args, object),
+                    javax_crypto_shim::MAC_CLASS => {
+                        let hmac = |a: Vec<CfmlValue>| {
+                            self.require_bif("javax.crypto.Mac", "hmac", a)
+                        };
+                        javax_crypto_shim::handle_mac(&m, all_args, object, hmac)
+                    }
+                    javax_crypto_shim::SECRET_KEY_SPEC_CLASS => {
+                        javax_crypto_shim::handle_secret_key_spec(&m, all_args, object)
+                    }
+                    javax_crypto_shim::SECRET_KEY_CLASS => {
+                        javax_crypto_shim::handle_secret_key(&m, all_args, object)
+                    }
+                    javax_crypto_shim::PBE_KEY_SPEC_CLASS => {
+                        javax_crypto_shim::handle_pbe_key_spec(&m, all_args, object)
+                    }
+                    javax_crypto_shim::SECRET_KEY_FACTORY_CLASS => {
+                        let pbkdf = |a: Vec<CfmlValue>| {
+                            self.require_bif(
+                                "javax.crypto.SecretKeyFactory",
+                                "generatePBKDFKey",
+                                a,
+                            )
+                        };
+                        javax_crypto_shim::handle_secret_key_factory(&m, all_args, object, pbkdf)
+                    }
+                    io_csv_shim::FILE_WRITER_CLASS
+                    | io_csv_shim::BUFFERED_WRITER_CLASS
+                    | io_csv_shim::PRINT_WRITER_CLASS => {
+                        io_csv_shim::handle_writer(&java_class, &m, all_args, object)
+                    }
+                    oc if osgi_shim::is_osgi_class(oc) => {
+                        osgi_shim::dispatch(oc, &m, all_args)
+                    }
+                    pc if poi_shim::handles(pc) => {
+                        // The POI adapter reaches the engine only through the
+                        // registered Spreadsheet* builtins.
+                        let call = |bif: &str, a: Vec<CfmlValue>| {
+                            self.require_bif("org.apache.poi", bif, a)
+                        };
+                        poi_shim::dispatch(pc, &m, all_args, object, &call)
+                    }
+                    javax_mail_shim::SESSION_CLASS => {
+                        javax_mail_shim::handle_session(&m, all_args, object)
+                    }
+                    javax_mail_shim::TRANSPORT_CLASS => {
+                        let probe = |a: Vec<CfmlValue>| {
+                            self.require_bif(
+                                "javax.mail.Session",
+                                "smtpConnectionTest",
+                                a,
+                            )
+                        };
+                        javax_mail_shim::handle_transport(&m, all_args, object, probe)
+                    }
+                    io_csv_shim::CSV_WRITER_CLASS => {
+                        let fmt = |a: Vec<CfmlValue>| {
+                            self.require_bif("com.opencsv.CSVWriter", "csvFormatRow", a)
+                        };
+                        io_csv_shim::handle_csv_writer(&m, all_args, object, fmt)
+                    }
+                    "java.util.stringtokenizer" => {
+                        java_shims::handle_java_stringtokenizer(&m, all_args, object)
+                    }
+                    "java.util.properties" | "java.util.hashtable" => {
+                        java_shims::handle_java_properties(&m, all_args, object)
+                    }
+                    javax_crypto_shim::SECURE_RANDOM_CLASS => {
+                        let rb = |n: i64| {
+                            self.require_bif(
+                                "java.security.SecureRandom",
+                                "randomBytes",
+                                vec![CfmlValue::Int(n)],
+                            )
+                        };
+                        javax_crypto_shim::handle_secure_random(&m, all_args, rb)
+                    }
+                    xmp_shim::ITERATOR_CLASS => {
+                        xmp_shim::handle_iterator(&m, all_args, object)
+                    }
+                    xmp_shim::PROPERTY_INFO_CLASS => {
+                        xmp_shim::handle_property_info(&m, all_args, object)
                     }
                     antisamy_shim::POLICY_CLASS => {
                         antisamy_shim::handle_policy(&m, all_args, object)

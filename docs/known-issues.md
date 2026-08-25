@@ -1370,6 +1370,56 @@ The rest of the surface the engine-bundled `Mail` shim exposes IS wired through:
 `addParam( file=, remove= )` as an attachment deleted after a successful send,
 `addPart` as a `multipart/alternative`, and `useSSL`/`useTLS`.
 
+## 64. Lucee's OSGi bundle plumbing is inert 🏗
+
+`lucee.runtime.osgi.OSGiUtil` and `lucee.loader.engine.CFMLEngineFactory` are
+shimmed so that a CFML library which ships its own jars can complete its
+bundle-loading ceremony. Nothing is loaded: there is no JVM, no OSGi container
+and no jar to install.
+
+* `getBundleLoaded()` reports **every** bundle as already present, so callers
+  take their "nothing to do" path instead of building a `Resource` for a jar
+  that will not be read. `installBundle()` accepts and does nothing.
+* This is deliberately **not** a claim that the bundle's classes exist. The
+  `createObject( "java", className, bundleName, version )` that follows the
+  ceremony is answered on its own merits — natively if the engine models the
+  class (see §65), and otherwise with the usual "Java class […] is not
+  supported" error, naming the class.
+
+Without the shim, the `init()` of any such library is a hard error, so the only
+reachable states were "throws at construction" and "reaches the class request".
+
+## 65. Apache POI is an adapter over the native spreadsheet engine, not POI 🏗
+
+Libraries that drive POI's object graph directly — `lucee-spreadsheet`
+(`spreadsheetCFML`), which Preside vendors as `spreadsheetLib` — run against an
+adapter that maps that graph onto the `Spreadsheet*` builtins. A `Sheet` is a
+workbook plus a sheet index, a `Row` adds a row, a `Cell` adds a column, and
+each mutation is the matching builtin. POI's 0-based indexing is converted at
+that boundary.
+
+Where the two models genuinely differ:
+
+| POI | Here |
+|---|---|
+| `new XSSFWorkbook()` has no sheets | The engine always has one, so the adapter keeps POI's view of the sheet list and **reuses** that sheet on the first `createSheet()`. Later ones add normally. |
+| `CellStyle`/`Font` are configure-then-assign, and a style is a live workbook object | A style is an **accumulator**; `setCellStyle()`/`setRowStyle()` is where the formatting is applied. Mutating a style *after* assigning it does not retroactively restyle the cells it already touched. |
+| `setFont()` replaces the style's font | It **merges**, which is what makes the library's clone-the-current-font-then-modify-it idiom compose correctly without a shared font table. |
+| Fonts have defaults (Calibri, 11pt, black) | An **unset** font property reads as `null`, and every setter ignores a `null`. Answering POI's defaults would stamp them onto every cell a cloned-from-empty style touched. |
+| `Font.setCharSet()` / `setTypeOffset()` | Accepted and ignored — neither the format struct nor the engine models them, and refusing would break a `cloneFont()` that never set them. |
+| `Workbook.write( OutputStream )` streams anywhere | Requires a **file-backed** stream (`java.io.FileOutputStream`); the adapter writes through the engine, which needs a path. Anything else throws `java.io.IOException`. |
+| `new HSSFWorkbook()` writes legacy binary `.xls` | The engine READS `.xls` but cannot write it, so the workbook is **backed by xlsx and written as xlsx** — under whatever filename the caller chose, `.xls` included. Every such write prints a `[POI]` warning to stderr naming the file. `getClass()` still reports `HSSFWorkbook`/`HSSFCellStyle`, because libraries branch on that to pick their style and colour classes and those branches must stay self-consistent; only the bytes differ. **This is a deliberate format substitution** — spreadsheet applications sniff content and open it, a strict `.xls` consumer will not. It exists so Preside's form-builder export (which asks for `.xls`) keeps working until that is changed upstream. |
+| `Row.cellIterator()` yields physically-created cells | Approximated by "has a value", the only distinction the engine records. |
+
+The substitution is **write-side only**: `SpreadsheetRead()` still picks its
+reader from the file extension, so reading such a file back through its `.xls`
+name does not work. Callers that need the round trip should name the file
+`.xlsx`.
+
+Anything outside the adapter's reach **throws, naming the class and the method**
+rather than returning a plausible default — a spreadsheet that silently loses a
+column is worse than one that fails.
+
 ---
 
 ---

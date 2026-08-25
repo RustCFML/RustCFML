@@ -2023,6 +2023,7 @@ bif!(fn_spreadsheet_set_active_sheet_number, "setActiveSheetNumber", 1);
 bif!(fn_spreadsheet_add_row, "addRow", 1);
 bif!(fn_spreadsheet_add_rows, "addRows", 1);
 bif!(fn_spreadsheet_add_column, "addColumn", 1);
+bif!(fn_spreadsheet_auto_size_column, "autoSizeColumn", 1);
 bif!(fn_spreadsheet_format_cell, "formatCell", 1);
 bif!(fn_spreadsheet_format_row, "formatRow", 1);
 bif!(fn_spreadsheet_format_column, "formatColumn", 1);

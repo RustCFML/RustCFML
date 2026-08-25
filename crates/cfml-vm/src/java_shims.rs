@@ -2318,6 +2318,241 @@ fn bytes_to_signed_array(bytes: &[u8]) -> CfmlValue {
 // on. No JVM needed — a `Binary` backing buffer + a position cursor.
 //
 // State: `__buffer` (Binary, the backing array) + `__position` (Int cursor).
+/// `java.util.StringTokenizer` — the pre-`split()` tokenizer, still reached for by
+/// code that wants "give me the next token, and tell me how many are left"
+/// semantics rather than an array.
+///
+/// Preside's `EmailStyleInliner` walks CSS with it: `new StringTokenizer( rules,
+/// "{}" )` then `while( countTokens() > 1 ) { selector = nextToken(); style =
+/// nextToken(); }`. That loop depends on `countTokens()` meaning *remaining*, not
+/// total, and on `nextToken()` advancing the receiver in place.
+///
+/// Java's default delimiter set is `" \t\n\r\f"`, empty tokens are never
+/// returned (runs of delimiters collapse), and `returnDelims=true` additionally
+/// yields each delimiter as its own one-character token.
+/// `java.util.Properties` — a `Map<String,String>` with `getProperty`/`setProperty`
+/// on top. Callers build one to configure something else: a JavaMail `Session`, a
+/// JDBC driver, a resource bundle.
+///
+/// Entries live as ordinary keys on the shim struct (the same convention the
+/// LinkedHashMap/TreeMap shims use), so a consumer can also just read them as
+/// struct members. `__`-prefixed keys are the shim's own bookkeeping and never
+/// appear in `size()`, `keys()` or `stringPropertyNames()`.
+///
+/// Property values are strings in Java; `put()` accepts anything and stringifies,
+/// which is what a CFML caller passing a number or a boolean means.
+pub fn handle_java_properties(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let user_keys = |obj: &CfmlValue| -> Vec<String> {
+        match obj {
+            CfmlValue::Struct(s) => s
+                .iter()
+                .map(|(k, _)| k.as_str().to_string())
+                .filter(|k| !k.starts_with("__"))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    match method {
+        "init" => Ok(CfmlValue::strukt(java_shim_map("java.util.properties"))),
+        "put" | "setproperty" => {
+            let key = args.first().map(|v| v.as_string()).unwrap_or_default();
+            let value = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+            let previous = match object {
+                CfmlValue::Struct(s) => {
+                    let prev = s.get_ci(&key);
+                    s.insert(key, CfmlValue::string(value));
+                    prev
+                }
+                _ => None,
+            };
+            // Java returns the displaced value (null if there was none).
+            Ok(previous.unwrap_or(CfmlValue::Null))
+        }
+        // getProperty(key) and getProperty(key, default).
+        "get" | "getproperty" => {
+            let key = args.first().map(|v| v.as_string()).unwrap_or_default();
+            if key.starts_with("__") {
+                return Ok(CfmlValue::Null);
+            }
+            let found = match object {
+                CfmlValue::Struct(s) => s.get_ci(&key),
+                _ => None,
+            };
+            Ok(match found {
+                Some(v) => v,
+                None => args.get(1).cloned().unwrap_or(CfmlValue::Null),
+            })
+        }
+        "containskey" | "containsproperty" | "haskey" => {
+            let key = args.first().map(|v| v.as_string()).unwrap_or_default();
+            Ok(CfmlValue::Bool(
+                !key.starts_with("__")
+                    && matches!(object, CfmlValue::Struct(s) if s.get_ci(&key).is_some()),
+            ))
+        }
+        "remove" => {
+            let key = args.first().map(|v| v.as_string()).unwrap_or_default();
+            if key.starts_with("__") {
+                return Ok(CfmlValue::Null);
+            }
+            Ok(match object {
+                CfmlValue::Struct(s) => {
+                    let prev = s.get_ci(&key);
+                    s.remove_ci(&key);
+                    prev.unwrap_or(CfmlValue::Null)
+                }
+                _ => CfmlValue::Null,
+            })
+        }
+        "size" => Ok(CfmlValue::Int(user_keys(object).len() as i64)),
+        "isempty" => Ok(CfmlValue::Bool(user_keys(object).is_empty())),
+        "keyset" | "keys" | "stringpropertynames" | "propertynames" => Ok(CfmlValue::array(
+            user_keys(object).into_iter().map(CfmlValue::string).collect(),
+        )),
+        "clear" => {
+            if let CfmlValue::Struct(s) = object {
+                for k in user_keys(object) {
+                    s.remove_ci(&k);
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "putall" => {
+            if let (CfmlValue::Struct(dest), Some(CfmlValue::Struct(src))) =
+                (object, args.first())
+            {
+                for (k, v) in src.iter() {
+                    if !k.as_str().starts_with("__") {
+                        dest.insert(k.as_str().to_string(), CfmlValue::string(v.as_string()));
+                    }
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        // load()/store() read and write the java .properties file format. There
+        // is no JVM stream to hand them, and inventing a partial parser here
+        // would answer wrongly for escapes and continuations — refuse instead.
+        "load" | "store" | "loadfromxml" | "storetoxml" => Err(CfmlError::new(
+            format!(
+                "java.util.Properties.{}() is not supported by RustCFML's shim — use \
+                 getProfileString()/setProfileString() or fileRead() to load a properties file",
+                method
+            ),
+            CfmlErrorType::Custom("java.lang.UnsupportedOperationException".to_string()),
+        )),
+        other => Err(CfmlError::new(
+            format!(
+                "java.util.Properties.{}() is not supported by RustCFML's shim",
+                other
+            ),
+            CfmlErrorType::Custom("java.lang.UnsupportedOperationException".to_string()),
+        )),
+    }
+}
+
+pub fn handle_java_stringtokenizer(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    fn tokenize(text: &str, delims: &str, return_delims: bool) -> Vec<String> {
+        let set: Vec<char> = delims.chars().collect();
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for c in text.chars() {
+            if set.contains(&c) {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                if return_delims {
+                    out.push(c.to_string());
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    let remaining = |obj: &CfmlValue| -> (Vec<CfmlValue>, usize) {
+        let items = match obj {
+            CfmlValue::Struct(s) => match s.get("__tokens") {
+                Some(CfmlValue::Array(a)) => a.snapshot(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let pos = match obj {
+            CfmlValue::Struct(s) => match s.get("__pos") {
+                Some(CfmlValue::Int(n)) => n.max(0) as usize,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        (items, pos)
+    };
+
+    match method {
+        "init" => {
+            let text = args.first().map(|v| v.as_string()).unwrap_or_default();
+            let delims = match args.get(1) {
+                Some(CfmlValue::Null) | None => " \t\n\r\u{0c}".to_string(),
+                Some(v) => v.as_string(),
+            };
+            let return_delims = matches!(args.get(2), Some(CfmlValue::Bool(true)));
+            let mut shim = java_shim_map("java.util.stringtokenizer");
+            shim.insert(
+                "__tokens".to_string(),
+                CfmlValue::array(
+                    tokenize(&text, &delims, return_delims)
+                        .into_iter()
+                        .map(CfmlValue::string)
+                        .collect(),
+                ),
+            );
+            shim.insert("__pos".to_string(), CfmlValue::Int(0));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Remaining, not total — the whole point of the countTokens() loop.
+        "counttokens" => {
+            let (items, pos) = remaining(object);
+            Ok(CfmlValue::Int(items.len().saturating_sub(pos) as i64))
+        }
+        "hasmoretokens" | "hasmoreelements" => {
+            let (items, pos) = remaining(object);
+            Ok(CfmlValue::Bool(pos < items.len()))
+        }
+        "nexttoken" | "nextelement" => {
+            let (items, pos) = remaining(object);
+            if pos >= items.len() {
+                return Err(CfmlError::new(
+                    "java.util.NoSuchElementException: StringTokenizer is exhausted".to_string(),
+                    CfmlErrorType::Custom("java.util.NoSuchElementException".to_string()),
+                ));
+            }
+            if let CfmlValue::Struct(s) = object {
+                s.insert("__pos".to_string(), CfmlValue::Int(pos as i64 + 1));
+            }
+            Ok(items[pos].clone())
+        }
+        other => Err(CfmlError::new(
+            format!(
+                "java.util.StringTokenizer.{}() is not supported by RustCFML's shim",
+                other
+            ),
+            CfmlErrorType::Custom("java.lang.UnsupportedOperationException".to_string()),
+        )),
+    }
+}
+
 pub fn handle_java_bytebuffer(
     method: &str,
     args: Vec<CfmlValue>,
