@@ -49,6 +49,7 @@ mod io_csv_shim;
 mod javax_mail_shim;
 mod osgi_shim;
 mod poi_shim;
+mod jsoup_shim;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
 mod ops;
 mod java_time;
@@ -5179,6 +5180,27 @@ impl CfmlVirtualMachine {
                 java_class, bif
             )))
         })
+    }
+
+    /// Invoke a method on a `CfmlNative` object, from a Java-shim handler.
+    ///
+    /// The companion to `call_bif` for the shims whose BIF hands back a native
+    /// object rather than a plain value — `HtmlDocument()` and the jsoup adapter
+    /// over it. Takes the write lock for the duration of the call, exactly as
+    /// `call_member_function` does, so a shim must not hold another lock on the
+    /// same object across it.
+    fn call_native(&self, object: &CfmlValue, method: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        let CfmlValue::NativeObject(obj) = object else {
+            return Err(CfmlError::runtime(format!(
+                "internal: expected a native object to call {}() on, got {}",
+                method,
+                object.type_name()
+            )));
+        };
+        let mut guard = obj
+            .write()
+            .map_err(|_| CfmlError::runtime("NativeObject lock poisoned".to_string()))?;
+        guard.call_method(method, args)
     }
 
     /// Record `name` in the lowercased `user_functions` index. MUST be called
@@ -16499,6 +16521,11 @@ impl CfmlVirtualMachine {
                                 other if poi_shim::is_poi_class(other) => {
                                     poi_shim::construct(other)
                                 }
+                                // jsoup, over the HtmlDocument() builtin's
+                                // mutable DOM.
+                                other if jsoup_shim::is_jsoup_class(other) => {
+                                    jsoup_shim::construct(other)
+                                }
                                 "java.util.stringtokenizer" => {
                                     java_shims::handle_java_stringtokenizer(
                                         "init",
@@ -23701,6 +23728,15 @@ impl CfmlVirtualMachine {
                     }
                     oc if osgi_shim::is_osgi_class(oc) => {
                         osgi_shim::dispatch(oc, &m, all_args)
+                    }
+                    jc if jsoup_shim::is_jsoup_class(jc) => {
+                        let parse = |a: Vec<CfmlValue>| {
+                            self.require_bif("org.jsoup.Jsoup", "htmlDocument", a)
+                        };
+                        let call = |doc: &CfmlValue, m: &str, a: Vec<CfmlValue>| {
+                            self.call_native(doc, m, a)
+                        };
+                        jsoup_shim::dispatch(jc, &m, all_args, object, &parse, &call)
                     }
                     pc if poi_shim::handles(pc) => {
                         // The POI adapter reaches the engine only through the

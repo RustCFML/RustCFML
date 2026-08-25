@@ -148,17 +148,24 @@ pub fn sanitize(html: &str, policy: &Policy) -> Result<String, SanitizeError> {
         let Some(mut node) = document.tree.get_mut(id) else { continue };
         if let Node::Element(el) = node.value() {
             for (name, replacement) in edits {
-                let position = el
+                // `Attributes` is an order-preserving IndexMap (scraper's
+                // `deterministic` feature), so an attribute is addressed by its
+                // key. Match case-insensitively: HTML attribute names are, and
+                // the policy's spelling need not be the document's.
+                let key = el
                     .attrs
-                    .iter()
-                    .position(|(k, _)| k.local.as_ref().eq_ignore_ascii_case(&name));
-                let Some(position) = position else { continue };
+                    .keys()
+                    .find(|k| k.local.as_ref().eq_ignore_ascii_case(&name))
+                    .cloned();
+                let Some(key) = key else { continue };
                 match replacement {
-                    Some(value) => el.attrs[position].1 = value.into(),
-                    // `remove`, not `swap_remove`: dropping one attribute must
-                    // not reshuffle the rest.
+                    Some(value) => {
+                        el.attrs.insert(key, value.into());
+                    }
+                    // `shift_remove`, not `swap_remove`: dropping one attribute
+                    // must not reshuffle the rest.
                     None => {
-                        el.attrs.remove(position);
+                        el.attrs.shift_remove(&key);
                     }
                 }
             }

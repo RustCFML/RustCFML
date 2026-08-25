@@ -7,6 +7,8 @@ pub mod image;
 pub mod spreadsheet;
 #[cfg(feature = "xml")]
 pub mod xmp;
+#[cfg(feature = "html")]
+pub mod html_dom;
 pub mod db_driver;
 pub mod pg_sql;
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]

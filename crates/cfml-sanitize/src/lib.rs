@@ -153,13 +153,14 @@ mod tests {
         // An <img> whose src fails validation is meaningless, so the policy
         // asks for the element itself to go — not just the attribute.
         assert_eq!(clean(r#"<img src="javascript:alert(1)" alt="x">"#), "");
-        // …while a valid src keeps it. html5ever normalises attribute ORDER
-        // (alphabetical), so the output is compared in that order rather than
-        // the input's — a cosmetic divergence from the Java library, recorded
-        // in docs/known-issues.md.
+        // …while a valid src keeps it, with its attributes in SOURCE order.
+        // They used to come back alphabetised — scraper sorts them unless its
+        // `deterministic` feature is on, which it now is — and that reordering
+        // was a (cosmetic) divergence from the Java library. Turning the feature
+        // on removed it, so this asserts the input's own order.
         assert_eq!(
             clean(r#"<img src="https://ok.test/a.png" alt="x" />"#),
-            r#"<img alt="x" src="https://ok.test/a.png" />"#
+            r#"<img src="https://ok.test/a.png" alt="x" />"#
         );
     }
 

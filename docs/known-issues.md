@@ -1104,6 +1104,12 @@ vector survives on either engine. The differences that do remain are cosmetic:
 | An emptied `<style>` reads `<![CDATA[/* */]]>` vs AntiSamy's `p {\n}` | Same cause: we drop the emptied rule, AntiSamy keeps the empty block |
 | `<scr<script>ipt>alert(1)</script>` leaves the text `ipt&gt;alert(1)` | html5ever and neko disagree about where the malformed tag ends. Both remove the script; we keep the leftover text, AntiSamy discards it |
 
+Attribute **order** used to diverge too — the parser alphabetised attributes,
+so `<img src alt>` came back as `<img alt src>`. It no longer does: source order
+is preserved (scraper's `deterministic` feature), which also keeps a
+parse/serialise round trip through `HtmlDocument()` from rewriting the caller's
+markup.
+
 Two behaviours are deliberate and will not change:
 
 - **At-rules inside `<style>` are dropped wholesale.** `@import` must never be
@@ -1419,6 +1425,30 @@ name does not work. Callers that need the round trip should name the file
 Anything outside the adapter's reach **throws, naming the class and the method**
 rather than returning a plausible default — a spreadsheet that silently loses a
 column is worse than one that fails.
+
+## 66. jsoup is an adapter over `HtmlDocument()` 🏗
+
+`org.jsoup.*` maps onto the `HtmlDocument()` builtin's mutable DOM. An `Element`
+is the shared document handle plus an integer node handle, so a mutation through
+one element is visible through every other and in the document's output — which
+is what the mutate-then-serialise callers (email click-tracking, CSS inlining)
+need.
+
+| jsoup | Here |
+|---|---|
+| `Document.OutputSettings` — charset, pretty-print, escape mode, indent | **Accepted and ignored**, fluently, so a caller's chain still runs. The serialiser has none of those knobs: it emits the document as parsed, in UTF-8. |
+| `Jsoup.clean( html, whitelist )` | **Refused.** It is a sanitiser with jsoup's Whitelist policy model, which has no equivalent here; quietly running AntiSamy instead would apply rules the caller never asked for. Use `sanitizeHtml( html, policyPath )`. |
+| `Element.toString()` on a *handle* coerced to a string | The element's outer HTML **as at selection time**. Every live read goes through a method (`toString()`, `html()`, `attr()`), which re-reads the document; only string coercion of the handle itself sees the snapshot. |
+| `Elements` | A plain CFML array, so indexing, `ArrayLen` and `for…in` behave as they do for a `java.util.List` on Lucee. |
+
+`Element.hashCode()` is the node handle — stable for one element, distinct
+between two, which is what callers grouping by it require.
+
+**An orphan table cell loses its tag.** `HtmlDocument( "<td>x</td>" )` yields
+`x`, because a `<td>` outside a table has no valid insertion point under the HTML
+parsing algorithm — a browser does the same with `innerHTML`. Wrap such
+fragments (`<table><tbody><tr>…`) before parsing, as Preside's
+`EmailStyleInliner` already does.
 
 ---
 

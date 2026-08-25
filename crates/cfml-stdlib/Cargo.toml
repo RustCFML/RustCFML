@@ -46,7 +46,7 @@ postgres_db = ["dep:postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls"
 mssql_db = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread"]
 all-databases = ["sqlite", "mysql_db", "postgres_db", "mssql_db"]
 xml = ["quick-xml"]
-html = ["scraper", "ego-tree"]
+html = ["scraper", "ego-tree", "dep:html5ever"]
 zip_support = ["dep:zip"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:tokio", "tokio?/rt-multi-thread"]
 
@@ -110,7 +110,17 @@ ab_glyph = { version = "0.2", optional = true }
 # EXIF metadata reader (imageGetEXIFMetadata/Tag). Pure-Rust, wasm-safe. IPTC is
 # hand-parsed from the JPEG APP13 segment (no maintained pure-Rust IPTC crate).
 kamadak-exif = { version = "0.6", optional = true }
-scraper = { version = "0.22", optional = true }
+# `atomic` swaps html5ever's non-atomic tendrils for Send-able ones. Required to
+# hold a parsed document across calls: `HtmlDocument` is a `CfmlNative`, which
+# must be `Send + Sync`, and the default tendril's `Cell`-based refcount is not.
+# `deterministic` keeps attributes in source order through a parse/serialise
+# round trip; without it the order is arbitrary, which is diff noise for a
+# rewritten document and unstable for anyone hashing the output as a cache key.
+scraper = { version = "0.22", optional = true, features = ["atomic", "deterministic"] }
+# Already in the graph via `scraper`; taken directly only for `QualName`, which
+# is the key type of the public `Element.attrs` map and which scraper does not
+# re-export. Same version scraper resolves, so this adds no crate to the tree.
+html5ever = { version = "0.29", optional = true }
 ego-tree = { version = "0.10", optional = true }
 # Pure-Rust xlsx read+edit+write (POI-model round-trip: styles/charts/images
 # preserved). Primary spreadsheet engine. Native-only (see `spreadsheet` feature).

@@ -103,7 +103,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "gettemplatepath", "gettickcount", "gettimezone", "gettimezoneinfo",
     "gettoken", "getvariable", "getwriteableimageformats", "hash",
     "hmac", "hour", "htmlcodeformat", "htmleditformat",
-    "htmlparse", "iif", "imageaddborder", "imageblur",
+    "htmldocument", "htmlparse", "iif", "imageaddborder", "imageblur",
     "imageclearrect", "imagecopy", "imagecrop", "imagedrawarc",
     "imagedrawbeveledrect", "imagedrawcubiccurve", "imagedrawimage", "imagedrawline",
     "imagedrawlines", "imagedrawoval", "imagedrawpoint", "imagedrawquadraticcurve",

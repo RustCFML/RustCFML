@@ -1018,6 +1018,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
         f.insert("__jsonSchemaValidateResult".to_string(), fn_json_schema_validate_result);
     }
 
+    // ---- Mutable HTML DOM ----
+    #[cfg(feature = "html")]
+    f.insert("htmlDocument".to_string(), crate::html_dom::fn_html_document);
+
     // ---- XML functions ----
     #[cfg(feature = "xml")]
     {
