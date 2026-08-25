@@ -22,7 +22,9 @@ fn greet(args: Vec<Value>) -> CfmlResult {
         .get(0)
         .map(|v| v.as_string())
         .unwrap_or_else(|| "World".to_string());
-    Ok(Value::String(format!("Hello, {} (from Rust)", name)))
+    // `Value::string(..)` — the String variant holds an Arc<String>, so build it
+    // through the constructor rather than the variant.
+    Ok(Value::string(format!("Hello, {} (from Rust)", name)))
 }
 
 fn add(args: Vec<Value>) -> CfmlResult {

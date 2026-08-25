@@ -3717,6 +3717,31 @@ path = "src/main.rs"
     fs::write(build_dir.join("Cargo.toml"), manifest)
         .map_err(|e| format!("write Cargo.toml: {}", e))?;
 
+    // Seed the lockfile from the checkout's.
+    //
+    // Without this the generated workspace resolves from scratch and takes the
+    // newest version of everything — including `rustcfml-cli`'s OPTIONAL aws-*
+    // crates, which we never enable but cargo still resolves. Their
+    // `rust-version` runs ahead of the toolchain that can build RustCFML itself,
+    // so `--build` failed before compiling a line:
+    //
+    //     error: rustc 1.93.0 is not supported by the following packages:
+    //       aws-config@1.11.0 requires rustc 1.94.1
+    //
+    // The main workspace never sees this because its committed Cargo.lock pins
+    // versions that do build. Copying that lock gives the cocktail the same
+    // pins; cargo then resolves ONLY the crates the user's modules add. It also
+    // means a cocktail binary is built from the same dependency versions as the
+    // release binary, which is worth having on its own.
+    //
+    // Only when absent, so a rebuild keeps whatever the previous one resolved.
+    let cocktail_lock = build_dir.join("Cargo.lock");
+    if !cocktail_lock.exists() {
+        if let Ok(lock) = fs::read(source_root.join("Cargo.lock")) {
+            let _ = fs::write(&cocktail_lock, lock);
+        }
+    }
+
     // Synthesise main.rs: chain each module's register(vm) inside
     // run_with_registrar.
     let imports: String = modules
