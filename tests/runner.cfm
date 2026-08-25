@@ -299,6 +299,7 @@ include "harness.cfm";
 <cf_runtest file="database/test_query_error_sqlstate_members.cfm">
 <cf_runtest file="database/test_pg_comment_placeholder_scan.cfm">
 <cf_runtest file="stdlib/test_date_functions_extra.cfm">
+<cf_runtest file="stdlib/test_lucee_json_date_form.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
