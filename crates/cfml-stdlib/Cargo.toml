@@ -19,7 +19,7 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet", "svg"]
+default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet", "svg", "pdf"]
 # Native spreadsheet support — Spreadsheet* BIFs, the fluent Spreadsheet()
 # builder, and <cfspreadsheet>. Read+edit+write .xlsx via the pure-Rust
 # `umya-spreadsheet` (POI-style open→mutate→save with styles/charts/images
@@ -37,6 +37,9 @@ image_support = ["dep:image", "dep:imageproc", "dep:ab_glyph", "dep:kamadak-exif
 # SVG -> raster. Implies image_support (the result is an image object) and is
 # native-only — see the `resvg` dependency note.
 svg = ["dep:resvg", "image_support"]
+# PDF reading + page rasterisation. Implies image_support (a rendered page is an
+# image object) and is native-only.
+pdf = ["dep:hayro", "image_support"]
 security = ["rand", "bcrypt", "scrypt", "argon2", "pbkdf2"]
 yaml = ["dep:serde_yaml"]
 jsonschema = ["dep:jsonschema"]
@@ -146,6 +149,12 @@ qrcode = { version = "0.14", optional = true, default-features = false }
 # that contains any as silently missing content, which is worse than not
 # offering the BIF there at all. The wasm crates therefore do not enable `svg`.
 resvg = { version = "0.48", optional = true }
+# PDF page rasterisation for the Pdf* BIFs. Pure Rust, no C — and the renderer
+# Typst itself uses for embedded PDFs, tested against 1400+ files from the
+# PDFBOX and pdf.js regression corpora. `embed-fonts` bundles the standard 14
+# PDF fonts so a PDF that names Helvetica renders the same on a server with no
+# fonts installed. NATIVE-ONLY for the same reason as `svg`.
+hayro = { version = "0.7", optional = true, features = ["embed-fonts"] }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 # `rustls-tls` (as distinct from `tokio1-rustls-tls`) is what enables TLS on the
 # BLOCKING `SmtpTransport` we actually use for <cfmail>. Without it the only

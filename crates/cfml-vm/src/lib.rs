@@ -52,6 +52,7 @@ mod poi_shim;
 mod jsoup_shim;
 mod qrgen_shim;
 mod batik_shim;
+mod pdfbox_shim;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
 mod ops;
 mod java_time;
@@ -16536,6 +16537,10 @@ impl CfmlVirtualMachine {
                                 other if batik_shim::is_batik_class(other) => {
                                     batik_shim::construct(other)
                                 }
+                                // PDFBox, over the Pdf* builtins.
+                                other if pdfbox_shim::is_pdfbox_class(other) => {
+                                    pdfbox_shim::construct(other)
+                                }
                                 "java.util.stringtokenizer" => {
                                     java_shims::handle_java_stringtokenizer(
                                         "init",
@@ -23738,6 +23743,20 @@ impl CfmlVirtualMachine {
                     }
                     oc if osgi_shim::is_osgi_class(oc) => {
                         osgi_shim::dispatch(oc, &m, all_args)
+                    }
+                    pb if pdfbox_shim::is_pdfbox_class(pb) => {
+                        let pdf_read = |a: Vec<CfmlValue>| {
+                            self.require_bif("org.apache.pdfbox", "pdfRead", a)
+                        };
+                        let call = |doc: &CfmlValue, mm: &str, a: Vec<CfmlValue>| {
+                            self.call_native(doc, mm, a)
+                        };
+                        let write_image = |a: Vec<CfmlValue>| {
+                            self.require_bif("org.apache.pdfbox", "imageWrite", a)
+                        };
+                        pdfbox_shim::dispatch(
+                            pb, &m, all_args, object, &pdf_read, &call, &write_image,
+                        )
                     }
                     bc if batik_shim::is_batik_class(bc) => {
                         let read_svg = |a: Vec<CfmlValue>| {
@@ -32605,6 +32624,24 @@ impl CfmlVirtualMachine {
     /// sees the new content (GH #284). Paths are read *after* `resolve_file_bif_paths`
     /// has rebased them, so they match the spelling the file op actually wrote.
     /// Non-mutating BIFs return an empty vec.
+    /// `<cfimage …>`'s write target, which lives in the attribute struct rather
+    /// than in an argument position.
+    ///
+    /// Deliberately its own function: `file_write_targets` is scanned by
+    /// `tests/intercept_declaration_guard.rs`, which harvests string literals in
+    /// a window after each `name_lower` and would read an attribute key as an
+    /// undeclared intercepted builtin name.
+    fn cfimage_destination(args: &[CfmlValue]) -> Vec<String> {
+        match args.first() {
+            Some(CfmlValue::Struct(s)) => s
+                .iter()
+                .find(|(k, _)| k.as_str().eq_ignore_ascii_case("destination"))
+                .map(|(_, v)| vec![v.as_string()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     fn file_write_targets(name_lower: &str, args: &[CfmlValue]) -> Vec<String> {
         // Index of the path arg(s) that get written/created/removed. For copy the
         // destination (1) is written; for move/rename both the source (0, now
@@ -32619,6 +32656,20 @@ impl CfmlVirtualMachine {
             | "directorycreate" => &[0],
             "filecopy" => &[1],
             "filemove" => &[0, 1],
+            // Object-then-path writers. These create a file every bit as much as
+            // fileWrite does, but the object is argument 0 and the path is
+            // argument 1, so they were invisible to this list — and the
+            // generate-it-if-it-is-missing idiom broke on them:
+            //
+            //     if ( !fileExists( thumb ) ) { imageWrite( img, thumb ); }
+            //     return fileExists( thumb );   // ...still false
+            //
+            // The first probe caches the negative and nothing retires it, so the
+            // thumbnail is regenerated on every request and reported absent.
+            "imagewrite" | "imagewritebase64" | "spreadsheetwrite" => &[1],
+            // cfimage names its target inside the attribute struct, not
+            // positionally, so it cannot be expressed as an argument index.
+            "cfimage" => return Self::cfimage_destination(args),
             _ => return Vec::new(),
         };
         indices

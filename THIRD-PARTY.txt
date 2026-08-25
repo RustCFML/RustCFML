@@ -18,10 +18,10 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 549 crate(s)
-  Apache License 2.0 (Apache-2.0) — 53 crate(s)
+  MIT License (MIT) — 572 crate(s)
+  Apache License 2.0 (Apache-2.0) — 54 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
-  BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 10 crate(s)
+  BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
   Mozilla Public License 2.0 (MPL-2.0) — 8 crate(s)
   ISC License (ISC) — 7 crate(s)
   BSD 2-Clause "Simplified" License (BSD-2-Clause) — 6 crate(s)
@@ -57,6 +57,7 @@ Dependencies
   simba 0.10.0 — https://github.com/dimforge/simba
 [Apache-2.0]
   moxcms 0.8.1 — https://github.com/awxkee/moxcms.git
+  pic-scale 0.7.11 — https://github.com/awxkee/pic-scale
   pxfm 0.1.30 — https://github.com/awxkee/pxfm
 [Apache-2.0]
   imgref 1.12.2 — https://github.com/kornelski/imgref
@@ -121,10 +122,14 @@ Dependencies
   tiny-skia-path 0.12.0 — https://github.com/linebender/tiny-skia/tree/master/path
   tiny-skia 0.12.0 — https://github.com/linebender/tiny-skia
 [BSD-3-Clause]
+  alloc-no-stdlib 2.0.4 — https://github.com/dropbox/rust-alloc-no-stdlib
+  brotli 8.0.4 — https://github.com/dropbox/rust-brotli
+[BSD-3-Clause]
   subtle 2.6.1 — https://github.com/dalek-cryptography/subtle
 [BSD-3-Clause]
   lebe 0.5.3 — https://github.com/johannesvollmer/lebe
 [BSD-3-Clause]
+  alloc-stdlib 0.2.4 — https://github.com/dropbox/rust-alloc-no-stdlib
   aws-lc-sys 0.42.0 — https://github.com/aws/aws-lc-rs
   exr 1.74.0 — https://github.com/johannesvollmer/exrs
 [BSD-3-Clause]
@@ -151,12 +156,15 @@ Dependencies
   sha1 0.10.6 — https://github.com/RustCrypto/hashes
   sha2 0.10.9 — https://github.com/RustCrypto/hashes
 [MIT]
+  brotli 8.0.4 — https://github.com/dropbox/rust-brotli
+[MIT]
   lazy_static 1.5.0 — https://github.com/rust-lang-nursery/lazy-static.rs
   rayon-core 1.13.0 — https://github.com/rayon-rs/rayon
   rayon 1.12.0 — https://github.com/rayon-rs/rayon
 [MIT]
   core-foundation-sys 0.8.7 — https://github.com/servo/core-foundation-rs
   core-foundation 0.10.1 — https://github.com/servo/core-foundation-rs
+  euclid 0.22.14 — https://github.com/servo/euclid
   string_cache 0.8.9 — https://github.com/servo/string-cache
 [MIT]
   hex 0.4.3 — https://github.com/KokaKiwi/rust-hex
@@ -391,7 +399,9 @@ Dependencies
 [MIT]
   as-slice 0.2.1 — https://github.com/japaric/as-slice
 [MIT]
+  fearless_simd 0.4.1 — https://github.com/linebender/fearless_simd
   kurbo 0.13.1 — https://github.com/linebender/kurbo
+  peniko 0.6.1 — https://github.com/linebender/peniko
   polycool 0.4.0 — https://github.com/linebender/kurbo
 [MIT]
   smallvec 1.15.2 — https://github.com/servo/rust-smallvec
@@ -433,6 +443,10 @@ Dependencies
   getrandom 0.4.3 — https://github.com/rust-random/getrandom
 [MIT]
   slab 0.4.12 — https://github.com/tokio-rs/slab
+[MIT]
+  font-types 0.11.3 — https://github.com/googlefonts/fontations
+  read-fonts 0.39.2 — https://github.com/googlefonts/fontations
+  skrifa 0.42.1 — https://github.com/googlefonts/fontations
 [MIT]
   salsa20 0.10.2 — https://github.com/RustCrypto/stream-ciphers
 [MIT]
@@ -560,6 +574,15 @@ Dependencies
   time-core 0.1.9 — https://github.com/time-rs/time
   time 0.3.53 — https://github.com/time-rs/time
 [MIT]
+  hayro-ccitt 0.3.0 — https://github.com/LaurenzV/hayro
+  hayro-cmap 0.1.0 — https://github.com/LaurenzV/hayro
+  hayro-interpret 0.7.0 — https://github.com/LaurenzV/hayro
+  hayro-jbig2 0.3.0 — https://github.com/LaurenzV/hayro
+  hayro-jpeg2000 0.3.5 — https://github.com/LaurenzV/hayro
+  hayro-postscript 0.1.0 — https://github.com/LaurenzV/hayro
+  hayro-syntax 0.7.2 — https://github.com/LaurenzV/hayro
+  hayro 0.7.1 — https://github.com/LaurenzV/hayro
+[MIT]
   libc 0.2.186 — https://github.com/rust-lang/libc
 [MIT]
   idna_adapter 1.2.2 — https://github.com/hsivonen/idna_adapter
@@ -585,6 +608,9 @@ Dependencies
 [MIT]
   libmimalloc-sys 0.1.49 — https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys
   mimalloc 0.1.52 — https://github.com/purpleprotocol/mimalloc_rust
+[MIT]
+  vello_common 0.0.8 — https://github.com/linebender/vello
+  vello_cpu 0.0.8 — https://github.com/linebender/vello
 [MIT]
   zerocopy-derive 0.8.52 — https://github.com/google/zerocopy
   zerocopy 0.8.52 — https://github.com/google/zerocopy
@@ -695,6 +721,7 @@ Dependencies
   agnostic 0.9.0 — https://github.com/al8n/agnostic
   automerge 0.9.0 — https://github.com/automerge/automerge
   base64-simd 0.8.0 — https://github.com/Nugine/simd
+  brotli-decompressor 5.0.3 — https://github.com/dropbox/rust-brotli-decompressor
   chrono-tz 0.10.4 — https://github.com/chronotope/chrono-tz
   chrono 0.4.45 — https://github.com/chronotope/chrono
   derivit-core 0.1.5 — https://github.com/al8n/derivit
@@ -752,8 +779,10 @@ Dependencies
 [MIT]
   simdutf8 0.1.5 — https://github.com/rusticstuff/simdutf8
 [MIT]
+  color 0.3.3 — https://github.com/linebender/color
   half 2.7.1 — https://github.com/VoidStarKat/half-rs
   ident_case 1.0.1 — https://github.com/TedDriggs/ident_case
+  linebender_resource_handle 0.1.1 — https://github.com/linebender/raw_resource_handle
   widestring 1.2.1 — https://github.com/VoidStarKat/widestring-rs
 [MIT]
   imagesize 0.14.0 — https://github.com/Roughsketch/imagesize
@@ -856,8 +885,10 @@ Dependencies
   phf 0.13.1 — https://github.com/rust-phf/rust-phf
   phf 0.14.0 — https://github.com/rust-phf/rust-phf
   phf_generator 0.11.3 — https://github.com/rust-phf/rust-phf
+  phf_generator 0.13.1 — https://github.com/rust-phf/rust-phf
   phf_generator 0.14.0 — https://github.com/rust-phf/rust-phf
   phf_macros 0.11.3 — https://github.com/rust-phf/rust-phf
+  phf_macros 0.13.1 — https://github.com/rust-phf/rust-phf
   phf_macros 0.14.0 — https://github.com/rust-phf/rust-phf
   phf_shared 0.11.3 — https://github.com/rust-phf/rust-phf
   phf_shared 0.12.1 — https://github.com/rust-phf/rust-phf
@@ -918,6 +949,8 @@ Dependencies
 [MIT]
   roxmltree 0.20.0 — https://github.com/RazrFalcon/roxmltree
   roxmltree 0.21.1 — https://github.com/RazrFalcon/roxmltree
+[MIT]
+  guillotiere 0.7.0 — https://github.com/nical/guillotiere
 [MIT]
   xmlwriter 0.1.0 — https://github.com/RazrFalcon/xmlwriter
 [MIT]
@@ -2101,6 +2134,7 @@ Apache License 2.0 (Apache-2.0)
 
 Applies to:
   - moxcms 0.8.1
+  - pic-scale 0.7.11
   - pxfm 0.1.30
 ================================================================================
 
@@ -3810,6 +3844,27 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
 
 Applies to:
+  - alloc-no-stdlib 2.0.4
+  - brotli 8.0.4
+================================================================================
+
+Copyright (c) 2016 Dropbox, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
+
+Applies to:
   - subtle 2.6.1
 ================================================================================
 
@@ -3881,6 +3936,7 @@ USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
 
 Applies to:
+  - alloc-stdlib 0.2.4
   - aws-lc-sys 0.42.0
   - exr 1.74.0
 ================================================================================
@@ -4184,6 +4240,33 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - brotli 8.0.4
+================================================================================
+
+Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - lazy_static 1.5.0
   - rayon-core 1.13.0
   - rayon 1.12.0
@@ -4221,6 +4304,7 @@ MIT License (MIT)
 Applies to:
   - core-foundation-sys 0.8.7
   - core-foundation 0.10.1
+  - euclid 0.22.14
   - string_cache 0.8.9
 ================================================================================
 
@@ -6721,7 +6805,9 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - fearless_simd 0.4.1
   - kurbo 0.13.1
+  - peniko 0.6.1
   - polycool 0.4.0
 ================================================================================
 
@@ -7312,6 +7398,41 @@ Applies to:
 ================================================================================
 
 Copyright (c) 2019 Carl Lerche
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - font-types 0.11.3
+  - read-fonts 0.39.2
+  - skrifa 0.42.1
+================================================================================
+
+Copyright (c) 2019 Colin Rothfels
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -8887,6 +9008,28 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - hayro-ccitt 0.3.0
+  - hayro-cmap 0.1.0
+  - hayro-interpret 0.7.0
+  - hayro-jbig2 0.3.0
+  - hayro-jpeg2000 0.3.5
+  - hayro-postscript 0.1.0
+  - hayro-syntax 0.7.2
+  - hayro 0.7.1
+================================================================================
+
+Copyright (c) The Hayro Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - libc 0.2.186
 ================================================================================
 
@@ -9128,6 +9271,40 @@ Applies to:
 ================================================================================
 
 Copyright 2019 Octavian Oncescu
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - vello_common 0.0.8
+  - vello_cpu 0.0.8
+================================================================================
+
+Copyright 2020 the Vello Authors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -10463,6 +10640,7 @@ Applies to:
   - agnostic 0.9.0
   - automerge 0.9.0
   - base64-simd 0.8.0
+  - brotli-decompressor 5.0.3
   - chrono-tz 0.10.4
   - chrono 0.4.45
   - derivit-core 0.1.5
@@ -10711,8 +10889,10 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - color 0.3.3
   - half 2.7.1
   - ident_case 1.0.1
+  - linebender_resource_handle 0.1.1
   - widestring 1.2.1
 ================================================================================
 
@@ -11322,8 +11502,10 @@ Applies to:
   - phf 0.13.1
   - phf 0.14.0
   - phf_generator 0.11.3
+  - phf_generator 0.13.1
   - phf_generator 0.14.0
   - phf_macros 0.11.3
+  - phf_macros 0.13.1
   - phf_macros 0.14.0
   - phf_shared 0.11.3
   - phf_shared 0.12.1
@@ -11950,6 +12132,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - guillotiere 0.7.0
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2019 Nicolas Silva
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ================================================================================
 MIT License (MIT)

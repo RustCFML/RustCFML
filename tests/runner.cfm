@@ -217,6 +217,7 @@ include "harness.cfm";
 <!--- HtmlDocument(): the mutable HTML DOM behind the jsoup adapter. --->
 <cf_runtest file="stdlib/test_html_document.cfm" rustcfmlOnly="true" why="HtmlDocument() is a RustCFML builtin — Lucee has no equivalent (its callers reach for the jsoup jar instead)">
 <cf_runtest file="stdlib/test_qrcode_and_svg.cfm" rustcfmlOnly="true" why="qrCodeGenerate() and imageReadSvg() are RustCFML builtins — Lucee has neither (its callers reach for the qrgen and batik jars)">
+<cf_runtest file="stdlib/test_pdf.cfm" rustcfmlOnly="true" why="the Pdf* builtins are RustCFML-only — Lucee has no equivalent (its callers reach for the PDFBox jar)">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
 <cf_runtest file="stdlib/test_encode_for_html_esapi.cfm">
 <cf_runtest file="stdlib/test_string_functions_encoding.cfm">
@@ -680,6 +681,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_osgi_inert.cfm" rustcfmlOnly="true" why="asserts that RustCFML's OSGi plumbing is inert; on Lucee it is real and installs bundles">
 <cf_runtest file="java_shims/test_jsoup_html.cfm" rustcfmlOnly="true" why="asserts the jsoup-over-HtmlDocument adapter; Lucee needs the real jsoup jar, which the test does not supply">
 <cf_runtest file="java_shims/test_qrgen_batik.cfm" rustcfmlOnly="true" why="asserts the qrgen and batik adapters; Lucee needs the real jars, which the tests deliberately do not supply">
+<cf_runtest file="java_shims/test_pdfbox.cfm" rustcfmlOnly="true" why="asserts the PDFBox-over-hayro adapter; Lucee needs the real PDFBox jar, which the test does not supply">
 <cf_runtest file="java_shims/test_optional.cfm">
 <cf_runtest file="java_shims/test_masa_io_text_shims.cfm" rustcfmlOnly="true" why="passes a locale shim to java.text.MessageFormat; real Java has no such constructor">
 

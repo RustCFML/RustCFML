@@ -4128,6 +4128,17 @@ fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     f.insert("qrCodeGenerate".to_string(), img::fn_qr_code_generate);
     #[cfg(feature = "svg")]
     f.insert("imageReadSvg".to_string(), img::fn_image_read_svg);
+
+    // ---- PDF reading + page rasterisation ----
+    #[cfg(feature = "pdf")]
+    {
+        f.insert("pdfRead".to_string(), crate::pdf::fn_pdf_read);
+        f.insert("pdf".to_string(), crate::pdf::fn_pdf);
+        f.insert("isPdfObject".to_string(), crate::pdf::fn_is_pdf_object);
+        f.insert("pdfInfo".to_string(), crate::pdf::fn_pdf_info);
+        f.insert("pdfPageCount".to_string(), crate::pdf::fn_pdf_page_count);
+        f.insert("pdfToImage".to_string(), crate::pdf::fn_pdf_to_image);
+    }
     f.insert("imageRead".to_string(), img::fn_image_read);
     f.insert("imageReadBase64".to_string(), img::fn_image_read_base64);
     f.insert("imageWrite".to_string(), img::fn_image_write);
@@ -15590,6 +15601,9 @@ fn fn_random_bytes(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Binary(buf))
 }
 
+// `security` — inserting randomBytes() above took over the #[cfg] that used to
+// sit here, leaving this ungated and breaking every build without the feature.
+#[cfg(feature = "security")]
 fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
     use rand::RngCore;
 

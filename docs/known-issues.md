@@ -1461,6 +1461,22 @@ fragments (`<table><tbody><tr>…`) before parsing, as Preside's
 | `PNGTranscoder` / `JPEGTranscoder` / `TIFFTranscoder` | Supported. `KEY_WIDTH`/`KEY_HEIGHT` (and the `KEY_MAX_*` forms, treated as a target when no exact size is set) are honoured; other hints are recorded and ignored. |
 | `transcode()` | **File to file.** `TranscoderInput` takes a `file:` URI or path, `TranscoderOutput` must wrap a `java.io.FileOutputStream` — the adapter goes through the image builtins, which need paths. A non-file output raises `TranscoderException`. |
 
+## 68. PDF reading and page rasterisation 🏗
+
+`PdfRead` / `Pdf` / `PdfInfo` / `PdfPageCount` / `PdfToImage`, and the
+`org.apache.pdfbox.*` adapter over them, are backed by
+[`hayro`](https://github.com/LaurenzV/hayro) — pure Rust, no C.
+
+| Behaviour | Note |
+|---|---|
+| Reading only | Pages can be read and rasterised. **Authoring, merging, splitting and form-filling are not supported** and say so; `PDDocument.save()` throws rather than writing an empty file. |
+| The `resolution` argument | PDFBox's `PDFImageWriter.writeImage(…, resolution)` is DPI, and the adapter honours it as DPI. Callers that pass a *pixel width* there (Preside does, then resizes) get a higher-resolution render that downsamples to a better thumbnail. |
+| Page indices | The `Pdf*` builtins are **1-based**, like the rest of CFML. PDFBox's `PDFRenderer` is **0-based**, and the adapter converts. |
+| Output size | Capped at 40 megapixels regardless of what the page declares or the caller asks for — thumbnailing usually means rendering files the public uploaded. Over the cap the scale is reduced to fit rather than the call failing. |
+| Unsupported by hayro | Knockout groups, and PDFs whose CID fonts are not embedded. |
+
+Native-only (the `pdf` cargo feature), like `svg` and `spreadsheet`.
+
 `imageReadSvg()` is **native-only** (the `svg` cargo feature, absent from the
 wasm builds), because rendering text in an SVG needs real fonts and the only
 honest source is the operating system's font database. Dropping text support to

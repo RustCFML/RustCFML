@@ -512,7 +512,16 @@ pub fn fn_cfimage(args: Vec<CfmlValue>) -> CfmlResult {
             let height = get("height").unwrap_or(CfmlValue::Null);
             dispatch(&handle, "resize", vec![width, height])?;
             if !destination.is_empty() {
-                dispatch(&handle, "write", vec![CfmlValue::string(destination), CfmlValue::Bool(true)])?;
+                dispatch(
+                    &handle,
+                    "write",
+                    // (destination, quality, overwrite) — `true` belongs in the
+                    // OVERWRITE slot. Passing it positionally as the 2nd argument put
+                    // it in `quality`, so `<cfimage action="resize" destination=…>`
+                    // died with "quality [true] is not a number" the moment a
+                    // destination was given.
+                    vec![CfmlValue::string(destination), CfmlValue::Null, CfmlValue::Bool(true)],
+                )?;
             }
             Ok(handle)
         }
@@ -521,7 +530,16 @@ pub fn fn_cfimage(args: Vec<CfmlValue>) -> CfmlResult {
             let angle = get("angle").unwrap_or(CfmlValue::Null);
             dispatch(&handle, "rotate", vec![angle])?;
             if !destination.is_empty() {
-                dispatch(&handle, "write", vec![CfmlValue::string(destination), CfmlValue::Bool(true)])?;
+                dispatch(
+                    &handle,
+                    "write",
+                    // (destination, quality, overwrite) — `true` belongs in the
+                    // OVERWRITE slot. Passing it positionally as the 2nd argument put
+                    // it in `quality`, so `<cfimage action="resize" destination=…>`
+                    // died with "quality [true] is not a number" the moment a
+                    // destination was given.
+                    vec![CfmlValue::string(destination), CfmlValue::Null, CfmlValue::Bool(true)],
+                )?;
             }
             Ok(handle)
         }
@@ -554,7 +572,16 @@ pub fn fn_cfimage(args: Vec<CfmlValue>) -> CfmlResult {
             let color = get("color").unwrap_or_else(|| CfmlValue::string("black"));
             dispatch(&handle, "addborder", vec![thickness, color])?;
             if !destination.is_empty() {
-                dispatch(&handle, "write", vec![CfmlValue::string(destination), CfmlValue::Bool(true)])?;
+                dispatch(
+                    &handle,
+                    "write",
+                    // (destination, quality, overwrite) — `true` belongs in the
+                    // OVERWRITE slot. Passing it positionally as the 2nd argument put
+                    // it in `quality`, so `<cfimage action="resize" destination=…>`
+                    // died with "quality [true] is not a number" the moment a
+                    // destination was given.
+                    vec![CfmlValue::string(destination), CfmlValue::Null, CfmlValue::Bool(true)],
+                )?;
             }
             Ok(handle)
         }
@@ -602,7 +629,16 @@ pub fn fn_cfimage(args: Vec<CfmlValue>) -> CfmlResult {
                 )?;
             }
             if !destination.is_empty() {
-                dispatch(&handle, "write", vec![CfmlValue::string(destination), CfmlValue::Bool(true)])?;
+                dispatch(
+                    &handle,
+                    "write",
+                    // (destination, quality, overwrite) — `true` belongs in the
+                    // OVERWRITE slot. Passing it positionally as the 2nd argument put
+                    // it in `quality`, so `<cfimage action="resize" destination=…>`
+                    // died with "quality [true] is not a number" the moment a
+                    // destination was given.
+                    vec![CfmlValue::string(destination), CfmlValue::Null, CfmlValue::Bool(true)],
+                )?;
             }
             Ok(handle)
         }
@@ -1706,6 +1742,15 @@ fn interp_kind(name: &str) -> Interpolation {
         "bicubic" | "cubic" | "highestquality" | "highquality" => Interpolation::Bicubic,
         _ => Interpolation::Bilinear,
     }
+}
+
+/// Wrap a decoded image as a CFML image object.
+///
+/// The one seam other modules need: `pdf.rs` and any future rasteriser produce a
+/// `DynamicImage` and must hand back something the whole `image*` family works
+/// on, without `CfmlImage`'s fields being public.
+pub fn image_value_from_dynamic(img: image::DynamicImage) -> CfmlValue {
+    CfmlImage::new(img, String::new(), ImageFormat::Png).into_value()
 }
 
 /// `imageReadSvg( source [, width [, height ]] )` → an image object.

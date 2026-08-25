@@ -16,7 +16,12 @@ publish = false
 [dependencies]
 # Already in the tree via cfml-stdlib; kept on the same versions so the
 # workspace resolves one html5ever, not two.
-scraper = "0.22"
+# `deterministic` is not optional here: it makes `Element.attrs` an
+# order-preserving IndexMap, and this crate addresses attributes BY KEY when
+# applying a policy. Without it `attrs` is a `Vec` and the code does not
+# compile. It was reaching this crate only by feature unification with
+# cfml-stdlib's `html`, so a build that did not enable that feature broke.
+scraper = { version = "0.22", features = ["deterministic"] }
 ego-tree = "0.10"
 quick-xml = "0.36"
 regex = "1"

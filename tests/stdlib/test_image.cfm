@@ -370,8 +370,49 @@ try {
 }
 assert("imageNew on non-image throws java.io.IOException", imgErrType, "io");
 
+// Regression: `<cfimage action="resize" destination="...">` died with
+// "quality [true] is not a number". The image object's write() takes
+// (destination, quality, overwrite), and the tag's resize/rotate/crop/convert
+// branches were passing `true` POSITIONALLY as the 2nd argument — landing it in
+// the QUALITY slot. It only fired when a destination was given, which is why it
+// survived: the in-memory forms all worked. Found driving Preside's PDF
+// thumbnail path, which resizes straight to a file.
+resizeDest = tmpDir & "/rustcfml_cfimage_resize_dest.png";
+if (fileExists(resizeDest)) { fileDelete(resizeDest); }
+cfimage(action="resize", source=pngPath, destination=resizeDest, overwrite=true, width=20);
+assertTrue("cfimage action=resize writes to a destination", fileExists(resizeDest));
+assert("...at the requested width", imageInfo(imageRead(resizeDest)).width, 20);
+
+// Regression: a builtin that writes a file must retire the cached NEGATIVE
+// existence answer for that path. imageWrite/imageWriteBase64/cfimage were not
+// VM-intercepted, so codegen bound them at compile time and the call skipped
+// call_function — and with it every bit of the engine's filesystem bookkeeping.
+// The file landed on disk and the engine went on insisting it was absent:
+//
+//     if ( !fileExists( thumb ) ) { imageWrite( img, thumb ); }
+//     fileExists( thumb )   // false
+//
+// i.e. the generate-it-once idiom regenerated on every request. Being
+// un-intercepted is not the same as being pure; see MUTATES_FILESYSTEM.
+cacheProbe = tmpDir & "/rustcfml_img_cache_" & createUUID() & ".png";
+assertFalse("a fresh path does not exist (this primes the negative cache)", fileExists(cacheProbe));
+imageWrite(imageNew("", 10, 10), cacheProbe);
+assertTrue("imageWrite retires the cached negative for the path it wrote", fileExists(cacheProbe));
+fileDelete(cacheProbe);
+
+cfimageProbe = tmpDir & "/rustcfml_img_cache2_" & createUUID() & ".png";
+assertFalse("likewise for cfimage's destination", fileExists(cfimageProbe));
+cfimage(action="resize", source=pngPath, destination=cfimageProbe, width=12, overwrite=true);
+assertTrue("cfimage action=resize retires it too", fileExists(cfimageProbe));
+fileDelete(cfimageProbe);
+
+rotateDest = tmpDir & "/rustcfml_cfimage_rotate_dest.png";
+if (fileExists(rotateDest)) { fileDelete(rotateDest); }
+cfimage(action="rotate", source=pngPath, destination=rotateDest, overwrite=true, angle=90);
+assertTrue("cfimage action=rotate writes to a destination too", fileExists(rotateDest));
+
 // cleanup
-for (p in [pngPath, jpgPath, misnamed, tmpDir & "/rustcfml_cfimage_write.png"]) {
+for (p in [pngPath, jpgPath, misnamed, resizeDest, rotateDest, tmpDir & "/rustcfml_cfimage_write.png"]) {
     if (fileExists(p)) { fileDelete(p); }
 }
 
