@@ -11579,6 +11579,31 @@ impl CfmlVirtualMachine {
                                         }
                                         _ => {}
                                     }
+                                    // A pseudo-constructor body that has not yet
+                                    // materialized `this` (Preside's Application.cfc,
+                                    // whose whole body is `super.setupApplication(...)`)
+                                    // left `this_ref` pointing at the `__is_super`
+                                    // dispatch struct above — which carries methods, not
+                                    // a `__variables` key — so the parent method ran with
+                                    // NO variables scope at all. Fall back to the frame's
+                                    // own shared method-table handle, which is the same
+                                    // one the temporary `this` below is seeded from.
+                                    //
+                                    // Until v0.630.0 this went unnoticed: a bare call to
+                                    // a sibling method resolved against the global
+                                    // `user_functions` table, which every component
+                                    // published into. #360 stopped that leak — correctly —
+                                    // and this frame had nothing else to resolve against,
+                                    // so `super.setupApplication()` died on its own
+                                    // default argument (`_getDefaultStatelessUrlPatterns()`).
+                                    if !method_locals.contains_key("__variables") {
+                                        if let Some(vars) =
+                                            locals.get(&*cfml_common::key::well_known::VARIABLES)
+                                        {
+                                            method_locals
+                                                .insert("__variables".to_string(), vars.clone());
+                                        }
+                                    }
                                     // Use the actual child 'this' from caller's locals.
                                     // During a subclass pseudo-constructor whose body has
                                     // not yet materialized `this` (e.g. Preside's
@@ -31795,16 +31820,31 @@ impl CfmlVirtualMachine {
                 .into_owned();
             // Normalize the resolved path the same way expandPath does, so file
             // BIFs (directoryList, fileExists, …) and expandPath agree on the
-            // canonical form. A mapping target containing ".." (e.g. Preside's
-            // "/preside" -> "../system") otherwise yields an un-collapsed
-            // "<webroot>/tests/../system/..." here while expandPath canonicalizes
-            // to "<webroot>/system/...". Preside's _getAllObjectPaths strips
+            // form. A mapping target containing ".." (e.g. Preside's "/preside"
+            // -> "../system") otherwise yields an un-collapsed
+            // "<webroot>/tests/../system/..." here while expandPath collapses to
+            // "<webroot>/system/...". Preside's _getAllObjectPaths strips
             // ExpandPath(dir) off each DirectoryList entry via Replace(); the
             // mismatch left the prefix un-stripped and produced a malformed
-            // doubled component path. canonicalize only resolves existing paths;
-            // fall back to the raw join (matching expandPath's own fallback) so
-            // not-yet-created write targets are unaffected.
-            let normalized = self.canonicalize_cached(&candidate).unwrap_or(candidate);
+            // doubled component path.
+            //
+            // LEXICALLY, exactly as expandPath does — NOT `canonicalize`. Both
+            // collapse `..`, which is all this needs, but canonicalize also
+            // resolves symlinks, and that reintroduced the very mismatch the
+            // normalization exists to prevent: with `/preside` mapped to a
+            // symlinked checkout, DirectoryList("/preside/system/helpers")
+            // returned real-path entries while ExpandPath("/preside/system/
+            // helpers/") returned the symlink path, so Preside's
+            // `Replace( fullPath, expandedMapping, "" )` stripped nothing and
+            // every helper resolved to "/preside/system/helpers/<absolute path>"
+            // — "Error loading UDF library". expandPath was moved off
+            // canonicalize for the same reason (a symlinked Preside extension
+            // 404'd every admin asset); this is the other half of that fix.
+            // Lexical normalization also works on paths that do not exist yet,
+            // so write targets need no special case.
+            let normalized = Self::lexically_normalize_path(std::path::Path::new(&candidate))
+                .to_string_lossy()
+                .into_owned();
             return Some(normalized);
         }
         None

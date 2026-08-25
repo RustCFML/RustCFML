@@ -629,6 +629,13 @@ include "harness.cfm";
 <cf_runtest file="lifecycle/test_application_timezone_locale.cfm">
 <cf_runtest file="lifecycle/test_application_pseudo_include.cfm">
 <cf_runtest file="lifecycle/test_application_shared_variables.cfm">
+
+<!--- super.method() from an Application.cfc body with no materialized `this`:
+     the parent method must still see the component method table (GH #360 fallout). --->
+<cf_runtest file="lifecycle/test_application_super_pseudoctor_vars.cfm">
+
+<!--- ExpandPath and the file BIFs must agree when a mapping target is a symlink. --->
+<cf_runtest file="lifecycle/test_mapping_symlink_paths.cfm">
 <cf_runtest file="lifecycle/test_application_lifecycle_case_override.cfm">
 <cf_runtest file="lifecycle/test_application_load_errors.cfm">
 <cf_runtest file="lifecycle/test_application_scope_custom_tag.cfm">
