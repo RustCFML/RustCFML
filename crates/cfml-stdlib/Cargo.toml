@@ -19,7 +19,7 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet"]
+default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet", "svg"]
 # Native spreadsheet support — Spreadsheet* BIFs, the fluent Spreadsheet()
 # builder, and <cfspreadsheet>. Read+edit+write .xlsx via the pure-Rust
 # `umya-spreadsheet` (POI-style open→mutate→save with styles/charts/images
@@ -33,7 +33,10 @@ spreadsheet = ["dep:umya-spreadsheet", "dep:calamine", "dep:imagesize"]
 # native. Default features of `image` are all pure-Rust codecs (png/jpeg/gif/
 # bmp/tiff/webp/ico/...); AVIF/HEIC (which need C libs) stay OFF so the wasm
 # and demo builds keep working.
-image_support = ["dep:image", "dep:imageproc", "dep:ab_glyph", "dep:kamadak-exif"]
+image_support = ["dep:image", "dep:imageproc", "dep:ab_glyph", "dep:kamadak-exif", "dep:qrcode"]
+# SVG -> raster. Implies image_support (the result is an image object) and is
+# native-only — see the `resvg` dependency note.
+svg = ["dep:resvg", "image_support"]
 security = ["rand", "bcrypt", "scrypt", "argon2", "pbkdf2"]
 yaml = ["dep:serde_yaml"]
 jsonschema = ["dep:jsonschema"]
@@ -131,6 +134,18 @@ calamine = { version = "0.36", optional = true }
 # Pure-Rust image-dimension probe (already in umya's tree) — lets addImage accept
 # raw bytes by supplying width/height to umya's new_image_with_dimensions.
 imagesize = { version = "0.14", optional = true }
+# QR encoding for qrCodeGenerate(). Pure Rust and wasm-safe. `default-features
+# = false` drops its `image` feature: the matrix is rendered here with the
+# `image` crate we already ship, so the two cannot disagree about output format,
+# and no second copy of `image` enters the graph.
+qrcode = { version = "0.14", optional = true, default-features = false }
+# SVG rasterisation for imageReadSvg(). Pure Rust (resvg -> usvg + tiny-skia).
+# NATIVE-ONLY, like `spreadsheet`: rendering text needs real fonts, and the only
+# honest source for them is the operating system's font database — which the
+# wasm targets do not have. Dropping text support instead would render an SVG
+# that contains any as silently missing content, which is worse than not
+# offering the BIF there at all. The wasm crates therefore do not enable `svg`.
+resvg = { version = "0.48", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 # `rustls-tls` (as distinct from `tokio1-rustls-tls`) is what enables TLS on the
 # BLOCKING `SmtpTransport` we actually use for <cfmail>. Without it the only

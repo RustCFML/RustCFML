@@ -50,6 +50,8 @@ mod javax_mail_shim;
 mod osgi_shim;
 mod poi_shim;
 mod jsoup_shim;
+mod qrgen_shim;
+mod batik_shim;
 // Per-op interpreter handlers extracted from the dispatch match (roadmap P3).
 mod ops;
 mod java_time;
@@ -16526,6 +16528,14 @@ impl CfmlVirtualMachine {
                                 other if jsoup_shim::is_jsoup_class(other) => {
                                     jsoup_shim::construct(other)
                                 }
+                                // QRGen's fluent builder, over qrCodeGenerate().
+                                other if qrgen_shim::is_qrgen_class(other) => {
+                                    qrgen_shim::construct(other)
+                                }
+                                // Batik's SVG transcoder, over imageReadSvg().
+                                other if batik_shim::is_batik_class(other) => {
+                                    batik_shim::construct(other)
+                                }
                                 "java.util.stringtokenizer" => {
                                     java_shims::handle_java_stringtokenizer(
                                         "init",
@@ -23728,6 +23738,21 @@ impl CfmlVirtualMachine {
                     }
                     oc if osgi_shim::is_osgi_class(oc) => {
                         osgi_shim::dispatch(oc, &m, all_args)
+                    }
+                    bc if batik_shim::is_batik_class(bc) => {
+                        let read_svg = |a: Vec<CfmlValue>| {
+                            self.require_bif("org.apache.batik", "imageReadSvg", a)
+                        };
+                        let write_image = |a: Vec<CfmlValue>| {
+                            self.require_bif("org.apache.batik", "imageWrite", a)
+                        };
+                        batik_shim::dispatch(bc, &m, all_args, object, &read_svg, &write_image)
+                    }
+                    qc if qrgen_shim::is_qrgen_class(qc) => {
+                        let gen = |a: Vec<CfmlValue>| {
+                            self.require_bif("net.glxn.qrgen", "qrCodeGenerate", a)
+                        };
+                        qrgen_shim::dispatch(qc, &m, all_args, object, &gen)
                     }
                     jc if jsoup_shim::is_jsoup_class(jc) => {
                         let parse = |a: Vec<CfmlValue>| {

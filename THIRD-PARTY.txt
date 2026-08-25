@@ -18,15 +18,15 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 522 crate(s)
+  MIT License (MIT) — 549 crate(s)
   Apache License 2.0 (Apache-2.0) — 53 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
-  BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 8 crate(s)
+  BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 10 crate(s)
   Mozilla Public License 2.0 (MPL-2.0) — 8 crate(s)
   ISC License (ISC) — 7 crate(s)
-  BSD 2-Clause "Simplified" License (BSD-2-Clause) — 5 crate(s)
+  BSD 2-Clause "Simplified" License (BSD-2-Clause) — 6 crate(s)
+  zlib License (Zlib) — 3 crate(s)
   Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0) — 2 crate(s)
-  zlib License (Zlib) — 2 crate(s)
   BSD Zero Clause License (0BSD) — 1 crate(s)
   MIT No Attribution (MIT-0) — 1 crate(s)
 
@@ -106,6 +106,8 @@ Dependencies
 [BSD-2-Clause]
   av1-grain 0.2.5 — https://github.com/rust-av/av1-grain
 [BSD-2-Clause]
+  arrayref 0.3.9 — https://github.com/droundy/arrayref
+[BSD-2-Clause]
   kamadak-exif 0.6.1 — https://github.com/kamadak/exif-rs
 [BSD-2-Clause]
   mutate_once 0.1.2 — https://github.com/kamadak/mutate_once-rs
@@ -115,6 +117,9 @@ Dependencies
   avif-serialize 0.8.9 — https://github.com/kornelski/avif-serialize
 [BSD-3-Clause]
   ravif 0.13.0 — https://github.com/kornelski/cavif-rs
+[BSD-3-Clause]
+  tiny-skia-path 0.12.0 — https://github.com/linebender/tiny-skia/tree/master/path
+  tiny-skia 0.12.0 — https://github.com/linebender/tiny-skia
 [BSD-3-Clause]
   subtle 2.6.1 — https://github.com/dalek-cryptography/subtle
 [BSD-3-Clause]
@@ -158,6 +163,7 @@ Dependencies
 [MIT]
   form_urlencoded 1.2.2 — https://github.com/servo/rust-url
 [MIT]
+  data-url 0.3.2 — https://github.com/servo/rust-url
   idna 1.1.0 — https://github.com/servo/rust-url/
   percent-encoding 2.3.2 — https://github.com/servo/rust-url/
   url 2.5.8 — https://github.com/servo/rust-url
@@ -210,6 +216,8 @@ Dependencies
   markup5ever 0.14.1 — https://github.com/servo/html5ever
 [MIT]
   nom 8.0.0 — https://github.com/rust-bakery/nom
+[MIT]
+  float-cmp 0.9.0 — https://github.com/mikedilger/float-cmp
 [MIT]
   libsqlite3-sys 0.28.0 — https://github.com/rusqlite/rusqlite
   rusqlite 0.31.0 — https://github.com/rusqlite/rusqlite
@@ -310,6 +318,8 @@ Dependencies
 [MIT]
   native-tls 0.2.18 — https://github.com/rust-native-tls/rust-native-tls
 [MIT]
+  qrcode 0.14.1 — https://github.com/kennytm/qrcode-rust
+[MIT]
   indexmap 2.14.0 — https://github.com/indexmap-rs/indexmap
 [MIT]
   equivalent 1.0.2 — https://github.com/indexmap-rs/equivalent
@@ -381,12 +391,16 @@ Dependencies
 [MIT]
   as-slice 0.2.1 — https://github.com/japaric/as-slice
 [MIT]
+  kurbo 0.13.1 — https://github.com/linebender/kurbo
+  polycool 0.4.0 — https://github.com/linebender/kurbo
+[MIT]
   smallvec 1.15.2 — https://github.com/servo/rust-smallvec
 [MIT]
   pin-utils 0.1.0 — https://github.com/rust-lang-nursery/pin-utils
 [MIT]
   ahash 0.8.12 — https://github.com/tkaitchuck/ahash
 [MIT]
+  svgtypes 0.16.1 — https://github.com/linebender/svgtypes
   ttf-parser 0.25.1 — https://github.com/harfbuzz/ttf-parser
 [MIT]
   auto_impl 1.3.0 — https://github.com/auto-impl-rs/auto_impl/
@@ -422,6 +436,10 @@ Dependencies
 [MIT]
   salsa20 0.10.2 — https://github.com/RustCrypto/stream-ciphers
 [MIT]
+  font-types 0.12.4 — https://github.com/googlefonts/fontations
+  read-fonts 0.41.0 — https://github.com/googlefonts/fontations
+  skrifa 0.44.0 — https://github.com/googlefonts/fontations
+[MIT]
   http-body 0.4.6 — https://github.com/hyperium/http-body
 [MIT]
   bumpalo 3.20.3 — https://github.com/fitzgen/bumpalo
@@ -438,6 +456,8 @@ Dependencies
   tower-service 0.3.3 — https://github.com/tower-rs/tower
   tower 0.5.3 — https://github.com/tower-rs/tower
 [MIT]
+  pico-args 0.5.0 — https://github.com/RazrFalcon/pico-args
+[MIT]
   axum 0.8.9 — https://github.com/tokio-rs/axum
 [MIT]
   http-body 1.0.1 — https://github.com/hyperium/http-body
@@ -449,6 +469,8 @@ Dependencies
   iana-time-zone 0.1.65 — https://github.com/strawlab/iana-time-zone
 [MIT]
   memmap2 0.2.3 — https://github.com/RazrFalcon/memmap2-rs
+[MIT]
+  memmap2 0.9.11 — https://github.com/RazrFalcon/memmap2-rs
 [MIT]
   no_std_io2 0.9.4 — https://github.com/wcampbell0x2a/no-std-io2
 [MIT]
@@ -488,6 +510,8 @@ Dependencies
   openssl-macros 0.1.1
 [MIT]
   inout 0.1.4 — https://github.com/RustCrypto/utils
+[MIT]
+  strict-num 0.1.1 — https://github.com/RazrFalcon/strict-num
 [MIT]
   inout 0.2.2 — https://github.com/RustCrypto/utils
 [MIT]
@@ -546,6 +570,9 @@ Dependencies
 [MIT]
   ipnet 2.12.0 — https://github.com/krisprice/ipnet
 [MIT]
+  resvg 0.48.1 — https://github.com/linebender/resvg
+  usvg 0.48.1 — https://github.com/linebender/resvg
+[MIT]
   rand_distr 0.6.0 — https://github.com/rust-random/rand_distr
 [MIT]
   rand 0.10.1 — https://github.com/rust-random/rand
@@ -578,6 +605,8 @@ Dependencies
 [MIT]
   precomputed-hash 0.1.1 — https://github.com/emilio/precomputed-hash
 [MIT]
+  imagesize 0.15.0 — https://github.com/Roughsketch/imagesize
+[MIT]
   cfb 0.14.0 — https://github.com/mdsteele/rust-cfb
 [MIT]
   darling 0.14.4 — https://github.com/TedDriggs/darling
@@ -604,6 +633,7 @@ Dependencies
   saturating 0.1.0 — https://github.com/breeswish/saturating-rs
 [MIT]
   bytemuck 1.25.0 — https://github.com/Lokathor/bytemuck
+  bytemuck_derive 1.12.0 — https://github.com/Lokathor/bytemuck
 [MIT]
   tokio-postgres-rustls 0.14.0 — https://github.com/jbg/tokio-postgres-rustls
 [MIT]
@@ -728,7 +758,11 @@ Dependencies
 [MIT]
   imagesize 0.14.0 — https://github.com/Roughsketch/imagesize
 [MIT]
+  unicode-script 0.5.8 — https://github.com/unicode-rs/unicode-script
+[MIT]
   umya-spreadsheet 3.0.1 — https://github.com/MathNya/umya-spreadsheet
+[MIT]
+  fontconfig-parser 0.5.8 — https://github.com/Riey/fontconfig-parser
 [MIT]
   unty 0.0.4 — https://github.com/bincode-org/unty
 [MIT]
@@ -782,6 +816,7 @@ Dependencies
   smol_str 0.3.6 — https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str
   syn 1.0.109 — https://github.com/dtolnay/syn
   syn 2.0.118 — https://github.com/dtolnay/syn
+  syn 3.0.4 — https://github.com/dtolnay/syn
   thiserror-impl 1.0.69 — https://github.com/dtolnay/thiserror
   thiserror-impl 2.0.18 — https://github.com/dtolnay/thiserror
   thiserror 1.0.69 — https://github.com/dtolnay/thiserror
@@ -877,7 +912,14 @@ Dependencies
 [MIT]
   humantime-serde 1.1.1 — https://github.com/jean-airoldie/humantime-serde
 [MIT]
+  simplecss 0.2.2 — https://github.com/linebender/simplecss
+  unicode-vo 0.1.0 — https://github.com/RazrFalcon/unicode-vo
   xmlparser 0.13.6 — https://github.com/RazrFalcon/xmlparser
+[MIT]
+  roxmltree 0.20.0 — https://github.com/RazrFalcon/roxmltree
+  roxmltree 0.21.1 — https://github.com/RazrFalcon/roxmltree
+[MIT]
+  xmlwriter 0.1.0 — https://github.com/RazrFalcon/xmlwriter
 [MIT]
   crossbeam-deque 0.8.6 — https://github.com/crossbeam-rs/crossbeam
   crossbeam-epoch 0.9.18 — https://github.com/crossbeam-rs/crossbeam
@@ -887,11 +929,17 @@ Dependencies
 [MIT]
   bcrypt 0.15.1 — https://github.com/Keats/rust-bcrypt
 [MIT]
+  fontdb 0.24.0 — https://github.com/RazrFalcon/fontdb
+[MIT]
   connection-string 0.2.0 — https://github.com/prisma/connection-string
 [MIT]
   mysql 28.0.0 — https://github.com/blackbeam/rust-mysql-simple
 [MIT]
   memcache 0.17.2 — https://github.com/aisk/rust-memcache
+[MIT]
+  base64 0.23.1 — https://github.com/marshallpierce/rust-base64
+[MIT]
+  harfrust 0.12.0 — https://github.com/harfbuzz/harfrust
 [MIT]
   weezl 0.1.12 — https://github.com/image-rs/weezl
 [MIT]
@@ -947,6 +995,8 @@ Dependencies
   zerovec 0.11.6 — https://github.com/unicode-org/icu4x
 [Zlib]
   zlib-rs 0.6.6 — https://github.com/trifectatechfoundation/zlib-rs
+[Zlib]
+  slotmap 1.1.1 — https://github.com/orlp/slotmap
 [Zlib]
   foldhash 0.2.0 — https://github.com/orlp/foldhash
 
@@ -3514,6 +3564,40 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 BSD 2-Clause "Simplified" License (BSD-2-Clause)
 
 Applies to:
+  - arrayref 0.3.9
+================================================================================
+
+Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the
+   distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+BSD 2-Clause "Simplified" License (BSD-2-Clause)
+
+Applies to:
   - kamadak-exif 0.6.1
 ================================================================================
 
@@ -3681,6 +3765,45 @@ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
 SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
+
+Applies to:
+  - tiny-skia-path 0.12.0
+  - tiny-skia 0.12.0
+================================================================================
+
+Copyright (c) 2011 Google Inc. All rights reserved.
+Copyright (c) 2020 Yevhenii Reizner All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+  * Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in
+    the documentation and/or other materials provided with the
+    distribution.
+
+  * Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived
+    from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
@@ -4192,6 +4315,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - data-url 0.3.2
   - idna 1.1.0
   - percent-encoding 2.3.2
   - url 2.5.8
@@ -4567,6 +4691,33 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - float-cmp 0.9.0
+================================================================================
+
+Copyright (c) 2014-2020 Optimal Computing (NZ) Ltd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
@@ -5530,6 +5681,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - qrcode 0.14.1
+================================================================================
+
+Copyright (c) 2016 kennytm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
@@ -6544,6 +6721,40 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - kurbo 0.13.1
+  - polycool 0.4.0
+================================================================================
+
+Copyright (c) 2018 Raph Levien
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - smallvec 1.15.2
 ================================================================================
 
@@ -6643,6 +6854,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - svgtypes 0.16.1
   - ttf-parser 0.25.1
 ================================================================================
 
@@ -7162,6 +7374,41 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - font-types 0.12.4
+  - read-fonts 0.41.0
+  - skrifa 0.44.0
+================================================================================
+
+Copyright (c) 2019 Fontations Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - http-body 0.4.6
 ================================================================================
 
@@ -7364,6 +7611,33 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - pico-args 0.5.0
+================================================================================
+
+Copyright (c) 2019 Yevhenii Reizner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - axum 0.8.9
 ================================================================================
 
@@ -7533,6 +7807,40 @@ Applies to:
 ================================================================================
 
 Copyright (c) 2020 Evgeniy Reizner
+Copyright (c) 2015 Dan Burkert
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - memmap2 0.9.11
+================================================================================
+
+Copyright (c) 2020 Yevhenii Reizner
 Copyright (c) 2015 Dan Burkert
 
 Permission is hereby granted, free of charge, to any
@@ -8112,6 +8420,33 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - strict-num 0.1.1
+================================================================================
+
+Copyright (c) 2022 Yevhenii Reizner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - inout 0.2.2
 ================================================================================
 
@@ -8681,6 +9016,40 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 MIT License (MIT)
 
 Applies to:
+  - resvg 0.48.1
+  - usvg 0.48.1
+================================================================================
+
+Copyright 2017 the Resvg Authors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - rand_distr 0.6.0
 ================================================================================
 
@@ -9015,6 +9384,35 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - imagesize 0.15.0
+================================================================================
+
+MIT License
+
+Copyright (c) 2017 Maiddog
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - cfb 0.14.0
 ================================================================================
 
@@ -9312,6 +9710,7 @@ MIT License (MIT)
 
 Applies to:
   - bytemuck 1.25.0
+  - bytemuck_derive 1.12.0
 ================================================================================
 
 MIT License
@@ -10370,12 +10769,76 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - unicode-script 0.5.8
+================================================================================
+
+MIT License
+
+Copyright (c) 2019 Manish Goregaokar
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - umya-spreadsheet 3.0.1
 ================================================================================
 
 MIT License
 
 Copyright (c) 2020 MathNya
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - fontconfig-parser 0.5.8
+================================================================================
+
+MIT License
+
+Copyright (c) 2021 Riey
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -10507,6 +10970,7 @@ Applies to:
   - smol_str 0.3.6
   - syn 1.0.109
   - syn 2.0.118
+  - syn 3.0.4
   - thiserror-impl 1.0.69
   - thiserror-impl 2.0.18
   - thiserror 1.0.69
@@ -11430,12 +11894,73 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - simplecss 0.2.2
+  - unicode-vo 0.1.0
   - xmlparser 0.13.6
 ================================================================================
 
 The MIT License (MIT)
 
 Copyright (c) 2018 Reizner Evgeniy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - roxmltree 0.20.0
+  - roxmltree 0.21.1
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2018 Yevhenii Reizner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - xmlwriter 0.1.0
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2019 Reizner Evgeniy
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11504,6 +12029,35 @@ Applies to:
 The MIT License (MIT)
 
 Copyright (c) 2020 Vincent Prouillet
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - fontdb 0.24.0
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2020 Yevhenii Reizner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11605,6 +12159,65 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - base64 0.23.1
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2025 Alice Maz, Marshall Pierce
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - harfrust 0.12.0
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) HarfBuzz developers
+Copyright (c) 2020 Yevhenii Reizner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
@@ -13177,6 +13790,33 @@ freely, subject to the following restrictions:
    misrepresented as being the original software.
 
 3. This notice may not be removed or altered from any source distribution.
+
+================================================================================
+zlib License (Zlib)
+
+Applies to:
+  - slotmap 1.1.1
+================================================================================
+
+Copyright (c) 2021 Orson Peters <orsonpeters@gmail.com>
+
+This software is provided 'as-is', without any express or implied warranty. In
+no event will the authors be held liable for any damages arising from the use of
+this software.
+
+Permission is granted to anyone to use this software for any purpose, including
+commercial applications, and to alter it and redistribute it freely, subject to
+the following restrictions:
+
+ 1. The origin of this software must not be misrepresented; you must not claim
+    that you wrote the original software. If you use this software in a product,
+    an acknowledgment in the product documentation would be appreciated but is
+    not required.
+
+ 2. Altered source versions must be plainly marked as such, and must not be
+    misrepresented as being the original software.
+
+ 3. This notice may not be removed or altered from any source distribution.
 
 ================================================================================
 zlib License (Zlib)

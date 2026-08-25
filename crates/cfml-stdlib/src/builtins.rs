@@ -4125,6 +4125,9 @@ const IMAGE_TIER1_NAMES: &[&str] = &[
 fn register_image_functions(f: &mut HashMap<String, BuiltinFunction>) {
     use crate::image as img;
     f.insert("imageNew".to_string(), img::fn_image_new);
+    f.insert("qrCodeGenerate".to_string(), img::fn_qr_code_generate);
+    #[cfg(feature = "svg")]
+    f.insert("imageReadSvg".to_string(), img::fn_image_read_svg);
     f.insert("imageRead".to_string(), img::fn_image_read);
     f.insert("imageReadBase64".to_string(), img::fn_image_read_base64);
     f.insert("imageWrite".to_string(), img::fn_image_write);

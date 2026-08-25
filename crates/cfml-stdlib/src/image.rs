@@ -1708,6 +1708,229 @@ fn interp_kind(name: &str) -> Interpolation {
     }
 }
 
+/// `imageReadSvg( source [, width [, height ]] )` → an image object.
+///
+/// `source` is either a path to an `.svg` file or the SVG markup itself. The
+/// result is an ordinary image object, so the whole `image*` family applies to
+/// it — resize, crop, draw on, `imageWrite()` to png/jpg/gif. That is the point:
+/// SVG becomes a format the rest of CFML can already work with, rather than a
+/// one-shot converter.
+///
+/// * With neither `width` nor `height`, the SVG's own dimensions are used.
+/// * With one, the other is derived from the aspect ratio — an SVG is scalable,
+///   so distorting it by inventing the missing edge would be a strange default.
+/// * With both, the SVG is scaled to fit **inside** that box, preserving aspect
+///   ratio and centring the result. Stretching vector art to an arbitrary box is
+///   almost never what a caller means by "make it 200x100".
+///
+/// Rasterisation is `resvg`; fonts come from the operating system's font
+/// database, so text in an SVG renders with the same faces the host has. This
+/// BIF is native-only (the wasm builds have no font database) — see the `svg`
+/// feature in Cargo.toml.
+#[cfg(feature = "svg")]
+pub fn fn_image_read_svg(args: Vec<CfmlValue>) -> CfmlResult {
+    let source = args.first().map(|v| v.as_string()).unwrap_or_default();
+    if source.trim().is_empty() {
+        return Err(CfmlError::runtime(
+            "imageReadSvg: source is required (a path to an .svg file, or SVG markup)".to_string(),
+        ));
+    }
+    let num = |i: usize| -> u32 {
+        args.get(i)
+            .map(|v| v.as_string().trim().parse::<f64>().unwrap_or(0.0))
+            .unwrap_or(0.0)
+            .max(0.0) as u32
+    };
+    let (want_w, want_h) = (num(1), num(2));
+
+    // Markup or a path? Anything containing "<svg" is markup; otherwise read it
+    // off disk. Sniffing beats a mode argument here because callers genuinely
+    // have both and the two are never confusable.
+    let data: Vec<u8> = if source.contains("<svg") || source.trim_start().starts_with("<?xml") {
+        source.into_bytes()
+    } else {
+        std::fs::read(&source).map_err(|e| {
+            CfmlError::runtime(format!("imageReadSvg: cannot read '{}': {}", source, e))
+        })?
+    };
+
+    // The system font database, built once: enumerating fonts is slow enough
+    // that doing it per call would dominate a page rendering a set of icons.
+    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    let fonts = FONTS.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        std::sync::Arc::new(db)
+    });
+
+    let mut opt = resvg::usvg::Options::default();
+    opt.fontdb = std::sync::Arc::clone(fonts);
+    let tree = resvg::usvg::Tree::from_data(&data, &opt).map_err(|e| {
+        CfmlError::runtime(format!("imageReadSvg: this is not valid SVG: {}", e))
+    })?;
+
+    let native = tree.size();
+    let (nw, nh) = (native.width(), native.height());
+    if nw <= 0.0 || nh <= 0.0 {
+        return Err(CfmlError::runtime(
+            "imageReadSvg: the SVG declares a zero or negative size".to_string(),
+        ));
+    }
+
+    // Scale, then the output canvas. See the doc note for why one-dimension and
+    // two-dimension requests behave differently.
+    let scale = match (want_w, want_h) {
+        (0, 0) => 1.0_f32,
+        (w, 0) => w as f32 / nw,
+        (0, h) => h as f32 / nh,
+        (w, h) => (w as f32 / nw).min(h as f32 / nh),
+    };
+    let (out_w, out_h) = match (want_w, want_h) {
+        (0, 0) => (nw.ceil() as u32, nh.ceil() as u32),
+        (w, 0) => (w, (nh * scale).ceil() as u32),
+        (0, h) => ((nw * scale).ceil() as u32, h),
+        (w, h) => (w, h),
+    };
+    let (out_w, out_h) = (out_w.clamp(1, 16384), out_h.clamp(1, 16384));
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(out_w, out_h).ok_or_else(|| {
+        CfmlError::runtime(format!(
+            "imageReadSvg: cannot allocate a {}x{} canvas",
+            out_w, out_h
+        ))
+    })?;
+    // Centre the scaled art in the canvas when both edges were given.
+    let dx = (out_w as f32 - nw * scale) / 2.0;
+    let dy = (out_h as f32 - nh * scale) / 2.0;
+    let transform = resvg::tiny_skia::Transform::from_translate(dx, dy)
+        .pre_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // tiny-skia gives PREMULTIPLIED RGBA; `image` expects straight alpha, so
+    // un-premultiply or every semi-transparent pixel comes out too dark.
+    let mut rgba = image::RgbaImage::new(out_w, out_h);
+    for (i, px) in pixmap.pixels().iter().enumerate() {
+        let (x, y) = ((i as u32) % out_w, (i as u32) / out_w);
+        rgba.put_pixel(
+            x,
+            y,
+            image::Rgba([px.demultiply().red(), px.demultiply().green(), px.demultiply().blue(), px.alpha()]),
+        );
+    }
+
+    Ok(CfmlImage::new(
+        image::DynamicImage::ImageRgba8(rgba),
+        String::new(),
+        ImageFormat::Png,
+    )
+    .into_value())
+}
+
+/// `qrCodeGenerate( text [, size [, format [, errorCorrection [, quietZone ]]]] )`
+/// → the encoded image as a **Binary**.
+///
+/// CFML has no QR primitive, so applications reach for a jar —
+/// `net.glxn.qrgen`, in Preside's case, which uses it to render the enrolment
+/// code an authenticator app scans during two-factor setup. This is that
+/// capability natively; the qrgen shim is a thin adapter over it.
+///
+/// * `size` (default 125) is the target edge length in **pixels**, and the
+///   result is square. The module grid rarely divides the requested size
+///   exactly, so the grid is drawn at the largest whole-pixel scale that fits
+///   and then nearest-neighbour resized to hit `size` on the nose — scaling a QR
+///   code with a smoothing filter blurs the module edges and can make it
+///   unreadable, which is the one thing this must not do.
+/// * `format` (default "png") is any format the image BIFs write: png, gif, jpg,
+///   bmp, webp. Preside asks for gif.
+/// * `errorCorrection` is L, M (default), Q or H — the proportion of the symbol
+///   that can be damaged and still decode. The default matches the qrgen /
+///   ZXing default.
+/// * `quietZone` (default 4) is the mandatory light margin, in modules. The QR
+///   spec requires 4; scanners rely on it, so it is only reducible deliberately.
+pub fn fn_qr_code_generate(args: Vec<CfmlValue>) -> CfmlResult {
+    use image::{Rgb, RgbImage};
+    use qrcode::{EcLevel, QrCode};
+
+    let text = args.first().map(|v| v.as_string()).unwrap_or_default();
+    if text.is_empty() {
+        return Err(CfmlError::runtime(
+            "qrCodeGenerate: text is required — an empty QR code encodes nothing".to_string(),
+        ));
+    }
+    let num = |i: usize, default: i64| -> i64 {
+        match args.get(i) {
+            Some(CfmlValue::Null) | None => default,
+            Some(v) => {
+                let s = v.as_string();
+                if s.trim().is_empty() { default } else { s.trim().parse().unwrap_or(default) }
+            }
+        }
+    };
+    let size = num(1, 125).clamp(16, 4096) as u32;
+    let format_name = match args.get(2) {
+        Some(CfmlValue::Null) | None => "png".to_string(),
+        Some(v) => {
+            let s = v.as_string();
+            if s.trim().is_empty() { "png".to_string() } else { s }
+        }
+    };
+    let format = format_from_name(&format_name)?;
+    let ec = match args
+        .get(3)
+        .map(|v| v.as_string().trim().to_ascii_uppercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "L" => EcLevel::L,
+        "Q" => EcLevel::Q,
+        "H" => EcLevel::H,
+        // "" and "M" alike: the qrgen/ZXing default.
+        _ => EcLevel::M,
+    };
+    let quiet = num(4, 4).clamp(0, 32) as u32;
+
+    let code = QrCode::with_error_correction_level(text.as_bytes(), ec).map_err(|e| {
+        CfmlError::runtime(format!(
+            "qrCodeGenerate: cannot encode this text as a QR code: {}. The most likely cause              is that it is too long for the chosen error-correction level — try \"L\".",
+            e
+        ))
+    })?;
+
+    let modules = code.width() as u32;
+    let grid = modules + quiet * 2;
+    // Largest whole-pixel module that still fits inside the requested size, so
+    // the grid stays crisp; at least 1 so a tiny `size` still produces a symbol.
+    let scale = (size / grid).max(1);
+    let drawn = grid * scale;
+
+    let colors = code.to_colors();
+    let mut img = RgbImage::from_pixel(drawn, drawn, Rgb([255, 255, 255]));
+    for (i, c) in colors.iter().enumerate() {
+        if *c != qrcode::Color::Dark {
+            continue;
+        }
+        let mx = (i as u32) % modules;
+        let my = (i as u32) / modules;
+        let x0 = (mx + quiet) * scale;
+        let y0 = (my + quiet) * scale;
+        for y in y0..y0 + scale {
+            for x in x0..x0 + scale {
+                img.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+    }
+
+    let mut dynamic = image::DynamicImage::ImageRgb8(img);
+    if drawn != size {
+        // Nearest, never a smoothing filter — see the doc note.
+        dynamic = dynamic.resize_exact(size, size, image::imageops::FilterType::Nearest);
+    }
+
+    let encoded = CfmlImage::new(dynamic, String::new(), format).encode(format, None)?;
+    Ok(CfmlValue::Binary(encoded))
+}
+
 fn format_from_name(name: &str) -> Result<ImageFormat, CfmlError> {
     match name.trim().trim_start_matches('.').to_lowercase().as_str() {
         "png" => Ok(ImageFormat::Png),

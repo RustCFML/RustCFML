@@ -1450,6 +1450,28 @@ parsing algorithm — a browser does the same with `innerHTML`. Wrap such
 fragments (`<table><tbody><tr>…`) before parsing, as Preside's
 `EmailStyleInliner` already does.
 
+## 67. QRGen and Batik are adapters over `qrCodeGenerate()` / `imageReadSvg()` 🏗
+
+| Behaviour | Note |
+|---|---|
+| `QRCode.…withSize( w, h )` with `w != h` | A QR symbol is square. The **smaller** edge is used, so the code stays inside the box the caller reserved for it, rather than being stretched into something a scanner may reject. |
+| `QRCode.…stream()` | Returns a stream whose `toByteArray()` is a **Binary**, not the signed-byte array `java.io.ByteArrayOutputStream`'s shim yields. Both answers are needed elsewhere — the array form is what `String.getBytes()` and the TOTP path rely on — so QRGen's stream is its own type instead of either being made wrong. |
+| `QRCode.…file()` | **Refused**: it writes to a JVM temp `File`. Use `.stream().toByteArray()` and `fileWrite()`. |
+| `QRCode.…withCharset()` / `withHint()` | Accepted and ignored. The encoder emits UTF-8, which is QRGen's own default and what scanners expect. |
+| `PNGTranscoder` / `JPEGTranscoder` / `TIFFTranscoder` | Supported. `KEY_WIDTH`/`KEY_HEIGHT` (and the `KEY_MAX_*` forms, treated as a target when no exact size is set) are honoured; other hints are recorded and ignored. |
+| `transcode()` | **File to file.** `TranscoderInput` takes a `file:` URI or path, `TranscoderOutput` must wrap a `java.io.FileOutputStream` — the adapter goes through the image builtins, which need paths. A non-file output raises `TranscoderException`. |
+
+`imageReadSvg()` is **native-only** (the `svg` cargo feature, absent from the
+wasm builds), because rendering text in an SVG needs real fonts and the only
+honest source is the operating system's font database. Dropping text support to
+gain a wasm build would render any SVG containing text as silently missing
+content, which is worse than the BIF not being there.
+
+Sizing follows the vector-graphics convention rather than the raster one: with
+one dimension given the other follows the aspect ratio, and with both the art is
+scaled to **fit inside** that box and centred. Stretching vector art to an
+arbitrary rectangle is almost never what "make it 200x100" means.
+
 ---
 
 ---
