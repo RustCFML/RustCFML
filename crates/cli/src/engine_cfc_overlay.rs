@@ -2,6 +2,7 @@
 //! component names resolve out of the box:
 //!   - the socket.io-lucee compat trio (`new SocketIoServer()` etc.)
 //!   - Lucee's built-in `new Query()` builder + its `Result` return object
+//!   - Lucee's built-in `new Mail()` message builder (GH #356)
 //!
 //! [`EngineCfcOverlay`] wraps the real filesystem and serves an engine copy
 //! for any path whose basename matches a reserved name — *only when the base
@@ -19,6 +20,7 @@ const NAMESPACE_CFC: &str = include_str!("../assets/socketio/SocketIoNamespace.c
 const SOCKET_CFC: &str = include_str!("../assets/socketio/SocketIoSocket.cfc");
 const QUERY_CFC: &str = include_str!("../assets/lucee/Query.cfc");
 const RESULT_CFC: &str = include_str!("../assets/lucee/Result.cfc");
+const MAIL_CFC: &str = include_str!("../assets/lucee/Mail.cfc");
 
 /// The embedded source for a reserved compat-CFC path, keyed by basename
 /// (case-insensitive). `None` for any other path.
@@ -38,6 +40,7 @@ fn engine_cfc(path: &str) -> Option<&'static str> {
         ("SocketIoSocket.cfc", SOCKET_CFC),
         ("Query.cfc", QUERY_CFC),
         ("Result.cfc", RESULT_CFC),
+        ("Mail.cfc", MAIL_CFC),
     ] {
         if base.eq_ignore_ascii_case(name) {
             return Some(src);

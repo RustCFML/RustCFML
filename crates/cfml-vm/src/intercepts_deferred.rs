@@ -11,7 +11,11 @@
 /// Names deferred to the VM-access handling further down `call_function`.
 pub(crate) const DEFERRED_TO_VM: &[&str] = &[
     "arraymap", "arrayfilter", "arrayreduce", "arrayeach",
-    "arraysome", "arrayevery", "arrayfindall", "arrayfindallnocase",
+    // NOTE: arrayFindAll/arrayFindAllNoCase are deliberately NOT here. Their
+    // closure-predicate form is claimed by the `arrayfind*` arm ABOVE the
+    // deferred arm, so deferring them only diverted the VALUE-needle form past
+    // the builtin dispatch and into "function is not defined" (GH #358 notes).
+    "arraysome", "arrayevery",
     "structeach", "structmap", "structfilter", "structreduce",
     "structsome", "structevery", "listeach", "listmap",
     "listfilter", "listreduce", "listsome", "listevery",

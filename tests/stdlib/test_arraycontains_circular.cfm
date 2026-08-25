@@ -16,7 +16,8 @@
 	a = { name = "a" };
 	a.self = a;
 	arr = [ a ];
-	assert("arrayContains finds the self-referential struct (by identity)", arrayContains(arr, a), true);
+	// GH #358: arrayContains returns the 1-based index, like arrayFind.
+	assert("arrayContains finds the self-referential struct (by identity)", arrayContains(arr, a), 1);
 	assert("arrayFind returns its 1-based index", arrayFind(arr, a), 1);
 
 	// Two-node cycle a <-> b.
@@ -25,18 +26,18 @@
 	x.peer = y;
 	y.peer = x;
 	list2 = [ x, y ];
-	assert("cycle member x found", arrayContains(list2, x), true);
-	assert("cycle member y found", arrayContains(list2, y), true);
+	assert("cycle member x found", arrayContains(list2, x), 1);
+	assert("cycle member y found", arrayContains(list2, y), 2);
 
 	// A structurally-cyclic but DIFFERENT instance is not found (identity, not deep).
 	z = { id = 1 };
 	z.peer = z;
-	assert("distinct instance not matched", arrayContains([x], z), false);
+	assert("distinct instance not matched", arrayContains([x], z), 0);
 
 	// Nested arrays that alias the same backing handle compare equal safely.
 	inner = [ 1, 2, 3 ];
 	holder = [ inner ];
-	assert("array holding an aliased inner array", arrayContains(holder, inner), true);
+	assert("array holding an aliased inner array", arrayContains(holder, inner), 1);
 
 	suiteEnd();
 </cfscript>

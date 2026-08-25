@@ -865,13 +865,17 @@ extern "C" fn cfml_array_contains_boxed_boxed(tag_a: i64, tag_v: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
     let va = unsafe { super::boxed::materialize_tagged(tag_a as usize) };
     let vv = unsafe { super::boxed::materialize_tagged(tag_v as usize) };
-    let b = if let CfmlValue::Array(arr) = &va {
+    // GH #358: the 1-based index of the first match, 0 when absent — the same
+    // shape the interpreter returns. Returning a boolean here while the
+    // interpreter returned an index would make a hot function disagree with its
+    // own cold runs.
+    let idx = if let CfmlValue::Array(arr) = &va {
         let needle = vv.as_string();
-        arr.iter().any(|x| x.as_string() == needle)
+        arr.iter().position(|x| x.as_string() == needle).map(|i| i + 1).unwrap_or(0)
     } else {
-        false
+        0
     };
-    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+    super::arena::box_into_active(CfmlValue::Int(idx as i64)) as i64
 }
 
 /// Mirrors `fn_array_contains_no_case(array, value)`.
@@ -879,13 +883,17 @@ extern "C" fn cfml_array_contains_no_case_boxed_boxed(tag_a: i64, tag_v: i64) ->
     use cfml_common::dynamic::CfmlValue;
     let va = unsafe { super::boxed::materialize_tagged(tag_a as usize) };
     let vv = unsafe { super::boxed::materialize_tagged(tag_v as usize) };
-    let b = if let CfmlValue::Array(arr) = &va {
+    // GH #358 — index, not boolean. See `cfml_array_contains_boxed_boxed`.
+    let idx = if let CfmlValue::Array(arr) = &va {
         let needle = vv.as_string().to_lowercase();
-        arr.iter().any(|x| x.as_string().to_lowercase() == needle)
+        arr.iter()
+            .position(|x| x.as_string().to_lowercase() == needle)
+            .map(|i| i + 1)
+            .unwrap_or(0)
     } else {
-        false
+        0
     };
-    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+    super::arena::box_into_active(CfmlValue::Int(idx as i64)) as i64
 }
 
 // ── v0.103.0 — Boxed-aware array + list shims ────────────────────────────────
@@ -2288,35 +2296,52 @@ mod tests {
             int_arg, k_present
         )));
 
-        // arrayContains / arrayContainsNoCase.
+        // arrayContains / arrayContainsNoCase — GH #358: these return the
+        // 1-based INDEX of the first match (0 when absent), not a boolean, so
+        // a JIT'd caller sees the same value its cold runs produced.
+        let extract_int = |tagged: i64| -> i64 {
+            let v = unsafe { boxed::borrow_tagged(tagged as usize) };
+            match v {
+                CfmlValue::Int(i) => *i,
+                other => panic!("expected Int, got {other:?}"),
+            }
+        };
         let str_arr = boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![
             CfmlValue::string("Foo"),
             CfmlValue::string("bar"),
         ]))) as i64;
         let needle_case = boxed::box_value(CfmlValue::string("FOO")) as i64;
         let needle_exact = boxed::box_value(CfmlValue::string("Foo")) as i64;
+        let needle_second = boxed::box_value(CfmlValue::string("bar")) as i64;
         let needle_missing = boxed::box_value(CfmlValue::string("baz")) as i64;
-        assert!(extract_bool(cfml_array_contains_boxed_boxed(
-            str_arr,
-            needle_exact
-        )));
-        assert!(!extract_bool(cfml_array_contains_boxed_boxed(
-            str_arr,
-            needle_case
-        )));
-        assert!(extract_bool(cfml_array_contains_no_case_boxed_boxed(
-            str_arr,
-            needle_case
-        )));
-        assert!(!extract_bool(cfml_array_contains_no_case_boxed_boxed(
-            str_arr,
-            needle_missing
-        )));
-        // Non-array receiver → false.
-        assert!(!extract_bool(cfml_array_contains_boxed_boxed(
-            int_arg,
-            needle_exact
-        )));
+        assert_eq!(
+            extract_int(cfml_array_contains_boxed_boxed(str_arr, needle_exact)),
+            1
+        );
+        assert_eq!(
+            extract_int(cfml_array_contains_boxed_boxed(str_arr, needle_second)),
+            2
+        );
+        assert_eq!(
+            extract_int(cfml_array_contains_boxed_boxed(str_arr, needle_case)),
+            0
+        );
+        assert_eq!(
+            extract_int(cfml_array_contains_no_case_boxed_boxed(str_arr, needle_case)),
+            1
+        );
+        assert_eq!(
+            extract_int(cfml_array_contains_no_case_boxed_boxed(
+                str_arr,
+                needle_missing
+            )),
+            0
+        );
+        // Non-array receiver → 0.
+        assert_eq!(
+            extract_int(cfml_array_contains_boxed_boxed(int_arg, needle_exact)),
+            0
+        );
 
         drop(_g);
         for t in [

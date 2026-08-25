@@ -277,5 +277,72 @@ assertTrue("cfloginuser() call form runs", true);
 cflogout();
 assertTrue("cflogout() call form runs", true);
 
+// ============================================================
+// GH ##357 — the six forms left over from the ##341 census. Each needed parser
+// work rather than another registry entry, which is why they were not bundled
+// in. All measured on Lucee 7.1.0.204.
+// ============================================================
+
+// 1. Function-call forms that resolved to nothing. Unlike the four above these
+//    have no `__cfX` intercept to point at, so each needed its own lowering.
+request._includeTest = "";
+cfinclude( template="_include_target.cfm" );
+assert("cfinclude( template=… ) includes", request._includeTest, "included");
+
+// `pageEncoding` is accepted and ignored, exactly as the angle-bracket tag is
+// (docs/known-issues.md ##60). What matters here is that it no longer throws —
+// and no longer leaves a stray `pageencoding` page variable behind, which is
+// what the bare statement form used to do by parsing as an assignment.
+cfprocessingdirective( pageencoding="utf-8" );
+assertTrue("cfprocessingdirective() call form runs", true);
+processingdirective pageencoding="utf-8";
+assertFalse("the statement form does not leak a `pageencoding` variable",
+	isDefined("variables.pageencoding"));
+
+// `suppressWhiteSpace` with a block collapses the body's output, like the tag.
+savecontent variable="_pdOut" {
+	processingdirective suppresswhitespace=true {
+		writeOutput("a" & chr(10) & "     " & chr(10) & "b");
+	}
+}
+assertFalse("processingdirective suppressWhiteSpace collapses the run of blanks",
+	_pdOut CONTAINS "     ");
+assertTrue("...and keeps the content", _pdOut CONTAINS "a" AND _pdOut CONTAINS "b");
+
+// `rethrow` is a KEYWORD statement, so even the bare `rethrow()` did not parse.
+_rt = "";
+try { try { throw(message="rt1"); } catch (any e) { cfrethrow(); } }
+catch (any e) { _rt = e.message; }
+assert("cfrethrow() rethrows", _rt, "rt1");
+// NB `rethrow()` is NOT asserted: Lucee rejects it ("No matching function
+// [RETHROW] found"), so accepting it here would be a superset that breaks on
+// deployment. `rethrow;`, `cfrethrow;` and `cfrethrow()` are the portable ones.
+_rt = "";
+try { try { throw(message="rt3"); } catch (any e) { cfrethrow; } }
+catch (any e) { _rt = e.message; }
+assert("cfrethrow; rethrows", _rt, "rt3");
+
+// 2. Block forms that were parse errors — the parenthesised-attributes-plus-
+//    block shape specifically. The `thread name=… { … }` statement equivalent
+//    already worked.
+cfthread( name="_gh357t" ) { thread.v = 1; }
+thread action="join" name="_gh357t";
+assert("cfthread( … ) { … } runs the body", cfthread._gh357t.v, 1);
+
+// `mail` in its bare spelling with space-separated attributes. Sending needs an
+// SMTP server, so this asserts the PARSE + lowering, not delivery: the throw is
+// the mail intercept's own "no SMTP Server defined", which proves the block
+// reached it rather than failing at parse time.
+_mailErr = "";
+try {
+	mail to="a@b.c" from="d@e.f" subject="s" { writeOutput("body"); }
+} catch (any e) { _mailErr = e.message; }
+assertTrue("bare `mail … { … }` reaches the mail intercept",
+	_mailErr CONTAINS "SMTP" OR _mailErr EQ "");
+
+// 3. `import` with a quoted path. The bare form already worked.
+import "java.lang.String";
+assertTrue("quoted import parses", true);
+
 suiteEnd();
 </cfscript>

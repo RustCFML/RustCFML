@@ -289,7 +289,28 @@ impl Parser {
             return Ok(self.build_throw_call(arguments, stmt_loc));
         }
 
-        if self.match_token(&Token::Rethrow) {
+        // `rethrow;` — the keyword statement. NOT `rethrow()`: Lucee rejects that
+        // ("No matching function [RETHROW] found"), so `rethrow` followed by `(`
+        // is deliberately left to the expression path, where it reports an
+        // undefined function the same way.
+        if self.check(&Token::Rethrow) && !matches!(self.peek(1), Token::LParen) {
+            self.advance();
+            self.match_token(&Token::Semicolon);
+            return Ok(CfmlNode::Statement(Statement::Rethrow(stmt_loc)));
+        }
+
+        // `cfrethrow();` / `cfrethrow;` — the spellings Lucee DOES accept.
+        // `rethrow` is a keyword here, so neither could resolve to anything and
+        // both threw "Variable 'cfrethrow' is undefined", which reads like a
+        // typo in user code rather than a missing script form (GH #357).
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("cfrethrow"))
+            && matches!(self.peek(1), Token::LParen | Token::Semicolon)
+        {
+            self.advance(); // cfrethrow
+            if self.check(&Token::LParen) && matches!(self.peek(1), Token::RParen) {
+                self.advance(); // (
+                self.advance(); // )
+            }
             self.match_token(&Token::Semicolon);
             return Ok(CfmlNode::Statement(Statement::Rethrow(stmt_loc)));
         }
@@ -480,7 +501,14 @@ impl Parser {
         }
 
         if self.match_token(&Token::Import) {
-            let path = self.extract_identifier()?;
+            // `import "java.lang.String";` — Lucee accepts a quoted path as well
+            // as the bare `import java.lang.String;` form (GH #357).
+            let path = if let Token::String(ref lit) = self.peek(0).clone() {
+                self.advance();
+                lit.clone()
+            } else {
+                self.extract_identifier()?
+            };
             let alias = if self.match_token(&Token::Identifier("as".into())) {
                 Some(self.extract_identifier()?)
             } else {
@@ -492,6 +520,155 @@ impl Parser {
                 alias,
                 location: stmt_loc,
             })));
+        }
+
+        // `cfinclude( template=… )` / `include( template=… )` — the function-call
+        // form of <cfinclude>. The statement form `include "x.cfm";` has always
+        // worked, but the call form resolved to nothing and threw "Variable
+        // 'cfinclude' is undefined" (GH #357). Lower it to the same
+        // Statement::Include the statement form produces.
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("cfinclude"))
+            && matches!(self.peek(1), Token::LParen)
+        {
+            let saved = self.current;
+            self.advance(); // cfinclude
+            self.advance(); // (
+            // Attributes only. The positional `cfinclude( "x.cfm" )` spelling is
+            // deliberately NOT accepted: Lucee rejects it at PARSE time
+            // ("Invalid Identifier … cannot be part of an identifier"), so
+            // supporting it here would be the harmful direction of divergence —
+            // code written against this engine failing only once deployed.
+            let template = match self.parse_tag_call_attrs() {
+                Ok(attrs) => attrs
+                    .into_iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("template"))
+                    .map(|(_, v)| v),
+                Err(_) => None,
+            };
+            match template {
+                Some(path) if self.match_token(&Token::RParen) => {
+                    self.match_token(&Token::Semicolon);
+                    return Ok(CfmlNode::Statement(Statement::Include(Include {
+                        path,
+                        location: stmt_loc,
+                    })));
+                }
+                _ => {
+                    self.current = saved;
+                    return Err(self.parse_error("cfinclude requires a 'template' attribute"));
+                }
+            }
+        }
+
+        // `cfprocessingdirective( pageEncoding=… )` / `processingdirective … ;`
+        // / `processingdirective suppressWhiteSpace=true { … }`. The call form
+        // threw "Variable 'cfprocessingdirective' is undefined", and the bare
+        // statement form parsed as an identifier plus an assignment — creating a
+        // stray `pageencoding` variable and doing nothing (GH #357).
+        //
+        // Behaviour mirrors the angle-bracket tag exactly: `suppressWhiteSpace`
+        // collapses the block's output; `pageEncoding` is accepted and ignored
+        // (see docs/known-issues.md — the engine reads source as UTF-8).
+        if matches!(self.peek(0), Token::Identifier(ref s)
+            if s.eq_ignore_ascii_case("processingdirective")
+                || s.eq_ignore_ascii_case("cfprocessingdirective"))
+        {
+            let paren_form = matches!(self.peek(1), Token::LParen);
+            let bare_form = self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal);
+            if paren_form || bare_form {
+                let saved = self.current;
+                self.advance(); // tag name
+                let mut attrs: Vec<(String, Expression)> = Vec::new();
+                if paren_form {
+                    self.advance(); // (
+                    match self.parse_tag_call_attrs() {
+                        Ok(a) => attrs = a,
+                        Err(_) => self.current = saved,
+                    }
+                    if self.current != saved && !self.match_token(&Token::RParen) {
+                        self.current = saved;
+                    }
+                } else {
+                    while !self.check(&Token::LBrace)
+                        && !self.check(&Token::Semicolon)
+                        && !self.is_at_end()
+                    {
+                        if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                            let key = self.extract_identifier()?;
+                            self.advance(); // consume '='
+                            match self.parse_expression() {
+                                Ok(v) => attrs.push((key, v)),
+                                Err(_) => break,
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if self.current != saved {
+                    let suppress = attrs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("suppresswhitespace"))
+                        .map(|(_, v)| match v {
+                            Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                                matches!(s.to_lowercase().as_str(), "true" | "yes")
+                            }
+                            Expression::Literal(Literal { value: LiteralValue::Bool(b), .. }) => *b,
+                            _ => false,
+                        })
+                        .unwrap_or(false);
+                    let body = if self.check(&Token::LBrace) {
+                        self.parse_block()?
+                    } else {
+                        self.match_token(&Token::Semicolon);
+                        Vec::new()
+                    };
+                    if !suppress {
+                        // No body, or a body to run verbatim.
+                        return Ok(CfmlNode::Statement(Statement::Output(Output {
+                            body,
+                            location: stmt_loc,
+                        })));
+                    }
+                    let call = |name: &str| {
+                        Expression::FunctionCall(Box::new(FunctionCall {
+                            name: Box::new(Expression::Identifier(Identifier {
+                                name: name.to_string(),
+                                location: stmt_loc,
+                            })),
+                            arguments: vec![],
+                            location: stmt_loc,
+                        }))
+                    };
+                    let mut stmts = vec![Statement::Expression(ExpressionStatement {
+                        expr: call("__cfsavecontent_start"),
+                        location: stmt_loc,
+                    })];
+                    stmts.extend(body);
+                    stmts.push(Statement::Expression(ExpressionStatement {
+                        expr: Expression::FunctionCall(Box::new(FunctionCall {
+                            name: Box::new(Expression::Identifier(Identifier {
+                                name: "writeOutput".to_string(),
+                                location: stmt_loc,
+                            })),
+                            arguments: vec![Expression::FunctionCall(Box::new(FunctionCall {
+                                name: Box::new(Expression::Identifier(Identifier {
+                                    name: "__cfprocessingdirective_collapse".to_string(),
+                                    location: stmt_loc,
+                                })),
+                                arguments: vec![call("__cfsavecontent_end")],
+                                location: stmt_loc,
+                            }))],
+                            location: stmt_loc,
+                        })),
+                        location: stmt_loc,
+                    }));
+                    return Ok(CfmlNode::Statement(Statement::Output(Output {
+                        body: stmts,
+                        location: stmt_loc,
+                    })));
+                }
+            }
         }
 
         // Handle 'http url="..." method="..." result="..." { httpparam...; }' in CFScript
@@ -1013,23 +1190,48 @@ impl Parser {
             }
         }
 
-        // Handle 'thread name="..." action="run" { body }' in CFScript
-        if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "thread")
-            && self.is_identifier_like_at(1)
-            && matches!(self.peek(2), Token::Equal)
+        // Handle 'thread name="..." action="run" { body }' in CFScript, in all
+        // four spellings Lucee accepts: with or without the `cf` prefix, and
+        // with the attributes either space-separated or parenthesised —
+        // `cfthread( name="t" ) { … }` used to be a parse error (GH #357).
+        let thread_name_here = matches!(self.peek(0), Token::Identifier(ref s)
+            if s.eq_ignore_ascii_case("thread") || s.eq_ignore_ascii_case("cfthread"));
+        let thread_paren_form = thread_name_here && matches!(self.peek(1), Token::LParen);
+        if thread_name_here
+            && (thread_paren_form
+                || (self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal)))
         {
-            self.advance(); // consume 'thread'
+            let thread_saved = self.current;
+            self.advance(); // consume 'thread' / 'cfthread'
             let mut attrs: Vec<(String, Expression)> = Vec::new();
-            while !self.check(&Token::LBrace) && !self.check(&Token::Semicolon) && !self.is_at_end() {
-                if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
-                    let attr_name = self.extract_identifier()?;
-                    self.advance(); // consume =
-                    let attr_value = self.parse_expression()?;
-                    attrs.push((attr_name.to_lowercase(), attr_value));
-                } else {
-                    break;
+            if thread_paren_form {
+                self.advance(); // consume '('
+                match self.parse_tag_call_attrs() {
+                    Ok(a) => attrs = a.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect(),
+                    // Not a tag call after all (e.g. a variable holding a
+                    // closure, called as `thread( x )`) — rewind and let the
+                    // ordinary expression path have it.
+                    Err(_) => { self.current = thread_saved; attrs.clear(); }
+                }
+                if self.current != thread_saved && !self.match_token(&Token::RParen) {
+                    self.current = thread_saved;
+                    attrs.clear();
+                }
+            } else {
+                while !self.check(&Token::LBrace) && !self.check(&Token::Semicolon) && !self.is_at_end() {
+                    if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                        let attr_name = self.extract_identifier()?;
+                        self.advance(); // consume =
+                        let attr_value = self.parse_expression()?;
+                        attrs.push((attr_name.to_lowercase(), attr_value));
+                    } else {
+                        break;
+                    }
                 }
             }
+            if self.current == thread_saved {
+                // Rewound above — fall through to the generic statement paths.
+            } else {
 
             // Extract name and action
             let thread_name = attrs.iter()
@@ -1138,6 +1340,7 @@ impl Parser {
                 _ => {
                     self.match_token(&Token::Semicolon);
                 }
+            }
             }
         }
 
@@ -1257,24 +1460,61 @@ impl Parser {
         // These lower to the same bytecode as the angle-bracket tag forms.
         if let Token::Identifier(ref nm) = self.peek(0).clone() {
             let nlow = nm.to_lowercase();
-            let is_body_tag = matches!(nlow.as_str(),
-                "cfsavecontent" | "cflock" | "cftransaction" | "cfmail" | "cfquery" | "cfhttp");
-            if is_body_tag && matches!(self.peek(1), Token::LParen) {
-                let saved = self.current;
-                self.advance(); // tag name
-                self.advance(); // (
-                let attrs = match self.parse_tag_call_attrs() {
-                    Ok(a) => a,
-                    Err(_) => { self.current = saved; Vec::new() }
-                };
-                if self.current != saved && self.check(&Token::RParen) {
-                    self.advance(); // )
-                    if self.check(&Token::LBrace) {
-                        let body = self.parse_block()?;
-                        return Ok(self.lower_script_body_tag(&nlow, attrs, body, stmt_loc));
+            // Lucee's rule is that the `cf` prefix is optional in script and the
+            // attributes may be parenthesised OR space-separated. Only the
+            // cf-prefixed parenthesised spelling was accepted here, so
+            // `mail to="a@b.c" … { … }` was a parse error (GH #357).
+            let body_tag = match nlow.strip_prefix("cf").unwrap_or(nlow.as_str()) {
+                "savecontent" => Some("cfsavecontent"),
+                "lock" => Some("cflock"),
+                "transaction" => Some("cftransaction"),
+                "mail" => Some("cfmail"),
+                "query" => Some("cfquery"),
+                "http" => Some("cfhttp"),
+                _ => None,
+            };
+            if let Some(canonical) = body_tag {
+                let paren_form = matches!(self.peek(1), Token::LParen);
+                let bare_form =
+                    self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal);
+                if paren_form || bare_form {
+                    let saved = self.current;
+                    self.advance(); // tag name
+                    let mut attrs: Vec<(String, Expression)> = Vec::new();
+                    if paren_form {
+                        self.advance(); // (
+                        match self.parse_tag_call_attrs() {
+                            Ok(a) => attrs = a,
+                            Err(_) => self.current = saved,
+                        }
+                        if self.current != saved && !self.match_token(&Token::RParen) {
+                            self.current = saved;
+                        }
                     } else {
-                        self.current = saved;
+                        while !self.check(&Token::LBrace)
+                            && !self.check(&Token::Semicolon)
+                            && !self.is_at_end()
+                        {
+                            if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                                let key = self.extract_identifier()?;
+                                self.advance(); // consume '='
+                                match self.parse_expression() {
+                                    Ok(v) => attrs.push((key, v)),
+                                    Err(_) => break,
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
+                    // A body block is what makes this a tag rather than an
+                    // ordinary call or assignment; without one, rewind so the
+                    // generic statement paths see exactly what they saw before.
+                    if self.current != saved && self.check(&Token::LBrace) {
+                        let body = self.parse_block()?;
+                        return Ok(self.lower_script_body_tag(canonical, attrs, body, stmt_loc));
+                    }
+                    self.current = saved;
                 }
             }
             // `transaction { body }` (bare) or `transaction action="begin" { body }`

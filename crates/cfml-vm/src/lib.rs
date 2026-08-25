@@ -11216,7 +11216,7 @@ impl CfmlVirtualMachine {
                     // `fn_registry` (registered at program load), so skipping this
                     // insert leaves `obj.evaluate()` working while bare
                     // `Evaluate()` correctly falls through to the BIF.
-                    if !(shadows_builtin && bc_func_arc.is_component_method) {
+                    if !bc_func_arc.is_component_method {
                         self.user_functions
                             .insert(func_name.clone(), Arc::clone(&bc_func_arc));
                         // Keep the lowercased resolution index in step.
@@ -13491,7 +13491,14 @@ impl CfmlVirtualMachine {
                 // match (find), or an array of all such indices (findAll). The
                 // value-needle form fails the guard and falls through to the
                 // builtin (deep-equality match).
+                // `arrayContains` is included because Lucee's `ArrayContains.call`
+                // is literally `return ArrayFind.call(...)`, and `ArrayFind`
+                // dispatches a UDF needle as a predicate (GH #358).
+                // `arrayContainsNoCase` is deliberately absent: Lucee routes it
+                // to `ArrayFindNoCase`, which has no UDF branch and compares the
+                // closure by equality — i.e. `0`.
                 "arrayfind" | "arrayfindnocase" | "arrayfindall" | "arrayfindallnocase"
+                | "arraycontains"
                     if matches!(args.get(1), Some(CfmlValue::Function(_))) =>
                 {
                     let all = name_lower.starts_with("arrayfindall");
@@ -13762,48 +13769,6 @@ impl CfmlVirtualMachine {
                         }
                     }
                     return Ok(CfmlValue::array(Vec::new()));
-                }
-                "arrayfindall" | "arrayfindallnocase" => {
-                    // arrayFindAll(array, callback) - callback(item, index, array)
-                    // When called with a callback, returns indices where callback returns true
-                    if let (Some(arr_val), Some(arg1)) = (args.get(0), args.get(1)) {
-                        if let CfmlValue::Array(arr) = arr_val {
-                            // Check if second arg is a callback (Function) or a simple value
-                            if matches!(arg1, CfmlValue::Function(_)) {
-                                let callback = arg1.clone();
-                                let mut pl: Option<ValueMap> = None;
-                                let mut result = Vec::new();
-                                for (i, item) in arr.iter().enumerate() {
-                                    let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(item.clone());
-                                    cb_args.push(CfmlValue::Int((i + 1) as i64));
-                                    cb_args.push(arr_val.clone());
-                                    self.closure_parent_writeback = None;
-                                    self.closure_parent_deletes = None;
-                                    let scope = pl.as_ref().unwrap_or(parent_locals);
-                                    let keep = self.call_function(&callback, cb_args, scope)?;
-                                    if let Some(wb) = self.closure_parent_writeback.take() {
-                                        let pl_ref = pl.get_or_insert_with(|| parent_locals.clone());
-                                        for (k, v) in &wb {
-                                            pl_ref.insert(k.clone(), v.clone());
-                                        }
-                                        Self::write_back_to_captured_scope(&callback, &wb);
-                                        self.closure_parent_writeback = Some(wb);
-                                    }
-                                    if keep.is_true() {
-                                        result.push(CfmlValue::Int((i + 1) as i64));
-                                    }
-                                }
-                                if let Some(ref pl_ref) = pl {
-                                    self.set_ho_final_writeback(pl_ref, parent_locals);
-                                }
-                                return Ok(CfmlValue::array(result));
-                            } else {
-                                // Simple value comparison: fall through to builtin
-                            }
-                        }
-                    }
-                    // Fall through to the builtin fn_array_find_all for simple value comparison
                 }
                 "arrayreduce" => {
                     if let (Some(arr_val), Some(callback)) = (args.get(0), args.get(1)) {

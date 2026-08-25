@@ -2557,30 +2557,62 @@ fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
     }
 }
 
+/// `arrayContains( array, value [, substringMatch] )` — the 1-based index of the
+/// first match, `0` when absent (GH #358). We used to return a boolean, which
+/// reads identically inside an `if` and diverges the moment the result is USED:
+/// `list[ arrayContains( list, needle ) ]` yields the element on Lucee/ACF and
+/// threw here. cfdocs documents the index; Lucee's `ArrayContains.call` is
+/// literally `return ArrayFind.call(pc, array, value)`.
+///
+/// The optional third argument is Lucee's `substringMatch`: match an element
+/// when the needle appears anywhere INSIDE its string form, rather than by
+/// equality. Lucee rejects a complex needle in that mode
+/// (`ArrayContains.call`), and its plain-`arrayContains` substring scan is
+/// case-SENSITIVE even though the equality scan below is not — mirrored here.
 fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
-    if args.len() >= 2 {
-        if let Some(arr) = args[0].as_array() {
-            return Ok(CfmlValue::Bool(
-                arr.iter().any(|v| cfml_deep_equal(&v, &args[1], false)),
-            ));
-        }
+    if args.len() >= 3 && args[2].is_true() {
+        return array_contains_substring(&args, "ArrayContains", false);
     }
-    Ok(CfmlValue::Bool(false))
+    fn_array_find(args)
 }
 
 fn fn_array_contains_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
-    if args.len() >= 2 {
-        if let Some(arr) = args[0].as_array() {
-            return Ok(CfmlValue::Bool(
-                arr.iter().any(|v| cfml_deep_equal(&v, &args[1], true)),
-            ));
+    if args.len() >= 3 && args[2].is_true() {
+        return array_contains_substring(&args, "ArrayContainsNoCase", true);
+    }
+    fn_array_find_no_case(args)
+}
+
+/// `substringMatch=true` scan shared by both — Lucee `ArrayUtil.arrayContainsIgnoreEmpty`
+/// plus its caller's `+ 1`, i.e. the 1-based index of the first element whose
+/// string form contains the needle, `0` when none does.
+fn array_contains_substring(
+    args: &[CfmlValue],
+    fn_name: &str,
+    ignore_case: bool,
+) -> CfmlResult {
+    if !fn_is_simple_value(vec![args[1].clone()])?.is_true() {
+        return Err(CfmlError::runtime(format!(
+            "invalid argument for function {}, substringMatch can not be true when the value that is searched for is a complex object",
+            fn_name
+        )));
+    }
+    let needle = args[1].as_string();
+    let needle = if ignore_case { needle.to_lowercase() } else { needle.to_string() };
+    if let Some(arr) = args[0].as_array() {
+        for (i, v) in arr.iter().enumerate() {
+            let item = v.as_string();
+            let item = if ignore_case { item.to_lowercase() } else { item.to_string() };
+            if item.contains(&needle) {
+                return Ok(CfmlValue::Int((i + 1) as i64));
+            }
         }
     }
-    Ok(CfmlValue::Bool(false))
+    Ok(CfmlValue::Int(0))
 }
 
 fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
@@ -6099,6 +6131,13 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
             // (Lucee/ACF/BoxLang treat a query cell as a simple value).
             serialize_value(val.query_column_scalar(), visited, by_columns)
         }
+        // Binary serializes to its base64 text, like Lucee (GH #359). This used
+        // to fall into the `null` arm below, so a struct carrying binary lost
+        // the payload on a serializeJSON/deserializeJSON round trip with nothing
+        // thrown — a silent data loss through a cache write or an API response.
+        // base64 is also the shape that recovers:
+        // `binaryDecode( deserializeJSON( json ), "base64" )` returns the bytes.
+        CfmlValue::Binary(b) => format!("\"{}\"", base64_encode_bytes(b)),
         _ => "null".to_string(),
     }
 }
@@ -17328,6 +17367,13 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     let cc = get_opt("cc");
     #[cfg(feature = "smtp")]
     let bcc = get_opt("bcc");
+    // `replyTo` / `failTo` were parsed by nothing at all — a message that asked
+    // for them simply went out without them. Preside's SMTP service provider
+    // sets both (GH #356).
+    #[cfg(feature = "smtp")]
+    let reply_to = get_opt("replyto");
+    #[cfg(feature = "smtp")]
+    let fail_to = get_opt("failto");
     #[cfg(feature = "smtp")]
     let cfg_default = default_mail_server();
     #[cfg(feature = "smtp")]
@@ -17423,17 +17469,35 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
         }).collect()
     } else { Vec::new() };
 
-    // Collect file attachments from params array
+    // Walk the `params` array once. A <cfmailparam> is either an ATTACHMENT
+    // (it names a `file`) or a custom HEADER (`name` + `value`) — the header
+    // half used to be dropped silently, so `addParam( name="X-Mailer", … )`
+    // did nothing (GH #356). `remove="true"` deletes the attachment after a
+    // successful send, which is how Preside cleans up generated files.
     let mut attachments: Vec<String> = Vec::new();
+    let mut remove_after_send: Vec<String> = Vec::new();
+    let mut custom_headers: Vec<(String, String)> = Vec::new();
     if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
         for param in params.iter() {
             if let CfmlValue::Struct(p) = param {
-                if let Some(file_path) = p.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("file"))
-                    .map(|(_, v)| v.as_string())
-                {
-                    if !file_path.is_empty() {
-                        attachments.push(file_path);
+                let field = |key: &str| -> Option<String> {
+                    p.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                        .map(|(_, v)| v.as_string())
+                };
+                let file_path = field("file").filter(|f| !f.is_empty());
+                if let Some(file_path) = file_path {
+                    if field("remove").map(|r| {
+                        r.eq_ignore_ascii_case("true") || r == "1" || r.eq_ignore_ascii_case("yes")
+                    }).unwrap_or(false) {
+                        remove_after_send.push(file_path.clone());
+                    }
+                    attachments.push(file_path);
+                    continue;
+                }
+                if let (Some(name), Some(value)) = (field("name"), field("value")) {
+                    if !name.is_empty() {
+                        custom_headers.push((name, value));
                     }
                 }
             }
@@ -17456,37 +17520,48 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
             Err(e) => return Err(CfmlError::runtime(format!("cfmail: invalid from address '{}': {}", from, e))),
         }
 
-        // Parse to addresses (comma-separated)
-        for addr in to.split(',') {
-            let addr = addr.trim();
-            if !addr.is_empty() {
-                match addr.parse::<lettre::message::Mailbox>() {
-                    Ok(mbox) => { email_builder = email_builder.to(mbox); }
-                    Err(e) => return Err(CfmlError::runtime(format!("cfmail: invalid to address '{}': {}", addr, e))),
-                }
+        // Recipient lists are comma- OR semicolon-delimited. Lucee accepts both;
+        // only the comma was split here, so Preside's `setTo( "a@x;b@y" )` (its
+        // SMTP provider joins recipients with `;`) parsed as one malformed
+        // address and the send failed outright (GH #356).
+        let split_addrs = |s: &str| -> Vec<String> {
+            s.split([',', ';'])
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect::<Vec<_>>()
+        };
+
+        // Parse to addresses
+        for addr in split_addrs(&to) {
+            match addr.parse::<lettre::message::Mailbox>() {
+                Ok(mbox) => { email_builder = email_builder.to(mbox); }
+                Err(e) => return Err(CfmlError::runtime(format!("cfmail: invalid to address '{}': {}", addr, e))),
             }
         }
 
         // CC
         if let Some(ref cc_addrs) = cc {
-            for addr in cc_addrs.split(',') {
-                let addr = addr.trim();
-                if !addr.is_empty() {
-                    if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
-                        email_builder = email_builder.cc(mbox);
-                    }
+            for addr in split_addrs(cc_addrs) {
+                if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
+                    email_builder = email_builder.cc(mbox);
                 }
             }
         }
 
         // BCC
         if let Some(ref bcc_addrs) = bcc {
-            for addr in bcc_addrs.split(',') {
-                let addr = addr.trim();
-                if !addr.is_empty() {
-                    if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
-                        email_builder = email_builder.bcc(mbox);
-                    }
+            for addr in split_addrs(bcc_addrs) {
+                if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
+                    email_builder = email_builder.bcc(mbox);
+                }
+            }
+        }
+
+        // Reply-To
+        if let Some(ref reply_addrs) = reply_to {
+            for addr in split_addrs(reply_addrs) {
+                if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
+                    email_builder = email_builder.reply_to(mbox);
                 }
             }
         }
@@ -17509,7 +17584,7 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
             Some(alt)
         };
 
-        let email = if let Some(alternative) = alternative {
+        let mut email = if let Some(alternative) = alternative {
             // Multipart message: cfmailpart-declared text/html alternatives,
             // optionally wrapped in a mixed part alongside file attachments.
             if attachments.is_empty() {
@@ -17587,6 +17662,30 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                 .map_err(|e| CfmlError::runtime(format!("cfmail: failed to build email: {}", e)))?
         };
 
+        // Raw headers: <cfmailparam name=… value=…> plus `failTo`, which is a
+        // Return-Path. lettre has no typed header for either, so they go in
+        // after the message is built.
+        {
+            use lettre::message::header::{HeaderName, HeaderValue};
+            let mut raw: Vec<(String, String)> = custom_headers.clone();
+            if let Some(ref ft) = fail_to {
+                if !ft.trim().is_empty() {
+                    raw.push(("Return-Path".to_string(), ft.trim().to_string()));
+                }
+            }
+            for (name, value) in raw {
+                match HeaderName::new_from_ascii(name.clone()) {
+                    Ok(hn) => email.headers_mut().insert_raw(HeaderValue::new(hn, value)),
+                    Err(e) => {
+                        return Err(CfmlError::runtime(format!(
+                            "cfmail: invalid header name '{}': {}",
+                            name, e
+                        )))
+                    }
+                }
+            }
+        }
+
         let port: u16 = port_str.as_deref()
             .and_then(|p| p.parse().ok())
             .unwrap_or(25);
@@ -17637,6 +17736,14 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             ),
             Err(e) => return Err(CfmlError::runtime(format!("cfmail: SMTP send failed: {}", e))),
+        }
+        // <cfmailparam remove="true"> — delete the attachment once it is on the
+        // wire. Only after a successful send: a failure the caller may retry
+        // must not have destroyed the file.
+        for file_path in &remove_after_send {
+            if let Err(e) = std::fs::remove_file(file_path) {
+                eprintln!("[CFMAIL] Warning: could not remove attachment '{}': {}", file_path, e);
+            }
         }
     }
 

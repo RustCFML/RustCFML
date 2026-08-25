@@ -222,6 +222,9 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_array_find_complex.cfm">
 <cf_runtest file="stdlib/test_arrayfind_closure.cfm">
 <cf_runtest file="stdlib/test_arraycontains_circular.cfm">
+<cf_runtest file="stdlib/test_arraycontains_returns_index.cfm">
+<cf_runtest file="stdlib/test_serializejson_binary.cfm">
+<cf_runtest file="stdlib/test_mail_component.cfm">
 <cf_runtest file="stdlib/test_arraysort_callback.cfm">
 <cf_runtest file="stdlib/test_dateadd_invalid_datepart.cfm">
 <cf_runtest file="stdlib/test_file_bif_errors.cfm">
@@ -367,6 +370,7 @@ include "harness.cfm";
 <!--- single-record JSON response comes back as ~379 internal keys. Runtime-safe. --->
 <cf_runtest file="oop/test_overflow_arg_no_leak.cfm">
 <cf_runtest file="oop/test_component_internals_serialize_leak.cfm">
+<cf_runtest file="oop/test_component_method_name_leak.cfm">
 <cf_runtest file="oop/test_component_method_builtin_name.cfm">
 <cf_runtest file="oop/test_component_name_builtin_collision.cfm">
 <cf_runtest file="oop/test_component_return_type.cfm">

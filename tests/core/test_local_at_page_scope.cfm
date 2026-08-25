@@ -27,16 +27,14 @@ assertFalse("isDefined('local') is false at page scope", isDefined("local"));
 assertFalse("a page variable is NOT visible as local.*", isDefined("local._pageOnlyVar"));
 assertFalse("no `local` key in the page variables scope", structKeyExists(variables, "local"));
 
-// Naming it does not yield a scope. On Lucee (and here, in isolation) it throws
-// outright; the assertion is written against the shape rather than the throw
-// because the full-suite run can leave a UDF literally named `local` reachable
-// as a bare name — a CFC's methods stay visible as bare names in later templates
-// on this engine, for `local` and `normal` alike — GH ##360, a separate
-// divergence from anything this file is about. Either way the point holds: naming `local`
-// at page scope must NOT hand back a scope struct.
+// Naming it does not yield a scope — it throws, exactly as on Lucee. This used
+// to be asserted against the returned shape rather than the throw, because a
+// CFC's methods stayed visible as bare names in later templates and
+// tests/oop/PresideFixLocalMethod.cfc declares `function local()` (GH ##360,
+// fixed in v0.630.0).
 _bareLocal = "threw";
 try { _bareLocal = isStruct( local ) ? "struct" : "other"; } catch (any e) { _bareLocal = "threw"; }
-assertFalse("naming `local` at page scope does not yield a scope struct", _bareLocal EQ "struct");
+assert("naming `local` at page scope throws", _bareLocal, "threw");
 
 // --- after a write it is an ORDINARY page variable, not a scope ---
 local.pageLevelKey = "written";

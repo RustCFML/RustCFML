@@ -1338,10 +1338,37 @@ second reason: coercing there would silently turn a binary into a real array,
 which is further from Lucee than leaving them alone. Closing this properly means
 a byte-backed array view rather than a per-call copy.
 
-Two neighbouring divergences found while measuring this are NOT specific to
-binaries and are tracked separately: `arrayContains`/`arrayContainsNoCase` return
-a boolean where Lucee returns the 1-based index (for ordinary arrays too), and
-`serializeJSON( binary )` yields `null` where Lucee yields the base64 string.
+Two neighbouring divergences found while measuring this were NOT specific to
+binaries and were tracked separately as GH #358 and GH #359 — both **fixed in
+v0.630.0**: `arrayContains`/`arrayContainsNoCase` now return the 1-based index
+like Lucee, and `serializeJSON( binary )` now yields the base64 string.
+
+## 62. `pageEncoding` is accepted and ignored 🏗
+
+`<cfprocessingdirective pageEncoding="…">` — and its script forms
+`cfprocessingdirective( pageEncoding=… )` / `processingdirective pageEncoding=…;`
+— parse and run, but the attribute has no effect: the engine reads every source
+file as UTF-8. `suppressWhiteSpace` IS honoured in both the tag and the script
+forms.
+
+This is not new behaviour; it is recorded here because GH #357 added the script
+spellings, and the bare statement form previously parsed as an identifier plus an
+assignment — doing nothing *and* leaving a stray `pageencoding` page variable
+behind. It is now a clean no-op that matches the tag.
+
+## 63. `new Mail()` / `<cfmail>`: `async` is ignored — every send is synchronous 🏗 *(GH [#356](https://github.com/RustCFML/RustCFML/issues/356))*
+
+Lucee spools a message when `async`/`spoolEnable` is set and delivers it from a
+background task, so the request returns before the SMTP dialogue happens. Here
+the attribute is accepted and ignored: `send()` always talks to the server
+inline and the request waits for it. A slow or unreachable SMTP server therefore
+shows up as request latency rather than as a queued message.
+
+The rest of the surface the engine-bundled `Mail` shim exposes IS wired through:
+`to`/`cc`/`bcc`/`replyTo` (comma- **or** semicolon-delimited), `failTo` as a
+`Return-Path`, `addParam( name=, value= )` as a custom header,
+`addParam( file=, remove= )` as an attachment deleted after a successful send,
+`addPart` as a `multipart/alternative`, and `useSSL`/`useTLS`.
 
 ---
 
