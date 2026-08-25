@@ -30,6 +30,10 @@ component {
     // resolves (issue #69 fixture).
     this.mappings["/comments"] = getDirectoryFromPath(getCurrentTemplatePath()) & "comments/";
 
+    // Map "database" so createObject("component", "database.SharedQueryInstanceFixture")
+    // resolves on Lucee too (same reason as /comments above).
+    this.mappings["/database"] = getDirectoryFromPath(getCurrentTemplatePath()) & "database/";
+
     // Distinct mapping name (NOT a real webroot subdirectory) used by
     // tags/test_mapping_include.cfm to isolate this.mappings-based cfinclude
     // resolution: a `/wheelsmapprobe/...` include can ONLY be found via this
