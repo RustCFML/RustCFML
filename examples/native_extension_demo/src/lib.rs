@@ -23,7 +23,8 @@ fn greet<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
         Some(v) if !v.is_null() => v.to_string(),
         _ => "World".to_string(),
     };
-    Ok(ctx.string(format!("Hello, {who}, from Rust")))
+    let hello = GREETING.get().map(String::as_str).unwrap_or("Hello");
+    Ok(ctx.string(format!("{hello}, {who}, from Rust")))
 }
 
 /// `demoStats( array )` — reading a container one element at a time.
@@ -215,10 +216,22 @@ impl NativeClass for Tally {
     }
 }
 
-/// Once per process, never per request. The place for thread pools and caches.
-fn on_load() -> Result<()> {
+/// Once per process, never per request — the place for thread pools and caches.
+///
+/// `settings` is this extension's `.cfconfig.json` block:
+///
+/// ```json
+/// { "extensions": { "settings": { "demo": { "greeting": "Hi" } } } }
+/// ```
+fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
+    if let Ok(greeting) = settings.key("greeting").as_str() {
+        GREETING.set(greeting.to_string()).ok();
+    }
     Ok(())
 }
+
+/// Configured greeting, if `.cfconfig.json` supplied one.
+static GREETING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 module! {
     name: "demo",

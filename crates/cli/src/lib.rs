@@ -232,12 +232,20 @@ static LOADED_EXTENSIONS: OnceLock<Vec<extensions::Extension>> = OnceLock::new()
 /// Problems are printed rather than swallowed: an extension that fails to load
 /// changes what the application can do, so it must never fail silently.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_extensions(explicit: Option<&str>, app_dir: Option<&std::path::Path>, verbose: bool) {
+pub fn load_extensions(
+    explicit: Option<&str>,
+    app_dir: Option<&std::path::Path>,
+    cfg: &cfml_config::schema::ExtensionsCfg,
+    verbose: bool,
+) {
     if LOADED_EXTENSIONS.get().is_some() {
         return;
     }
-    let dirs = extensions::search_dirs(explicit, app_dir);
-    let (loaded, problems) = extensions::load_all(&dirs);
+    // `--extensions` wins over the config's `directory`, which wins over the
+    // built-in locations.
+    let explicit = explicit.map(str::to_string).or_else(|| cfg.directory.clone());
+    let dirs = extensions::search_dirs(explicit.as_deref(), app_dir);
+    let (loaded, problems) = extensions::load_all(&dirs, cfg);
     for p in &problems {
         eprintln!("Extension warning: {}", p);
     }
@@ -264,6 +272,36 @@ pub fn load_extensions(explicit: Option<&str>, app_dir: Option<&std::path::Path>
         }
     }
     let _ = LOADED_EXTENSIONS.set(loaded);
+}
+
+/// Read just the `extensions` block of the server-level `.cfconfig.json`.
+///
+/// Loaded separately, and early, because extensions must be in the process
+/// before the first template is compiled — which is before the serve/CLI paths
+/// resolve the rest of the configuration.
+#[cfg(not(target_arch = "wasm32"))]
+fn server_extensions_cfg(args: &Args) -> cfml_config::schema::ExtensionsCfg {
+    let explicit = args
+        .cfconfig
+        .clone()
+        .or_else(|| std::env::var("CFCONFIG").ok().filter(|s| !s.is_empty()));
+    let cfg = match explicit {
+        Some(path) => RustCfmlConfig::from_file(std::path::Path::new(&path)).ok(),
+        None => {
+            let mut search: Vec<PathBuf> = Vec::new();
+            if let Some(ref doc_root) = args.serve {
+                search.push(PathBuf::from(doc_root));
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                search.push(cwd);
+            }
+            if let Some(d) = resolve::exe_dir() {
+                search.push(d);
+            }
+            RustCfmlConfig::load(&search).ok()
+        }
+    };
+    cfg.map(|c| c.extensions.cfg()).unwrap_or_default()
 }
 
 /// The loaded extensions, for `rustcfml ext list` and `getFunctionList`
@@ -622,7 +660,21 @@ fn real_main() {
                 }
             })
             .or_else(|| std::env::current_dir().ok());
-        load_extensions(args.extensions.as_deref(), app_dir.as_deref(), args.verbose);
+        // The SERVER-level `.cfconfig.json` only. Extensions load once per
+        // process, before anything is compiled, so a per-application config
+        // cannot enable or disable one — by the time an application resolves,
+        // the extension is already in the process, and there is no unload.
+        //
+        // A malformed file is not reported here: the serve/CLI paths below load
+        // the same file properly a moment later and report it once, with the
+        // right message.
+        let ext_cfg = server_extensions_cfg(&args);
+        load_extensions(
+            args.extensions.as_deref(),
+            app_dir.as_deref(),
+            &ext_cfg,
+            args.verbose,
+        );
     }
 
     if let Some(ref doc_root) = args.serve {
@@ -4049,7 +4101,7 @@ fn run_embedded_app(mut files: std::collections::HashMap<String, Vec<u8>>) {
     // itself, from the user's directory, or from `extensions/` in the working
     // directory. This path never sees the CLI flags (it returns before they are
     // parsed), so the search list is the default one.
-    load_extensions(None, std::env::current_dir().ok().as_deref(), false);
+    load_extensions(None, std::env::current_dir().ok().as_deref(), &Default::default(), false);
 
     let (mode, entry) = parse_embedded_meta(&files);
 

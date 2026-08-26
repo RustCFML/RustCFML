@@ -26,6 +26,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use cfml_common::dynamic::CfmlValue;
+use cfml_config::schema::ExtensionsCfg;
 use cfml_module_abi as abi;
 use cfml_vm::foreign::{self, LoadedModule};
 
@@ -306,7 +308,7 @@ fn clear_quarantine(path: &Path) {
 }
 
 /// Load one library and adopt its module declaration.
-fn load_library(path: &Path) -> Result<LoadedModule, String> {
+fn load_library(path: &Path, config: CfmlValue) -> Result<LoadedModule, String> {
     let label = path.display().to_string();
     unsafe {
         let library = libloading::Library::new(path)
@@ -320,7 +322,7 @@ fn load_library(path: &Path) -> Result<LoadedModule, String> {
                 )
             })?;
         let decl = decl_fn();
-        let module = foreign::adopt(decl, &label)?;
+        let module = foreign::adopt(decl, &label, config)?;
         // Never unloaded (see the module docs): foreign fn pointers outlive any
         // request, so dropping the Library would be undefined behaviour.
         std::mem::forget(library);
@@ -332,7 +334,7 @@ fn load_library(path: &Path) -> Result<LoadedModule, String> {
 ///
 /// Returns the loaded extensions and any problems, so the caller can decide how
 /// loudly to complain: a broken extension is reported, never silently skipped.
-pub fn load_all(dirs: &[PathBuf]) -> (Vec<Extension>, Vec<String>) {
+pub fn load_all(dirs: &[PathBuf], cfg: &ExtensionsCfg) -> (Vec<Extension>, Vec<String>) {
     let mut problems = Vec::new();
     let mut chosen: HashMap<String, Candidate> = HashMap::new();
 
@@ -384,6 +386,17 @@ pub fn load_all(dirs: &[PathBuf]) -> (Vec<Extension>, Vec<String>) {
         if refused.contains(&c.name) {
             continue;
         }
+        // `enabled`/`disabled` from `.cfconfig.json`. Filtered here, BEFORE the
+        // library is opened: a disabled extension must not get to run its
+        // `on_load`, and on macOS must not even be dlopen'd.
+        if !cfg.allows(&c.name) {
+            continue;
+        }
+        let settings = cfg
+            .settings_for(&c.name)
+            .cloned()
+            .map(cfml_vm::json_value_to_cfml)
+            .unwrap_or_else(|| CfmlValue::strukt(Default::default()));
         let lib_path = match &c.manifest {
             Some(m) => match stage_library(&c.path, m) {
                 Ok(p) => p,
@@ -394,7 +407,7 @@ pub fn load_all(dirs: &[PathBuf]) -> (Vec<Extension>, Vec<String>) {
             },
             None => c.path.clone(),
         };
-        match load_library(&lib_path) {
+        match load_library(&lib_path, settings) {
             Ok(module) => out.push(Extension {
                 name: module.name.to_string(),
                 version: module.version.clone(),

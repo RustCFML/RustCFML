@@ -149,6 +149,15 @@ impl NativeClass for Tally {
     }
 }
 
+/// Whatever `.cfconfig.json` handed this extension, captured at load.
+static SEEN_CONFIG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
+    let seen = settings.key("motto").to_string();
+    *SEEN_CONFIG.lock().unwrap() = Some(seen);
+    Ok(())
+}
+
 module! {
     name: "abitest",
     version: "9.9.9",
@@ -166,6 +175,7 @@ module! {
         "abiNewTally"    => new_tally,
     },
     classes: { Tally },
+    on_load: on_load,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +183,13 @@ module! {
 // ---------------------------------------------------------------------------
 
 fn load() -> foreign::LoadedModule {
-    unsafe { foreign::adopt(rustcfml_module_decl(), "abitest").expect("module should adopt") }
+    load_with(CfmlValue::Struct(CfmlStruct::empty()))
+}
+
+fn load_with(config: CfmlValue) -> foreign::LoadedModule {
+    unsafe {
+        foreign::adopt(rustcfml_module_decl(), "abitest", config).expect("module should adopt")
+    }
 }
 
 fn bif(module: &foreign::LoadedModule, name: &str) -> foreign::ForeignBuiltin {
@@ -411,4 +427,19 @@ fn opaque_values_survive_a_round_trip_untouched() {
     let CfmlValue::Struct(back) = out else { panic!("expected a struct") };
     // The SAME backing store — nothing was copied on the way through.
     assert!(back.ptr_eq(&nested), "a value crossing the ABI must not be deep-copied");
+}
+
+#[test]
+fn cfconfig_settings_reach_on_load() {
+    // `.cfconfig.json` → `extensions.settings.<name>` arrives as an ordinary
+    // struct. Without this the config plumbing would exist and deliver nothing,
+    // which is worse than not having it.
+    let settings = CfmlStruct::empty();
+    settings.insert("motto".to_string(), CfmlValue::string("measure it"));
+    let _ = load_with(CfmlValue::Struct(settings));
+    assert_eq!(
+        SEEN_CONFIG.lock().unwrap().as_deref(),
+        Some("measure it"),
+        "the settings block should reach on_load"
+    );
 }

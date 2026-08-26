@@ -18,6 +18,81 @@ use crate::env::expand_env_vars;
 // Root
 // ─────────────────────────────────────────────
 
+/// The `extensions` key, in either shape it can arrive in.
+///
+/// RustCFML's own form is an object. Lucee writes an **array** of `.lex`
+/// extension records under the same key, and a config exported from Lucee or
+/// CommandBox must not fail to parse just because it mentions extensions we do
+/// not use — so that shape is accepted and ignored.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExtensionsSection {
+    /// RustCFML's `.rcx` configuration.
+    RustCfml(Box<ExtensionsCfg>),
+    /// Lucee's `.lex` list. Parsed so the file loads; otherwise ignored.
+    LuceeLexList(Vec<serde_json::Value>),
+}
+
+impl Default for ExtensionsSection {
+    fn default() -> Self {
+        ExtensionsSection::RustCfml(Box::default())
+    }
+}
+
+impl ExtensionsSection {
+    /// The RustCFML configuration, or the defaults when the key held Lucee's
+    /// `.lex` array instead.
+    pub fn cfg(&self) -> ExtensionsCfg {
+        match self {
+            ExtensionsSection::RustCfml(c) => (**c).clone(),
+            ExtensionsSection::LuceeLexList(_) => ExtensionsCfg::default(),
+        }
+    }
+}
+
+/// How `.rcx` extensions are found, filtered and configured.
+///
+/// Extensions load **once per process**, before anything is compiled, so this
+/// is read from the SERVER-level `.cfconfig.json` only. A per-application
+/// config cannot enable or disable an extension: by the time an application is
+/// resolved the extension is already loaded into the process, and there is no
+/// unload.
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExtensionsCfg {
+    /// An additional directory, searched BEFORE the built-in locations
+    /// (`<app>/extensions`, `~/.rustcfml/extensions`, `<binary>/extensions`).
+    pub directory: Option<String>,
+    /// When non-empty, only these extensions load, by declared name.
+    pub enabled: Vec<String>,
+    /// Extensions to skip, by declared name. Applied after `enabled`.
+    pub disabled: Vec<String>,
+    /// Per-extension settings, handed to that extension's `on_load` as an
+    /// ordinary CFML struct. Keyed by declared extension name.
+    pub settings: IndexMap<String, serde_json::Value>,
+}
+
+impl ExtensionsCfg {
+    /// Whether `name` should be loaded.
+    pub fn allows(&self, name: &str) -> bool {
+        if self.disabled.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+            return false;
+        }
+        if self.enabled.is_empty() {
+            return true;
+        }
+        self.enabled.iter().any(|e| e.eq_ignore_ascii_case(name))
+    }
+
+    /// The settings block for `name`, if any.
+    pub fn settings_for(&self, name: &str) -> Option<&serde_json::Value> {
+        self.settings
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct RustCfmlConfig {
@@ -47,6 +122,14 @@ pub struct RustCfmlConfig {
     pub session_storage: String,
     pub session: SessionCfg,
     pub logging: LoggingCfg,
+    /// Dynamic native extensions (`.rcx`) — see `docs/extensions.md`.
+    ///
+    /// Lucee's `.cfconfig.json` uses this same key for its **`.lex` extension
+    /// list**, which is an ARRAY. A Lucee/CommandBox export must keep parsing,
+    /// so the field accepts either shape and only the object form configures
+    /// RustCFML (see [`ExtensionsSection`]).
+    #[serde(default)]
+    pub extensions: ExtensionsSection,
     pub debugging: DebuggingCfg,
     /// RustCFML-native observability subsystems (sampling profiler, OpenTelemetry,
     /// DAP debugger). Distinct from `debugging`, which is the Lucee-compatible

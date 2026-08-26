@@ -455,9 +455,16 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
         zip.write_all(&data).map_err(|e| e.to_string())?;
     }
 
-    // Ship the CFML side, if there is one.
+    // Ship the CFML side, if there is one. The format carries it, but nothing
+    // registers it yet — so say so here rather than let someone ship a CFC
+    // facade that silently never appears.
     let cfml_dir = dir.join("cfml");
     if cfml_dir.is_dir() {
+        eprintln!(
+            "Warning: {} contains CFML, which is packaged but NOT yet registered as a mapping by \n\
+             \x20        the engine. Its CFCs will not be reachable until that lands.",
+            cfml_dir.display()
+        );
         add_dir(&mut zip, &cfml_dir, &cfml_dir, "cfml", opts)?;
     }
     for extra in ["README.md", "LICENSE"] {
@@ -639,10 +646,12 @@ fn cmd_install(args: &[String]) -> i32 {
 }
 
 fn load_check(rcx: &Path, manifest: &Manifest) -> Result<(), String> {
-    let (loaded, problems) = extensions::load_all(&[rcx
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))]);
+    // Deliberately unfiltered: `ext install` is checking that this file loads
+    // at all, not whether the server config happens to enable it.
+    let (loaded, problems) = extensions::load_all(
+        &[rcx.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))],
+        &Default::default(),
+    );
     if let Some(p) = problems.first() {
         return Err(p.clone());
     }
@@ -670,7 +679,7 @@ fn cmd_list(_args: &[String]) -> i32 {
         };
         println!("{:<24} {:<10} {:<6} {}", c.name, version, tier, c.path.display());
     }
-    let (loaded, problems) = extensions::load_all(&dirs);
+    let (loaded, problems) = extensions::load_all(&dirs, &Default::default());
     println!("\n{} loaded, {} problem(s)", loaded.len(), problems.len());
     for p in problems {
         println!("  ! {}", p);

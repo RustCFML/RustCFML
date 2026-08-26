@@ -1119,9 +1119,16 @@ fn leak(s: &str) -> &'static str {
 
 /// Read a `ModuleDecl` and check it against this host.
 ///
+/// `config` is the extension's `.cfconfig.json` settings block, handed to its
+/// `on_load` as an ordinary CFML struct.
+///
 /// # Safety
 /// `decl` must point at a live `ModuleDecl` produced by `rustcfml_module_decl`.
-pub unsafe fn adopt(decl: *const abi::ModuleDecl, source: &str) -> Result<LoadedModule, String> {
+pub unsafe fn adopt(
+    decl: *const abi::ModuleDecl,
+    source: &str,
+    config: CfmlValue,
+) -> Result<LoadedModule, String> {
     if decl.is_null() {
         return Err(format!("{}: rustcfml_module_decl() returned null", source));
     }
@@ -1171,10 +1178,23 @@ pub unsafe fn adopt(decl: *const abi::ModuleDecl, source: &str) -> Result<Loaded
         }
     }
 
+    // QoQ functions are declared in the ABI but not yet accepted: the registry
+    // they would live in (`QoQFunctionRegistry`) stores bare `fn` pointers,
+    // which cannot carry a module identity or be handed a `ctx`, exactly as
+    // `builtins` could not. Refuse loudly rather than load the extension and
+    // silently provide none of the SQL functions it advertises — a query that
+    // quietly loses a function is a wrong answer, not a missing feature.
+    if d.qoq_fn_count > 0 && !d.qoq_fns.is_null() {
+        return Err(format!(
+            "{}: declares {} Query-of-Queries function(s), which this engine does not yet accept \
+             from an extension. Remove them, or use plain BIFs until QoQ registration lands.",
+            source, d.qoq_fn_count
+        ));
+    }
+
     // on_load: once per process. Given a real ctx so config can be delivered as
     // an ordinary struct handle rather than a second marshalling scheme.
     if let Some(on_load) = d.on_load {
-        let config = CfmlValue::Struct(CfmlStruct::empty());
         let refused = std::sync::atomic::AtomicBool::new(false);
         let r = with_call(&|| "on_load".to_string(), None, vec![config], |raw, handles| {
             let code = unsafe {

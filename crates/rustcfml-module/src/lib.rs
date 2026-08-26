@@ -588,6 +588,11 @@ pub mod internal {
         f(&spilled)
     }
 
+    /// Wrap a raw handle the host handed us.
+    pub fn value_from<'a>(ctx: &'a Ctx, h: ValueHandle) -> Value<'a> {
+        Value { h, ctx }
+    }
+
     /// # Safety
     /// Called by the host with a live ctx and `argc` valid handles.
     pub unsafe extern "C-unwind" fn bif_shim<B: Bif>(
@@ -836,11 +841,17 @@ macro_rules! module {
         #[doc(hidden)]
         unsafe extern "C-unwind" fn __rustcfml_on_load(
             vtable: *const $crate::abi::HostVtable,
-            _ctx: *mut $crate::abi::Ctx,
-            _config: $crate::abi::ValueHandle,
+            ctx: *mut $crate::abi::Ctx,
+            config: $crate::abi::ValueHandle,
         ) -> u32 {
             $crate::install_host(vtable);
-            $( if $on_load().is_err() { return 1; } )?
+            $(
+                let ctx = $crate::Ctx::from_raw(ctx);
+                let settings = $crate::internal::value_from(&ctx, config);
+                if $on_load(&ctx, settings).is_err() {
+                    return 1;
+                }
+            )?
             0
         }
 

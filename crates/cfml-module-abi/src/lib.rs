@@ -237,6 +237,10 @@ pub struct ClassDecl {
 }
 
 /// One QoQ SQL function a module provides.
+///
+/// **Declared but not yet accepted.** A host that cannot register these refuses
+/// the whole extension rather than loading it with the functions missing, so a
+/// query can never silently lose one.
 #[repr(C)]
 pub struct QoqFnDecl {
     pub name: StrRef,

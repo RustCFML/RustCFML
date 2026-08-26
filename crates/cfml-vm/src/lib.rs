@@ -806,7 +806,11 @@ pub(crate) fn cfconfig_to_cfml(cfg: &cfml_config::RustCfmlConfig) -> CfmlValue {
     }
 }
 
-fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
+/// Convert parsed JSON into a CFML value.
+///
+/// Public because the extension loader turns an extension's `.cfconfig.json`
+/// settings block into the struct handed to its `on_load`.
+pub fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
     match value {
         serde_json::Value::Null => CfmlValue::Null,
         serde_json::Value::Bool(b) => CfmlValue::Bool(b),
