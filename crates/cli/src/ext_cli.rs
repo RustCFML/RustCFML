@@ -461,7 +461,26 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
         println!("  including cfml/, mounted as /{}/ at load", name);
         add_dir(&mut zip, &cfml_dir, &cfml_dir, "cfml", opts)?;
     }
-    for extra in ["README.md", "LICENSE"] {
+    // Attribution has to travel WITH the library, not merely sit in the source
+    // repository: a `.rcx` is a compiled artifact that statically links its
+    // dependencies, so MIT/BSD-style notice terms and Apache-2.0 §4 attach to
+    // the archive an operator installs. LICENSE-MIT/LICENSE-APACHE are included
+    // because a dual-licensed extension's LICENSE file is usually a pointer to
+    // them rather than a licence in itself.
+    for extra in [
+        "README.md",
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "NOTICE",
+        "THIRD-PARTY.txt",
+        // The Rust convention for a dual-licensed crate: LICENSE-APACHE +
+        // LICENSE-MIT carry the terms, COPYRIGHT explains the choice. Named
+        // that way rather than LICENSE so GitHub's licence detection picks one
+        // of the two rather than reporting "Other".
+        "COPYRIGHT",
+    ] {
         let p = dir.join(extra);
         if p.is_file() {
             if let Ok(data) = fs::read(&p) {

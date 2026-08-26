@@ -369,6 +369,19 @@ Running `ext build` on a second platform **merges** into an existing `.rcx`
 rather than replacing it, which is how a single file ends up carrying macOS,
 Linux and Windows libraries.
 
+That "fat" shape is right for a file you carry between machines you own, and
+wrong for one you publish. Every download then carries four libraries so that
+one can be used, and the extensions most likely to be published are the ones
+whose size is the reason they are extensions at all — `rustcfml-typst` packages
+to 15.3 MB for one platform, so four is ~61 MB of which 75% is unusable on any
+given host. Publish **one archive per platform**: a fresh checkout has no prior
+`.rcx`, so a per-platform CI job packages exactly its own without needing a flag.
+The file name is yours to choose — the loader keys on the triples inside
+`module.json`, not on what the file is called — and installing the wrong one
+fails by name, listing what the archive does contain.
+[`rustcfml-typst`'s release workflow](https://github.com/RustCFML/rustcfml-typst/blob/main/.github/workflows/release.yml)
+is the worked example.
+
 ## Where extensions are found
 
 First hit wins per extension name:
