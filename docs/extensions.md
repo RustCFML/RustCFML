@@ -165,14 +165,58 @@ Linux and Windows libraries.
 
 First hit wins per extension name:
 
-1. `--extensions <dir>`
-2. `extensions/` in the application directory — per-app, checked into the
+1. `--extensions <dir>` on the command line
+2. `extensions.directory` from the server `.cfconfig.json`
+3. `extensions/` in the application directory — per-app, checked into the
    project, and the common case
-3. `~/.rustcfml/extensions/`
-4. `extensions/` beside the `rustcfml` binary — system or container image
+4. `~/.rustcfml/extensions/`
+5. `extensions/` beside the `rustcfml` binary — system or container image
 
-`rustcfml --verbose` prints what loaded and from where. Anything that fails to
-load is reported on stderr, never skipped silently.
+`rustcfml --verbose` prints what loaded and from where; `rustcfml ext list`
+shows the same without starting anything. Anything that fails to load is
+reported on stderr, never skipped silently.
+
+## Configuring them — `.cfconfig.json`
+
+```json
+{
+  "extensions": {
+    "directory": "lib/extensions",
+    "enabled":  [],
+    "disabled": ["browser"],
+    "settings": {
+      "typst": { "fontDir": "/usr/share/fonts" }
+    }
+  }
+}
+```
+
+| key | meaning |
+|---|---|
+| `directory` | an extra directory, searched before the built-in locations |
+| `enabled` | when non-empty, **only** these load, by declared name |
+| `disabled` | names to skip; applied after `enabled` |
+| `settings` | per-extension config, handed to that extension's `on_load` as a struct |
+
+`settings` is the delivery mechanism for anything an extension needs to know at
+start-up — a font directory, a pool size, an endpoint:
+
+```rust
+fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
+    if let Ok(dir) = settings.key( "fontDir" ).as_str() { … }
+    Ok(())
+}
+```
+
+**This is read from the SERVER-level `.cfconfig.json` only.** Extensions load
+once per process, before anything is compiled; by the time a per-application
+config is resolved the extension is already in the process, and there is no
+unload. A per-app `extensions` block is therefore ignored rather than
+half-honoured.
+
+> Lucee uses this same key for its `.lex` extension list, which is an *array*.
+> A config exported from Lucee or CommandBox still parses — that shape is
+> accepted and ignored.
 
 ## Inside a `.rcx`
 
@@ -244,5 +288,14 @@ answer.
 - **Tier 1 today.** An extension can compute over CFML values and hold its own
   Rust state. It cannot yet read `application`, take a `<cflock>`, or call back
   into CFML. Those are tiers 2 and 3.
+- **No Query-of-Queries functions yet.** The ABI declares them, but the registry
+  they would live in stores bare `fn` pointers that cannot carry a module
+  identity. An extension declaring one is **refused outright** rather than
+  loaded with the function missing, because a query that quietly loses a
+  function is a wrong answer.
+- **CFML shipped inside a `.rcx` is not registered yet.** The format carries a
+  `cfml/` directory and `ext build` packages it, but nothing mounts it as a
+  mapping, so a CFC facade is not reachable. `ext build` warns when it packages
+  one.
 - **macOS:** downloaded libraries are quarantined by Gatekeeper and would fail
   to `dlopen` with no explanation; `ext install` clears the attribute for you.
