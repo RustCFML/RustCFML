@@ -31,7 +31,7 @@ use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 
 /// The tier this host implements. Values only, for now; tier 2 appends scope
 /// access to the vtable without breaking anything already published.
-pub const HOST_TIER: u32 = abi::tier::VALUES;
+pub const HOST_TIER: u32 = abi::tier::SCOPES;
 
 const CTX_MAGIC: u64 = 0x5243464d_4c435458; // "RCFMLCTX"
 
@@ -49,6 +49,16 @@ struct CallState {
     error: Option<CfmlError>,
 }
 
+/// The scopes a module may only WRITE while holding that scope's lock.
+///
+/// These are the live, cross-request ones. `variables` and `request` belong to
+/// one request and need no lock; `cgi`/`url`/`form`/`cookie` are request inputs
+/// and are read-only to an extension.
+const SHARED_SCOPES: &[&str] = &["application", "session", "server"];
+
+/// Scopes an extension may not write at all.
+const READ_ONLY_SCOPES: &[&str] = &["cgi", "url", "form", "cookie"];
+
 /// What `*mut Ctx` really points at. The module only ever holds the opaque
 /// pointer; every vtable entry casts it back and checks the magic first, so a
 /// stored-and-reused ctx is [`abi::status::BAD_CTX`] rather than a wild read.
@@ -60,6 +70,21 @@ struct HostCtx {
     /// [`ValueHandle::SELF`]. `None` inside a plain BIF, which is why
     /// returning SELF from one is an error rather than a null.
     receiver: Option<CfmlValue>,
+    /// Tier 2: the VM for exactly the duration of this call.
+    ///
+    /// Derived from the `&mut self` the dispatch site already holds, and never
+    /// used by the host while the module call is in flight — the same discipline
+    /// as the call slab's pointer. Null when there is no VM (`on_load`), which
+    /// makes every scope entry return [`abi::status::NO_SCOPE`] rather than
+    /// dereference nothing.
+    vm: *mut crate::CfmlVirtualMachine,
+    /// The calling frame's locals, so an unqualified read can honour CFML's
+    /// resolution order from the frame that actually made the call.
+    locals: *const ValueMap,
+    /// `held_locks.len()` on entry. Anything the module pushed past this is
+    /// force-released when the call returns: a lock held across requests is a
+    /// hang, not a bug report.
+    lock_floor: usize,
 }
 
 thread_local! {
@@ -72,6 +97,55 @@ thread_local! {
 /// Generations are process-global and monotonic, so a handle from one thread
 /// can never be mistaken for a live slot on another.
 static NEXT_GEN: AtomicU32 = AtomicU32::new(1);
+
+thread_local! {
+    /// The VM and calling-frame locals for the foreign call in flight.
+    ///
+    /// A side channel rather than a parameter because `CfmlNative::call_method`
+    /// has no VM argument, and inventing one would churn the trait and every
+    /// existing implementor for the sake of extensions. Set by [`VmScope`] at
+    /// each dispatch site — where a `&mut CfmlVirtualMachine` is in hand — and
+    /// restored on the way out, so nesting is correct and nothing survives the
+    /// call.
+    static CURRENT_VM: RefCell<(*mut crate::CfmlVirtualMachine, *const ValueMap)> =
+        const { RefCell::new((std::ptr::null_mut(), std::ptr::null())) };
+}
+
+/// Publishes the VM to the foreign call about to run, and takes it away again.
+///
+/// The pointer is derived from a `&mut CfmlVirtualMachine` the dispatch site
+/// already holds and does not touch while the module runs — the same discipline
+/// the call slab's pointer uses.
+pub struct VmScope {
+    prev: (*mut crate::CfmlVirtualMachine, *const ValueMap),
+}
+
+impl VmScope {
+    pub fn new(vm: &mut crate::CfmlVirtualMachine, locals: Option<&ValueMap>) -> VmScope {
+        let next = (
+            vm as *mut crate::CfmlVirtualMachine,
+            locals.map_or(std::ptr::null(), |l| l as *const ValueMap),
+        );
+        let prev = CURRENT_VM.with(|c| {
+            let mut cell = c.borrow_mut();
+            let prev = *cell;
+            *cell = next;
+            prev
+        });
+        VmScope { prev }
+    }
+}
+
+impl Drop for VmScope {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        CURRENT_VM.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+fn current_vm() -> (*mut crate::CfmlVirtualMachine, *const ValueMap) {
+    CURRENT_VM.with(|c| *c.borrow())
+}
 
 fn acquire() -> CallState {
     let mut state = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
@@ -750,6 +824,18 @@ pub static HOST_VTABLE: HostVtable = HostVtable {
     native_class_name: h_native_class_name,
     new_native: h_new_native,
     throw: h_throw,
+    // ---- tier 2 ----
+    scope_get: h_scope_get,
+    scope_set: h_scope_set,
+    scope_has: h_scope_has,
+    scope_delete: h_scope_delete,
+    scope_snapshot: h_scope_snapshot,
+    var_get: h_var_get,
+    lock: h_lock,
+    unlock: h_unlock,
+    root: h_root,
+    unroot: h_unroot,
+    root_get: h_root_get,
 };
 
 // ---------------------------------------------------------------------------
@@ -777,11 +863,18 @@ where
     }
     // Handed to the module as a slice; the Vec itself lives on in the pool.
     let handles = std::mem::take(&mut state.handles);
+    let (vm, locals) = current_vm();
+    // Where the lock stack stood on entry: anything the module pushes above
+    // this is force-released below.
+    let lock_floor = if vm.is_null() { 0 } else { unsafe { (*vm).held_lock_depth() } };
     let mut ctx = HostCtx {
         magic: CTX_MAGIC,
         generation: state.generation,
         state: &mut state as *mut CallState,
         receiver: receiver.clone(),
+        vm,
+        locals,
+        lock_floor,
     };
     let raw = &mut ctx as *mut HostCtx as *mut Ctx;
 
@@ -792,6 +885,19 @@ where
 
     // Drop the ctx before touching `state` again: it holds a raw pointer to it.
     drop(ctx);
+
+    // Guards are call-scoped. A module that acquires and forgets must not hold a
+    // lock into the next request.
+    if !vm.is_null() {
+        let leaked = unsafe { (*vm).release_locks_above(lock_floor) };
+        if leaked > 0 {
+            log::warn!(
+                "native extension [{}] returned holding {} lock(s); released",
+                what(),
+                leaked
+            );
+        }
+    }
 
     // Put the buffer back before the result is read out.
     state.handles = handles;
@@ -1230,3 +1336,335 @@ pub unsafe fn adopt(
 /// A struct built from a `ValueMap`, for `throw`'s `extras`.
 #[allow(dead_code)]
 fn _unused(_: ValueMap) {}
+
+// ---------------------------------------------------------------------------
+// Tier 2 — the scope facade
+// ---------------------------------------------------------------------------
+
+/// The VM behind a ctx, or `None` in a context that has none (`on_load`).
+///
+/// # Safety
+/// The returned reference is valid only while the module call that owns `raw`
+/// is in flight — which is exactly when the module can call this.
+unsafe fn vm_of<'a>(raw: *mut Ctx) -> Option<&'a mut crate::CfmlVirtualMachine> {
+    let c = ctx_of(raw)?;
+    if c.vm.is_null() {
+        return None;
+    }
+    Some(&mut *c.vm)
+}
+
+unsafe fn locals_of<'a>(raw: *mut Ctx) -> &'a ValueMap {
+    // A leaked empty map, so callers always have something to borrow. One
+    // allocation for the process, and it is never mutated.
+    static EMPTY: std::sync::OnceLock<ValueMap> = std::sync::OnceLock::new();
+    match ctx_of(raw) {
+        Some(c) if !c.locals.is_null() => &*c.locals,
+        _ => EMPTY.get_or_init(ValueMap::default),
+    }
+}
+
+fn normalise_scope(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+/// The scope's container, as a struct we can read and write through.
+///
+/// `session` is deliberately absent: it is indirected through
+/// `set_session_variable` / `get_session_scope` because a session may be backed
+/// by an external store, so it is handled separately at each call site.
+unsafe fn scope_struct(
+    vm: &mut crate::CfmlVirtualMachine,
+    scope: &str,
+) -> Option<CfmlStruct> {
+    match scope {
+        "request" => Some(vm.request_scope.clone()),
+        "application" => vm.application_scope.clone(),
+        "server" => Some(vm.live_server_scope()),
+        "variables" => None, // flat `globals`, handled at the call site
+        _ => None,
+    }
+}
+
+/// Take the scope's read lock for the duration of `f`.
+///
+/// A read of a shared scope has to be consistent with an in-flight exclusive
+/// CFML `<cflock>`, and the author should not have to think about it — so every
+/// read takes the lock, and a read of a per-request scope takes nothing because
+/// nothing else can be writing it.
+unsafe fn with_scope_read<R>(
+    vm: &mut crate::CfmlVirtualMachine,
+    scope: &str,
+    f: impl FnOnce(&mut crate::CfmlVirtualMachine) -> R,
+) -> R {
+    if !SHARED_SCOPES.contains(&scope) {
+        return f(vm);
+    }
+    let key = vm.scope_lock_key_for(scope);
+    // Already held by this call (or by an enclosing <cflock>)? Reentrant, so do
+    // not try to re-acquire — the underlying RwLock is not reentrant.
+    if vm.holds_lock(&key) {
+        return f(vm);
+    }
+    let opts = crate::LockOpts::for_scope(key, scope, false);
+    // A read lock that cannot be had is not worth failing the read over: fall
+    // through after the same timeout <cflock> would use. Correctness-wise this
+    // is the pre-tier-2 behaviour, and it cannot deadlock a reader.
+    let acquired = vm.acquire_named_lock(&opts).unwrap_or(false);
+    let out = f(vm);
+    if acquired {
+        vm.release_top_lock();
+    }
+    out
+}
+
+unsafe extern "C" fn h_scope_get(raw: *mut Ctx, scope: StrRef, key: StrRef) -> ValueHandle {
+    let scope_name = normalise_scope(&str_in(scope));
+    let k = str_in(key);
+    let found = {
+        let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+        with_scope_read(vm, &scope_name, |vm| match scope_name.as_str() {
+            "session" => match vm.get_session_scope() {
+                CfmlValue::Struct(s) => s.get_ci(k.as_str()),
+                _ => None,
+            },
+            "variables" => vm.globals.get(k.as_str()).cloned().or_else(|| {
+                vm.globals
+                    .iter()
+                    .find(|(gk, _)| gk.eq_ignore_ascii_case(&k))
+                    .map(|(_, v)| v.clone())
+            }),
+            other => scope_struct(vm, other).and_then(|s| s.get_ci(k.as_str())),
+        })
+    };
+    make(raw, found.unwrap_or(CfmlValue::Null))
+}
+
+unsafe extern "C" fn h_scope_has(
+    raw: *mut Ctx,
+    scope: StrRef,
+    key: StrRef,
+    out: *mut bool,
+) -> u32 {
+    let h = h_scope_get(raw, scope, key);
+    *out = !matches!(value_ref(raw, h), None | Some(CfmlValue::Null));
+    abi::status::OK
+}
+
+/// Is a write to `scope` allowed right now?
+unsafe fn writable(raw: *mut Ctx, scope: &str) -> u32 {
+    if READ_ONLY_SCOPES.contains(&scope) {
+        return abi::status::NO_SCOPE;
+    }
+    if !SHARED_SCOPES.contains(&scope) {
+        return abi::status::OK;
+    }
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    let key = vm.scope_lock_key_for(scope);
+    if vm.holds_lock(&key) {
+        abi::status::OK
+    } else {
+        abi::status::UNLOCKED
+    }
+}
+
+unsafe extern "C" fn h_scope_set(
+    raw: *mut Ctx,
+    scope: StrRef,
+    key: StrRef,
+    value: ValueHandle,
+) -> u32 {
+    let scope_name = normalise_scope(&str_in(scope));
+    let code = writable(raw, &scope_name);
+    if code != abi::status::OK {
+        return code;
+    }
+    let k = str_in(key);
+    let v = out_or!(value_of(raw, value), abi::status::BAD_HANDLE);
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    match scope_name.as_str() {
+        "session" => match vm.set_session_variable(&k, v) {
+            Ok(_) => abi::status::OK,
+            Err(_) => abi::status::NO_SCOPE,
+        },
+        "variables" => {
+            vm.globals.insert(k, v);
+            abi::status::OK
+        }
+        other => match scope_struct(vm, other) {
+            Some(s) => {
+                s.insert(k, v);
+                abi::status::OK
+            }
+            None => abi::status::NO_SCOPE,
+        },
+    }
+}
+
+unsafe extern "C" fn h_scope_delete(raw: *mut Ctx, scope: StrRef, key: StrRef) -> u32 {
+    let scope_name = normalise_scope(&str_in(scope));
+    let code = writable(raw, &scope_name);
+    if code != abi::status::OK {
+        return code;
+    }
+    let k = str_in(key);
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    match scope_name.as_str() {
+        "variables" => {
+            vm.globals.shift_remove(k.as_str());
+            abi::status::OK
+        }
+        other => match scope_struct(vm, other) {
+            Some(s) => {
+                s.remove_ci(&k);
+                abi::status::OK
+            }
+            None => abi::status::NO_SCOPE,
+        },
+    }
+}
+
+unsafe extern "C" fn h_scope_snapshot(raw: *mut Ctx, scope: StrRef) -> ValueHandle {
+    let scope_name = normalise_scope(&str_in(scope));
+    let snap = {
+        let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+        with_scope_read(vm, &scope_name, |vm| match scope_name.as_str() {
+            "session" => match vm.get_session_scope() {
+                CfmlValue::Struct(s) => Some(s.snapshot()),
+                _ => None,
+            },
+            "variables" => Some(vm.globals.clone()),
+            other => scope_struct(vm, other).map(|s| s.snapshot()),
+        })
+    };
+    match snap {
+        // A COPY, not the live store: walking a live shared scope key by key
+        // while another request writes it is exactly the race this avoids.
+        Some(map) => make(raw, CfmlValue::strukt(map)),
+        None => ValueHandle::NULL,
+    }
+}
+
+unsafe extern "C" fn h_var_get(raw: *mut Ctx, key: StrRef) -> ValueHandle {
+    let k = str_in(key);
+    let locals = locals_of(raw);
+    let found = {
+        let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+        // The engine's own resolver, so an unqualified read from an extension
+        // and from CFML answer identically by construction.
+        vm.resolve_path_root_public(&k, locals)
+    };
+    make(raw, found.unwrap_or(CfmlValue::Null))
+}
+
+// ---- locks -----------------------------------------------------------------
+
+unsafe extern "C" fn h_lock(
+    raw: *mut Ctx,
+    scope: StrRef,
+    name: StrRef,
+    exclusive: bool,
+    timeout_ms: u64,
+    out: *mut u64,
+) -> u32 {
+    let scope_name = normalise_scope(&str_in(scope));
+    let lock_name = str_in(name);
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    let (key, label) = if !lock_name.is_empty() {
+        (lock_name.clone(), format!("lock with name [{}]", lock_name))
+    } else if !scope_name.is_empty() {
+        (
+            vm.scope_lock_key_for(&scope_name),
+            format!("[{}] scope lock", scope_name),
+        )
+    } else {
+        return abi::status::NO_SCOPE;
+    };
+    let mut opts = crate::LockOpts::for_scope(key, &label, exclusive);
+    opts.timeout_ms = timeout_ms;
+    match vm.acquire_named_lock(&opts) {
+        Ok(true) => {
+            // The token is the held_locks depth, so release is exact even when
+            // several locks are taken in one call.
+            *out = vm.held_lock_depth() as u64;
+            abi::status::OK
+        }
+        Ok(false) => abi::status::TIMEOUT,
+        Err(e) => {
+            // Surface the engine's own `lock`-typed error, LockOperation and
+            // wording included, rather than inventing a second dialect.
+            if let Some(state) = state_of(raw) {
+                state.error = Some(e);
+            }
+            abi::status::TIMEOUT
+        }
+    }
+}
+
+unsafe extern "C" fn h_unlock(raw: *mut Ctx, token: u64) -> u32 {
+    let floor = match ctx_of(raw) {
+        Some(c) => c.lock_floor,
+        None => return abi::status::BAD_CTX,
+    };
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    // Only locks this call took may be released, and only down to the depth the
+    // token names — an extension must never be able to drop a lock an enclosing
+    // `<cflock>` is holding.
+    let target = (token as usize).max(floor + 1);
+    while vm.held_lock_depth() >= target {
+        vm.release_top_lock();
+    }
+    abi::status::OK
+}
+
+// ---- rooted values ---------------------------------------------------------
+
+/// Values an extension has asked to keep beyond a call.
+///
+/// **Cycle-collector participation comes for free**, and that is worth stating
+/// because it looked like the hard part: the collector decides liveness by
+/// refcount (`external = strong_count − 1 − internal_in`), not from a root
+/// list. A `CfmlValue` parked here holds its `Arc`, this table is not in the
+/// survivor set, so the value reads as externally owned and is protected. There
+/// is a test for exactly that, because "it should follow" is not evidence.
+static ROOTS: Mutex<Option<(u64, HashMap<u64, CfmlValue>)>> = Mutex::new(None);
+
+unsafe extern "C" fn h_root(raw: *mut Ctx, h: ValueHandle, out: *mut u64) -> u32 {
+    let v = out_or!(value_of(raw, h), abi::status::BAD_HANDLE);
+    let mut guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let table = guard.get_or_insert_with(|| (0, HashMap::new()));
+    table.0 += 1;
+    let id = table.0;
+    table.1.insert(id, v);
+    *out = id;
+    abi::status::OK
+}
+
+unsafe extern "C" fn h_unroot(id: u64) -> u32 {
+    let mut guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut().and_then(|t| t.1.remove(&id)) {
+        Some(_) => abi::status::OK,
+        None => abi::status::NOT_FOUND,
+    }
+}
+
+unsafe extern "C" fn h_root_get(raw: *mut Ctx, id: u64) -> ValueHandle {
+    let found = {
+        let guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().and_then(|t| t.1.get(&id).cloned())
+    };
+    match found {
+        Some(v) => make(raw, v),
+        None => ValueHandle::NULL,
+    }
+}
+
+/// How many values an extension is currently keeping alive. For tests and
+/// diagnostics.
+pub fn rooted_count() -> usize {
+    ROOTS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|t| t.1.len()))
+        .unwrap_or(0)
+}

@@ -25,6 +25,29 @@ rebuilt, and this crate links neither the engine nor its allocator.
 | `demoFail()` | a custom-typed error, catchable by `<cfcatch type="demo.deliberate">` |
 | `demoTally( [start] )` / `rust:Tally` | a class with state, fluent mutators and a `this.count` property |
 
+## Tier 2 — seeing the running application
+
+`tier2.cfm` and `tier2_race.cfm` need **serve mode**: the `application` scope and
+the lock registry only exist there.
+
+```sh
+rustcfml --serve . --port 8500
+#  /tier2.cfm       the guided tour
+#  /tier2_race.cfm  hammer it concurrently
+```
+
+| | |
+|---|---|
+| `demoMemoise( key, value )` | memoise into `application` — read unlocked, then lock, **re-check**, write |
+| `demoMemoiseComputations()` | how many times it actually computed; under load this stays at 1 |
+| `demoUnlockedWrite( key )` | deliberately wrong, so the refusal is visible from CFML |
+| `demoRequestVar( key )` | an unqualified read through CFML's own resolution order |
+
+Note `Application.cfc`. Without one there is no application, so the
+`application` scope does not persist between requests — for CFML *or* for an
+extension. `probe_application_scope.cfm` checks that in plain CFML with no
+extension involved, and is the first thing to run when a memoiser looks broken.
+
 ## The two things worth copying
 
 **Bulk reads.** `query_column(i)` materialises a whole column in one crossing;

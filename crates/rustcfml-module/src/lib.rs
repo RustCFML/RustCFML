@@ -765,6 +765,241 @@ pub const fn class_vtable<C: NativeClass>() -> *const abi::NativeClassVtable {
     &Vt::<C>::TABLE
 }
 
+
+// ---------------------------------------------------------------------------
+// Tier 2 — scopes, locks, and values that outlive a call
+// ---------------------------------------------------------------------------
+
+/// Fail clearly when the loaded host is older than the capability being used,
+/// rather than calling through a vtable slot it never filled in.
+fn require(entry_offset: usize, what: &str) -> Result<()> {
+    let host = host();
+    if host.tier < abi::tier::SCOPES || !host.has(entry_offset) {
+        return Err(Error::new(format!(
+            "{what} needs an engine that provides extension capability tier {} \
+             (scopes); this one provides tier {}",
+            abi::tier::SCOPES,
+            host.tier
+        )));
+    }
+    Ok(())
+}
+
+/// One CFML scope, reached by name.
+///
+/// Reads take that scope's read lock, so a value can never be read half-written
+/// by a concurrent CFML `<cflock>`. **Writing a shared scope (`application`,
+/// `session`, `server`) requires a lock you are already holding** — see
+/// [`Ctx::lock`]. That is stricter than CFML itself, on purpose: an extension
+/// can write a live shared scope from a thread the application never thinks
+/// about.
+pub struct Scope<'a> {
+    ctx: &'a Ctx,
+    /// Owned, so a returned [`Value`] borrows only the ctx. Borrowing the name
+    /// instead tied every value read out of a scope to the lifetime of the
+    /// string that named it, which made the obvious one-liner
+    /// (`ctx.scope(&name).get(&key)`) fail to compile.
+    name: String,
+}
+
+impl<'a> Scope<'a> {
+    pub fn get(&self, key: &str) -> Result<Value<'a>> {
+        require(core::mem::offset_of!(HostVtable, scope_get), "reading a scope")?;
+        let h = unsafe {
+            (host().scope_get)(self.ctx.raw, StrRef::new(&self.name), StrRef::new(key))
+        };
+        Ok(Value { h, ctx: self.ctx })
+    }
+
+    pub fn set(&self, key: &str, value: Value<'_>) -> Result<()> {
+        require(core::mem::offset_of!(HostVtable, scope_set), "writing a scope")?;
+        let code = unsafe {
+            (host().scope_set)(
+                self.ctx.raw,
+                StrRef::new(&self.name),
+                StrRef::new(key),
+                value.h,
+            )
+        };
+        if code == abi::status::UNLOCKED {
+            return Err(Error::new(format!(
+                "writing [{}] requires holding its lock — take ctx.lock(\"{}\", …) first",
+                self.name, self.name
+            )));
+        }
+        status(code, "scope set")
+    }
+
+    pub fn has(&self, key: &str) -> Result<bool> {
+        require(core::mem::offset_of!(HostVtable, scope_has), "reading a scope")?;
+        let mut out = false;
+        let code = unsafe {
+            (host().scope_has)(
+                self.ctx.raw,
+                StrRef::new(&self.name),
+                StrRef::new(key),
+                &mut out,
+            )
+        };
+        status(code, "scope has")?;
+        Ok(out)
+    }
+
+    pub fn remove(&self, key: &str) -> Result<()> {
+        require(core::mem::offset_of!(HostVtable, scope_delete), "writing a scope")?;
+        let code = unsafe {
+            (host().scope_delete)(self.ctx.raw, StrRef::new(&self.name), StrRef::new(key))
+        };
+        status(code, "scope delete")
+    }
+
+    /// The whole scope as a **snapshot** struct — a copy. Walking a live shared
+    /// scope key by key while another request writes it would race, so there is
+    /// deliberately no live iterator.
+    pub fn snapshot(&self) -> Result<Value<'a>> {
+        require(core::mem::offset_of!(HostVtable, scope_snapshot), "reading a scope")?;
+        let h = unsafe { (host().scope_snapshot)(self.ctx.raw, StrRef::new(&self.name)) };
+        Ok(Value { h, ctx: self.ctx })
+    }
+}
+
+/// A lock held for the rest of this call, or until dropped.
+///
+/// The host force-releases anything still held when the call returns, so a
+/// forgotten guard cannot become a hang in the next request — but drop it when
+/// you are done anyway, so CFML code waiting on the same scope is not blocked
+/// for the rest of your function.
+pub struct LockGuard<'a> {
+    ctx: &'a Ctx,
+    token: u64,
+    released: bool,
+}
+
+impl LockGuard<'_> {
+    /// Release now rather than at call end.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        unsafe { (host().unlock)(self.ctx.raw, self.token) };
+    }
+}
+
+impl Drop for LockGuard<'_> {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+/// A value kept alive beyond the call that produced it — a cross-request cache.
+///
+/// Unroots on drop. Rooted values are visible to the cycle collector, so a
+/// cache cannot be collected out from under you; the flip side is that a
+/// `Rooted` you never drop is a leak for the life of the process.
+pub struct Rooted {
+    id: u64,
+}
+
+impl Rooted {
+    /// Bring the value back as a handle in the current call.
+    pub fn get<'a>(&self, ctx: &'a Ctx) -> Value<'a> {
+        let h = unsafe { (host().root_get)(ctx.raw, self.id) };
+        Value { h, ctx }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for Rooted {
+    fn drop(&mut self) {
+        // No ctx here, and none needed: a root outlives every call, which is
+        // why `unroot` is the one host entry that takes no context.
+        unsafe { (host().unroot)(self.id) };
+    }
+}
+
+impl Ctx {
+    /// A CFML scope by name: `"application"`, `"session"`, `"server"`,
+    /// `"request"`, `"variables"`, `"cgi"`, `"url"`, `"form"`, `"cookie"`.
+    pub fn scope(&self, name: &str) -> Scope<'_> {
+        Scope { ctx: self, name: name.to_string() }
+    }
+
+    /// An unqualified read, honouring CFML's own resolution order. Identical to
+    /// what an unprefixed read in CFML source would see, because it goes through
+    /// the engine's own resolver.
+    pub fn var(&self, key: &str) -> Result<Value<'_>> {
+        require(core::mem::offset_of!(HostVtable, var_get), "reading a variable")?;
+        let h = unsafe { (host().var_get)(self.raw, StrRef::new(key)) };
+        Ok(Value { h, ctx: self })
+    }
+
+    /// Take a scope lock — the same lock `<cflock scope="…">` takes, so CFML
+    /// code and this extension mutually exclude.
+    ///
+    /// `timeout` of zero means wait forever, matching CFML.
+    pub fn lock(&self, scope: &str, exclusive: bool, timeout_ms: u64) -> Result<LockGuard<'_>> {
+        self.lock_inner(scope, "", exclusive, timeout_ms)
+    }
+
+    /// Take a named lock, equivalent to `<cflock name="…">`.
+    pub fn lock_named(
+        &self,
+        name: &str,
+        exclusive: bool,
+        timeout_ms: u64,
+    ) -> Result<LockGuard<'_>> {
+        self.lock_inner("", name, exclusive, timeout_ms)
+    }
+
+    fn lock_inner(
+        &self,
+        scope: &str,
+        name: &str,
+        exclusive: bool,
+        timeout_ms: u64,
+    ) -> Result<LockGuard<'_>> {
+        require(core::mem::offset_of!(HostVtable, lock), "locking")?;
+        let mut token = 0u64;
+        let code = unsafe {
+            (host().lock)(
+                self.raw,
+                StrRef::new(scope),
+                StrRef::new(name),
+                exclusive,
+                timeout_ms,
+                &mut token,
+            )
+        };
+        if code == abi::status::TIMEOUT {
+            // The host has already staged the engine's own `lock`-typed error,
+            // LockOperation and Lucee wording included, so returning a second
+            // message of our own would mask it.
+            return Err(Error::new(format!(
+                "timed out acquiring the {} lock",
+                if name.is_empty() { scope } else { name }
+            )));
+        }
+        status(code, "lock")?;
+        Ok(LockGuard { ctx: self, token, released: false })
+    }
+
+    /// Keep `value` alive beyond this call.
+    pub fn root(&self, value: Value<'_>) -> Result<Rooted> {
+        require(core::mem::offset_of!(HostVtable, root), "rooting a value")?;
+        let mut id = 0u64;
+        status(unsafe { (host().root)(self.raw, value.h, &mut id) }, "root")?;
+        Ok(Rooted { id })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // module!
 // ---------------------------------------------------------------------------

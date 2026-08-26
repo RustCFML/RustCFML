@@ -99,6 +99,95 @@ fn returns_self_wrongly<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'
     Ok(ctx.this())
 }
 
+// ---- tier 2: scopes, locks, roots -----------------------------------------
+
+/// Read one key from a named scope.
+fn scope_read<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let scope = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let key = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+    ctx.scope(&scope).get(&key)
+}
+
+/// Write a key WITHOUT taking a lock. Must be refused for a shared scope.
+fn scope_write_unlocked<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let scope = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let key = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+    let value = args.get(2).copied().unwrap_or_else(|| ctx.null());
+    ctx.scope(&scope).set(&key, value)?;
+    Ok(ctx.bool(true))
+}
+
+/// Write a key the way an extension is supposed to: lock, write, drop.
+fn scope_write_locked<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let scope = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let key = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+    let value = args.get(2).copied().unwrap_or_else(|| ctx.null());
+    let guard = ctx.lock(&scope, true, 5_000)?;
+    ctx.scope(&scope).set(&key, value)?;
+    drop(guard);
+    Ok(ctx.bool(true))
+}
+
+fn scope_snapshot_keys<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let scope = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let snap = ctx.scope(&scope).snapshot()?;
+    let out = ctx.array();
+    for k in snap.keys()? {
+        out.push(ctx.string(k))?;
+    }
+    Ok(out)
+}
+
+fn unqualified_read<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+    ctx.var(&key)
+}
+
+/// Root the argument and hand back its id, so a test can prove the value
+/// survives a collection with no other owner.
+fn root_it<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let v = args.first().copied().unwrap_or_else(|| ctx.null());
+    let rooted = ctx.root(v)?;
+    let id = rooted.id();
+    // Deliberately leaked: the point is a value that outlives this call. The
+    // test unroots it by id afterwards.
+    std::mem::forget(rooted);
+    Ok(ctx.double(id as f64))
+}
+
+/// Root a value, keep the guard in module state, and hand back nothing — the
+/// shape of a real cross-request cache.
+fn cache_it<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let v = args.first().copied().unwrap_or_else(|| ctx.null());
+    let rooted = ctx.root(v)?;
+    *CACHE.lock().unwrap() = Some(rooted);
+    Ok(ctx.bool(true))
+}
+
+/// Read the cached value back in a LATER call, which is the whole point.
+fn cached<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
+    match CACHE.lock().unwrap().as_ref() {
+        Some(r) => Ok(r.get(ctx)),
+        None => Ok(ctx.null()),
+    }
+}
+
+fn drop_cache<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
+    *CACHE.lock().unwrap() = None;
+    Ok(ctx.bool(true))
+}
+
+static CACHE: std::sync::Mutex<Option<rustcfml_module::Rooted>> =
+    std::sync::Mutex::new(None);
+
+/// Acquire a lock and DO NOT release it — the host must force-release on return.
+fn leak_a_lock<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let scope = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let guard = ctx.lock(&scope, true, 5_000)?;
+    std::mem::forget(guard);
+    Ok(ctx.bool(true))
+}
+
 fn new_tally<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
     Ok(ctx.new_object(Tally { count: AtomicI64::new(0) }))
 }
@@ -149,12 +238,17 @@ impl NativeClass for Tally {
     }
 }
 
-/// Whatever `.cfconfig.json` handed this extension, captured at load.
-static SEEN_CONFIG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Every settings block this extension has been handed.
+///
+/// A Vec rather than a single slot because these tests each call `adopt`, so
+/// `on_load` runs many times and in parallel — in production it runs once per
+/// process. Asserting "contains" instead of "equals" keeps the test about the
+/// product rather than about test ordering.
+static SEEN_CONFIG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
     let seen = settings.key("motto").to_string();
-    *SEEN_CONFIG.lock().unwrap() = Some(seen);
+    SEEN_CONFIG.lock().unwrap().push(seen);
     Ok(())
 }
 
@@ -173,6 +267,16 @@ module! {
         "abiPanics"      => always_panics,
         "abiBadSelf"     => returns_self_wrongly,
         "abiNewTally"    => new_tally,
+        "abiScopeRead"   => scope_read,
+        "abiScopeWriteUnlocked" => scope_write_unlocked,
+        "abiScopeWriteLocked"   => scope_write_locked,
+        "abiScopeKeys"   => scope_snapshot_keys,
+        "abiVar"         => unqualified_read,
+        "abiRoot"        => root_it,
+        "abiCacheIt"     => cache_it,
+        "abiCached"      => cached,
+        "abiDropCache"   => drop_cache,
+        "abiLeakLock"    => leak_a_lock,
     },
     classes: { Tally },
     on_load: on_load,
@@ -210,7 +314,7 @@ fn the_declaration_is_adopted_with_everything_it_provides() {
     let m = load();
     assert_eq!(&*m.name, "abitest");
     assert_eq!(m.version, "9.9.9");
-    assert_eq!(m.bifs.len(), 11);
+    assert_eq!(m.bifs.len(), 21);
     assert_eq!(m.classes.len(), 1);
     assert_eq!(m.classes[0].0, "Tally");
 }
@@ -437,9 +541,286 @@ fn cfconfig_settings_reach_on_load() {
     let settings = CfmlStruct::empty();
     settings.insert("motto".to_string(), CfmlValue::string("measure it"));
     let _ = load_with(CfmlValue::Struct(settings));
-    assert_eq!(
-        SEEN_CONFIG.lock().unwrap().as_deref(),
-        Some("measure it"),
+    assert!(
+        SEEN_CONFIG.lock().unwrap().iter().any(|s| s == "measure it"),
         "the settings block should reach on_load"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2 — scopes, locks, rooted values
+// ---------------------------------------------------------------------------
+
+use cfml_vm::{CfmlVirtualMachine, ServerState};
+
+/// A VM with an application scope and a server state, i.e. one where shared
+/// scopes and locks actually exist. Without `server_state` locks are a no-op by
+/// design (CLI mode), which would make the locking assertions vacuous.
+fn vm_with_shared_scopes() -> CfmlVirtualMachine {
+    let mut vm = CfmlVirtualMachine::new(cfml_codegen::BytecodeProgram { functions: Vec::new() });
+    vm.server_state = Some(ServerState::new());
+    vm.application_scope = Some(CfmlStruct::empty());
+    vm
+}
+
+/// Call a foreign BIF with a VM published, the way the interpreter does.
+fn call_in_vm(
+    vm: &mut CfmlVirtualMachine,
+    m: &foreign::LoadedModule,
+    name: &str,
+    args: Vec<CfmlValue>,
+) -> core::result::Result<CfmlValue, cfml_common::vm::CfmlError> {
+    let fb = bif(m, name);
+    let _scope = foreign::VmScope::new(vm, None);
+    fb.call(args)
+}
+
+#[test]
+fn a_module_reads_the_scopes_the_engine_owns() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    vm.application_scope.as_ref().unwrap().insert("greeting".to_string(), CfmlValue::string("hi"));
+    vm.request_scope.insert("rkey".to_string(), CfmlValue::Int(7));
+
+    let got = call_in_vm(
+        &mut vm,
+        &m,
+        "abiScopeRead",
+        vec![CfmlValue::string("application"), CfmlValue::string("GREETING")],
+    )
+    .unwrap();
+    // Case-insensitively, like every CFML key lookup.
+    assert_eq!(got.as_string(), "hi");
+
+    let got = call_in_vm(
+        &mut vm,
+        &m,
+        "abiScopeRead",
+        vec![CfmlValue::string("request"), CfmlValue::string("rkey")],
+    )
+    .unwrap();
+    assert_eq!(got.as_string(), "7");
+
+    // A scope with nothing in it is a null, not an error.
+    let got = call_in_vm(
+        &mut vm,
+        &m,
+        "abiScopeRead",
+        vec![CfmlValue::string("application"), CfmlValue::string("absent")],
+    )
+    .unwrap();
+    assert!(matches!(got, CfmlValue::Null));
+}
+
+#[test]
+fn writing_a_shared_scope_without_its_lock_is_refused() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+
+    let err = call_in_vm(
+        &mut vm,
+        &m,
+        "abiScopeWriteUnlocked",
+        vec![
+            CfmlValue::string("application"),
+            CfmlValue::string("k"),
+            CfmlValue::Int(1),
+        ],
+    )
+    .expect_err("an unlocked write to a shared scope must be refused");
+    assert!(
+        err.message.contains("requires holding its lock"),
+        "the error should say what to do: {}",
+        err.message
+    );
+    // And nothing was written — a refused write must not half-succeed.
+    assert!(vm.application_scope.as_ref().unwrap().get_ci("k").is_none());
+}
+
+#[test]
+fn a_per_request_scope_needs_no_lock() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    // `request` belongs to one request, so there is nothing to serialise
+    // against and requiring a lock would be ceremony.
+    call_in_vm(
+        &mut vm,
+        &m,
+        "abiScopeWriteUnlocked",
+        vec![CfmlValue::string("request"), CfmlValue::string("k"), CfmlValue::Int(42)],
+    )
+    .expect("request scope should be writable without a lock");
+    assert_eq!(vm.request_scope.get_ci("k").map(|v| v.as_string()).as_deref(), Some("42"));
+}
+
+#[test]
+fn a_locked_write_lands_and_releases_the_lock() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    call_in_vm(
+        &mut vm,
+        &m,
+        "abiScopeWriteLocked",
+        vec![
+            CfmlValue::string("application"),
+            CfmlValue::string("counter"),
+            CfmlValue::Int(1),
+        ],
+    )
+    .expect("a locked write should succeed");
+    assert_eq!(
+        vm.application_scope.as_ref().unwrap().get_ci("counter").map(|v| v.as_string()).as_deref(),
+        Some("1")
+    );
+    // Nothing is still held: a lock surviving the call would be the next
+    // request's hang.
+    assert_eq!(vm.held_lock_depth_public(), 0);
+}
+
+#[test]
+fn a_forgotten_lock_is_force_released_when_the_call_returns() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    call_in_vm(&mut vm, &m, "abiLeakLock", vec![CfmlValue::string("application")])
+        .expect("acquiring should succeed");
+    // The module deliberately forgot its guard. The host must not let that
+    // become a lock held into the next request.
+    assert_eq!(
+        vm.held_lock_depth_public(),
+        0,
+        "a lock the module forgot must be force-released at call end"
+    );
+    // And the lock is genuinely free afterwards, not merely forgotten about.
+    call_in_vm(&mut vm, &m, "abiLeakLock", vec![CfmlValue::string("application")])
+        .expect("the lock should be re-acquirable");
+    assert_eq!(vm.held_lock_depth_public(), 0);
+}
+
+#[test]
+fn a_native_write_and_a_cfml_lock_mutually_exclude() {
+    // The plan's exit criterion, and the reason the lock registry is SHARED: a
+    // separate native table would look correct and protect nothing.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+
+    // Stand in for `<cflock scope="application">` held by CFML code, by taking
+    // the same key through the engine's own path.
+    let key = vm.scope_lock_key_for_public("application");
+    let state = vm.server_state.clone().unwrap();
+    let lock = {
+        let mut locks = state.named_locks.lock().unwrap();
+        locks.entry(key).or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(()))).clone()
+    };
+    let held = lock.write().unwrap();
+
+    // A native write with a 200 ms timeout must NOT get in.
+    let fb = bif(&m, "abiScopeWriteLocked");
+    let started = std::time::Instant::now();
+    let err = {
+        let _scope = foreign::VmScope::new(&mut vm, None);
+        fb.call(vec![
+            CfmlValue::string("application"),
+            CfmlValue::string("k"),
+            CfmlValue::Int(1),
+        ])
+    }
+    .expect_err("a native write must block on a CFML-held lock");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(150),
+        "it should have WAITED for the lock, not failed instantly"
+    );
+    assert!(
+        err.message.to_lowercase().contains("timeout")
+            || err.message.to_lowercase().contains("timed out"),
+        "should report a lock timeout: {}",
+        err.message
+    );
+
+    drop(held);
+
+    // Once CFML lets go, the same write succeeds.
+    let mut vm2 = vm_with_shared_scopes();
+    vm2.server_state = Some(state);
+    call_in_vm(
+        &mut vm2,
+        &m,
+        "abiScopeWriteLocked",
+        vec![CfmlValue::string("application"), CfmlValue::string("k"), CfmlValue::Int(1)],
+    )
+    .expect("the write should succeed once the CFML lock is released");
+}
+
+#[test]
+fn a_snapshot_is_a_copy_not_the_live_scope() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    let app = vm.application_scope.clone().unwrap();
+    app.insert("a".to_string(), CfmlValue::Int(1));
+    app.insert("b".to_string(), CfmlValue::Int(2));
+
+    let keys = call_in_vm(&mut vm, &m, "abiScopeKeys", vec![CfmlValue::string("application")])
+        .unwrap();
+    let CfmlValue::Array(arr) = keys else { panic!("expected an array") };
+    let names: Vec<String> = arr.snapshot().iter().map(|v| v.as_string()).collect();
+    assert_eq!(names, vec!["a", "b"]);
+}
+
+#[test]
+fn an_unqualified_read_uses_the_engines_own_resolution_order() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    vm.application_scope.as_ref().unwrap().insert("shared".to_string(), CfmlValue::string("from app"));
+    vm.request_scope.insert("shared".to_string(), CfmlValue::string("from request"));
+
+    let got = call_in_vm(&mut vm, &m, "abiVar", vec![CfmlValue::string("shared")]).unwrap();
+    // request beats application, exactly as an unprefixed CFML read would.
+    assert_eq!(got.as_string(), "from request");
+}
+
+#[test]
+fn a_rooted_value_survives_with_no_other_owner_and_a_collection() {
+    // The plan called GC participation "the substantive part". It turns out to
+    // come for free — the collector decides liveness by REFCOUNT (external =
+    // strong_count − 1 − internal_in), not from a root list, so a value parked
+    // in the host's root table reads as externally owned. This test is here
+    // because "it should follow" is not evidence.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+
+    let before = foreign::rooted_count();
+    let payload = CfmlStruct::empty();
+    payload.insert("kept".to_string(), CfmlValue::string("still here"));
+
+    call_in_vm(&mut vm, &m, "abiCacheIt", vec![CfmlValue::Struct(payload.clone())]).unwrap();
+    assert_eq!(foreign::rooted_count(), before + 1);
+
+    // Drop every non-root owner, then collect.
+    drop(payload);
+    cfml_common::cycle_gc::collect();
+
+    let got = call_in_vm(&mut vm, &m, "abiCached", vec![]).unwrap();
+    let CfmlValue::Struct(back) = got else { panic!("the cached value should still be a struct") };
+    assert_eq!(
+        back.get_ci("kept").map(|v| v.as_string()).as_deref(),
+        Some("still here"),
+        "a rooted value must not be collected"
+    );
+
+    // And unrooting actually releases it — a root you never drop is a leak.
+    call_in_vm(&mut vm, &m, "abiDropCache", vec![]).unwrap();
+    assert_eq!(foreign::rooted_count(), before);
+    let gone = call_in_vm(&mut vm, &m, "abiCached", vec![]).unwrap();
+    assert!(matches!(gone, CfmlValue::Null));
+}
+
+#[test]
+fn scope_access_without_a_vm_is_an_error_not_a_crash() {
+    // `on_load` runs before any request exists, so there is no VM behind the
+    // ctx. Reading a scope there must be a clean null rather than a null
+    // dereference.
+    let m = load();
+    let got = bif(&m, "abiScopeRead")
+        .call(vec![CfmlValue::string("application"), CfmlValue::string("k")])
+        .expect("should not panic");
+    assert!(matches!(got, CfmlValue::Null));
 }

@@ -57,6 +57,12 @@ pub mod status {
     pub const BAD_CTX: u32 = 4;
     /// The host does not implement this entry.
     pub const UNSUPPORTED: u32 = 5;
+    /// A write to a shared scope was attempted without holding its lock.
+    pub const UNLOCKED: u32 = 6;
+    /// A lock could not be acquired within its timeout.
+    pub const TIMEOUT: u32 = 7;
+    /// No scope of that name, or no VM in this context.
+    pub const NO_SCOPE: u32 = 8;
 }
 
 /// Type discriminants reported by [`HostVtable::val_type`].
@@ -393,7 +399,71 @@ pub struct HostVtable {
         extras: ValueHandle,
     ),
 
-    // --- tier 2 (scope facade) and tier 3 (CFML execution) append below. ---
+    // ---- tier 2: the scope facade ----------------------------------------
+    //
+    // APPENDED, never reordered: an extension built against tier 1 has a
+    // smaller `size` and simply never reaches these, and an extension built
+    // against tier 2 checks `HostVtable::has` before calling them. That is the
+    // whole reason `ctx` was in every signature from day one.
+    //
+    // Scope names are the CFML ones: "variables", "request", "session",
+    // "application", "server", "cgi", "url", "form", "cookie".
+
+    /// Read one key from a named scope. Takes that scope's read lock for the
+    /// duration, so the value is never torn by a concurrent CFML `<cflock>`.
+    pub scope_get: unsafe extern "C" fn(*mut Ctx, scope: StrRef, key: StrRef) -> ValueHandle,
+    /// Write one key into a named scope.
+    ///
+    /// Writing a **shared** scope (`application`, `session`, `server`) requires
+    /// a lock this call is already holding, acquired via [`HostVtable::lock`];
+    /// without one this returns [`status::UNLOCKED`] rather than succeeding.
+    /// Stricter than CFML itself, deliberately — a native module can write a
+    /// live shared scope from a thread the application never thinks about.
+    pub scope_set: unsafe extern "C" fn(*mut Ctx, scope: StrRef, key: StrRef, ValueHandle) -> u32,
+    pub scope_has: unsafe extern "C" fn(*mut Ctx, scope: StrRef, key: StrRef, *mut bool) -> u32,
+    pub scope_delete: unsafe extern "C" fn(*mut Ctx, scope: StrRef, key: StrRef) -> u32,
+    /// The whole scope as a **snapshot** struct — a copy, safe to walk without
+    /// holding anything. Iterating a live shared scope key by key would race.
+    pub scope_snapshot: unsafe extern "C" fn(*mut Ctx, scope: StrRef) -> ValueHandle,
+    /// An unqualified read, honouring CFML's own resolution order
+    /// (local → arguments → variables → request → … → application → server).
+    pub var_get: unsafe extern "C" fn(*mut Ctx, key: StrRef) -> ValueHandle,
+
+    /// Acquire a lock, in the **same registry `<cflock>` uses**, so a CFML
+    /// `<cflock scope="application">` and a native write mutually exclude.
+    ///
+    /// `scope` names a scope lock; pass an empty `scope` and a non-empty `name`
+    /// for a named lock. `timeout_ms == 0` means wait forever (Lucee
+    /// semantics). A timeout raises a `lock`-typed CFML error carrying
+    /// `LockOperation = "Timeout"`.
+    ///
+    /// The token is written through `out`. Guards are **call-scoped**: anything
+    /// still held when the call returns is force-released, because a module
+    /// holding a lock across requests is a hang, not a bug report.
+    pub lock: unsafe extern "C" fn(
+        *mut Ctx,
+        scope: StrRef,
+        name: StrRef,
+        exclusive: bool,
+        timeout_ms: u64,
+        out: *mut u64,
+    ) -> u32,
+    /// Release a lock early. Optional — the host releases at call end anyway.
+    pub unlock: unsafe extern "C" fn(*mut Ctx, token: u64) -> u32,
+
+    /// Keep a value alive beyond this call, for a cache that spans requests.
+    ///
+    /// The host owns the root; the id is valid until [`HostVtable::unroot`].
+    /// Rooted values are visible to the cycle collector, so a cache cannot be
+    /// collected out from under a module.
+    pub root: unsafe extern "C" fn(*mut Ctx, ValueHandle, out: *mut u64) -> u32,
+    /// Release a root. Deliberately takes no `ctx`: a root outlives every call,
+    /// so its RAII drop has none to offer.
+    pub unroot: unsafe extern "C" fn(id: u64) -> u32,
+    /// Bring a rooted value back as a handle in the current call.
+    pub root_get: unsafe extern "C" fn(*mut Ctx, id: u64) -> ValueHandle,
+
+    // --- tier 3 (CFML execution) appends below. ---
 }
 
 impl HostVtable {

@@ -1793,6 +1793,22 @@ struct LockOpts {
     label: String,
 }
 
+impl LockOpts {
+    /// A lock request built by something other than the `<cflock>` lowering —
+    /// currently a native extension (§5.2b). `label` is what a timeout message
+    /// calls it; the defaults match an attribute-less `<cflock>`.
+    pub(crate) fn for_scope(name: String, label: &str, exclusive: bool) -> LockOpts {
+        LockOpts {
+            name,
+            ltype: if exclusive { "exclusive".to_string() } else { "readonly".to_string() },
+            // 0 = wait forever, which is what an omitted `timeout` means.
+            timeout_ms: 0,
+            throw_on_timeout: true,
+            label: label.to_string(),
+        }
+    }
+}
+
 /// The Lucee wording for a lock-acquisition timeout, e.g.
 /// `a timeout occurred after 2 seconds trying to acquire a exclusive lock with
 /// name [probeI].` / `… a read-only [application] scope lock.` A timeout that is
@@ -5152,6 +5168,10 @@ impl CfmlVirtualMachine {
         // which makes this a single `is_empty` on the hot path.
         if !self.foreign_builtins.is_empty() {
             if let Some(fb) = self.foreign_builtins.get(name.as_str()).copied() {
+                // No frame locals on this op (it is the compile-time-bound fast
+                // path), so an unqualified `ctx.var()` read from here sees the
+                // shared scopes but not `local`/`arguments`.
+                let _vm = foreign::VmScope::new(self, None);
                 let out = fb.call(args)?;
                 stack.push(out);
                 return Ok(());
@@ -13271,6 +13291,184 @@ impl CfmlVirtualMachine {
     /// `name` and `scope` are mutually exclusive (Lucee/ACF both reject the pair).
     /// The positional form (`name, type, timeout`) is accepted for the script
     /// lowering's benefit and has no `scope`.
+    /// Acquire a `<cflock>` / `lock {}` lock, pushing it onto `held_locks`.
+    ///
+    /// Returns `Ok(true)` when the lock is held (the body should run) and
+    /// `Ok(false)` only for `throwOnTimeout="false"` after a timeout.
+    ///
+    /// Extracted so **native extensions take the same locks CFML does** (§5.2b).
+    /// A separate native lock table would be worse than no locking at all — it
+    /// would look correct and protect nothing — and reimplementing the timeout
+    /// semantics is how the Preside reload-flag bug would come back.
+    /// The `named_locks` key for a scope lock in THIS request's context.
+    ///
+    /// Native extensions must lock against the same key `<cflock scope="…">`
+    /// uses, or the two would look mutually exclusive and protect nothing.
+    pub(crate) fn scope_lock_key_for(&self, scope: &str) -> String {
+        scope_lock_key(
+            scope,
+            self.current_application_name.as_deref().unwrap_or(""),
+            self.session_id.as_deref(),
+            self.request_scope.backing_ptr(),
+        )
+    }
+
+    /// Does this request already hold the lock keyed `name`?
+    pub(crate) fn holds_lock(&self, name: &str) -> bool {
+        self.held_locks.iter().any(|(n, _)| n == name)
+    }
+
+    /// How many locks this request holds. Used as an extension's lock token, so
+    /// a release is exact even when several are taken in one call.
+    pub(crate) fn held_lock_depth(&self) -> usize {
+        self.held_locks.len()
+    }
+
+    /// Release the most recently acquired lock, LIFO, exactly as
+    /// `__cflock_end` does.
+    pub(crate) fn release_top_lock(&mut self) {
+        self.held_locks.pop();
+    }
+
+    /// Force-release every lock taken above `floor`.
+    ///
+    /// Called when a native call returns. A module that acquires and forgets
+    /// must not be able to hold a lock into the next request — that is a hang,
+    /// not a bug report.
+    pub(crate) fn release_locks_above(&mut self, floor: usize) -> usize {
+        let leaked = self.held_locks.len().saturating_sub(floor);
+        while self.held_locks.len() > floor {
+            self.held_locks.pop();
+        }
+        leaked
+    }
+
+    /// Lock depth, for tests asserting that native locks do not outlive a call.
+    pub fn held_lock_depth_public(&self) -> usize {
+        self.held_locks.len()
+    }
+
+    /// The scope-lock key, for tests that need to contend with a native lock
+    /// from the CFML side.
+    pub fn scope_lock_key_for_public(&self, scope: &str) -> String {
+        self.scope_lock_key_for(scope)
+    }
+
+    /// `resolve_path_root`, for the extension facade's unqualified read.
+    ///
+    /// Exposed rather than duplicated so an unqualified read from an extension
+    /// and from CFML answer identically by construction.
+    pub(crate) fn resolve_path_root_public(
+        &self,
+        root: &str,
+        locals: &ValueMap,
+    ) -> Option<CfmlValue> {
+        self.resolve_path_root(root, locals)
+    }
+
+    fn acquire_named_lock(&mut self, opts: &LockOpts) -> Result<bool, CfmlError> {
+        let LockOpts { name: lock_name, ltype: lock_type, timeout_ms, throw_on_timeout, label: lock_label } = opts;
+        let (timeout_ms, throw_on_timeout) = (*timeout_ms, *throw_on_timeout);
+            if let Some(ref server_state) = self.server_state {
+                // Named locks are reentrant within the same request/thread:
+                // if this VM already holds a lock by this name, re-acquiring
+                // it must succeed immediately rather than self-deadlock on the
+                // non-reentrant RwLock (Lucee/ACF/BoxLang all permit same-thread
+                // re-entry). Push a placeholder that __cflock_end pops in LIFO
+                // order without releasing the real guard.
+                if self.held_locks.iter().any(|(n, _)| n == lock_name) {
+                    self.held_locks.push((lock_name.clone(), HeldLock::Reentrant));
+                    return Ok(true);
+                }
+                // Get or create the named lock
+                let lock = {
+                    let mut locks = server_state.named_locks.lock().unwrap();
+                    const NAMED_LOCK_CAP: usize = 1024;
+                    evict_idle_named_locks(&mut locks, lock_name.as_str(), NAMED_LOCK_CAP);
+                    locks
+                        .entry(lock_name.clone())
+                        .or_insert_with(|| Arc::new(RwLock::new(())))
+                        .clone()
+                };
+
+                // Acquire lock with timeout using try_lock in a spin loop.
+                // `timeout_ms == 0` means NO timeout — wait indefinitely, which is
+                // also what an omitted `timeout` means. Lucee semantics, measured
+                // against 7.0.4.34 (it waits 1594ms / 6600ms for a held lock
+                // rather than failing).
+                //
+                // ⚠️ This is only SAFE because `ApplicationState::variables` is a
+                // LIVE shared scope. Preside guards its application reload with
+                // `applicationReloadLockTimeout = 0`, deliberately asking
+                // concurrent requests to QUEUE behind the reload. With the old
+                // per-request snapshot scope every queued request then still found
+                // `application.cbBootstrap` absent and re-booted the whole
+                // framework — 8 concurrent cold requests did 8 boots (~7s each).
+                // Do NOT reintroduce a snapshot application scope without also
+                // reverting this to fail-fast.
+                let deadline = (timeout_ms > 0).then(|| {
+                    cfml_common::clock::Monotonic::now()
+                        + std::time::Duration::from_millis(timeout_ms)
+                });
+                let timed_out = |deadline: Option<cfml_common::clock::Monotonic>| {
+                    deadline.is_some_and(|d| cfml_common::clock::Monotonic::now() >= d)
+                };
+                let is_exclusive = lock_type != "readonly";
+
+                if is_exclusive {
+                    loop {
+                        if let Ok(guard) = lock.try_write() {
+                            // SAFETY: the lifetime extension is sound because we
+                            // store the owning `Arc<RwLock<()>>` (`lock`) alongside
+                            // the guard in the same `HeldLock`. The Arc keeps the
+                            // RwLock allocation alive for at least as long as the
+                            // guard, and HeldLock's field order drops the guard
+                            // (unlock) before the Arc (free). See HeldLock docs.
+                            let guard: std::sync::RwLockWriteGuard<'static, ()> =
+                                unsafe { std::mem::transmute(guard) };
+                            self.held_locks
+                                .push((lock_name.clone(), HeldLock::Write(guard, lock.clone())));
+                            break;
+                        }
+                        if timed_out(deadline) {
+                            if !throw_on_timeout {
+                                // throwOnTimeout="false": the body is skipped and
+                                // execution continues. The lowering guards the body
+                                // on this return value.
+                                return Ok(false);
+                            }
+                            return Err(lock_timeout_error(timeout_ms, true, &lock_label));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                } else {
+                    loop {
+                        if let Ok(guard) = lock.try_read() {
+                            // SAFETY: see the exclusive branch above — the owning
+                            // Arc is stored next to the guard, keeping the RwLock
+                            // alive (and unevictable) for the guard's whole life.
+                            let guard: std::sync::RwLockReadGuard<'static, ()> =
+                                unsafe { std::mem::transmute(guard) };
+                            self.held_locks
+                                .push((lock_name.clone(), HeldLock::Read(guard, lock.clone())));
+                            break;
+                        }
+                        if timed_out(deadline) {
+                            if !throw_on_timeout {
+                                return Ok(false);
+                            }
+                            return Err(lock_timeout_error(timeout_ms, false, &lock_label));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+
+        // Without server_state (CLI mode), locks are a no-op — but the body must
+        // still run, so report "acquired".
+        Ok(true)
+    }
+
     fn parse_lock_opts(&self, args: &[CfmlValue]) -> Result<LockOpts, CfmlError> {
         fn to_ms(v: &CfmlValue) -> Option<u64> {
             match v {
@@ -13742,6 +13940,9 @@ impl CfmlVirtualMachine {
                     // existing "the registrar may override a builtin" contract.
                     if !self.foreign_builtins.is_empty() {
                         if let Some(fb) = self.foreign_builtins.get(&name_lower).copied() {
+                            // Publish the VM for the duration, so the extension
+                            // can reach scopes and locks (tier 2).
+                            let _vm = foreign::VmScope::new(self, Some(parent_locals));
                             return fb.call(args);
                         }
                     }
@@ -16548,6 +16749,7 @@ impl CfmlVirtualMachine {
                             if let Some(class) = self.foreign_classes.get(&key).copied() {
                                 let ctor_args: Vec<CfmlValue> =
                                     args.iter().skip(2).cloned().collect();
+                                let _vm = foreign::VmScope::new(self, None);
                                 return class.construct(ctor_args);
                             }
                             return Err(CfmlError::runtime(format!(
@@ -18287,111 +18489,8 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cflock_start" => {
-                    let LockOpts {
-                        name: lock_name,
-                        ltype: lock_type,
-                        timeout_ms,
-                        throw_on_timeout,
-                        label: lock_label,
-                    } = self.parse_lock_opts(&args)?;
-
-                    if let Some(ref server_state) = self.server_state {
-                        // Named locks are reentrant within the same request/thread:
-                        // if this VM already holds a lock by this name, re-acquiring
-                        // it must succeed immediately rather than self-deadlock on the
-                        // non-reentrant RwLock (Lucee/ACF/BoxLang all permit same-thread
-                        // re-entry). Push a placeholder that __cflock_end pops in LIFO
-                        // order without releasing the real guard.
-                        if self.held_locks.iter().any(|(n, _)| *n == lock_name) {
-                            self.held_locks.push((lock_name, HeldLock::Reentrant));
-                            return Ok(CfmlValue::Bool(true));
-                        }
-                        // Get or create the named lock
-                        let lock = {
-                            let mut locks = server_state.named_locks.lock().unwrap();
-                            const NAMED_LOCK_CAP: usize = 1024;
-                            evict_idle_named_locks(&mut locks, lock_name.as_str(), NAMED_LOCK_CAP);
-                            locks
-                                .entry(lock_name.clone())
-                                .or_insert_with(|| Arc::new(RwLock::new(())))
-                                .clone()
-                        };
-
-                        // Acquire lock with timeout using try_lock in a spin loop.
-                        // `timeout_ms == 0` means NO timeout — wait indefinitely, which is
-                        // also what an omitted `timeout` means. Lucee semantics, measured
-                        // against 7.0.4.34 (it waits 1594ms / 6600ms for a held lock
-                        // rather than failing).
-                        //
-                        // ⚠️ This is only SAFE because `ApplicationState::variables` is a
-                        // LIVE shared scope. Preside guards its application reload with
-                        // `applicationReloadLockTimeout = 0`, deliberately asking
-                        // concurrent requests to QUEUE behind the reload. With the old
-                        // per-request snapshot scope every queued request then still found
-                        // `application.cbBootstrap` absent and re-booted the whole
-                        // framework — 8 concurrent cold requests did 8 boots (~7s each).
-                        // Do NOT reintroduce a snapshot application scope without also
-                        // reverting this to fail-fast.
-                        let deadline = (timeout_ms > 0).then(|| {
-                            cfml_common::clock::Monotonic::now()
-                                + std::time::Duration::from_millis(timeout_ms)
-                        });
-                        let timed_out = |deadline: Option<cfml_common::clock::Monotonic>| {
-                            deadline.is_some_and(|d| cfml_common::clock::Monotonic::now() >= d)
-                        };
-                        let is_exclusive = lock_type != "readonly";
-
-                        if is_exclusive {
-                            loop {
-                                if let Ok(guard) = lock.try_write() {
-                                    // SAFETY: the lifetime extension is sound because we
-                                    // store the owning `Arc<RwLock<()>>` (`lock`) alongside
-                                    // the guard in the same `HeldLock`. The Arc keeps the
-                                    // RwLock allocation alive for at least as long as the
-                                    // guard, and HeldLock's field order drops the guard
-                                    // (unlock) before the Arc (free). See HeldLock docs.
-                                    let guard: std::sync::RwLockWriteGuard<'static, ()> =
-                                        unsafe { std::mem::transmute(guard) };
-                                    self.held_locks
-                                        .push((lock_name, HeldLock::Write(guard, lock.clone())));
-                                    break;
-                                }
-                                if timed_out(deadline) {
-                                    if !throw_on_timeout {
-                                        // throwOnTimeout="false": the body is skipped and
-                                        // execution continues. The lowering guards the body
-                                        // on this return value.
-                                        return Ok(CfmlValue::Bool(false));
-                                    }
-                                    return Err(lock_timeout_error(timeout_ms, true, &lock_label));
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                        } else {
-                            loop {
-                                if let Ok(guard) = lock.try_read() {
-                                    // SAFETY: see the exclusive branch above — the owning
-                                    // Arc is stored next to the guard, keeping the RwLock
-                                    // alive (and unevictable) for the guard's whole life.
-                                    let guard: std::sync::RwLockReadGuard<'static, ()> =
-                                        unsafe { std::mem::transmute(guard) };
-                                    self.held_locks
-                                        .push((lock_name, HeldLock::Read(guard, lock.clone())));
-                                    break;
-                                }
-                                if timed_out(deadline) {
-                                    if !throw_on_timeout {
-                                        return Ok(CfmlValue::Bool(false));
-                                    }
-                                    return Err(lock_timeout_error(timeout_ms, false, &lock_label));
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                        }
-                    }
-                    // Without server_state (CLI mode), locks are a no-op — but the
-                    // body must still run, so report "acquired".
-                    return Ok(CfmlValue::Bool(true));
+                    let opts = self.parse_lock_opts(&args)?;
+                    return self.acquire_named_lock(&opts).map(CfmlValue::Bool);
                 }
                 "__cflock_end" => {
                     // Release the most recently acquired lock. The argument is the same
@@ -23746,6 +23845,10 @@ impl CfmlVirtualMachine {
         // re-entrant calls on the same object will deadlock by design.
         if let CfmlValue::NativeObject(obj) = object {
             let args = std::mem::take(extra_args);
+            // Publish the VM before dispatch: `CfmlNative::call_method` has no
+            // VM argument, so an extension class reaches scopes and locks
+            // through this side channel (see `foreign::VmScope`).
+            let _vm = foreign::VmScope::new(self, Some(caller_locals));
             let mut guard = obj.write().map_err(|_| {
                 CfmlError::runtime("NativeObject lock poisoned".to_string())
             })?;
@@ -32155,6 +32258,7 @@ impl CfmlVirtualMachine {
         let parent = if let Some(ctor) = self.native_classes.get(&key).copied() {
             ctor(Vec::new())?
         } else if let Some(class) = self.foreign_classes.get(&key).copied() {
+            let _vm = foreign::VmScope::new(self, None);
             class.construct(Vec::new())?
         } else {
             return Err(CfmlError::runtime(format!(

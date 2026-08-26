@@ -216,6 +216,66 @@ impl NativeClass for Tally {
     }
 }
 
+/// `demoMemoise( key, value )` — the tier-2 shape: memoise into `application`.
+///
+/// This is what "an extension can see the running app" buys. Note the three
+/// things it does NOT do: it does not keep its own copy of the application
+/// scope, it does not invent a lock, and it does not write unlocked. The lock is
+/// the SAME one `<cflock scope="application">` takes, so CFML code and this
+/// function mutually exclude.
+fn memoise<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let key = args
+        .first()
+        .map(|v| v.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::expression("demoMemoise() needs a key"))?;
+    let app = ctx.scope("application");
+
+    // Fast path: an unlocked READ is safe — reads take the scope's read lock,
+    // so this cannot see a half-written value.
+    let existing = app.get(&key)?;
+    if !existing.is_null() {
+        return Ok(existing);
+    }
+
+    // Slow path: take the exclusive lock, then re-check. Without the re-check
+    // every racing caller would compute and write in turn, which is the classic
+    // memoisation bug rather than a locking one.
+    let guard = ctx.lock("application", true, 10_000)?;
+    let existing = app.get(&key)?;
+    if !existing.is_null() {
+        return Ok(existing);
+    }
+    let computed = args.get(1).copied().unwrap_or_else(|| ctx.int(1));
+    app.set(&key, computed)?;
+    COMPUTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    drop(guard);
+    Ok(computed)
+}
+
+/// How many times `demoMemoise` actually computed rather than hit the cache.
+/// The point of the concurrency test: under load this must stay at 1.
+static COMPUTED: AtomicI64 = AtomicI64::new(0);
+
+fn memoise_computations<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
+    Ok(ctx.int(COMPUTED.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
+/// `demoUnlockedWrite( key )` — deliberately wrong, so the refusal is visible
+/// from CFML rather than only in a Rust test.
+fn unlocked_write<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+    ctx.scope("application").set(&key, ctx.int(1))?;
+    Ok(ctx.bool(true))
+}
+
+/// `demoRequestVar( key )` — an unqualified read, using CFML's own resolution
+/// order. Proves the extension sees what the page sees.
+fn request_var<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+    ctx.var(&key)
+}
+
 /// Once per process, never per request — the place for thread pools and caches.
 ///
 /// `settings` is this extension's `.cfconfig.json` block:
@@ -244,6 +304,10 @@ module! {
         "demoChecksum"       => checksum,
         "demoFail"           => fail,
         "demoTally"          => new_tally,
+        "demoMemoise"            => memoise,
+        "demoMemoiseComputations" => memoise_computations,
+        "demoUnlockedWrite"      => unlocked_write,
+        "demoRequestVar"         => request_var,
     },
     classes: { Tally },
     on_load: on_load,

@@ -143,6 +143,94 @@ request and every `cfthread` child — so nothing expensive may happen there.
 
 ---
 
+## Seeing the running application (tier 2)
+
+An extension can read and write the engine's scopes, take the same locks CFML
+takes, and keep values alive across requests.
+
+```rust
+fn memoise<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let app = ctx.scope( "application" );
+
+    // Reads take the scope's read lock, so this can never see a half-written
+    // value — no ceremony required.
+    let hit = app.get( "answer" )?;
+    if !hit.is_null() { return Ok( hit ); }
+
+    // Writes to a SHARED scope require a lock you are holding.
+    let guard = ctx.lock( "application", true, 10_000 )?;
+    let hit = app.get( "answer" )?;          // re-check: without this every
+    if !hit.is_null() { return Ok( hit ); }  // racing caller still computes
+    let computed = ctx.int( 42 );
+    app.set( "answer", computed )?;
+    drop( guard );
+    Ok( computed )
+}
+```
+
+### Scopes
+
+`ctx.scope(name)` reaches `variables`, `request`, `session`, `application`,
+`server`, and read-only `cgi` / `url` / `form` / `cookie`. It offers `get`,
+`set`, `has`, `remove` and `snapshot`. `ctx.var(key)` is an **unqualified** read
+that goes through the engine's own resolver, so it sees exactly what an
+unprefixed read in CFML source would.
+
+`snapshot()` returns a **copy**, and there is deliberately no live iterator:
+walking a live shared scope key by key while another request writes it is a
+race, not a convenience.
+
+### Writing a shared scope requires its lock
+
+`application`, `session` and `server` are live and shared across concurrent
+requests, so an unlocked write is refused:
+
+```
+writing [application] requires holding its lock — take ctx.lock("application", …) first
+```
+
+This is **stricter than CFML itself**, on purpose. CFML lets you write
+`application.x` unlocked; an extension may not, because it can do so from a
+thread the application never thinks about, and because the failure mode is
+corruption rather than an error. `variables` and `request` belong to one request
+and need no lock.
+
+### Locks are the engine's locks
+
+`ctx.lock(scope, exclusive, timeout_ms)` and `ctx.lock_named(...)` take locks
+from **the same registry `<cflock>` uses**. A `<cflock scope="application">` in a
+CFML page and a native write mutually exclude — a separate native lock table
+would look correct and protect nothing. Same reentrancy (a nested acquire by the
+same request succeeds), the same `timeout_ms = 0` means wait forever, and a
+timeout raises the engine's own `lock`-typed error carrying
+`LockOperation = "Timeout"`.
+
+Guards are **call-scoped**: anything still held when your call returns is
+force-released and logged, because a module holding a lock into the next request
+is a hang, not a bug report. Drop the guard when you are done anyway, so CFML
+code waiting on the scope is not blocked for the rest of your function.
+
+### Values that outlive a call
+
+```rust
+let rooted = ctx.root( value )?;   // keep it
+let back   = rooted.get( ctx );    // in a later call
+                                   // dropped => released
+```
+
+Rooted values are visible to the cycle collector, so a cache cannot be collected
+out from under you. The flip side: a `Rooted` you never drop is a leak for the
+life of the process.
+
+### Checking the host is new enough
+
+An extension built against tier 2 and loaded by a tier-1 engine gets a legible
+error the first time it reaches for a scope, not a jump through an unfilled
+vtable slot — that is what `size` and `ctx`-from-day-one bought. Declare the
+tier you need in `module!` and the loader refuses a too-old host up front.
+
+---
+
 ## The command line
 
 ```
@@ -285,9 +373,11 @@ answer.
 - **An extension is trusted code**, exactly like a Lucee `.lex`: arbitrary
   native code with full process privilege. The manifest digests protect against
   a corrupted download, not a hostile author. This is not a sandbox.
-- **Tier 1 today.** An extension can compute over CFML values and hold its own
-  Rust state. It cannot yet read `application`, take a `<cflock>`, or call back
-  into CFML. Those are tiers 2 and 3.
+- **Tier 2 today.** An extension can compute over CFML values, hold its own Rust
+  state, read and write the engine's scopes, take the locks CFML takes, and keep
+  values alive across requests. It cannot yet **call back into CFML** — no
+  invoking a UDF, instantiating a component, or writing the output buffer. That
+  is tier 3.
 - **No Query-of-Queries functions yet.** The ABI declares them, but the registry
   they would live in stores bare `fn` pointers that cannot carry a module
   identity. An extension declaring one is **refused outright** rather than
