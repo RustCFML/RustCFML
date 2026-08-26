@@ -39,10 +39,23 @@ assert(
 	txnCatchClauseFor(memDs, "SELECT 1 FROM rcfml_missing_table_f362"),
 	"database"
 );
+// The path has to be unopenable for EVERY uid, which "/rcfml-no-such-dir-f362/"
+// is not: the SQLite adapter deliberately creates a file-backed database's
+// parent directory chain (builtins.rs, "so a configured path just works"), so
+// as root — any container, and plenty of real deployments — that directory is
+// simply created and the open succeeds. The assertion only ever passed because
+// macOS refuses a normal user write access to "/", which is a property of the
+// host rather than of the engine. Caught by running the suite on Linux.
+//
+// Rooting the path at THIS TEMPLATE — an existing regular file — makes the
+// premise privilege-independent: mkdir under a file is ENOTDIR for root too.
 assert(
 	"cftransaction: an unopenable datasource is database-typed",
 	txnCatchClauseFor(
-		{ class: "org.sqlite.JDBC", connectionString: "jdbc:sqlite:/rcfml-no-such-dir-f362/t.db" },
+		{
+			  class            = "org.sqlite.JDBC"
+			, connectionString = "jdbc:sqlite:" & getCurrentTemplatePath() & "/nope-f362/t.db"
+		},
 		"SELECT 1"
 	),
 	"database"
