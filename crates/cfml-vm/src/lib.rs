@@ -13343,6 +13343,134 @@ impl CfmlVirtualMachine {
         leaked
     }
 
+    /// Resolve a callable by name — a UDF, a builtin, or a function value in
+    /// scope — for a tier-3 extension's `call_fn`.
+    pub(crate) fn resolve_callable(&self, name: &str, locals: &ValueMap) -> Option<CfmlValue> {
+        // Same order a bare `name(…)` uses: frame data that holds a function,
+        // then user functions, then builtins.
+        if let Some(v @ CfmlValue::Function(_)) = locals.get(name) {
+            return Some(v.clone());
+        }
+        if let Some(v @ (CfmlValue::Function(_) | CfmlValue::Closure(_))) =
+            self.globals.get(name).cloned()
+        {
+            return Some(v);
+        }
+        let lower = name.to_lowercase();
+        if self.user_functions.contains_key(name) || self.is_builtin_name_ci(name, &lower) {
+            return Some(Self::builtin_fn_value(name));
+        }
+        None
+    }
+
+    /// Call a function value. The extension-facing entry point for tier 3.
+    pub(crate) fn call_value_public(
+        &mut self,
+        callee: &CfmlValue,
+        args: Vec<CfmlValue>,
+        locals: &ValueMap,
+    ) -> CfmlResult {
+        self.call_function(callee, args, locals)
+    }
+
+    /// `createObject( "component", path )` with constructor arguments, for a
+    /// tier-3 extension.
+    pub(crate) fn new_component_public(
+        &mut self,
+        path: &str,
+        args: Vec<CfmlValue>,
+        locals: &ValueMap,
+    ) -> CfmlResult {
+        let mut call_args = vec![CfmlValue::string("component"), CfmlValue::string(path)];
+        call_args.extend(args);
+        // Routed through `createObject` itself rather than reimplemented, so an
+        // extension gets the same inheritance chain, `implements` resolution,
+        // security policy and `init` handling that CFML does.
+        let callee = Self::builtin_fn_value("createObject");
+        self.call_function(&callee, call_args, locals)
+    }
+
+    /// Invoke a method on a component or native object, for a tier-3 extension.
+    pub(crate) fn invoke_method_public(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        args: Vec<CfmlValue>,
+        locals: &ValueMap,
+    ) -> CfmlResult {
+        let mut extra = args;
+        self.call_member_function(object, method, &mut extra, None, locals)
+    }
+
+    /// `getComponentMetadata( path )`, for a tier-3 extension. Annotation-driven
+    /// dependency injection is metadata-driven, so this matters more than it
+    /// looks.
+    pub(crate) fn component_metadata_public(
+        &mut self,
+        path: &str,
+        locals: &ValueMap,
+    ) -> CfmlResult {
+        let callee = Self::builtin_fn_value("getComponentMetadata");
+        self.call_function(&callee, vec![CfmlValue::string(path)], locals)
+    }
+
+    /// Append to page output, honouring whatever capture is in effect
+    /// (`cfsavecontent`, `cfsilent`, a thread's own buffer) — because
+    /// `output_buffer` IS the innermost of those.
+    pub(crate) fn write_output_public(&mut self, text: &str) {
+        self.output_buffer.push_str(text);
+    }
+
+    /// Run a template for its output, for a tier-3 extension.
+    ///
+    /// Deliberately NOT the `<cfinclude>` op: that merges the included file's
+    /// new variables back into the *calling frame's* locals, and an extension
+    /// has no calling frame to merge into. This runs the template with a fresh
+    /// scope and discards what it defined; its output goes to the buffer. Well
+    /// defined, rather than guessing whose `variables` scope to touch.
+    pub(crate) fn include_for_extension(&mut self, path: &str) -> Result<(), CfmlError> {
+        let path = if path.starts_with('/') || path.starts_with('\\') {
+            format!("/{}", path.trim_start_matches(['/', '\\']))
+        } else {
+            path.to_string()
+        };
+        let resolved = if let Some(ref source) = self.source_file {
+            let dir = std::path::Path::new(source)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            normalize_path(&dir.join(&path).to_string_lossy())
+        } else {
+            path.clone()
+        };
+        let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+            self.resolve_leading_slash_include(&path)
+                .or_else(|| self.resolve_include_with_mappings(&path))
+                .unwrap_or(resolved)
+        } else {
+            resolved
+        };
+        let sub_program = self.compile_file_cached_req(&resolved)?;
+        let old_program = self.push_program_swap(sub_program);
+        let old_source = self.source_file.clone();
+        self.source_file = Some(resolved.clone());
+        let main_idx = self
+            .program
+            .functions
+            .iter()
+            .position(|f| f.name == "__main__")
+            .unwrap_or(0);
+        let inc_func = self.program.functions[main_idx].clone();
+        // Isolate the try-stack, exactly as the include op does: a throw inside
+        // the template must not consume a handler outside it.
+        let saved_try_stack = std::mem::take(&mut self.try_stack);
+        let result = self.execute_function_with_args(&inc_func, Vec::new(), None);
+        self.try_stack = saved_try_stack;
+        self.captured_locals.take();
+        self.source_file = old_source;
+        self.pop_program_swap(old_program);
+        result.map(|_| ())
+    }
+
     /// Lock depth, for tests asserting that native locks do not outlive a call.
     pub fn held_lock_depth_public(&self) -> usize {
         self.held_locks.len()
@@ -23846,9 +23974,31 @@ impl CfmlVirtualMachine {
         if let CfmlValue::NativeObject(obj) = object {
             let args = std::mem::take(extra_args);
             // Publish the VM before dispatch: `CfmlNative::call_method` has no
-            // VM argument, so an extension class reaches scopes and locks
-            // through this side channel (see `foreign::VmScope`).
+            // VM argument, so an extension class reaches scopes, locks and (at
+            // tier 3) CFML itself through this side channel (`foreign::VmScope`).
             let _vm = foreign::VmScope::new(self, Some(caller_locals));
+
+            // Does this object need the exclusive lock held for the whole call?
+            // Asked under a SHARED lock so the question itself cannot block.
+            let exclusive = obj
+                .read()
+                .map(|g| g.needs_exclusive())
+                .map_err(|_| CfmlError::runtime("NativeObject lock poisoned".to_string()))?;
+
+            if !exclusive {
+                // A self-synchronising native (an extension class). Only a
+                // shared lock is taken, so the method may call back into CFML
+                // which calls a method on this same object — the re-entrancy
+                // that an exclusive guard makes a deadlock. Nothing takes the
+                // exclusive lock for such an object, so nested shared
+                // acquisitions cannot be starved by a waiting writer.
+                let guard = obj.read().map_err(|_| {
+                    CfmlError::runtime("NativeObject lock poisoned".to_string())
+                })?;
+                let args = Self::bind_native_named_args(&*guard, method, arg_names, args)?;
+                return guard.call_method_shared(method, args);
+            }
+
             let mut guard = obj.write().map_err(|_| {
                 CfmlError::runtime("NativeObject lock poisoned".to_string())
             })?;

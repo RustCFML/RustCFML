@@ -231,6 +231,73 @@ tier you need in `module!` and the loader refuses a too-old host up front.
 
 ---
 
+## Running CFML (tier 3)
+
+```rust
+// A closure the page handed you — the mechanism behind
+// `thing.onEvent( function(e){ … } )`.
+let doubled = callback.call_as_fn( &[ ctx.int( 21 ) ] )?;
+
+// A builtin, or any UDF in scope.
+let shouted = ctx.call( "ucase", &[ ctx.string( "hi" ) ] )?;
+
+// A component: construct, inject, invoke.
+let svc = ctx.new_component( "services.Mailer", &[] )?;
+svc.set_property( "transport", my_transport )?;
+svc.invoke( "send", &[ message ] )?;
+
+// What annotation-driven DI is built on.
+let meta = ctx.component_metadata( "services.Mailer" )?;
+
+ctx.write_output( "straight to the page" )?;
+ctx.include( "/views/partial.cfm" )?;
+```
+
+### Re-entrancy is the whole difficulty
+
+An extension method that calls CFML which calls back into **the same object** used
+to deadlock: dispatch held the object's exclusive lock for the entire call, and
+the re-entry waited for it. A dependency container resolving a bean whose
+provider resolves another bean from the same container is exactly that shape, so
+this is the main line, not a corner case.
+
+The fix is an opt-out. `CfmlNative::needs_exclusive()` defaults to `true`, so
+**every class implemented inside the engine is untouched** — it still gets
+`&mut self` and the guard. An extension class returns `false`: dispatch takes
+only a shared lock and calls `call_method_shared`, so several frames of the same
+object can be live at once. That is sound because the ABI already requires a
+module to manage its own synchronisation, and the wrapper's `&self` method
+signature enforces it. Nothing takes the exclusive lock for such an object, so
+nested shared acquisitions cannot be starved by a waiting writer.
+
+`ctx.this()` is a value, not just a return: passing it to `invoke` is how a
+method re-enters itself through the engine.
+
+### `set_property` writes `variables`, not `this`
+
+Injecting a dependency means writing the component's **`variables`** scope,
+because that is what its own methods read. Writing the public member instead
+compiles, runs, and leaves the component seeing nothing — a silent no-op rather
+than an error. This is the one place the ABI deliberately does not mirror
+`struct_set`.
+
+### `include` is not `<cfinclude>`
+
+`<cfinclude>` merges the included file's new variables back into the *calling
+frame's* locals. An extension has no calling frame to merge into, so
+`ctx.include` runs the template with a fresh scope and discards what it defines;
+its output goes to the buffer. Well defined, rather than guessing whose
+`variables` scope to touch.
+
+### Errors from re-entrant CFML
+
+When CFML you called throws, that error is what your caller sees — the module's
+own `Err` on the way out does not replace it. First error wins, deliberately: a
+precise "no such component" or a lock timeout is worth more than a generic
+"[newComponent] failed" wrapped around it.
+
+---
+
 ## The command line
 
 ```
@@ -373,11 +440,11 @@ answer.
 - **An extension is trusted code**, exactly like a Lucee `.lex`: arbitrary
   native code with full process privilege. The manifest digests protect against
   a corrupted download, not a hostile author. This is not a sandbox.
-- **Tier 2 today.** An extension can compute over CFML values, hold its own Rust
-  state, read and write the engine's scopes, take the locks CFML takes, and keep
-  values alive across requests. It cannot yet **call back into CFML** — no
-  invoking a UDF, instantiating a component, or writing the output buffer. That
-  is tier 3.
+- **Tier 3 today** — the full surface. An extension can compute over CFML values,
+  hold Rust state, read and write scopes, take the locks CFML takes, keep values
+  alive across requests, and **run CFML**: call functions and closures,
+  instantiate components, invoke methods, inject dependencies, read metadata,
+  write page output and include templates.
 - **No Query-of-Queries functions yet.** The ABI declares them, but the registry
   they would live in stores bare `fn` pointers that cannot carry a module
   identity. An extension declaring one is **refused outright** rather than

@@ -40,7 +40,8 @@ pub mod tier {
     /// Adds the scope facade: read/write `application`, `session`, … and take
     /// the same locks `<cflock>` uses. Still executes no CFML.
     pub const SCOPES: u32 = 2;
-    /// Adds CFML execution — calling UDFs, instantiating components.
+    /// Adds CFML execution — calling UDFs and closures, instantiating
+    /// components, invoking methods, page output, and `include`.
     pub const EXECUTION: u32 = 3;
 }
 
@@ -463,7 +464,59 @@ pub struct HostVtable {
     /// Bring a rooted value back as a handle in the current call.
     pub root_get: unsafe extern "C" fn(*mut Ctx, id: u64) -> ValueHandle,
 
-    // --- tier 3 (CFML execution) appends below. ---
+    // ---- tier 3: CFML execution -------------------------------------------
+    //
+    // Everything here re-enters the engine, which is why the object-dispatch
+    // lock had to become optional first: an extension method that calls CFML
+    // which calls back into the same object would otherwise deadlock on the
+    // guard its own caller is holding.
+
+    /// Call a function by name — a BIF, a UDF, or anything in scope.
+    pub call_fn: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        name: StrRef,
+        args: *const ValueHandle,
+        argc: usize,
+    ) -> ValueHandle,
+    /// Call a function VALUE: a UDF or closure handed to you as an argument.
+    /// This is what makes `page.onRequest( function(req){ … } )` possible.
+    pub call_value: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        callee: ValueHandle,
+        args: *const ValueHandle,
+        argc: usize,
+    ) -> ValueHandle,
+    /// `createObject( "component", path )`, constructor arguments included.
+    pub new_component: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        path: StrRef,
+        args: *const ValueHandle,
+        argc: usize,
+    ) -> ValueHandle,
+    /// Invoke a method on a component or native object.
+    pub invoke_method: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        object: ValueHandle,
+        name: StrRef,
+        args: *const ValueHandle,
+        argc: usize,
+    ) -> ValueHandle,
+    /// Set a property on a component — annotation-driven dependency injection
+    /// is the reason this exists separately from `struct_set`.
+    pub component_set: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        object: ValueHandle,
+        name: StrRef,
+        value: ValueHandle,
+    ) -> u32,
+    /// `getComponentMetadata( path )`. Metadata matters more than it looks:
+    /// annotation-driven DI is metadata-driven.
+    pub component_metadata: unsafe extern "C-unwind" fn(*mut Ctx, path: StrRef) -> ValueHandle,
+    /// Append to the page output buffer, honouring whatever capture is in
+    /// effect (`cfsavecontent`, `cfsilent`, a thread's buffer).
+    pub write_output: unsafe extern "C-unwind" fn(*mut Ctx, text: StrRef) -> u32,
+    /// `<cfinclude>` a template.
+    pub include_template: unsafe extern "C-unwind" fn(*mut Ctx, path: StrRef) -> u32,
 }
 
 impl HostVtable {

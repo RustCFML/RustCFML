@@ -773,13 +773,16 @@ pub const fn class_vtable<C: NativeClass>() -> *const abi::NativeClassVtable {
 /// Fail clearly when the loaded host is older than the capability being used,
 /// rather than calling through a vtable slot it never filled in.
 fn require(entry_offset: usize, what: &str) -> Result<()> {
+    require_tier(entry_offset, what, abi::tier::SCOPES)
+}
+
+fn require_tier(entry_offset: usize, what: &str, tier: u32) -> Result<()> {
     let host = host();
-    if host.tier < abi::tier::SCOPES || !host.has(entry_offset) {
+    if host.tier < tier || !host.has(entry_offset) {
         return Err(Error::new(format!(
-            "{what} needs an engine that provides extension capability tier {} \
-             (scopes); this one provides tier {}",
-            abi::tier::SCOPES,
-            host.tier
+            "{what} needs an engine that provides extension capability tier {}; \
+             this one provides tier {}",
+            tier, host.tier
         )));
     }
     Ok(())
@@ -1000,6 +1003,154 @@ impl Ctx {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Tier 3 — running CFML
+// ---------------------------------------------------------------------------
+
+fn args_of(values: &[Value<'_>]) -> Vec<ValueHandle> {
+    values.iter().map(|v| v.h).collect()
+}
+
+impl Ctx {
+    /// Call a CFML function by name — a BIF, a UDF, anything in scope.
+    ///
+    /// ```ignore
+    /// let upper = ctx.call( "ucase", &[ ctx.string( "hi" ) ] )?;
+    /// ```
+    pub fn call<'a>(&'a self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, call_fn),
+            "calling a CFML function",
+            abi::tier::EXECUTION,
+        )?;
+        let handles = args_of(args);
+        let h = unsafe {
+            (host().call_fn)(self.raw, StrRef::new(name), handles.as_ptr(), handles.len())
+        };
+        self.checked(h, name)
+    }
+
+    /// `createObject( "component", path )`, constructor arguments included.
+    pub fn new_component<'a>(&'a self, path: &str, args: &[Value<'a>]) -> Result<Value<'a>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, new_component),
+            "instantiating a component",
+            abi::tier::EXECUTION,
+        )?;
+        let handles = args_of(args);
+        let h = unsafe {
+            (host().new_component)(self.raw, StrRef::new(path), handles.as_ptr(), handles.len())
+        };
+        self.checked(h, path)
+    }
+
+    /// `getComponentMetadata( path )` — the annotations dependency injection
+    /// is driven by.
+    pub fn component_metadata(&self, path: &str) -> Result<Value<'_>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, component_metadata),
+            "reading component metadata",
+            abi::tier::EXECUTION,
+        )?;
+        let h = unsafe { (host().component_metadata)(self.raw, StrRef::new(path)) };
+        self.checked(h, path)
+    }
+
+    /// Append to page output, honouring any capture in effect
+    /// (`cfsavecontent`, `cfsilent`, a thread's buffer).
+    pub fn write_output(&self, text: &str) -> Result<()> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, write_output),
+            "writing page output",
+            abi::tier::EXECUTION,
+        )?;
+        status(unsafe { (host().write_output)(self.raw, StrRef::new(text)) }, "write_output")
+    }
+
+    /// Run a template for its output.
+    ///
+    /// Unlike `<cfinclude>` this has no calling frame to merge variables back
+    /// into, so the template runs with a fresh scope and what it defines is
+    /// discarded. Its output goes to the buffer.
+    pub fn include(&self, path: &str) -> Result<()> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, include_template),
+            "including a template",
+            abi::tier::EXECUTION,
+        )?;
+        let code = unsafe { (host().include_template)(self.raw, StrRef::new(path)) };
+        if code != abi::status::OK {
+            // The host staged the real CFML error; a second message here would
+            // mask it.
+            return Err(Error::new(format!("include [{}] failed", path)));
+        }
+        Ok(())
+    }
+
+    /// A NULL return means the host staged a CFML error for us; surfacing our
+    /// own message instead would hide it, so this only fills in when there is
+    /// nothing better.
+    fn checked<'a>(&'a self, h: ValueHandle, what: &str) -> Result<Value<'a>> {
+        if h.is_null() {
+            return Err(Error::new(format!("[{}] failed", what)));
+        }
+        Ok(Value { h, ctx: self })
+    }
+}
+
+impl<'a> Value<'a> {
+    /// Call this value as a function — a UDF or closure handed to you as an
+    /// argument. The mechanism behind `thing.onEvent( function(e){ … } )`.
+    pub fn call_as_fn(self, args: &[Value<'a>]) -> Result<Value<'a>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, call_value),
+            "calling a function value",
+            abi::tier::EXECUTION,
+        )?;
+        let handles = args_of(args);
+        let h = unsafe {
+            (host().call_value)(self.ctx.raw, self.h, handles.as_ptr(), handles.len())
+        };
+        self.ctx.checked(h, "function value")
+    }
+
+    /// Invoke a method on a component or native object.
+    pub fn invoke(self, method: &str, args: &[Value<'a>]) -> Result<Value<'a>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, invoke_method),
+            "invoking a method",
+            abi::tier::EXECUTION,
+        )?;
+        let handles = args_of(args);
+        let h = unsafe {
+            (host().invoke_method)(
+                self.ctx.raw,
+                self.h,
+                StrRef::new(method),
+                handles.as_ptr(),
+                handles.len(),
+            )
+        };
+        self.ctx.checked(h, method)
+    }
+
+    /// Set a property on a component — dependency injection.
+    pub fn set_property(self, name: &str, value: Value<'_>) -> Result<()> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, component_set),
+            "injecting a component property",
+            abi::tier::EXECUTION,
+        )?;
+        status(
+            unsafe {
+                (host().component_set)(self.ctx.raw, self.h, StrRef::new(name), value.h)
+            },
+            "component_set",
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // module!
 // ---------------------------------------------------------------------------
@@ -1026,6 +1177,7 @@ macro_rules! module {
     (
         name: $name:literal,
         version: $version:literal
+        $(, tier: $tier:expr )?
         $(, bifs: { $( $bif_name:literal => $bif_fn:path ),* $(,)? } )?
         $(, classes: { $( $class:ty ),* $(,)? } )?
         $(, on_load: $on_load:path )?
@@ -1094,7 +1246,15 @@ macro_rules! module {
         static __RUSTCFML_DECL: $crate::abi::ModuleDecl = $crate::abi::ModuleDecl {
             size: core::mem::size_of::<$crate::abi::ModuleDecl>(),
             abi_major: $crate::abi::ABI_MAJOR,
-            tier: $crate::abi::tier::VALUES,
+            // The tier this extension REQUIRES. Declaring it lets an older
+            // engine refuse the load up front with a legible message instead of
+            // failing at the first call.
+            tier: {
+                #[allow(unused_mut, unused_assignments)]
+                let mut t = $crate::abi::tier::VALUES;
+                $( t = $tier; )?
+                t
+            },
             name: $crate::abi::StrRef::new($name),
             version: $crate::abi::StrRef::new($version),
             target: $crate::abi::StrRef::new($crate::abi::TARGET),

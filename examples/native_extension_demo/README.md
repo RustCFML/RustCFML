@@ -48,6 +48,26 @@ Note `Application.cfc`. Without one there is no application, so the
 extension. `probe_application_scope.cfm` checks that in plain CFML with no
 extension involved, and is the first thing to run when a memoiser looks broken.
 
+## Tier 3 — running CFML from Rust
+
+`tier3.cfm`, also serve mode.
+
+| | |
+|---|---|
+| `demoApply( callback, value )` | call a CFML closure the page handed over |
+| `demoSort( array )` | Rust does the mechanics, CFML does the per-element work |
+| `demoUseComponent( path, method )` | construct a CFC, **inject** into it, invoke it |
+| `demoComponentAnnotations( path )` | read a CFC's metadata |
+| `demoEmit( text )` | write straight to page output |
+
+`Greeter.cfc` is an ordinary component the extension constructs and drives. Note
+that its `hello()` reads `variables.injected` — injection writes the
+**`variables`** scope, because that is what a component's own methods read.
+
+The last block in `tier3.cfm` is the one that matters: CFML → extension → CFML →
+extension. Under the old exclusive dispatch guard the nested extension call
+deadlocked.
+
 ## The two things worth copying
 
 **Bulk reads.** `query_column(i)` materialises a whole column in one crossing;

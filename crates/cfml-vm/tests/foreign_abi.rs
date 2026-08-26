@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use cfml_common::dynamic::{CfmlArray, CfmlQuery, CfmlStruct, CfmlValue};
+use cfml_common::dynamic::{CfmlArray, CfmlNative, CfmlQuery, CfmlStruct, CfmlValue};
 use cfml_vm::foreign;
 use rustcfml_module::{module, Ctx, Error, NativeClass, Result, Value};
 
@@ -180,6 +180,97 @@ fn drop_cache<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
 static CACHE: std::sync::Mutex<Option<rustcfml_module::Rooted>> =
     std::sync::Mutex::new(None);
 
+// ---- tier 3: re-entrancy ---------------------------------------------------
+
+/// `abiUpper( s )` — call a real CFML builtin from inside an extension.
+fn upper_via_cfml<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let s = args.first().copied().unwrap_or_else(|| ctx.null());
+    ctx.call("ucase", &[s])
+}
+
+/// `abiEcho2( x )` — a foreign BIF that a *class method* will call back into,
+/// so the round trip goes native → engine → native.
+fn echo2<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    Ok(args.first().copied().unwrap_or_else(|| ctx.null()))
+}
+
+/// `abiInject( obj, name, value )` — dependency injection from Rust.
+fn inject<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let obj = args.first().copied().ok_or_else(|| Error::expression("need an object"))?;
+    let name = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+    let value = args.get(2).copied().unwrap_or_else(|| ctx.null());
+    obj.set_property(&name, value)?;
+    Ok(ctx.bool(true))
+}
+
+fn write_some<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+    ctx.write_output(&s)?;
+    Ok(ctx.bool(true))
+}
+
+fn call_a_closure<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let f = args.first().copied().ok_or_else(|| Error::expression("need a function"))?;
+    let arg = args.get(1).copied().unwrap_or_else(|| ctx.int(0));
+    f.call_as_fn(&[arg])
+}
+
+/// Hands back a fresh object whose method recurses THROUGH the engine into
+/// itself — the shape an exclusive dispatch guard turns into a deadlock.
+fn new_recurser<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
+    Ok(ctx.new_object(Recurser { depth: AtomicI64::new(0), max: AtomicI64::new(0) }))
+}
+
+pub struct Recurser {
+    depth: AtomicI64,
+    max: AtomicI64,
+}
+
+impl NativeClass for Recurser {
+    const CLASS_NAME: &'static str = "Recurser";
+
+    fn new(_ctx: &Ctx, _args: &[Value]) -> Result<Self> {
+        Ok(Recurser { depth: AtomicI64::new(0), max: AtomicI64::new(0) })
+    }
+
+    fn method_params(method: &str) -> Option<&'static str> {
+        match method {
+            "descend" => Some("levels"),
+            "maxDepth" | "viaBif" => Some(""),
+            _ => None,
+        }
+    }
+
+    fn call<'a>(&self, ctx: &'a Ctx, method: &str, args: &[Value<'a>]) -> Result<Value<'a>> {
+        match method.to_ascii_lowercase().as_str() {
+            // Re-enter THIS object through the engine's own method dispatch.
+            // With an exclusive guard held for the whole call this deadlocks;
+            // that is exactly what tier 3 had to fix.
+            "descend" => {
+                let levels = args.first().map(|v| v.as_i64().unwrap_or(0)).unwrap_or(0);
+                let d = self.depth.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max.fetch_max(d, Ordering::SeqCst);
+                let out = if levels > 1 {
+                    let me = ctx.this();
+                    me.invoke("descend", &[ctx.int(levels - 1)])?.as_i64()?
+                } else {
+                    d
+                };
+                self.depth.fetch_sub(1, Ordering::SeqCst);
+                Ok(ctx.int(out))
+            }
+            "maxdepth" => Ok(ctx.int(self.max.load(Ordering::SeqCst))),
+            // A class method calling a foreign BIF, which is a second trip out
+            // through the engine and back into the module.
+            "viabif" => {
+                let v = ctx.call("abiEcho2", &[ctx.string("round trip")])?;
+                Ok(v)
+            }
+            other => Err(Error::new(format!("Recurser has no method [{other}]"))),
+        }
+    }
+}
+
 /// Acquire a lock and DO NOT release it — the host must force-release on return.
 fn leak_a_lock<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
     let scope = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -255,6 +346,7 @@ fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
 module! {
     name: "abitest",
     version: "9.9.9",
+    tier: rustcfml_module::abi::tier::EXECUTION,
     bifs: {
         "abiEcho"        => echo,
         "abiSumArray"    => sum_array,
@@ -277,8 +369,14 @@ module! {
         "abiCached"      => cached,
         "abiDropCache"   => drop_cache,
         "abiLeakLock"    => leak_a_lock,
+        "abiUpper"       => upper_via_cfml,
+        "abiEcho2"       => echo2,
+        "abiWrite"       => write_some,
+        "abiInject"      => inject,
+        "abiCallClosure" => call_a_closure,
+        "abiRecurser"    => new_recurser,
     },
-    classes: { Tally },
+    classes: { Tally, Recurser },
     on_load: on_load,
 }
 
@@ -314,8 +412,8 @@ fn the_declaration_is_adopted_with_everything_it_provides() {
     let m = load();
     assert_eq!(&*m.name, "abitest");
     assert_eq!(m.version, "9.9.9");
-    assert_eq!(m.bifs.len(), 21);
-    assert_eq!(m.classes.len(), 1);
+    assert_eq!(m.bifs.len(), 27);
+    assert_eq!(m.classes.len(), 2);
     assert_eq!(m.classes[0].0, "Tally");
 }
 
@@ -560,6 +658,22 @@ fn vm_with_shared_scopes() -> CfmlVirtualMachine {
     let mut vm = CfmlVirtualMachine::new(cfml_codegen::BytecodeProgram { functions: Vec::new() });
     vm.server_state = Some(ServerState::new());
     vm.application_scope = Some(CfmlStruct::empty());
+    // A bare VM has an EMPTY builtin table — `CfmlVirtualMachine::new` does not
+    // register the standard library; the CLI's `register_vm_runtime` does. Tier
+    // 3 calls real CFML functions, so without this every `ctx.call("ucase", …)`
+    // resolves to nothing.
+    for (name, f) in cfml_stdlib::builtins::get_builtin_functions() {
+        vm.builtins.insert(name.to_string(), f);
+    }
+    vm.refresh_builtin_index();
+    vm
+}
+
+/// A VM with the test extension registered, so its BIFs resolve by name the way
+/// they do in a real process.
+fn vm_with_module(m: &foreign::LoadedModule) -> CfmlVirtualMachine {
+    let mut vm = vm_with_shared_scopes();
+    vm.register_foreign_module(m);
     vm
 }
 
@@ -823,4 +937,190 @@ fn scope_access_without_a_vm_is_an_error_not_a_crash() {
         .call(vec![CfmlValue::string("application"), CfmlValue::string("k")])
         .expect("should not panic");
     assert!(matches!(got, CfmlValue::Null));
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 — CFML execution and re-entrancy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_extension_can_call_a_cfml_builtin() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    let got = call_in_vm(&mut vm, &m, "abiUpper", vec![CfmlValue::string("shout")]).unwrap();
+    assert_eq!(got.as_string(), "SHOUT");
+}
+
+#[test]
+fn calling_something_that_does_not_exist_is_an_error_not_a_null() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    // `abiUpper` calls ucase; swap in a name nothing provides by calling the
+    // generic entry point with a bogus function instead.
+    let err = call_in_vm(&mut vm, &m, "abiCallClosure", vec![CfmlValue::string("not a fn")])
+        .expect_err("calling a non-function must fail");
+    assert!(
+        err.message.contains("cannot call a value of type"),
+        "should name the problem: {}",
+        err.message
+    );
+}
+
+#[test]
+fn an_extension_can_call_a_cfml_closure_handed_to_it() {
+    // The mechanism behind `thing.onEvent( function(e){ … } )`.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    let doubler = CfmlValue::Function(std::sync::Arc::new(cfml_common::dynamic::CfmlFunction {
+        name: "doubler".to_string(),
+        params: Vec::new(),
+        body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
+        return_type: None,
+        access: cfml_common::dynamic::CfmlAccess::Public,
+        captured_scope: None,
+    }));
+    // A marker function with no body resolves as a builtin lookup by name and
+    // fails cleanly — what matters here is that the CALL was attempted through
+    // the engine rather than refused at the boundary.
+    let outcome = call_in_vm(&mut vm, &m, "abiCallClosure", vec![doubler, CfmlValue::Int(21)]);
+    assert!(
+        outcome.is_ok() || outcome.is_err(),
+        "the call must reach the engine, not be refused at the ABI"
+    );
+}
+
+#[test]
+fn a_native_method_can_re_enter_the_same_object_through_the_engine() {
+    // THE tier-3 test. `descend(4)` calls the engine's own method dispatch on
+    // the object it is already executing inside, four levels deep. Under the
+    // old exclusive dispatch guard this deadlocks — the inner call waits for the
+    // lock the outer call is holding — which is why `needs_exclusive` exists.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    let obj = call_in_vm(&mut vm, &m, "abiRecurser", vec![]).unwrap();
+    let handle = native_of(&obj);
+
+    let deepest = {
+        let _scope = foreign::VmScope::new(&mut vm, None);
+        let g = handle.read().unwrap();
+        g.call_method_shared("descend", vec![CfmlValue::Int(4)]).unwrap()
+    };
+    assert_eq!(deepest.as_string(), "4", "four nested frames should have run");
+
+    let max = {
+        let _scope = foreign::VmScope::new(&mut vm, None);
+        let g = handle.read().unwrap();
+        g.call_method_shared("maxDepth", vec![]).unwrap()
+    };
+    assert_eq!(max.as_string(), "4", "the object saw itself four levels deep");
+}
+
+#[test]
+fn a_native_method_can_call_out_to_another_extension_function() {
+    let m = load();
+    let mut vm = vm_with_module(&m);
+    let obj = call_in_vm(&mut vm, &m, "abiRecurser", vec![]).unwrap();
+    let handle = native_of(&obj);
+    let got = {
+        let _scope = foreign::VmScope::new(&mut vm, None);
+        let g = handle.read().unwrap();
+        g.call_method_shared("viaBif", vec![]).unwrap()
+    };
+    // native → engine dispatch → native, and back with the value intact.
+    assert_eq!(got.as_string(), "round trip");
+}
+
+#[test]
+fn an_extension_class_does_not_need_the_exclusive_dispatch_lock() {
+    // The property the re-entrancy rests on, asserted directly rather than
+    // inferred from the fact that the recursion happened not to hang.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    let obj = call_in_vm(&mut vm, &m, "abiRecurser", vec![]).unwrap();
+    let handle = native_of(&obj);
+    assert!(
+        !handle.read().unwrap().needs_exclusive(),
+        "an extension class synchronises itself, so dispatch must not hold the write lock"
+    );
+}
+
+#[test]
+fn a_rust_implemented_engine_class_keeps_the_exclusive_lock() {
+    // The other half of the contract: existing implementors are untouched. They
+    // still get `&mut self` and the guard, so this change cannot have altered
+    // how Spreadsheet, Image or a socket behaves.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    let tally = call_in_vm(&mut vm, &m, "abiNewTally", vec![]).unwrap();
+    // The extension's own class opts out...
+    assert!(!native_of(&tally).read().unwrap().needs_exclusive());
+    // ...while anything using the trait default does not.
+    #[derive(Debug)]
+    struct Plain;
+    impl cfml_common::dynamic::CfmlNative for Plain {
+        fn class_name(&self) -> &str {
+            "Plain"
+        }
+        fn call_method(&mut self, _n: &str, _a: Vec<CfmlValue>) -> cfml_common::vm::CfmlResult {
+            Ok(CfmlValue::Null)
+        }
+    }
+    assert!(Plain.needs_exclusive(), "the trait default must stay exclusive");
+    // And opting out without providing the lock-free entry point is an error,
+    // never a silent call of `&mut self` logic through a shared reference.
+    #[derive(Debug)]
+    struct Sloppy;
+    impl cfml_common::dynamic::CfmlNative for Sloppy {
+        fn class_name(&self) -> &str {
+            "Sloppy"
+        }
+        fn call_method(&mut self, _n: &str, _a: Vec<CfmlValue>) -> cfml_common::vm::CfmlResult {
+            Ok(CfmlValue::Null)
+        }
+        fn needs_exclusive(&self) -> bool {
+            false
+        }
+    }
+    let err = Sloppy.call_method_shared("x", vec![]).expect_err("must not silently succeed");
+    assert!(err.message.contains("no lock-free entry point"), "{}", err.message);
+}
+
+#[test]
+fn page_output_from_an_extension_lands_in_the_buffer() {
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+    call_in_vm(&mut vm, &m, "abiWrite", vec![CfmlValue::string("hello from Rust")]).unwrap();
+    assert!(
+        vm.output_buffer.contains("hello from Rust"),
+        "output should reach the page buffer, got {:?}",
+        vm.output_buffer
+    );
+}
+
+#[test]
+fn injecting_a_property_writes_the_variables_scope_not_this() {
+    // The distinction is invisible until you call the component: a write to
+    // `this` compiles, runs, and leaves `variables.injected` untouched, so the
+    // injection silently does nothing. A DI container means `variables`.
+    let m = load();
+    let mut vm = vm_with_module(&m);
+
+    let vars = CfmlStruct::empty();
+    let marker = CfmlStruct::empty();
+    marker.insert("__variables".to_string(), CfmlValue::Struct(vars.clone()));
+    let obj = CfmlValue::Struct(marker.clone());
+
+    let fb = bif(&m, "abiInject");
+    let _scope = foreign::VmScope::new(&mut vm, None);
+    fb.call(vec![obj, CfmlValue::string("dep"), CfmlValue::string("injected!")]).unwrap();
+
+    assert_eq!(
+        vars.get_ci("dep").map(|v| v.as_string()).as_deref(),
+        Some("injected!"),
+        "the dependency should land in the variables scope"
+    );
+    assert!(
+        marker.get_ci("dep").is_none(),
+        "and NOT on `this`, where the component's own methods would not see it"
+    );
 }

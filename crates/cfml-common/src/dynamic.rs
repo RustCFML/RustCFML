@@ -1646,6 +1646,42 @@ pub trait CfmlNative: Send + Sync + fmt::Debug {
     fn method_params(&self, _method: &str) -> Option<&'static [&'static str]> {
         None
     }
+
+    /// Must dispatch hold this object's **exclusive** lock for the whole call?
+    ///
+    /// `true` — the default, and what every Rust-implemented class in the engine
+    /// wants — gives `call_method` its `&mut self`. The cost is that a method
+    /// which calls back into CFML that touches the same object deadlocks: the
+    /// re-entry needs the lock the outer call is still holding. A dependency
+    /// container resolving a bean whose provider resolves another bean from the
+    /// same container is exactly that shape, so for anything re-entrant this is
+    /// the main line, not a corner case.
+    ///
+    /// `false` says "I synchronise myself". Dispatch then takes only a *shared*
+    /// lock and calls [`CfmlNative::call_method_shared`], so several frames of
+    /// the same object can be live at once and CFML re-entry works. Nothing
+    /// takes the exclusive lock for such an object, so shared re-entry cannot be
+    /// starved by a waiting writer.
+    fn needs_exclusive(&self) -> bool {
+        true
+    }
+
+    /// Dispatch for an object that synchronises itself
+    /// ([`CfmlNative::needs_exclusive`] returning `false`).
+    ///
+    /// Only ever called for such an object, which is why the default is an
+    /// error rather than a forward to `call_method`: silently succeeding here
+    /// would mean an implementor had opted out of the lock without providing the
+    /// lock-free entry point, and the engine would be calling `&mut self` logic
+    /// through a shared reference.
+    fn call_method_shared(&self, name: &str, _args: Vec<CfmlValue>) -> CfmlResult {
+        Err(crate::vm::CfmlError::runtime(format!(
+            "{} declares it does not need the exclusive dispatch lock but provides no \
+             lock-free entry point (method [{}])",
+            self.class_name(),
+            name
+        )))
+    }
 }
 
 #[derive(Clone)]

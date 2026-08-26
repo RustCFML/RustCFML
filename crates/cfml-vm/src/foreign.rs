@@ -31,7 +31,7 @@ use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 
 /// The tier this host implements. Values only, for now; tier 2 appends scope
 /// access to the vtable without breaking anything already published.
-pub const HOST_TIER: u32 = abi::tier::SCOPES;
+pub const HOST_TIER: u32 = abi::tier::EXECUTION;
 
 const CTX_MAGIC: u64 = 0x5243464d_4c435458; // "RCFMLCTX"
 
@@ -212,6 +212,13 @@ unsafe fn state_of<'a>(raw: *mut Ctx) -> Option<&'a mut CallState> {
 /// bump for every container type, so this is cheap for exactly the values where
 /// it would otherwise be expensive.
 unsafe fn value_of(raw: *mut Ctx, h: ValueHandle) -> Option<CfmlValue> {
+    // `ctx.this()` is usable as a VALUE, not only as a return: passing it to
+    // `invoke_method` is how a class method re-enters itself through the engine,
+    // which is the whole point of tier 3. Resolved here so every entry point
+    // accepts it without each one remembering to.
+    if h.is_self() {
+        return ctx_of(raw)?.receiver.clone();
+    }
     let state = state_of(raw)?;
     if h.gen != state.generation {
         return None;
@@ -222,6 +229,9 @@ unsafe fn value_of(raw: *mut Ctx, h: ValueHandle) -> Option<CfmlValue> {
 /// Borrow a handle's value in place, for the accessors that hand out a pointer
 /// into it.
 unsafe fn value_ref<'a>(raw: *mut Ctx, h: ValueHandle) -> Option<&'a CfmlValue> {
+    if h.is_self() {
+        return ctx_of(raw)?.receiver.as_ref();
+    }
     let state = state_of(raw)?;
     if h.gen != state.generation {
         return None;
@@ -772,6 +782,14 @@ unsafe extern "C" fn h_throw(
         }),
         _ => CfmlErrorType::Application,
     };
+    // FIRST error wins. A tier-3 entry point that fails stages the engine's own
+    // error, and the wrapper then returns `Err` from the module — whose `throw`
+    // would otherwise land here and replace a precise CFML error ("no such
+    // component", a database error, a lock timeout) with the module's generic
+    // "[x] failed". The inner cause is the one worth reporting.
+    if state.error.is_some() {
+        return;
+    }
     let mut err = CfmlError::new(message, kind);
     if let Some(CfmlValue::Struct(s)) = extras_val {
         err.extras = Some(Box::new(s.snapshot()));
@@ -836,6 +854,15 @@ pub static HOST_VTABLE: HostVtable = HostVtable {
     root: h_root,
     unroot: h_unroot,
     root_get: h_root_get,
+    // ---- tier 3 ----
+    call_fn: h_call_fn,
+    call_value: h_call_value,
+    new_component: h_new_component,
+    invoke_method: h_invoke_method,
+    component_set: h_component_set,
+    component_metadata: h_component_metadata,
+    write_output: h_write_output,
+    include_template: h_include_template,
 };
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1085,24 @@ impl ForeignNative {
         CfmlValue::NativeObject(arc)
     }
 
+    /// Forward a method call to the module, with no engine lock held.
+    fn dispatch(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        let vtable = self.vtable;
+        let data = self.data;
+        let class = self.class_name();
+        let label = || format!("{}.{}", class, name);
+        let method = name.to_string();
+        with_call(&label, self.this(), args, move |raw, handles| unsafe {
+            ((*vtable).call_method)(
+                raw,
+                data,
+                StrRef::new(&method),
+                handles.as_ptr(),
+                handles.len(),
+            )
+        })
+    }
+
     fn this(&self) -> Option<CfmlValue> {
         self.self_ref
             .as_ref()
@@ -1080,21 +1125,22 @@ impl CfmlNative for ForeignNative {
         }
     }
 
+    /// An extension manages its own synchronisation by contract (§4.6), and the
+    /// wrapper's `&self` method signature enforces it — so dispatch need not
+    /// hold the exclusive lock, which is what lets an extension method call back
+    /// into CFML that re-enters this same object.
+    fn needs_exclusive(&self) -> bool {
+        false
+    }
+
+    fn call_method_shared(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        self.dispatch(name, args)
+    }
+
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
-        let vtable = self.vtable;
-        let data = self.data;
-        let class = self.class_name();
-        let label = || format!("{}.{}", class, name);
-        let method = name.to_string();
-        with_call(&label, self.this(), args, move |raw, handles| unsafe {
-            ((*vtable).call_method)(
-                raw,
-                data,
-                StrRef::new(&method),
-                handles.as_ptr(),
-                handles.len(),
-            )
-        })
+        // Reached only through a path that took the exclusive lock anyway
+        // (`cfinvoke`, a proxy SAM invoke). Forwards to the same place.
+        self.dispatch(name, args)
     }
 
     fn method_params(&self, method: &str) -> Option<&'static [&'static str]> {
@@ -1667,4 +1713,180 @@ pub fn rooted_count() -> usize {
         .ok()
         .and_then(|g| g.as_ref().map(|t| t.1.len()))
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 — CFML execution
+// ---------------------------------------------------------------------------
+//
+// Everything here re-enters the engine while a module call is in flight. That is
+// only possible because object dispatch stopped holding the exclusive guard for
+// self-synchronising natives (`CfmlNative::needs_exclusive`): an extension
+// method calling CFML that calls back into the same object would otherwise
+// block on the lock its own caller holds.
+
+/// Pull the argument handles into owned values, for a re-entrant call.
+///
+/// Cloning out first matters: the callee runs arbitrary CFML, which may create
+/// values and grow the slab, and a borrow into it would not survive that.
+unsafe fn args_out(raw: *mut Ctx, args: *const ValueHandle, argc: usize) -> Vec<CfmlValue> {
+    if argc == 0 || args.is_null() {
+        return Vec::new();
+    }
+    std::slice::from_raw_parts(args, argc)
+        .iter()
+        .map(|h| value_of(raw, *h).unwrap_or(CfmlValue::Null))
+        .collect()
+}
+
+/// Stage an error raised by re-entrant CFML so the module's return becomes it.
+unsafe fn stage_err(raw: *mut Ctx, e: CfmlError) -> ValueHandle {
+    if let Some(state) = state_of(raw) {
+        state.error = Some(e);
+    }
+    ValueHandle::NULL
+}
+
+unsafe extern "C-unwind" fn h_call_fn(
+    raw: *mut Ctx,
+    name: StrRef,
+    args: *const ValueHandle,
+    argc: usize,
+) -> ValueHandle {
+    let fname = str_in(name);
+    let vals = args_out(raw, args, argc);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    let Some(callee) = vm.resolve_callable(&fname, &locals) else {
+        return stage_err(
+            raw,
+            CfmlError::runtime(format!("Function [{}] not found", fname)),
+        );
+    };
+    match vm.call_value_public(&callee, vals, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
+    }
+}
+
+unsafe extern "C-unwind" fn h_call_value(
+    raw: *mut Ctx,
+    callee: ValueHandle,
+    args: *const ValueHandle,
+    argc: usize,
+) -> ValueHandle {
+    let f = out_or!(value_of(raw, callee), ValueHandle::NULL);
+    if !matches!(f, CfmlValue::Function(_) | CfmlValue::Closure(_)) {
+        return stage_err(
+            raw,
+            CfmlError::runtime(format!("cannot call a value of type {}", f.type_name())),
+        );
+    }
+    let vals = args_out(raw, args, argc);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    match vm.call_value_public(&f, vals, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
+    }
+}
+
+unsafe extern "C-unwind" fn h_new_component(
+    raw: *mut Ctx,
+    path: StrRef,
+    args: *const ValueHandle,
+    argc: usize,
+) -> ValueHandle {
+    let p = str_in(path);
+    let vals = args_out(raw, args, argc);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    match vm.new_component_public(&p, vals, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
+    }
+}
+
+unsafe extern "C-unwind" fn h_invoke_method(
+    raw: *mut Ctx,
+    object: ValueHandle,
+    name: StrRef,
+    args: *const ValueHandle,
+    argc: usize,
+) -> ValueHandle {
+    let obj = out_or!(value_of(raw, object), ValueHandle::NULL);
+    let method = str_in(name);
+    let vals = args_out(raw, args, argc);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    match vm.invoke_method_public(&obj, &method, vals, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
+    }
+}
+
+unsafe extern "C-unwind" fn h_component_set(
+    raw: *mut Ctx,
+    object: ValueHandle,
+    name: StrRef,
+    value: ValueHandle,
+) -> u32 {
+    let obj = out_or!(value_of(raw, object), abi::status::BAD_HANDLE);
+    let v = out_or!(value_of(raw, value), abi::status::BAD_HANDLE);
+    let key = str_in(name);
+    // Writes the component's **`variables`** scope, not `this` — because that is
+    // what injecting a dependency means, and what the component's own methods
+    // read. Setting the public member instead compiles, runs, and leaves
+    // `variables.injected` untouched, so the injection silently does nothing.
+    //
+    // A component arrives either as the marker struct or, with the flyweight
+    // instance model on (the default), as an `Instance`. `createObject` returns
+    // the latter, so handling only the struct form fails every real injection.
+    match &obj {
+        #[cfg(feature = "component-instance")]
+        CfmlValue::Instance(inst) => {
+            let vars = inst.read().private_map_handle();
+            vars.insert(key, v);
+            abi::status::OK
+        }
+        CfmlValue::Struct(s) => {
+            match s.get_ci(&*cfml_common::key::well_known::VARIABLES) {
+                Some(CfmlValue::Struct(vars)) => vars.insert(key, v),
+                // A marker with no `variables` scope assembled yet (an
+                // in-construction `this`): fall back to the struct itself.
+                _ => s.insert(key, v),
+            };
+            abi::status::OK
+        }
+        _ => abi::status::WRONG_TYPE,
+    }
+}
+
+unsafe extern "C-unwind" fn h_component_metadata(raw: *mut Ctx, path: StrRef) -> ValueHandle {
+    let p = str_in(path);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    match vm.component_metadata_public(&p, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
+    }
+}
+
+unsafe extern "C-unwind" fn h_write_output(raw: *mut Ctx, text: StrRef) -> u32 {
+    let t = str_in(text);
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    vm.write_output_public(&t);
+    abi::status::OK
+}
+
+unsafe extern "C-unwind" fn h_include_template(raw: *mut Ctx, path: StrRef) -> u32 {
+    let p = str_in(path);
+    let Some(vm) = vm_of(raw) else { return abi::status::NO_SCOPE };
+    match vm.include_for_extension(&p) {
+        Ok(()) => abi::status::OK,
+        Err(e) => {
+            stage_err(raw, e);
+            1
+        }
+    }
 }

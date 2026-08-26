@@ -276,6 +276,80 @@ fn request_var<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
     ctx.var(&key)
 }
 
+// ---------------------------------------------------------------------------
+// Tier 3 — running CFML from Rust
+// ---------------------------------------------------------------------------
+
+/// `demoApply( callback, value )` — call a CFML closure the page handed us.
+///
+/// This is the shape that makes fluent interception possible:
+/// `thing.onEvent( function(e){ … } )`.
+fn apply_callback<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let f = args
+        .first()
+        .copied()
+        .ok_or_else(|| Error::expression("demoApply() needs a function"))?;
+    let arg = args.get(1).copied().unwrap_or_else(|| ctx.int(0));
+    f.call_as_fn(&[arg])
+}
+
+/// `demoUseComponent( path, method )` — instantiate a CFC and call a method on
+/// it, entirely from Rust.
+fn use_component<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let path = args
+        .first()
+        .map(|v| v.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::expression("demoUseComponent() needs a component path"))?;
+    let method = args.get(1).map(|v| v.to_string()).unwrap_or_else(|| "hello".to_string());
+    let obj = ctx.new_component(&path, &[])?;
+    // Injection, the way a container would do it.
+    obj.set_property("injected", ctx.string("set from Rust"))?;
+    obj.invoke(&method, &[])
+}
+
+/// `demoComponentAnnotations( path )` — read a CFC's metadata, which is what
+/// annotation-driven dependency injection is built on.
+fn component_annotations<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let path = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let meta = ctx.component_metadata(&path)?;
+    let out = ctx.strukt();
+    out.put("name", meta.key("name"))?;
+    out.put("hint", meta.key("hint"))?;
+    Ok(out)
+}
+
+/// `demoEmit( text )` — write straight to page output, honouring whatever
+/// capture is in effect.
+fn emit<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let text = args.first().map(|v| v.to_string()).unwrap_or_default();
+    ctx.write_output(&text)?;
+    Ok(ctx.bool(true))
+}
+
+/// `demoSort( array )` — do the work in Rust, but call back into CFML for the
+/// comparison, which is the pattern a real extension uses when the policy
+/// belongs to the application and the mechanics belong to Rust.
+fn sort_with_cfml<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let arr = args
+        .first()
+        .copied()
+        .filter(|v| v.kind() == abi::ty::ARRAY)
+        .ok_or_else(|| Error::expression("demoSort() takes an array"))?;
+    let n = arr.len()?;
+    let mut items: Vec<String> = (0..n).map(|i| arr.get(i).to_string()).collect();
+    // `ucase` is a CFML builtin, called per element from Rust.
+    for item in items.iter_mut() {
+        *item = ctx.call("ucase", &[ctx.string(item.as_str())])?.to_string();
+    }
+    items.sort();
+    let out = ctx.array_with_capacity(items.len());
+    for item in items {
+        out.push(ctx.string(item))?;
+    }
+    Ok(out)
+}
+
 /// Once per process, never per request — the place for thread pools and caches.
 ///
 /// `settings` is this extension's `.cfconfig.json` block:
@@ -296,6 +370,9 @@ static GREETING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 module! {
     name: "demo",
     version: "0.1.0",
+    // This extension reads scopes, takes locks AND runs CFML, so it needs the
+    // top tier. An engine providing less refuses the load up front.
+    tier: abi::tier::EXECUTION,
     bifs: {
         "demoGreet"          => greet,
         "demoStats"          => stats,
@@ -308,6 +385,11 @@ module! {
         "demoMemoiseComputations" => memoise_computations,
         "demoUnlockedWrite"      => unlocked_write,
         "demoRequestVar"         => request_var,
+        "demoApply"               => apply_callback,
+        "demoUseComponent"        => use_component,
+        "demoComponentAnnotations" => component_annotations,
+        "demoEmit"                => emit,
+        "demoSort"                => sort_with_cfml,
     },
     classes: { Tally },
     on_load: on_load,
