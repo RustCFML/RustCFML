@@ -3419,9 +3419,13 @@ fn build_self_contained(app_dir: &str, output: &str, mode: &str, entry: &str) {
         );
     }
 
-    // Walk directory and collect all files
+    // Walk directory and collect all files. The output binary is excluded: it
+    // usually lives IN the app directory, and embedding the previous build's
+    // ~100 MB self-contained binary into the new one doubles the size on every
+    // rebuild while still running perfectly, so nothing ever notices.
+    let skip_output = fs::canonicalize(output).ok();
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
-    collect_files(&app_path, &app_path, &mut files);
+    collect_files(&app_path, &app_path, skip_output.as_deref(), &mut files);
 
     if files.is_empty() {
         eprintln!("Error: No files found in '{}'", app_dir);
@@ -3825,7 +3829,12 @@ path = "src/main.rs"
 
 /// Recursively collect files from a directory into a HashMap.
 /// Keys are relative paths with forward slashes.
-fn collect_files(base: &Path, dir: &Path, files: &mut std::collections::HashMap<String, Vec<u8>>) {
+fn collect_files(
+    base: &Path,
+    dir: &Path,
+    skip: Option<&Path>,
+    files: &mut std::collections::HashMap<String, Vec<u8>>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -3848,8 +3857,13 @@ fn collect_files(base: &Path, dir: &Path, files: &mut std::collections::HashMap<
             if name == "native" && path.parent() == Some(base) {
                 continue;
             }
-            collect_files(base, &path, files);
+            collect_files(base, &path, skip, files);
         } else if path.is_file() {
+            if let Some(skip) = skip {
+                if fs::canonicalize(&path).is_ok_and(|p| p == skip) {
+                    continue;
+                }
+            }
             let relative = path.strip_prefix(base)
                 .unwrap_or(&path)
                 .to_string_lossy()

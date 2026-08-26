@@ -183,6 +183,14 @@ impl CfmlPdf {
 }
 
 impl CfmlNative for CfmlPdf {
+    fn method_params(&self, method: &str) -> Option<&'static [&'static str]> {
+        Some(match method.to_ascii_lowercase().as_str() {
+            "toimage" | "topage" | "render" => &["page", "width", "dpi"][..],
+            "info" | "pagecount" | "getpagecount" | "size" | "source" => &[][..],
+            _ => return None,
+        })
+    }
+
     fn class_name(&self) -> &str {
         "Pdf"
     }

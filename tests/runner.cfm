@@ -334,6 +334,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_cfhttp.cfm">
 <cf_runtest file="stdlib/test_cfhttp_binary_response.cfm">
 <cf_runtest file="stdlib/test_spreadsheet.cfm">
+<cf_runtest file="stdlib/test_native_named_args.cfm" rustcfmlOnly="true" why="exercises RustCFML native-class (Rust-backed) method dispatch">
 <cf_runtest file="stdlib/test_member_function_coverage.cfm">
 <cf_runtest file="stdlib/test_locale_state.cfm">
 <cf_runtest file="stdlib/test_binary_as_array.cfm">

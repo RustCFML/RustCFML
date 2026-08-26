@@ -1415,6 +1415,88 @@ impl CfmlNative for CfmlSpreadsheet {
         "Spreadsheet"
     }
 
+    /// Declared parameter names, so `wb.formatRow( row=1, format={bold:true} )`
+    /// binds by name instead of by call-site order. Names follow the
+    /// ACF/Lucee/cfsimplicity `Spreadsheet*` BIF signatures (minus the leading
+    /// workbook argument, which the member form supplies as the receiver).
+    fn method_params(&self, method: &str) -> Option<&'static [&'static str]> {
+        Some(match method.to_lowercase().as_str() {
+            "setcellvalue" => &["value", "row", "column", "type"][..],
+            "createsheet" | "newsheet" | "setactivesheet" | "sheet" => &["sheetName"][..],
+            "renamesheet" => &["sheetName", "sheetNumber"][..],
+            "write" => &["filepath", "overwrite", "password"][..],
+            "setactivesheetnumber" => &["sheetNumber"][..],
+            "addrow" => &["data", "row", "column", "insert", "delimiter"][..],
+            "addrows" => &["data", "row", "column", "includeQueryColumnNames"][..],
+            "addcolumn" => &["data", "startRow", "startColumn", "insert", "delimiter"][..],
+            "formatcell" => &["format", "row", "column"][..],
+            "formatrow" => &["format", "row"][..],
+            "formatcolumn" => &["format", "column"][..],
+            "formatcellrange" => {
+                &["format", "startRow", "startColumn", "endRow", "endColumn"][..]
+            }
+            "mergecells" | "clearcellrange" => {
+                &["startRow", "startColumn", "endRow", "endColumn"][..]
+            }
+            "addfreezepane" => &["freezeColumn", "freezeRow"][..],
+            "freezerows" | "setrepeatingrows" | "deleterows" => &["rows"][..],
+            "freezecols" | "freezecolumns" | "setrepeatingcolumns" | "deletecolumns" => {
+                &["columns"][..]
+            }
+            "autosizecolumn" | "deletecolumn" | "hidecolumn" | "showcolumn"
+            | "iscolumnhidden" | "getcolumnwidth" => &["column"][..],
+            "setcolumnwidth" => &["column", "width"][..],
+            "setrowheight" => &["row", "height"][..],
+            "deleterow" | "hiderow" | "showrow" | "isrowhidden" => &["row"][..],
+            "shiftrows" | "shiftcolumns" => &["start", "end", "offset"][..],
+            "setcellformula" => &["formula", "row", "column"][..],
+            "clearcell" | "setactivecell" | "getcellcomment" | "getcellhyperlink"
+            | "getcellformula" | "getcelltype" | "getcellformat" | "getcellvalue" => {
+                &["row", "column"][..]
+            }
+            "setcellrangevalue" => {
+                &["value", "startRow", "startColumn", "endRow", "endColumn"][..]
+            }
+            "setcolumnhidden" => &["column", "hidden"][..],
+            "setrowhidden" => &["row", "hidden"][..],
+            "setcellcomment" => &["comment", "row", "column"][..],
+            "setcellhyperlink" => &["link", "row", "column", "tooltip"][..],
+            "addautofilter" => &["range"][..],
+            "addinfo" => &["info"][..],
+            "addimage" => &["image", "anchor"][..],
+            "addchart" => &["chart"][..],
+            "fromquery" | "fromarray" => &["data", "includeHeaders"][..],
+            "fromcsv" => &["csv", "delimiter"][..],
+            "selectsheet" => &["sheet"][..],
+            "headerrow" => &["data"][..],
+            "writetocsv" | "writecsv" => &["filepath", "delimiter"][..],
+            "addsplitpane" => {
+                &[
+                    "xSplitPosition",
+                    "ySplitPosition",
+                    "leftmostColumn",
+                    "topRow",
+                    "activePane",
+                ][..]
+            }
+            "setprintorientation" => &["orientation"][..],
+            "setfittopage" => &["state", "pagesWide", "pagesHigh"][..],
+            "setheader" | "setfooter" => &["left", "center", "right"][..],
+            "adddatavalidation" => &["validation"][..],
+            "addconditionalformatting" | "addconditionalformat" => &["format"][..],
+            "addpagebreaks" => &["rowBreaks", "columnBreaks"][..],
+            "load" => &["filepath"][..],
+            "fromjson" => &["json"][..],
+            "tojson" => &["pretty"][..],
+            "tocsv" => &["delimiter"][..],
+            // No-argument methods: naming anything is an error, which is what an
+            // empty parameter list produces.
+            "autosize" | "readbinary" | "tobinary" | "toquery" | "toarray"
+            | "getrowcount" | "rowcount" | "getcolumncount" | "columncount" | "info" => &[][..],
+            _ => return None,
+        })
+    }
+
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         let a = args.as_slice();
         match name.to_lowercase().as_str() {

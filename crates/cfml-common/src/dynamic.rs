@@ -1629,6 +1629,23 @@ pub trait CfmlNative: Send + Sync + fmt::Debug {
     fn set_property(&mut self, _name: &str, _value: CfmlValue) -> Option<Result<(), crate::vm::CfmlError>> {
         None
     }
+
+    /// The declared parameter names of `method`, in positional order, so the
+    /// host can bind a **named** call — `wb.renameSheet( sheetNumber=1,
+    /// sheetName="Zed" )` — to the positions `call_method` expects.
+    ///
+    /// Returning `None` means "this method does not declare its parameters".
+    /// The host then **refuses** a named call rather than passing the values in
+    /// call-site order, which binds them to the wrong parameters and corrupts
+    /// silently (the `renameSheet` example above renamed the sheet to "1").
+    /// Positional calls are unaffected either way.
+    ///
+    /// Names are matched case-insensitively. Omitted middle parameters arrive
+    /// as `CfmlValue::Null`; omitted trailing ones are simply absent, so
+    /// `args.get(n)` defaulting keeps working unchanged.
+    fn method_params(&self, _method: &str) -> Option<&'static [&'static str]> {
+        None
+    }
 }
 
 #[derive(Clone)]

@@ -333,6 +333,19 @@ impl CfmlHtmlDocument {
 }
 
 impl CfmlNative for CfmlHtmlDocument {
+    fn method_params(&self, method: &str) -> Option<&'static [&'static str]> {
+        Some(match method.to_ascii_lowercase().as_str() {
+            "select" => &["selector"][..],
+            "selectwithin" => &["element", "selector"][..],
+            "attr" | "removeattr" | "hasattr" => &["element", "name"][..],
+            "setattr" => &["element", "name", "value"][..],
+            "allelements" | "attributes" | "text" | "data" | "html" | "innerhtml"
+            | "outerhtml" | "tagname" => &["element"][..],
+            "tostring" | "documenthtml" => &[][..],
+            _ => return None,
+        })
+    }
+
     fn class_name(&self) -> &str {
         "HtmlDocument"
     }

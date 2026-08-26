@@ -23466,6 +23466,127 @@ impl CfmlVirtualMachine {
         Some(CfmlValue::Function(Arc::new(inner)))
     }
 
+    /// Reorder a native-class method's call-site arguments into the positional
+    /// order its `call_method` expects, using the parameter names the class
+    /// declares via [`CfmlNative::method_params`].
+    ///
+    /// `arg_names` is parallel to `arg_values`: an empty entry is a positional
+    /// argument, a non-empty one is the call-site name. Mixing the two forms is
+    /// already rejected upstream by `validate_named_args`, so in practice the
+    /// list is either all-empty (fast path, returned untouched) or all-named.
+    /// An `argumentCollection` struct is expanded into named arguments and an
+    /// `argumentCollection` array into positional ones, matching what free
+    /// functions do in `reorder_named_args_with_extras`.
+    fn bind_native_named_args(
+        native: &dyn cfml_common::dynamic::CfmlNative,
+        method: &str,
+        arg_names: Option<&[String]>,
+        arg_values: Vec<CfmlValue>,
+    ) -> Result<Vec<CfmlValue>, CfmlError> {
+        let Some(arg_names) = arg_names else {
+            return Ok(arg_values);
+        };
+        if arg_names.iter().all(|n| n.is_empty()) {
+            return Ok(arg_values);
+        }
+
+        // Expand argumentCollection first: a struct spreads as named arguments
+        // (numeric keys as positional, 1-based), an array as positional.
+        let mut named: Vec<(String, CfmlValue)> = Vec::with_capacity(arg_names.len());
+        let mut positional: Vec<(usize, CfmlValue)> = Vec::new();
+        for (i, name) in arg_names.iter().enumerate() {
+            let value = arg_values.get(i).cloned().unwrap_or(CfmlValue::Null);
+            if name.eq_ignore_ascii_case("argumentcollection") {
+                match &value {
+                    CfmlValue::Struct(s) => {
+                        s.with_map(|m| {
+                            for (k, v) in m.iter() {
+                                match k.parse::<usize>() {
+                                    Ok(pos) if pos >= 1 => positional.push((pos - 1, v.clone())),
+                                    _ => named.push((k.as_str().to_string(), v.clone())),
+                                }
+                            }
+                        });
+                        continue;
+                    }
+                    CfmlValue::Array(items) => {
+                        for (idx, v) in items.iter().enumerate() {
+                            positional.push((idx, v));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if name.is_empty() {
+                positional.push((positional.len(), value));
+            } else {
+                named.push((name.clone(), value));
+            }
+        }
+        if named.is_empty() {
+            positional.sort_by_key(|(i, _)| *i);
+            return Ok(positional.into_iter().map(|(_, v)| v).collect());
+        }
+
+        let Some(params) = native.method_params(method) else {
+            return Err(CfmlError::new(
+                format!(
+                    "{} method [{}] does not accept named arguments \u{2014} it does not declare \
+                     its parameter names. Call it positionally.",
+                    native.class_name(),
+                    method
+                ),
+                CfmlErrorType::Expression,
+            ));
+        };
+
+        let mut slots: Vec<Option<CfmlValue>> = vec![None; params.len()];
+        for (idx, value) in positional {
+            if idx >= slots.len() {
+                return Err(CfmlError::new(
+                    format!(
+                        "{}.{}() takes at most {} argument(s)",
+                        native.class_name(),
+                        method,
+                        params.len()
+                    ),
+                    CfmlErrorType::Expression,
+                ));
+            }
+            slots[idx] = Some(value);
+        }
+        for (name, value) in named {
+            match params.iter().position(|p| p.eq_ignore_ascii_case(&name)) {
+                Some(i) => slots[i] = Some(value),
+                None => {
+                    let valid = if params.is_empty() {
+                        "it takes no arguments".to_string()
+                    } else {
+                        format!("valid arguments are: {}", params.join(", "))
+                    };
+                    return Err(CfmlError::new(
+                        format!(
+                            "{}.{}() has no argument named [{}] \u{2014} {}",
+                            native.class_name(),
+                            method,
+                            name,
+                            valid
+                        ),
+                        CfmlErrorType::Expression,
+                    ));
+                }
+            }
+        }
+        // Trailing gaps are dropped so `args.get(n)` defaulting is unchanged;
+        // interior gaps become Null, which is what a positional caller skipping
+        // an argument would have produced anyway.
+        while matches!(slots.last(), Some(None)) {
+            slots.pop();
+        }
+        Ok(slots.into_iter().map(|s| s.unwrap_or(CfmlValue::Null)).collect())
+    }
+
     fn call_member_function_impl(
         &mut self,
         object: &CfmlValue,
@@ -23544,6 +23665,11 @@ impl CfmlVirtualMachine {
             let mut guard = obj.write().map_err(|_| {
                 CfmlError::runtime("NativeObject lock poisoned".to_string())
             })?;
+            // Named arguments must be bound by NAME. Passing them in call-site
+            // order silently misbinds (`renameSheet( sheetNumber=1,
+            // sheetName="Zed" )` renamed the sheet to "1"), so a native that
+            // does not declare its parameters refuses the call instead.
+            let args = Self::bind_native_named_args(&*guard, method, arg_names, args)?;
             return guard.call_method(method, args);
         }
 
