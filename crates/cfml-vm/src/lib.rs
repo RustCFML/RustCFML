@@ -26,6 +26,8 @@ mod intercepts_varpath;
 mod intercepts_output;
 mod intercepts_realtime;
 pub mod application_store;
+/// Host side of the dynamic native-extension ABI (`.rcx`).
+pub mod foreign;
 pub mod async_kernel;
 pub mod dump;
 /// Observability/debugging hook bus (Phase 0) + the classic CF debug footer
@@ -2545,6 +2547,14 @@ pub struct CfmlVirtualMachine {
     /// CFML calls `createObject("rust", "Name", ...)` / `new rust:Name(...)`
     /// to produce a fresh `CfmlValue::NativeObject`.
     pub native_classes: HashMap<String, NativeConstructor>,
+    /// BIFs provided by loaded `.rcx` extensions, keyed lowercase.
+    ///
+    /// These cannot live in `builtins`: that map holds bare
+    /// `fn(Vec<CfmlValue>) -> CfmlResult` pointers, which cannot carry "which
+    /// module, which entry point" and cannot be handed a `ctx`.
+    pub foreign_builtins: HashMap<String, foreign::ForeignBuiltin>,
+    /// Classes provided by loaded `.rcx` extensions, keyed lowercase.
+    pub foreign_classes: HashMap<String, foreign::ForeignClass>,
 
     /// Query-of-Queries function registry: native scalar/aggregate functions
     /// registered via `register_native_qoq_fn`, plus CFML UDFs/closures
@@ -3463,6 +3473,8 @@ impl CfmlVirtualMachine {
             pending_fused_parent: None,
             pending_called_name: None,
             native_classes: HashMap::new(),
+            foreign_builtins: HashMap::new(),
+            foreign_classes: HashMap::new(),
             qoq_registry: QoQFunctionRegistry::new(),
             // Compiled-in runtime defaults. `apply_cfconfig` overlays the
             // user's `.cfconfig.json` values when a VM is constructed via
@@ -4949,6 +4961,36 @@ impl CfmlVirtualMachine {
             .insert(name.to_lowercase(), constructor);
     }
 
+    /// Install everything a loaded `.rcx` extension provides.
+    ///
+    /// Called once per VM — every request and every `cfthread` child — so it
+    /// does nothing but insert into maps. All the expensive work an extension
+    /// wants to do happens once per process, in its `on_load`.
+    pub fn register_foreign_module(&mut self, module: &foreign::LoadedModule) {
+        for bif in &module.bifs {
+            let key = bif.name.to_lowercase();
+            // Mirror `register_native_fn`: the global marker is what
+            // `LoadGlobal` finds, and `call_function` routes from there.
+            self.globals.insert(
+                bif.name.to_string(),
+                CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+                    name: bif.name.to_string(),
+                    params: Vec::new(),
+                    body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+                        CfmlValue::Null,
+                    )),
+                    return_type: None,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
+                    captured_scope: None,
+                })),
+            );
+            self.foreign_builtins.insert(key, bif.clone());
+        }
+        for (name, class) in &module.classes {
+            self.foreign_classes.insert(name.to_lowercase(), *class);
+        }
+    }
+
     /// Register a Rust function as a callable CFML built-in.
     ///
     /// Intended for use by `--build`-produced binaries (and tests) that need to
@@ -4996,6 +5038,12 @@ impl CfmlVirtualMachine {
     /// `eq_ignore_ascii_case` exactly.
     #[inline]
     fn is_builtin_name_ci(&self, name: &str, name_lower: &str) -> bool {
+        // A name an extension provides is a builtin name for every purpose the
+        // resolver cares about — most importantly, it must be immune to data
+        // shadowing exactly as a compiled-in builtin is.
+        if !self.foreign_builtins.is_empty() && self.foreign_builtins.contains_key(name_lower) {
+            return true;
+        }
         if self.builtin_lc_src_len == self.builtins.len() {
             return self.builtin_names_lc.contains_key(name_lower);
         }
@@ -5094,6 +5142,17 @@ impl CfmlVirtualMachine {
             args.push(stack.pop().unwrap_or(CfmlValue::Null));
         }
         args.reverse();
+        // An extension's BIF is compile-time bound too (codegen's
+        // `is_direct_builtin` consults the loaded set), so check the foreign
+        // registry first — it is empty for everyone who has not installed one,
+        // which makes this a single `is_empty` on the hot path.
+        if !self.foreign_builtins.is_empty() {
+            if let Some(fb) = self.foreign_builtins.get(name.as_str()).copied() {
+                let out = fb.call(args)?;
+                stack.push(out);
+                return Ok(());
+            }
+        }
         // Single probe on the lowercase index; the name is already lowercased at
         // compile time, so there is no `to_lowercase` allocation here.
         let resolved = if self.builtin_lc_src_len == self.builtins.len() {
@@ -5113,13 +5172,21 @@ impl CfmlVirtualMachine {
                 stack.push(out);
                 Ok(())
             }
-            // Every `DIRECT_BUILTINS` name is unconditionally registered by
-            // `get_builtin_functions()`, so this is only reachable if an
-            // embedder removed one. Report it rather than silently no-op.
-            None => Err(CfmlError::runtime(format!(
-                "Function [{}] not found",
-                name.as_str()
-            ))),
+            // Reachable if an embedder removed a builtin, or if a template
+            // compiled while an extension was loaded is executed by a process
+            // without it. Fall back to generic resolution rather than failing:
+            // a name that is a UDF or a scope value here still resolves, so the
+            // worst case is the speed of the old path, never a wrong answer.
+            None => {
+                let callee = self
+                    .globals
+                    .get(name.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| Self::builtin_fn_value(name.as_str()));
+                let out = self.call_function(&callee, args, &ValueMap::default())?;
+                stack.push(out);
+                Ok(())
+            }
         }
     }
 
@@ -13666,6 +13733,14 @@ impl CfmlVirtualMachine {
                     // Resolve the builtin (exact match first, then
                     // case-insensitive) to a single fn pointer so the dispatch —
                     // and the GH #284 post-write cache flush below — happens once.
+                    // A `.rcx` extension's BIF is resolved before the
+                    // compiled-in table, matching `register_native_fn`'s
+                    // existing "the registrar may override a builtin" contract.
+                    if !self.foreign_builtins.is_empty() {
+                        if let Some(fb) = self.foreign_builtins.get(&name_lower).copied() {
+                            return fb.call(args);
+                        }
+                    }
                     let builtin_fn = self
                         .builtin_lookup_ci(&func.name, &name_lower)
                         .map(|(_, f)| f);
@@ -16465,6 +16540,11 @@ impl CfmlVirtualMachine {
                                 let ctor_args: Vec<CfmlValue> =
                                     args.iter().skip(2).cloned().collect();
                                 return ctor(ctor_args);
+                            }
+                            if let Some(class) = self.foreign_classes.get(&key).copied() {
+                                let ctor_args: Vec<CfmlValue> =
+                                    args.iter().skip(2).cloned().collect();
+                                return class.construct(ctor_args);
                             }
                             return Err(CfmlError::runtime(format!(
                                 "No native (Rust) class registered with name '{}'",
@@ -32068,13 +32148,16 @@ impl CfmlVirtualMachine {
             return Ok(CfmlValue::Struct(s));
         }
         let key = rust_class.to_lowercase();
-        let ctor = self.native_classes.get(&key).copied().ok_or_else(|| {
-            CfmlError::runtime(format!(
+        let parent = if let Some(ctor) = self.native_classes.get(&key).copied() {
+            ctor(Vec::new())?
+        } else if let Some(class) = self.foreign_classes.get(&key).copied() {
+            class.construct(Vec::new())?
+        } else {
+            return Err(CfmlError::runtime(format!(
                 "No native (Rust) class registered with name '{}'",
                 rust_class
-            ))
-        })?;
-        let parent = ctor(Vec::new())?;
+            )));
+        };
         s.insert("__super".to_string(), parent);
         Ok(CfmlValue::Struct(s))
     }

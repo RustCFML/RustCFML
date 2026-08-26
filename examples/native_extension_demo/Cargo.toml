@@ -1,0 +1,14 @@
+[package]
+name    = "demo-extension"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+# `cdylib` is what a `.rcx` ships. Kept in the workspace so the example is
+# compiled on every `cargo build` and cannot quietly rot.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustcfml-module = { path = "../../crates/rustcfml-module" }

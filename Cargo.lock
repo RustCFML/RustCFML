@@ -1604,6 +1604,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfml-module-abi"
+version = "0.1.0"
+
+[[package]]
 name = "cfml-qoq"
 version = "0.634.1"
 dependencies = [
@@ -1698,6 +1702,7 @@ dependencies = [
  "cfml-common",
  "cfml-compiler",
  "cfml-config",
+ "cfml-module-abi",
  "cfml-qoq",
  "cfml-sanitize",
  "cfml-stdlib",
@@ -1717,6 +1722,7 @@ dependencies = [
  "rsa",
  "rust_decimal",
  "rustc-hash 1.1.0",
+ "rustcfml-module",
  "serde",
  "serde_json",
  "sha1 0.10.6",
@@ -2427,6 +2433,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "demo-extension"
+version = "0.1.0"
+dependencies = [
+ "rustcfml-module",
 ]
 
 [[package]]
@@ -4399,6 +4412,16 @@ checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]
@@ -6890,6 +6913,7 @@ dependencies = [
  "cfml-common",
  "cfml-compiler",
  "cfml-config",
+ "cfml-module-abi",
  "cfml-qoq",
  "cfml-stdlib",
  "cfml-vm",
@@ -6901,6 +6925,7 @@ dependencies = [
  "httpdate",
  "indexmap",
  "libc",
+ "libloading",
  "log",
  "memberlist",
  "memcache",
@@ -6916,11 +6941,20 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "socket2 0.5.10",
  "socketioxide",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "uuid",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rustcfml-module"
+version = "0.1.0"
+dependencies = [
+ "cfml-module-abi",
 ]
 
 [[package]]

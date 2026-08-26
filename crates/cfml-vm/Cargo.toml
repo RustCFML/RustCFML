@@ -23,6 +23,7 @@ cfml-common = { workspace = true }
 cfml-config = { workspace = true }
 cfml-qoq = { workspace = true }
 cfml-sanitize = { workspace = true }
+cfml-module-abi = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-stdlib = { workspace = true, default-features = false, optional = true }
 indexmap = { workspace = true }
@@ -68,6 +69,9 @@ cranelift-native = { workspace = true, optional = true }
 
 [dev-dependencies]
 cfml-stdlib = { workspace = true, default-features = false }
+# Exercises the extension ABI from the module side, in-process: everything a
+# real `.rcx` does except the dlopen itself.
+rustcfml-module = { path = "../rustcfml-module" }
 
 [features]
 default = ["std", "real-threads", "jit", "observability", "scope-pool", "component-instance"]

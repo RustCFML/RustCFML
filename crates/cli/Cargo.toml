@@ -33,6 +33,7 @@ cfml-compiler = { workspace = true }
 cfml-codegen = { workspace = true }
 cfml-qoq = { workspace = true }
 cfml-vm = { workspace = true, features = ["s3"] }
+cfml-module-abi = { workspace = true }
 indexmap = { workspace = true }
 cfml-stdlib = { workspace = true, features = ["default", "all-databases", "s3"] }
 log = { workspace = true }
@@ -54,6 +55,13 @@ multer = "3"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Dynamic native extensions (.rcx). ISC-licensed, no transitive deps beyond the
+# platform loader; used only on native targets — the wasm builds never see it.
+libloading = "0.8"
+# .rcx is a zip. Same crate (and same feature set) the spreadsheet support
+# already pulls in, so this adds nothing to the graph.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
 memcache = { version = "0.17", optional = true }
 # memcache enables its `tls` feature by default, which pulls in native openssl.
 # `vendored` compiles OpenSSL from source and statically links it, so the build

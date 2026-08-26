@@ -1502,7 +1502,15 @@ impl BytecodeOp {
 fn is_direct_builtin(name: &str) -> bool {
     // `name` arrives in source casing; the declared lists are lowercase.
     let lower = name.to_ascii_lowercase();
+    // An extension's BIF is bound at compile time on the same terms as a
+    // compiled-in one. It cannot be VM-intercepted by construction (the
+    // intercept chain knows nothing about it), and extensions load before
+    // anything is compiled and are never unloaded — so the answer cannot change
+    // under a compiled template. Worth ~195 ns per call: the ABI crossing is a
+    // small part of an extension call, and the generic dispatch path is most
+    // of it.
     cfml_common::builtins_meta::is_pure_builtin(&lower)
+        || cfml_common::builtins_meta::is_foreign_builtin(&lower)
 }
 
 

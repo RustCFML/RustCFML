@@ -1,0 +1,12 @@
+[package]
+name         = "rustcfml-module"
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MIT"
+# See cfml-module-abi: unpublished for now, so it stays out of THIRD-PARTY.txt.
+publish      = false
+description  = "Write a RustCFML native extension in safe Rust. The ergonomic layer over the .rcx C ABI."
+
+[dependencies]
+cfml-module-abi = { path = "../cfml-module-abi", version = "0.1.0" }

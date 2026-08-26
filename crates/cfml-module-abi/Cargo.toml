@@ -1,0 +1,19 @@
+[package]
+name         = "cfml-module-abi"
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MIT"
+# Not published yet: cargo-about only omits workspace members that are
+# unpublished, and listing our own crates in THIRD-PARTY.txt makes the generated
+# notice churn on every version bump. This flips to a real publish when the
+# extension ABI is released to crates.io for third-party authors.
+publish      = false
+description  = "The stable C ABI between RustCFML and a dynamically loaded native extension (.rcx)."
+
+# ZERO dependencies, deliberately and permanently. This crate is compiled into
+# both the host and every extension ever published; anything it depends on
+# becomes part of the contract.
+[dependencies]
+
+[build-dependencies]

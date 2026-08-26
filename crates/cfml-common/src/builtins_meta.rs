@@ -294,3 +294,95 @@ pub fn is_vm_intercepted(lower: &str) -> bool {
 pub fn is_pure_builtin(lower: &str) -> bool {
     BUILTIN_NAMES.binary_search(&lower).is_ok() && !is_vm_intercepted(lower)
 }
+
+// ---------------------------------------------------------------------------
+// Extension-provided builtins
+// ---------------------------------------------------------------------------
+
+/// Names contributed by dynamically loaded `.rcx` extensions, lowercased.
+///
+/// Codegen needs this to bind an extension's BIF at compile time exactly as it
+/// binds a compiled-in one — the difference between ~325 ns and ~130 ns per
+/// call, because the generic path (a `LoadGlobal`, the locals/`variables`/
+/// globals chain walk, a per-call `to_lowercase`, and `call_function`'s
+/// intercept chain) dwarfs the ABI crossing itself.
+///
+/// Safe to consult from codegen because extensions load **once, at process
+/// start, before anything is compiled**, and are never unloaded (there is no
+/// `dlclose`). The set is therefore write-once-then-read-only in practice, and
+/// the VM's `CallBuiltin` handler still falls back to generic resolution if a
+/// name it was told about is somehow absent — so a stale bytecode cache degrades
+/// in speed, never in correctness.
+static FOREIGN_BUILTINS: std::sync::RwLock<Option<std::collections::BTreeSet<String>>> =
+    std::sync::RwLock::new(None);
+
+/// Record the BIF names a loaded extension provides. Called by the loader,
+/// before the first template is compiled.
+pub fn register_foreign_builtin_names<I, S>(names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut guard = FOREIGN_BUILTINS.write().unwrap_or_else(|e| e.into_inner());
+    let set = guard.get_or_insert_with(std::collections::BTreeSet::new);
+    for n in names {
+        set.insert(n.as_ref().to_ascii_lowercase());
+    }
+    ANY_FOREIGN.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True if `lower` is a BIF provided by a loaded extension.
+///
+/// The `is_none()` fast path matters: with no extensions loaded — the
+/// overwhelmingly common case — this is one relaxed read and no lock contention
+/// on a path codegen walks for every call site it compiles.
+#[inline]
+pub fn is_foreign_builtin(lower: &str) -> bool {
+    if !ANY_FOREIGN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    FOREIGN_BUILTINS
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(lower)))
+        .unwrap_or(false)
+}
+
+/// Set once any extension registers a name, so the common "no extensions"
+/// case never takes the lock.
+static ANY_FOREIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Every extension-provided BIF name, for diagnostics.
+pub fn foreign_builtin_names() -> Vec<String> {
+    FOREIGN_BUILTINS
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.iter().cloned().collect()))
+        .unwrap_or_default()
+}
+
+
+#[cfg(test)]
+mod foreign_builtin_tests {
+    use super::*;
+
+    #[test]
+    fn extension_names_become_compile_time_bindable() {
+        // Nothing registered: the fast path must answer without taking a lock.
+        assert!(!is_foreign_builtin("zzz_not_an_extension_bif"));
+
+        register_foreign_builtin_names(["demoGreet", "DEMOSTATS"]);
+        // Matched lowercased, like every CFML identifier.
+        assert!(is_foreign_builtin("demogreet"));
+        assert!(is_foreign_builtin("demostats"));
+        assert!(!is_foreign_builtin("demogreets"));
+
+        // An extension name must NOT be mistaken for a compiled-in one: the two
+        // registries are consulted separately, and only the compiled-in table
+        // can be dispatched through a bare fn pointer.
+        assert!(!is_pure_builtin("demogreet"));
+        assert!(is_pure_builtin("len"));
+
+        assert!(foreign_builtin_names().contains(&"demogreet".to_string()));
+    }
+}

@@ -1,4 +1,10 @@
 mod engine_cfc_overlay;
+/// Loading dynamic native extensions (`.rcx`).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod extensions;
+/// The `rustcfml ext …` subcommand.
+#[cfg(not(target_arch = "wasm32"))]
+mod ext_cli;
 mod rewrite;
 mod session;
 mod socketio;
@@ -199,9 +205,72 @@ where
 /// downstream test harnesses can call it directly when they construct a VM
 /// outside of `run()`.
 pub fn apply_native_modules(vm: &mut CfmlVirtualMachine) {
+    // Statically linked modules first (the cocktail `--build` path), then
+    // dynamically loaded `.rcx` extensions. Both are per-VM registration only:
+    // an extension's expensive work happened once, in its `on_load`.
     if let Some(r) = REGISTRAR.get() {
         r(vm);
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(loaded) = LOADED_EXTENSIONS.get() {
+        for ext in loaded {
+            vm.register_foreign_module(&ext.module);
+        }
+    }
+}
+
+/// Extensions loaded once per process, applied to every VM.
+///
+/// Deliberately separate from `REGISTRAR`: that is a single-shot slot whose
+/// first setter wins, and a `--build` binary that carries static modules must
+/// still be able to load dynamic ones.
+#[cfg(not(target_arch = "wasm32"))]
+static LOADED_EXTENSIONS: OnceLock<Vec<extensions::Extension>> = OnceLock::new();
+
+/// Resolve, verify and load every `.rcx` extension, once per process.
+///
+/// Problems are printed rather than swallowed: an extension that fails to load
+/// changes what the application can do, so it must never fail silently.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_extensions(explicit: Option<&str>, app_dir: Option<&std::path::Path>, verbose: bool) {
+    if LOADED_EXTENSIONS.get().is_some() {
+        return;
+    }
+    let dirs = extensions::search_dirs(explicit, app_dir);
+    let (loaded, problems) = extensions::load_all(&dirs);
+    for p in &problems {
+        eprintln!("Extension warning: {}", p);
+    }
+    // Tell codegen which names extensions provide, BEFORE anything is compiled.
+    // This is what lets an extension's BIF be bound at compile time exactly as a
+    // compiled-in one is — the difference between ~325 ns and ~130 ns per call.
+    let names: Vec<String> = loaded
+        .iter()
+        .flat_map(|e| e.module.bifs.iter().map(|b| b.name.to_string()))
+        .collect();
+    if !names.is_empty() {
+        cfml_common::builtins_meta::register_foreign_builtin_names(&names);
+    }
+    if verbose && !loaded.is_empty() {
+        for ext in &loaded {
+            println!(
+                "Loaded extension {} {} ({} bif(s), {} class(es)) from {}",
+                ext.name,
+                ext.version,
+                ext.module.bifs.len(),
+                ext.module.classes.len(),
+                ext.source.display()
+            );
+        }
+    }
+    let _ = LOADED_EXTENSIONS.set(loaded);
+}
+
+/// The loaded extensions, for `rustcfml ext list` and `getFunctionList`
+/// attribution.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn loaded_extensions() -> &'static [extensions::Extension] {
+    LOADED_EXTENSIONS.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
 /// Convenience wrapper: install the registrar and then enter the standard
@@ -233,6 +302,12 @@ struct Args {
     /// Execute code from command line
     #[arg(short, long)]
     code: Option<String>,
+
+    /// Directory to load native extensions (`.rcx`) from, searched before the
+    /// application's `extensions/`, `~/.rustcfml/extensions/` and the
+    /// directory beside this binary.
+    #[arg(long, value_name = "DIR")]
+    extensions: Option<String>,
 
     /// Enable debug output
     #[arg(short, long)]
@@ -468,6 +543,13 @@ fn real_main() {
         return;
     }
 
+    // `rustcfml ext …` is a subcommand in front of an otherwise flag-driven
+    // CLI, so it is dispatched before clap sees a positional filename.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some("ext") {
+        exit(ext_cli::main(&argv[2..]));
+    }
+
     let args = Args::parse();
 
     if args.version {
@@ -521,6 +603,26 @@ fn real_main() {
         }
         build_self_contained(app_dir, &args.output, &mode, &args.entry);
         return;
+    }
+
+    // Extensions load once per process, before any VM exists, so that an
+    // extension's BIFs are present for the very first request. The application
+    // directory is part of the search path (§4.10), which is what makes an
+    // extension checked into a project Just Work.
+    {
+        let app_dir = args
+            .serve
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| {
+                if args.file.is_empty() {
+                    None
+                } else {
+                    Path::new(&args.file).parent().map(Path::to_path_buf)
+                }
+            })
+            .or_else(|| std::env::current_dir().ok());
+        load_extensions(args.extensions.as_deref(), app_dir.as_deref(), args.verbose);
     }
 
     if let Some(ref doc_root) = args.serve {
@@ -3609,7 +3711,7 @@ fn discover_native_modules(app_dir: &Path) -> Vec<NativeModule> {
 /// Returns `None` when neither path exists on disk. Module-using `--build`
 /// requires a checkout (or a published rustcfml-cli on crates.io, which
 /// doesn't exist yet).
-fn rustcfml_source_root() -> Option<PathBuf> {
+pub(crate) fn rustcfml_source_root() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("RUSTCFML_SOURCE") {
         let pb = PathBuf::from(p);
         if pb.join("Cargo.toml").is_file() {
@@ -3942,6 +4044,12 @@ fn parse_embedded_meta(files: &std::collections::HashMap<String, Vec<u8>>) -> (S
 /// Supports both "serve" (web server) and "cli" (command-line) modes.
 fn run_embedded_app(mut files: std::collections::HashMap<String, Vec<u8>>) {
     use cfml_common::vfs::{EmbeddedFs, FallbackFs, RealFs};
+
+    // A self-contained binary can still load `.rcx` extensions — from beside
+    // itself, from the user's directory, or from `extensions/` in the working
+    // directory. This path never sees the CLI flags (it returns before they are
+    // parsed), so the search list is the default one.
+    load_extensions(None, std::env::current_dir().ok().as_deref(), false);
 
     let (mode, entry) = parse_embedded_meta(&files);
 

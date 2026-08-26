@@ -1,5 +1,13 @@
 # Native (Rust) Modules
 
+> **There is now a second way to do this.** A `.rcx` **extension** is
+> precompiled Rust that a *stock* `rustcfml` binary loads at start-up — no
+> `--build`, no engine checkout to compile against, and no need to match the
+> engine's rustc. See [extensions.md](extensions.md). This page documents the
+> statically linked route, which is still supported and is the better choice
+> when you want a single self-contained binary.
+
+
 [← Back to README](../README.md)
 
 Self-contained binaries can include user-authored Rust code that surfaces as first-class CFML built-in functions and classes. When `rustcfml --build` finds a `native/<crate>/Cargo.toml` inside your app dir, it generates a Cargo workspace and compiles your modules into the binary alongside the CFML.

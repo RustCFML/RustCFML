@@ -22,8 +22,8 @@ Summary
   Apache License 2.0 (Apache-2.0) — 54 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
+  ISC License (ISC) — 8 crate(s)
   Mozilla Public License 2.0 (MPL-2.0) — 8 crate(s)
-  ISC License (ISC) — 7 crate(s)
   BSD 2-Clause "Simplified" License (BSD-2-Clause) — 6 crate(s)
   zlib License (Zlib) — 3 crate(s)
   Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0) — 2 crate(s)
@@ -141,6 +141,8 @@ Dependencies
   untrusted 0.9.0 — https://github.com/briansmith/untrusted
 [ISC]
   ring 0.17.14 — https://github.com/briansmith/ring
+[ISC]
+  libloading 0.8.9 — https://github.com/nagisa/rust_libloading/
 [ISC]
   ego-tree 0.10.0 — https://github.com/rust-scraper/ego-tree
 [ISC]
@@ -4098,6 +4100,26 @@ SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
 OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+ISC License (ISC)
+
+Applies to:
+  - libloading 0.8.9
+================================================================================
+
+Copyright © 2015, Simonas Kazlauskas
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without
+fee is hereby granted, provided that the above copyright notice and this permission notice appear
+in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
 
 ================================================================================
 ISC License (ISC)
