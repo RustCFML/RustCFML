@@ -1249,6 +1249,12 @@ pub struct LoadedModule {
     pub version: String,
     pub bifs: Vec<ForeignBuiltin>,
     pub classes: Vec<(String, ForeignClass)>,
+    /// SQL functions usable inside `queryExecute(…, {dbtype:"query"})`.
+    /// `true` in the second slot means aggregate.
+    pub qoq_fns: Vec<(String, ForeignBuiltin, bool)>,
+    /// A directory of CFML the extension ships, mounted as `/<name>/`. Set by
+    /// the loader after extraction; the ABI knows nothing about it.
+    pub cfml_dir: Option<std::path::PathBuf>,
 }
 
 // The pointers inside are module-static.
@@ -1307,14 +1313,15 @@ pub unsafe fn adopt(
         ));
     }
 
-    let name: Arc<str> = Arc::from(d.name.as_str());
+    let name_str = d.name.as_str().to_string();
+    let name: Arc<str> = Arc::from(name_str.as_str());
     let mut bifs = Vec::with_capacity(d.bif_count);
     if !d.bifs.is_null() {
         for i in 0..d.bif_count {
             let b = &*d.bifs.add(i);
             bifs.push(ForeignBuiltin {
                 entry: b.entry,
-                module: leak(&name),
+                module: leak(&name_str),
                 name: leak(b.name.as_str()),
             });
         }
@@ -1330,18 +1337,21 @@ pub unsafe fn adopt(
         }
     }
 
-    // QoQ functions are declared in the ABI but not yet accepted: the registry
-    // they would live in (`QoQFunctionRegistry`) stores bare `fn` pointers,
-    // which cannot carry a module identity or be handed a `ctx`, exactly as
-    // `builtins` could not. Refuse loudly rather than load the extension and
-    // silently provide none of the SQL functions it advertises — a query that
-    // quietly loses a function is a wrong answer, not a missing feature.
-    if d.qoq_fn_count > 0 && !d.qoq_fns.is_null() {
-        return Err(format!(
-            "{}: declares {} Query-of-Queries function(s), which this engine does not yet accept \
-             from an extension. Remove them, or use plain BIFs until QoQ registration lands.",
-            source, d.qoq_fn_count
-        ));
+    let mut qoq_fns = Vec::with_capacity(d.qoq_fn_count);
+    if !d.qoq_fns.is_null() {
+        for i in 0..d.qoq_fn_count {
+            let q = &*d.qoq_fns.add(i);
+            let name = q.name.as_str().to_string();
+            qoq_fns.push((
+                name.clone(),
+                ForeignBuiltin {
+                    entry: q.entry,
+                    module: leak(&name_str),
+                    name: leak(&name),
+                },
+                q.kind == 1,
+            ));
+        }
     }
 
     // on_load: once per process. Given a real ctx so config can be delivered as
@@ -1376,6 +1386,8 @@ pub unsafe fn adopt(
         version: d.version.as_str().to_string(),
         bifs,
         classes,
+        qoq_fns,
+        cfml_dir: None,
     })
 }
 
@@ -1703,6 +1715,34 @@ unsafe extern "C" fn h_root_get(raw: *mut Ctx, id: u64) -> ValueHandle {
         Some(v) => make(raw, v),
         None => ValueHandle::NULL,
     }
+}
+
+/// Mappings contributed by loaded extensions, as `(prefix, directory)`.
+///
+/// Process-global, not per-VM, because several engine paths REPLACE
+/// `CfmlVirtualMachine::mappings` wholesale (`Application.cfc`'s
+/// `this.mappings`, a thread seed, `application action="update"`). Keeping the
+/// extension set here and re-applying it after those means an extension's CFCs
+/// cannot silently vanish when an application declares its own mappings — which
+/// is exactly how the shipped-CFML payload failed the first time.
+static EXTENSION_MAPPINGS: Mutex<Option<Vec<(String, String)>>> = Mutex::new(None);
+
+/// Record a mapping an extension provides. Idempotent.
+pub fn register_extension_mapping(prefix: String, dir: String) {
+    let mut guard = EXTENSION_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let list = guard.get_or_insert_with(Vec::new);
+    if !list.iter().any(|(p, _)| *p == prefix) {
+        list.push((prefix, dir));
+    }
+}
+
+/// Every extension-provided mapping, for the engine to re-apply.
+pub fn extension_mappings() -> Vec<(String, String)> {
+    EXTENSION_MAPPINGS
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
 }
 
 /// How many values an extension is currently keeping alive. For tests and

@@ -20,6 +20,7 @@ type AppFnIdSet = HashSet<i64, ValueBuildHasher>;
 type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 
 mod intercepts_common;
+mod intercepts_extensions;
 mod intercepts_deferred;
 mod intercepts_querydir;
 mod intercepts_varpath;
@@ -4603,6 +4604,7 @@ impl CfmlVirtualMachine {
         self.base_template_path = seed.base_template_path;
         self.source_file = seed.source_file;
         self.mappings = seed.mappings;
+        self.apply_extension_mappings();
         self.refresh_mappings_fingerprint();
         self.custom_tag_paths = seed.custom_tag_paths;
         self.custom_tag_deep_search = seed.custom_tag_deep_search;
@@ -4987,7 +4989,17 @@ impl CfmlVirtualMachine {
     /// does nothing but insert into maps. All the expensive work an extension
     /// wants to do happens once per process, in its `on_load`.
     pub fn register_foreign_module(&mut self, module: &foreign::LoadedModule) {
-        for bif in &module.bifs {
+        // QoQ functions are ALSO plain BIFs, mirroring
+        // `register_native_qoq_fn`, so the same function works in SQL and in
+        // CFML. Registered through the same loop so they get the `globals`
+        // marker too — without it `slugify( … )` from CFML is undefined even
+        // though `SELECT SLUGIFY( … )` works.
+        let bifs = module
+            .bifs
+            .iter()
+            .copied()
+            .chain(module.qoq_fns.iter().map(|(_, fb, _)| *fb));
+        for bif in bifs {
             let key = bif.name.to_lowercase();
             // Mirror `register_native_fn`: the global marker is what
             // `LoadGlobal` finds, and `call_function` routes from there.
@@ -5008,6 +5020,31 @@ impl CfmlVirtualMachine {
         }
         for (name, class) in &module.classes {
             self.foreign_classes.insert(name.to_lowercase(), *class);
+        }
+        // CFML the extension ships, mounted as `/<name>/`. A SERVER-level
+        // mapping (`from_application: false`) deliberately: an application's
+        // `action="update" mappings=` REPLACES its own set, and an extension's
+        // CFCs must not vanish when an application does that.
+        if let Some(dir) = &module.cfml_dir {
+            foreign::register_extension_mapping(
+                format!("/{}/", module.name.to_lowercase()),
+                dir.to_string_lossy().to_string(),
+            );
+        }
+        self.apply_extension_mappings();
+        for (name, fb, aggregate) in &module.qoq_fns {
+            // Registered as a closure: `QoQFn` is a bare fn pointer, which
+            // cannot carry which module and entry point to call, so cfml-qoq
+            // grew a dynamic slot rather than this being forced through one.
+            let fb = *fb;
+            let call: cfml_qoq::function::DynamicQoQFn =
+                Arc::new(move |args: Vec<CfmlValue>| fb.call(args));
+            let kind = if *aggregate {
+                cfml_qoq::function::QoQFnKind::Aggregate
+            } else {
+                cfml_qoq::function::QoQFnKind::Scalar
+            };
+            self.qoq_registry.register_dynamic(name, call, kind);
         }
     }
 
@@ -5409,6 +5446,11 @@ impl CfmlVirtualMachine {
         // The engine may invoke CFML UDFs; `call_function` needs `&mut self`, so
         // take the registry out to avoid borrowing self both ways, then restore.
         let registry = std::mem::take(&mut self.qoq_registry);
+        // Publish the VM for the duration, so an extension's SQL function gets
+        // the same scope/lock/CFML access every other extension entry point has.
+        // The guard holds a raw pointer rather than a borrow, which is why it can
+        // coexist with the `&mut self` the UDF callback needs.
+        let _vm_scope = foreign::VmScope::new(self, Some(parent_locals));
         let result = {
             let mut udf = |func: &CfmlValue, args: Vec<CfmlValue>| {
                 self.call_function(func, args, parent_locals)
@@ -13471,6 +13513,32 @@ impl CfmlVirtualMachine {
         result.map(|_| ())
     }
 
+    /// Merge in any extension-provided mappings that are missing.
+    ///
+    /// Called after every path that REPLACES `mappings` wholesale
+    /// (`Application.cfc`'s `this.mappings`, a thread seed, `application
+    /// action="update"`), because an extension's CFCs must survive an
+    /// application declaring its own mapping set. Server-level
+    /// (`from_application: false`) for the same reason.
+    pub fn apply_extension_mappings(&mut self) {
+        let extras = foreign::extension_mappings();
+        if extras.is_empty() {
+            return;
+        }
+        let mut added = false;
+        for (prefix, dir) in extras {
+            if !self.mappings.iter().any(|m| m.name == prefix) {
+                self.mappings.push(CfmlMapping { name: prefix, path: dir, from_application: false });
+                added = true;
+            }
+        }
+        if added {
+            // Longest-prefix-first, so the most specific mapping wins.
+            self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+            self.refresh_mappings_fingerprint();
+        }
+    }
+
     /// Lock depth, for tests asserting that native locks do not outlive a call.
     pub fn held_lock_depth_public(&self) -> usize {
         self.held_locks.len()
@@ -13877,6 +13945,14 @@ impl CfmlVirtualMachine {
 
             // Reflective variable paths need the CALLING frame's scope chain, so
             // they take `parent_locals` on top of the usual (name, args).
+            // Introspection that must include loaded extensions.
+            if intercepts_extensions::handles(&name_lower) {
+                match self.dispatch_extension_introspection(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
+                }
+            }
+
             if intercepts_varpath::handles(&name_lower) {
                 match self.dispatch_varpath(&name_lower, args.clone(), parent_locals) {
                     Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
@@ -18567,6 +18643,10 @@ impl CfmlVirtualMachine {
                             // mapping wins during resolution.
                             self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
                             self.refresh_mappings_fingerprint();
+                            // `action="update"` REPLACES the application's set
+                            // (Lucee parity); an extension's mappings are not
+                            // the application's to drop.
+                            self.apply_extension_mappings();
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -34796,6 +34876,9 @@ impl CfmlVirtualMachine {
             }
             self.mappings = early_mappings;
             self.refresh_mappings_fingerprint();
+            // `this.mappings` REPLACES the set; extension mappings are not the
+            // application's to drop.
+            self.apply_extension_mappings();
         }
 
         // Merge `this.*` members set by `super.setupApplication(...)` (or any
@@ -35998,6 +36081,9 @@ impl CfmlVirtualMachine {
         }
         self.mappings = mappings;
         self.refresh_mappings_fingerprint();
+        // The application's mapping set REPLACES whatever was there, including
+        // an extension's — which is not the application's to drop.
+        self.apply_extension_mappings();
 
         // 3c. Expand customTagPaths relative to Application.cfc directory. Same
         // cache routing as 3b: `canonicalize_cached` makes these per-request

@@ -1180,6 +1180,8 @@ macro_rules! module {
         $(, tier: $tier:expr )?
         $(, bifs: { $( $bif_name:literal => $bif_fn:path ),* $(,)? } )?
         $(, classes: { $( $class:ty ),* $(,)? } )?
+        $(, qoq_scalars: { $( $qs_name:literal => $qs_fn:path ),* $(,)? } )?
+        $(, qoq_aggregates: { $( $qa_name:literal => $qa_fn:path ),* $(,)? } )?
         $(, on_load: $on_load:path )?
         $(,)?
     ) => {
@@ -1223,7 +1225,46 @@ macro_rules! module {
         ];
 
         #[doc(hidden)]
-        static __RUSTCFML_QOQ: &[$crate::abi::QoqFnDecl] = &[];
+        static __RUSTCFML_QOQ: &[$crate::abi::QoqFnDecl] = &[
+            $( $(
+                $crate::abi::QoqFnDecl {
+                    name: $crate::abi::StrRef::new($qs_name),
+                    entry: {
+                        struct Shim;
+                        impl $crate::internal::Bif for Shim {
+                            const NAME: &'static str = $qs_name;
+                            fn call<'a>(
+                                ctx: &'a $crate::Ctx,
+                                args: &[$crate::Value<'a>],
+                            ) -> $crate::Result<$crate::Value<'a>> {
+                                $qs_fn(ctx, args)
+                            }
+                        }
+                        $crate::internal::bif_shim::<Shim> as $crate::abi::ModuleFn
+                    },
+                    kind: 0,
+                },
+            )* )?
+            $( $(
+                $crate::abi::QoqFnDecl {
+                    name: $crate::abi::StrRef::new($qa_name),
+                    entry: {
+                        struct Shim;
+                        impl $crate::internal::Bif for Shim {
+                            const NAME: &'static str = $qa_name;
+                            fn call<'a>(
+                                ctx: &'a $crate::Ctx,
+                                args: &[$crate::Value<'a>],
+                            ) -> $crate::Result<$crate::Value<'a>> {
+                                $qa_fn(ctx, args)
+                            }
+                        }
+                        $crate::internal::bif_shim::<Shim> as $crate::abi::ModuleFn
+                    },
+                    kind: 1,
+                },
+            )* )?
+        ];
 
         #[doc(hidden)]
         unsafe extern "C-unwind" fn __rustcfml_on_load(
@@ -1264,7 +1305,7 @@ macro_rules! module {
             classes: __RUSTCFML_CLASSES.as_ptr(),
             class_count: __RUSTCFML_CLASSES.len(),
             qoq_fns: __RUSTCFML_QOQ.as_ptr(),
-            qoq_fn_count: 0,
+            qoq_fn_count: __RUSTCFML_QOQ.len(),
         };
 
         /// The symbol the loader resolves.

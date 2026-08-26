@@ -350,6 +350,48 @@ fn sort_with_cfml<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Query-of-Queries functions
+// ---------------------------------------------------------------------------
+
+/// `SLUGIFY( col )` — a SCALAR: called once per row, with that row's value.
+fn sql_slugify<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = true;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    Ok(ctx.string(out.trim_matches('-')))
+}
+
+/// `MEDIAN( col )` — an AGGREGATE: called once per partition, and its argument
+/// arrives as an ARRAY of that column's value across every row in the partition.
+/// Worth having as an example because it is the shape people get wrong.
+fn sql_median<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let col = args
+        .first()
+        .copied()
+        .filter(|v| v.kind() == abi::ty::ARRAY)
+        .ok_or_else(|| Error::expression("MEDIAN() expects a column"))?;
+    let n = col.len()?;
+    let mut nums: Vec<f64> = (0..n).filter_map(|i| col.get(i).as_f64().ok()).collect();
+    if nums.is_empty() {
+        return Ok(ctx.null());
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = nums.len() / 2;
+    let median =
+        if nums.len() % 2 == 0 { (nums[mid - 1] + nums[mid]) / 2.0 } else { nums[mid] };
+    Ok(ctx.double(median))
+}
+
 /// Once per process, never per request — the place for thread pools and caches.
 ///
 /// `settings` is this extension's `.cfconfig.json` block:
@@ -392,5 +434,7 @@ module! {
         "demoSort"                => sort_with_cfml,
     },
     classes: { Tally },
+    qoq_scalars: { "slugify" => sql_slugify },
+    qoq_aggregates: { "median" => sql_median },
     on_load: on_load,
 }

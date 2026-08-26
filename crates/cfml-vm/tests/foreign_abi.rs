@@ -194,6 +194,20 @@ fn echo2<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
     Ok(args.first().copied().unwrap_or_else(|| ctx.null()))
 }
 
+/// A QoQ SCALAR: one row's value in, one out.
+fn sql_double<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let n = args.first().map(|v| v.as_i64().unwrap_or(0)).unwrap_or(0);
+    Ok(ctx.int(n * 2))
+}
+
+/// A QoQ AGGREGATE: the whole column arrives as an array.
+fn sql_total<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let col = args.first().copied().ok_or_else(|| Error::expression("need a column"))?;
+    let n = col.len()?;
+    let sum: i64 = (0..n).filter_map(|i| col.get(i).as_i64().ok()).sum();
+    Ok(ctx.int(sum))
+}
+
 /// `abiInject( obj, name, value )` — dependency injection from Rust.
 fn inject<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
     let obj = args.first().copied().ok_or_else(|| Error::expression("need an object"))?;
@@ -377,6 +391,8 @@ module! {
         "abiRecurser"    => new_recurser,
     },
     classes: { Tally, Recurser },
+    qoq_scalars: { "abiDouble" => sql_double },
+    qoq_aggregates: { "abiTotal" => sql_total },
     on_load: on_load,
 }
 
@@ -1123,4 +1139,110 @@ fn injecting_a_property_writes_the_variables_scope_not_this() {
         marker.get_ci("dep").is_none(),
         "and NOT on `this`, where the component's own methods would not see it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Query-of-Queries functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qoq_functions_reach_the_sql_registry_and_the_builtin_table() {
+    use cfml_qoq::function::QoQFnKind;
+
+    let m = load();
+    assert_eq!(m.qoq_fns.len(), 2, "both SQL functions should be adopted");
+    assert!(m.qoq_fns.iter().any(|(n, _, agg)| n == "abiDouble" && !agg));
+    assert!(m.qoq_fns.iter().any(|(n, _, agg)| n == "abiTotal" && *agg));
+
+    let mut vm = vm_with_module(&m);
+
+    // In the SQL registry, under the right kind — a scalar registered as an
+    // aggregate would be called once per partition with an array, and quietly
+    // produce nonsense.
+    let scalar = vm
+        .qoq_registry
+        .get_dynamic("abidouble", QoQFnKind::Scalar)
+        .expect("scalar should be registered");
+    assert!(vm.qoq_registry.get_dynamic("abidouble", QoQFnKind::Aggregate).is_none());
+    assert!(vm.qoq_registry.is_aggregate("abitotal"));
+    assert!(!vm.qoq_registry.is_aggregate("abidouble"));
+
+    // And it actually dispatches into the module.
+    let _scope = foreign::VmScope::new(&mut vm, None);
+    assert_eq!(scalar(vec![CfmlValue::Int(21)]).unwrap().as_string(), "42");
+
+    let aggregate = vm
+        .qoq_registry
+        .get_dynamic("abitotal", QoQFnKind::Aggregate)
+        .expect("aggregate should be registered");
+    let column = CfmlValue::Array(CfmlArray::new(vec![
+        CfmlValue::Int(1),
+        CfmlValue::Int(2),
+        CfmlValue::Int(3),
+    ]));
+    assert_eq!(aggregate(vec![column]).unwrap().as_string(), "6");
+}
+
+#[test]
+fn a_qoq_function_is_callable_from_cfml_too() {
+    // Parity with `register_native_qoq_fn`, which registers both. Without the
+    // `globals` marker the SQL form works and the CFML form is undefined, which
+    // is a confusing half-registration.
+    let m = load();
+    let mut vm = vm_with_module(&m);
+    let fb = *vm
+        .foreign_builtins
+        .get("abidouble")
+        .expect("a QoQ function should also be registered as a BIF");
+    let _scope = foreign::VmScope::new(&mut vm, None);
+    assert_eq!(fb.call(vec![CfmlValue::Int(50)]).unwrap().as_string(), "100");
+}
+
+// ---------------------------------------------------------------------------
+// CFML shipped inside an extension
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_extension_mapping_survives_the_application_replacing_the_mapping_set() {
+    // `self.mappings` is REPLACED wholesale at four separate points —
+    // `Application.cfc`'s `this.mappings`, the application-lifecycle setup, a
+    // thread seed, and `application action="update"`. Three of the four were
+    // covered before this test existed and the extension's CFCs still vanished,
+    // which is why the re-apply is centralised and asserted rather than
+    // sprinkled and hoped for.
+    let m = load();
+    let mut vm = vm_with_shared_scopes();
+
+    foreign::register_extension_mapping("/exttest/".to_string(), "/tmp/exttest".to_string());
+    vm.register_foreign_module(&m);
+    vm.apply_extension_mappings();
+    assert!(
+        vm.mappings.iter().any(|mp| mp.name == "/exttest/"),
+        "the extension mapping should be present"
+    );
+
+    // Simulate an application declaring its own set, which replaces everything.
+    vm.mappings = vec![cfml_vm::CfmlMapping {
+        name: "/".to_string(),
+        path: "/tmp/app".to_string(),
+        from_application: false,
+    }];
+    assert!(!vm.mappings.iter().any(|mp| mp.name == "/exttest/"));
+
+    vm.apply_extension_mappings();
+    let restored = vm
+        .mappings
+        .iter()
+        .find(|mp| mp.name == "/exttest/")
+        .expect("the extension mapping must come back");
+    assert_eq!(restored.path, "/tmp/exttest");
+    // Server-level, so the next `action="update"` (which retains only
+    // non-application mappings) cannot drop it either.
+    assert!(
+        !restored.from_application,
+        "an extension mapping must be server-level, not the application's to replace"
+    );
+    // Longest-prefix-first is preserved, or a more specific mapping would lose.
+    let names: Vec<usize> = vm.mappings.iter().map(|mp| mp.name.len()).collect();
+    assert!(names.windows(2).all(|w| w[0] >= w[1]), "mappings must stay longest-first");
 }

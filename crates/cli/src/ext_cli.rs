@@ -455,16 +455,10 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
         zip.write_all(&data).map_err(|e| e.to_string())?;
     }
 
-    // Ship the CFML side, if there is one. The format carries it, but nothing
-    // registers it yet — so say so here rather than let someone ship a CFC
-    // facade that silently never appears.
+    // Ship the CFML side, if there is one. The engine mounts it as `/<name>/`.
     let cfml_dir = dir.join("cfml");
     if cfml_dir.is_dir() {
-        eprintln!(
-            "Warning: {} contains CFML, which is packaged but NOT yet registered as a mapping by \n\
-             \x20        the engine. Its CFCs will not be reachable until that lands.",
-            cfml_dir.display()
-        );
+        println!("  including cfml/, mounted as /{}/ at load", name);
         add_dir(&mut zip, &cfml_dir, &cfml_dir, "cfml", opts)?;
     }
     for extra in ["README.md", "LICENSE"] {

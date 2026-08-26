@@ -298,6 +298,59 @@ precise "no such component" or a lock timeout is worth more than a generic
 
 ---
 
+## SQL functions
+
+An extension can add functions to Query-of-Queries:
+
+```rust
+module! {
+    …
+    qoq_scalars:    { "slugify" => sql_slugify },
+    qoq_aggregates: { "median"  => sql_median  },
+}
+```
+
+```cfml
+queryExecute( "SELECT SLUGIFY( title ) AS slug FROM posts", {}, { dbtype = "query" } );
+queryExecute( "SELECT MEDIAN( views ) AS mid FROM posts",   {}, { dbtype = "query" } );
+```
+
+A **scalar** is called once per row with that row's values. An **aggregate** is
+called once per partition, and each SQL argument arrives as an **array** of that
+argument's value across every row — the part people get wrong. Both are also
+registered as ordinary BIFs, so `slugify( "…" )` works from CFML too.
+
+An extension's SQL function is never assumed pure, so it is not hoisted out of a
+row loop: it may read a scope or call CFML.
+
+## Shipping CFML with an extension
+
+A `.rcx` can carry a `cfml/` directory, which the engine mounts as
+`/<extension-name>/`:
+
+```
+demo-0.1.0.rcx
+└── cfml/Formatter.cfc      →  createObject( "component", "demo.Formatter" )
+```
+
+Nothing in the application declares that mapping. This is what makes a `.rcx` an
+*extension* rather than a plugin: a Rust core can present a CFML facade, which
+is usually the nicer API anyway.
+
+The mapping is **server-level and re-applied after anything that replaces the
+mapping set** — `Application.cfc`'s `this.mappings`, the application lifecycle, a
+thread seed, `application action="update"`. All four replace wholesale, and an
+extension's CFCs are not the application's to drop.
+
+## Discovering what an extension provides
+
+`getFunctionList()` includes extension functions, with the providing extension's
+name as the value (compiled-in functions have an empty string). Without that, an
+extension's BIFs are callable but invisible to anything enumerating the engine's
+functions — an answer that looks authoritative and is wrong.
+
+---
+
 ## The command line
 
 ```
@@ -445,14 +498,7 @@ answer.
   alive across requests, and **run CFML**: call functions and closures,
   instantiate components, invoke methods, inject dependencies, read metadata,
   write page output and include templates.
-- **No Query-of-Queries functions yet.** The ABI declares them, but the registry
-  they would live in stores bare `fn` pointers that cannot carry a module
-  identity. An extension declaring one is **refused outright** rather than
-  loaded with the function missing, because a query that quietly loses a
-  function is a wrong answer.
-- **CFML shipped inside a `.rcx` is not registered yet.** The format carries a
-  `cfml/` directory and `ext build` packages it, but nothing mounts it as a
-  mapping, so a CFC facade is not reachable. `ext build` warns when it packages
-  one.
+- **No signing yet.** Manifest digests catch a corrupted download, not a hostile
+  author.
 - **macOS:** downloaded libraries are quarantined by Gatekeeper and would fail
   to `dlopen` with no explanation; `ext install` clears the attribute for you.

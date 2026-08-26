@@ -237,7 +237,7 @@ fn read_manifest(rcx: &Path) -> Result<Manifest, String> {
 /// `dlopen` needs a real filesystem path on every platform we support — there
 /// is no in-memory load — so the extraction is not avoidable. Keying the cache
 /// on the digest means an unchanged extension is extracted exactly once, ever.
-fn stage_library(rcx: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+fn stage_library(rcx: &Path, manifest: &Manifest) -> Result<(PathBuf, PathBuf), String> {
     let Some((inner, want_sha)) = manifest.libraries.get(abi::TARGET) else {
         let mut have: Vec<&str> = manifest.libraries.keys().map(String::as_str).collect();
         have.sort_unstable();
@@ -284,7 +284,7 @@ fn stage_library(rcx: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
         }
         clear_quarantine(&out);
     }
-    Ok(out)
+    Ok((out, dir))
 }
 
 /// Strip macOS's `com.apple.quarantine` xattr.
@@ -305,6 +305,53 @@ fn clear_quarantine(path: &Path) {
     }
     #[cfg(not(target_os = "macos"))]
     let _ = path;
+}
+
+/// Extract an extension's `cfml/` payload beside its staged library.
+///
+/// Keyed on the same content hash as the library, so an unchanged extension
+/// extracts once, ever. Returns `None` when the archive ships no CFML.
+fn stage_cfml(rcx: &Path, into: &Path) -> Option<PathBuf> {
+    let dest = into.join("cfml");
+    if dest.is_dir() {
+        return Some(dest);
+    }
+    let file = fs::File::open(rcx).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut wrote = false;
+    for i in 0..zip.len() {
+        let mut entry = match zip.by_index(i) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.name().to_string();
+        let Some(rel) = name.strip_prefix("cfml/") else { continue };
+        if rel.is_empty() || name.ends_with('/') {
+            continue;
+        }
+        // Reject anything that would escape the destination. A `.rcx` is
+        // trusted code, but a path-traversal entry writing outside the cache is
+        // still not something to hand it for free.
+        if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+            eprintln!("Warning: {} contains a suspicious cfml path [{}]; skipped", rcx.display(), name);
+            continue;
+        }
+        let out = dest.join(rel);
+        if let Some(parent) = out.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        let mut buf = Vec::new();
+        if entry.read_to_end(&mut buf).is_ok() && fs::write(&out, buf).is_ok() {
+            wrote = true;
+        }
+    }
+    if wrote {
+        Some(dest)
+    } else {
+        None
+    }
 }
 
 /// Load one library and adopt its module declaration.
@@ -397,23 +444,31 @@ pub fn load_all(dirs: &[PathBuf], cfg: &ExtensionsCfg) -> (Vec<Extension>, Vec<S
             .cloned()
             .map(cfml_vm::json_value_to_cfml)
             .unwrap_or_else(|| CfmlValue::strukt(Default::default()));
-        let lib_path = match &c.manifest {
+        let (lib_path, cfml_dir) = match &c.manifest {
             Some(m) => match stage_library(&c.path, m) {
-                Ok(p) => p,
+                Ok((lib, cache_dir)) => (lib, stage_cfml(&c.path, &cache_dir)),
                 Err(e) => {
                     problems.push(e);
                     continue;
                 }
             },
-            None => c.path.clone(),
+            // A loose library in development: honour a `cfml/` directory
+            // sitting beside it, so the CFML half is testable before packaging.
+            None => {
+                let beside = c.path.parent().map(|p| p.join("cfml")).filter(|p| p.is_dir());
+                (c.path.clone(), beside)
+            }
         };
         match load_library(&lib_path, settings) {
-            Ok(module) => out.push(Extension {
-                name: module.name.to_string(),
-                version: module.version.clone(),
-                source: c.path.clone(),
-                module,
-            }),
+            Ok(mut module) => {
+                module.cfml_dir = cfml_dir;
+                out.push(Extension {
+                    name: module.name.to_string(),
+                    version: module.version.clone(),
+                    source: c.path.clone(),
+                    module,
+                });
+            }
             Err(e) => problems.push(e),
         }
     }

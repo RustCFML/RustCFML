@@ -254,7 +254,15 @@ pub fn load_extensions(
     // compiled-in one is — the difference between ~325 ns and ~130 ns per call.
     let names: Vec<String> = loaded
         .iter()
-        .flat_map(|e| e.module.bifs.iter().map(|b| b.name.to_string()))
+        .flat_map(|e| {
+            e.module
+                .bifs
+                .iter()
+                .map(|b| b.name.to_string())
+                // A QoQ function is a BIF too, so it gets compile-time bound
+                // like any other.
+                .chain(e.module.qoq_fns.iter().map(|(n, _, _)| n.clone()))
+        })
         .collect();
     if !names.is_empty() {
         cfml_common::builtins_meta::register_foreign_builtin_names(&names);
@@ -262,11 +270,16 @@ pub fn load_extensions(
     if verbose && !loaded.is_empty() {
         for ext in &loaded {
             println!(
-                "Loaded extension {} {} ({} bif(s), {} class(es)) from {}",
+                "Loaded extension {} {} ({} bif(s), {} class(es), {} sql fn(s){}) from {}",
                 ext.name,
                 ext.version,
                 ext.module.bifs.len(),
                 ext.module.classes.len(),
+                ext.module.qoq_fns.len(),
+                match &ext.module.cfml_dir {
+                    Some(d) => format!(", cfml at {}", d.display()),
+                    None => String::new(),
+                },
                 ext.source.display()
             );
         }

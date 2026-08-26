@@ -173,7 +173,11 @@ fn expr_is_pure(e: &Expr, reg: &QoQFunctionRegistry) -> bool {
     match e {
         // A custom UDF call needs the VM callback → not parallel-safe.
         Expr::Function { name, args, .. } => {
-            reg.get_custom(name).is_none() && args.iter().all(|a| expr_is_pure(a, reg))
+            // An extension's function is not assumed pure: it may read a scope
+            // or call CFML, so it must not be hoisted out of a row loop.
+            reg.get_custom(name).is_none()
+                && !reg.dynamics.contains_key(&name.to_lowercase())
+                && args.iter().all(|a| expr_is_pure(a, reg))
         }
         // Any subquery forces the sequential path.
         Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
@@ -1874,7 +1878,11 @@ impl<'a, I: Invoker> Engine<'a, I> {
         if let Some((QoQFnKind::Scalar, f)) = self.registry.get_native(name) {
             return f(args);
         }
-        // 3. custom CFML UDF (scalar)
+        // 3. a native extension's scalar
+        if let Some(f) = self.registry.get_dynamic(name, QoQFnKind::Scalar) {
+            return f(args);
+        }
+        // 4. custom CFML UDF (scalar)
         if let Some((cfval, QoQFnKind::Scalar)) = self.registry.get_custom(name).cloned() {
             return self.inv.invoke_custom(&cfval, args);
         }
@@ -1967,6 +1975,9 @@ impl<'a, I: Invoker> Engine<'a, I> {
             arrays.push(CfmlValue::array(col));
         }
         if let Some((QoQFnKind::Aggregate, f)) = self.registry.get_native(&lname) {
+            return f(arrays);
+        }
+        if let Some(f) = self.registry.get_dynamic(&lname, QoQFnKind::Aggregate) {
             return f(arrays);
         }
         if let Some((cfval, QoQFnKind::Aggregate)) = self.registry.get_custom(&lname).cloned() {
