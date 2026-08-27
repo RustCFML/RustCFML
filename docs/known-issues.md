@@ -1490,6 +1490,34 @@ arbitrary rectangle is almost never what "make it 200x100" means.
 
 ---
 
+## 69. `loop file=` reads the whole file, so it does not bound memory 🏗 *(GH [#367](https://github.com/RustCFML/RustCFML/issues/367))*
+
+Both spellings iterate a file line by line and both produce correct results:
+
+```cfml
+<cfloop file="#p#" index="line"> ... </cfloop>     <!--- tag form --->
+loop file=p item="line" { ... }                    // script form (added for GH #367)
+```
+
+What they do **not** yet deliver is the reason the construct exists. Lucee
+streams the file through a buffered reader, so the resident cost is one line.
+RustCFML's `__cfloop_file_lines` reads the file into a string via the VFS and
+materialises an array of every line before the first iteration — so peak memory
+is the file size plus one string per line, which is *worse* than the
+`fileRead()` + `listToArray()` workaround the construct is meant to replace.
+
+Correctness is unaffected (including blank-line preservation); only the memory
+profile is. A file large enough for this to matter is exactly the case that
+motivates reaching for the construct, so treat it as unsuitable for very large
+files until it streams.
+
+Fixing it properly needs a streaming entry point on the `Vfs` trait (defaulting
+to today's eager read for the non-filesystem implementations) plus a cursor the
+loop lowering can pump, since both lowerings currently emit `for (x in
+<array>)`.
+
+---
+
 ---
 
 # Part E — Environment-specific 🌍

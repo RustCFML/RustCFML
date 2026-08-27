@@ -4970,9 +4970,32 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         "%b %d %Y %H:%M:%S",
         "%B %d %Y %H:%M",
         "%b %d %Y %H:%M",
+        // Lucee's own serializeJSON date form, offset-less variant:
+        // "August, 25 2026 09:00:14". The comma sits after the MONTH here, not
+        // after the day, so none of the "%B %d, %Y" patterns above match it.
+        // See the offset-bearing variant just below (GH #365).
+        "%B, %d %Y %H:%M:%S",
+        "%b, %d %Y %H:%M:%S",
+        "%B, %d %Y %H:%M",
+        "%b, %d %Y %H:%M",
     ] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
             return Some(dt);
+        }
+    }
+
+    // Lucee's serializeJSON date form WITH the trailing UTC offset:
+    // `serializeJSON({d: createDateTime(2026,8,25,9,0,14)})` emits
+    // {"D":"August, 25 2026 09:00:14 +0000"} on Lucee 7.0.5, and Lucee's date
+    // parser reads it straight back. We rejected it, so every date a Lucee
+    // deployment had written into a JSON/jsonb column became unreadable after
+    // switching engines — isDate() false, dateDiff "Invalid date2" (GH #365).
+    // Our own serializeJSON writes "yyyy-mm-dd HH:mm:ss", which both engines
+    // parse, so the gap is one-directional and this is the recovering half.
+    // Wall-clock fields as written, matching the RFC 3339 branch below.
+    for fmt in &["%B, %d %Y %H:%M:%S %z", "%b, %d %Y %H:%M:%S %z"] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+            return Some(dt.with_timezone(&Local).naive_local());
         }
     }
 
@@ -4988,6 +5011,9 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         "%d-%b-%Y",
         "%B %d %Y",
         "%b %d %Y",
+        // Month-comma order, date only (GH #365 — see the datetime list above).
+        "%B, %d %Y",
+        "%b, %d %Y",
     ] {
         if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
             return d.and_hms_opt(0, 0, 0);
@@ -5002,11 +5028,20 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
     }
 
     // RFC 3339 / ISO 8601 with a timezone offset or 'Z' suffix
-    // ("2026-06-10T07:20:42.177+00:00", "...Z"). Return the wall-clock fields
-    // as written (naive); callers that need the absolute instant (timestamptz)
-    // use `parse_cfml_datetime_utc`, which honours the offset instead.
+    // ("2026-06-10T07:20:42.177+00:00", "...Z").
+    //
+    // The offset is HONOURED and the result expressed in the server's timezone,
+    // which is what Lucee does for every offset-bearing form (probed on Lucee
+    // 7.1.0.204 under Europe/London: "2026-08-25T09:00:14Z" -> 10:00:14,
+    // "...-05:00" -> 15:00:14). We previously returned the wall-clock fields as
+    // written, discarding the offset — so a stored UTC timestamp read back on a
+    // non-UTC server was wrong by exactly that server's offset, and by six hours
+    // for the -05:00 case. Invisible wherever the server runs in UTC (CI, most
+    // containers), silently wrong everywhere else. Found alongside GH #365.
+    //
+    // `parse_cfml_datetime_utc` remains the accessor for the absolute instant.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.naive_local());
+        return Some(dt.with_timezone(&Local).naive_local());
     }
 
     // Date serial number (days since 1899-12-30, OLE Automation date)

@@ -42,8 +42,24 @@ assert("control: dateDiff between two ISO-style strings", tryDiff("2026-08-25 09
 // The gap: Lucee's own JSON date form.
 assertTrue("isDate accepts Lucee's serializeJSON date form (with +0000)", isDate(luceeForm));
 assertTrue("isDate accepts Lucee's serializeJSON date form (no offset)", isDate(luceeFormNoZ));
-assert("dateDiff with the Lucee form as date2", tryDiff("2026-08-25 09:00:00", luceeForm), 14);
-assert("dateDiff with the Lucee form as date1", tryDiff(luceeForm, "2026-08-25 09:01:14"), 60);
+// The offset-BEARING form: `+0000` is a real offset on Lucee, not decoration —
+// it is honoured and the result expressed in the server's timezone (probed on
+// Lucee 7.1.0.204 under Europe/London: the string below reads as 10:00:14
+// local, not 09:00:14). So these legs must be written timezone-independently,
+// or they only hold on a UTC server and are off by the server's offset
+// everywhere else.
+//
+// Two strings that carry the SAME offset are a clean differential: whatever the
+// server timezone, they are 14 seconds apart.
+assert("dateDiff between two offset-bearing Lucee forms", tryDiff("August, 25 2026 09:00:00 +0000", luceeForm), 14);
+assert("dateDiff with the offset-less Lucee form as date2", tryDiff("2026-08-25 09:00:00", luceeFormNoZ), 14);
+assert("dateDiff with the offset-less Lucee form as date1", tryDiff(luceeFormNoZ, "2026-08-25 09:01:14"), 60);
+
+// And pin that the offset is actually applied: `+0000` names a UTC instant, so
+// it must equal that instant converted to local time. dateConvert agrees on
+// both engines, which is what makes this assertion portable.
+assert("the +0000 offset is honoured, not discarded",
+    tryDiff(dateConvert("utc2Local", createDateTime(2026, 8, 25, 9, 0, 14)), luceeForm), 0);
 assert("parseDateTime + dateFormat/timeFormat of the Lucee form names the same instant", tryFormat(luceeFormNoZ), "2026-08-25 09:00:14");
 
 suiteEnd();

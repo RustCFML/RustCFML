@@ -514,7 +514,7 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
     // Build attributes struct
     let mut attr_parts = Vec::new();
     for (k, v) in &attrs {
-        attr_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
+        attr_parts.push(format!("{}: {}", format_attr_key(k), format_attr_value(v, quoted.contains(k))));
     }
     let attrs_expr = format!("{{ {} }}", attr_parts.join(", "));
 
@@ -2134,7 +2134,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if kl == "name" && !uses_template {
                     continue;
                 }
-                attr_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
+                attr_parts.push(format!("{}: {}", format_attr_key(k), format_attr_value(v, quoted.contains(k))));
             }
             let attrs_expr = format!("{{ {} }}", attr_parts.join(", "));
 
@@ -2543,7 +2543,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Build attributes struct from all attrs
                 let mut attr_parts = Vec::new();
                 for (k, v) in &attrs {
-                    attr_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
+                    attr_parts.push(format!("{}: {}", format_attr_key(k), format_attr_value(v, quoted.contains(k))));
                 }
                 let attrs_expr = format!("{{ {} }}", attr_parts.join(", "));
 
@@ -2552,7 +2552,15 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if let Some(body_start) = find_closing_tag(chars, tag_end, len, &tag_name_full) {
                     let body_chars = &chars[tag_end..body_start];
                     let body_source: String = body_chars.iter().collect();
-                    let body_script = tags_to_script_impl(&body_source, imports);
+                    // `_inner` with the CALLER's flag, not `_impl` (which restarts
+                    // at in_cfoutput = false): a `<cf_name>` body belongs to the
+                    // template that wrote it, so it inherits the enclosing output
+                    // context — an enclosing `<cfoutput>`, or a `<cffunction
+                    // output="true">` body. Restarting the flag left `#expr#` in
+                    // the body as literal text while the SAME tag invoked through
+                    // `<cfmodule>` (which passes the flag through, just below)
+                    // interpolated it (GH #363). No error, just wrong output.
+                    let body_script = tags_to_script_inner(&body_source, imports, in_cfoutput);
                     let close_end = find_tag_end(chars, body_start, len);
                     let result = format!(
                         "__cfcustomtag_start({}, {});\n{}\n__cfcustomtag_end();\n",
@@ -2945,6 +2953,27 @@ fn decode_attr_escapes(raw: &str, quote: char) -> String {
 /// *inside* an unquoted value a compile error ("Simple attribute value can't
 /// contain [#]"), where we interpolate/quote it. That direction can only accept
 /// source Lucee rejects — it can never produce a different value.
+/// Render a tag attribute name as a struct-literal KEY.
+///
+/// Custom tags (`<cf_name …>`, `<cfmodule …>`) have an open attribute
+/// vocabulary, and HTML-flavoured names are ordinary there: `x-ref`, `x-data`,
+/// `data-foo`, `aria-label`. Emitted bare into the generated struct literal,
+/// `x-ref: "r1"` parses as the EXPRESSION `x - ref`, so the tag threw
+/// "Variable 'x' is undefined" before it ever ran — and the reported line
+/// pointed nowhere near the attribute (GH #364). Quote any name that is not a
+/// plain CFML identifier so it stays a literal key. Identifiers are emitted
+/// unchanged, keeping the generated source (and its casing) exactly as it was.
+fn format_attr_key(k: &str) -> String {
+    let is_identifier = !k.is_empty()
+        && k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_identifier {
+        k.to_string()
+    } else {
+        format!("\"{}\"", escape_for_string_literal(k))
+    }
+}
+
 fn format_attr_value(raw: &str, was_quoted: bool) -> String {
     // Pure `#expr#` (whole value is one expression) — preserve native type
     // rather than coercing through string concat. Custom-tag attrs in

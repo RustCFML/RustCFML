@@ -3365,6 +3365,16 @@ struct CustomTagState {
     base_tag_depth: usize,
 }
 
+/// Engine-generated bind-param accumulators that must never escape the frame
+/// assembling the statement. Emitted by the runtime-body lowering of `<cfquery>`
+/// and `<cfhttp>` (the forms whose body contains control flow, so the SQL and the
+/// param set are built at execution time). A CFML identifier cannot collide:
+/// the `__cf` prefix is reserved for the engine. See GH #362.
+#[inline]
+fn is_engine_frame_local(name: &str) -> bool {
+    name.eq_ignore_ascii_case("__cfquery_params") || name.eq_ignore_ascii_case("__cfhttp_params")
+}
+
 impl CfmlVirtualMachine {
     pub fn new(program: BytecodeProgram) -> Self {
         let mut vm = Self {
@@ -4526,6 +4536,10 @@ impl CfmlVirtualMachine {
         attributes: Option<CfmlValue>,
     ) -> ThreadSeed {
         let mut body = closure;
+        // The component `variables` scope the body was written in, if any (see
+        // the `__variables` flatten below). Overlaid onto the child VM's page
+        // scope so `variables.method()` resolves inside the body — GH #366.
+        let mut component_vars: Option<ValueMap> = None;
         if let CfmlValue::Function(f) = &mut body {
             let snap = f
                 .captured_scope
@@ -4542,9 +4556,24 @@ impl CfmlVirtualMachine {
                 // snapshot semantics, unscoped writes stay thread-local —
                 // exactly what the flat-locals capture used to provide.
                 if let Some(CfmlValue::Struct(vars)) = snap.shift_remove("__variables") {
-                    for (k, v) in vars.iter() {
-                        snap.entry(k).or_insert(v);
+                    // `snapshot_with_methods`, NOT `iter`: on a CFC instance the
+                    // method entries do not live in the instance's own map at
+                    // all — they are a per-class flyweight table hanging off the
+                    // struct, which plain iteration does not see. Flattening
+                    // with `iter()` therefore carried the component's DATA into
+                    // the thread while silently dropping every one of its
+                    // METHODS, so a bare sibling call in the body threw
+                    // "Variable 'x' is undefined" (GH #366). It stayed hidden
+                    // while component methods were ALSO published into the
+                    // ambient `user_functions` table, which the seed copies
+                    // wholesale — v0.630.0 (GH #360) correctly stopped
+                    // publishing them and took the thread body's last remaining
+                    // source of its own siblings with it.
+                    let vars = vars.snapshot_with_methods();
+                    for (k, v) in &vars {
+                        snap.entry(k.clone()).or_insert_with(|| v.clone());
                     }
+                    component_vars = Some(vars);
                 }
                 Arc::make_mut(f).captured_scope = Some(cfml_common::cycle_gc::tracked_scope(snap));
             }
@@ -4552,7 +4581,21 @@ impl CfmlVirtualMachine {
         ThreadSeed {
             program: self.program.clone(),
             user_functions: self.user_functions.clone(),
-            variables_snapshot: self.globals.clone(),
+            variables_snapshot: {
+                // Inside a CFC method `variables` IS the component scope, and the
+                // child VM's page scope is what `variables.` resolves against —
+                // so the component's keys are overlaid here, and win. (Lucee
+                // copies the spawning context's variables scope, whichever that
+                // is.) A by-value copy either way, so the GH #234 fix above —
+                // sibling threads must not share one live scope — still holds.
+                let mut vars = self.globals.clone();
+                if let Some(cv) = component_vars {
+                    for (k, v) in cv {
+                        vars.insert(k, v);
+                    }
+                }
+                vars
+            },
             page_thread_scope: self.page_thread_scope.snapshot(),
             vfs: self.vfs.clone(),
             server_state: self.server_state.clone(),
@@ -8605,6 +8648,17 @@ impl CfmlVirtualMachine {
                             }
                         } else if locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
                             && !declared_locals.contains(name.as_str())
+                            // The engine's own `<cfquery>`/`<cfhttp>` bind-param
+                            // accumulator must stay pinned to the frame building
+                            // the statement. Its init is an UNSCOPED assignment
+                            // emitted by the tag/script lowering, so under classic
+                            // localmode it landed in the component `variables`
+                            // scope — which every thread sharing that instance
+                            // holds too. Two concurrent callers then appended into
+                            // ONE array: wrong bind counts, and rows silently
+                            // carrying the other caller's values (GH #362). No user
+                            // variable can collide — `__cf` is reserved.
+                            && !is_engine_frame_local(name)
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
                             && name_lower != "cfcatch"

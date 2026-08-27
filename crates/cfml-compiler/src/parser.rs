@@ -2585,7 +2585,30 @@ impl Parser {
             })));
         }
 
-        // 8) No recognised attributes — infinite loop.
+        // 8) file=… (+ index|item) — iterate the file's lines, binding each to
+        //    the named variable. The TAG form has had this since GH #158; the
+        //    script form fell through to the infinite-loop fallback below, so
+        //    the body ran once with the binding never created and threw
+        //    "Variable 'line' is undefined" (GH #367). Same lowering as the tag
+        //    so the two spellings cannot drift.
+        if let Some(file) = get("file") {
+            if let Some(binding) = item.clone().or(index.clone()) {
+                let name = var_name(&binding).unwrap_or_else(|| "line".to_string());
+                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    variable: name,
+                    iterable: call("__cfloop_file_lines", vec![file]),
+                    body,
+                    location: loc,
+                })));
+            }
+            return Err(ParseError {
+                message: "loop file requires an item or index attribute".to_string(),
+                line: loc.start.line,
+                column: loc.start.column,
+            });
+        }
+
+        // 9) No recognised attributes — infinite loop.
         Ok(CfmlNode::Statement(Statement::While(While {
             condition: Expression::Literal(Literal { value: LiteralValue::Bool(true), location: loc }),
             body,
