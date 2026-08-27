@@ -358,6 +358,7 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_relative_component_metadata.cfm">
 <cf_runtest file="oop/test_flyweight_instance.cfm">
 <cf_runtest file="oop/test_reserved_key_visibility.cfm">
 <cf_runtest file="oop/test_component_introspection_surface.cfm">

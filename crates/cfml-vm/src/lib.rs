@@ -458,6 +458,22 @@ pub(crate) fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool 
 /// [`CfmlVirtualMachine::build_inheritance_metadata`] (GitHub #210). Mirrors the
 /// `extract_component_meta` helper inside the `getcomponentmetadata` arm, but
 /// returns a `ValueMap` so the caller can attach a recursive `extends`.
+/// Metadata `path` is the component's file, and Lucee/ACF always report it as an
+/// ABSOLUTE path — frameworks treat it as an identity and re-resolve it (WireBox
+/// maps an object by `md.path`). Serve mode already resolves absolutely; a CLI
+/// run resolves against the process directory, so join it back on. Deliberately
+/// NOT `canonicalize`: that resolves symlinks, which expandPath must not do.
+fn absolute_metadata_path(src: &str) -> String {
+    let p = std::path::Path::new(src);
+    if p.is_absolute() {
+        return src.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+        Err(_) => src.to_string(),
+    }
+}
+
 fn component_leaf_metadata(s: &ValueMap, fallback_name: &str) -> ValueMap {
     let mut meta = ValueMap::default();
     let name_val = s
@@ -468,7 +484,10 @@ fn component_leaf_metadata(s: &ValueMap, fallback_name: &str) -> ValueMap {
     meta.insert("fullname".to_string(), name_val);
     meta.insert("type".to_string(), CfmlValue::string("component".to_string()));
     if let Some(CfmlValue::String(src)) = s.get("__source_file") {
-        meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+        meta.insert(
+            "path".to_string(),
+            CfmlValue::string(absolute_metadata_path(src)),
+        );
     }
     if let Some(imp) = build_implements_meta(s) {
         meta.insert("implements".to_string(), imp);
@@ -16653,7 +16672,10 @@ impl CfmlVirtualMachine {
                         // file (re-parsing it for declared-property order); without
                         // it the value was null and `.reReplace()` threw.
                         if let Some(CfmlValue::String(src)) = s.get("__source_file") {
-                            meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+                            meta.insert(
+                                "path".to_string(),
+                                CfmlValue::string(absolute_metadata_path(src)),
+                            );
                         }
                         // `extends`: a component stores __extends as a single
                         // parent name (a String, surfaced via __extends_chain
@@ -29925,6 +29947,30 @@ impl CfmlVirtualMachine {
     /// (this was TestBox's `targetMD.name` "Variable 'name' is undefined" crash
     /// when a virtualized bundle's metadata was built in a context where the
     /// inheritance walk couldn't resolve the template).
+    /// The dotted component name Lucee reports for a `.cfc` at `file`: the path
+    /// relative to the webroot (serve) or the process directory (CLI), without
+    /// the extension and with separators as dots. `None` when the file is not
+    /// under that root, so callers keep whatever name they already had.
+    fn webroot_relative_component_name(&self, file: &str) -> Option<String> {
+        let path = std::path::Path::new(file);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        let root = match self.server_state.as_ref().and_then(|s| s.webroot.clone()) {
+            Some(w) => w,
+            None => std::env::current_dir().ok()?,
+        };
+        let rel = abs.strip_prefix(&root).ok()?;
+        let rel = rel.to_string_lossy();
+        let rel = rel.strip_suffix(".cfc").unwrap_or(&rel);
+        if rel.is_empty() {
+            return None;
+        }
+        Some(rel.replace(['/', '\\'], "."))
+    }
+
     #[cfg(feature = "component-instance")]
     fn instance_metadata(
         &mut self,
@@ -29943,8 +29989,44 @@ impl CfmlVirtualMachine {
             ValueMap::default()
         } else {
             let mut visited = std::collections::HashSet::new();
-            self.build_inheritance_metadata(&name, src, parent_locals, &mut visited)
-                .unwrap_or_default()
+            let built =
+                self.build_inheritance_metadata(&name, src.clone(), parent_locals, &mut visited);
+            match built {
+                Some(m) => m,
+                // A component created by a RELATIVE dotted name — `new
+                // algorithms.Rsa()` inside another CFC — records that name
+                // verbatim, and re-resolving it against the component's OWN
+                // directory looks for `algorithms/algorithms/Rsa.cfc` and fails.
+                // The class already knows the file, so build from THAT instead of
+                // from a name that only meant something in the caller's directory.
+                // Without this the metadata collapsed to bare `{ name }`: no
+                // `path`, no `type`, no `functions`. WireBox reads `md.path` as an
+                // object's identity (Injector.autowire), so every relatively
+                // instantiated model got a mapping whose path was a bare name, and
+                // resolving THAT later threw "can't find component [Rsa]".
+                None => {
+                    let by_file = src.as_ref().and_then(|file| {
+                        let mut visited = std::collections::HashSet::new();
+                        self.build_inheritance_metadata(file, None, parent_locals, &mut visited)
+                    });
+                    match by_file {
+                        Some(mut m) => {
+                            // Built from a FILE path, so `name` came out as that
+                            // path dotted. Lucee reports the webroot-relative
+                            // dotted path; fall back to the name as written when
+                            // the file lives outside the webroot.
+                            let dotted = src
+                                .as_ref()
+                                .and_then(|f| self.webroot_relative_component_name(f))
+                                .unwrap_or_else(|| name.clone());
+                            m.insert("name".to_string(), CfmlValue::string(dotted.clone()));
+                            m.insert("fullname".to_string(), CfmlValue::string(dotted));
+                            m
+                        }
+                        None => ValueMap::default(),
+                    }
+                }
+            }
         };
         let has_name = meta_map.keys().any(|k| k.eq_ignore_ascii_case("name"));
         if !name.is_empty() && !has_name {
