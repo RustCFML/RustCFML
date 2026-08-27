@@ -15,7 +15,7 @@
 //! - System functions
 
 use cfml_common::dynamic::{build_implements_meta, CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use std::collections::HashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
@@ -15161,171 +15161,502 @@ fn uu_decode(s: &str) -> Vec<u8> {
 
 // ==== CIPHER HELPERS ====
 
-fn cfmx_compat_encrypt(data: &[u8], key: &str) -> Vec<u8> {
-    // CFMX_COMPAT is a simple XOR cipher with a key-derived seed
-    let seed: u32 = key.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-    let mut rng = seed;
-    data.iter().map(|&b| {
-        rng = rng.wrapping_mul(214013).wrapping_add(2531011);
-        let keystream = ((rng >> 16) & 0xFF) as u8;
-        b ^ keystream
-    }).collect()
+/// Lucee's `lucee.runtime.crypt.CFMXCompat` — the three-LFSR stream cipher CFML
+/// has used for `CFMX_COMPAT` since CF MX, ported line for line from
+/// CFMXCompat.java. It is the DEFAULT algorithm for `encrypt()`/`decrypt()` when
+/// the caller names none, so its keystream has to be byte-identical to Lucee's:
+/// values encrypted by a Lucee-served request are sitting in application
+/// databases waiting to be read back by a RustCFML-served one.
+struct CfmxCompat {
+    lfsr_a: u32,
+    lfsr_b: u32,
+    lfsr_c: u32,
 }
 
-fn cfmx_compat_decrypt(data: &[u8], key: &str) -> Vec<u8> {
-    // XOR is symmetric, so decrypt = encrypt
-    cfmx_compat_encrypt(data, key)
-}
+impl CfmxCompat {
+    const MASK_A: u32 = 0x8000_0062;
+    const MASK_B: u32 = 0x4000_0020;
+    const MASK_C: u32 = 0x1000_0002;
+    const ROT0_A: u32 = 0x7fff_ffff;
+    const ROT0_B: u32 = 0x3fff_ffff;
+    const ROT0_C: u32 = 0x0fff_ffff;
+    const ROT1_A: u32 = 0x8000_0000;
+    const ROT1_B: u32 = 0xc000_0000;
+    const ROT1_C: u32 = 0xf000_0000;
 
-fn aes_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use aes::Aes128;
-    use aes::Aes192;
-    use aes::Aes256;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
+    /// Port of `setKey`. Two Java-isms are load-bearing and deliberately kept:
+    /// the seed array is sized from `"Default Seed"` when the key is empty but
+    /// *filled* from the original (still empty) key, so an empty key seeds from
+    /// NUL chars; and the seed is UTF-16 code units, not bytes, so a non-ASCII
+    /// key seeds per-char rather than per-byte.
+    fn new(key: &str) -> Self {
+        let mut lfsr_a: u32 = 0x1357_9bdf;
+        let mut lfsr_b: u32 = 0x2468_ace0;
+        let mut lfsr_c: u32 = 0xfdb9_7531;
 
-    let iv = vec![0u8; 16]; // Zero IV (CFML default)
+        let key_chars: Vec<u16> = key.encode_utf16().collect();
+        let sized_len = if key_chars.is_empty() {
+            "Default Seed".encode_utf16().count()
+        } else {
+            key_chars.len()
+        };
+        let mut seed = vec![0u16; sized_len.max(12)];
+        seed[..key_chars.len()].copy_from_slice(&key_chars);
 
-    match key.len() {
-        16 => {
-            let encryptor = Encryptor::<Aes128>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-128 init error: {}", e))?;
-            Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+        // Repeat the key over the first 12 seed chars.
+        let original_len = key_chars.len();
+        let mut i = 0;
+        while original_len + i < 12 {
+            seed[original_len + i] = seed[i];
+            i += 1;
         }
-        24 => {
-            let encryptor = Encryptor::<Aes192>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-192 init error: {}", e))?;
-            Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+
+        for i in 0..4 {
+            lfsr_a = (lfsr_a << 8) | seed[i + 4] as u32;
+            lfsr_b = (lfsr_b << 8) | seed[i + 4] as u32;
+            lfsr_c = (lfsr_c << 8) | seed[i + 4] as u32;
         }
-        32 => {
-            let encryptor = Encryptor::<Aes256>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-256 init error: {}", e))?;
-            Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+        if lfsr_a == 0 {
+            lfsr_a = 0x1357_9bdf;
         }
-        _ => Err(format!("Invalid AES key length: {} bytes (expected 16, 24, or 32)", key.len()))
+        if lfsr_b == 0 {
+            lfsr_b = 0x2468_ace0;
+        }
+        if lfsr_c == 0 {
+            lfsr_c = 0xfdb9_7531;
+        }
+
+        Self { lfsr_a, lfsr_b, lfsr_c }
+    }
+
+    /// Port of `transformByte`. The shifts are Java's `>>>` (logical), which is
+    /// what `u32 >>` already is.
+    fn transform_byte(&mut self, target: u8) -> u8 {
+        let mut crypto: u8 = 0;
+        let mut b = self.lfsr_b & 1;
+        let mut c = self.lfsr_c & 1;
+        for _ in 0..8 {
+            if self.lfsr_a & 1 != 0 {
+                self.lfsr_a = (self.lfsr_a ^ (Self::MASK_A >> 1)) | Self::ROT1_A;
+                if self.lfsr_b & 1 != 0 {
+                    self.lfsr_b = (self.lfsr_b ^ (Self::MASK_B >> 1)) | Self::ROT1_B;
+                    b = 1;
+                } else {
+                    self.lfsr_b = (self.lfsr_b >> 1) & Self::ROT0_B;
+                    b = 0;
+                }
+            } else {
+                self.lfsr_a = (self.lfsr_a >> 1) & Self::ROT0_A;
+                if self.lfsr_c & 1 != 0 {
+                    self.lfsr_c = (self.lfsr_c ^ (Self::MASK_C >> 1)) | Self::ROT1_C;
+                    c = 1;
+                } else {
+                    self.lfsr_c = (self.lfsr_c >> 1) & Self::ROT0_C;
+                    c = 0;
+                }
+            }
+            crypto = (crypto << 1) | ((b ^ c) as u8 & 1);
+        }
+        target ^ crypto
+    }
+
+    /// The cipher is a keystream XOR, so encrypt and decrypt are the same pass.
+    /// Lucee builds a fresh `CFMXCompat` per call; so do we (`new` per transform).
+    fn transform(key: &str, data: &[u8]) -> Vec<u8> {
+        let mut state = Self::new(key);
+        data.iter().map(|&b| state.transform_byte(b)).collect()
     }
 }
 
-fn aes_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use aes::Aes128;
-    use aes::Aes192;
-    use aes::Aes256;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
+/// `CFMXCompat.isCfmxCompat` — an empty/blank algorithm means CFMX_COMPAT too.
+fn is_cfmx_compat(algorithm: &str) -> bool {
+    algorithm.trim().is_empty() || algorithm.eq_ignore_ascii_case("cfmx_compat")
+}
 
-    let iv = vec![0u8; 16];
+/// The block ciphers `encrypt()`/`decrypt()` can drive, with the key rules Lucee
+/// applies to each (`Cryptor.getTargetKeyLength` + its `isValidLength` checks).
+#[derive(Clone, Copy, PartialEq)]
+enum BlockAlgo {
+    Aes,
+    Des,
+    DesEde,
+    Blowfish,
+}
 
-    match key.len() {
-        16 => {
-            let decryptor = Decryptor::<Aes128>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-128 init error: {}", e))?;
-            decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                .map_err(|e| format!("AES decryption error: {}", e))
+impl BlockAlgo {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "AES" => Some(Self::Aes),
+            "DES" => Some(Self::Des),
+            "DESEDE" | "DESEDE3" | "TRIPLEDES" => Some(Self::DesEde),
+            "BLOWFISH" => Some(Self::Blowfish),
+            _ => None,
         }
-        24 => {
-            let decryptor = Decryptor::<Aes192>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-192 init error: {}", e))?;
-            decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                .map_err(|e| format!("AES decryption error: {}", e))
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Aes => "AES",
+            Self::Des => "DES",
+            Self::DesEde => "DESEDE",
+            Self::Blowfish => "BLOWFISH",
         }
-        32 => {
-            let decryptor = Decryptor::<Aes256>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-256 init error: {}", e))?;
-            decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                .map_err(|e| format!("AES decryption error: {}", e))
+    }
+
+    fn block_size(self) -> usize {
+        match self {
+            Self::Aes => 16,
+            _ => 8,
         }
-        _ => Err(format!("Invalid AES key length: {} bytes", key.len()))
+    }
+
+    /// `Cryptor.getTargetKeyLength` — the length a raw (non-base64) key is
+    /// padded or truncated to.
+    fn target_key_len(self) -> usize {
+        match self {
+            Self::Aes => 16,
+            Self::Des => 8,
+            Self::DesEde => 24,
+            Self::Blowfish => 16,
+        }
+    }
+
+    /// Whether a base64-decoded key is usable as-is for this algorithm.
+    fn accepts_key_len(self, len: usize) -> bool {
+        match self {
+            Self::Aes => matches!(len, 16 | 24 | 32),
+            Self::Des => len == 8,
+            Self::DesEde => len == 16 || len == 24,
+            Self::Blowfish => (4..=56).contains(&len),
+        }
     }
 }
 
-fn des_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::Des;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
+#[derive(Clone, Copy, PartialEq)]
+enum CipherMode {
+    Ecb,
+    Cbc,
+}
 
-    if key.len() != 8 {
-        return Err(format!("DES key must be 8 bytes, got {}", key.len()));
+/// A parsed JCE transformation string — `AES`, `AES/CBC/PKCS5Padding`, ...
+/// A bare algorithm name is ECB, because that is what `Cipher.getInstance("AES")`
+/// resolves to on the JVM. (RustCFML used to read a bare `AES` as CBC with a zero
+/// IV, which agrees with ECB for the first block only and silently produced
+/// undecryptable ciphertext for anything longer.)
+struct Transformation {
+    algo: BlockAlgo,
+    mode: CipherMode,
+    padded: bool,
+}
+
+impl Transformation {
+    fn parse(spec: &str, verb: &str) -> Result<Self, CfmlError> {
+        let upper = spec.to_uppercase();
+        let mut parts = upper.split('/');
+        let algo_name = parts.next().unwrap_or("");
+        let algo = BlockAlgo::parse(algo_name).ok_or_else(|| {
+            CfmlError::runtime(format!("Unsupported {} algorithm: {}", verb, upper))
+        })?;
+        let mode = match parts.next() {
+            None | Some("") | Some("ECB") => CipherMode::Ecb,
+            Some("CBC") => CipherMode::Cbc,
+            Some(other) => {
+                return Err(CfmlError::runtime(format!(
+                    "Unsupported {} mode [{}] in [{}]: RustCFML implements ECB and CBC",
+                    verb, other, upper
+                )))
+            }
+        };
+        let padded = match parts.next() {
+            None | Some("") | Some("PKCS5PADDING") | Some("PKCS7PADDING") => true,
+            Some("NOPADDING") => false,
+            Some(other) => {
+                return Err(CfmlError::runtime(format!(
+                    "Unsupported {} padding [{}] in [{}]: RustCFML implements \
+                     PKCS5Padding, PKCS7Padding and NoPadding",
+                    verb, other, upper
+                )))
+            }
+        };
+        Ok(Self { algo, mode, padded })
     }
-    let iv = [0u8; 8];
-    let encryptor = Encryptor::<Des>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DES init error: {}", e))?;
-    Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
 }
 
-fn des_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::Des;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    if key.len() != 8 {
-        return Err(format!("DES key must be 8 bytes, got {}", key.len()));
+/// Lucee's `Base64Coder`/`Base64Encoder.decode(data, precise)`. With `precise`
+/// (the default for encrypt/decrypt) the string is validated before decoding and
+/// the failures arrive as `lucee.runtime.coder.CoderException`, which is what
+/// CFML code catches by type.
+fn lucee_base64_decode(data: &str, precise: bool) -> Result<Vec<u8>, CfmlError> {
+    let coder_error = |msg: String| {
+        CfmlError::new(
+            msg,
+            CfmlErrorType::Custom("lucee.runtime.coder.CoderException".to_string()),
+        )
+    };
+    if data.is_empty() {
+        return Ok(Vec::new());
     }
-    let iv = [0u8; 8];
-    let decryptor = Decryptor::<Des>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DES init error: {}", e))?;
-    decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-        .map_err(|e| format!("DES decryption error: {}", e))
-}
-
-fn desede_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::TdesEde3;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    if key.len() != 24 {
-        return Err(format!("DESEDE key must be 24 bytes, got {}", key.len()));
+    if precise {
+        let chars: Vec<char> = data.chars().collect();
+        let len = chars.len();
+        if len % 4 != 0 {
+            return Err(coder_error(format!(
+                "cannot convert the input to a binary, invalid length ({}) of the string",
+                len
+            )));
+        }
+        // Lucee scans BACKWARDS: trailing padding first, then the body — so the
+        // reported position is the LAST offending character, not the first.
+        let mut i = len as isize - 1;
+        let mut padding = 0;
+        while i >= 0 && chars[i as usize] == '=' {
+            padding += 1;
+            i -= 1;
+        }
+        if padding > 3 {
+            return Err(coder_error(format!(
+                "invalid padding length [{}], maximal length is [3]",
+                padding
+            )));
+        }
+        while i >= 0 {
+            let c = chars[i as usize];
+            let ok = c.is_ascii_alphanumeric() || c == '+' || c == '/';
+            if !ok {
+                return Err(coder_error(format!(
+                    "invalid character [{}] in base64 string at position [{}]",
+                    c,
+                    i + 1
+                )));
+            }
+            i -= 1;
+        }
     }
-    let iv = [0u8; 8];
-    let encryptor = Encryptor::<TdesEde3>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DESEDE init error: {}", e))?;
-    Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
-}
-
-fn desede_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::TdesEde3;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    if key.len() != 24 {
-        return Err(format!("DESEDE key must be 24 bytes, got {}", key.len()));
+    let decoded = base64_decode_bytes(data);
+    if decoded.is_empty() {
+        return Err(coder_error(
+            "cannot convert the input to a binary".to_string(),
+        ));
     }
-    let iv = [0u8; 8];
-    let decryptor = Decryptor::<TdesEde3>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DESEDE init error: {}", e))?;
-    decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-        .map_err(|e| format!("DESEDE decryption error: {}", e))
+    Ok(decoded)
 }
 
-fn blowfish_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use blowfish::Blowfish;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
+/// `Cryptor._crypt`'s key resolution for AES/DES/DESEDE/BLOWFISH.
+///
+/// A key of 8 characters or more is treated as base64 and must decode to a
+/// length the algorithm accepts. Anything shorter — or, when `precise` is false,
+/// anything that fails those checks — is taken as raw UTF-8 bytes, then padded
+/// with NULs or truncated to the algorithm's target length.
+///
+/// Not ported: the two ACF-bug-compat retries in `Cryptor.crypt` (double a
+/// 4-character key; drop the last 4 characters on "Illegal key size"). Both fire
+/// only on JCE policy messages that a pure-Rust cipher never produces, so there
+/// is nothing here for them to catch.
+fn resolve_cipher_key(key: &str, algo: BlockAlgo, precise: bool) -> Result<Vec<u8>, CfmlError> {
+    let raw_key = || {
+        let mut bytes = key.as_bytes().to_vec();
+        bytes.resize(algo.target_key_len(), 0);
+        bytes
+    };
 
-    let iv = [0u8; 8];
-    let encryptor = Encryptor::<Blowfish>::new_from_slices(key, &iv)
-        .map_err(|e| format!("Blowfish init error: {}", e))?;
-    Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+    // Lucee's `looksLikeBase64` regex ends in `.*`, so it matches any string;
+    // the length check is the only part that actually decides.
+    if key.encode_utf16().count() < 8 {
+        return Ok(raw_key());
+    }
+
+    match lucee_base64_decode(key, precise) {
+        Ok(decoded) if algo.accepts_key_len(decoded.len()) => Ok(decoded),
+        Ok(decoded) => {
+            if precise {
+                // Lucee raises a bare java.lang.RuntimeException here.
+                Err(CfmlError::new(
+                    format!(
+                        "Invalid key length for {}: {} bytes",
+                        algo.label(),
+                        decoded.len()
+                    ),
+                    CfmlErrorType::Custom("java.lang.RuntimeException".to_string()),
+                ))
+            } else {
+                Ok(raw_key())
+            }
+        }
+        Err(e) => {
+            if precise {
+                Err(e)
+            } else {
+                Ok(raw_key())
+            }
+        }
+    }
 }
 
-fn blowfish_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use blowfish::Blowfish;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    let iv = [0u8; 8];
-    let decryptor = Decryptor::<Blowfish>::new_from_slices(key, &iv)
-        .map_err(|e| format!("Blowfish init error: {}", e))?;
-    decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-        .map_err(|e| format!("Blowfish decryption error: {}", e))
+fn pkcs_pad(data: &[u8], block: usize) -> Vec<u8> {
+    let pad = block - (data.len() % block);
+    let mut out = data.to_vec();
+    out.extend(std::iter::repeat(pad as u8).take(pad));
+    out
 }
+
+fn pkcs_unpad(mut data: Vec<u8>, block: usize) -> Result<Vec<u8>, String> {
+    let pad = *data.last().ok_or_else(|| "Given final block not properly padded".to_string())? as usize;
+    if pad == 0 || pad > block || pad > data.len() {
+        return Err("Given final block not properly padded".to_string());
+    }
+    let keep = data.len() - pad;
+    if data[keep..].iter().any(|&b| b as usize != pad) {
+        return Err("Given final block not properly padded".to_string());
+    }
+    data.truncate(keep);
+    Ok(data)
+}
+
+/// Generate the ECB/CBC pair for one concrete block cipher. A macro rather than a
+/// generic function because the RustCrypto `BlockEncrypt`/`KeyIvInit` bounds
+/// differ per mode and would have to be spelled out three times anyway.
+macro_rules! block_cipher_ops {
+    ($name:ident, $cipher:ty) => {
+        fn $name(
+            t: &Transformation,
+            key: &[u8],
+            iv: &[u8],
+            data: &[u8],
+            encrypt: bool,
+        ) -> Result<Vec<u8>, String> {
+            use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, KeyIvInit};
+            use cbc::cipher::{BlockDecryptMut, BlockEncryptMut};
+            let block = t.algo.block_size();
+
+            if !t.padded && data.len() % block != 0 {
+                return Err(format!(
+                    "Input length not multiple of {} bytes",
+                    block
+                ));
+            }
+
+            match t.mode {
+                CipherMode::Ecb => {
+                    let cipher = <$cipher>::new_from_slice(key)
+                        .map_err(|e| format!("{} init error: {}", t.algo.label(), e))?;
+                    if encrypt {
+                        let mut out = if t.padded { pkcs_pad(data, block) } else { data.to_vec() };
+                        for chunk in out.chunks_mut(block) {
+                            cipher.encrypt_block(chunk.into());
+                        }
+                        Ok(out)
+                    } else {
+                        let mut out = data.to_vec();
+                        for chunk in out.chunks_mut(block) {
+                            cipher.decrypt_block(chunk.into());
+                        }
+                        if t.padded { pkcs_unpad(out, block) } else { Ok(out) }
+                    }
+                }
+                CipherMode::Cbc => {
+                    if encrypt {
+                        let enc = cbc::Encryptor::<$cipher>::new_from_slices(key, iv)
+                            .map_err(|e| format!("{} init error: {}", t.algo.label(), e))?;
+                        if t.padded {
+                            Ok(enc.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(data))
+                        } else {
+                            Ok(enc.encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(data))
+                        }
+                    } else {
+                        let dec = cbc::Decryptor::<$cipher>::new_from_slices(key, iv)
+                            .map_err(|e| format!("{} init error: {}", t.algo.label(), e))?;
+                        if t.padded {
+                            dec.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(data)
+                                .map_err(|e| format!("{} decryption error: {}", t.algo.label(), e))
+                        } else {
+                            dec.decrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(data)
+                                .map_err(|e| format!("{} decryption error: {}", t.algo.label(), e))
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+block_cipher_ops!(cipher_ops_aes128, aes::Aes128);
+block_cipher_ops!(cipher_ops_aes192, aes::Aes192);
+block_cipher_ops!(cipher_ops_aes256, aes::Aes256);
+block_cipher_ops!(cipher_ops_des, des::Des);
+block_cipher_ops!(cipher_ops_desede, des::TdesEde3);
+block_cipher_ops!(cipher_ops_blowfish, blowfish::Blowfish);
+
+/// Run one block-cipher operation, picking the concrete cipher from the key
+/// length the way JCE picks an AES/DESede variant from the SecretKeySpec.
+fn run_block_cipher(
+    t: &Transformation,
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+    encrypt: bool,
+) -> Result<Vec<u8>, CfmlError> {
+    let result = match t.algo {
+        BlockAlgo::Aes => match key.len() {
+            16 => cipher_ops_aes128(t, key, iv, data, encrypt),
+            24 => cipher_ops_aes192(t, key, iv, data, encrypt),
+            32 => cipher_ops_aes256(t, key, iv, data, encrypt),
+            other => Err(format!(
+                "Invalid AES key length: {} bytes (expected 16, 24, or 32)",
+                other
+            )),
+        },
+        BlockAlgo::Des => cipher_ops_des(t, key, iv, data, encrypt),
+        BlockAlgo::DesEde => {
+            // JCE accepts a 16-byte DESede key as the two-key form (K1 K2 K1).
+            let mut full = key.to_vec();
+            if full.len() == 16 {
+                full.extend_from_slice(&key[..8]);
+            }
+            cipher_ops_desede(t, &full, iv, data, encrypt)
+        }
+        BlockAlgo::Blowfish => cipher_ops_blowfish(t, key, iv, data, encrypt),
+    };
+    result.map_err(CfmlError::runtime)
+}
+
+/// The `ivOrSalt` argument: absent/null means "none", a binary value is used as
+/// bytes and any other simple value as its UTF-8 bytes (Lucee's `Decision`
+/// branch in Encrypt/Decrypt).
+fn cipher_iv_arg(args: &[CfmlValue]) -> Option<Vec<u8>> {
+    match args.get(4) {
+        None | Some(CfmlValue::Null) => None,
+        Some(CfmlValue::Binary(b)) => Some(b.clone()),
+        Some(other) => Some(other.as_string().into_bytes()),
+    }
+}
+
+/// The `precise` argument (7th) — defaults to true, as every Lucee
+/// `Encrypt`/`Decrypt` overload passes.
+fn cipher_precise_arg(args: &[CfmlValue]) -> bool {
+    match args.get(6) {
+        None | Some(CfmlValue::Null) => true,
+        Some(v) => v.is_true(),
+    }
+}
+
+/// A fresh random IV for a feedback-mode encrypt with no caller-supplied IV.
+#[cfg(feature = "security")]
+fn random_iv(len: usize) -> Result<Vec<u8>, CfmlError> {
+    use rand::RngCore;
+    let mut iv = vec![0u8; len];
+    rand::rngs::OsRng.fill_bytes(&mut iv);
+    Ok(iv)
+}
+
+#[cfg(not(feature = "security"))]
+fn random_iv(_len: usize) -> Result<Vec<u8>, CfmlError> {
+    Err(CfmlError::runtime(
+        "A feedback-mode cipher (e.g. AES/CBC) with no explicit IV needs a secure \
+         random source: rebuild with the `security` feature, or pass an IV."
+            .to_string(),
+    ))
+}
+
 
 // ==== SECURITY BUILTIN FUNCTIONS ====
 
@@ -15671,45 +16002,53 @@ fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(base64_encode_bytes(&key_bytes)))
 }
 
+/// `encrypt( input, key [, algorithm [, encoding [, ivOrSalt [, iterations
+/// [, precise ]]]]] )`.
+///
+/// The algorithm defaults to CFMX_COMPAT, NOT AES — Lucee's
+/// `Cryptor.DEFAULT_ALGORITHM`. Getting this wrong made a two-argument
+/// `Encrypt( value, "somekey" )` (Preside's crm-base config does exactly that at
+/// boot) fail with "Invalid AES key length: 12 bytes", because a 16-character
+/// passphrase base64-decodes to 12 bytes.
 fn fn_encrypt(args: Vec<CfmlValue>) -> CfmlResult {
     let plaintext = get_str(&args, 0);
-    let key_b64 = get_str(&args, 1);
-    let algorithm = if args.len() >= 3 {
-        get_str(&args, 2).to_uppercase()
-    } else {
-        "AES".to_string()
-    };
+    let key = get_str(&args, 1);
+    let algorithm = if args.len() >= 3 { get_str(&args, 2) } else { String::new() };
     let encoding = if args.len() >= 4 {
         get_str(&args, 3).to_uppercase()
     } else {
         "UU".to_string()
     };
 
-    let ciphertext = if algorithm == "CFMX_COMPAT" {
-        cfmx_compat_encrypt(plaintext.as_bytes(), &key_b64)
+    let ciphertext = if is_cfmx_compat(&algorithm) {
+        CfmxCompat::transform(&key, plaintext.as_bytes())
     } else {
-        let key_bytes = base64_decode_bytes(&key_b64);
-        let plaintext_bytes = plaintext.as_bytes();
+        let t = Transformation::parse(&algorithm, "encryption")?;
+        let precise = cipher_precise_arg(&args);
+        let key_bytes = resolve_cipher_key(&key, t.algo, precise)?;
+        let block = t.algo.block_size();
 
-        match algorithm.as_str() {
-            "AES" | "AES/CBC/PKCS5PADDING" | "AES/CBC/PKCS7PADDING" => {
-                aes_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "DES" | "DES/CBC/PKCS5PADDING" => {
-                des_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "DESEDE" | "DESEDE/CBC/PKCS5PADDING" => {
-                desede_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "BLOWFISH" | "BLOWFISH/CBC/PKCS5PADDING" => {
-                blowfish_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            _ => return Err(CfmlError::runtime(format!("Unsupported encryption algorithm: {}", algorithm)))
+        // Lucee prepends a generated IV to the ciphertext, and ONLY then — an IV
+        // the caller supplied is theirs to keep track of.
+        let (iv, prefix_iv) = match (cipher_iv_arg(&args), t.mode) {
+            (Some(iv), _) => (iv, false),
+            (None, CipherMode::Cbc) => (random_iv(block)?, true),
+            (None, CipherMode::Ecb) => (Vec::new(), false),
+        };
+        if t.mode != CipherMode::Ecb && iv.len() != block {
+            return Err(CfmlError::runtime(format!(
+                "Wrong IV length: must be {} bytes long",
+                block
+            )));
         }
+
+        let mut out = run_block_cipher(&t, &key_bytes, &iv, plaintext.as_bytes(), true)?;
+        if prefix_iv {
+            let mut with_iv = iv;
+            with_iv.append(&mut out);
+            out = with_iv;
+        }
+        out
     };
 
     let encoded = match encoding.as_str() {
@@ -15722,56 +16061,66 @@ fn fn_encrypt(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(encoded))
 }
 
+/// `decrypt( input, key [, algorithm [, encoding [, ivOrSalt [, iterations
+/// [, precise ]]]]] )` — the inverse of [`fn_encrypt`], sharing its defaults.
 fn fn_decrypt(args: Vec<CfmlValue>) -> CfmlResult {
     let encoded_str = get_str(&args, 0);
-    let key_b64 = get_str(&args, 1);
-    let algorithm = if args.len() >= 3 {
-        get_str(&args, 2).to_uppercase()
-    } else {
-        "AES".to_string()
-    };
+    let key = get_str(&args, 1);
+    let algorithm = if args.len() >= 3 { get_str(&args, 2) } else { String::new() };
     let encoding = if args.len() >= 4 {
         get_str(&args, 3).to_uppercase()
     } else {
         "UU".to_string()
     };
+    let precise = cipher_precise_arg(&args);
 
     let ciphertext = match encoding.as_str() {
         "UU" => uu_decode(&encoded_str),
-        "BASE64" => base64_decode_bytes(&encoded_str),
-        "HEX" => hex_decode(&encoded_str).map_err(|e| CfmlError::runtime(e))?,
+        "BASE64" => lucee_base64_decode(&encoded_str, precise)?,
+        "HEX" => hex_decode(&encoded_str).map_err(CfmlError::runtime)?,
         _ => return Err(CfmlError::runtime(format!("Unsupported encoding: {}", encoding)))
     };
 
-    let plaintext_bytes = if algorithm == "CFMX_COMPAT" {
-        cfmx_compat_decrypt(&ciphertext, &key_b64)
+    let plaintext_bytes = if is_cfmx_compat(&algorithm) {
+        CfmxCompat::transform(&key, &ciphertext)
     } else {
-        let key_bytes = base64_decode_bytes(&key_b64);
+        let t = Transformation::parse(&algorithm, "decryption")?;
+        let key_bytes = resolve_cipher_key(&key, t.algo, precise)?;
+        let block = t.algo.block_size();
 
-        match algorithm.as_str() {
-            "AES" | "AES/CBC/PKCS5PADDING" | "AES/CBC/PKCS7PADDING" => {
-                aes_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
+        // With no caller-supplied IV a feedback-mode ciphertext carries its IV in
+        // the leading block, exactly where encrypt put it.
+        let (iv, body) = match (cipher_iv_arg(&args), t.mode) {
+            (Some(iv), _) => (iv, ciphertext.as_slice()),
+            (None, CipherMode::Cbc) => {
+                if ciphertext.len() < block {
+                    return Err(CfmlError::runtime(format!(
+                        "Input too short: a {} ciphertext carries its {}-byte IV in the \
+                         first block",
+                        t.algo.label(),
+                        block
+                    )));
+                }
+                (ciphertext[..block].to_vec(), &ciphertext[block..])
             }
-            "DES" | "DES/CBC/PKCS5PADDING" => {
-                des_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "DESEDE" | "DESEDE/CBC/PKCS5PADDING" => {
-                desede_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "BLOWFISH" | "BLOWFISH/CBC/PKCS5PADDING" => {
-                blowfish_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            _ => return Err(CfmlError::runtime(format!("Unsupported decryption algorithm: {}", algorithm)))
+            (None, CipherMode::Ecb) => (Vec::new(), ciphertext.as_slice()),
+        };
+        if t.mode != CipherMode::Ecb && iv.len() != block {
+            return Err(CfmlError::runtime(format!(
+                "Wrong IV length: must be {} bytes long",
+                block
+            )));
         }
+
+        run_block_cipher(&t, &key_bytes, &iv, body, false)?
     };
 
-    let result = String::from_utf8(plaintext_bytes)
-        .map_err(|e| CfmlError::runtime(format!("Decrypted data is not valid UTF-8: {}", e)))?;
-    Ok(CfmlValue::string(result))
+    // Lucee builds the result with `new String(bytes, charset)`, which SUBSTITUTES
+    // U+FFFD for undecodable bytes rather than throwing — code that probes a key
+    // by decrypting and comparing depends on getting a (wrong) string back.
+    Ok(CfmlValue::string(
+        String::from_utf8_lossy(&plaintext_bytes).into_owned(),
+    ))
 }
 
 // ==== SYSTEM FUNCTIONS ====

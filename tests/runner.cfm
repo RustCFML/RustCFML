@@ -286,6 +286,7 @@ include "harness.cfm";
 <!--- binding, runtime mapping via application action="update". --->
 <cf_runtest file="stdlib/test_coldbox_preside_boot_fixes.cfm">
 <cf_runtest file="stdlib/test_security.cfm">
+<cf_runtest file="stdlib/test_encrypt_lucee_vectors.cfm">
 <cf_runtest file="stdlib/test_password_hashing.cfm">
 <cf_runtest file="stdlib/test_xml.cfm">
 <cf_runtest file="stdlib/test_utility.cfm">
