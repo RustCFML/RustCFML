@@ -16941,6 +16941,24 @@ impl CfmlVirtualMachine {
                             }
                             return Ok(self_.memo_path_metadata(meta_key, resolved));
                         }
+                        // The named component could not be loaded. Lucee THROWS
+                        // here; returning an empty struct is what turned a syntax
+                        // error inside a Preside service into ColdBox's
+                        // "Variable 'name' is undefined" three frames away, with
+                        // no mention of the file that would not parse. Surface the
+                        // stashed parse/tag error when there is one (it carries
+                        // file + line), otherwise Lucee's not-found message.
+                        let comp_name = comp_name.clone();
+                        return Err(match self_.last_component_compile_error.take() {
+                            Some(msg) => CfmlError::new(msg, CfmlErrorType::Template),
+                            None => CfmlError::new(
+                                format!(
+                                    "invalid component definition, can't find component [{}]",
+                                    comp_name
+                                ),
+                                CfmlErrorType::Expression,
+                            ),
+                        });
                     }
                     return Ok(CfmlValue::strukt(ValueMap::default()));
                 }

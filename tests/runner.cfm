@@ -15,6 +15,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_keyword_loop_variables.cfm">
 <cf_runtest file="core/test_elvis_error_scope.cfm">
 <cf_runtest file="core/test_arguments_scope_dispatch.cfm">
 <cf_runtest file="core/test_unscoped_scope_cascade.cfm">

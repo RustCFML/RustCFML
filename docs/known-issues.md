@@ -1516,6 +1516,33 @@ to today's eager read for the non-filesystem implementations) plus a cursor the
 loop lowering can pump, since both lowerings currently emit `for (x in
 <array>)`.
 
+## 70. An operator word used as a plain variable is read as the operator 🏗
+
+A reserved word may **name** a variable on Lucee, and RustCFML now agrees for
+every position that matters — declarations (`var case = 1`), argument names,
+struct keys, member access (`case.label`), and, since the fix for the Preside
+boot failure below, the for-in loop variable:
+
+```cfml
+for ( var case in caseQuery ) { out &= case.label; }   // Preside app services do this
+```
+
+The one remaining gap is READING a variable whose name is an *infix operator
+word* — `contains`, `eq`, `is`, `mod`, `and`, `or`, `xor`, `gt`, `lt`, `imp`:
+
+```cfml
+for ( var contains in [ "a" ] ) { out &= contains; }   // Lucee: "a"   RustCFML: ""
+```
+
+The loop variable is assigned correctly; it is the *read* in operand position
+that our parser resolves as the operator rather than the identifier. Assigning,
+passing, and member access all work — only the bare read diverges. Rename the
+variable, or read it through a scope (`local.contains`).
+
+Note this is distinct from the words that are also LITERALS (`true`, `false`,
+`null`) or statement keywords (`return`): those read back as the literal or fail
+on **both** engines, so they are not a divergence.
+
 ---
 
 ---

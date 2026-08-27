@@ -2057,18 +2057,29 @@ impl Parser {
         // Lookahead to detect for-in: scan past a (possibly dotted) identifier to find 'in'
         {
             let mut la = 0;
-            // First token must be an identifier, soft keyword, or `this`
+            // First token must be an identifier, keyword or `this`
             // (Wheels-style `for (this.x.y in arr)` writes through the
             // component instance — Lucee/ACF/BoxLang all accept it.)
+            //
+            // The loop variable accepts the FULL keyword set (`is_property_name_at`,
+            // not `is_identifier_like_at`): Lucee lets any reserved word name a
+            // loop variable, and real code does it — Preside app services iterate
+            // `for( var case in caseQuery )`. The position is unambiguous because
+            // the lookahead only commits once it sees `in`, so a classic
+            // `for( var i = 0; ... )` is unaffected. Rejecting `case` here did not
+            // report a syntax error: it fell through to the classic-for parse,
+            // which failed on the `in`, and the resulting parse error was then
+            // swallowed by `getComponentMetaData` (returning `{}`), surfacing much
+            // later as ColdBox throwing "Variable 'name' is undefined".
             let is_ident_start =
-                self.is_identifier_like_at(la) || matches!(self.peek(la), Token::This);
+                self.is_property_name_at(la) || matches!(self.peek(la), Token::This);
             if is_ident_start {
                 la += 1;
                 // Skip dotted parts: .ident .ident ... — keyword-like member
                 // names (package, default, ...) are valid here, so reuse the
-                // canonical identifier-like check.
+                // canonical member-name check.
                 while matches!(self.peek(la), Token::Dot)
-                    && self.is_identifier_like_at(la + 1)
+                    && self.is_property_name_at(la + 1)
                 {
                     la += 2;
                 }
@@ -2078,10 +2089,10 @@ impl Parser {
                         self.advance();
                         "this".to_string()
                     } else {
-                        self.extract_identifier()?
+                        self.extract_property_name()?
                     };
                     while self.match_token(&Token::Dot) {
-                        let part = self.extract_identifier()?;
+                        let part = self.extract_property_name()?;
                         name.push('.');
                         name.push_str(&part);
                     }
