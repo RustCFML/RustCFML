@@ -19394,9 +19394,22 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
     use zip::write::SimpleFileOptions;
     use std::io::{Read, Write, Cursor};
 
-    let opts = match args.into_iter().next() {
+    let mut args_iter = args.into_iter();
+    let opts = match args_iter.next() {
         Some(CfmlValue::Struct(s)) => s,
         _ => return Err(CfmlError::runtime("cfzip requires a struct argument".into())),
+    };
+    // Second argument: the `<cfzipparam>` / `cfzipparam(...)` entries collected
+    // by the tag or script body, each a struct of that child tag's attributes.
+    let params: Vec<ValueMap> = match args_iter.next() {
+        Some(CfmlValue::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                CfmlValue::Struct(s) => Some(s.snapshot()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     };
 
     let action = opts.get("action").map(|v| v.as_string().to_lowercase()).unwrap_or_else(|| "zip".to_string());
@@ -19413,13 +19426,84 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
     match action.as_str() {
         "zip" => {
-            if file_path.is_empty() || source.is_empty() {
-                return Err(CfmlError::runtime("cfzip action=zip requires file and source attributes".into()));
+            if file_path.is_empty() || (source.is_empty() && params.is_empty()) {
+                return Err(CfmlError::runtime(
+                    "cfzip action=zip requires a file attribute and either a source \
+                     attribute or at least one cfzipparam".into(),
+                ));
             }
             let out_file = std::fs::File::create(&file_path)
                 .map_err(|e| CfmlError::runtime(format!("cfzip: cannot create file '{}': {}", file_path, e)))?;
             let mut zip_writer = zip::ZipWriter::new(out_file);
             let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+            // Each cfzipparam contributes its own source (file or directory) with
+            // its own prefix/entrypath/filter/recurse, or literal `content`
+            // written at `entrypath`. Params are added BEFORE the tag-level
+            // `source`, matching the document order of the child tags.
+            for p in &params {
+                let p_str = |k: &str| p.get(k).map(|v| v.as_string()).unwrap_or_default();
+                let p_entry = p_str("entrypath");
+                let p_prefix = p_str("prefix");
+                let p_filter = p_str("filter");
+                let p_recurse = p.get("recurse").map(|v| v.is_true()).unwrap_or(recurse);
+                if let Some(content) = p.get("content") {
+                    // Literal content — `entrypath` names it inside the archive.
+                    let name = if p_entry.is_empty() {
+                        return Err(CfmlError::runtime(
+                            "cfzipparam with content requires an entrypath".into(),
+                        ));
+                    } else {
+                        p_entry.clone()
+                    };
+                    let bytes = match content {
+                        CfmlValue::Binary(b) => b.clone(),
+                        other => other.as_string().into_bytes(),
+                    };
+                    zip_writer.start_file(&name, options).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    zip_writer.write_all(&bytes).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    continue;
+                }
+                let p_source = p_str("source");
+                if p_source.is_empty() {
+                    return Err(CfmlError::runtime(
+                        "cfzipparam requires a source or content attribute".into(),
+                    ));
+                }
+                let sp = std::path::Path::new(&p_source);
+                if sp.is_dir() {
+                    cfzip_add_directory(&mut zip_writer, sp, sp, &options, p_recurse, store_path, &p_prefix, &p_filter)?;
+                } else if sp.is_file() {
+                    // `entrypath` names the entry outright; otherwise the file
+                    // name, under `prefix` when one is given.
+                    let name = if !p_entry.is_empty() {
+                        p_entry.clone()
+                    } else {
+                        let base = sp.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if p_prefix.is_empty() {
+                            base
+                        } else {
+                            format!("{}/{}", p_prefix.trim_end_matches('/'), base)
+                        }
+                    };
+                    let mut f = std::fs::File::open(sp)
+                        .map_err(|e| CfmlError::runtime(format!("cfzip: cannot read '{}': {}", p_source, e)))?;
+                    let mut buf = Vec::new();
+                    f.read_to_end(&mut buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    zip_writer.start_file(&name, options).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    zip_writer.write_all(&buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                } else {
+                    return Err(CfmlError::runtime(format!(
+                        "cfzip: cfzipparam source '{}' does not exist",
+                        p_source
+                    )));
+                }
+            }
+
+            if source.is_empty() {
+                zip_writer.finish().map_err(|e| CfmlError::runtime(e.to_string()))?;
+                return Ok(CfmlValue::Null);
+            }
 
             let source_path = std::path::Path::new(&source);
             if source_path.is_dir() {
@@ -19442,6 +19526,12 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
             zip_writer.finish().map_err(|e| CfmlError::runtime(e.to_string()))?;
             Ok(CfmlValue::Null)
         }
+        // A cfzipparam on any other action would be silently dropped, so refuse
+        // it: those forms (per-entry unzip/delete filters) are not implemented.
+        _ if !params.is_empty() => Err(CfmlError::runtime(format!(
+            "cfzipparam is only supported for action=\"zip\"; action=\"{}\" ignores it",
+            action
+        ))),
         "unzip" => {
             if file_path.is_empty() || destination.is_empty() {
                 return Err(CfmlError::runtime("cfzip action=unzip requires file and destination attributes".into()));

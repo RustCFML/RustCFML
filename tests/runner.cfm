@@ -16,6 +16,8 @@ include "harness.cfm";
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
 <cf_runtest file="core/test_keyword_loop_variables.cfm">
+<cf_runtest file="core/test_parser_lucee_shapes.cfm">
+<cf_runtest file="core/test_throw_mixed_args_superset.cfm" rustcfmlOnly="true" why="Lucee refuses to COMPILE a file containing throw( type=.., 'msg' ); RustCFML accepts it and raises at the call, so the assertion cannot run there">
 <cf_runtest file="core/test_elvis_error_scope.cfm">
 <cf_runtest file="core/test_arguments_scope_dispatch.cfm">
 <cf_runtest file="core/test_unscoped_scope_cascade.cfm">
@@ -481,6 +483,8 @@ include "harness.cfm";
 
 <!--- --- Tags --- --->
 <cf_runtest file="tags/test_cfdump_tag.cfm">
+<cf_runtest file="tags/test_script_child_tags.cfm">
+<cf_runtest file="tags/test_zip_tag_params.cfm">
 <cf_runtest file="tags/test_tag_preprocessor_masa_fixes.cfm">
 <cf_runtest file="tags/test_cfmodule_script_form.cfm">
 <cf_runtest file="tags/test_seethrough_udf_variables.cfm">
@@ -678,7 +682,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
-<cf_runtest file="java_shims/test_esapi_security_config.cfm">
+<cf_runtest file="java_shims/test_esapi_security_config.cfm" rustcfmlOnly="true" why="asserts RustCFML's ESAPI class-name shim; a CommandBox Lucee has no ESAPI on the classpath, so createObject fails there at the first line">
 
 <!--- Adobe XMPCore, the JCE crypto surface, opencsv + java.io writers,
      java.util.StringTokenizer/Properties and JavaMail's connection probe. --->

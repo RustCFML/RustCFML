@@ -222,17 +222,7 @@ impl Parser {
             if self.check(&Token::LParen) {
                 self.consume(&Token::LParen)?;
 
-                // Check if first arg is named (identifier followed by = or :)
-                let is_named = matches!(self.peek(0), Token::Identifier(_))
-                    && (matches!(self.peek(1), Token::Equal | Token::Colon));
-
-                let arguments = if is_named {
-                    // Parse named args like throw(message="oops", type="custom") or throw(message : "oops", type : "custom")
-                    let named = self.parse_throw_named_attrs(true)?;
-                    self.throw_named_to_positional(named, stmt_loc)
-                } else {
-                    self.parse_arguments()?
-                };
+                let arguments = self.parse_throw_call_arguments(stmt_loc)?;
 
                 self.consume(&Token::RParen)?;
                 self.match_token(&Token::Semicolon);
@@ -276,14 +266,7 @@ impl Parser {
         {
             self.advance(); // consume `cfthrow`
             self.consume(&Token::LParen)?;
-            let is_named = matches!(self.peek(0), Token::Identifier(_))
-                && matches!(self.peek(1), Token::Equal | Token::Colon);
-            let arguments = if is_named {
-                let named = self.parse_throw_named_attrs(true)?;
-                self.throw_named_to_positional(named, stmt_loc)
-            } else {
-                self.parse_arguments()?
-            };
+            let arguments = self.parse_throw_call_arguments(stmt_loc)?;
             self.consume(&Token::RParen)?;
             self.match_token(&Token::Semicolon);
             return Ok(self.build_throw_call(arguments, stmt_loc));
@@ -977,58 +960,7 @@ impl Parser {
             }));
 
             // Bind the result if a returnVariable was given.
-            match return_var_expr {
-                None => {
-                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
-                        expr: call,
-                        location: stmt_loc,
-                    })));
-                }
-                Some(rv) => {
-                    // A STATIC name -> a real lvalue, reusing the normal assignment
-                    // path so `local.rv` / `variables.x` / dotted paths all work.
-                    let static_name = match &rv {
-                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
-                        Expression::Identifier(id) => Some(id.name.clone()),
-                        _ => None,
-                    };
-                    if let Some(name) = static_name {
-                        if !name.is_empty() {
-                            if let Some(lvalue) = self.returnvar_lvalue(&name) {
-                                return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
-                                    expr: Expression::BinaryOp(Box::new(BinaryOp {
-                                        left: Box::new(lvalue),
-                                        operator: BinaryOpType::Assign,
-                                        right: Box::new(call),
-                                        location: stmt_loc.clone(),
-                                    })),
-                                    location: stmt_loc,
-                                })));
-                            }
-                        }
-                        // Empty/unusable static name: just invoke, drop the result.
-                        return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
-                            expr: call,
-                            location: stmt_loc,
-                        })));
-                    }
-                    // A DYNAMIC returnVariable (e.g. "#arguments.rv#") -> assign by
-                    // name at runtime. (setVariable resolves variables/request/
-                    // session/application prefixes; other scopes go to variables.)
-                    let set_call = Expression::FunctionCall(Box::new(FunctionCall {
-                        name: Box::new(Expression::Identifier(Identifier {
-                            name: "setVariable".to_string(),
-                            location: stmt_loc.clone(),
-                        })),
-                        arguments: vec![rv, call],
-                        location: stmt_loc.clone(),
-                    }));
-                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
-                        expr: set_call,
-                        location: stmt_loc,
-                    })));
-                }
-            }
+            return Ok(self.bind_invoke_result(call, return_var_expr, stmt_loc));
         }
 
         // Handle CFScript tag-as-statement syntax: keyword attr=value attr=value;
@@ -1471,6 +1403,14 @@ impl Parser {
                 "mail" => Some("cfmail"),
                 "query" => Some("cfquery"),
                 "http" => Some("cfhttp"),
+                // Body forms whose bodies carry CHILD TAGS:
+                //   cfzip( file=… ) { cfzipparam( source=… ); }
+                //   cfinvoke( component=…, method=… ) { cfinvokeArgument( name=…, value=… ); }
+                // Both are ordinary calls without a `{ … }` block, and the
+                // recogniser below rewinds when there is none, so the plain
+                // `cfzip(…)` / `invoke(obj,"m",args)` call forms are untouched.
+                "zip" => Some("cfzip"),
+                "invoke" => Some("cfinvoke"),
                 _ => None,
             };
             if let Some(canonical) = body_tag {
@@ -1656,6 +1596,100 @@ impl Parser {
                         })),
                         location: stmt_loc,
                     })));
+                }
+                self.current = saved;
+            }
+            // cfzipparam(source=…, prefix=…, …) → appends to the runtime array
+            // that the surrounding script `cfzip(){ }` (or the <cfzip> tag body)
+            // seeds, exactly like cfhttpparam. Collecting at RUNTIME rather than
+            // at parse time is what lets params sit inside `if`/`for` in the body.
+            if nlow == "cfzipparam" && matches!(self.peek(1), Token::LParen) {
+                let saved = self.current;
+                self.advance(); // cfzipparam
+                self.advance(); // (
+                let attrs = match self.parse_tag_call_attrs() {
+                    Ok(a) => a,
+                    Err(_) => { self.current = saved; Vec::new() }
+                };
+                if self.current != saved && self.check(&Token::RParen) {
+                    self.advance(); // )
+                    self.match_token(&Token::Semicolon);
+                    let param_struct = Expression::Struct(Struct {
+                        pairs: attrs.iter().map(|(k, v)| (
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(k.to_lowercase()),
+                                location: stmt_loc,
+                            }),
+                            v.clone(),
+                        )).collect(),
+                        ordered: false,
+                        location: stmt_loc,
+                    });
+                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                        expr: Expression::FunctionCall(Box::new(FunctionCall {
+                            name: Box::new(Expression::Identifier(Identifier {
+                                name: "arrayAppend".to_string(),
+                                location: stmt_loc,
+                            })),
+                            arguments: vec![
+                                Expression::Identifier(Identifier {
+                                    name: "__cfzip_params".to_string(),
+                                    location: stmt_loc,
+                                }),
+                                param_struct,
+                            ],
+                            location: stmt_loc,
+                        })),
+                        location: stmt_loc,
+                    })));
+                }
+                self.current = saved;
+            }
+            // cfinvokeArgument(name=…, value=…) → adds one entry to the runtime
+            // argument struct the surrounding script `cfinvoke(){ }` seeds. (The
+            // BARE-attribute spelling inside a bare-attribute cfinvoke body is
+            // collected at parse time further up; this is the parenthesised child
+            // tag, which is what Lucee compiles inside a cfscript block.)
+            if (nlow == "cfinvokeargument" || nlow == "invokeargument")
+                && matches!(self.peek(1), Token::LParen)
+            {
+                let saved = self.current;
+                self.advance(); // cfinvokeargument
+                self.advance(); // (
+                let attrs = match self.parse_tag_call_attrs() {
+                    Ok(a) => a,
+                    Err(_) => { self.current = saved; Vec::new() }
+                };
+                if self.current != saved && self.check(&Token::RParen) {
+                    self.advance(); // )
+                    self.match_token(&Token::Semicolon);
+                    let pick = |want: &str| attrs.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                        .map(|(_, v)| v.clone());
+                    if let (Some(n), Some(v)) = (pick("name"), pick("value")) {
+                        return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                            expr: Expression::FunctionCall(Box::new(FunctionCall {
+                                name: Box::new(Expression::Identifier(Identifier {
+                                    name: "structInsert".to_string(),
+                                    location: stmt_loc,
+                                })),
+                                arguments: vec![
+                                    Expression::Identifier(Identifier {
+                                        name: "__cfinvoke_args".to_string(),
+                                        location: stmt_loc,
+                                    }),
+                                    n,
+                                    v,
+                                    Expression::Literal(Literal {
+                                        value: LiteralValue::Bool(true),
+                                        location: stmt_loc,
+                                    }),
+                                ],
+                                location: stmt_loc,
+                            })),
+                            location: stmt_loc,
+                        })));
+                    }
                 }
                 self.current = saved;
             }
@@ -3403,6 +3437,66 @@ impl Parser {
         out
     }
 
+    /// Bind a `__cfinvoke(...)` call to its `returnVariable`, shared by every
+    /// cfinvoke spelling (bare-attribute, parenthesised, with or without a child
+    /// body). A STATIC name becomes a real lvalue so `local.rv` / `variables.x` /
+    /// dotted paths go through the normal assignment path; a DYNAMIC one
+    /// (`"#arguments.rv#"`) is assigned by name at runtime via setVariable; no
+    /// name at all just invokes and drops the result.
+    fn bind_invoke_result(
+        &self,
+        call: Expression,
+        return_var_expr: Option<Expression>,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        let rv = match return_var_expr {
+            None => {
+                return CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                    expr: call,
+                    location: loc,
+                }))
+            }
+            Some(rv) => rv,
+        };
+        let static_name = match &rv {
+            Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+            Expression::Identifier(id) => Some(id.name.clone()),
+            _ => None,
+        };
+        if let Some(name) = static_name {
+            if !name.is_empty() {
+                if let Some(lvalue) = self.returnvar_lvalue(&name) {
+                    return CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                        expr: Expression::BinaryOp(Box::new(BinaryOp {
+                            left: Box::new(lvalue),
+                            operator: BinaryOpType::Assign,
+                            right: Box::new(call),
+                            location: loc,
+                        })),
+                        location: loc,
+                    }));
+                }
+            }
+            // Empty/unusable static name: just invoke, drop the result.
+            return CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                expr: call,
+                location: loc,
+            }));
+        }
+        let set_call = Expression::FunctionCall(Box::new(FunctionCall {
+            name: Box::new(Expression::Identifier(Identifier {
+                name: "setVariable".to_string(),
+                location: loc,
+            })),
+            arguments: vec![rv, call],
+            location: loc,
+        }));
+        CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+            expr: set_call,
+            location: loc,
+        }))
+    }
+
     /// Lower a script-call-with-body form (`cfsavecontent(...) { ... }`,
     /// `cflock(...) { ... }`, `cftransaction(...) { ... }`, `cfmail(...) { ... }`)
     /// into the same AST shape the angle-bracket tag forms produce.
@@ -3561,6 +3655,113 @@ impl Parser {
                     ]),
                     location: loc,
                 }));
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
+            // Script `cfzip( file=… ) { cfzipparam( source=… ); }`. The body runs
+            // after seeding __cfzip_params = [], each cfzipparam(...) appends to
+            // it (including from inside for/if), then cfzip({...attrs}, params)
+            // runs. Without this the trailing `{ … }` parsed as a struct literal
+            // and the whole component failed to compile.
+            "cfzip" => {
+                let call = |name: &str, arguments: Vec<Expression>| Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier { name: name.to_string(), location: loc })),
+                    arguments,
+                    location: loc,
+                }));
+                // `name=` / `variable=` name the result variable (cfzip action=list),
+                // every other attribute is an option.
+                let result_var = attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("name") || k.eq_ignore_ascii_case("variable"))
+                    .and_then(|(_, v)| match v {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+                        Expression::Identifier(id) => Some(id.name.clone()),
+                        _ => None,
+                    });
+                let opts_struct = Expression::Struct(Struct {
+                    pairs: attrs.iter()
+                        .filter(|(k, _)| !k.eq_ignore_ascii_case("name") && !k.eq_ignore_ascii_case("variable"))
+                        .map(|(k, v)| (
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(k.to_lowercase()),
+                                location: loc,
+                            }),
+                            v.clone(),
+                        ))
+                        .collect(),
+                    ordered: false,
+                    location: loc,
+                });
+                let mut stmts = vec![
+                    Statement::Assignment(Assignment {
+                        target: AssignTarget::Variable("__cfzip_params".to_string()),
+                        value: Expression::Array(Array { elements: vec![], location: loc }),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    }),
+                ];
+                stmts.extend(body);
+                let zip_call = call("cfzip", vec![
+                    opts_struct,
+                    Expression::Identifier(Identifier { name: "__cfzip_params".to_string(), location: loc }),
+                ]);
+                stmts.push(match result_var {
+                    Some(name) if !name.is_empty() => Statement::Assignment(Assignment {
+                        target: AssignTarget::Variable(name),
+                        value: zip_call,
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    }),
+                    _ => Statement::Expression(ExpressionStatement { expr: zip_call, location: loc }),
+                });
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
+            // Script `cfinvoke( component=…, method=… ) { cfinvokeArgument(…); }`.
+            // The child arguments accumulate into __cfinvoke_args at runtime, so
+            // an argument added inside `if`/`for` is seen — then the same
+            // `__cfinvoke(component, method, args)` call the bare-attribute form
+            // builds runs with them.
+            "cfinvoke" => {
+                let pick = |want: &str| attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                    .map(|(_, v)| v.clone());
+                let str_lit = |s: &str| Expression::Literal(Literal {
+                    value: LiteralValue::String(s.to_string()),
+                    location: loc,
+                });
+                // Attributes other than the four structural ones are argument
+                // values, exactly as in the tag form (`<cfinvoke … arg1="x">`).
+                let seed_pairs: Vec<(Expression, Expression)> = attrs.iter()
+                    .filter(|(k, _)| !matches!(k.to_lowercase().as_str(),
+                        "component" | "method" | "returnvariable" | "argumentcollection"))
+                    .map(|(k, v)| (str_lit(k), v.clone()))
+                    .collect();
+                let mut stmts = vec![
+                    Statement::Assignment(Assignment {
+                        target: AssignTarget::Variable("__cfinvoke_args".to_string()),
+                        value: Expression::Struct(Struct { pairs: seed_pairs, ordered: false, location: loc }),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    }),
+                ];
+                stmts.extend(body);
+                let args_expr = pick("argumentcollection").unwrap_or_else(||
+                    Expression::Identifier(Identifier { name: "__cfinvoke_args".to_string(), location: loc }));
+                let call = Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier {
+                        name: "__cfinvoke".to_string(),
+                        location: loc,
+                    })),
+                    arguments: vec![
+                        pick("component").unwrap_or_else(|| str_lit("")),
+                        pick("method").unwrap_or_else(|| str_lit("")),
+                        args_expr,
+                    ],
+                    location: loc,
+                }));
+                match self.bind_invoke_result(call, pick("returnvariable"), loc) {
+                    CfmlNode::Statement(st) => stmts.push(st),
+                    _ => {}
+                }
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }
             "cfhttp" => {
@@ -4042,6 +4243,36 @@ impl Parser {
     /// `comma_separated` is true (paren form) pairs are separated by commas;
     /// otherwise (bare statement form) they are whitespace-separated and the
     /// list ends at the first token that isn't `identifier =`.
+    /// Parse the argument list of a `throw(...)` / `cfthrow(...)` CALL (the
+    /// opening paren is already consumed; the caller consumes the closing one).
+    ///
+    /// An all-named list is mapped to the fixed positional order the VM's throw
+    /// intercept expects. Anything else — including the MIXED form
+    /// `throw( type="x", "the message" )` — goes through the ordinary argument
+    /// parser, so it compiles and then fails at RUNTIME with the usual
+    /// mixed-arguments error. That distinction matters: Lucee compiles such a
+    /// file and only raises when the line executes ("can't mix named and
+    /// unNamed arguments"), whereas rejecting it at parse time takes the whole
+    /// component down — a Preside extension ships this exact line, and it made
+    /// every service in the file unloadable.
+    fn parse_throw_call_arguments(
+        &mut self,
+        loc: SourceLocation,
+    ) -> Result<Vec<Expression>, ParseError> {
+        let first_is_named = matches!(self.peek(0), Token::Identifier(_))
+            && matches!(self.peek(1), Token::Equal | Token::Colon);
+        if first_is_named {
+            let saved = self.current;
+            if let Ok(named) = self.parse_throw_named_attrs(true) {
+                if self.check(&Token::RParen) {
+                    return Ok(self.throw_named_to_positional(named, loc));
+                }
+            }
+            self.current = saved;
+        }
+        self.parse_arguments()
+    }
+
     fn parse_throw_named_attrs(
         &mut self,
         comma_separated: bool,
@@ -5593,6 +5824,18 @@ impl Parser {
         let expr = self.parse_imp()?;
 
         if self.match_token(&Token::Question) {
+            // `cond ? : fallback` — Lucee's lexer allows whitespace (and
+            // newlines) between the `?` and the `:` of the elvis operator, so
+            // the two-token form means exactly what `?:` means. Real code writes
+            // it: `action = wasEdit ? : "datamanager_add_record"`.
+            if self.match_token(&Token::Colon) {
+                let right = Box::new(self.parse_expression()?);
+                return Ok(Expression::Elvis(Box::new(Elvis {
+                    left: Box::new(expr),
+                    right,
+                    location: self.current_location(),
+                })));
+            }
             let then_expr = Box::new(self.parse_expression()?);
             self.consume(&Token::Colon)?;
             let else_expr = Box::new(self.parse_expression()?);
@@ -6468,14 +6711,7 @@ impl Parser {
                 let loc = self.current_location();
                 if self.check(&Token::LParen) {
                     self.consume(&Token::LParen)?;
-                    let is_named = matches!(self.peek(0), Token::Identifier(_))
-                        && (matches!(self.peek(1), Token::Equal | Token::Colon));
-                    let arguments = if is_named {
-                        let named = self.parse_throw_named_attrs(true)?;
-                        self.throw_named_to_positional(named, loc)
-                    } else {
-                        self.parse_arguments()?
-                    };
+                    let arguments = self.parse_throw_call_arguments(loc)?;
                     self.consume(&Token::RParen)?;
                     Ok(Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -6953,24 +7189,23 @@ impl Parser {
                     // struct ends up missing the "null" entry — so
                     // queryExecute's struct-unwrap can't see null=true.
                     let key = match self.peek(0) {
-                        Token::Null if matches!(self.peek(1), Token::Colon | Token::Equal) => {
-                            self.advance();
+                        // ANY reserved word is a legal struct key on
+                        // Lucee/ACF/BoxLang — `{ type="function", function={...} }`
+                        // is how an LLM tool definition is built, and Preside app
+                        // code writes `{ function = frame.function ?: "" }`.
+                        // Softening applies only when the word is immediately
+                        // followed by a key/value separator, so `{ x }` shorthand
+                        // and expression keys are untouched. Identifiers keep the
+                        // expression path (which preserves their source casing);
+                        // a keyword token carries no lexeme, so its key takes the
+                        // canonical lower-case spelling.
+                        t if !matches!(t, Token::Identifier(_))
+                            && self.is_property_name_at(0)
+                            && matches!(self.peek(1), Token::Colon | Token::Equal) =>
+                        {
+                            let name = self.extract_property_name()?;
                             Expression::Literal(Literal {
-                                value: LiteralValue::String("null".to_string()),
-                                location: self.current_location(),
-                            })
-                        }
-                        Token::True if matches!(self.peek(1), Token::Colon | Token::Equal) => {
-                            self.advance();
-                            Expression::Literal(Literal {
-                                value: LiteralValue::String("true".to_string()),
-                                location: self.current_location(),
-                            })
-                        }
-                        Token::False if matches!(self.peek(1), Token::Colon | Token::Equal) => {
-                            self.advance();
-                            Expression::Literal(Literal {
-                                value: LiteralValue::String("false".to_string()),
+                                value: LiteralValue::String(name),
                                 location: self.current_location(),
                             })
                         }

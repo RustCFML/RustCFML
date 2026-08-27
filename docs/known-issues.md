@@ -1543,6 +1543,38 @@ Note this is distinct from the words that are also LITERALS (`true`, `false`,
 `null`) or statement keywords (`return`): those read back as the literal or fail
 on **both** engines, so they are not a divergence.
 
+## 71. `cfzipparam` covers `action="zip"` only 🏗
+
+`<cfzipparam>` / `cfzipparam(...)` contributes an entry to the enclosing
+`<cfzip>` — `source` (a file or a directory), `entrypath`, `prefix`, `filter`,
+`recurse`, and literal `content` written at `entrypath`. That is the whole of
+the `action="zip"` surface.
+
+Lucee also accepts child params on the other actions (a per-entry `entrypath`
+filter for `action="unzip"`/`"delete"`). Those are NOT implemented, and rather
+than drop them silently `cfzip` raises when a param is supplied with any action
+other than `zip`.
+
+---
+
+## 72. `throw()` mixing named and positional arguments — a deliberate superset 🏗
+
+```cfml
+throw( type="my.type", "the message" );   // named, then positional
+```
+
+Lucee refuses to **compile** the file that contains this ("Invalid argument for
+function [ throw ], You can't mix named and unNamed arguments"), so the whole
+component is unloadable there. RustCFML compiles it and raises at the call
+instead — the mixed-arguments error every other function call already produces,
+typed `expression`.
+
+The reason for the divergence is blast radius: a shipped Preside extension
+contains this line, and failing at parse time takes every service in the file
+with it. Accepting the file keeps the rest of the component usable while the bad
+line still fails when it runs. Nothing that works on Lucee behaves differently
+here — only code Lucee rejects outright.
+
 ---
 
 ---

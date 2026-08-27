@@ -1642,14 +1642,56 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
-            let call = format!("cfzip({{ {} }})", parts.join(", "));
-            if let Some(n) = name {
-                (format!("{} = {};\n", n, call), tag_end - start)
-            } else if let Some(v) = variable {
-                (format!("{} = {};\n", v, call), tag_end - start)
+            // A `<cfzip>` with a body carries `<cfzipparam>` children, each naming
+            // its own source/entrypath/prefix. They are collected into a runtime
+            // array (rather than harvested literally) so a param inside
+            // `<cfif>`/`<cfloop>` is seen, exactly as the script form does.
+            let (params_arg, body_script, consumed) = if is_self_closing_tag(chars, tag_end) {
+                (String::new(), String::new(), tag_end - start)
+            } else if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfzip") {
+                let body: String = chars[tag_end..close_pos].iter().collect();
+                let close_end = find_tag_end(chars, close_pos, len);
+                (
+                    ", __cfzip_params".to_string(),
+                    format!(
+                        "__cfzip_params = [];\n{}",
+                        tags_to_script_inner(&body, imports, in_cfoutput)
+                    ),
+                    close_end - start,
+                )
             } else {
-                (format!("{};\n", call), tag_end - start)
+                (String::new(), String::new(), tag_end - start)
+            };
+            let call = format!("cfzip({{ {} }}{})", parts.join(", "), params_arg);
+            if let Some(n) = name {
+                (format!("{}{} = {};\n", body_script, n, call), consumed)
+            } else if let Some(v) = variable {
+                (format!("{}{} = {};\n", body_script, v, call), consumed)
+            } else {
+                (format!("{}{};\n", body_script, call), consumed)
             }
+        }
+        "cfzipparam" => {
+            // <cfzipparam source="..." entrypath="..." ...> — one entry for the
+            // enclosing <cfzip> body. Appends to the array that arm seeds.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                let raw = v.trim();
+                let lower = raw.to_lowercase();
+                if lower == "true" || lower == "yes" {
+                    parts.push(format!("{}: true", k));
+                } else if lower == "false" || lower == "no" {
+                    parts.push(format!("{}: false", k));
+                } else if raw.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, raw));
+                } else {
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+                }
+            }
+            (
+                format!("arrayAppend(__cfzip_params, {{ {} }});\n", parts.join(", ")),
+                tag_end - start,
+            )
         }
         "cfsavecontent" => {
             let variable = attrs.get("variable").cloned().unwrap_or("__savecontent_result".to_string());
