@@ -676,6 +676,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
+<cf_runtest file="java_shims/test_esapi_security_config.cfm">
 
 <!--- Adobe XMPCore, the JCE crypto surface, opencsv + java.io writers,
      java.util.StringTokenizer/Properties and JavaMail's connection probe. --->

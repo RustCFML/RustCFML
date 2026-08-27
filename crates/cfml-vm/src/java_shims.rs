@@ -346,6 +346,67 @@ pub fn handle_java_bcrypt(
     Ok(CfmlValue::strukt(shim))
 }
 
+/// `org.owasp.esapi.reference.DefaultSecurityConfiguration` — OWASP ESAPI's
+/// default SecurityConfiguration implementation. On Lucee this class exists
+/// only because ESAPI ships in the servlet container; application code reaches
+/// for it to *name* it, not to use it. Preside's saml2-sso extension does
+/// exactly that at config time:
+///
+/// ```cfml
+/// var defaultVal = CreateObject( "java", "org.owasp.esapi.reference.DefaultSecurityConfiguration" )
+///                    .getClass().getName();
+/// System.setProperty( "org.owasp.esapi.SecurityConfiguration", defaultVal );
+/// ```
+///
+/// So the shim is deliberately narrow: it constructs, answers the class-name
+/// reflection calls, and throws a clear error on every genuine ESAPI method
+/// (RustCFML has no JVM and no ESAPI runtime). ESAPI's *encoding* surface is
+/// already native — see the `encodeFor*` / `esapiEncode` BIFs.
+pub const ESAPI_SECURITY_CONFIG_CLASS: &str =
+    "org.owasp.esapi.reference.defaultsecurityconfiguration";
+
+/// The canonical (cased) class name the shim reports from getName()/toString().
+const ESAPI_SECURITY_CONFIG_NAME: &str =
+    "org.owasp.esapi.reference.DefaultSecurityConfiguration";
+
+pub fn handle_esapi_security_config(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string(ESAPI_SECURITY_CONFIG_CLASS.to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert(
+                "__class_name".to_string(),
+                CfmlValue::string(ESAPI_SECURITY_CONFIG_NAME.to_string()),
+            );
+            Ok(CfmlValue::strukt(shim))
+        }
+        // DefaultSecurityConfiguration.getInstance() — the singleton accessor.
+        // The receiver already is that singleton.
+        "getinstance" => Ok(object.clone()),
+        // Reflection surface: the only thing callers actually want.
+        "getclass" => Ok(make_class_shim(ESAPI_SECURITY_CONFIG_NAME)),
+        "getname" | "getcanonicalname" | "gettypename" => {
+            Ok(CfmlValue::string(ESAPI_SECURITY_CONFIG_NAME.to_string()))
+        }
+        "tostring" => Ok(CfmlValue::string(ESAPI_SECURITY_CONFIG_NAME.to_string())),
+        _ => Err(CfmlError::runtime(format!(
+            "{}.{}() is not supported: RustCFML has no JVM and no ESAPI runtime. \
+             This class is shimmed only so class-name reflection \
+             (getClass().getName()) works; ESAPI's encoding surface is available \
+             natively via the encodeFor*() / esapiEncode() functions.",
+            ESAPI_SECURITY_CONFIG_NAME, method
+        ))),
+    }
+}
+
 /// `org.yaml.snakeyaml.Yaml` construction. Returns a marker shim; the `load`
 /// method is routed (VM-side) to the native `yamlDeserialize` builtin. The jar
 /// path arg is ignored. Lets legacy Preside's cfflow YamlParser work without a

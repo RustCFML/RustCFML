@@ -17320,6 +17320,14 @@ impl CfmlVirtualMachine {
                                 // shim's load() routes to the native
                                 // yamlDeserialize builtin (see
                                 // handle_snakeyaml_method).
+                                // OWASP ESAPI's default SecurityConfiguration.
+                                // Preside's saml2-sso extension constructs it
+                                // purely to read getClass().getName() into a
+                                // system property. See
+                                // java_shims::handle_esapi_security_config.
+                                java_shims::ESAPI_SECURITY_CONFIG_CLASS => {
+                                    java_shims::handle_esapi_security_config("init", empty_args, &CfmlValue::Null)
+                                }
                                 "org.yaml.snakeyaml.yaml" => {
                                     java_shims::handle_java_yaml("init", empty_args, &CfmlValue::Null)
                                 }
@@ -24282,6 +24290,9 @@ impl CfmlVirtualMachine {
                 let result = match java_class.as_str() {
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
+                    java_shims::ESAPI_SECURITY_CONFIG_CLASS => {
+                        java_shims::handle_esapi_security_config(&m, all_args, object)
+                    }
                     "ca.vanmulligen.json.schema.validator" => {
                         self.handle_jsonvalidator_method(&m, object, all_args)
                     }
