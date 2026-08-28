@@ -2819,7 +2819,7 @@ pub struct CfmlVirtualMachine {
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
-    pub last_component_compile_error: Option<String>,
+    pub last_component_compile_error: Option<CfmlError>,
     /// Optional Cranelift JIT engine. `Some` only under `--features jit` on a
     /// native target when not disabled via `RUSTCFML_JIT=0`. Consulted at the
     /// top of `execute_function_with_args`; the interpreter is always the
@@ -16972,7 +16972,7 @@ impl CfmlVirtualMachine {
                         // file + line), otherwise Lucee's not-found message.
                         let comp_name = comp_name.clone();
                         return Err(match self_.last_component_compile_error.take() {
-                            Some(msg) => CfmlError::new(msg, CfmlErrorType::Template),
+                            Some(err) => err,
                             None => CfmlError::new(
                                 format!(
                                     "invalid component definition, can't find component [{}]",
@@ -29455,8 +29455,8 @@ impl CfmlVirtualMachine {
     /// it points at the real syntax problem with file + line. Otherwise the file
     /// genuinely was not found, so report the missing-component message.
     fn component_load_error(&mut self, class_name: &str) -> CfmlError {
-        if let Some(msg) = self.last_component_compile_error.take() {
-            CfmlError::runtime(msg)
+        if let Some(err) = self.last_component_compile_error.take() {
+            err
         } else {
             CfmlError::runtime(format!("Could not find the component [{}].", class_name))
         }
@@ -30582,7 +30582,7 @@ impl CfmlVirtualMachine {
         // a not-found and the component-name message is the right one.
         if let Err(ref e) = compiled {
             if !e.message.starts_with(&format!("Cannot read '{}'", cfc_path)) {
-                self.last_component_compile_error = Some(e.message.clone());
+                self.last_component_compile_error = Some(e.clone());
             }
         }
         if let Ok(sub_program) = compiled {
@@ -30920,7 +30920,17 @@ impl CfmlVirtualMachine {
             // construction in progress (a nested `new` inside the body restores
             // the outer stash on its own return). See pseudo_ctor_super_this_writes.
             let saved_super_this_writes = self.pseudo_ctor_super_this_writes.take();
-            let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            // An error thrown by the pseudo-constructor must NOT be discarded.
+            // Lucee propagates it, and swallowing it here left the half-built
+            // component to be assembled from a corrupted stack: a nested
+            // `new Child()` that threw inside a struct literal
+            // (`variables.x = { a = new sub.Child() }`) left ITS `__extends` on
+            // the stack, the enclosing BuildStruct absorbed it, and the outer
+            // component silently acquired the inner one's parent. A missing EC
+            // algorithm in a Preside module's `init()` was reported three steps
+            // later as "invalid component definition, can't find component [Rsa]".
+            let body_result =
+                self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
             let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
             self.pseudo_ctor_super_this_writes = saved_super_this_writes;
             self.pending_pseudo_ctor_parent_this = None;
@@ -30938,6 +30948,14 @@ impl CfmlVirtualMachine {
             // there is no merge-append, op remap, or index fixup to do — just
             // restore the caller's program.
             self.pop_program_swap(old_program);
+            // Cleanup above is unconditional; only now is it safe to bail. This
+            // function reports failure as `None`, so the error travels in the
+            // same stash a parse failure uses — `component_load_error` and
+            // getComponentMetaData both surface it verbatim.
+            if let Err(e) = body_result {
+                self.last_component_compile_error = Some(e);
+                return None;
+            }
             let short_name = class_name.split('.').last().unwrap_or(class_name);
             // Deep-copy the cached template into an independent instance. Structs
             // are reference-typed, so a plain handle clone would alias mutable
