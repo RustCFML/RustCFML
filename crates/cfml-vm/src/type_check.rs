@@ -358,9 +358,27 @@ pub fn satisfies(value: &CfmlValue, declared: &str, env: &Env<'_>) -> bool {
             matches!(value, CfmlValue::String(_)) && env.is_valid("variablename", value)
         }
         Target::AnyComponent => (env.is_component)(value),
-        // `returntype="void"` tolerates only "returned nothing", and the
-        // caller has already filtered Null out, so any value here is wrong.
-        Target::Void => false,
+        // `returntype="void"` is NOT "nothing came back" — Lucee's
+        // `Decision.isVoid` also accepts an empty string, a boolean `false`,
+        // and any number that TRUNCATES to zero, and hands the value back
+        // unchanged rather than nulling it. `return false;` from a void
+        // function is common in the wild (it reads as "stop here"), and a
+        // shipped Preside extension's interceptor does exactly that — treating
+        // it as a violation stopped the application booting.
+        //
+        // Null is already filtered out by the caller. Note the asymmetry
+        // between forms: `0` passes but `"0"` does not, because Lucee tests a
+        // String only for emptiness. Probed against Lucee 7, and this is
+        // `Decision.isVoid` line for line.
+        Target::Void => match value {
+            CfmlValue::String(s) => s.is_empty(),
+            CfmlValue::Bool(b) => !*b,
+            CfmlValue::Int(i) => *i == 0,
+            // Java's `Number.intValue()` truncates toward zero, so 0.5 and
+            // -0.5 are both "zero" here.
+            CfmlValue::Double(d) => d.trunc() == 0.0 || d.is_nan(),
+            _ => false,
+        },
         Target::TypedArray(inner) => match value {
             CfmlValue::Array(a) => a.iter().all(|el| {
                 // An element that is itself absent can't be type-checked.

@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 572 crate(s)
+  MIT License (MIT) — 584 crate(s)
   Apache License 2.0 (Apache-2.0) — 54 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -199,6 +199,8 @@ Dependencies
   mime 0.3.17 — https://github.com/hyperium/mime
 [MIT]
   base64ct 1.8.3 — https://github.com/RustCrypto/formats
+[MIT]
+  base16ct 0.2.0 — https://github.com/RustCrypto/formats/tree/master/base16ct
 [MIT]
   bitflags 1.3.2 — https://github.com/bitflags/bitflags
   bitflags 2.13.0 — https://github.com/bitflags/bitflags
@@ -422,6 +424,9 @@ Dependencies
   block-buffer 0.10.4 — https://github.com/RustCrypto/utils
   block-padding 0.3.3 — https://github.com/RustCrypto/utils
 [MIT]
+  ecdsa 0.16.9 — https://github.com/RustCrypto/signatures/tree/master/ecdsa
+  rfc6979 0.4.0 — https://github.com/RustCrypto/signatures/tree/master/rfc6979
+[MIT]
   cbc 0.1.2 — https://github.com/RustCrypto/block-modes
   cbc 0.2.1 — https://github.com/RustCrypto/block-modes
 [MIT]
@@ -490,10 +495,17 @@ Dependencies
 [MIT]
   no_std_io2 0.9.4 — https://github.com/wcampbell0x2a/no-std-io2
 [MIT]
+  p384 0.13.1 — https://github.com/RustCrypto/elliptic-curves/tree/master/p384
+[MIT]
+  elliptic-curve 0.13.8 — https://github.com/RustCrypto/traits/tree/master/elliptic-curve
+  p521 0.13.3 — https://github.com/RustCrypto/elliptic-curves/tree/master/p521
+[MIT]
   const-oid 0.9.6 — https://github.com/RustCrypto/formats/tree/master/const-oid
   der_derive 0.7.3 — https://github.com/RustCrypto/formats/tree/master/der/derive
 [MIT]
+  p256 0.13.2 — https://github.com/RustCrypto/elliptic-curves/tree/master/p256
   password-hash 0.5.0 — https://github.com/RustCrypto/traits/tree/master/password-hash
+  primeorder 0.13.6 — https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder
 [MIT]
   der 0.7.10 — https://github.com/RustCrypto/formats/tree/master/der
   pkcs8 0.10.2 — https://github.com/RustCrypto/formats/tree/master/pkcs8
@@ -507,9 +519,12 @@ Dependencies
 [MIT]
   crypto-common 0.1.7 — https://github.com/RustCrypto/traits
 [MIT]
+  crypto-bigint 0.5.5 — https://github.com/RustCrypto/crypto-bigint
   x509-cert 0.2.5 — https://github.com/RustCrypto/formats/tree/master/x509-cert
 [MIT]
   tiberius 0.12.3 — https://github.com/prisma/tiberius
+[MIT]
+  sec1 0.7.3 — https://github.com/RustCrypto/formats/tree/master/sec1
 [MIT]
   pkcs1 0.7.5 — https://github.com/RustCrypto/formats/tree/master/pkcs1
   scrypt 0.11.0 — https://github.com/RustCrypto/password-hashes/tree/master/scrypt
@@ -816,6 +831,7 @@ Dependencies
   event-listener 5.4.1 — https://github.com/smol-rs/event-listener
   fast-float2 0.2.3 — https://github.com/Alexhuszagh/fast-float-rust
   fastrand 2.4.1 — https://github.com/smol-rs/fastrand
+  group 0.13.0 — https://github.com/zkcrypto/group
   io-enum 1.2.1 — https://github.com/taiki-e/io-enum
   itoa 1.0.18 — https://github.com/dtolnay/itoa
   linux-raw-sys 0.12.1 — https://github.com/sunfishcode/linux-raw-sys
@@ -942,6 +958,8 @@ Dependencies
   tokio-postgres 0.7.18 — https://github.com/rust-postgres/rust-postgres
 [MIT]
   winapi-util 0.1.11 — https://github.com/BurntSushi/winapi-util
+[MIT]
+  ff 0.13.1 — https://github.com/zkcrypto/ff
 [MIT]
   humantime-serde 1.1.1 — https://github.com/jean-airoldie/humantime-serde
 [MIT]
@@ -4655,6 +4673,40 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - base16ct 0.2.0
+================================================================================
+
+Copyright (c) 2014 Steve "Sc00bz" Thomas (steve at tobtu dot com)
+Copyright (c) 2022 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - bitflags 1.3.2
   - bitflags 2.13.0
   - bufstream 0.1.4
@@ -7084,6 +7136,40 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - ecdsa 0.16.9
+  - rfc6979 0.4.0
+================================================================================
+
+Copyright (c) 2018-2022 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - cbc 0.1.2
   - cbc 0.2.1
 ================================================================================
@@ -8041,6 +8127,73 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - p384 0.13.1
+================================================================================
+
+Copyright (c) 2020-2021 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - elliptic-curve 0.13.8
+  - p521 0.13.3
+================================================================================
+
+Copyright (c) 2020-2022 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - const-oid 0.9.6
   - der_derive 0.7.3
 ================================================================================
@@ -8075,7 +8228,9 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - p256 0.13.2
   - password-hash 0.5.0
+  - primeorder 0.13.6
 ================================================================================
 
 Copyright (c) 2020-2023 RustCrypto Developers
@@ -8269,6 +8424,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - crypto-bigint 0.5.5
   - x509-cert 0.2.5
 ================================================================================
 
@@ -8306,6 +8462,39 @@ Applies to:
 ================================================================================
 
 Copyright (c) 2021 Tiberius Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - sec1 0.7.3
+================================================================================
+
+Copyright (c) 2021-2022 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -11141,6 +11330,7 @@ Applies to:
   - event-listener 5.4.1
   - fast-float2 0.2.3
   - fastrand 2.4.1
+  - group 0.13.0
   - io-enum 1.2.1
   - itoa 1.0.18
   - linux-raw-sys 0.12.1
@@ -12046,6 +12236,35 @@ Applies to:
 The MIT License (MIT)
 
 Copyright (c) 2017 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - ff 0.13.1
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2017 Sean Bowe
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

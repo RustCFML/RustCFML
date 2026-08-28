@@ -24494,7 +24494,14 @@ impl CfmlVirtualMachine {
                     java_security::BIGINTEGER_CLASS => {
                         java_security::handle_java_biginteger(&m, all_args, object)
                     }
+                    java_security::KEYPAIRGEN_CLASS => {
+                        java_security::handle_java_keypairgenerator(&m, all_args, object)
+                    }
+                    java_security::KEYPAIR_CLASS => {
+                        java_security::handle_java_keypair(&m, all_args, object)
+                    }
                     java_security::X509_SPEC_CLASS
+                    | java_security::ECGEN_SPEC_CLASS
                     | java_security::PKCS8_SPEC_CLASS
                     | java_security::RSA_PUBLIC_SPEC_CLASS
                     | java_security::PUBLIC_KEY_CLASS

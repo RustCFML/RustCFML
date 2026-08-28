@@ -51,6 +51,16 @@ md-5 = "0.10"
 # is deterministic and verification needs no entropy, so the shim never draws
 # from an RNG and the wasm targets keep building without a random backend.
 rsa = { version = "0.9", default-features = false, features = ["std", "sha1", "sha2"] }
+# Pure-Rust, wasm-safe NIST-curve ECDSA for the same shims (SHA*withECDSA, the
+# ES256/384/512 half of the JWT surface). Signing is RFC 6979 DETERMINISTIC, so
+# — exactly like the RSA line above — no `getrandom` backend is pulled in and
+# the wasm targets keep building. Key *generation* is the one operation that
+# needs entropy; it lives behind `cfg(not(target_arch = "wasm32"))` with the
+# `rand_core` dep below, and throws on wasm rather than silently producing a
+# weak key.
+p256 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+p384 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+p521 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
@@ -60,6 +70,16 @@ uuid = { version = "1", features = ["v4", "js"] }
 # is a build-time impossibility (mirrors MatchBox). The interpreter is always
 # the default and the universal fallback; nothing here changes a default build.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# P-521 is the one curve whose signing is NOT deterministic: p521 0.13 has no
+# RFC 6979 support yet (its own TODO), so it draws a random nonce and gates
+# `sign_prehash` behind `getrandom`. Native-only, therefore, and the P-521
+# SIGNING branch is `cfg`-ed off wasm; P-521 *verification* needs no entropy and
+# stays available everywhere.
+p521 = { version = "0.13", default-features = false, features = ["getrandom"] }
+# OS entropy for KeyPairGenerator.generateKeyPair(). Native-only on purpose:
+# see the p256/p384/p521 note above — key generation is the ONLY shim operation
+# that draws from an RNG, so this is the only place a random backend is needed.
+rand_core = { version = "0.6", features = ["getrandom"] }
 rustc-hash = { workspace = true, optional = true }
 cranelift-jit = { workspace = true, optional = true }
 cranelift-module = { workspace = true, optional = true }

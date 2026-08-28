@@ -1596,6 +1596,8 @@ Restrictions that apply only on a particular target (wasm, CLI vs serve).
 | `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
 | `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads: `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
 | `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
+| `java.security.KeyPairGenerator.generateKeyPair()` | Not supported on `wasm32`: there is no OS entropy source, and inventing a key from a deterministic source would be worse than failing. Throws with that explanation. Generate the pair elsewhere and supply it as PEM. |
+| `SHA512withECDSA` **signing** (P-521 only) | Not supported on `wasm32`, for the same reason: `p521` has no RFC 6979 implementation, so P-521 signing draws a random nonce. P-521 *verification*, and both signing and verification on P-256/P-384 (which are RFC 6979 deterministic), work everywhere. |
 
 ---
 

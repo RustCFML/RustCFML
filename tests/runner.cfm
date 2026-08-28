@@ -684,6 +684,8 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
+<cf_runtest file="core/test_void_return_type.cfm">
+<cf_runtest file="java_shims/test_java_security_ecdsa.cfm">
 <cf_runtest file="java_shims/test_esapi_security_config.cfm" rustcfmlOnly="true" why="asserts RustCFML's ESAPI class-name shim; a CommandBox Lucee has no ESAPI on the classpath, so createObject fails there at the first line">
 
 <!--- Adobe XMPCore, the JCE crypto surface, opencsv + java.io writers,
