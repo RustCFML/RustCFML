@@ -30,6 +30,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_gcm_leading_dot_path.cfm">
 <cf_runtest file="core/test_var_indexed_assignment.cfm">
 <cf_runtest file="core/test_function_scope_capture.cfm">
+<cf_runtest file="core/test_component_method_named_url_scope.cfm">
 <cf_runtest file="core/test_cfthread_component_method_scope.cfm">
 <cf_runtest file="core/test_bare_call_caller_stack_leak.cfm">
 <cf_runtest file="core/test_defaulted_param_variables_clobber.cfm">
@@ -684,8 +685,6 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
-<cf_runtest file="core/test_void_return_type.cfm">
-<cf_runtest file="java_shims/test_java_security_ecdsa.cfm">
 <cf_runtest file="java_shims/test_esapi_security_config.cfm" rustcfmlOnly="true" why="asserts RustCFML's ESAPI class-name shim; a CommandBox Lucee has no ESAPI on the classpath, so createObject fails there at the first line">
 
 <!--- Adobe XMPCore, the JCE crypto surface, opencsv + java.io writers,

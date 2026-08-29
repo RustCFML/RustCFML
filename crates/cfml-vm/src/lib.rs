@@ -8624,6 +8624,23 @@ impl CfmlVirtualMachine {
                         } else if Self::is_web_request_scope(&name_lower)
                             && !declared_locals.contains(name.as_str())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
+                            // Only a SCOPE round-trip commits here. A whole-value
+                            // store of something that isn't a struct is not the
+                            // scope — most importantly a NAMED FUNCTION DECLARATION
+                            // whose name happens to be a scope word (`function
+                            // url( key )` on an S3-proxy CFC is the common shape:
+                            // `DefineFunction` + this `StoreLocal("url")`). Without
+                            // this guard the method value REPLACED `globals["url"]`,
+                            // so merely instantiating the component emptied the
+                            // caller's url scope for the rest of the request — reads
+                            // went undefined and later `url.x = …` writes vanished
+                            // (PR #369; Moopa's re-init always landing on the home
+                            // page because `url.route` disappeared). Falling through
+                            // stores the method in the component/page `variables`
+                            // scope like any other method, matching what the
+                            // request/application/session branches above already do
+                            // by testing `if let CfmlValue::Struct`.
+                            && matches!(val, CfmlValue::Struct(_))
                         {
                             // Web request scopes (url/form/cgi/cookie) are always
                             // request-global: a `url.path = x` writeback (LoadLocal
