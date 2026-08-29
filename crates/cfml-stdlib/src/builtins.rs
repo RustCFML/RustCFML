@@ -893,6 +893,9 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cfcookie".to_string(), fn_cfcookie_stub);
     f.insert("__cfcache".to_string(), fn_cfcache_stub);
     f.insert("__cfloop_file_lines".to_string(), fn_cfloop_file_lines_stub);
+    f.insert("__cfloop_file_open".to_string(), fn_cfloop_file_cursor_stub);
+    f.insert("__cfloop_file_next".to_string(), fn_cfloop_file_cursor_stub);
+    f.insert("__cfloop_file_close".to_string(), fn_cfloop_file_cursor_stub);
     f.insert("__cfexecute".to_string(), fn_cfexecute_stub);
     f.insert("__cfmail".to_string(), fn_cfmail);
     // Gated with its implementation: the SMTP probe needs `lettre`, which the
@@ -17901,6 +17904,13 @@ fn fn_cfcache_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cfloop_file_lines_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfloop_file_lines requires VM intercept".into()))
+}
+
+/// The `loop file=` streaming cursor trio (GH #367). Genuinely unusable outside
+/// the VM — the cursor lives in VM state — so the stub is an error rather than a
+/// standalone implementation.
+fn fn_cfloop_file_cursor_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("cfloop file cursor requires VM intercept".into()))
 }
 
 fn fn_cfexecute_stub(_args: Vec<CfmlValue>) -> CfmlResult {

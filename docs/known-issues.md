@@ -1490,31 +1490,48 @@ arbitrary rectangle is almost never what "make it 200x100" means.
 
 ---
 
-## 69. `loop file=` reads the whole file, so it does not bound memory 🏗 *(GH [#367](https://github.com/RustCFML/RustCFML/issues/367))*
+## 69. `loop file=` streams — RESOLVED in v0.640.0 *(GH [#367](https://github.com/RustCFML/RustCFML/issues/367))*
 
-Both spellings iterate a file line by line and both produce correct results:
+Kept as a pointer because the entry above it shipped in two halves and the
+first half read like the whole fix.
+
+Both spellings iterate a file line by line:
 
 ```cfml
 <cfloop file="#p#" index="line"> ... </cfloop>     <!--- tag form --->
 loop file=p item="line" { ... }                    // script form (added for GH #367)
 ```
 
-What they do **not** yet deliver is the reason the construct exists. Lucee
-streams the file through a buffered reader, so the resident cost is one line.
-RustCFML's `__cfloop_file_lines` reads the file into a string via the VFS and
-materialises an array of every line before the first iteration — so peak memory
-is the file size plus one string per line, which is *worse* than the
+v0.636.0 made the script form *work* — it previously fell through to the
+infinite-loop fallback and threw "Variable 'line' is undefined". It did not
+make either form bound its memory: `__cfloop_file_lines` read the file whole
+and materialised an array of every line before the first iteration, so peak
+cost was the file size plus one `String` per line — *worse* than the
 `fileRead()` + `listToArray()` workaround the construct is meant to replace.
 
-Correctness is unaffected (including blank-line preservation); only the memory
-profile is. A file large enough for this to matter is exactly the case that
-motivates reaching for the construct, so treat it as unsuitable for very large
-files until it streams.
+v0.640.0 closes that half. `Vfs::open_lines` returns a `VfsLines` cursor
+(`RealFs` buffers over the open file; in-memory implementations keep the eager
+read, which is optimal for them and forwarded by the delegating ones), and both
+lowerings converge on a pump — open, `next` until it yields Null, close — in
+place of `for (x in <array>)`. Measured on a 214MB / 4M-row CSV: peak RSS 1038MB
+eager → 241MB streaming, which is the engine's own baseline footprint; peak is
+flat from a 12MB file to a 214MB one. CPU is unchanged to slightly better.
 
-Fixing it properly needs a streaming entry point on the `Vfs` trait (defaulting
-to today's eager read for the non-filesystem implementations) plus a cursor the
-loop lowering can pump, since both lowerings currently emit `for (x in
-<array>)`.
+Two properties worth knowing rather than rediscovering:
+
+- **The cursor holds an OS file descriptor, so every exit path must close it.**
+  The loop is lowered as `try { while(true){…} } finally { close }` rather than
+  as hand-emitted bytecode precisely for this: the body can leave by running
+  out, by `break`, by `return`, or by throwing. A first cut covered the first
+  three and leaked on the fourth, which is not academic — a function that
+  returns from inside the loop leaks one descriptor per call, so a few thousand
+  calls in one request exhaust a default 1024-fd limit and fail with EMFILE far
+  from the cause. Regression cover: 40,000 early exits (returns and throws)
+  under a deliberately-set 256-fd limit.
+- **Invalid UTF-8 surfaces at the offending line, not before the first
+  iteration**, because nothing reads ahead of the cursor. Lucee's buffered
+  reader behaves the same way; the alternative is scanning the whole file
+  up-front, which is the cost being removed.
 
 ## 70. An operator word used as a plain variable is read as the operator 🏗
 

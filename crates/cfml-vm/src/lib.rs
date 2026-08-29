@@ -2809,6 +2809,19 @@ pub struct CfmlVirtualMachine {
     /// can only go stale via a *delete*, and every filesystem-mutating BIF clears
     /// this cache (see `builtin_may_remove_path`). Dropped at request end.
     pub request_exists_cache: parking_lot::RwLock<HashMap<String, ExistsEntry>>,
+    /// Open `loop file=` line cursors, keyed by the handle the loop lowering
+    /// carries in a local (GH #367).
+    ///
+    /// The loop closes its own handle on both normal exit and `break`. A
+    /// `return` or an exception out of the body leaks one entry, which is
+    /// bounded and deliberate: in serve mode this VM is per-request, so the
+    /// cursor — and the file descriptor under it — is dropped at request end.
+    /// Unwinding a handle through every `?` in the interpreter would buy
+    /// nothing over that.
+    file_line_cursors: HashMap<i64, Box<dyn cfml_common::vfs::VfsLines>>,
+    /// Monotonic handle counter. Never reused, so a stale handle from a closed
+    /// cursor reports "closed" rather than silently reading someone else's file.
+    next_file_line_cursor: i64,
     /// Request epoch for the existence-probe census (`exists-census` builds
     /// only). Taken once per `Vm`, which in serve mode is once per request, so
     /// the census can tell a repeat probe *within* a request from one that
@@ -3562,6 +3575,8 @@ impl CfmlVirtualMachine {
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
+            file_line_cursors: HashMap::new(),
+            next_file_line_cursor: 1,
             #[cfg(feature = "exists-census")]
             exists_census_epoch: cfml_common::perf_counters::exists_census::next_epoch(),
             last_component_compile_error: None,
@@ -19699,6 +19714,60 @@ impl CfmlVirtualMachine {
                 // through the VFS like fileRead so it works in CLI and serve modes.
                 // Without a `file=` handler `<cfloop file=…>` previously fell through
                 // to `while(true)` and hung the request (GitHub issue #158).
+                // ---- <cfloop file="..."> streaming line cursor (GH #367) ----
+                // The three halves of one construct: the loop lowering opens a
+                // cursor, pumps `next` until it yields Null, and closes. Peak
+                // memory is one line, which is the property `loop file=` exists
+                // for — the eager `__cfloop_file_lines` below materialised the
+                // whole file plus one String per line BEFORE the first
+                // iteration, so on the reporter's million-row files it was
+                // strictly worse than the fileRead()+listToArray() workaround
+                // it is meant to replace.
+                "__cfloop_file_open" => {
+                    let path = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    let cursor = self.vfs.open_lines(&path).map_err(|e| {
+                        CfmlError::runtime(format!("cfloop file: cannot read '{}': {}", path, e))
+                    })?;
+                    let handle = self.next_file_line_cursor;
+                    self.next_file_line_cursor += 1;
+                    self.file_line_cursors.insert(handle, cursor);
+                    return Ok(CfmlValue::Int(handle));
+                }
+                // Null means end of file. Unambiguous: a line is always a
+                // string, and a blank line is `""`, not Null — so the loop's
+                // null test cannot mistake an interior empty line for EOF.
+                "__cfloop_file_next" => {
+                    let handle = match args.first() {
+                        Some(CfmlValue::Int(h)) => *h,
+                        other => other.map(|v| v.as_string().parse().unwrap_or(0)).unwrap_or(0),
+                    };
+                    let Some(cursor) = self.file_line_cursors.get_mut(&handle) else {
+                        // Only reachable if the handle local was clobbered — the
+                        // lowering never calls next after close. Report it
+                        // rather than ending the loop silently on a short read.
+                        return Err(CfmlError::runtime(
+                            "cfloop file: line cursor is closed or invalid".to_string(),
+                        ));
+                    };
+                    return match cursor.next_line() {
+                        Ok(Some(line)) => Ok(CfmlValue::string(line)),
+                        Ok(None) => Ok(CfmlValue::Null),
+                        Err(e) => Err(CfmlError::runtime(format!(
+                            "cfloop file: error reading line: {}",
+                            e
+                        ))),
+                    };
+                }
+                "__cfloop_file_close" => {
+                    let handle = match args.first() {
+                        Some(CfmlValue::Int(h)) => *h,
+                        other => other.map(|v| v.as_string().parse().unwrap_or(0)).unwrap_or(0),
+                    };
+                    // Dropping the cursor closes the underlying file descriptor.
+                    self.file_line_cursors.remove(&handle);
+                    return Ok(CfmlValue::Null);
+                }
+
                 "__cfloop_file_lines" => {
                     let path = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     return match self.vfs.read_to_string(&path) {

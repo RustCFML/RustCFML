@@ -95,6 +95,15 @@ impl Vfs for EngineCfcOverlay {
         }
     }
 
+    /// Forwarded so a `loop file=` on an ordinary path still streams; only the
+    /// handful of overlaid engine CFCs (already in-memory strings) go eager.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn cfml_common::vfs::VfsLines>> {
+        match self.overlaid(path) {
+            Some(src) => Ok(Box::new(cfml_common::vfs::EagerLines::new(src))),
+            None => self.base.open_lines(path),
+        }
+    }
+
     fn exists(&self, path: &str) -> bool {
         // Ordinary paths: one stat, straight through (see `overlaid`).
         if engine_cfc(path).is_none() {
