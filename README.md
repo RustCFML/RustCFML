@@ -124,7 +124,8 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 
 | Topic | Description |
 |---|---|
-| **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
+| **[Extensions](docs/extensions.md)** | `.rcx` files — precompiled Rust that a stock binary loads at start-up, adding built-in functions and classes with no rebuild |
+| **[Native Modules](docs/native-modules.md)** | Statically link Rust built-ins and classes into a self-contained binary via `--build` |
 | **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |
 | **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
 | **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
