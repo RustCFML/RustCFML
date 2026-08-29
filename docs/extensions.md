@@ -4,17 +4,25 @@ An **extension** is a `.rcx` file: precompiled Rust that a stock `rustcfml`
 binary loads at start-up and that adds built-in functions and classes to every
 request. No engine rebuild, no toolchain on the server, no `--build`.
 
+Most people meet one by **using** something somebody else published. That is two
+commands and a restart:
+
 ```sh
-rustcfml ext new mything          # scaffold a crate that already compiles
-cd mything && rustcfml ext build .
-rustcfml ext install mything-0.1.0.rcx --user
+rustcfml ext install typst-0.1.0-linux-x86_64.rcx --user
+rustcfml ext list          # what is installed, and whether it loaded
 ```
 
+Its functions and classes are then ordinary built-ins, available in every
+request with nothing to import:
+
 ```cfml
-writeOutput( mythingGreet( "there" ) );
-t = mythingTally();
-writeOutput( t.bump( by = 5 ).value() );
+pdf = Document().heading( text = "Invoice INV-1042", level = 1 )
+                .toBinary();
 ```
+
+That path — installing, placing and configuring an extension — is the first half
+of this page. [Writing one](#writing-one) is the second half, and you do not need
+it to use one.
 
 > **Naming.** The shipped artifact is an **extension** (`.rcx`). The Rust crate
 > you write is a **native module**. An extension contains one or more native
@@ -28,13 +36,119 @@ writeOutput( t.bump( by = 5 ).value() );
 Some capabilities are too big to put in the engine for everyone. Typst-backed
 PDF authoring is +31.6 MB of binary; a browser engine is far more. Making those
 extensions means the base binary stays small and you opt in by installing a
-file.
+file. [RustCFML-Extension-Typst](https://github.com/RustCFML/RustCFML-Extension-Typst)
+is the worked example throughout this page: a published, per-platform extension
+you can install and read.
 
 The other reason is distribution. An extension is a single artifact that can
 carry libraries for several platforms at once, and it installs into a directory
 the engine already searches — including one you can check into your project.
 
+## Installing one
+
+```
+rustcfml ext install <file.rcx> [--user | --dir D]
+rustcfml ext list                  installed extensions and their load status
+rustcfml ext remove <name>
+```
+
+`--user` installs into `~/.rustcfml/extensions/`; `--dir` puts it wherever you
+say. The alternative to installing at all is to **drop the `.rcx` into your
+application's `extensions/` directory and check it into the project**, which
+makes the dependency explicit and travels with a deploy. Both are first-class —
+see [Where extensions are found](#where-extensions-are-found) for the full
+search order.
+
+Two things that are easy to trip over:
+
+- **Restart the engine.** Extensions load once, at process start, and are never
+  unloaded. `ext install` says "restart to activate" and means it.
+- **Take the archive for your platform.** A published extension ships one
+  archive per platform (`…-macos-aarch64.rcx`, `…-linux-x86_64.rcx`, and so on).
+  Installing the wrong one fails by name and lists what the archive actually
+  contains, rather than loading and misbehaving.
+
+On macOS a downloaded library is quarantined by Gatekeeper and would fail to
+`dlopen` with no explanation; `ext install` clears the attribute for you.
+
+`rustcfml ext list` shows what is installed and whether it loads without
+starting anything, and `rustcfml --verbose` prints what loaded and from where at
+boot. Anything that fails to load is reported on stderr, never skipped
+silently.
+
+## Where extensions are found
+
+First hit wins per extension name:
+
+1. `--extensions <dir>` on the command line
+2. `extensions.directory` from the server `.cfconfig.json`
+3. `extensions/` in the application directory — per-app, checked into the
+   project, and the common case
+4. `~/.rustcfml/extensions/`
+5. `extensions/` beside the `rustcfml` binary — system or container image
+
+`rustcfml --verbose` prints what loaded and from where; `rustcfml ext list`
+shows the same without starting anything. Anything that fails to load is
+reported on stderr, never skipped silently.
+
+## Configuring them — `.cfconfig.json`
+
+```json
+{
+  "extensions": {
+    "directory": "lib/extensions",
+    "enabled":  [],
+    "disabled": ["browser"],
+    "settings": {
+      "typst": { "fontDir": "/usr/share/fonts" }
+    }
+  }
+}
+```
+
+| key | meaning |
+|---|---|
+| `directory` | an extra directory, searched before the built-in locations |
+| `enabled` | when non-empty, **only** these load, by declared name |
+| `disabled` | names to skip; applied after `enabled` |
+| `settings` | per-extension config, handed to that extension's `on_load` as a struct |
+
+`settings` is the delivery mechanism for anything an extension needs to know at
+start-up — a font directory, a pool size, an endpoint:
+
+```rust
+fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
+    if let Ok(dir) = settings.key( "fontDir" ).as_str() { … }
+    Ok(())
+}
+```
+
+**This is read from the SERVER-level `.cfconfig.json` only.** Extensions load
+once per process, before anything is compiled; by the time a per-application
+config is resolved the extension is already in the process, and there is no
+unload. A per-app `extensions` block is therefore ignored rather than
+half-honoured.
+
+> Lucee uses this same key for its `.lex` extension list, which is an *array*.
+> A config exported from Lucee or CommandBox still parses — that shape is
+> accepted and ignored.
+
+## Discovering what an extension provides
+
+`getFunctionList()` includes extension functions, with the providing extension's
+name as the value (compiled-in functions have an empty string). Without that, an
+extension's BIFs are callable but invisible to anything enumerating the engine's
+functions — an answer that looks authoritative and is wrong.
+
+---
+
 ## Which delivery mode
+
+*Everything above is about using an extension someone else built. From here on
+you are the author.*
+
+The first decision is whether you want an extension at all, or the older
+statically linked route:
 
 | | `.rcx` extension | `--build` cocktail |
 |---|---|---|
@@ -51,6 +165,20 @@ want one self-contained binary.
 ---
 
 ## Writing one
+
+Scaffold, build, install — the whole loop:
+
+```sh
+rustcfml ext new mything          # scaffold a crate that already compiles
+cd mything && rustcfml ext build .
+rustcfml ext install mything-0.1.0.rcx --user
+```
+
+```cfml
+writeOutput( mythingGreet( "there" ) );
+t = mythingTally();
+writeOutput( t.bump( by = 5 ).value() );
+```
 
 `rustcfml ext new` writes a crate that compiles as-is. The shape:
 
@@ -342,15 +470,6 @@ mapping set** — `Application.cfc`'s `this.mappings`, the application lifecycle
 thread seed, `application action="update"`. All four replace wholesale, and an
 extension's CFCs are not the application's to drop.
 
-## Discovering what an extension provides
-
-`getFunctionList()` includes extension functions, with the providing extension's
-name as the value (compiled-in functions have an empty string). Without that, an
-extension's BIFs are callable but invisible to anything enumerating the engine's
-functions — an answer that looks authoritative and is wrong.
-
----
-
 ## The command line
 
 ```
@@ -364,6 +483,8 @@ rustcfml ext remove <name>
 `ext build` reads the built library's own declaration to write the manifest, so
 the manifest can never disagree with the code — including the extension's name,
 which comes from `module!`, not from the crate name.
+
+## Publishing — one archive per platform
 
 Running `ext build` on a second platform **merges** into an existing `.rcx`
 rather than replacing it, which is how a single file ends up carrying macOS,
@@ -379,65 +500,8 @@ given host. Publish **one archive per platform**: a fresh checkout has no prior
 The file name is yours to choose — the loader keys on the triples inside
 `module.json`, not on what the file is called — and installing the wrong one
 fails by name, listing what the archive does contain.
-[`rustcfml-typst`'s release workflow](https://github.com/RustCFML/rustcfml-typst/blob/main/.github/workflows/release.yml)
+[the Typst extension's release workflow](https://github.com/RustCFML/RustCFML-Extension-Typst/blob/main/.github/workflows/release.yml)
 is the worked example.
-
-## Where extensions are found
-
-First hit wins per extension name:
-
-1. `--extensions <dir>` on the command line
-2. `extensions.directory` from the server `.cfconfig.json`
-3. `extensions/` in the application directory — per-app, checked into the
-   project, and the common case
-4. `~/.rustcfml/extensions/`
-5. `extensions/` beside the `rustcfml` binary — system or container image
-
-`rustcfml --verbose` prints what loaded and from where; `rustcfml ext list`
-shows the same without starting anything. Anything that fails to load is
-reported on stderr, never skipped silently.
-
-## Configuring them — `.cfconfig.json`
-
-```json
-{
-  "extensions": {
-    "directory": "lib/extensions",
-    "enabled":  [],
-    "disabled": ["browser"],
-    "settings": {
-      "typst": { "fontDir": "/usr/share/fonts" }
-    }
-  }
-}
-```
-
-| key | meaning |
-|---|---|
-| `directory` | an extra directory, searched before the built-in locations |
-| `enabled` | when non-empty, **only** these load, by declared name |
-| `disabled` | names to skip; applied after `enabled` |
-| `settings` | per-extension config, handed to that extension's `on_load` as a struct |
-
-`settings` is the delivery mechanism for anything an extension needs to know at
-start-up — a font directory, a pool size, an endpoint:
-
-```rust
-fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
-    if let Ok(dir) = settings.key( "fontDir" ).as_str() { … }
-    Ok(())
-}
-```
-
-**This is read from the SERVER-level `.cfconfig.json` only.** Extensions load
-once per process, before anything is compiled; by the time a per-application
-config is resolved the extension is already in the process, and there is no
-unload. A per-app `extensions` block is therefore ignored rather than
-half-honoured.
-
-> Lucee uses this same key for its `.lex` extension list, which is an *array*.
-> A config exported from Lucee or CommandBox still parses — that shape is
-> accepted and ignored.
 
 ## Inside a `.rcx`
 
