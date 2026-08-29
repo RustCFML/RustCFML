@@ -1,0 +1,1 @@
+LEADING-TEXT<cfset request.outsideBefore = "ran"><cfcomponent output="true" hint="Everything before the open tag belongs to no component and must be neither emitted nor executed."><cffunction name="m" output="true" returntype="string"><cfreturn "M"></cffunction></cfcomponent>

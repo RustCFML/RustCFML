@@ -311,6 +311,9 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
     let chars: Vec<char> = source.chars().collect();
     let len = chars.len();
     let mut i = 0;
+    // Have we passed the opening `<cfcomponent>`/`<cfinterface>` tag? Drives the
+    // outside-the-element suppression in the tag branch below.
+    let mut component_started = false;
 
     while i < len {
         // Strip CFML comments: <!--- ... --->
@@ -365,7 +368,40 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
         }
         if i < len - 1 && chars[i] == '<' && is_cf_tag_start(&chars, i, len) {
             let (script, consumed) = parse_cf_tag(&chars, i, len, imports, in_cfoutput);
-            result.push_str(&script);
+            // Anything OUTSIDE the top-level <cfcomponent>/<cfinterface> element
+            // is not part of the component and is ignored by Lucee — verified
+            // against 7.1.0+204 for all four shapes: text and `<cfset>` code,
+            // both before the open tag and after the close tag, are dropped and
+            // never run. RustCFML emitted/executed all four, so the trailing
+            // newline every editor leaves after `</cfcomponent>` was written
+            // into the response on every instantiation of a tag-based CFC
+            // (issue #375; it is also the one byte by which we and Lucee still
+            // differed on the `output="true"` arm of issue #373).
+            //
+            // Leading region: discard what it emitted, but only once the open
+            // tag is actually reached — a file with no component at all must
+            // keep everything, so this can never be decided up front. `imports`
+            // survives the clear deliberately: a taglib `<cfimport>` emits no
+            // script, it only registers a prefix, and dropping that registration
+            // would turn a `<my:tag>` inside the body into unrecognised markup.
+            // Lucee, ignoring the whole leading region, most likely drops the
+            // import too — this is the conservative side to err on, and no
+            // cross-engine test pins it either way.
+            //
+            // Trailing region: `break`. The `}` for the component has already
+            // been emitted, so stopping here leaves nothing unbalanced.
+            match component_element_boundary(&chars, i, len) {
+                Some(false) if !component_started => {
+                    component_started = true;
+                    result.clear();
+                    result.push_str(&script);
+                }
+                Some(true) if component_started => {
+                    result.push_str(&script);
+                    return result;
+                }
+                _ => result.push_str(&script),
+            }
             i += consumed;
         } else if !imports.is_empty() && chars[i] == '<' && is_import_tag_start(&chars, i, len, imports) {
             let (script, consumed) = parse_import_tag(&chars, i, len, imports, in_cfoutput);
@@ -573,6 +609,24 @@ fn find_closing_hash(chars: &[char], start: usize, len: usize) -> Option<usize> 
         i += 1;
     }
     None
+}
+
+/// `Some(false)` for a `<cfcomponent`/`<cfinterface` OPEN tag at `pos`,
+/// `Some(true)` for the matching close tag, `None` for every other tag. Used to
+/// bound the region of a source file that actually belongs to the component —
+/// see the call site in [`tags_to_script_inner`].
+fn component_element_boundary(chars: &[char], pos: usize, len: usize) -> Option<bool> {
+    let is_closing = chars.get(pos + 1) == Some(&'/');
+    let name_start = if is_closing { pos + 2 } else { pos + 1 };
+    let mut name_end = name_start;
+    while name_end < len && (chars[name_end].is_alphanumeric() || chars[name_end] == '_') {
+        name_end += 1;
+    }
+    let name: String = chars[name_start..name_end].iter().collect();
+    match name.to_lowercase().as_str() {
+        "cfcomponent" | "cfinterface" => Some(is_closing),
+        _ => None,
+    }
 }
 
 fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::collections::HashMap<String, String>, in_cfoutput: bool) -> (String, usize) {
