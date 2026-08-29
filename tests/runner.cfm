@@ -31,6 +31,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_var_indexed_assignment.cfm">
 <cf_runtest file="core/test_function_scope_capture.cfm">
 <cf_runtest file="core/test_component_method_named_url_scope.cfm">
+<cf_runtest file="core/test_component_output_attribute.cfm">
 <cf_runtest file="core/test_cfthread_component_method_scope.cfm">
 <cf_runtest file="core/test_bare_call_caller_stack_leak.cfm">
 <cf_runtest file="core/test_defaulted_param_variables_clobber.cfm">

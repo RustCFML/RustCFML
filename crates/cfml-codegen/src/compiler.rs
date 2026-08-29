@@ -1729,6 +1729,32 @@ impl CfmlCompiler {
         instructions.shrink_to_fit();
         let main = Arc::get_mut(&mut self.program.functions[0]).unwrap();
         main.instructions = instructions;
+        // A component's PSEUDO-CONSTRUCTOR is this `__main__` body (the VM clones
+        // it as `__cfc_body__`), so `<cfcomponent output="false">` has to reach it
+        // the same way `<cffunction output="false">` reaches a method: as an
+        // `output` entry in the frame's metadata, which `finalize()` turns into
+        // `output_suppressed`. Without this the component attribute was parsed,
+        // stored in `__metadata`, and then ignored at execution — every
+        // instantiation of a TAG-BASED CFC emitted its own inter-tag whitespace
+        // into the response. Lucee emits nothing for `output="false"` and leaks
+        // the whitespace for `output="true"`/no attribute (verified against
+        // 7.1.0+204), which is exactly what this reproduces. Component metadata
+        // keys are lower-cased by the tag preprocessor and the script parser, but
+        // compare loosely anyway — the same shape a method's `finalize()` accepts.
+        if let Some(CfmlNode::Statement(Statement::ComponentDecl(cd))) = ast
+            .statements
+            .iter()
+            .find(|n| matches!(n, CfmlNode::Statement(Statement::ComponentDecl(_))))
+        {
+            if let Some((k, v)) = cd
+                .component
+                .metadata
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("output"))
+            {
+                main.metadata.push((k.clone(), v.clone()));
+            }
+        }
         main.finalize();
         self.program.functions.shrink_to_fit();
 
