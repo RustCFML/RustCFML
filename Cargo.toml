@@ -72,6 +72,18 @@ cranelift-codegen = "0.132"
 cranelift-frontend = "0.132"
 cranelift-native = "0.132"
 
+# Debug builds default to full DWARF for the whole graph, which is what took
+# target/debug past 250G. Line tables keep backtraces and profiler symbols
+# working; what goes is variable inspection in a debugger, which we can get
+# back per-crate when we actually need it.
+[profile.dev]
+debug = "line-tables-only"
+
+# Third-party deps essentially never get stepped through, and they are the bulk
+# of the graph. No debuginfo for them at all.
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
