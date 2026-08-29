@@ -70,6 +70,21 @@ impl Parser {
         &self.tokens[idx].token
     }
 
+    /// The source spelling of the keyword just consumed by `advance()`, falling
+    /// back to its canonical lowercase form when the word was already lowercase
+    /// (the common case, which stores no text). Keyword tokens carry no text of
+    /// their own, so without this every keyword used as a name — a struct key, a
+    /// method name, a segment of a dotted component path — came back lowercased.
+    /// See `TokenWithLoc::raw` (GH #381).
+    fn consumed_keyword_name(&self, canonical: &str) -> String {
+        if self.current > 0 {
+            if let Some(raw) = self.tokens[self.current - 1].raw.as_deref() {
+                return raw.to_string();
+            }
+        }
+        canonical.to_string()
+    }
+
     fn current_location(&self) -> SourceLocation {
         if self.current < self.tokens.len() {
             self.tokens[self.current].location
@@ -5535,39 +5550,39 @@ impl Parser {
                 }
             }
             // CFML soft keywords — can be used as identifiers in most contexts
-            Token::Local => { self.advance(); Ok("local".to_string()) }
-            Token::Param => { self.advance(); Ok("param".to_string()) }
-            Token::Output => { self.advance(); Ok("output".to_string()) }
-            Token::Required => { self.advance(); Ok("required".to_string()) }
-            Token::Default => { self.advance(); Ok("default".to_string()) }
-            Token::Include => { self.advance(); Ok("include".to_string()) }
-            Token::Import => { self.advance(); Ok("import".to_string()) }
-            Token::Property => { self.advance(); Ok("property".to_string()) }
-            Token::Abstract => { self.advance(); Ok("abstract".to_string()) }
-            Token::Final => { self.advance(); Ok("final".to_string()) }
-            Token::Static => { self.advance(); Ok("static".to_string()) }
-            Token::Lock => { self.advance(); Ok("lock".to_string()) }
-            Token::Function => { self.advance(); Ok("function".to_string()) }
-            Token::Var => { self.advance(); Ok("var".to_string()) }
-            Token::Throw => { self.advance(); Ok("throw".to_string()) }
-            Token::Component => { self.advance(); Ok("component".to_string()) }
-            Token::Interface => { self.advance(); Ok("interface".to_string()) }
-            Token::Package => { self.advance(); Ok("package".to_string()) }
-            Token::Remote => { self.advance(); Ok("remote".to_string()) }
-            Token::Public => { self.advance(); Ok("public".to_string()) }
-            Token::Private => { self.advance(); Ok("private".to_string()) }
+            Token::Local => { self.advance(); Ok(self.consumed_keyword_name("local")) }
+            Token::Param => { self.advance(); Ok(self.consumed_keyword_name("param")) }
+            Token::Output => { self.advance(); Ok(self.consumed_keyword_name("output")) }
+            Token::Required => { self.advance(); Ok(self.consumed_keyword_name("required")) }
+            Token::Default => { self.advance(); Ok(self.consumed_keyword_name("default")) }
+            Token::Include => { self.advance(); Ok(self.consumed_keyword_name("include")) }
+            Token::Import => { self.advance(); Ok(self.consumed_keyword_name("import")) }
+            Token::Property => { self.advance(); Ok(self.consumed_keyword_name("property")) }
+            Token::Abstract => { self.advance(); Ok(self.consumed_keyword_name("abstract")) }
+            Token::Final => { self.advance(); Ok(self.consumed_keyword_name("final")) }
+            Token::Static => { self.advance(); Ok(self.consumed_keyword_name("static")) }
+            Token::Lock => { self.advance(); Ok(self.consumed_keyword_name("lock")) }
+            Token::Function => { self.advance(); Ok(self.consumed_keyword_name("function")) }
+            Token::Var => { self.advance(); Ok(self.consumed_keyword_name("var")) }
+            Token::Throw => { self.advance(); Ok(self.consumed_keyword_name("throw")) }
+            Token::Component => { self.advance(); Ok(self.consumed_keyword_name("component")) }
+            Token::Interface => { self.advance(); Ok(self.consumed_keyword_name("interface")) }
+            Token::Package => { self.advance(); Ok(self.consumed_keyword_name("package")) }
+            Token::Remote => { self.advance(); Ok(self.consumed_keyword_name("remote")) }
+            Token::Public => { self.advance(); Ok(self.consumed_keyword_name("public")) }
+            Token::Private => { self.advance(); Ok(self.consumed_keyword_name("private")) }
             // `extends` / `implements` are declaration keywords but, like the
             // other soft keywords above, are legal ordinary identifiers (e.g.
             // function parameter names) on Lucee/Adobe CF/BoxLang. Component and
             // interface headers match these tokens explicitly before reaching
             // here, so accepting them as identifiers does not shadow inheritance.
-            Token::Extends => { self.advance(); Ok("extends".to_string()) }
-            Token::Implements => { self.advance(); Ok("implements".to_string()) }
+            Token::Extends => { self.advance(); Ok(self.consumed_keyword_name("extends")) }
+            Token::Implements => { self.advance(); Ok(self.consumed_keyword_name("implements")) }
             // `imp` (logical implication) is an operator only between two
             // operands; as a bare token it is a legal identifier on Lucee/Adobe
             // CF/BoxLang (e.g. `var imp = ...`). The operator is consumed at the
             // parse_imp precedence level before primary/identifier contexts see it.
-            Token::ImpKeyword => { self.advance(); Ok("imp".to_string()) }
+            Token::ImpKeyword => { self.advance(); Ok(self.consumed_keyword_name("imp")) }
             _ => Err(self.parse_error("Expected identifier")),
         }
     }
@@ -5609,7 +5624,7 @@ impl Parser {
             _ => return Err(self.parse_error("Expected property name")),
         };
         self.advance();
-        Ok(name.to_string())
+        Ok(self.consumed_keyword_name(name))
     }
 
     /// Extract a component/interface declaration attribute VALUE. CFML accepts

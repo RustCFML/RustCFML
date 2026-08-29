@@ -1116,4 +1116,19 @@ include "harness.cfm";
 <!--- createUUID / createUniqueID shape (docs/known-issues.md §34). --->
 <cf_runtest file="stdlib/test_uuid_shape.cfm">
 
+<!--- hash() must digest binary BYTES, not a lossy string form of them (GH #376). --->
+<cf_runtest file="stdlib/test_hash_binary.cfm">
+
+<!--- java.io.File two-argument (parent, child) constructor (GH #378). --->
+<cf_runtest file="java_shims/test_java_file_two_arg.cfm">
+
+<!--- getTempDirectory() ends with a separator, so `& name` joins inside it (GH #380). --->
+<cf_runtest file="stdlib/test_gettempdirectory_separator.cfm">
+
+<!--- A keyword-named component-path segment keeps its source case (GH #381). --->
+<cf_runtest file="core/test_keyword_component_path_case.cfm">
+
+<!--- <cfapplication> is implemented, not a "tag not implemented" 500 (GH #374). --->
+<cf_runtest file="tags/test_cfapplication_tag.cfm">
+
 <cfscript> printSummary(); </cfscript>

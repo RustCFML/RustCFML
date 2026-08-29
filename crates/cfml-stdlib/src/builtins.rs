@@ -7886,32 +7886,38 @@ fn fn_hash(args: Vec<CfmlValue>) -> CfmlResult {
     use md5::Md5;
     use sha2::{Sha256, Sha384, Sha512, Digest};
     use sha1::Sha1;
-    let input = get_str(&args, 0);
+    // Hash the BYTES, not a string form of them. `get_str` round-tripped a
+    // `Binary` through a lossy string coercion, so `hash(charsetDecode("abc",
+    // "utf-8"), "SHA-256")` digested mojibake instead of the three bytes —
+    // producing a plausible-looking but wrong digest that broke AWS SigV4
+    // payload signing and every other hash-the-bytes protocol (GH #376).
+    // A plain string argument still hashes its UTF-8 bytes, exactly as before.
+    let input = get_bytes(&args, 0);
     let algorithm = if args.len() >= 2 { get_str(&args, 1).to_uppercase() } else { "MD5".to_string() };
     let hex = match algorithm.as_str() {
         "MD5" => {
             let mut hasher = Md5::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-1" | "SHA1" => {
             let mut hasher = Sha1::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-256" | "SHA256" => {
             let mut hasher = Sha256::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-384" | "SHA384" => {
             let mut hasher = Sha384::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-512" | "SHA512" => {
             let mut hasher = Sha512::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         _ => {
@@ -8595,7 +8601,8 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_get_temp_directory(_args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::string(std::env::temp_dir().to_string_lossy().to_string()))
+    // Trailing separator — see `cfml_common::vfs::temp_dir_with_separator`.
+    Ok(CfmlValue::string(cfml_common::vfs::temp_dir_with_separator()))
 }
 
 fn fn_get_temp_file(args: Vec<CfmlValue>) -> CfmlResult {

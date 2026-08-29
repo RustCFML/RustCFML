@@ -729,3 +729,24 @@ mod tests {
         assert!(names.contains(&"index.cfm".to_string()), "{names:?}");
     }
 }
+
+/// The system temp directory WITH a trailing separator, which is what Lucee and
+/// Adobe CF both return from `getTempDirectory()`.
+///
+/// `std::env::temp_dir()` trails on macOS (TMPDIR happens to) but not on Linux,
+/// where a bare `/tmp` turned the ubiquitous `getTempDirectory() & name` join
+/// into `/tmpname` — a path at the filesystem ROOT — so every following
+/// directoryCreate/fileWrite failed with a permission error (GH #380). That
+/// platform difference is exactly why it went unseen in local development.
+///
+/// Lives here rather than in `cfml-stdlib` because the VM's sandbox intercept
+/// needs it too, and `cfml-stdlib` is an OPTIONAL dependency of `cfml-vm`
+/// (feature `s3`) — calling into it unconditionally builds only when that
+/// feature happens to be on.
+pub fn temp_dir_with_separator() -> String {
+    let mut dir = std::env::temp_dir().to_string_lossy().to_string();
+    if !dir.ends_with(std::path::MAIN_SEPARATOR) && !dir.ends_with('/') {
+        dir.push(std::path::MAIN_SEPARATOR);
+    }
+    dir
+}

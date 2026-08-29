@@ -1946,6 +1946,34 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 }
             }
         }
+        "cfapplication" => {
+            // <cfapplication name="x" sessionmanagement="true" sessiontimeout="#ts#">
+            // → __cfapplication({name: "x", sessionmanagement: true, ...});
+            //
+            // The pre-Application.cfc way to declare an application, still common
+            // in older code. It used to fall through to the generic "Tag <X> is
+            // not implemented" throw, which 500'd the request and stopped the page
+            // dead at the tag (GH #374) — even though the SCRIPT form
+            // (`application name="x";`) already lowered to this very intercept.
+            // Same attribute→literal shaping as cfsetting: yes/no and true/false
+            // become booleans, bare numbers stay numeric, and anything else
+            // (including `#createTimeSpan(...)#`) goes through format_attr_value
+            // so it evaluates at runtime.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                let lower = v.to_lowercase();
+                if !v.contains('#') && (lower == "true" || lower == "yes") {
+                    parts.push(format!("{}: true", k));
+                } else if !v.contains('#') && (lower == "false" || lower == "no") {
+                    parts.push(format!("{}: false", k));
+                } else if !v.contains('#') && v.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, v));
+                } else {
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+                }
+            }
+            (format!("__cfapplication({{ {} }});\n", parts.join(", ")), tag_end - start)
+        }
         "cfsetting" => {
             let mut parts = Vec::new();
             for (k, v) in &attrs {

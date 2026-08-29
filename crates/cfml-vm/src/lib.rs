@@ -18726,8 +18726,12 @@ impl CfmlVirtualMachine {
                     // registers a module's cfmapping (e.g. "/HTMLHelper") through
                     // exactly this path, so a subsequent expandPath("/HTMLHelper/
                     // models") (Binder.mapDirectory) resolves to the module dir.
-                    // Other cfapplication attributes (name/sessionmanagement/...)
-                    // are established at application start and ignored here.
+                    // The remaining attributes (name/sessionManagement/
+                    // sessionTimeout/...) are applied by
+                    // `apply_cfapplication_settings` below — <cfapplication> is
+                    // the pre-Application.cfc way to DECLARE an application, so
+                    // for a page that uses it there is no application start to
+                    // establish them at (GH #374).
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         let mapping_struct = opts
                             .iter()
@@ -18782,6 +18786,10 @@ impl CfmlVirtualMachine {
                             // the application's to drop.
                             self.apply_extension_mappings();
                         }
+                    }
+                    if let Some(CfmlValue::Struct(opts)) = args.get(0) {
+                        let snapshot = opts.snapshot();
+                        self.apply_cfapplication_settings(&snapshot)?;
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -33729,8 +33737,10 @@ impl CfmlVirtualMachine {
                 }
             }
             "fileclose" => Some(Ok(CfmlValue::Null)),
+            // Trailing separator, matching the unsandboxed builtin and
+            // Lucee/ACF (GH #380).
             "gettempdirectory" => Some(Ok(CfmlValue::string(
-                std::env::temp_dir().to_string_lossy().to_string(),
+                cfml_common::vfs::temp_dir_with_separator(),
             ))),
 
             // --- Write operations: blocked ---
@@ -35198,6 +35208,150 @@ impl CfmlVirtualMachine {
             }
         }
         Ok(Some(resolved))
+    }
+
+    /// Apply a `<cfapplication …>` / script `application …;` declaration made
+    /// from inside a running page.
+    ///
+    /// This is the pre-`Application.cfc` way to define an application, and it
+    /// still turns up in older code. It differs from `Application.cfc` in one
+    /// way that shapes everything here: it declares an application but brings NO
+    /// lifecycle component, so there is no `onApplicationStart`/`onSessionStart`
+    /// to fire and no `this` scope to read settings out of at request start. The
+    /// tag's own attributes ARE the settings, and they take effect at the point
+    /// the tag runs — mid-page, after the scopes for this request are already
+    /// bound. So this re-binds them in place rather than going through
+    /// `execute_with_lifecycle`'s startup path.
+    ///
+    /// `mappings` is handled by the caller (the `action="update"` path, which
+    /// predates this); everything else lands here.
+    fn apply_cfapplication_settings(&mut self, opts: &ValueMap) -> Result<(), CfmlError> {
+        let get = |key: &str| -> Option<CfmlValue> {
+            opts.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.clone())
+        };
+        fn truthy(v: &CfmlValue) -> bool {
+            match v {
+                CfmlValue::Bool(b) => *b,
+                other => matches!(
+                    other.as_string().to_lowercase().as_str(),
+                    "true" | "yes" | "1"
+                ),
+            }
+        }
+
+        // 1. Fold the declared attributes into the application metadata, so
+        //    getApplicationMetadata()/getApplicationSettings() report them the
+        //    way they report an Application.cfc's `this.*`. Built as a FRESH
+        //    struct from a snapshot rather than written into the existing
+        //    template — that one is shared, and mutating it would leak this
+        //    page's declaration into other requests.
+        let mut meta = match &self.app_cfc_template {
+            Some(CfmlValue::Struct(existing)) => existing.snapshot(),
+            _ => ValueMap::default(),
+        };
+        for (k, v) in opts.iter() {
+            // `action` is the verb, not a setting; `mappings` is already applied
+            // to `self.mappings` and is surfaced from there by the metadata BIF.
+            if k.eq_ignore_ascii_case("action") || k.eq_ignore_ascii_case("mappings") {
+                continue;
+            }
+            // ValueMap keys are case-insensitive and `insert` keeps the
+            // first-written casing while replacing the value, so this overwrites
+            // a `this.sessionManagement` from an Application.cfc rather than
+            // adding a second spelling of it.
+            meta.insert(k.as_str().to_string(), v.clone());
+        }
+        self.app_cfc_template = Some(CfmlValue::strukt(meta));
+
+        // 2. Bind the named application scope. Skipped when this request is
+        //    already on that application (an Application.cfc bound it, or the
+        //    tag ran twice) so a live scope handle is never swapped out from
+        //    under the page.
+        let app_name = get("name").map(|v| v.as_string()).unwrap_or_default();
+        if !app_name.is_empty()
+            && self.current_application_name.as_deref() != Some(app_name.as_str())
+        {
+            if let Some(server_state) = self.server_state.clone() {
+                if !server_state.applications.contains(&app_name) {
+                    server_state.applications.insert(
+                        &app_name,
+                        ApplicationState {
+                            name: app_name.clone(),
+                            variables: CfmlStruct::empty(),
+                            // NOT `true`: a <cfapplication> app has no start
+                            // handler to run, but an Application.cfc that later
+                            // claims the same name still needs its
+                            // onApplicationStart to fire.
+                            started: false,
+                            config: ValueMap::default(),
+                            app_function_table: Vec::new(),
+                            app_fn_prune_at: 0,
+                            session_storage: None,
+                            app_caches: indexmap::IndexMap::new(),
+                        },
+                    );
+                }
+                if let Some(snapshot) = server_state.applications.get(&app_name) {
+                    // Handle clone (Arc bump), not a copy — see step 4 of
+                    // execute_with_lifecycle: every in-flight request on this
+                    // application shares the one live scope.
+                    self.application_scope = Some(snapshot.variables.clone());
+                }
+            } else if self.application_scope.is_none() {
+                // CLI single-run: no ServerState to hold the scope.
+                self.application_scope = Some(CfmlStruct::empty());
+            }
+            self.current_application_name = Some(app_name.clone());
+            if let Some(ref scope) = self.application_scope {
+                if !scope.contains_key_ci("applicationname") {
+                    scope.insert(
+                        "applicationName".to_string(),
+                        CfmlValue::string(app_name.clone()),
+                    );
+                }
+            }
+        }
+
+        // 3. Session management. `sessionmanagement="false"` (the default) leaves
+        //    the session scope alone entirely.
+        if get("sessionmanagement").map(|v| truthy(&v)).unwrap_or(false) {
+            if let Some(timeout) = get("sessiontimeout") {
+                if let Some(secs) = Self::timeout_value_to_secs(&timeout) {
+                    self.session_timeout_secs = secs;
+                }
+            }
+            if self.server_state.is_some() {
+                let sid = self.session_id.clone().unwrap_or_default();
+                let existing = if sid.is_empty() { None } else { self.session_record() };
+                if let Some(mut session) = existing {
+                    session.last_accessed_secs = now_epoch_secs();
+                    session.timeout_secs = self.session_timeout_secs;
+                    self.store_session_record(session);
+                    self.attach_session_scope();
+                } else {
+                    // No record yet: defer creation to the first session write,
+                    // exactly like the Application.cfc path's lazy default
+                    // (issue #88). The scope attaches then.
+                    self.session_lazy_pending = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A CFML session/application timeout attribute as whole seconds.
+    /// `createTimeSpan()` yields a day-FRACTION, so it has to be scaled; a bare
+    /// integer or numeric string is already a seconds count.
+    fn timeout_value_to_secs(v: &CfmlValue) -> Option<u64> {
+        let secs = match v {
+            CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => (d * 86_400.0).round() as u64,
+            CfmlValue::Int(i) => *i as u64,
+            CfmlValue::String(s) => s.parse::<u64>().ok()?,
+            _ => return None,
+        };
+        Some(secs.max(MIN_SESSION_TIMEOUT_SECS))
     }
 
     /// Extract application config from a component struct.
