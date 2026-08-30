@@ -152,34 +152,59 @@ impl HotnessTracker {
     }
 }
 
-/// Composite cache key: `(global_id, signature)` where `signature` packs
-/// `(nargs, kind-bitmap)` so each `(func, param-kind-tuple)` specialization
-/// caches independently. v0.89.0 widens the encoding from a 1-bit float
-/// bitmap (32 max params) to a 2-bit kind tuple (16 max params) admitting a
-/// third kind, `Boxed`. Code:
+/// Composite cache key: `(global_id, signature)` where `signature` packs the
+/// per-parameter kind tuple so each `(func, param-kind-tuple)` specialization
+/// caches independently. v0.89.0 moved from a 1-bit float bitmap to a 2-bit
+/// kind tuple admitting a third kind, `Boxed`. Codes:
 /// * `0b00` → `Int`
 /// * `0b01` → `Float`
 /// * `0b10` → `Boxed` (any non-numeric `CfmlValue`, crossed as a tagged
 ///   `usize` per [`boxed`])
-/// * `0b11` → reserved
+/// * `0b11` → ABSENT (this parameter slot is past the end of the call)
+///
+/// v0.642.0 — arity cap raised 16 → 32. The old layout was
+/// `(packed << 32) | nargs`, which spent the entire lower half of the key on
+/// an arity that never exceeds 64, leaving only 32 bits (= 16 slots) for the
+/// kinds. `nargs` was there because trailing `Int`s pack to zero, so `f(Int)`
+/// and `f(Int, Int)` both packed to 0 and would have collided.
+///
+/// Marking unused slots with the previously-reserved `0b11` encodes the arity
+/// *implicitly* — the two calls above now pack to `…111100` and `…111000`, which
+/// differ — so the whole u64 is available for kinds. `sig` stays a `u64`, which
+/// matters: it is passed into compiled code as an I64 immediate argument to
+/// `cfml_call_jit_udf` (see `translate.rs`), so widening the key to `u128` would
+/// have meant splitting it across two params and changing that shim's ABI.
+///
+/// The key is opaque — nothing decodes it. It is used only for equality
+/// (`caller_sig == callee_sig`) and as a `HashMap` key.
 type CacheKey = (u32, u64);
 
-const MAX_JIT_PARAMS: usize = 16;
+/// Two bits per parameter in a u64 signature.
+const MAX_JIT_PARAMS: usize = 32;
 
 const KIND_INT: u64 = 0b00;
 const KIND_FLOAT: u64 = 0b01;
 const KIND_BOXED: u64 = 0b10;
+/// Not a value kind — marks a parameter slot past the end of the call, so that
+/// arity is encoded in the packed word itself. See [`CacheKey`].
+const KIND_ABSENT: u64 = 0b11;
 
 fn pack_sig<I: ExactSizeIterator<Item = u64>>(kinds: I) -> Option<u64> {
     let nargs = kinds.len();
     if nargs > MAX_JIT_PARAMS {
         return None;
     }
-    let mut packed: u64 = 0;
+    // Every slot starts ABSENT (all-ones); each supplied argument overwrites
+    // its own 2-bit field. A call of arity N therefore always differs from one
+    // of arity M != N, whatever the kinds.
+    debug_assert_eq!(KIND_ABSENT, 0b11);
+    let mut packed: u64 = u64::MAX;
     for (i, k) in kinds.enumerate() {
-        packed |= (k & 0b11) << (i * 2);
+        let shift = i * 2;
+        packed &= !(0b11 << shift);
+        packed |= (k & 0b11) << shift;
     }
-    Some((packed << 32) | (nargs as u64))
+    Some(packed)
 }
 
 /// Build the cache signature for a call.
@@ -1089,6 +1114,60 @@ fn run_compiled(
 
 #[cfg(test)]
 mod tests {
+
+    // ── signature packing (v0.642.0 arity cap 16 -> 32) ─────────────────────
+    //
+    // The encoding relies on ABSENT-filling to make arity implicit. If that
+    // regresses, two DIFFERENT calls collide on one cache entry and the JIT
+    // runs a body specialized for the wrong parameter kinds — a miscompile,
+    // not a slowdown. These pin the property directly.
+
+    #[test]
+    fn pack_sig_admits_up_to_32_params_and_refuses_33() {
+        let ints = |n: usize| super::pack_sig(vec![super::KIND_INT; n].into_iter());
+        assert!(ints(16).is_some(), "16 params must still be admitted");
+        assert!(ints(17).is_some(), "17 params was the old cliff");
+        assert!(ints(32).is_some(), "32 params is the new cap");
+        assert!(ints(33).is_none(), "33 params must be refused, not truncated");
+    }
+
+    #[test]
+    fn pack_sig_distinguishes_arity_with_identical_kinds() {
+        // The exact collision the old `nargs` field existed to prevent:
+        // trailing Ints pack to zero, so f(Int) and f(Int,Int) must still differ.
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..=super::MAX_JIT_PARAMS {
+            let sig = super::pack_sig(vec![super::KIND_INT; n].into_iter()).unwrap();
+            assert!(seen.insert(sig), "arity {n} collided with a shorter all-Int call");
+        }
+    }
+
+    #[test]
+    fn pack_sig_distinguishes_every_kind_in_every_slot() {
+        // A kind change in ANY slot (including the last, which the old
+        // `packed << 32` layout could not reach past slot 15) must change the key.
+        let kinds = [super::KIND_INT, super::KIND_FLOAT, super::KIND_BOXED];
+        let mut seen = std::collections::HashSet::new();
+        for slot in 0..super::MAX_JIT_PARAMS {
+            for k in kinds {
+                let mut v = vec![super::KIND_INT; super::MAX_JIT_PARAMS];
+                v[slot] = k;
+                let sig = super::pack_sig(v.into_iter()).unwrap();
+                if k != super::KIND_INT {
+                    assert!(seen.insert(sig), "slot {slot} kind {k:#04b} collided");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_sig_absent_code_is_not_a_value_kind() {
+        // ABSENT must never be producible as a real argument kind, or a call
+        // would alias a shorter call.
+        for k in [super::KIND_INT, super::KIND_FLOAT, super::KIND_BOXED] {
+            assert_ne!(k, super::KIND_ABSENT);
+        }
+    }
     use super::*;
     use cfml_codegen::compiler::CfmlCompiler;
     use cfml_compiler::parser::Parser;
