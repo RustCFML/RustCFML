@@ -3439,6 +3439,12 @@ fn instance_public_as_struct(v: &CfmlValue) -> Option<CfmlValue> {
 
 fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // NOT guarded against a read-only scope (GitHub #372): Lucee lets a
+        // `structDelete(cgi,…)` through — it silently does nothing rather than
+        // throwing. Throwing here would be a RESTRICTIVE divergence (it can break
+        // a working app), and silently dropping the delete is the no-op Lucee
+        // shipped by accident. We do neither: the delete is left working.
+        // Documented in docs/known-issues.md.
         // Flyweight component: delete the public member in place via the live
         // instance (a Struct-only match no-oped, silently reporting deletion of a
         // key it never removed).
@@ -3468,6 +3474,10 @@ fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_insert(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
+        // GitHub #372: `cgi` is read-only to CFML code. Guarded on the VALUE, not
+        // by name at the call site, so an alias (`local.c = cgi`) is refused too.
+        // The key goes through verbatim — Lucee echoes the literal as written.
+        args[0].check_struct_writable(&args[1].as_string())?;
         // Flyweight component: set the public member in place (a Struct-only match
         // no-oped, so structInsert/structUpdate on a component were silently lost).
         if let Some(comp) = args[0].as_component().filter(|c| c.is_instance_backed()) {
@@ -3616,6 +3626,11 @@ fn struct_find_value_recursive(
 }
 
 fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    // GitHub #372: Lucee refuses to empty a read-only struct (`cgi`), and words
+    // it differently from a keyed write.
+    if let Some(target) = args.first() {
+        target.check_struct_clearable()?;
+    }
     // Phase C.3 — Slice 4/5: a flyweight instance clears its public scope (data +
     // method table) in place, keeping identity + private data (MockBox pattern).
     if let Some(comp) = args.first().and_then(|v| v.as_component()) {
@@ -3683,6 +3698,8 @@ fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // Not guarded against a read-only scope — same reasoning as
+        // `fn_struct_delete` (GitHub #372).
         // Phase C.3 — Slice 4: destination is a flyweight instance (the mixin
         // injection path `structAppend(target, mixins, true)` — the merged Function
         // values become injected data-methods on the instance). `is_instance_backed`
@@ -11494,6 +11511,333 @@ fn mysql_returns_rows(sql: &str) -> bool {
         && sql_has_top_level_keyword(trimmed, "RETURNING")
 }
 
+/// How a statement's leading keyword must be routed.
+///
+/// MySQL refuses to PREPARE `LOAD DATA` / `LOAD XML` at all (server error 1295,
+/// "This command is not supported in the prepared statement protocol yet"), so
+/// they have to go down the plain text protocol (`Conn::query*`) rather than
+/// `Conn::exec*`, which always prepares first — even with zero bind params,
+/// which LOAD never has anyway (the filename and the FIELDS/LINES terminators
+/// must all be literals in the SQL text). GitHub #382.
+#[cfg(feature = "mysql_db")]
+#[derive(Debug, PartialEq)]
+enum MysqlLoadForm {
+    /// Not a LOAD statement: prepare and execute as usual.
+    NotLoad,
+    /// The server opens the file itself (`LOAD DATA INFILE`, no LOCAL). Needs
+    /// the text protocol, but no client-side handler.
+    ServerSide,
+    /// `LOAD DATA LOCAL INFILE '<path>'`, with the path decoded exactly as the
+    /// server will have parsed it — that decoded name is what it asks this
+    /// client for, so it is what we match on.
+    Local(String),
+    /// A LOCAL form whose path literal we could not decode. Never executed: see
+    /// `mysql_run_mutation` for why running it anyway is worse than failing.
+    LocalUnparsed,
+}
+
+/// Classifies a statement for `mysql_run_mutation`.
+///
+/// `backslash_escapes` is the session's escaping mode (false under
+/// `NO_BACKSLASH_ESCAPES`), which changes how the path literal decodes.
+#[cfg(feature = "mysql_db")]
+fn mysql_load_form(sql: &str, backslash_escapes: bool) -> MysqlLoadForm {
+    let trimmed = strip_leading_sql_noise(sql);
+    let chars: Vec<char> = trimmed.chars().collect();
+    let kw_len = chars.iter().take_while(|c| c.is_ascii_alphabetic()).count();
+    if !chars[..kw_len].iter().collect::<String>().eq_ignore_ascii_case("LOAD") {
+        return MysqlLoadForm::NotLoad;
+    }
+
+    // `LOAD {DATA|XML} [LOW_PRIORITY|CONCURRENT] [LOCAL] INFILE '<path>'` — at
+    // most four keywords stand between LOAD and INFILE, so the scan is bounded
+    // rather than hunting the whole statement for the word. That bound is the
+    // point: a table or column called `infile` further down the statement (or
+    // the letters "local" inside the path itself) must not be mistaken for the
+    // keyword.
+    let mut i = kw_len;
+    let mut saw_local = false;
+    let mut infile_end = None;
+    for _ in 0..6 {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        let token: String = chars[start..i].iter().collect();
+        if token.eq_ignore_ascii_case("LOCAL") {
+            saw_local = true;
+        } else if token.eq_ignore_ascii_case("INFILE") {
+            infile_end = Some(i);
+            break;
+        }
+    }
+
+    // No INFILE in the header, or no LOCAL: either way no client-side file is
+    // involved. Send it down the text protocol and let the server speak for
+    // itself — a malformed LOAD gets its own syntax error rather than 1295.
+    let Some(mut i) = infile_end.filter(|_| saw_local) else {
+        return MysqlLoadForm::ServerSide;
+    };
+
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    let quote = match chars.get(i) {
+        Some(&c) if c == '\'' || c == '"' => c,
+        _ => return MysqlLoadForm::LocalUnparsed,
+    };
+    match mysql_decode_string_literal(&chars, i, quote, backslash_escapes) {
+        Some(path) => MysqlLoadForm::Local(path),
+        None => MysqlLoadForm::LocalUnparsed,
+    }
+}
+
+/// Decodes a MySQL string literal starting at its opening quote, yielding the
+/// value the SERVER will have parsed — which is the name it echoes back in its
+/// local-infile request, and therefore what `mysql_run_mutation` matches on.
+///
+/// Both quoting styles escape their own quote by doubling it (`''`). Outside
+/// `NO_BACKSLASH_ESCAPES` a backslash also escapes the next character: the named
+/// ones (`\0`, `\b`, `\n`, `\r`, `\t`, `\Z`) become their control character and
+/// any other `\x` is simply `x`. That last rule is why a Windows path has to be
+/// written `'C:\\data\\x.csv'` — `'C:\data\x.csv'` really does decode to
+/// `C:datax.csv`, and agreeing with the server means reproducing that rather
+/// than quietly "fixing" it.
+///
+/// `None` for an unterminated literal.
+#[cfg(feature = "mysql_db")]
+fn mysql_decode_string_literal(
+    chars: &[char],
+    open_quote: usize,
+    quote: char,
+    backslash_escapes: bool,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut i = open_quote + 1;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == quote {
+            if chars.get(i + 1) == Some(&quote) {
+                out.push(quote);
+                i += 2;
+                continue;
+            }
+            return Some(out);
+        }
+        if c == '\\' && backslash_escapes {
+            let esc = *chars.get(i + 1)?;
+            out.push(match esc {
+                '0' => '\0',
+                'b' => '\u{8}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'Z' => '\u{1a}',
+                other => other,
+            });
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    None
+}
+
+/// A mutation fails one of two ways: the server (or the wire) rejected it, or
+/// this engine refused to send it. The two call sites word server errors
+/// differently, so they stay apart rather than being flattened to a string here.
+#[cfg(feature = "mysql_db")]
+enum MysqlMutationError {
+    Server(mysql::Error),
+    Refused(String),
+}
+
+/// Runs a non-row-returning statement, routing `LOAD DATA` / `LOAD XML` around
+/// MySQL's prepared-statement protocol (error 1295 — see `MysqlLoadForm`) and,
+/// for the `LOCAL` form, serving the file the statement named.
+///
+/// The file handler is installed for exactly this one statement and cleared
+/// again immediately after. The narrowness is the security property, not tidiness:
+/// the `mysql` crate advertises `CLIENT_LOCAL_FILES` on every connection it
+/// opens, so while a handler is registered the SERVER may answer *any* query
+/// with "send me local file X" — a `SELECT 1` included. A handler that lives for
+/// the connection's lifetime is therefore a standing exfiltration channel; this
+/// one exists for the span of the statement that asked for it and refuses every
+/// name but the one that statement itself wrote.
+#[cfg(feature = "mysql_db")]
+fn mysql_run_mutation(
+    conn: &mut mysql::PooledConn,
+    sql: &str,
+    params: &mysql::Params,
+) -> Result<(), MysqlMutationError> {
+    use mysql::prelude::*;
+    use MysqlMutationError::{Refused, Server};
+
+    let path = match mysql_load_form(sql, !conn.no_backslash_escape()) {
+        MysqlLoadForm::NotLoad => return conn.exec_drop(sql, params).map_err(Server),
+        MysqlLoadForm::ServerSide => return conn.query_drop(sql).map_err(Server),
+        MysqlLoadForm::Local(path) => path,
+        // Refusing beats running it. With no handler registered the crate answers
+        // the server's file request with an EMPTY buffer rather than an error
+        // (mysql-28 `Conn::send_local_infile` has no `else` arm), so the statement
+        // would report success having imported nothing at all — a far worse
+        // outcome than a loud failure the caller can see.
+        MysqlLoadForm::LocalUnparsed => {
+            return Err(Refused(
+                "LOAD DATA LOCAL INFILE: could not read the file path out of the \
+                 statement, so it was NOT run. The path must be a single quoted \
+                 string literal directly after INFILE (bind parameters are not \
+                 supported there by MySQL). Running it unparsed would have \
+                 reported success while importing nothing."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let expected = path.clone();
+    conn.set_local_infile_handler(Some(mysql::LocalInfileHandler::new(
+        move |requested, writer| {
+            if requested != expected.as_bytes() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing LOAD DATA LOCAL INFILE request for '{}': the statement asked for '{}'",
+                        String::from_utf8_lossy(requested),
+                        expected
+                    ),
+                ));
+            }
+            // Streamed rather than read into memory: a bulk import is routinely
+            // hundreds of MB (the #382 reporter's is 119 MB).
+            let mut file = std::fs::File::open(&expected)?;
+            std::io::copy(&mut file, writer)?;
+            Ok(())
+        },
+    )));
+    let result = conn.query_drop(sql);
+    conn.set_local_infile_handler(None);
+    result.map_err(Server)
+}
+
+/// GitHub #382. The routing decision these cover is not cosmetic: get it wrong
+/// one way and the statement hits server error 1295, get it wrong the other and
+/// MySQL reports success having imported zero rows.
+#[cfg(all(test, feature = "mysql_db"))]
+mod mysql_load_data_tests {
+    use super::{MysqlLoadForm, mysql_load_form};
+
+    fn form(sql: &str) -> MysqlLoadForm {
+        mysql_load_form(sql, true)
+    }
+
+    #[test]
+    fn ordinary_mutations_are_not_load_statements() {
+        for sql in [
+            "insert into t (a) values (1)",
+            "UPDATE t SET a = 1",
+            "delete from t where id = 1",
+            "  /* header */ -- note\n  INSERT INTO loader VALUES (1)",
+        ] {
+            assert_eq!(form(sql), MysqlLoadForm::NotLoad, "{}", sql);
+        }
+    }
+
+    #[test]
+    fn server_side_load_needs_the_text_protocol_but_no_handler() {
+        assert_eq!(
+            form("LOAD DATA INFILE '/var/lib/mysql-files/x.csv' INTO TABLE t"),
+            MysqlLoadForm::ServerSide
+        );
+        assert_eq!(
+            form("load xml infile '/tmp/x.xml' into table t"),
+            MysqlLoadForm::ServerSide
+        );
+    }
+
+    #[test]
+    fn local_form_yields_the_path_the_server_will_ask_for() {
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE '/tmp/hd.csv' INTO TABLE hdcatalog"),
+            MysqlLoadForm::Local("/tmp/hd.csv".to_string())
+        );
+        // Case, the optional priority keyword, LOAD XML, and a double-quoted
+        // literal all reach the same place.
+        assert_eq!(
+            form("load data low_priority local infile \"/tmp/hd.csv\" into table t"),
+            MysqlLoadForm::Local("/tmp/hd.csv".to_string())
+        );
+        assert_eq!(
+            form("LOAD XML CONCURRENT LOCAL INFILE '/tmp/a.xml' INTO TABLE t"),
+            MysqlLoadForm::Local("/tmp/a.xml".to_string())
+        );
+        // A newline-formatted statement, as CFML heredoc-style SQL arrives.
+        assert_eq!(
+            form("\n  LOAD DATA LOCAL INFILE '/tmp/x.csv'\n  INTO TABLE t\n  FIELDS TERMINATED BY ','\n"),
+            MysqlLoadForm::Local("/tmp/x.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn the_word_local_inside_the_path_is_not_the_keyword() {
+        // `find("local")` over the whole statement matches the path here, which
+        // is why the keyword scan is bounded to the statement's header.
+        assert_eq!(
+            form("LOAD DATA INFILE '/var/local/x.csv' INTO TABLE t"),
+            MysqlLoadForm::ServerSide
+        );
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE '/var/local/infile.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("/var/local/infile.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn path_literal_decodes_the_way_the_server_parsed_it() {
+        // Doubled quote.
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE '/tmp/o''brien.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("/tmp/o'brien.csv".to_string())
+        );
+        // Escaped backslashes: the well-worn Windows path.
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE 'C:\\\\data\\\\hd.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("C:\\data\\hd.csv".to_string())
+        );
+        // Unescaped ones really do collapse — matching the server matters more
+        // than being helpful.
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE 'C:\\data\\hd.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("C:datahd.csv".to_string())
+        );
+        // ...unless the session is in NO_BACKSLASH_ESCAPES.
+        assert_eq!(
+            mysql_load_form("LOAD DATA LOCAL INFILE 'C:\\data\\hd.csv' INTO TABLE t", false),
+            MysqlLoadForm::Local("C:\\data\\hd.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn an_undecodable_local_path_is_refused_rather_than_run_empty() {
+        for sql in [
+            // Bind parameter — MySQL does not accept one here at all, and with
+            // no handler the import would silently land zero rows.
+            "LOAD DATA LOCAL INFILE ? INTO TABLE t",
+            "LOAD DATA LOCAL INFILE :filepath INTO TABLE t",
+            // Unterminated literal.
+            "LOAD DATA LOCAL INFILE '/tmp/x.csv INTO TABLE t",
+        ] {
+            assert_eq!(form(sql), MysqlLoadForm::LocalUnparsed, "{}", sql);
+        }
+    }
+}
+
 #[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
 fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
     let chars: Vec<char> = sql.chars().collect();
@@ -12647,8 +12991,12 @@ fn execute_mysql_on_conn(
 
         build_query_result(columns, rows, sql, return_type)
     } else {
-        conn.exec_drop(sql, &params)
-            .map_err(|e| map_err(e, "error"))?;
+        mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
+            MysqlMutationError::Server(e) => map_err(e, "error"),
+            MysqlMutationError::Refused(msg) => {
+                CfmlError::database(format!("queryExecute: {}", msg))
+            }
+        })?;
 
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
@@ -14414,8 +14762,14 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         }
         build_query_result(columns, rows, sql, return_type)
     } else {
-        conn.exec_drop(sql, &params)
-            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL error: {}", e)))?;
+        mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
+            MysqlMutationError::Server(e) => {
+                CfmlError::database(format!("queryExecute: MySQL error: {}", e))
+            }
+            MysqlMutationError::Refused(msg) => {
+                CfmlError::database(format!("queryExecute: {}", msg))
+            }
+        })?;
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
         build_mutation_result(affected, last_id, sql)
