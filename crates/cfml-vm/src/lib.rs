@@ -11464,6 +11464,48 @@ impl CfmlVirtualMachine {
                             ))));
                         }
                     };
+                    // Fast path — a component method being (re)declared by its
+                    // OWN CFC pseudo-constructor body.
+                    //
+                    // `body_vars` hoists every method of the class into
+                    // `method_arc_cache` BEFORE the body runs (full hoist, Lucee
+                    // parity), so the value this op is about to build already
+                    // exists and is class-invariant. Building it again cost, PER
+                    // METHOD PER CONSTRUCTION: a name `String` clone, a
+                    // `to_lowercase` + builtin-shadowing probe, an O(locals)
+                    // closure-env seed/sync (so O(N^2) over a body declaring N
+                    // methods), and a fresh `CfmlFunction` with a fresh `params`
+                    // `Vec` of cloned names/types/annotations — and then the
+                    // instance assembly below `Arc::make_mut`-cloned it again just
+                    // to strip the `captured_scope` this path had attached, and
+                    // `canonicalize_method_arcs` replaced it with this very cached
+                    // `Arc` anyway.
+                    //
+                    // Measured on an 86-method CFC (TestBox's `Expectation.cfc`,
+                    // one `new` per `expect()`): 93 -> 26 us per construction.
+                    //
+                    // Guards: only inside `__cfc_body__` (the pseudo-constructor
+                    // frame built by `cfc_body_variant`), only for a method the
+                    // hoist actually cached, and only when name AND access match —
+                    // the same pair `canon_method_scope` checks, so this can never
+                    // widen a private method to public. Anything else (a closure, a
+                    // `__`-prefixed synthetic like `__cfc_static_init__`, a method
+                    // defined outside a CFC body) falls through to the full path.
+                    if bc_func_arc.is_component_method
+                        && func.is_template_frame
+                        && func.name == "__cfc_body__"
+                    {
+                        if let Some(shared) = self.method_arc_cache.get(&(global_id as u32)) {
+                            if shared.name == bc_func_arc.name
+                                && shared.access == bc_func_arc.access
+                            {
+                                let shared = shared.clone();
+                                self.app_fn_table_dirty = true;
+                                stack.push(CfmlValue::Function(shared));
+                                continue;
+                            }
+                        }
+                    }
                     let func_name = bc_func_arc.name.clone();
                     // Lucee parity: a named function declaration that collides
                     // with a built-in function is a compile/parse-time error in
@@ -30142,6 +30184,29 @@ impl CfmlVirtualMachine {
         meta
     }
 
+    /// The `__cfc_body__` variant of a CFC's `__main__`, memoised on the
+    /// function itself (see `BytecodeFunction::cfc_body`).
+    ///
+    /// The pseudo-constructor runs `__main__` under a different name and with
+    /// `is_template_frame` set. Producing that used to mean `(*cfc_func).clone()`
+    /// on EVERY construction — a deep copy of the whole instruction `Vec` to
+    /// change a `String` and a `bool`. The variant is class-invariant, so it is
+    /// built once per process and handed out as an `Arc`.
+    fn cfc_body_variant(
+        f: &Arc<cfml_codegen::compiler::BytecodeFunction>,
+    ) -> Arc<cfml_codegen::compiler::BytecodeFunction> {
+        f.cfc_body
+            .get_or_init(|| {
+                let mut b = (**f).clone();
+                b.name = "__cfc_body__".to_string();
+                b.is_template_frame = true;
+                // Never nest the memo inside the memoised copy.
+                b.cfc_body = std::sync::OnceLock::new();
+                Arc::new(b)
+            })
+            .clone()
+    }
+
     /// Dedup a freshly-built instance's method `CfmlFunction` values against the
     /// per-class `method_arc_cache`, so every instance of a class shares ONE `Arc`
     /// per method rather than the fresh copy the component body created during this
@@ -30998,9 +31063,7 @@ impl CfmlVirtualMachine {
             // unscoped lookups inside the child body resolve inherited values).
             // Mark as "__cfc_body__" so the VM treats it as function scope
             // (prevents globals leaking into `variables` via LoadLocal).
-            let mut cfc_body = (*cfc_func).clone();
-            cfc_body.name = "__cfc_body__".to_string();
-            cfc_body.is_template_frame = true;
+            let cfc_body = Self::cfc_body_variant(&cfc_func);
             // Expose `super` to the body so `super.method(...)` calls in the
             // pseudo-constructor resolve to the parent (see pseudo_ctor_super).
             let pushed_super = super_value.is_some();
@@ -31551,6 +31614,25 @@ impl CfmlVirtualMachine {
                         .insert(cache_key, v.deep_copy());
                 }
             }
+            // Bound mid-request cycle retention.
+            //
+            // A CFC instance is inherently CYCLIC: the body keeps the instance in
+            // a local named after the component (used to hang methods and
+            // generated accessors off it), that local is captured into
+            // `variables`, and `this.__variables` points back — so
+            // `this -> __variables -> variables -> this` and refcounting can
+            // never free it. The collector reclaims it happily, but it only ran
+            // at REQUEST END, so a request that constructs many components grew
+            // without bound: 100k constructions of an 86-method CFC held 1.8 GB
+            // and 400k held 7.2 GB, with three uncollectable cycles per
+            // construction.
+            //
+            // Component construction is where those cycles are minted, so this
+            // is the natural place to check. `collect_incremental` is a no-op
+            // until the request's tracked-allocation log passes its threshold,
+            // so an ordinary request (which never gets near it) pays one
+            // thread-local length read per `new`.
+            cfml_common::cycle_gc::collect_incremental();
             return result;
         }
         None
@@ -34761,9 +34843,7 @@ impl CfmlVirtualMachine {
         let cfc_func = self.program.functions[main_idx].clone();
         // Mark as __cfc_body__ so the VM treats it as function scope
         // (prevents globals leaking into `variables` via LoadLocal)
-        let mut cfc_body = (*cfc_func).clone();
-        cfc_body.name = "__cfc_body__".to_string();
-        cfc_body.is_template_frame = true;
+        let cfc_body = Self::cfc_body_variant(&cfc_func);
 
         // Application.cfc commonly extends a framework Bootstrap and calls
         // `super.setupApplication(...)` at body level (Preside, FW/1, ColdBox).

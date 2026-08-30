@@ -210,6 +210,15 @@ pub struct BytecodeFunction {
     /// per-request cache shared it within a request: the marker is filtered
     /// from user-visible introspection, so nothing can mutate it.
     pub params_marker: std::sync::OnceLock<cfml_common::dynamic::CfmlValue>,
+    /// The `__cfc_body__` variant of this function: a CFC's `__main__` renamed
+    /// and flagged as a template frame, which is what the pseudo-constructor
+    /// actually executes. Built ONCE per process, same rationale as the
+    /// `OnceLock`s above. Previously every single component construction did
+    /// `(*cfc_func).clone()` — a full deep copy of the instruction `Vec` (and
+    /// every other field) purely to change a name and set one `bool`, then
+    /// dropped it again on return. `new Expectation()` in TestBox's `expect()`
+    /// paid that per assertion.
+    pub cfc_body: std::sync::OnceLock<std::sync::Arc<BytecodeFunction>>,
     /// Which params are required (parallel to `params`; true = required)
     pub required_params: Vec<bool>,
     /// Which params declare a default value (parallel to `params`; true = has
@@ -1552,6 +1561,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: Vec::new(),
@@ -4408,6 +4418,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
@@ -4690,6 +4701,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
@@ -4785,6 +4797,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: vec![true],
                     has_default: vec![false],
                     instructions: setter_instructions,
@@ -4970,6 +4983,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                 required_params: Vec::new(),
                 has_default: Vec::new(),
                 instructions: static_instrs,
@@ -6013,6 +6027,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
@@ -6109,6 +6124,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,

@@ -83,6 +83,7 @@ pub fn collected_total() -> usize {
 
 /// One logged allocation, held weakly so the log never extends an object's
 /// lifetime (a dead object's `Weak` simply fails to upgrade at collection time).
+#[derive(Clone)]
 enum TrackedAlloc {
     Struct(Weak<PlRwLock<StructInner>>),
     Array(Weak<PlRwLock<Vec<CfmlValue>>>),
@@ -147,6 +148,7 @@ fn log_cap() -> usize {
 /// request execution (serve mode only).
 pub fn enable() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    NEXT_SWEEP.with(|c| c.set(incremental_threshold()));
 }
 
 /// Stop logging and drop the log without collecting.
@@ -680,6 +682,126 @@ pub fn collect() -> usize {
 /// spawning request's threads finish. Safe to run concurrently with unrelated
 /// requests: the cycles it touches are internal to one finished request and
 /// unreachable from anywhere else, so their `strong_count`s are stable.
+/// Number of tracked allocations after which a MID-REQUEST sweep is allowed.
+/// `0` disables incremental sweeping (end-of-request only, the historical
+/// behaviour). Override with `RUSTCFML_GC_INCREMENTAL`.
+///
+/// Why this exists: `collect()` used to run ONLY at request end, so every cycle
+/// a request minted was retained for the whole request. A CFC instance is
+/// inherently cyclic (the body keeps the instance in a local named after the
+/// component, which lands in `variables`, closing
+/// `this -> __variables -> variables -> this`), so a request constructing many
+/// components grew without bound: 100k constructions of an 86-method CFC held
+/// **1.8 GB**, 400k held **7.2 GB**, with `survivors=300001` at 100k — three
+/// uncollectable cycles per construction, every one of them reclaimable.
+/// Chosen by measurement (86-method CFC, warm serve, both directions tested):
+///
+/// | base   | 200k discarded ctors | 60k LIVE components |
+/// |--------|----------------------|---------------------|
+/// | 0 (off)| 3.6 G / 16.0 s       | 1.1 G / 4.8 s       |
+/// | 10,000 | 61 M / 15.5 s        | 201 M / **5.1 s**   |
+/// | 25,000 | **113 M / 13.1 s**   | **218 M / 3.5 s**   |
+/// | 50,000 | 177 M / 11.1 s       | 221 M / 3.5 s       |
+///
+/// 25,000 is the knee: ~32x less memory on churn and ~5x on a large live set,
+/// with CPU at or below the sweeping-off arm on BOTH. 10,000 buys a little more
+/// memory back but starts paying for the extra passes on the live workload.
+const INCREMENTAL_DEFAULT: usize = 25_000;
+
+fn incremental_threshold() -> usize {
+    use std::sync::OnceLock;
+    static T: OnceLock<usize> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("RUSTCFML_GC_INCREMENTAL")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(INCREMENTAL_DEFAULT)
+    })
+}
+
+impl TrackedAlloc {
+    /// Whether the tracked allocation is still alive (its `Weak` upgrades).
+    fn is_alive(&self) -> bool {
+        match self {
+            TrackedAlloc::Struct(w) => w.strong_count() > 0,
+            TrackedAlloc::Array(w) => w.strong_count() > 0,
+            TrackedAlloc::Query(w) => w.strong_count() > 0,
+            TrackedAlloc::Scope(w) => w.strong_count() > 0,
+            #[cfg(feature = "component-instance")]
+            TrackedAlloc::Instance(w) => w.strong_count() > 0,
+        }
+    }
+}
+
+thread_local! {
+    /// Log length at which the NEXT mid-request sweep is allowed. Reset to the
+    /// base threshold when a request arms the log, then raised adaptively — see
+    /// [`collect_incremental`].
+    static NEXT_SWEEP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Run a collection pass NOW if this request's log has grown past the current
+/// adaptive budget. Returns the number of nodes reclaimed.
+///
+/// **Correctness** is the same conservative argument the end-of-request pass
+/// uses: an object still referenced from outside the logged set (the VM stack, a
+/// frame's locals, an outer scope) has an external strong reference and is
+/// classified live, so a mid-request pass can never over-collect. The extra
+/// obligation is that a survivor stays VISIBLE to later passes — it may become
+/// cyclic garbage later in the same request — so still-alive handles are
+/// re-registered before returning.
+///
+/// **Why the budget is adaptive, not a fixed count.** Re-registering survivors
+/// means each pass rescans everything still alive, so a fixed threshold is
+/// quadratic in the live set: a request holding 60k live components went from
+/// 3.4 s (sweeping off) to over TEN MINUTES at a flat 10k threshold. The budget
+/// is therefore raised to twice the surviving live set after every pass — the
+/// classic "collect again when the heap has doubled" rule. A churn workload
+/// (nothing survives) keeps sweeping at the base threshold and stays flat; a
+/// workload that genuinely holds N objects live sweeps O(log N) times, so the
+/// total rescan work stays linear-ish instead of quadratic.
+///
+/// Must not be called while an `ALLOC_LOG` borrow is held.
+pub fn collect_incremental() -> usize {
+    let base = incremental_threshold();
+    if base == 0 {
+        return 0;
+    }
+    let budget = NEXT_SWEEP.with(|c| c.get());
+    let budget = if budget == usize::MAX { base } else { budget };
+    let log = ALLOC_LOG.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_mut() {
+            Some(v) if v.len() >= budget => Some(std::mem::take(v)),
+            _ => None,
+        }
+    });
+    let Some(log) = log else { return 0 };
+    let carry = log.clone();
+    let reclaimed = collect_from_log(log);
+    let mut live = 0usize;
+    ALLOC_LOG.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            for t in carry {
+                if t.is_alive() {
+                    live += 1;
+                    v.push(t);
+                }
+            }
+        }
+    });
+    NEXT_SWEEP.with(|c| c.set(std::cmp::max(base, live.saturating_mul(2))));
+    if reclaimed > 0 && std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        eprintln!(
+            "[cycle_gc] incremental sweep reclaimed {} node(s); {} live, next sweep at {}",
+            reclaimed,
+            live,
+            std::cmp::max(base, live.saturating_mul(2))
+        );
+    }
+    reclaimed
+}
+
 fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
     if log.is_empty() {
         return 0;
@@ -789,4 +911,92 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
         );
     }
     collected
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    use crate::dynamic::{CfmlStruct, CfmlValue, ValueMap};
+
+    /// Build a 2-node reference cycle of tracked structs and return it. Dropping
+    /// the returned handles leaves the cycle unreachable but NOT freed by
+    /// refcounting — exactly the shape a CFC instance has.
+    fn make_cycle() -> (CfmlStruct, CfmlStruct) {
+        let a = CfmlStruct::new(ValueMap::default());
+        let b = CfmlStruct::new(ValueMap::default());
+        a.insert("b".to_string(), CfmlValue::Struct(b.clone()));
+        b.insert("a".to_string(), CfmlValue::Struct(a.clone()));
+        (a, b)
+    }
+
+    /// A mid-request sweep must reclaim unreachable cycles WITHOUT waiting for
+    /// request end — the whole point of `collect_incremental`.
+    #[test]
+    fn incremental_sweep_reclaims_unreachable_cycles() {
+        arm();
+        enable();
+        // Base threshold of 1 so the very first check sweeps.
+        NEXT_SWEEP.with(|c| c.set(1));
+        for _ in 0..50 {
+            let (a, b) = make_cycle();
+            drop(a);
+            drop(b);
+        }
+        let reclaimed = collect_incremental();
+        assert!(
+            reclaimed > 0,
+            "an incremental sweep must reclaim unreachable cycles mid-request, got {reclaimed}"
+        );
+        disable_and_clear();
+    }
+
+    /// The safety property: a sweep must NEVER collect something still reachable,
+    /// and the survivor must stay VISIBLE to a later sweep (it can become garbage
+    /// later in the same request). Without re-registration the second sweep below
+    /// would find nothing and the object would leak for the rest of the request.
+    #[test]
+    fn incremental_sweep_keeps_live_and_re_registers_it() {
+        arm();
+        enable();
+        let (live_a, live_b) = make_cycle();
+        NEXT_SWEEP.with(|c| c.set(1));
+        collect_incremental();
+        // Still fully intact and readable after the sweep.
+        assert!(
+            matches!(live_a.get("b"), Some(CfmlValue::Struct(_))),
+            "a reachable cycle must survive an incremental sweep"
+        );
+        // Now drop the only external handles; a later sweep must still see it.
+        drop(live_a);
+        drop(live_b);
+        NEXT_SWEEP.with(|c| c.set(1));
+        let reclaimed = collect_incremental();
+        assert!(
+            reclaimed > 0,
+            "a survivor must be re-registered so a LATER sweep can still reclaim it"
+        );
+        disable_and_clear();
+    }
+
+    /// The budget must back off with the live set. A fixed threshold rescans
+    /// every survivor on every pass, which is quadratic: a request holding 60k
+    /// live components went from 3.4 s to over ten minutes at a flat threshold.
+    #[test]
+    fn budget_backs_off_with_the_live_set() {
+        arm();
+        enable();
+        let mut live = Vec::new();
+        for _ in 0..40 {
+            live.push(make_cycle());
+        }
+        NEXT_SWEEP.with(|c| c.set(1));
+        collect_incremental();
+        let after = NEXT_SWEEP.with(|c| c.get());
+        assert!(
+            after >= 80,
+            "budget must rise to ~2x the live set (>=80 for 40 live cycles), got {after}"
+        );
+        drop(live);
+        disable_and_clear();
+    }
 }

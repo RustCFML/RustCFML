@@ -405,6 +405,8 @@ include "harness.cfm";
 <cf_runtest file="oop/test_unqualified_new_package_relative.cfm">
 <cf_runtest file="oop/test_unqualified_new_inherited_package.cfm">
 <cf_runtest file="oop/test_inherited_new_mapping_qualified_fqn.cfm">
+<cf_runtest file="oop/test_component_ctor_method_hoist.cfm">
+<cf_runtest file="gc/test_incremental_cycle_sweep.cfm">
 <cf_runtest file="oop/test_runtime_added_method_via_structappend.cfm">
 <cf_runtest file="oop/test_injected_method_instance_isolation.cfm">
 <cf_runtest file="oop/test_metadata.cfm">
