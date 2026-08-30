@@ -1885,7 +1885,14 @@ fn fn_to_base64(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_to_binary(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Binary(base64_decode_bytes(&get_str(&args, 0))))
+    // Borrow the base64 text rather than `get_str`-ing it: `as_string()` clones
+    // the whole `Arc<String>`, which on ColdBox's DiskStore meant copying a
+    // ~26KB cached page purely to read it once.
+    let bytes = match args.first() {
+        Some(CfmlValue::String(s)) => base64_decode_bytes(s.as_str()),
+        other => base64_decode_bytes(&other.map(|v| v.as_string()).unwrap_or_default()),
+    };
+    Ok(CfmlValue::Binary(bytes))
 }
 
 /// Magic header prefixing an `objectSave()` blob. Lets `objectLoad()` recognise
@@ -15043,10 +15050,39 @@ pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
     // positional over the FILTERED sequence, so this pass can't be fused into
     // the decode loop below (the `i + 2` / `i + 3` lookaheads need the filtered
     // length). One sized allocation instead of growth-by-doubling.
-    let mut chars: Vec<u8> = Vec::with_capacity(s.len());
-    chars.extend(s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' '));
+    // Fast path: base64 that carries no MIME wrapping (the common case — our own
+    // `toBase64`, JWT segments, a DiskStore blob) needs no filtered copy at all,
+    // so decode straight out of the borrowed input. Only genuinely wrapped input
+    // pays for the extra buffer.
+    let raw = s.as_bytes();
+    let needs_filter = raw.iter().any(|&b| b == b'\n' || b == b'\r' || b == b' ');
+    let filtered: Vec<u8>;
+    let chars: &[u8] = if needs_filter {
+        let mut c: Vec<u8> = Vec::with_capacity(raw.len());
+        c.extend(raw.iter().copied().filter(|&b| b != b'\n' && b != b'\r' && b != b' '));
+        filtered = c;
+        &filtered
+    } else {
+        raw
+    };
     let mut bytes = Vec::with_capacity(chars.len() / 4 * 3 + 3);
     let mut i = 0;
+    // Hot loop: every quad that carries no padding decodes to exactly three
+    // bytes with no per-byte branching. Padding can only appear in the FINAL
+    // quad, so this runs the whole input bar the tail; the general loop below
+    // then finishes from wherever this stopped. Splitting it out is worth ~30%:
+    // the general form re-tests `has2`/`has3` for every group in the input to
+    // serve a case only the last group can hit.
+    while i + 4 <= chars.len() {
+        let (c0, c1, c2, c3) = (chars[i], chars[i + 1], chars[i + 2], chars[i + 3]);
+        if c0 == b'=' || c1 == b'=' || c2 == b'=' || c3 == b'=' {
+            break;
+        }
+        let triple =
+            (b64_val(c0) << 18) | (b64_val(c1) << 12) | (b64_val(c2) << 6) | b64_val(c3);
+        bytes.extend_from_slice(&[(triple >> 16) as u8, (triple >> 8) as u8, triple as u8]);
+        i += 4;
+    }
     while i < chars.len() {
         if i + 1 >= chars.len() {
             break;
