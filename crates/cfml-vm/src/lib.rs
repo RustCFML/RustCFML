@@ -30406,7 +30406,56 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Build (or fetch) a component template. Timed for the debug footer: this
+    /// is where a `new X()` actually spends its time — executing the CFC body and
+    /// materialising its method values — and until now NONE of it was visible.
+    /// Component *methods* opened a timed frame but construction did not, so on a
+    /// framework request every microsecond of object building landed in the
+    /// top-level page's residual row. Measured: 200 `new` of a 40-method CFC cost
+    /// 7.4ms with no row of its own anywhere in the footer.
+    ///
+    /// Zero cost when the footer is off: `interest` is `Interest::NONE` unless an
+    /// observer is installed, so the guard is one bitflag test and neither the
+    /// clock nor the frame stack is touched. Same shape as the method/include
+    /// sites.
     fn resolve_component_template(
+        &mut self,
+        class_name: &str,
+        locals: &ValueMap,
+    ) -> Option<CfmlValue> {
+        #[cfg(feature = "observability")]
+        {
+            if self.interest.contains(observe::Interest::TEMPLATE) {
+                let start = std::time::Instant::now();
+                self.template_frame_begin();
+                let r = self.resolve_component_template_impl(class_name, locals);
+                // Attribute to the RESOLVED file, so the row names the CFC that was
+                // built rather than the (possibly dotted, possibly mapped) path the
+                // caller typed.
+                let src = match &r {
+                    Some(CfmlValue::Struct(s)) => s
+                        .get_ci("__source_file")
+                        .map(|v| v.as_string())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                let us = start.elapsed().as_micros() as i64;
+                match src {
+                    Some(src) => self.template_frame_end(&src, Some("<constructor>"), us),
+                    // Nothing to name (unresolved path, or a non-struct template):
+                    // still pop the frame so the child-time stack stays balanced,
+                    // and credit the time to the caller rather than losing it.
+                    None => {
+                        let _ = frame_exclusive_us(&mut self.tmpl_child_us_stack, us);
+                    }
+                }
+                return r;
+            }
+        }
+        self.resolve_component_template_impl(class_name, locals)
+    }
+
+    fn resolve_component_template_impl(
         &mut self,
         class_name: &str,
         locals: &ValueMap,
