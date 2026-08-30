@@ -3785,6 +3785,71 @@ fn jit_udf_lookup(
     })
 }
 
+/// The per-application start gate — one lock per application NAME.
+///
+/// CFML's lifecycle contract is that `onApplicationStart` runs to completion
+/// before ANY request executes against the new application scope. Flipping
+/// `started = true` up front stops a second request from *re-firing* the handler,
+/// but it does not make that request WAIT: it sails past the block into
+/// `onRequest` against whatever half-built state the start handler has reached.
+/// On a restart under live traffic that is a window of 500s ("Variable 'auth' is
+/// undefined") and then 404s from a route registry that has not loaded yet — one
+/// bypass per concurrent request. GitHub #383.
+///
+/// `parking_lot::Mutex` rather than `std::sync::Mutex` deliberately: a panic
+/// inside a user's `onApplicationStart` must not poison the gate for the life of
+/// the process.
+static APP_START_GATES: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn app_start_gate(app_name: &str) -> Arc<parking_lot::Mutex<()>> {
+    let gates =
+        APP_START_GATES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut g = gates.lock();
+    Arc::clone(
+        g.entry(app_name.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(()))),
+    )
+}
+
+thread_local! {
+    /// Applications this thread is currently starting.
+    ///
+    /// The gate is not reentrant, so a start handler that re-enters application
+    /// loading for its OWN app on the same thread (an `include` that touches the
+    /// app, an `applicationStop()` mid-start) would deadlock against a lock it
+    /// already holds. The pre-gate `started` flip means such a re-entry has
+    /// nothing left to do, so it skips the gate rather than waiting on itself.
+    static STARTING_APPS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds a name in [`STARTING_APPS`] for the duration of one start.
+struct StartingAppGuard(String);
+
+impl StartingAppGuard {
+    fn enter(name: &str) -> Self {
+        STARTING_APPS.with(|s| s.borrow_mut().push(name.to_string()));
+        StartingAppGuard(name.to_string())
+    }
+}
+
+impl Drop for StartingAppGuard {
+    fn drop(&mut self) {
+        STARTING_APPS.with(|s| {
+            let mut v = s.borrow_mut();
+            if let Some(i) = v.iter().rposition(|n| n == &self.0) {
+                v.remove(i);
+            }
+        });
+    }
+}
+
+fn app_start_in_flight_on_this_thread(app_name: &str) -> bool {
+    STARTING_APPS.with(|s| s.borrow().iter().any(|n| n == app_name))
+}
+
 impl CfmlVirtualMachine {
     // continuation of the previous impl block (split only to insert the
     // free `jit_is_shadowed` helper above with the matching cfg gates).
@@ -36815,64 +36880,122 @@ impl CfmlVirtualMachine {
             // 5. onApplicationStart (if not yet started)
             let already_started = app_snapshot.started;
             if !already_started {
-                // Flip `started` first so concurrent requests don't re-fire
-                // onApplicationStart. Release any internal lock the store
-                // holds before calling the lifecycle method, since it may
-                // recursively touch the store.
-                server_state
-                    .applications
-                    .modify(&app_name, &mut |app| {
-                        app.started = true;
-                    });
+                // A start already running further up THIS thread's stack (the
+                // handler itself re-entering application loading — an `include`
+                // that touches the app) must not run the handler a second time,
+                // and must not wait on a gate this thread already holds.
+                let reentrant = app_start_in_flight_on_this_thread(&app_name);
 
-                // Functions created during onApplicationStart (factory beans,
-                // resource CFCs) that stay reachable from application scope are
-                // re-homed into the stable function table by the end-of-request
-                // pass; no separate "delta added during start" cache is needed,
-                // and a warm request needs no append/remap — app-scope `Function`
-                // bodies already hold stable ids resolved via the table loaded at
-                // request start.
-                if let Err(e) =
-                    self.call_lifecycle_method(&mut template, "onApplicationStart", vec![])
-                {
-                    // Roll the flag back so the NEXT request retries the boot.
-                    //
-                    // Without this, a single failed start — a database that was
-                    // slow or black-holed for one request, a transient upstream
-                    // blip — left `started = true` forever. The only other reset
-                    // is an explicit `applicationStop()`, so the process served
-                    // every subsequent request against an application that had
-                    // never run its start handler: empty application scope, empty
-                    // function table, permanently. That is GitHub #302's "the
-                    // worker's failed application boot is cached for its
-                    // lifetime", and it is why the reported symptom survived
-                    // every engine-version change the reporter tried.
-                    //
-                    // Deliberately NOT persisting the partial application scope
-                    // here: a retry must start clean, or a half-populated scope
-                    // would make the next run's guard-once blocks skip the
-                    // initialisation they exist to do. `persist_application_state`
-                    // is the only writer of `app.variables`, so skipping it leaves
-                    // the stored scope untouched for the retry.
-                    //
-                    // The cost is that a *permanently* failing start now re-runs
-                    // on every request instead of failing fast. That is the
-                    // correct trade: whether to keep retrying an app that cannot
-                    // boot is the application's call, not the engine's.
-                    server_state
+                // Take the application's start gate. A request that arrives while
+                // onApplicationStart is mid-flight BLOCKS here until it finishes
+                // rather than sailing past into onRequest against a half-built
+                // scope — that is the lifecycle contract, and skipping the wait is
+                // GitHub #383.
+                //
+                // `started` is flipped AFTER the handler returns, not before. The
+                // pre-flip this replaces did stop a concurrent request re-firing
+                // the handler, but only by making it skip the whole block — which
+                // is precisely the bypass. Mutual exclusion on the gate plus the
+                // re-check below give the same once-only guarantee while actually
+                // making the second request wait.
+                let gate = (!reentrant).then(|| app_start_gate(&app_name));
+                let _gate_guard = gate.as_ref().map(|g| g.lock());
+
+                // Re-read under the gate: the request we queued behind may have
+                // completed the start while we waited. The application SCOPE needs
+                // no refresh — `self.application_scope` is a handle on the same Arc
+                // the starter mutated, so its writes are already visible here.
+                let started_while_waiting = reentrant
+                    || server_state
                         .applications
-                        .modify(&app_name, &mut |app| {
-                            app.started = false;
-                        });
-                    let _ = self.call_lifecycle_method(
-                        &mut template,
-                        "onError",
-                        vec![
-                            CfmlValue::string(e.message.clone()),
-                            CfmlValue::string("onApplicationStart".to_string()),
-                        ],
-                    );
-                    return Err(e);
+                        .get(&app_name)
+                        .map(|a| a.started)
+                        .unwrap_or(false);
+                if started_while_waiting {
+                    // Adopt what the starter registered; our own copy came from
+                    // the pre-start snapshot.
+                    if let Some(app) = server_state.applications.get(&app_name) {
+                        self.app_function_table = app.app_function_table.clone();
+                        let carried = self.app_function_table.clone();
+                        for f in &carried {
+                            self.register_fn_local(f);
+                        }
+                        publish_shared_fns(carried.iter());
+                    }
+                } else {
+                    let _starting = StartingAppGuard::enter(&app_name);
+
+                    // Functions created during onApplicationStart (factory beans,
+                    // resource CFCs) that stay reachable from application scope are
+                    // re-homed into the stable function table by the end-of-request
+                    // pass; no separate "delta added during start" cache is needed,
+                    // and a warm request needs no append/remap — app-scope `Function`
+                    // bodies already hold stable ids resolved via the table loaded at
+                    // request start.
+                    if let Err(e) =
+                        self.call_lifecycle_method(&mut template, "onApplicationStart", vec![])
+                    {
+                        // Leave the app UNSTARTED so the NEXT request retries the boot.
+                        //
+                        // Without this, a single failed start — a database that was
+                        // slow or black-holed for one request, a transient upstream
+                        // blip — left the app marked started forever. The only other
+                        // reset is an explicit `applicationStop()`, so the process
+                        // served every subsequent request against an application that
+                        // had never run its start handler: empty application scope,
+                        // empty function table, permanently. That is GitHub #302's
+                        // "the worker's failed application boot is cached for its
+                        // lifetime", and it is why the reported symptom survived every
+                        // engine-version change the reporter tried.
+                        //
+                        // Since v0.646.0 the flag is only SET on success (see below),
+                        // so the failure path has nothing to roll back — it just has
+                        // to not set it. The store is still written explicitly rather
+                        // than left implicit, because `applicationStop()` inside the
+                        // handler may have created a fresh entry behind us.
+                        //
+                        // Deliberately NOT persisting the partial application scope
+                        // here: a retry must start clean, or a half-populated scope
+                        // would make the next run's guard-once blocks skip the
+                        // initialisation they exist to do. `persist_application_state`
+                        // is the only writer of `app.variables`, so skipping it leaves
+                        // the stored scope untouched for the retry.
+                        //
+                        // The cost is that a *permanently* failing start now re-runs
+                        // on every request instead of failing fast. That is the
+                        // correct trade: whether to keep retrying an app that cannot
+                        // boot is the application's call, not the engine's.
+                        server_state
+                            .applications
+                            .modify(&app_name, &mut |app| {
+                                app.started = false;
+                            });
+                        let _ = self.call_lifecycle_method(
+                            &mut template,
+                            "onError",
+                            vec![
+                                CfmlValue::string(e.message.clone()),
+                                CfmlValue::string("onApplicationStart".to_string()),
+                            ],
+                        );
+                        return Err(e);
+                    }
+
+                    // Started — and only now, with the gate still held, so the
+                    // requests queued behind it are released into a scope that is
+                    // fully built rather than one that merely exists.
+                    //
+                    // Skipped when the handler called `applicationStop()`: it asked
+                    // for the application to be torn down, and marking it started
+                    // would resurrect a stopped app as a started one with an empty
+                    // scope.
+                    if !self.application_stopped {
+                        server_state
+                            .applications
+                            .modify(&app_name, &mut |app| {
+                                app.started = true;
+                            });
+                    }
                 }
             }
         } else {
