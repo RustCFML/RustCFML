@@ -192,7 +192,9 @@ pub fn build_web_scopes(
         CfmlValue::Bool(true),
     );
 
-    globals.insert("cgi".to_string(), CfmlValue::strukt(cgi));
+    // Read-only to CFML code: Lucee rejects a `cgi` write ("struct is readonly")
+    // while leaving url/form/cookie writable. GitHub #372.
+    globals.insert("cgi".to_string(), CfmlValue::read_only_strukt(cgi));
 
     let url_scope = parse_query_string(query_string);
     globals.insert("url".to_string(), CfmlValue::strukt(url_scope));

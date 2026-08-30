@@ -622,6 +622,17 @@ impl FromIterator<CfmlValue> for CfmlArray {
 pub struct StructInner {
     pub map: ValueMap,
     pub shape_id: u64,
+    /// Set on a scope the engine hands to CFML code but does not let it write —
+    /// today that is `cgi` alone (GitHub #372; Lucee rejects a `cgi` write with
+    /// "struct is readonly" while leaving `url`/`form`/`cookie` writable).
+    ///
+    /// The flag lives on the STRUCT rather than being a check on the name `cgi`
+    /// at each assignment, because that is what Lucee is actually modelling: it
+    /// is the scope object that is read-only, so `local.c = cgi; local.c.x = 1`
+    /// is refused too. A name-based guard would let every alias through.
+    /// Enforced by [`CfmlValue::check_struct_writable`] at the mutation entry
+    /// points; see its callers.
+    pub read_only: bool,
     /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
     /// private `__variables` struct, a read of the `this` key resolves to the
     /// upgraded handle — the component's live public scope — rather than a
@@ -944,6 +955,7 @@ impl CfmlStruct {
         let arc = Arc::new(PlRwLock::new(StructInner {
             map: m,
             shape_id: next_shape_id(),
+            read_only: false,
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -977,11 +989,26 @@ impl CfmlStruct {
         CfmlStruct(Arc::new(PlRwLock::new(StructInner {
             map: m,
             shape_id: next_shape_id(),
+            read_only: false,
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
             method_table: None,
         })))
+    }
+
+    /// Marks this struct as one CFML code may read but not write (GitHub #372).
+    /// Set once, when the engine builds the scope; there is deliberately no way
+    /// to unset it from CFML.
+    #[inline]
+    pub fn mark_read_only(&self) {
+        self.0.write().read_only = true;
+    }
+
+    /// True for a scope CFML code may not write — see [`StructInner::read_only`].
+    #[inline]
+    pub fn is_read_only(&self) -> bool {
+        self.0.read().read_only
     }
 
     /// Attach a shared per-class method table (component-model flyweight). After
@@ -2355,6 +2382,16 @@ impl CfmlValue {
         CfmlValue::Struct(CfmlStruct::new(m))
     }
 
+    /// `strukt` variant for a scope CFML code may read but not write — the `cgi`
+    /// scope (GitHub #372). See [`StructInner::read_only`] for why the mark sits
+    /// on the struct rather than on the name it is published under.
+    #[inline]
+    pub fn read_only_strukt(m: ValueMap) -> Self {
+        let s = CfmlStruct::new(m);
+        s.mark_read_only();
+        CfmlValue::Struct(s)
+    }
+
     /// `strukt` variant that skips the cycle-GC allocation log — see
     /// [`CfmlStruct::new_untracked`] for the strict soundness contract. Use ONLY
     /// for a struct provably confined to its creating call frame.
@@ -2420,6 +2457,36 @@ impl CfmlValue {
 
     /// Borrow the shared struct handle (no copy). Mutating through it is visible
     /// to all aliases. Returns `None` for non-structs.
+    /// `Err` when this value is a struct the engine marked read-only — the `cgi`
+    /// scope (GitHub #372). `Ok` for everything else, so a mutation entry point
+    /// can guard itself with one `?` regardless of what it was handed.
+    ///
+    /// The message deliberately matches Lucee's wording, because CFML code that
+    /// cares about this branch has to match on the message: Lucee raises a plain
+    /// expression exception with no distinguishing type. `key` is passed through
+    /// verbatim — Lucee echoes a string-literal key as written (`cgi["b"]` →
+    /// `[b]`) and an identifier key upper-cased (`cgi.b` → `[B]`), because its
+    /// compiler upper-cases member names, so the CASING IS THE CALLER'S JOB.
+    pub fn check_struct_writable(&self, key: &str) -> Result<(), crate::vm::CfmlError> {
+        match self {
+            CfmlValue::Struct(s) if s.is_read_only() => Err(crate::vm::CfmlError::expression(
+                format!("can't set key [{}] to struct, struct is readonly", key),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// `Err` when this value is a read-only struct being emptied wholesale
+    /// (`structClear`), which Lucee words differently from a keyed write.
+    pub fn check_struct_clearable(&self) -> Result<(), crate::vm::CfmlError> {
+        match self {
+            CfmlValue::Struct(s) if s.is_read_only() => Err(crate::vm::CfmlError::expression(
+                "can't clear struct, struct is readonly".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub fn as_cfml_struct(&self) -> Option<&CfmlStruct> {
         match self {
             CfmlValue::Struct(s) => Some(s),

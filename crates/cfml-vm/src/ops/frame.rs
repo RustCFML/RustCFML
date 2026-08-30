@@ -65,14 +65,15 @@ pub(crate) fn op_delete_scope_key(
     locals: &mut ValueMap,
     effective_local_mode_modern: bool,
     scope: &Name,
-) {
+) -> Result<(), cfml_common::vm::CfmlError> {
     // `StructDelete(<scope>, keyExpr)` — pop the key and delete
     // `<scope>.<key>` from the live scope container (scopes are
     // snapshotted when passed as a builtin arg, so an in-place
     // struct mutation wouldn't reach them).
     let key = stack.pop().unwrap_or(CfmlValue::Null).as_string();
     let path = format!("{}.{}", scope, key);
-    vm.delete_scope_path(&path, locals, effective_local_mode_modern);
+    vm.delete_scope_path(&path, locals, effective_local_mode_modern)?;
+    Ok(())
 }
 
 /// `SetDynamicVar`
@@ -82,7 +83,7 @@ pub(crate) fn op_set_dynamic_var(
     stack: &mut Vec<CfmlValue>,
     locals: &mut ValueMap,
     effective_local_mode_modern: bool,
-) {
+) -> Result<(), cfml_common::vm::CfmlError> {
     // Dynamic/quoted-string LHS assignment: the path string was
     // resolved at runtime (e.g. "variables.propDep" from
     // `"#scope#.#prop#" = v`). Store scope-aware into the current
@@ -93,8 +94,9 @@ pub(crate) fn op_set_dynamic_var(
         .pop()
         .map(|v| v.as_string())
         .unwrap_or_default();
-    vm.store_runtime_path(&path, value.clone(), locals, effective_local_mode_modern);
+    vm.store_runtime_path(&path, value.clone(), locals, effective_local_mode_modern)?;
     stack.push(value);
+    Ok(())
 }
 
 /// `MarkAccessorPrivate`
@@ -127,10 +129,13 @@ pub(crate) fn op_mark_accessor_private(
 #[inline]
 pub(crate) fn op_set_index(
     stack: &mut Vec<CfmlValue>,
-) {
+) -> Result<(), cfml_common::vm::CfmlError> {
     let index = stack.pop().unwrap_or(CfmlValue::Null);
     let mut collection = stack.pop().unwrap_or(CfmlValue::Null);
     let value = stack.pop().unwrap_or(CfmlValue::Null);
+    // GitHub #372: `cgi["x"] = v` is the same write as `cgi.x = v` and gets the
+    // same refusal — read-only is a property of the struct, not of the syntax.
+    collection.check_struct_writable(&index.as_string())?;
     match &mut collection {
         CfmlValue::Array(arr) => {
             // 1-based index; accept Int or numeric Double/String.
@@ -241,5 +246,6 @@ pub(crate) fn op_set_index(
         _ => {}
     }
     stack.push(collection);
+    Ok(())
 }
 

@@ -174,7 +174,9 @@ fn empty_magic_cgi() -> CfmlValue {
         cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER.to_string(),
         CfmlValue::Bool(true),
     );
-    CfmlValue::strukt(m)
+    // Read-only to CFML code, exactly as in serve mode — a `cgi` write must not
+    // depend on which entry point built the scope. GitHub #372.
+    CfmlValue::read_only_strukt(m)
 }
 
 // ---------------------------------------------------------------------------

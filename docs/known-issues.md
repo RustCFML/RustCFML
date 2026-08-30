@@ -1594,6 +1594,37 @@ here — only code Lucee rejects outright.
 
 ---
 
+## 73. `cgi` is read-only — but a refused DELETE or APPEND still happens 🏗 *(GH [#372](https://github.com/RustCFML/RustCFML/issues/372))*
+
+Writing to the `cgi` scope is refused, matching Lucee:
+
+```cfml
+cgi.qtest = "x";   // Expression: can't set key [QTEST] to struct, struct is readonly
+```
+
+The mark rides on the scope STRUCT rather than on the name, so an alias is
+refused identically (`local.c = cgi; local.c.x = 1`) — which is what Lucee does
+too. `url`, `form` and `cookie` stay writable on both engines.
+
+Where we differ is the two operations Lucee *lets through*. Verified against
+Lucee 7.1.0+204:
+
+| operation | Lucee | RustCFML |
+|---|---|---|
+| `cgi.x = v`, `cgi["x"] = v`, `structInsert`/`structUpdate`, `cgi.insert()`, `cgi.x = nullValue()` | throws | throws |
+| `structClear( cgi )` | throws (`can't clear struct…`) | throws |
+| `structDelete( cgi, k )`, `cgi.delete( k )` | returns success, **does nothing** | performs the delete |
+| `structAppend( cgi, s )`, `cgi.append( s )` | returns success, **does nothing** | performs the append |
+
+Lucee's read-only struct throws from `put`/`clear` but leaves `remove`/`putAll`
+as no-ops, so it reports a delete that never happened. Copying that would be
+shipping a silent no-op; throwing instead would be a RESTRICTIVE divergence — the
+kind that can break an app that works on Lucee. We do neither, and leave those
+two operations working as they always did. Code that relies on either is already
+broken on Lucee, in the quieter direction.
+
+---
+
 ---
 
 # Part E — Environment-specific 🌍

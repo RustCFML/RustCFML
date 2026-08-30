@@ -54,6 +54,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_recursive_closure_var.cfm">
 <cf_runtest file="core/test_caller_local_no_leak.cfm">
 <cf_runtest file="core/test_scope_member_mutators.cfm">
+<cf_runtest file="core/test_cgi_scope_readonly.cfm">
 <cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
 <cf_runtest file="core/test_closure_unscoped_reset.cfm">
 <cf_runtest file="core/test_closure_param_defaults.cfm">

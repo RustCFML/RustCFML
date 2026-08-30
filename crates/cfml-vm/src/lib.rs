@@ -8828,10 +8828,22 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
-                BytecodeOp::SetDynamicVar => { ops::frame::op_set_dynamic_var(self, &mut stack, &mut locals, effective_local_mode_modern); }
-                BytecodeOp::UnsetPath(path) => { ops::locals::op_unset_path(self, func, &mut locals, &mut slots, &closure_env, &mut inherited_or_param_keys, effective_local_mode_modern, path); }
+                BytecodeOp::SetDynamicVar => {
+                    if let Err(e) = ops::frame::op_set_dynamic_var(self, &mut stack, &mut locals, effective_local_mode_modern) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
+                BytecodeOp::UnsetPath(path) => {
+                    if let Err(e) = ops::locals::op_unset_path(self, func, &mut locals, &mut slots, &closure_env, &mut inherited_or_param_keys, effective_local_mode_modern, path) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
 
-                BytecodeOp::DeleteScopeKey(scope) => { ops::frame::op_delete_scope_key(self, &mut stack, &mut locals, effective_local_mode_modern, scope); }
+                BytecodeOp::DeleteScopeKey(scope) => {
+                    if let Err(e) = ops::frame::op_delete_scope_key(self, &mut stack, &mut locals, effective_local_mode_modern, scope) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
                 BytecodeOp::ArrayAppendLocal(name) | BytecodeOp::ArrayAppendSlot(_, name) => { ops::locals::op_array_append_local(self, &mut stack, func, &mut locals, &mut slots, &closure_env, &declared_locals, effective_local_mode_modern, is_inside_function, op, name)?; }
                 BytecodeOp::LoadGlobal(name) | BytecodeOp::LoadVariablesKey(name) => {
                     // Avoid allocating a lowercase String when the identifier is
@@ -9898,7 +9910,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
                                 // Reconcile any nested-closure writeback that reached
                                 // the shared env behind an intermediate frame (see the
                                 // CallMethod arm / reconcile_closure_env_into_locals).
@@ -10084,7 +10096,7 @@ impl CfmlVirtualMachine {
                                                 &mut inherited_or_param_keys,
                                                 &mut declared_locals,
                                                 effective_local_mode_modern,
-                                            );
+                                            )?;
                                         }
                                     }
                                     stack.push(result);
@@ -10340,12 +10352,12 @@ impl CfmlVirtualMachine {
                                             Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
                                         }
                                         if var.contains('.') {
-                                            self.store_runtime_path(&var, result.clone(), &mut locals, effective_local_mode_modern);
+                                            self.store_runtime_path(&var, result.clone(), &mut locals, effective_local_mode_modern)?;
                                         } else {
                                             locals.insert(var, result.clone());
                                         }
                                     }
-                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
+                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
                                     stack.push(result);
                                 }
                                 Err(e) => {
@@ -10585,7 +10597,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
                                 Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                                 stack.push(result);
                             }
@@ -10911,7 +10923,11 @@ impl CfmlVirtualMachine {
                 BytecodeOp::BuildArray(count) => ops::value::op_build_array(&mut stack, *count),
                 BytecodeOp::BuildStruct(count) => ops::value::op_build_struct(&mut stack, *count),
                 BytecodeOp::GetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip)?; }
-                BytecodeOp::SetIndex => { ops::frame::op_set_index(&mut stack); }
+                BytecodeOp::SetIndex => {
+                    if let Err(e) = ops::frame::op_set_index(&mut stack) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
 
                 BytecodeOp::LoadLocalProperty(local_name, prop_name)
                 | BytecodeOp::TryLoadLocalProperty(local_name, prop_name)
@@ -10951,6 +10967,13 @@ impl CfmlVirtualMachine {
                                 .globals
                                 .entry(local_name.to_lowercase())
                                 .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+                            // GitHub #372: `cgi` is read-only (Lucee rejects the
+                            // write; url/form/cookie stay writable, and carry no
+                            // mark, so they cost nothing here).
+                            if let Err(e) = entry.check_struct_writable(&prop_name.to_uppercase()) {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
                             if let Some(s) = entry.as_cfml_struct() {
                                 s.insert(prop_name.to_string(), value);
                             }
@@ -11019,6 +11042,14 @@ impl CfmlVirtualMachine {
                                 }
                                 continue;
                             }
+                            // GitHub #372: a read-only scope struct (`cgi`) reached
+                            // through ANY name — the scope itself, or a local
+                            // holding it (`local.c = cgi; local.c.x = 1`), which is
+                            // why the mark is on the struct and not on the name.
+                            if let Err(e) = obj.check_struct_writable(&prop_name.to_uppercase()) {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
                             if let Some(s) = obj.as_cfml_struct() {
                                 s.insert(prop_name.to_string(), value);
                             } else {
@@ -11083,6 +11114,10 @@ impl CfmlVirtualMachine {
                                 // (struct backing or the instance's public data map),
                                 // so this write is visible through `variables.<name>`.
                                 // `set` handles both Struct and flyweight Instance.
+                                if let Err(e) = existing.check_struct_writable(&prop_name.to_uppercase()) {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
                                 existing.set(prop_name.to_string(), value);
                             } else {
                                 // Auto-vivification: assigning to a member path of a
@@ -11127,7 +11162,14 @@ impl CfmlVirtualMachine {
                 BytecodeOp::LoadStaticHolder(name) => { ops::frame::op_load_static_holder(self, &mut stack, &locals, name); }
                 BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
                 BytecodeOp::MarkAccessorPrivate(name) => { ops::frame::op_mark_accessor_private(&locals, name); }
-                BytecodeOp::SetProperty(name) => { ops::access::op_set_property(&mut stack, name)?; }
+                BytecodeOp::SetProperty(name) => {
+                    // Routed through the try handler rather than `?`-propagated:
+                    // a member-store failure must be catchable, which is what
+                    // `try { cgi.x = 1 } catch( any e )` depends on (GitHub #372).
+                    if let Err(e) = ops::access::op_set_property(&mut stack, name) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
 
                 BytecodeOp::NewObject(arg_count)
                 | BytecodeOp::NewObjectNamed(_, arg_count) => {
@@ -21927,13 +21969,14 @@ impl CfmlVirtualMachine {
         value: CfmlValue,
         locals: &mut ValueMap,
         local_mode_modern: bool,
-    ) {
+    ) -> Result<(), CfmlError> {
         // CFML null-assignment: storing Null through a scope path (a dynamic
         // `"variables.x" = voidFn()` LHS, or a null result-writeback delivery)
         // DELETES the target rather than materializing a null-valued key.
         if matches!(value, CfmlValue::Null) {
-            self.delete_scope_path(path, locals, local_mode_modern);
-            return;
+            self.check_scope_path_writable(path, locals)?;
+            self.delete_scope_path(path, locals, local_mode_modern)?;
+            return Ok(());
         }
         let parts: Vec<&str> = path.split('.').collect();
         if parts.len() >= 2 {
@@ -21941,6 +21984,10 @@ impl CfmlVirtualMachine {
             let root = self
                 .scope_aware_load(scope, locals)
                 .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()));
+            // GitHub #372: refuse a write into a read-only scope (`cgi`) before
+            // any of the walks below mutate it. Checked on the RESOLVED root, so
+            // it also catches the path reaching the scope under another name.
+            root.check_struct_writable(&parts[1].to_uppercase())?;
             // A Rust-backed object root (e.g. the live `socket` handle): descend
             // through its `CfmlNative` accessors instead of rebuilding the path
             // as a plain struct — otherwise `socket.data.x = v` would replace the
@@ -21953,7 +22000,7 @@ impl CfmlVirtualMachine {
                     if let Ok(mut g) = obj.write() {
                         let _ = g.set_property(seg, value);
                     }
-                    return;
+                    return Ok(());
                 }
                 let prop = obj.read().ok().and_then(|g| g.get_property(seg));
                 if let Some(CfmlValue::Struct(s)) = prop {
@@ -21963,7 +22010,7 @@ impl CfmlVirtualMachine {
                     }
                     cur.insert(parts[parts.len() - 1].to_string(), value);
                 }
-                return;
+                return Ok(());
             }
             // A flyweight component-instance root (`a.b.c = v` where `a` is an
             // Instance): descend through its data members IN PLACE rather than
@@ -21974,7 +22021,7 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             if matches!(root, CfmlValue::Instance(_)) {
                 Self::store_member_path_in_place(&root, &parts[1..], value);
-                return;
+                return Ok(());
             }
             let root = if matches!(root, CfmlValue::Struct(_)) {
                 root
@@ -22057,6 +22104,7 @@ impl CfmlVirtualMachine {
             // Bare name (no scope prefix) — single-variable store.
             self.scope_aware_store(path, value, locals, local_mode_modern);
         }
+        Ok(())
     }
 
     /// Delete a scope-qualified / nested variable path, the deletion half of
@@ -22064,7 +22112,32 @@ impl CfmlVirtualMachine {
     /// rather than materializing a null one). The bare-name case is handled
     /// inline in the `UnsetPath` opcode (it also clears globals + closure env);
     /// this covers `<scope>.leaf` and deeper `<scope>.a.b…leaf` paths.
-    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap, modern: bool) {
+    /// Refuses a write through a scope-qualified path whose ROOT is a read-only
+    /// scope — `cgi` (GitHub #372).
+    ///
+    /// Used by the null-assignment routes (`cgi.x = nullValue()`), which delete
+    /// rather than store but which Lucee compiles as a set and rejects as one.
+    /// Deliberately NOT used by `structDelete`/`DeleteScopeKey`: Lucee lets that
+    /// through (silently doing nothing), and refusing it would be a restrictive
+    /// divergence. The key is upper-cased because these paths always come from an
+    /// identifier, which is the form Lucee upper-cases in its message.
+    pub(crate) fn check_scope_path_writable(
+        &mut self,
+        path: &str,
+        locals: &ValueMap,
+    ) -> Result<(), CfmlError> {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.len() < 2 {
+            return Ok(());
+        }
+        let leaf = parts[parts.len() - 1];
+        if let Some(root) = self.scope_aware_load(parts[0], locals) {
+            root.check_struct_writable(&leaf.to_uppercase())?;
+        }
+        Ok(())
+    }
+
+    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap, modern: bool) -> Result<(), CfmlError> {
         // `modern` is the live frame's effective localMode (not the app default),
         // threaded from the callers so the scope-container store-backs below
         // commit a classic-localmode component var back to __variables rather
@@ -22078,7 +22151,7 @@ impl CfmlVirtualMachine {
                 vars.remove_ci(path);
             }
             imap_remove_ci(&mut self.globals, path);
-            return;
+            return Ok(());
         }
         let scope = parts[0];
         let leaf = parts[parts.len() - 1];
@@ -22134,7 +22207,7 @@ impl CfmlVirtualMachine {
                             let g = inst.read();
                             g.remove_public_member(leaf);
                             g.remove_private_member(leaf);
-                            return;
+                            return Ok(());
                         }
                         if let Some(s) = obj.as_cfml_struct() {
                             s.remove_ci(leaf);
@@ -22143,7 +22216,7 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
         // Nested target: `<scope>.a.b…leaf`. Walk to the parent container — every
@@ -22162,12 +22235,12 @@ impl CfmlVirtualMachine {
                     let member = inst.read().get_member(key);
                     match member {
                         Some(next) => { cur = next; continue; }
-                        None => return,
+                        None => return Ok(()),
                     }
                 }
                 match cur.as_cfml_struct().and_then(|s| s.get_ci(key)) {
                     Some(next) => cur = next,
-                    None => return,
+                    None => return Ok(()),
                 }
             }
             // Flyweight component leaf-parent: remove from the live data maps.
@@ -22177,7 +22250,7 @@ impl CfmlVirtualMachine {
                 g.remove_public_member(leaf);
                 g.remove_private_member(leaf);
                 self.scope_aware_store(scope, root, locals, modern);
-                return;
+                return Ok(());
             }
             if let Some(s) = cur.as_cfml_struct() {
                 s.remove_ci(leaf);
@@ -22189,6 +22262,7 @@ impl CfmlVirtualMachine {
             // scopes the leaf is removed in place and this re-commit is a no-op.
             self.scope_aware_store(scope, root, locals, modern);
         }
+        Ok(())
     }
 
     /// Apply (and clear) any caller-scope deliveries requested by the call
@@ -22259,10 +22333,10 @@ impl CfmlVirtualMachine {
         inherited_or_param_keys: &mut InheritedKeys,
         declared_locals: &mut DeclaredLocals,
         local_mode_modern: bool,
-    ) {
+    ) -> Result<(), CfmlError> {
         if let Some(sets) = self.pending_result_writeback.take() {
             for (path, value) in sets {
-                self.store_runtime_path(&path, value, locals, local_mode_modern);
+                self.store_runtime_path(&path, value, locals, local_mode_modern)?;
                 let parts: Vec<&str> = path.split('.').collect();
                 if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("local") {
                     inherited_or_param_keys.remove(parts[1]);
@@ -22284,6 +22358,7 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        Ok(())
     }
 
     /// Reject calls that mix positional and named arguments.
