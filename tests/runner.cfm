@@ -663,6 +663,11 @@ include "harness.cfm";
 <cf_runtest file="lifecycle/test_mapping_symlink_paths.cfm">
 <cf_runtest file="lifecycle/test_application_lifecycle_case_override.cfm">
 <cf_runtest file="lifecycle/test_application_load_errors.cfm">
+
+<!--- onApplicationStart must gate ALL concurrent requests, not just the one that
+     triggers it: bypassers observe the half-built application scope (boot-window
+     500s/404s under live traffic). --->
+<cf_runtest file="lifecycle/test_application_start_serialisation.cfm">
 <cf_runtest file="lifecycle/test_application_scope_custom_tag.cfm">
 <cf_runtest file="lifecycle/test_application_onerror_onabort.cfm">
 <cf_runtest file="lifecycle/test_appscope_receiver_no_resurrect.cfm">
