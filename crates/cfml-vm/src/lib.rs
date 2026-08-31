@@ -32738,21 +32738,26 @@ impl CfmlVirtualMachine {
     /// only `read_dir` when the parent directory itself exists, so the common
     /// "override CFC absent" probe does not pay a directory listing.
     fn resolve_existing_cf_path(&self, path: &str) -> Option<String> {
+        // Cache-first: the common exact-case / overlay miss stays a memoised
+        // probe. When VFS says the path exists, RealFs may have matched a
+        // different on-disk spelling (`storage/testDir` vs `testdir`) — return
+        // that spelling so std::fs consumers and compile/include cache keys
+        // stay stable. Overlay-only hits (lucee_case_fold_path = None) keep
+        // the requested string; EmbeddedFs already lowercases.
         if self.exists_cached_path(path) {
-            return Some(path.to_string());
+            return Some(
+                cfml_common::vfs::lucee_case_fold_path(path).unwrap_or_else(|| path.to_string()),
+            );
         }
         self.resolve_case_folded_cf_path(path)
     }
 
     fn resolve_case_folded_cf_path(&self, path: &str) -> Option<String> {
         let p = std::path::Path::new(path);
-        let ext = p.extension().and_then(|e| e.to_str())?;
-        if !(ext.eq_ignore_ascii_case("cfc")
-            || ext.eq_ignore_ascii_case("cfm")
-            || ext.eq_ignore_ascii_case("cfs"))
-        {
-            return None;
-        }
+        // Every segment, any extension — not just last-segment `.cfc`/`.cfm`.
+        // Preside FileStorage asks for `testDir/loading.gif` while the fixture
+        // is `testdir/loading.gif`. Overlay/embedded VFS still needs this
+        // walk when the path is not on the real filesystem.
         // Walk every segment. Preside also disagrees with on-disk *directory*
         // spelling (`sitetree` vs `siteTree`, `assetmanager` vs `assetManager`,
         // `cfmlScopes` vs `cfmlscopes`), and Lucee matches those too. Exact
@@ -32804,6 +32809,11 @@ impl CfmlVirtualMachine {
     }
 
     /// `vfs.exists` behind the two-layer existence memo.
+    ///
+    /// RealFs folds **every** path segment (GH #387), so a wrong-case mid-path
+    /// (`storage/testDir/loading.gif` vs on-disk `testdir`) is a positive hit
+    /// and is cached under the requested spelling. Overlay/embedded VFS still
+    /// goes through `resolve_case_folded_cf_path` when RealFs has no match.
     fn exists_cached_path(&self, path: &str) -> bool {
         self.exists_cached(path, EXISTS_ANY, |vfs| vfs.exists(path))
     }
@@ -33297,7 +33307,15 @@ impl CfmlVirtualMachine {
                     "filecopy" | "filemove" | "directorycopy" | "directoryrename" => i == 0,
                     _ => true,
                 };
-                let resolved = self.resolve_template_relative(cur, allow_fallback);
+                let mut resolved = self.resolve_template_relative(cur, allow_fallback);
+                // Fold existing paths so fileReadBinary(".../testDir/x.gif")
+                // finds testdir/x.gif on Linux (GH #387). Skip for brand-new
+                // write/create targets.
+                if allow_fallback {
+                    if let Some(folded) = cfml_common::vfs::lucee_case_fold_path(&resolved) {
+                        resolved = folded;
+                    }
+                }
                 if resolved.as_str() != cur {
                     args[i] = CfmlValue::string(resolved);
                 }

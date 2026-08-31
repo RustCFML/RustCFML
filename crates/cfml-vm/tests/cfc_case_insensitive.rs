@@ -111,17 +111,19 @@ fn negative_exists_cache_does_not_block_case_folded_cfc_hit() {
     let dir = tmp("negcache");
     write(&dir.join("SqlRunner.cfc"), &cfc("after-miss"));
 
-    // fileExists on the wrong-case path caches a negative for that exact
-    // string; createObject must still case-fold to the real file.
+    // RealFs now folds every segment, so fileExists on the wrong-case
+    // spelling is a HIT (same as fileRead). createObject must still
+    // resolve to the on-disk CFC; a positive exists-cache entry for the
+    // requested spelling must not hide that.
     let page_src = r#"<cfscript>
-miss = fileExists(expandPath("./sqlRunner.cfc"));
+hit = fileExists(expandPath("./sqlRunner.cfc"));
 obj = createObject("component", "sqlRunner");
-writeOutput((miss ? "hit" : "miss") & "," & obj.ping());
+writeOutput((hit ? "hit" : "miss") & "," & obj.ping());
 </cfscript>"#;
     write(&dir.join("index.cfm"), page_src);
     let page = dir.join("index.cfm").to_string_lossy().to_string();
 
-    assert_eq!("miss,after-miss", run_page(&page, page_src, vec![]));
+    assert_eq!("hit,after-miss", run_page(&page, page_src, vec![]));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -145,5 +147,23 @@ writeOutput(obj.ping());
     }];
 
     assert_eq!("site", run_page(&page, page_src, mappings));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_ops_find_file_when_mid_path_directory_case_differs() {
+    let dir = tmp("midpath");
+    let pkg = dir.join("storage").join("testdir");
+    std::fs::create_dir_all(&pkg).expect("mkdir testdir");
+    write(&pkg.join("loading.gif"), "GIF89a");
+
+    let page_src = r#"<cfscript>
+p = expandPath("./storage/testDir/loading.gif");
+writeOutput((fileExists(p) ? "yes" : "no") & "," & fileRead(p));
+</cfscript>"#;
+    write(&dir.join("index.cfm"), page_src);
+    let page = dir.join("index.cfm").to_string_lossy().to_string();
+
+    assert_eq!("yes,GIF89a", run_page(&page, page_src, vec![]));
     let _ = std::fs::remove_dir_all(&dir);
 }
