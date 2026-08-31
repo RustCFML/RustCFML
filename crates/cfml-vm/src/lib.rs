@@ -12819,7 +12819,9 @@ impl CfmlVirtualMachine {
                     // serve-mode webroot, then CLI-mode base_template_path's
                     // parent. The prefix check MUST come first: relative
                     // includes never need the existence probe.
-                    let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+                    let resolved = if let Some(real) = self.resolve_existing_cf_path(&resolved) {
+                        real
+                    } else if path.starts_with('/') {
                         self.resolve_leading_slash_include(&path)
                             .unwrap_or(resolved)
                     } else {
@@ -13019,7 +13021,9 @@ impl CfmlVirtualMachine {
                         path.clone()
                     };
 
-                    let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+                    let resolved = if let Some(real) = self.resolve_existing_cf_path(&resolved) {
+                        real
+                    } else if path.starts_with('/') {
                         self.resolve_leading_slash_include(&path)
                             .unwrap_or(resolved)
                     } else {
@@ -13538,7 +13542,9 @@ impl CfmlVirtualMachine {
         } else {
             path.clone()
         };
-        let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+        let resolved = if let Some(real) = self.resolve_existing_cf_path(&resolved) {
+            real
+        } else if path.starts_with('/') {
             self.resolve_leading_slash_include(&path)
                 .or_else(|| self.resolve_include_with_mappings(&path))
                 .unwrap_or(resolved)
@@ -28201,8 +28207,8 @@ impl CfmlVirtualMachine {
                     path.trim_end_matches('/'),
                     remainder.replace('/', std::path::MAIN_SEPARATOR_STR)
                 );
-                if self.exists_cached_path(&cfc_path) {
-                    return Some(cfc_path);
+                if let Some(real) = self.resolve_existing_cf_path(&cfc_path) {
+                    return Some(real);
                 }
             }
         }
@@ -28223,8 +28229,8 @@ impl CfmlVirtualMachine {
         let stripped = include_path.trim_start_matches('/');
         if let Some(webroot) = self.server_state.as_ref().and_then(|s| s.webroot.as_ref()) {
             let candidate = webroot.join(stripped).to_string_lossy().to_string();
-            if self.exists_cached_path(&candidate) {
-                return Some(candidate);
+            if let Some(real) = self.resolve_existing_cf_path(&candidate) {
+                return Some(real);
             }
         }
         if let Some(ref base) = self.base_template_path {
@@ -28232,8 +28238,8 @@ impl CfmlVirtualMachine {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
             let candidate = base_dir.join(stripped).to_string_lossy().to_string();
-            if self.exists_cached_path(&candidate) {
-                return Some(candidate);
+            if let Some(real) = self.resolve_existing_cf_path(&candidate) {
+                return Some(real);
             }
         }
         None
@@ -28256,8 +28262,8 @@ impl CfmlVirtualMachine {
                 };
                 let remainder = remainder.trim_start_matches('/');
                 let resolved = format!("{}/{}", mapping.path.trim_end_matches('/'), remainder);
-                if self.exists_cached_path(&resolved) {
-                    return Some(resolved);
+                if let Some(real) = self.resolve_existing_cf_path(&resolved) {
+                    return Some(real);
                 }
             }
         }
@@ -30321,8 +30327,8 @@ impl CfmlVirtualMachine {
                 }
                 let mut resolved_path = None;
                 for cand in &candidates {
-                    if self.exists_cached_path(cand) {
-                        resolved_path = Some(cand.clone());
+                    if let Some(real) = self.resolve_existing_cf_path(cand) {
+                        resolved_path = Some(real);
                         break;
                     } else if let Some(resolved) = self.resolve_leading_slash_include(cand) {
                         resolved_path = Some(resolved);
@@ -30336,14 +30342,15 @@ impl CfmlVirtualMachine {
                 } else {
                     format!("{}.cfc", class_name)
                 };
-                if self.exists_cached_path(&p) {
-                    p
+                if let Some(real) = self.resolve_existing_cf_path(&p) {
+                    real
                 } else if let Some(ref source) = self.source_file {
                     // Try relative to source file
                     let source_dir = std::path::Path::new(source)
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("."));
-                    source_dir.join(&p).to_string_lossy().to_string()
+                    let joined = source_dir.join(&p).to_string_lossy().to_string();
+                    self.resolve_existing_cf_path(&joined).unwrap_or(joined)
                 } else {
                     p
                 }
@@ -30364,8 +30371,8 @@ impl CfmlVirtualMachine {
                         class_name.replace('.', std::path::MAIN_SEPARATOR_STR)
                     )
                 };
-                if self.exists_cached_path(&relative_path) {
-                    relative_path
+                if let Some(real) = self.resolve_existing_cf_path(&relative_path) {
+                    real
                 } else if let Some(mapped) = self.resolve_path_with_mappings(class_name) {
                     mapped
                 } else if let Some(ref base) = self.base_template_path {
@@ -30378,8 +30385,8 @@ impl CfmlVirtualMachine {
                         .join(format!("{}.cfc", file_name))
                         .to_string_lossy()
                         .to_string();
-                    if self.exists_cached_path(&base_path) {
-                        base_path
+                    if let Some(real) = self.resolve_existing_cf_path(&base_path) {
+                        real
                     } else if let Some(webroot_path) = self
                         .server_state
                         .as_ref()
@@ -30390,8 +30397,8 @@ impl CfmlVirtualMachine {
                                 .to_string()
                         })
                     {
-                        if self.exists_cached_path(&webroot_path) {
-                            webroot_path
+                        if let Some(real) = self.resolve_existing_cf_path(&webroot_path) {
+                            real
                         } else {
                             relative_path
                         }
@@ -30409,8 +30416,8 @@ impl CfmlVirtualMachine {
                             .to_string()
                     })
                 {
-                    if self.exists_cached_path(&webroot_path) {
-                        webroot_path
+                    if let Some(real) = self.resolve_existing_cf_path(&webroot_path) {
+                        real
                     } else {
                         relative_path
                     }
@@ -32715,6 +32722,53 @@ impl CfmlVirtualMachine {
     /// `vfs.is_dir` behind the two-layer existence memo.
     fn is_dir_cached(&self, path: &str) -> bool {
         self.exists_cached(path, EXISTS_DIR, |vfs| vfs.is_dir(path))
+    }
+
+    /// Resolve `path` to an existing CFML template (`.cfc` / `.cfm` / `.cfs`).
+    ///
+    /// Exact-case `exists` is the fast path. On a miss, list the parent
+    /// directory and match the filename case-insensitively — Lucee does this
+    /// on case-sensitive filesystems, and Preside ships CFC names whose dotted
+    /// `createObject` form disagrees with the on-disk spelling (`sqlRunner` vs
+    /// `SqlRunner.cfc`, `TaskManagerLogAppender` vs `TaskmanagerLogAppender.cfc`).
+    /// Returns the on-disk path so a subsequent `read` succeeds (GH #387).
+    ///
+    /// A negative existence-cache entry for the *requested* (wrong-case) string
+    /// must not hide the case-folded hit: those are different cache keys. We
+    /// only `read_dir` when the parent directory itself exists, so the common
+    /// "override CFC absent" probe does not pay a directory listing.
+    fn resolve_existing_cf_path(&self, path: &str) -> Option<String> {
+        if self.exists_cached_path(path) {
+            return Some(path.to_string());
+        }
+        self.resolve_case_folded_cf_path(path)
+    }
+
+    fn resolve_case_folded_cf_path(&self, path: &str) -> Option<String> {
+        let p = std::path::Path::new(path);
+        let ext = p.extension().and_then(|e| e.to_str())?;
+        if !(ext.eq_ignore_ascii_case("cfc")
+            || ext.eq_ignore_ascii_case("cfm")
+            || ext.eq_ignore_ascii_case("cfs"))
+        {
+            return None;
+        }
+        let want = p.file_name().and_then(|n| n.to_str())?;
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+        let parent_str = parent.to_string_lossy();
+        // Genuinely-missing overlay dirs must not pay a read_dir. Use the
+        // memoised dir probe — a negative here is for the *directory*, not
+        // the wrong-case file, so it cannot hide a case-folded file hit.
+        if !self.is_dir_cached(parent_str.as_ref()) {
+            return None;
+        }
+        let entries = self.vfs.read_dir(parent_str.as_ref()).ok()?;
+        for entry in entries {
+            if entry.is_file && entry.name.eq_ignore_ascii_case(want) {
+                return Some(parent.join(&entry.name).to_string_lossy().into_owned());
+            }
+        }
+        None
     }
 
     /// `vfs.exists` behind the two-layer existence memo.
