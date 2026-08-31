@@ -32753,22 +32753,54 @@ impl CfmlVirtualMachine {
         {
             return None;
         }
-        let want = p.file_name().and_then(|n| n.to_str())?;
-        let parent = p.parent().filter(|d| !d.as_os_str().is_empty())?;
-        let parent_str = parent.to_string_lossy();
-        // Genuinely-missing overlay dirs must not pay a read_dir. Use the
-        // memoised dir probe — a negative here is for the *directory*, not
-        // the wrong-case file, so it cannot hide a case-folded file hit.
-        if !self.is_dir_cached(parent_str.as_ref()) {
-            return None;
-        }
-        let entries = self.vfs.read_dir(parent_str.as_ref()).ok()?;
-        for entry in entries {
-            if entry.is_file && entry.name.eq_ignore_ascii_case(want) {
-                return Some(parent.join(&entry.name).to_string_lossy().into_owned());
+        // Walk every segment. Preside also disagrees with on-disk *directory*
+        // spelling (`sitetree` vs `siteTree`, `assetmanager` vs `assetManager`,
+        // `cfmlScopes` vs `cfmlscopes`), and Lucee matches those too. Exact
+        // exists is still the per-segment fast path; a negative cache entry
+        // for a wrong-case segment is a different key from the real name.
+        let mut acc = std::path::PathBuf::new();
+        let comps: Vec<_> = p.components().collect();
+        for (i, comp) in comps.iter().enumerate() {
+            match comp {
+                std::path::Component::Prefix(pre) => acc.push(pre.as_os_str()),
+                std::path::Component::RootDir => acc.push(std::path::MAIN_SEPARATOR_STR),
+                std::path::Component::CurDir | std::path::Component::ParentDir => {
+                    acc.push(comp.as_os_str());
+                }
+                std::path::Component::Normal(seg) => {
+                    let next = acc.join(seg);
+                    let next_str = next.to_string_lossy();
+                    let last = i + 1 == comps.len();
+                    if self.exists_cached_path(next_str.as_ref()) {
+                        acc = next;
+                        continue;
+                    }
+                    // Missing overlay segments must not pay a listing when the
+                    // parent directory itself is absent.
+                    if acc.as_os_str().is_empty() || !self.is_dir_cached(acc.to_string_lossy().as_ref()) {
+                        return None;
+                    }
+                    let want = seg.to_str()?;
+                    let entries = self.vfs.read_dir(acc.to_string_lossy().as_ref()).ok()?;
+                    let mut hit = None;
+                    for entry in entries {
+                        if !entry.name.eq_ignore_ascii_case(want) {
+                            continue;
+                        }
+                        if last && !entry.is_file {
+                            continue;
+                        }
+                        if !last && !entry.is_dir {
+                            continue;
+                        }
+                        hit = Some(entry.name);
+                        break;
+                    }
+                    acc.push(hit?);
+                }
             }
         }
-        None
+        Some(acc.to_string_lossy().into_owned())
     }
 
     /// `vfs.exists` behind the two-layer existence memo.

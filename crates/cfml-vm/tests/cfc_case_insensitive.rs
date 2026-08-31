@@ -124,3 +124,26 @@ writeOutput((miss ? "hit" : "miss") & "," & obj.ping());
     assert_eq!("miss,after-miss", run_page(&page, page_src, vec![]));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mapping_dotted_name_finds_cfc_when_directory_case_differs() {
+    let dir = tmp("dircase");
+    let pkg = dir.join("system").join("siteTree");
+    std::fs::create_dir_all(&pkg).expect("mkdir pkg");
+    write(&pkg.join("SiteService.cfc"), &cfc("site"));
+
+    let page_src = r#"<cfscript>
+obj = createObject("component", "preside.system.sitetree.SiteService");
+writeOutput(obj.ping());
+</cfscript>"#;
+    write(&dir.join("index.cfm"), page_src);
+    let page = dir.join("index.cfm").to_string_lossy().to_string();
+    let mappings = vec![CfmlMapping {
+        name: "/preside".to_string(),
+        path: dir.to_string_lossy().to_string(),
+        from_application: true,
+    }];
+
+    assert_eq!("site", run_page(&page, page_src, mappings));
+    let _ = std::fs::remove_dir_all(&dir);
+}
