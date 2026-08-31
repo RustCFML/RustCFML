@@ -1673,11 +1673,20 @@ counts anything containing `xml`, `json`, `rss`, `atom` or `text`), and
 matching Lucee's `FormImpl.getInputStream()` — and a streamed upload never had
 the bytes to expose in any case.
 
-> **Not yet done: temp files are never cleaned up.** They accumulate in the
-> system temp directory for the life of the host. Lucee deletes them when the
-> request ends. Deliberately left out of this change rather than bundled into
-> it, because the obvious fix interacts with code that hands `tempFilePath` to
-> a `cfthread` outliving the request.
+> **Not yet done: temp files are never cleaned up** — GH
+> [#386](https://github.com/RustCFML/RustCFML/issues/386). They accumulate in
+> the system temp directory for the life of the host. Deliberately left out of
+> this change rather than bundled into it, because the fix is a design decision
+> rather than a detail: Lucee deletes them when the form scope is released
+> (`FormImpl.release`), but skips that entirely for any request that used
+> `cfthread` (`PageContextImpl.release` only calls `urlForm.release` in its
+> non-`hasFamily` branch), so one thread anywhere in a request leaks its
+> uploads permanently. That hole is the conservative answer to a real hazard —
+> a `cfthread` can outlive its request and may have been handed
+> `tempFilePath` — and our threads have the same shape. The plan in #386 is
+> request-end deletion for requests that spawned no thread, plus an age-based
+> reaper for the rest, which also covers what request-end deletion structurally
+> cannot: crashes, `kill -9`, and files left by a previous run.
 
 ## 8. Environment-specific 🌍
 
