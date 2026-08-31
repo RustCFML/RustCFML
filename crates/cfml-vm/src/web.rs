@@ -97,6 +97,76 @@ pub fn resolve_file(
     None
 }
 
+/// How the host is handing us the request body.
+///
+/// A `multipart/form-data` upload must never be materialised in memory: a host
+/// with a filesystem parses it off the wire and writes each file part straight
+/// to a temp file, so by the time scopes are built there is no body left to
+/// pass — only the form scope it produced. Hosts without a filesystem (wasm,
+/// the Cloudflare worker) still buffer, which is why both shapes exist.
+pub enum RequestBody<'a> {
+    /// The whole body is in memory.
+    Buffered(&'a [u8]),
+    /// A multipart body the host already streamed and parsed; file parts are
+    /// on disk and this is the resulting form scope.
+    StreamedForm(ValueMap),
+}
+
+impl<'a> From<&'a [u8]> for RequestBody<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        RequestBody::Buffered(bytes)
+    }
+}
+
+/// Does this content type name something that should be exposed to CFML as
+/// text rather than as a byte array?
+///
+/// Ported from Lucee's `HTTPUtil.isTextMimeType` so `getHttpRequestData().content`
+/// agrees with the reference engine about which bodies are strings. Lucee's
+/// rule is deliberately loose — anything merely *containing* "xml", "json",
+/// "rss", "atom" or "text" counts, which catches `application/soap+xml`,
+/// `application/vnd.api+json` and friends without enumerating them.
+pub fn is_text_mime_type(mime: &str) -> bool {
+    let m = mime.trim().to_lowercase();
+    m.starts_with("text")
+        || m.starts_with("application/xml")
+        || m.starts_with("application/atom+xml")
+        || m.starts_with("application/xhtml")
+        || m.starts_with("application/json")
+        || m.starts_with("application/cfml")
+        || m.starts_with("message")
+        || m.contains("xml")
+        || m.contains("json")
+        || m.contains("rss")
+        || m.contains("atom")
+        || m.contains("text")
+}
+
+/// Build the `getHttpRequestData().content` value for a non-form request body.
+///
+/// This used to be `String::from_utf8_lossy(body)` for EVERY body regardless of
+/// content type, which was wrong twice over: it cost a second full-size copy of
+/// the body on every request that had one, and for binary input it was a
+/// *lossy* copy — each invalid byte became a 3-byte U+FFFD, so the result could
+/// be three times the size of the body it corrupted, and no caller could
+/// recover the bytes.
+///
+/// Lucee's rule (`ReqRspUtil.getRequestBody`) is the parity target: a body is
+/// binary unless the content type is absent, a text mime type, or
+/// form-urlencoded. A binary body is handed over as `CfmlValue::Binary` so it
+/// survives intact.
+fn request_body_content(content_type: &str, body: &[u8]) -> CfmlValue {
+    if body.is_empty() {
+        return CfmlValue::string(String::new());
+    }
+    let is_binary = !(content_type.is_empty() || is_text_mime_type(content_type));
+    if is_binary {
+        CfmlValue::Binary(body.to_vec())
+    } else {
+        CfmlValue::string(String::from_utf8_lossy(body).to_string())
+    }
+}
+
 /// Build CGI, URL, Form, and Cookie scopes from extracted HTTP request data.
 ///
 /// Returns `(globals, http_request_data)` — globals contains the four scopes
@@ -105,7 +175,7 @@ pub fn resolve_file(
 pub fn build_web_scopes(
     method: &str,
     headers: &[(String, String)],
-    body: &[u8],
+    body: RequestBody<'_>,
     script_name: &str,
     path_info: &str,
     query_string: &str,
@@ -199,20 +269,41 @@ pub fn build_web_scopes(
     let url_scope = parse_query_string(query_string);
     globals.insert("url".to_string(), CfmlValue::strukt(url_scope));
 
-    let raw_body = String::from_utf8_lossy(body).to_string();
-
     // Populate the form scope from a form-encoded request body for ANY method
     // that carries one — PUT, PATCH and DELETE submit forms just like POST
     // (Lucee/ACF key off the content-type, not the method). GET and other
     // bodyless requests fall through to an empty form scope.
-    let form_scope = if content_type.starts_with("application/x-www-form-urlencoded")
-        && !raw_body.is_empty()
-    {
-        parse_query_string(&raw_body)
-    } else if content_type.starts_with("multipart/form-data") {
-        parse_multipart_sync(&content_type, body)
-    } else {
-        ValueMap::default()
+    //
+    // `body_content` is what `getHttpRequestData().content` will expose. It is
+    // NOT simply "the body as a string": see `request_body_content` for the
+    // Lucee rules, and note that a host which streamed a multipart body never
+    // had the bytes to begin with.
+    let (form_scope, body_content) = match body {
+        // The host parsed the multipart body off the wire itself and wrote the
+        // file parts to disk, so nothing was ever materialised in memory.
+        RequestBody::StreamedForm(form) => (form, CfmlValue::string(String::new())),
+        RequestBody::Buffered(bytes) => {
+            if content_type.starts_with("application/x-www-form-urlencoded") {
+                let raw = String::from_utf8_lossy(bytes).to_string();
+                let form = if raw.is_empty() {
+                    ValueMap::default()
+                } else {
+                    parse_query_string(&raw)
+                };
+                (form, CfmlValue::string(raw))
+            } else if content_type.starts_with("multipart/form-data") {
+                // Buffered multipart: the wasm/worker hosts, which have no
+                // filesystem to stream to. `content` stays empty either way —
+                // Lucee's FormImpl.getInputStream() returns an empty stream for
+                // multipart, so nothing downstream can expect the raw envelope.
+                (
+                    parse_multipart_sync(&content_type, bytes),
+                    CfmlValue::string(String::new()),
+                )
+            } else {
+                (ValueMap::default(), request_body_content(&content_type, bytes))
+            }
+        }
     };
     globals.insert("form".to_string(), CfmlValue::strukt(form_scope));
 
@@ -241,7 +332,7 @@ pub fn build_web_scopes(
 
     let mut http_request_data = ValueMap::default();
     http_request_data.insert("headers".to_string(), CfmlValue::strukt(headers_struct));
-    http_request_data.insert("content".to_string(), CfmlValue::string(raw_body));
+    http_request_data.insert("content".to_string(), body_content);
     http_request_data.insert("method".to_string(), CfmlValue::string(method.to_string()));
     http_request_data.insert("protocol".to_string(), CfmlValue::string("HTTP/1.1".to_string()));
 
@@ -454,25 +545,20 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
         }
 
         if let Some(fname) = file_name {
-            let (server_dir, temp_path) = write_multipart_file(&fname, part_body);
+            let client_file = sanitize_upload_filename(&fname);
+            let (server_dir, temp_path, saved) = write_multipart_file(part_body);
 
-            let mut file_info = ValueMap::default();
-            file_info.insert("serverFile".to_string(), CfmlValue::string(fname.clone()));
-            file_info.insert("clientFile".to_string(), CfmlValue::string(fname.clone()));
-            file_info.insert("serverDirectory".to_string(), CfmlValue::string(server_dir));
-            file_info.insert("serverFileName".to_string(), CfmlValue::string(fname.clone()));
-            file_info.insert("tempFilePath".to_string(), CfmlValue::string(temp_path));
-            file_info.insert(
-                "contentType".to_string(),
-                CfmlValue::string(
-                    part_content_type
-                        .unwrap_or_else(|| "application/octet-stream".to_string()),
-                ),
+            form.insert(
+                field_name.to_lowercase(),
+                CfmlValue::strukt(uploaded_file_info(
+                    &client_file,
+                    part_content_type,
+                    server_dir,
+                    temp_path,
+                    part_body.len() as i64,
+                    saved,
+                )),
             );
-            file_info.insert("fileSize".to_string(), CfmlValue::Int(part_body.len() as i64));
-            file_info.insert("fileWasSaved".to_string(), CfmlValue::Bool(true));
-
-            form.insert(field_name.to_lowercase(), CfmlValue::strukt(file_info));
         } else {
             form.insert(
                 field_name.to_lowercase(),
@@ -535,21 +621,102 @@ fn strip_one_trailing_crlf(part: &[u8]) -> &[u8] {
     }
 }
 
+/// Reduce a client-supplied upload filename to a bare, safe basename.
+///
+/// The name in `filename="..."` is attacker-controlled. It used to be
+/// interpolated straight into the temp path (`cfupload_{fname}`), so
+/// `filename="../../etc/thing"` wrote outside the temp directory entirely, and
+/// `cffile action="upload"` still joins this value onto the destination
+/// directory — the same escape one level further on.
+///
+/// Everything up to the last `/` or `\\` is dropped (a browser sends a bare
+/// name; historically IE sent a full Windows path, which ACF/Lucee also strip),
+/// and a name that reduces to nothing, `.` or `..` becomes `upload`.
+pub fn sanitize_upload_filename(raw: &str) -> String {
+    let base = raw
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('\0');
+    if base.is_empty() || base == "." || base == ".." {
+        return "upload".to_string();
+    }
+    base.to_string()
+}
+
+/// Build the `form.<field>` struct describing one uploaded file.
+///
+/// Shared by the buffered parser here and the CLI's streaming one so the two
+/// cannot drift in what they expose to CFML.
+pub fn uploaded_file_info(
+    client_file: &str,
+    part_content_type: Option<String>,
+    server_dir: String,
+    temp_path: String,
+    file_size: i64,
+    file_was_saved: bool,
+) -> ValueMap {
+    let mut file_info = ValueMap::default();
+    file_info.insert("serverFile".to_string(), CfmlValue::string(client_file.to_string()));
+    file_info.insert("clientFile".to_string(), CfmlValue::string(client_file.to_string()));
+    file_info.insert("serverDirectory".to_string(), CfmlValue::string(server_dir));
+    file_info.insert("serverFileName".to_string(), CfmlValue::string(client_file.to_string()));
+    file_info.insert("tempFilePath".to_string(), CfmlValue::string(temp_path));
+    file_info.insert(
+        "contentType".to_string(),
+        CfmlValue::string(
+            part_content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        ),
+    );
+    file_info.insert("fileSize".to_string(), CfmlValue::Int(file_size));
+    // Honest, rather than hardcoded: a temp file the host could not create or
+    // could not finish writing must not claim it was saved, or the receiving
+    // template will happily move a truncated file into place.
+    file_info.insert("fileWasSaved".to_string(), CfmlValue::Bool(file_was_saved));
+    file_info
+}
+
+/// Reserve a temp path for one uploaded file part.
+///
+/// The name is derived from the process id and a counter, never from the
+/// client-supplied filename: two concurrent requests both uploading
+/// `avatar.png` used to be handed the same `cfupload_avatar.png` and clobber
+/// each other's data. Lucee does the same thing (`tmp-<counter>.upload`); the
+/// original name is preserved as metadata in `uploaded_file_info` instead.
 #[cfg(not(target_arch = "wasm32"))]
-fn write_multipart_file(fname: &str, bytes: &[u8]) -> (String, String) {
+pub fn next_upload_temp_path() -> (std::path::PathBuf, String, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let temp_dir = std::env::temp_dir();
-    let temp_path = temp_dir.join(format!("cfupload_{}", fname));
-    let _ = std::fs::write(&temp_path, bytes);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = temp_dir.join(format!("cfupload_{}_{}.upload", std::process::id(), n));
     (
+        temp_path.clone(),
         temp_dir.to_string_lossy().to_string(),
         temp_path.to_string_lossy().to_string(),
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn write_multipart_file(bytes: &[u8]) -> (String, String, bool) {
+    let (path, server_dir, temp_path) = next_upload_temp_path();
+    let saved = match std::fs::write(&path, bytes) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("upload: could not write temp file {}: {e}", path.display());
+            false
+        }
+    };
+    (server_dir, temp_path, saved)
+}
+
 #[cfg(target_arch = "wasm32")]
-fn write_multipart_file(_fname: &str, _bytes: &[u8]) -> (String, String) {
-    // No filesystem on Workers — surface metadata only.
-    (String::new(), String::new())
+fn write_multipart_file(_bytes: &[u8]) -> (String, String, bool) {
+    // No filesystem on Workers — surface metadata only, and say so rather than
+    // claiming a file was saved.
+    (String::new(), String::new(), false)
 }
 
 #[cfg(test)]
@@ -679,6 +846,209 @@ mod tests {
         let written = std::fs::read(&temp_path).expect("temp file should exist");
         let _ = std::fs::remove_file(&temp_path);
         assert_eq!(written, file_bytes, "uploaded bytes must be preserved exactly");
+    }
+
+    #[test]
+    fn upload_temp_path_never_contains_the_client_filename() {
+        // Security regression: the temp path used to be
+        // `cfupload_{client filename}`, interpolated with no sanitising at all,
+        // so `filename="../../evil"` wrote outside the temp directory. It also
+        // meant two concurrent uploads of `avatar.png` shared one path and
+        // silently clobbered each other.
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"f\"; filename=\"../../../etc/evil.txt\"\r\n\r\n",
+        );
+        body.extend_from_slice(b"payload");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let form = parse_multipart_sync(&ct, &body);
+        let file = match form.get("f") {
+            Some(CfmlValue::Struct(s)) => s,
+            other => panic!("expected file struct, got {:?}", other),
+        };
+        let temp_path = match file.get("tempFilePath") {
+            Some(CfmlValue::String(p)) => p.to_string(),
+            other => panic!("expected tempFilePath, got {:?}", other),
+        };
+        let _ = std::fs::remove_file(&temp_path);
+
+        let temp_dir = std::env::temp_dir();
+        let parent = std::path::Path::new(&temp_path)
+            .parent()
+            .expect("temp path has a parent");
+        assert_eq!(
+            parent, temp_dir,
+            "the upload must land directly in the temp dir, not somewhere a \
+             client-supplied path walked to: {temp_path}"
+        );
+        assert!(
+            !temp_path.contains("evil") && !temp_path.contains(".."),
+            "the temp path must carry NOTHING from the client filename: {temp_path}"
+        );
+
+        // The original name still reaches CFML as metadata, reduced to a bare
+        // basename so `cffile action="upload"` cannot be walked out of its
+        // destination directory either.
+        match file.get("clientFile") {
+            Some(CfmlValue::String(name)) => assert_eq!(&name.to_string(), "evil.txt"),
+            other => panic!("expected clientFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn two_uploads_of_the_same_name_get_distinct_temp_paths() {
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let one = |()| -> String {
+            let mut body: Vec<u8> = Vec::new();
+            body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+            body.extend_from_slice(
+                b"Content-Disposition: form-data; name=\"f\"; filename=\"avatar.png\"\r\n\r\n",
+            );
+            body.extend_from_slice(b"data");
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+            let form = parse_multipart_sync(&ct, &body);
+            match form.get("f") {
+                Some(CfmlValue::Struct(s)) => match s.get("tempFilePath") {
+                    Some(CfmlValue::String(p)) => p.to_string(),
+                    other => panic!("expected tempFilePath, got {:?}", other),
+                },
+                other => panic!("expected file struct, got {:?}", other),
+            }
+        };
+        let a = one(());
+        let b = one(());
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        assert_ne!(a, b, "concurrent uploads of one filename must not share a temp path");
+    }
+
+    #[test]
+    fn sanitize_upload_filename_reduces_to_a_bare_basename() {
+        assert_eq!(sanitize_upload_filename("photo.png"), "photo.png");
+        assert_eq!(sanitize_upload_filename("../../etc/passwd"), "passwd");
+        // Historic IE behaviour: the whole client-side path.
+        assert_eq!(sanitize_upload_filename("C:\\Users\\bob\\photo.png"), "photo.png");
+        assert_eq!(sanitize_upload_filename(".."), "upload");
+        assert_eq!(sanitize_upload_filename(""), "upload");
+        assert_eq!(sanitize_upload_filename("/"), "upload");
+    }
+
+    #[test]
+    fn binary_request_body_is_exposed_as_binary_not_a_lossy_string() {
+        // `getHttpRequestData().content` used to be
+        // `String::from_utf8_lossy(body)` for EVERY content type, so a binary
+        // POST came back as replacement characters — unrecoverable, and up to
+        // 3x the size of the body it corrupted.
+        let bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0xFF, 0xC0];
+        let (_globals, data) = build_web_scopes(
+            "POST",
+            &h(&[("content-type", "application/octet-stream")]),
+            RequestBody::Buffered(bytes),
+            "/x.cfm",
+            "",
+            "",
+            80,
+            "127.0.0.1",
+        );
+        let content = match &data {
+            CfmlValue::Struct(s) => s.get("content"),
+            other => panic!("expected struct, got {:?}", other),
+        };
+        match content {
+            Some(CfmlValue::Binary(b)) => assert_eq!(b, bytes),
+            other => panic!("a binary body must arrive as Binary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn text_request_body_is_still_a_string() {
+        // Lucee's rule (ReqRspUtil.getRequestBody): no content type, a text mime
+        // type, or form-urlencoded means a string; anything else is binary.
+        for ct in ["application/json", "text/plain", "application/soap+xml", ""] {
+            let (_globals, data) = build_web_scopes(
+                "POST",
+                &h(&[("content-type", ct)]),
+                RequestBody::Buffered(b"{\"a\":1}"),
+                "/x.cfm",
+                "",
+                "",
+                80,
+                "127.0.0.1",
+            );
+            let content = match &data {
+                CfmlValue::Struct(s) => s.get("content"),
+                other => panic!("expected struct, got {:?}", other),
+            };
+            match content {
+                Some(CfmlValue::String(sv)) => {
+                    assert_eq!(sv.to_string(), "{\"a\":1}", "content-type {ct:?}")
+                }
+                other => panic!("content-type {ct:?} should be text, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_body_exposes_no_raw_content() {
+        // Lucee's FormImpl.getInputStream() returns an empty stream for
+        // multipart, so nothing may depend on the raw envelope — and a streamed
+        // upload never had the bytes to expose in the first place.
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"greeting\"\r\n\r\n");
+        body.extend_from_slice(b"hello");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let (_globals, data) = build_web_scopes(
+            "POST",
+            &h(&[("content-type", &ct)]),
+            RequestBody::Buffered(&body),
+            "/x.cfm",
+            "",
+            "",
+            80,
+            "127.0.0.1",
+        );
+        match &data {
+            CfmlValue::Struct(s) => match s.get("content") {
+                Some(CfmlValue::String(sv)) => assert_eq!(sv.to_string(), ""),
+                other => panic!("expected empty content, got {:?}", other),
+            },
+            other => panic!("expected struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn streamed_form_becomes_the_form_scope_verbatim() {
+        let mut form = ValueMap::default();
+        form.insert("uuid".to_string(), CfmlValue::string("abc".to_string()));
+        let (globals, _data) = build_web_scopes(
+            "POST",
+            &h(&[("content-type", "multipart/form-data; boundary=x")]),
+            RequestBody::StreamedForm(form),
+            "/x.cfm",
+            "",
+            "",
+            80,
+            "127.0.0.1",
+        );
+        match globals.get("form") {
+            Some(CfmlValue::Struct(s)) => match s.get("uuid") {
+                Some(CfmlValue::String(v)) => assert_eq!(v.to_string(), "abc"),
+                other => panic!("expected uuid, got {:?}", other),
+            },
+            other => panic!("expected form struct, got {:?}", other),
+        }
     }
 
     #[test]

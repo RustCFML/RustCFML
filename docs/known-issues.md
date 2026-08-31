@@ -1633,6 +1633,52 @@ Restrictions that apply only on a particular target (wasm, CLI vs serve).
 
 <a id="8"></a>
 
+## 74. Form file uploads stream to disk — RESOLVED in v0.647.0 *(GH [#384](https://github.com/RustCFML/RustCFML/issues/384), [#385](https://github.com/RustCFML/RustCFML/issues/385))*
+
+A `multipart/form-data` upload is parsed off the wire and each file part is
+written straight to its own temp file. Nothing about the CFML surface changed —
+`form.<field>.tempFilePath` and `cffile action="upload"` work as before — but
+three things behind it did, and all three are worth knowing.
+
+**The body is no longer buffered.** It used to be read whole by
+`axum::body::to_bytes` before the handler ran, then split, then written to
+disk: three copies of every uploaded byte, with the peak charged per concurrent
+request. Measured on a 300MB upload: peak RSS growth 745MB → 3.1MB, and flat
+from 300MB to 900MB. `server.maxRequestBodySize` is still enforced (413 on the
+way past it) but is now a policy limit rather than a per-request memory
+reservation. Hosts with no filesystem — the Cloudflare worker, wasm — still
+buffer, which is what `web::RequestBody` distinguishes; Lucee streams the same
+way (`FormImpl.initializeMultiPart` → `FileItemIterator` → `IOUtil.copy`).
+
+**The temp filename no longer comes from the client.** It was
+`cfupload_{filename}` interpolated with no sanitising at all, which was two bugs
+in one string: `filename="../../etc/thing"` wrote outside the temp directory,
+and two concurrent uploads of `avatar.png` shared one path and clobbered each
+other. Temp files are now `cfupload_<pid>_<counter>.upload` — nothing
+client-derived — and the original name reaches CFML as `clientFile`/`serverFile`
+reduced to a bare basename. That last part matters beyond the temp directory:
+`cffile action="upload"` joins `clientFile` onto its destination, so an
+unsanitised name escaped *that* directory too. Lucee names its temp files
+`tmp-<counter>.upload` for the same reason.
+
+**`getHttpRequestData().content` follows Lucee's rule now.** It used to be
+`String::from_utf8_lossy(body)` for every request that had a body, whatever the
+content type — a second full-size copy, and for binary input a *lossy* one, so
+each invalid byte became a 3-byte U+FFFD and the value could be larger than the
+body it had already corrupted beyond recovery. Per
+`ReqRspUtil.getRequestBody`, a body is now text when the content type is
+absent, form-urlencoded, or a text mime type (`HTTPUtil.isTextMimeType`, which
+counts anything containing `xml`, `json`, `rss`, `atom` or `text`), and
+`CfmlValue::Binary` otherwise. A multipart request exposes an empty `content`,
+matching Lucee's `FormImpl.getInputStream()` — and a streamed upload never had
+the bytes to expose in any case.
+
+> **Not yet done: temp files are never cleaned up.** They accumulate in the
+> system temp directory for the life of the host. Lucee deletes them when the
+> request ends. Deliberately left out of this change rather than bundled into
+> it, because the obvious fix interacts with code that hands `tempFilePath` to
+> a `cfthread` outliving the request.
+
 ## 8. Environment-specific 🌍
 
 | Feature | Restriction |

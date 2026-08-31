@@ -2512,6 +2512,147 @@ fn body_read_error_is_length_limit(err: &axum::Error) -> bool {
     false
 }
 
+/// Parse a `multipart/form-data` body straight off the wire, writing each file
+/// part to its own temp file as the bytes arrive.
+///
+/// Peak memory is one copy buffer plus the non-file form fields, whatever the
+/// upload size — the body is never assembled. `limit` is
+/// `server.maxRequestBodySize` applied to the whole stream, so an over-limit
+/// upload still fails with the same 413 it did when the body was buffered, but
+/// without allocating the limit first.
+async fn stream_multipart_form(
+    body: axum::body::Body,
+    content_type: &str,
+    limit: usize,
+) -> Result<cfml_common::dynamic::ValueMap, multer::Error> {
+    use cfml_common::dynamic::{CfmlValue, ValueMap};
+    use tokio::io::AsyncWriteExt;
+
+    let boundary = multer::parse_boundary(content_type)?;
+    let constraints = if limit == usize::MAX {
+        multer::Constraints::new()
+    } else {
+        multer::Constraints::new()
+            .size_limit(multer::SizeLimit::new().whole_stream(limit as u64))
+    };
+    let mut multipart =
+        multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
+
+    let mut form = ValueMap::default();
+    while let Some(mut field) = multipart.next_field().await? {
+        let field_name = match field.name() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if field_name.is_empty() {
+            continue;
+        }
+        let file_name = field.file_name().map(|f| f.to_string());
+        let part_content_type = field.content_type().map(|m| m.to_string());
+
+        match file_name {
+            Some(raw_name) => {
+                let client_file = cfml_vm::web::sanitize_upload_filename(&raw_name);
+                let (path, server_dir, temp_path) = cfml_vm::web::next_upload_temp_path();
+                let mut file = match tokio::fs::File::create(&path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::error!(
+                            "upload: could not create temp file {}: {e}",
+                            path.display()
+                        );
+                        // Drain the rest of this part so the stream stays in
+                        // sync, then skip the field rather than aborting the
+                        // whole request.
+                        while field.chunk().await?.is_some() {}
+                        continue;
+                    }
+                };
+                let mut written: i64 = 0;
+                let mut saved = true;
+                while let Some(chunk) = field.chunk().await? {
+                    if let Err(e) = file.write_all(&chunk).await {
+                        log::error!("upload: write to {} failed: {e}", path.display());
+                        saved = false;
+                        break;
+                    }
+                    written += chunk.len() as i64;
+                }
+                if let Err(e) = file.flush().await {
+                    log::error!("upload: flush of {} failed: {e}", path.display());
+                    saved = false;
+                }
+                drop(file);
+
+                form.insert(
+                    field_name.to_lowercase(),
+                    CfmlValue::strukt(cfml_vm::web::uploaded_file_info(
+                        &client_file,
+                        part_content_type,
+                        server_dir,
+                        temp_path,
+                        written,
+                        saved,
+                    )),
+                );
+            }
+            None => {
+                // Plain form fields are small by construction and are the whole
+                // point of the form scope, so these DO stay in memory — Lucee
+                // reads them the same way (`IOUtil.toBytes` per field).
+                let text = field.text().await?;
+                form.insert(field_name.to_lowercase(), CfmlValue::string(text));
+            }
+        }
+    }
+
+    Ok(form)
+}
+
+/// Turn a streaming-multipart failure into the same 413/400 split the buffered
+/// path produces.
+///
+/// The distinction matters as much here as it did for `to_bytes`: a client that
+/// aborted mid-upload must not be told it exceeded a limit it never approached.
+fn multipart_error_response(
+    err: multer::Error,
+    method: &str,
+    url: &str,
+    declared: &str,
+    configured_limit: u64,
+) -> axum::response::Response {
+    let over_limit = matches!(
+        err,
+        multer::Error::StreamSizeExceeded { .. } | multer::Error::FieldSizeExceeded { .. }
+    );
+    if over_limit {
+        log::error!(
+            "413 {method} {url}: request body exceeds server.maxRequestBodySize \
+             ({configured_limit} bytes); declared content-length {declared}: {err}"
+        );
+        return axum::response::Response::builder()
+            .status(413)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(format!(
+                "Request body too large. The server limit is {configured_limit} bytes \
+                 (server.maxRequestBodySize in cfconfig; 0 = unlimited)."
+            )))
+            .unwrap();
+    }
+    log::error!(
+        "400 {method} {url}: could not read the multipart request body \
+         (declared content-length {declared}, server.maxRequestBodySize {configured_limit} bytes \
+         was NOT reached): {err}"
+    );
+    axum::response::Response::builder()
+        .status(400)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from(format!(
+            "Could not read the request body: {err}"
+        )))
+        .unwrap()
+}
+
 async fn handle_request_inner(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -2533,6 +2674,50 @@ async fn handle_request_inner(
         0 => usize::MAX,
         n => n as usize,
     };
+
+    // A `multipart/form-data` body is parsed off the wire and its file parts
+    // written straight to temp files, so it is NEVER materialised in memory.
+    // Buffering it cost the full upload size in resident memory per concurrent
+    // request before the template ran (and, with the old lossy `content` copy,
+    // rather more than that) — a 200 MB default limit was effectively a 200 MB
+    // per-request allocation permit. Lucee streams the same upload
+    // (`FormImpl.initializeMultiPart` -> `FileItemIterator` -> `IOUtil.copy`).
+    let multipart_ct = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        })
+        .map(|ct| ct.to_string());
+
+    let mut streamed_form: Option<cfml_common::dynamic::ValueMap> = None;
+    let mut body = body;
+    if let Some(ct) = multipart_ct {
+        match stream_multipart_form(body, &ct, body_limit).await {
+            Ok(form) => {
+                streamed_form = Some(form);
+                body = axum::body::Body::empty();
+            }
+            Err(e) => {
+                let declared = parts
+                    .headers
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown")
+                    .to_string();
+                return multipart_error_response(
+                    e,
+                    &method,
+                    &url,
+                    &declared,
+                    state.cfconfig.server.max_request_body_size,
+                );
+            }
+        }
+    }
     // An over-limit body MUST fail loudly with 413. This previously used
     // `.unwrap_or_default()`, which silently substituted an EMPTY body: the
     // request then ran with no form scope at all (not just a missing file), so
@@ -2821,7 +3006,7 @@ async fn handle_request_inner(
 
             // Build web scopes using resolved script_name and path_info
             let (extra_globals, http_request_data) = build_web_scopes(
-                &method, &headers, &body_bytes, &rf.script_name, &rf.path_info, &query_string, state.port, &remote_addr,
+                &method, &headers, &mut streamed_form, &body_bytes, &rf.script_name, &rf.path_info, &query_string, state.port, &remote_addr,
             );
 
             let file_path = rf.file_path.to_string_lossy().to_string();
@@ -2964,7 +3149,7 @@ async fn handle_request_inner(
                 let target_page = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
 
                 let (extra_globals, http_request_data) = build_web_scopes(
-                    &method, &headers, &body_bytes, &target_page, "", &query_string, state.port, &remote_addr,
+                    &method, &headers, &mut streamed_form, &body_bytes, &target_page, "", &query_string, state.port, &remote_addr,
                 );
 
                 let existing_sid: Option<String> = {
@@ -3121,13 +3306,22 @@ use cfml_vm::web::{ResolvedFile, resolve_file};
 fn build_web_scopes(
     method: &str,
     headers: &[(String, String)],
-    body: &[u8],
+    streamed_form: &mut Option<ValueMap>,
+    body_bytes: &[u8],
     script_name: &str,
     path_info: &str,
     query_string: &str,
     port: u16,
     remote_addr: &str,
 ) -> (ValueMap, CfmlValue) {
+    // A streamed multipart upload has no body left to pass — its file parts are
+    // already on disk and `streamed_form` is what the parse produced. Taking it
+    // here (rather than at the callsites) keeps the two serve-handler branches,
+    // only one of which ever runs, from having to move the same value.
+    let body = match streamed_form.take() {
+        Some(form) => cfml_vm::web::RequestBody::StreamedForm(form),
+        None => cfml_vm::web::RequestBody::Buffered(body_bytes),
+    };
     cfml_vm::web::build_web_scopes(
         method, headers, body, script_name, path_info, query_string, port, remote_addr,
     )
