@@ -7191,8 +7191,20 @@ impl CfmlVirtualMachine {
         // falls through to the interpreter unchanged. `func`/`args` are the
         // caller's, not borrowed from `self.jit`, so there is no borrow conflict;
         // with the feature off the whole block compiles away. See `jit/mod.rs`.
+        // §29 — a declared parameter type is enforced by the binding prologue
+        // below, which a JIT-compiled body never runs. Validate here, BEFORE
+        // the compiled body can execute (a type violation must throw instead of
+        // running the function), and record it so the prologue does not repeat
+        // the work when the JIT declines the call. Costs nothing for a function
+        // that declares no parameter types, which is the common case.
+        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+        let mut param_types_checked = false;
         #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
         {
+            if self.jit.is_some() && func.param_types.iter().any(|t| t.is_some()) {
+                self.check_declared_param_types(func, &args)?;
+                param_types_checked = true;
+            }
             // The shadowing guard makes sure a user-defined function or
             // global with the same name as an allowlisted builtin (e.g.
             // `function abs(x) { … }`) wins over the JIT's native call. We
@@ -7722,8 +7734,14 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                        _p4_typechecks += 1;
-                        self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                        let already = param_types_checked;
+                        #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
+                        let already = false;
+                        if !already {
+                            _p4_typechecks += 1;
+                            self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                        }
                     }
                     _p4_supplied += 1;
                     locals.insert(param_keys[i].clone(), value.clone());
@@ -23059,6 +23077,39 @@ impl CfmlVirtualMachine {
             type_check::value_label(value, &Self::component_type_label),
             declared.trim()
         ))))
+    }
+
+    /// §29 — validate every supplied argument against its declared parameter
+    /// type, in parameter order.
+    ///
+    /// Extracted so the interpreter's binding prologue and the JIT dispatch
+    /// path cannot drift. They did: a JIT-compiled body is the function's
+    /// BODY, and it is entered without the prologue that performs this check,
+    /// so `function f( numeric n )` silently accepted `"1,000"`, `"0x10"`,
+    /// `[]` and `{}` for as long as the compiled body served the call. The
+    /// declared RETURN type never had this hole — it is enforced in the call
+    /// wrapper (`execute_function_with_args`), which the JIT path still
+    /// returns through.
+    ///
+    /// `Null` is "not supplied" in CFML and is never checked, matching the
+    /// prologue: an omitted optional argument is simply absent.
+    fn check_declared_param_types(
+        &mut self,
+        func: &BytecodeFunction,
+        args: &[CfmlValue],
+    ) -> Result<(), CfmlError> {
+        for (i, param_name) in func.params.iter().enumerate() {
+            let Some(Some(ptype)) = func.param_types.get(i) else {
+                continue;
+            };
+            match args.get(i) {
+                Some(value) if !matches!(value, CfmlValue::Null) => {
+                    self.check_declared_param_type(func, i, param_name, ptype, value)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// §29 — enforce a declared RETURN type, on the way out of a call.
