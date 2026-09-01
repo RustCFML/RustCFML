@@ -17,6 +17,46 @@ pub struct VfsDirEntry {
     pub is_dir: bool,
 }
 
+/// A streaming line reader over one file.
+///
+/// Exists so `loop file=` can bound its memory to a single line instead of
+/// materialising the whole file (GH #367): the reporter's files run to over a
+/// million rows, and the eager path cost file-size + one `String` per line
+/// *before the first iteration* — strictly worse than the `fileRead()` +
+/// `listToArray()` workaround the construct is supposed to replace.
+///
+/// Line semantics match the eager path exactly (`str::lines`): the terminator
+/// is stripped, `\r\n` and `\n` both end a line, a trailing newline does NOT
+/// yield a final empty line, and interior blank lines ARE yielded so line
+/// numbers stay accurate.
+pub trait VfsLines: Send {
+    /// The next line, or `None` at end of file.
+    fn next_line(&mut self) -> io::Result<Option<String>>;
+}
+
+/// Eager fallback: the whole file split up-front, handed back one line at a time.
+///
+/// The default for VFS implementations that have nothing to stream *from* — an
+/// embedded archive is already resident in memory, so a "streaming" read of it
+/// would save nothing. Callers get the same values either way; only the peak
+/// memory differs, and for those implementations it cannot be improved.
+pub struct EagerLines {
+    lines: std::vec::IntoIter<String>,
+}
+
+impl EagerLines {
+    pub fn new(content: &str) -> Self {
+        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        EagerLines { lines: lines.into_iter() }
+    }
+}
+
+impl VfsLines for EagerLines {
+    fn next_line(&mut self) -> io::Result<Option<String>> {
+        Ok(self.lines.next())
+    }
+}
+
 /// Virtual filesystem trait — abstracts source file I/O so the VM can read
 /// from disk or from an embedded archive.
 pub trait Vfs: Send + Sync {
@@ -30,6 +70,18 @@ pub trait Vfs: Send + Sync {
     fn modified(&self, path: &str) -> io::Result<SystemTime>;
     /// Canonicalize a path (resolve symlinks, make absolute).
     fn canonicalize(&self, path: &str) -> io::Result<String>;
+
+    /// Open a file for line-by-line streaming (see [`VfsLines`]).
+    ///
+    /// Defaults to reading the file whole and iterating the result, which is
+    /// correct for every implementation and optimal for the in-memory ones.
+    /// [`RealFs`] overrides it with a buffered reader so a large file on disk
+    /// costs one line of resident memory rather than its whole size.
+    /// Delegating implementations must forward this, or they silently drop
+    /// back to the eager path for the files that most need streaming.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+        Ok(Box::new(EagerLines::new(&self.read_to_string(path)?)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +242,24 @@ impl Vfs for RealFs {
         }
     }
 
+    /// Buffered, one line resident at a time — this is the whole point of
+    /// [`Vfs::open_lines`]. `BufRead::lines` strips the terminator and a
+    /// preceding `\r` exactly as `str::lines` does, so the values are
+    /// identical to the eager path's.
+    ///
+    /// One deliberate divergence from the eager path: invalid UTF-8 surfaces
+    /// when the loop reaches the offending line rather than before the first
+    /// iteration, because nothing reads ahead of the cursor. That is what
+    /// Lucee's buffered reader does too, and it is inherent to streaming — the
+    /// alternative is to scan the whole file first, which is the cost being
+    /// removed.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+        let file = std::fs::File::open(path)?;
+        Ok(Box::new(BufReaderLines {
+            lines: io::BufRead::lines(io::BufReader::new(file)),
+        }))
+    }
+
     fn canonicalize(&self, path: &str) -> io::Result<String> {
         match std::fs::canonicalize(path) {
             Ok(p) => Ok(p.to_string_lossy().to_string()),
@@ -298,6 +368,17 @@ impl EmbeddedFs {
             }
         }
         parts.join("/")
+    }
+}
+
+/// [`RealFs`]'s streaming reader — a `BufReader` over the open file.
+struct BufReaderLines {
+    lines: io::Lines<io::BufReader<std::fs::File>>,
+}
+
+impl VfsLines for BufReaderLines {
+    fn next_line(&mut self) -> io::Result<Option<String>> {
+        self.lines.next().transpose()
     }
 }
 
@@ -429,6 +510,14 @@ impl Vfs for FallbackFs {
         let result = self.embedded.read_to_string(path);
         if result.is_ok() || self.sandbox { return result; }
         self.real.read_to_string(path)
+    }
+    /// Forwarded, not defaulted — the whole point of a `--build` binary reading
+    /// a large data file off disk is that it streams. Resolution order mirrors
+    /// `read_to_string`: embedded first, then the real FS unless sandboxed.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+        let result = self.embedded.open_lines(path);
+        if result.is_ok() || self.sandbox { return result; }
+        self.real.open_lines(path)
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         let result = self.embedded.read(path);
@@ -801,4 +890,25 @@ mod tests {
         assert!(!folded.contains("testDir"), "must not keep requested case: {folded}");
     }
 
+}
+
+/// The system temp directory WITH a trailing separator, which is what Lucee and
+/// Adobe CF both return from `getTempDirectory()`.
+///
+/// `std::env::temp_dir()` trails on macOS (TMPDIR happens to) but not on Linux,
+/// where a bare `/tmp` turned the ubiquitous `getTempDirectory() & name` join
+/// into `/tmpname` — a path at the filesystem ROOT — so every following
+/// directoryCreate/fileWrite failed with a permission error (GH #380). That
+/// platform difference is exactly why it went unseen in local development.
+///
+/// Lives here rather than in `cfml-stdlib` because the VM's sandbox intercept
+/// needs it too, and `cfml-stdlib` is an OPTIONAL dependency of `cfml-vm`
+/// (feature `s3`) — calling into it unconditionally builds only when that
+/// feature happens to be on.
+pub fn temp_dir_with_separator() -> String {
+    let mut dir = std::env::temp_dir().to_string_lossy().to_string();
+    if !dir.ends_with(std::path::MAIN_SEPARATOR) && !dir.ends_with('/') {
+        dir.push(std::path::MAIN_SEPARATOR);
+    }
+    dir
 }

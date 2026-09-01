@@ -290,9 +290,24 @@ struct MethodAgg {
 }
 
 /// Aggregate template hits into `pages` rows, optionally leading with the main
-/// page (recorded with the total request time). The main page is listed first,
-/// then each included template in encounter order — matching Lucee's habit of
-/// showing the requested page plus every `<cfinclude>`/render below it.
+/// page. The main page is listed first, then each included template in encounter
+/// order — matching Lucee's habit of showing the requested page plus every
+/// `<cfinclude>`/render below it.
+///
+/// The main page's time is the request total MINUS every recorded frame, not the
+/// total itself. Only includes, component methods and custom tags open a timed
+/// frame; the top-level page never does, so it has no self-time of its own to
+/// report. Since every recorded hit carries EXCLUSIVE (self) time, the hits
+/// partition the request between frames and the residual is exactly what the
+/// top-level page spent in its own body.
+///
+/// Booking the full `total_us` here instead — which is what this did — put the
+/// whole request into the first row of a self-time table: the column no longer
+/// summed to anything (every frame below was counted twice, once in its own row
+/// and once inside the main page's), the requested page always sorted to the top
+/// of "total ms" however little work it actually did, and there was no way to see
+/// the page's own cost. The request total is still reported on its own, in the
+/// summary line above this table.
 fn aggregate_pages_with_main(
     templates: &[TemplateHit],
     main_page: Option<&str>,
@@ -300,10 +315,14 @@ fn aggregate_pages_with_main(
 ) -> Vec<PageAgg> {
     let mut hits: Vec<TemplateHit> = Vec::new();
     if let Some(p) = main_page {
+        // Template hits are never clipped (unlike queries, which have
+        // `max_records`), so this subtraction can't silently over-credit the
+        // page. `max(0)` guards only against per-frame microsecond truncation.
+        let frames_us: i64 = templates.iter().map(|t| t.time).sum();
         hits.push(TemplateHit {
             path: p.to_string(),
             method: String::new(),
-            time: total_us,
+            time: (total_us - frames_us).max(0),
         });
     }
     hits.extend_from_slice(templates);
@@ -1234,6 +1253,38 @@ mod tests {
         });
         c.add_generic("Wheels", "controller", "users");
         c
+    }
+
+    #[test]
+    fn main_page_row_is_self_time_not_the_request_total() {
+        // Four frames totalling 6,500us of self time inside a 10,000us request.
+        let hits = vec![
+            TemplateHit { path: "/header.cfm".into(), method: String::new(), time: 2_000 },
+            TemplateHit { path: "/svc.cfc".into(), method: "a".into(), time: 1_000 },
+            TemplateHit { path: "/svc.cfc".into(), method: "b".into(), time: 3_000 },
+            TemplateHit { path: "/svc.cfc".into(), method: "c".into(), time: 500 },
+        ];
+        let pages = aggregate_pages_with_main(&hits, Some("/index.cfm"), 10_000);
+
+        // The requested page reports what it spent in its OWN body, not the
+        // request total — booking the total here double-counted every frame
+        // below it and pinned the page to the top of the "total ms" sort.
+        let main = pages.iter().find(|p| p.id == "/index.cfm").unwrap();
+        assert_eq!(main.total, 3_500, "10,000us request - 6,500us of frames");
+
+        // With that, the column is a genuine partition: the rows sum to the
+        // request total exactly once.
+        assert_eq!(pages.iter().map(|p| p.total).sum::<i64>(), 10_000);
+
+        // Frames still report their own self time, untouched.
+        let svc = pages.iter().find(|p| p.id == "/svc.cfc").unwrap();
+        assert_eq!(svc.total, 4_500);
+        assert_eq!(svc.count, 3);
+
+        // A page that did all its work inside frames reports zero rather than
+        // going negative on per-frame microsecond truncation.
+        let all_in_frames = aggregate_pages_with_main(&hits, Some("/index.cfm"), 6_000);
+        assert_eq!(all_in_frames.iter().find(|p| p.id == "/index.cfm").unwrap().total, 0);
     }
 
     #[test]

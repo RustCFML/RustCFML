@@ -1272,6 +1272,7 @@ mod tests {
             args_needed: Default::default(),
             args_never_escapes: Default::default(),
             params_marker: Default::default(),
+            cfc_body: Default::default(),
             required_params: params.iter().map(|_| true).collect(),
             has_default: params.iter().map(|_| false).collect(),
             instructions: instrs,

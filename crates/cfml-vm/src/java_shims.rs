@@ -346,6 +346,67 @@ pub fn handle_java_bcrypt(
     Ok(CfmlValue::strukt(shim))
 }
 
+/// `org.owasp.esapi.reference.DefaultSecurityConfiguration` — OWASP ESAPI's
+/// default SecurityConfiguration implementation. On Lucee this class exists
+/// only because ESAPI ships in the servlet container; application code reaches
+/// for it to *name* it, not to use it. Preside's saml2-sso extension does
+/// exactly that at config time:
+///
+/// ```cfml
+/// var defaultVal = CreateObject( "java", "org.owasp.esapi.reference.DefaultSecurityConfiguration" )
+///                    .getClass().getName();
+/// System.setProperty( "org.owasp.esapi.SecurityConfiguration", defaultVal );
+/// ```
+///
+/// So the shim is deliberately narrow: it constructs, answers the class-name
+/// reflection calls, and throws a clear error on every genuine ESAPI method
+/// (RustCFML has no JVM and no ESAPI runtime). ESAPI's *encoding* surface is
+/// already native — see the `encodeFor*` / `esapiEncode` BIFs.
+pub const ESAPI_SECURITY_CONFIG_CLASS: &str =
+    "org.owasp.esapi.reference.defaultsecurityconfiguration";
+
+/// The canonical (cased) class name the shim reports from getName()/toString().
+const ESAPI_SECURITY_CONFIG_NAME: &str =
+    "org.owasp.esapi.reference.DefaultSecurityConfiguration";
+
+pub fn handle_esapi_security_config(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string(ESAPI_SECURITY_CONFIG_CLASS.to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert(
+                "__class_name".to_string(),
+                CfmlValue::string(ESAPI_SECURITY_CONFIG_NAME.to_string()),
+            );
+            Ok(CfmlValue::strukt(shim))
+        }
+        // DefaultSecurityConfiguration.getInstance() — the singleton accessor.
+        // The receiver already is that singleton.
+        "getinstance" => Ok(object.clone()),
+        // Reflection surface: the only thing callers actually want.
+        "getclass" => Ok(make_class_shim(ESAPI_SECURITY_CONFIG_NAME)),
+        "getname" | "getcanonicalname" | "gettypename" => {
+            Ok(CfmlValue::string(ESAPI_SECURITY_CONFIG_NAME.to_string()))
+        }
+        "tostring" => Ok(CfmlValue::string(ESAPI_SECURITY_CONFIG_NAME.to_string())),
+        _ => Err(CfmlError::runtime(format!(
+            "{}.{}() is not supported: RustCFML has no JVM and no ESAPI runtime. \
+             This class is shimmed only so class-name reflection \
+             (getClass().getName()) works; ESAPI's encoding surface is available \
+             natively via the encodeFor*() / esapiEncode() functions.",
+            ESAPI_SECURITY_CONFIG_NAME, method
+        ))),
+    }
+}
+
 /// `org.yaml.snakeyaml.Yaml` construction. Returns a marker shim; the `load`
 /// method is routed (VM-side) to the native `yamlDeserialize` builtin. The jar
 /// path arg is ignored. Lets legacy Preside's cfflow YamlParser work without a
@@ -1376,7 +1437,42 @@ pub fn handle_java_url(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -
 pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     match method {
         "init" => {
-            let path = args.first().map(|a| a.as_string()).unwrap_or_default();
+            // `new File(pathname)` and the two-argument `new File(parent, child)`,
+            // where `parent` is either a path string or another File shim. The
+            // second argument used to be dropped silently, so the standard
+            // `new File(dir, name)` idiom operated on the DIRECTORY (GH #378).
+            // Java resolves the child against the parent; an absolute-looking
+            // child is still treated as relative to the parent (unlike a plain
+            // concat), and a blank parent yields the child alone.
+            let path = match args.len() {
+                0 => String::new(),
+                1 => args
+                    .first()
+                    .map(|a| a.as_string())
+                    .unwrap_or_default(),
+                _ => {
+                    let parent = java_path_arg(&args[0])
+                        .unwrap_or_else(|| args[0].as_string());
+                    let child = java_path_arg(&args[1])
+                        .unwrap_or_else(|| args[1].as_string());
+                    let child = child.trim_start_matches(['/', '\\']);
+                    let parent_trimmed = parent.trim_end_matches(['/', '\\']);
+                    if parent_trimmed.is_empty() {
+                        // A parent of "" contributes nothing; a parent that was
+                        // nothing BUT separators ("/") is the root, and Java
+                        // keeps it — `new File("/", "x")` is "/x", not "x".
+                        if parent.is_empty() {
+                            child.to_string()
+                        } else {
+                            format!("{}{}", std::path::MAIN_SEPARATOR, child)
+                        }
+                    } else if child.is_empty() {
+                        parent_trimmed.to_string()
+                    } else {
+                        format!("{}{}{}", parent_trimmed, std::path::MAIN_SEPARATOR, child)
+                    }
+                }
+            };
             let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
@@ -1483,8 +1579,11 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             }
             Ok(CfmlValue::Null)
         }
-        "tostring" => {
-            // java.io.File.toString() returns the original path as given.
+        "tostring" | "getpath" => {
+            // java.io.File.toString()/getPath() both return the pathname string
+            // exactly as the File was constructed with it. getPath() had no arm
+            // at all, so it fell through to the unhandled-method error the
+            // caller then saw as an empty string.
             if let CfmlValue::Struct(ref shim) = object {
                 return Ok(shim
                     .get("__path")
@@ -1563,15 +1662,24 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             }
             Ok(CfmlValue::Bool(false))
         }
-        "getname" | "lastmodified" | "length" => {
+        "getname" => {
+            // Pure string work in Java — the file need not exist. This used to
+            // share the metadata-gated arm below, so getName() on a path with
+            // nothing behind it returned the integer 0 instead of the filename.
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    if let Some(n) = std::path::Path::new(path.as_str()).file_name() {
+                        return Ok(CfmlValue::string(n.to_string_lossy().to_string()));
+                    }
+                }
+            }
+            Ok(CfmlValue::string(String::new()))
+        }
+        "lastmodified" | "length" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
                     if let Ok(meta) = std::fs::metadata(path.as_str()) {
-                        if method == "getname" {
-                            if let Some(n) = std::path::Path::new(path.as_str()).file_name() {
-                                return Ok(CfmlValue::string(n.to_string_lossy().to_string()));
-                            }
-                        } else if method == "lastmodified" {
+                        if method == "lastmodified" {
                             if let Ok(t) = meta.modified() {
                                 let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
                                 return Ok(CfmlValue::Double(d.as_millis() as f64));

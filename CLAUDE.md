@@ -218,6 +218,17 @@ Users can extend a self-contained binary with first-class Rust BIFs and classes.
 
 ## Important Conventions
 
+> 🚫 **NEVER kill processes by name. `pkill -f rustcfml`, `pkill -f "rustcfml
+> --serve"`, `killall rustcfml` and friends are BANNED.** The developer runs
+> long-lived `--serve` instances of their own — a Preside site on 8500, other
+> apps on other ports — and a name pattern matches every one of them, not just
+> the servers you started. This has killed a running Preside server mid-session.
+> Kill ONLY what you started, and only by something that cannot match anything
+> else: the **PID** you captured at launch, or a pattern anchored to **your own
+> port** (`pkill -f "rustcfml --serve --port 8611"`). If you did not start it,
+> do not stop it. Before restarting anything of the developer's, ASK — booting a
+> Preside site WRITES to its database, so guessing the docroot is not free.
+
 > 🚫 **NEVER solve a problem by making a function a no-op (or a stub / fake-empty
 > return) without first flagging it and getting the user's approval.** If a boot
 > blocker or failing call can be "fixed" by having a function return

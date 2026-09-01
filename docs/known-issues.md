@@ -1490,31 +1490,138 @@ arbitrary rectangle is almost never what "make it 200x100" means.
 
 ---
 
-## 69. `loop file=` reads the whole file, so it does not bound memory 🏗 *(GH [#367](https://github.com/RustCFML/RustCFML/issues/367))*
+## 69. `loop file=` streams — RESOLVED in v0.640.0 *(GH [#367](https://github.com/RustCFML/RustCFML/issues/367))*
 
-Both spellings iterate a file line by line and both produce correct results:
+Kept as a pointer because the entry above it shipped in two halves and the
+first half read like the whole fix.
+
+Both spellings iterate a file line by line:
 
 ```cfml
 <cfloop file="#p#" index="line"> ... </cfloop>     <!--- tag form --->
 loop file=p item="line" { ... }                    // script form (added for GH #367)
 ```
 
-What they do **not** yet deliver is the reason the construct exists. Lucee
-streams the file through a buffered reader, so the resident cost is one line.
-RustCFML's `__cfloop_file_lines` reads the file into a string via the VFS and
-materialises an array of every line before the first iteration — so peak memory
-is the file size plus one string per line, which is *worse* than the
+v0.636.0 made the script form *work* — it previously fell through to the
+infinite-loop fallback and threw "Variable 'line' is undefined". It did not
+make either form bound its memory: `__cfloop_file_lines` read the file whole
+and materialised an array of every line before the first iteration, so peak
+cost was the file size plus one `String` per line — *worse* than the
 `fileRead()` + `listToArray()` workaround the construct is meant to replace.
 
-Correctness is unaffected (including blank-line preservation); only the memory
-profile is. A file large enough for this to matter is exactly the case that
-motivates reaching for the construct, so treat it as unsuitable for very large
-files until it streams.
+v0.640.0 closes that half. `Vfs::open_lines` returns a `VfsLines` cursor
+(`RealFs` buffers over the open file; in-memory implementations keep the eager
+read, which is optimal for them and forwarded by the delegating ones), and both
+lowerings converge on a pump — open, `next` until it yields Null, close — in
+place of `for (x in <array>)`. Measured on a 214MB / 4M-row CSV: peak RSS 1038MB
+eager → 241MB streaming, which is the engine's own baseline footprint; peak is
+flat from a 12MB file to a 214MB one. CPU is unchanged to slightly better.
 
-Fixing it properly needs a streaming entry point on the `Vfs` trait (defaulting
-to today's eager read for the non-filesystem implementations) plus a cursor the
-loop lowering can pump, since both lowerings currently emit `for (x in
-<array>)`.
+Two properties worth knowing rather than rediscovering:
+
+- **The cursor holds an OS file descriptor, so every exit path must close it.**
+  The loop is lowered as `try { while(true){…} } finally { close }` rather than
+  as hand-emitted bytecode precisely for this: the body can leave by running
+  out, by `break`, by `return`, or by throwing. A first cut covered the first
+  three and leaked on the fourth, which is not academic — a function that
+  returns from inside the loop leaks one descriptor per call, so a few thousand
+  calls in one request exhaust a default 1024-fd limit and fail with EMFILE far
+  from the cause. Regression cover: 40,000 early exits (returns and throws)
+  under a deliberately-set 256-fd limit.
+- **Invalid UTF-8 surfaces at the offending line, not before the first
+  iteration**, because nothing reads ahead of the cursor. Lucee's buffered
+  reader behaves the same way; the alternative is scanning the whole file
+  up-front, which is the cost being removed.
+
+## 70. An operator word used as a plain variable is read as the operator 🏗
+
+A reserved word may **name** a variable on Lucee, and RustCFML now agrees for
+every position that matters — declarations (`var case = 1`), argument names,
+struct keys, member access (`case.label`), and, since the fix for the Preside
+boot failure below, the for-in loop variable:
+
+```cfml
+for ( var case in caseQuery ) { out &= case.label; }   // Preside app services do this
+```
+
+The one remaining gap is READING a variable whose name is an *infix operator
+word* — `contains`, `eq`, `is`, `mod`, `and`, `or`, `xor`, `gt`, `lt`, `imp`:
+
+```cfml
+for ( var contains in [ "a" ] ) { out &= contains; }   // Lucee: "a"   RustCFML: ""
+```
+
+The loop variable is assigned correctly; it is the *read* in operand position
+that our parser resolves as the operator rather than the identifier. Assigning,
+passing, and member access all work — only the bare read diverges. Rename the
+variable, or read it through a scope (`local.contains`).
+
+Note this is distinct from the words that are also LITERALS (`true`, `false`,
+`null`) or statement keywords (`return`): those read back as the literal or fail
+on **both** engines, so they are not a divergence.
+
+## 71. `cfzipparam` covers `action="zip"` only 🏗
+
+`<cfzipparam>` / `cfzipparam(...)` contributes an entry to the enclosing
+`<cfzip>` — `source` (a file or a directory), `entrypath`, `prefix`, `filter`,
+`recurse`, and literal `content` written at `entrypath`. That is the whole of
+the `action="zip"` surface.
+
+Lucee also accepts child params on the other actions (a per-entry `entrypath`
+filter for `action="unzip"`/`"delete"`). Those are NOT implemented, and rather
+than drop them silently `cfzip` raises when a param is supplied with any action
+other than `zip`.
+
+---
+
+## 72. `throw()` mixing named and positional arguments — a deliberate superset 🏗
+
+```cfml
+throw( type="my.type", "the message" );   // named, then positional
+```
+
+Lucee refuses to **compile** the file that contains this ("Invalid argument for
+function [ throw ], You can't mix named and unNamed arguments"), so the whole
+component is unloadable there. RustCFML compiles it and raises at the call
+instead — the mixed-arguments error every other function call already produces,
+typed `expression`.
+
+The reason for the divergence is blast radius: a shipped Preside extension
+contains this line, and failing at parse time takes every service in the file
+with it. Accepting the file keeps the rest of the component usable while the bad
+line still fails when it runs. Nothing that works on Lucee behaves differently
+here — only code Lucee rejects outright.
+
+---
+
+## 73. `cgi` is read-only — but a refused DELETE or APPEND still happens 🏗 *(GH [#372](https://github.com/RustCFML/RustCFML/issues/372))*
+
+Writing to the `cgi` scope is refused, matching Lucee:
+
+```cfml
+cgi.qtest = "x";   // Expression: can't set key [QTEST] to struct, struct is readonly
+```
+
+The mark rides on the scope STRUCT rather than on the name, so an alias is
+refused identically (`local.c = cgi; local.c.x = 1`) — which is what Lucee does
+too. `url`, `form` and `cookie` stay writable on both engines.
+
+Where we differ is the two operations Lucee *lets through*. Verified against
+Lucee 7.1.0+204:
+
+| operation | Lucee | RustCFML |
+|---|---|---|
+| `cgi.x = v`, `cgi["x"] = v`, `structInsert`/`structUpdate`, `cgi.insert()`, `cgi.x = nullValue()` | throws | throws |
+| `structClear( cgi )` | throws (`can't clear struct…`) | throws |
+| `structDelete( cgi, k )`, `cgi.delete( k )` | returns success, **does nothing** | performs the delete |
+| `structAppend( cgi, s )`, `cgi.append( s )` | returns success, **does nothing** | performs the append |
+
+Lucee's read-only struct throws from `put`/`clear` but leaves `remove`/`putAll`
+as no-ops, so it reports a delete that never happened. Copying that would be
+shipping a silent no-op; throwing instead would be a RESTRICTIVE divergence — the
+kind that can break an app that works on Lucee. We do neither, and leave those
+two operations working as they always did. Code that relies on either is already
+broken on Lucee, in the quieter direction.
 
 ---
 
@@ -1525,6 +1632,61 @@ loop lowering can pump, since both lowerings currently emit `for (x in
 Restrictions that apply only on a particular target (wasm, CLI vs serve).
 
 <a id="8"></a>
+
+## 74. Form file uploads stream to disk — RESOLVED in v0.647.0 *(GH [#384](https://github.com/RustCFML/RustCFML/issues/384), [#385](https://github.com/RustCFML/RustCFML/issues/385))*
+
+A `multipart/form-data` upload is parsed off the wire and each file part is
+written straight to its own temp file. Nothing about the CFML surface changed —
+`form.<field>.tempFilePath` and `cffile action="upload"` work as before — but
+three things behind it did, and all three are worth knowing.
+
+**The body is no longer buffered.** It used to be read whole by
+`axum::body::to_bytes` before the handler ran, then split, then written to
+disk: three copies of every uploaded byte, with the peak charged per concurrent
+request. Measured on a 300MB upload: peak RSS growth 745MB → 3.1MB, and flat
+from 300MB to 900MB. `server.maxRequestBodySize` is still enforced (413 on the
+way past it) but is now a policy limit rather than a per-request memory
+reservation. Hosts with no filesystem — the Cloudflare worker, wasm — still
+buffer, which is what `web::RequestBody` distinguishes; Lucee streams the same
+way (`FormImpl.initializeMultiPart` → `FileItemIterator` → `IOUtil.copy`).
+
+**The temp filename no longer comes from the client.** It was
+`cfupload_{filename}` interpolated with no sanitising at all, which was two bugs
+in one string: `filename="../../etc/thing"` wrote outside the temp directory,
+and two concurrent uploads of `avatar.png` shared one path and clobbered each
+other. Temp files are now `cfupload_<pid>_<counter>.upload` — nothing
+client-derived — and the original name reaches CFML as `clientFile`/`serverFile`
+reduced to a bare basename. That last part matters beyond the temp directory:
+`cffile action="upload"` joins `clientFile` onto its destination, so an
+unsanitised name escaped *that* directory too. Lucee names its temp files
+`tmp-<counter>.upload` for the same reason.
+
+**`getHttpRequestData().content` follows Lucee's rule now.** It used to be
+`String::from_utf8_lossy(body)` for every request that had a body, whatever the
+content type — a second full-size copy, and for binary input a *lossy* one, so
+each invalid byte became a 3-byte U+FFFD and the value could be larger than the
+body it had already corrupted beyond recovery. Per
+`ReqRspUtil.getRequestBody`, a body is now text when the content type is
+absent, form-urlencoded, or a text mime type (`HTTPUtil.isTextMimeType`, which
+counts anything containing `xml`, `json`, `rss`, `atom` or `text`), and
+`CfmlValue::Binary` otherwise. A multipart request exposes an empty `content`,
+matching Lucee's `FormImpl.getInputStream()` — and a streamed upload never had
+the bytes to expose in any case.
+
+> **Not yet done: temp files are never cleaned up** — GH
+> [#386](https://github.com/RustCFML/RustCFML/issues/386). They accumulate in
+> the system temp directory for the life of the host. Deliberately left out of
+> this change rather than bundled into it, because the fix is a design decision
+> rather than a detail: Lucee deletes them when the form scope is released
+> (`FormImpl.release`), but skips that entirely for any request that used
+> `cfthread` (`PageContextImpl.release` only calls `urlForm.release` in its
+> non-`hasFamily` branch), so one thread anywhere in a request leaks its
+> uploads permanently. That hole is the conservative answer to a real hazard —
+> a `cfthread` can outlive its request and may have been handed
+> `tempFilePath` — and our threads have the same shape. The plan in #386 is
+> request-end deletion for requests that spawned no thread, plus an age-based
+> reaper for the rest, which also covers what request-end deletion structurally
+> cannot: crashes, `kill -9`, and files left by a previous run.
 
 ## 8. Environment-specific 🌍
 
@@ -1537,6 +1699,8 @@ Restrictions that apply only on a particular target (wasm, CLI vs serve).
 | `runAsync` / `_schedule` — `delayMs` | On `wasm32` (and other no-real-threads builds) `delayMs` is ignored: the closure runs inline immediately rather than being scheduled. With real threads it is honoured. |
 | `_schedule` — `everyMs` / `spacedMs` | Honoured with real threads: `everyMs` is fixed-rate (period measured from each run's start, missed ticks **skipped** rather than burst-replayed), `spacedMs` is fixed-delay (measured from each run's end); `everyMs` wins if both are given. A run that throws is not rescheduled, and `cancel()` stops the schedule and the run in flight. On `wasm32` (and other no-real-threads builds) they are still ignored along with `delayMs` — the closure runs inline exactly once. |
 | `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
+| `java.security.KeyPairGenerator.generateKeyPair()` | Not supported on `wasm32`: there is no OS entropy source, and inventing a key from a deterministic source would be worse than failing. Throws with that explanation. Generate the pair elsewhere and supply it as PEM. |
+| `SHA512withECDSA` **signing** (P-521 only) | Not supported on `wasm32`, for the same reason: `p521` has no RFC 6979 implementation, so P-521 signing draws a random nonce. P-521 *verification*, and both signing and verification on P-256/P-384 (which are RFC 6979 deterministic), work everywhere. |
 
 ---
 

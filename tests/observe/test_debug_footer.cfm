@@ -77,6 +77,24 @@ if (isRustCFML() && isDebugMode()) {
     assert("CFC method call recorded a pages row (flyweight regression guard)",
         kidRecorded, true);
 
+    // Regression (v0.645): CFC CONSTRUCTION must feed the `pages` section too.
+    // Only component METHODS opened a timed frame, so `new X()` was invisible —
+    // and construction is not cheap: 200 `new` of a 40-method CFC measured
+    // 7.4ms with no row of its own anywhere in the footer, all of it dumped into
+    // the top-level page's residual. This fixture is constructed and NEVER
+    // method-called, so a row for it can only come from the construction.
+    var ctorOnly = new observe.DebugFooterCtorOnly();
+    assert("ctor-only fixture constructed", isObject(ctorOnly), true);
+    var ctorRows = getDebugData().pages.filter(
+        (p) => lCase(p.id).findNoCase("debugfooterctoronly.cfc") > 0
+    );
+    assert("construction alone recorded a pages row", arrayLen(ctorRows) > 0, true);
+    // ...and it is labelled as the constructor, not as a method, so it can never
+    // silently merge with a real method of the same name.
+    var ctorMethods = ctorRows[1].methods.map((m) => m.name);
+    assert("construction row is labelled <constructor>",
+        ctorMethods.some((n) => n == "<constructor>"), true);
+
     // A `<cfmodule>` / custom-tag execution must ALSO feed the `pages` section.
     // Lucee's Execution Time section is documented as covering "templates,
     // includes, modules, custom tags, and component method calls"; RustCFML

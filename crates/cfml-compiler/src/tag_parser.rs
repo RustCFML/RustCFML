@@ -311,6 +311,9 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
     let chars: Vec<char> = source.chars().collect();
     let len = chars.len();
     let mut i = 0;
+    // Have we passed the opening `<cfcomponent>`/`<cfinterface>` tag? Drives the
+    // outside-the-element suppression in the tag branch below.
+    let mut component_started = false;
 
     while i < len {
         // Strip CFML comments: <!--- ... --->
@@ -365,7 +368,40 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
         }
         if i < len - 1 && chars[i] == '<' && is_cf_tag_start(&chars, i, len) {
             let (script, consumed) = parse_cf_tag(&chars, i, len, imports, in_cfoutput);
-            result.push_str(&script);
+            // Anything OUTSIDE the top-level <cfcomponent>/<cfinterface> element
+            // is not part of the component and is ignored by Lucee — verified
+            // against 7.1.0+204 for all four shapes: text and `<cfset>` code,
+            // both before the open tag and after the close tag, are dropped and
+            // never run. RustCFML emitted/executed all four, so the trailing
+            // newline every editor leaves after `</cfcomponent>` was written
+            // into the response on every instantiation of a tag-based CFC
+            // (issue #375; it is also the one byte by which we and Lucee still
+            // differed on the `output="true"` arm of issue #373).
+            //
+            // Leading region: discard what it emitted, but only once the open
+            // tag is actually reached — a file with no component at all must
+            // keep everything, so this can never be decided up front. `imports`
+            // survives the clear deliberately: a taglib `<cfimport>` emits no
+            // script, it only registers a prefix, and dropping that registration
+            // would turn a `<my:tag>` inside the body into unrecognised markup.
+            // Lucee, ignoring the whole leading region, most likely drops the
+            // import too — this is the conservative side to err on, and no
+            // cross-engine test pins it either way.
+            //
+            // Trailing region: `break`. The `}` for the component has already
+            // been emitted, so stopping here leaves nothing unbalanced.
+            match component_element_boundary(&chars, i, len) {
+                Some(false) if !component_started => {
+                    component_started = true;
+                    result.clear();
+                    result.push_str(&script);
+                }
+                Some(true) if component_started => {
+                    result.push_str(&script);
+                    return result;
+                }
+                _ => result.push_str(&script),
+            }
             i += consumed;
         } else if !imports.is_empty() && chars[i] == '<' && is_import_tag_start(&chars, i, len, imports) {
             let (script, consumed) = parse_import_tag(&chars, i, len, imports, in_cfoutput);
@@ -573,6 +609,24 @@ fn find_closing_hash(chars: &[char], start: usize, len: usize) -> Option<usize> 
         i += 1;
     }
     None
+}
+
+/// `Some(false)` for a `<cfcomponent`/`<cfinterface` OPEN tag at `pos`,
+/// `Some(true)` for the matching close tag, `None` for every other tag. Used to
+/// bound the region of a source file that actually belongs to the component —
+/// see the call site in [`tags_to_script_inner`].
+fn component_element_boundary(chars: &[char], pos: usize, len: usize) -> Option<bool> {
+    let is_closing = chars.get(pos + 1) == Some(&'/');
+    let name_start = if is_closing { pos + 2 } else { pos + 1 };
+    let mut name_end = name_start;
+    while name_end < len && (chars[name_end].is_alphanumeric() || chars[name_end] == '_') {
+        name_end += 1;
+    }
+    let name: String = chars[name_start..name_end].iter().collect();
+    match name.to_lowercase().as_str() {
+        "cfcomponent" | "cfinterface" => Some(is_closing),
+        _ => None,
+    }
 }
 
 fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::collections::HashMap<String, String>, in_cfoutput: bool) -> (String, usize) {
@@ -1642,14 +1696,56 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
-            let call = format!("cfzip({{ {} }})", parts.join(", "));
-            if let Some(n) = name {
-                (format!("{} = {};\n", n, call), tag_end - start)
-            } else if let Some(v) = variable {
-                (format!("{} = {};\n", v, call), tag_end - start)
+            // A `<cfzip>` with a body carries `<cfzipparam>` children, each naming
+            // its own source/entrypath/prefix. They are collected into a runtime
+            // array (rather than harvested literally) so a param inside
+            // `<cfif>`/`<cfloop>` is seen, exactly as the script form does.
+            let (params_arg, body_script, consumed) = if is_self_closing_tag(chars, tag_end) {
+                (String::new(), String::new(), tag_end - start)
+            } else if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfzip") {
+                let body: String = chars[tag_end..close_pos].iter().collect();
+                let close_end = find_tag_end(chars, close_pos, len);
+                (
+                    ", __cfzip_params".to_string(),
+                    format!(
+                        "__cfzip_params = [];\n{}",
+                        tags_to_script_inner(&body, imports, in_cfoutput)
+                    ),
+                    close_end - start,
+                )
             } else {
-                (format!("{};\n", call), tag_end - start)
+                (String::new(), String::new(), tag_end - start)
+            };
+            let call = format!("cfzip({{ {} }}{})", parts.join(", "), params_arg);
+            if let Some(n) = name {
+                (format!("{}{} = {};\n", body_script, n, call), consumed)
+            } else if let Some(v) = variable {
+                (format!("{}{} = {};\n", body_script, v, call), consumed)
+            } else {
+                (format!("{}{};\n", body_script, call), consumed)
             }
+        }
+        "cfzipparam" => {
+            // <cfzipparam source="..." entrypath="..." ...> — one entry for the
+            // enclosing <cfzip> body. Appends to the array that arm seeds.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                let raw = v.trim();
+                let lower = raw.to_lowercase();
+                if lower == "true" || lower == "yes" {
+                    parts.push(format!("{}: true", k));
+                } else if lower == "false" || lower == "no" {
+                    parts.push(format!("{}: false", k));
+                } else if raw.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, raw));
+                } else {
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+                }
+            }
+            (
+                format!("arrayAppend(__cfzip_params, {{ {} }});\n", parts.join(", ")),
+                tag_end - start,
+            )
         }
         "cfsavecontent" => {
             let variable = attrs.get("variable").cloned().unwrap_or("__savecontent_result".to_string());
@@ -1849,6 +1945,34 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     (String::new(), tag_end - start)
                 }
             }
+        }
+        "cfapplication" => {
+            // <cfapplication name="x" sessionmanagement="true" sessiontimeout="#ts#">
+            // → __cfapplication({name: "x", sessionmanagement: true, ...});
+            //
+            // The pre-Application.cfc way to declare an application, still common
+            // in older code. It used to fall through to the generic "Tag <X> is
+            // not implemented" throw, which 500'd the request and stopped the page
+            // dead at the tag (GH #374) — even though the SCRIPT form
+            // (`application name="x";`) already lowered to this very intercept.
+            // Same attribute→literal shaping as cfsetting: yes/no and true/false
+            // become booleans, bare numbers stay numeric, and anything else
+            // (including `#createTimeSpan(...)#`) goes through format_attr_value
+            // so it evaluates at runtime.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                let lower = v.to_lowercase();
+                if !v.contains('#') && (lower == "true" || lower == "yes") {
+                    parts.push(format!("{}: true", k));
+                } else if !v.contains('#') && (lower == "false" || lower == "no") {
+                    parts.push(format!("{}: false", k));
+                } else if !v.contains('#') && v.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, v));
+                } else {
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+                }
+            }
+            (format!("__cfapplication({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
         "cfsetting" => {
             let mut parts = Vec::new();

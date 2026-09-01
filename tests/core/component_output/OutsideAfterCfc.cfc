@@ -1,0 +1,1 @@
+<cfcomponent output="true" hint="Everything after the close tag belongs to no component and must be neither emitted nor executed."><cffunction name="m" output="true" returntype="string"><cfreturn "M"></cffunction></cfcomponent>TRAILING-TEXT<cfset request.outsideAfter = "ran">

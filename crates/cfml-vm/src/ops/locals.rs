@@ -789,7 +789,7 @@ pub(crate) fn op_unset_path(
     inherited_or_param_keys: &mut InheritedKeys,
     effective_local_mode_modern: bool,
     path: &str,
-) {
+) -> Result<(), cfml_common::vm::CfmlError> {
     // CFML null-assignment: `x = voidFn()` (Null RHS) must DELETE
     // the target rather than materialize a null-valued key. The
     // value (Null) was already popped by the guard's `Pop`.
@@ -817,7 +817,11 @@ pub(crate) fn op_unset_path(
             }
         }
     }
-    vm.delete_scope_path(path, locals, effective_local_mode_modern);
+    // GitHub #372: `cgi.x = nullValue()` deletes here, but Lucee compiles it as a
+    // SET and rejects it as one on a read-only scope. `structDelete` reaches the
+    // scope through DeleteScopeKey instead and is deliberately left working.
+    vm.check_scope_path_writable(path, locals)?;
+    vm.delete_scope_path(path, locals, effective_local_mode_modern)?;
     // Drop any closure-env copy so sibling closures see the
     // deletion too (mirrors StoreLocal's env sync).
     if let Some(ref env) = closure_env {
@@ -832,6 +836,7 @@ pub(crate) fn op_unset_path(
     // view — keep it shadowing any inherited caller key.
     let leaf = path.rsplit('.').next().unwrap_or(path);
     inherited_or_param_keys.remove(leaf);
+    Ok(())
 }
 
 /// `CallSpread`

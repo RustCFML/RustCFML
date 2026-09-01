@@ -494,6 +494,10 @@ pub(crate) fn op_set_property(
             if matches!(obj, CfmlValue::Null) {
                 obj = CfmlValue::strukt(ValueMap::default());
             }
+            // GitHub #372: refuse a write into a read-only scope struct (`cgi`).
+            // The mark rides on the struct, so this catches the scope reached
+            // under any name and at any depth of the receiver chain.
+            obj.check_struct_writable(&name.to_uppercase())?;
             // Phase C.3 — Slice 3: `instance.x = v` writes the public
             // DATA map in place (shared Arc → persists on the instance).
             // A CFC with a `rust:` native parent routes writes the

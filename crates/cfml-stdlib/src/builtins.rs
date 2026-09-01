@@ -15,7 +15,7 @@
 //! - System functions
 
 use cfml_common::dynamic::{build_implements_meta, CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use std::collections::HashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
@@ -893,6 +893,9 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cfcookie".to_string(), fn_cfcookie_stub);
     f.insert("__cfcache".to_string(), fn_cfcache_stub);
     f.insert("__cfloop_file_lines".to_string(), fn_cfloop_file_lines_stub);
+    f.insert("__cfloop_file_open".to_string(), fn_cfloop_file_cursor_stub);
+    f.insert("__cfloop_file_next".to_string(), fn_cfloop_file_cursor_stub);
+    f.insert("__cfloop_file_close".to_string(), fn_cfloop_file_cursor_stub);
     f.insert("__cfexecute".to_string(), fn_cfexecute_stub);
     f.insert("__cfmail".to_string(), fn_cfmail);
     // Gated with its implementation: the SMTP probe needs `lettre`, which the
@@ -1882,7 +1885,14 @@ fn fn_to_base64(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_to_binary(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Binary(base64_decode_bytes(&get_str(&args, 0))))
+    // Borrow the base64 text rather than `get_str`-ing it: `as_string()` clones
+    // the whole `Arc<String>`, which on ColdBox's DiskStore meant copying a
+    // ~26KB cached page purely to read it once.
+    let bytes = match args.first() {
+        Some(CfmlValue::String(s)) => base64_decode_bytes(s.as_str()),
+        other => base64_decode_bytes(&other.map(|v| v.as_string()).unwrap_or_default()),
+    };
+    Ok(CfmlValue::Binary(bytes))
 }
 
 /// Magic header prefixing an `objectSave()` blob. Lets `objectLoad()` recognise
@@ -3429,6 +3439,12 @@ fn instance_public_as_struct(v: &CfmlValue) -> Option<CfmlValue> {
 
 fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // NOT guarded against a read-only scope (GitHub #372): Lucee lets a
+        // `structDelete(cgi,…)` through — it silently does nothing rather than
+        // throwing. Throwing here would be a RESTRICTIVE divergence (it can break
+        // a working app), and silently dropping the delete is the no-op Lucee
+        // shipped by accident. We do neither: the delete is left working.
+        // Documented in docs/known-issues.md.
         // Flyweight component: delete the public member in place via the live
         // instance (a Struct-only match no-oped, silently reporting deletion of a
         // key it never removed).
@@ -3458,6 +3474,10 @@ fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_insert(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
+        // GitHub #372: `cgi` is read-only to CFML code. Guarded on the VALUE, not
+        // by name at the call site, so an alias (`local.c = cgi`) is refused too.
+        // The key goes through verbatim — Lucee echoes the literal as written.
+        args[0].check_struct_writable(&args[1].as_string())?;
         // Flyweight component: set the public member in place (a Struct-only match
         // no-oped, so structInsert/structUpdate on a component were silently lost).
         if let Some(comp) = args[0].as_component().filter(|c| c.is_instance_backed()) {
@@ -3606,6 +3626,11 @@ fn struct_find_value_recursive(
 }
 
 fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    // GitHub #372: Lucee refuses to empty a read-only struct (`cgi`), and words
+    // it differently from a keyed write.
+    if let Some(target) = args.first() {
+        target.check_struct_clearable()?;
+    }
     // Phase C.3 — Slice 4/5: a flyweight instance clears its public scope (data +
     // method table) in place, keeping identity + private data (MockBox pattern).
     if let Some(comp) = args.first().and_then(|v| v.as_component()) {
@@ -3673,6 +3698,8 @@ fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // Not guarded against a read-only scope — same reasoning as
+        // `fn_struct_delete` (GitHub #372).
         // Phase C.3 — Slice 4: destination is a flyweight instance (the mixin
         // injection path `structAppend(target, mixins, true)` — the merged Function
         // values become injected data-methods on the instance). `is_instance_backed`
@@ -7883,32 +7910,38 @@ fn fn_hash(args: Vec<CfmlValue>) -> CfmlResult {
     use md5::Md5;
     use sha2::{Sha256, Sha384, Sha512, Digest};
     use sha1::Sha1;
-    let input = get_str(&args, 0);
+    // Hash the BYTES, not a string form of them. `get_str` round-tripped a
+    // `Binary` through a lossy string coercion, so `hash(charsetDecode("abc",
+    // "utf-8"), "SHA-256")` digested mojibake instead of the three bytes —
+    // producing a plausible-looking but wrong digest that broke AWS SigV4
+    // payload signing and every other hash-the-bytes protocol (GH #376).
+    // A plain string argument still hashes its UTF-8 bytes, exactly as before.
+    let input = get_bytes(&args, 0);
     let algorithm = if args.len() >= 2 { get_str(&args, 1).to_uppercase() } else { "MD5".to_string() };
     let hex = match algorithm.as_str() {
         "MD5" => {
             let mut hasher = Md5::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-1" | "SHA1" => {
             let mut hasher = Sha1::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-256" | "SHA256" => {
             let mut hasher = Sha256::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-384" | "SHA384" => {
             let mut hasher = Sha384::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         "SHA-512" | "SHA512" => {
             let mut hasher = Sha512::new();
-            hasher.update(input.as_bytes());
+            hasher.update(&input);
             format!("{:X}", hasher.finalize())
         }
         _ => {
@@ -8611,7 +8644,8 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_get_temp_directory(_args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::string(std::env::temp_dir().to_string_lossy().to_string()))
+    // Trailing separator — see `cfml_common::vfs::temp_dir_with_separator`.
+    Ok(CfmlValue::string(cfml_common::vfs::temp_dir_with_separator()))
 }
 
 fn fn_get_temp_file(args: Vec<CfmlValue>) -> CfmlResult {
@@ -11497,6 +11531,333 @@ fn mysql_returns_rows(sql: &str) -> bool {
         && sql_has_top_level_keyword(trimmed, "RETURNING")
 }
 
+/// How a statement's leading keyword must be routed.
+///
+/// MySQL refuses to PREPARE `LOAD DATA` / `LOAD XML` at all (server error 1295,
+/// "This command is not supported in the prepared statement protocol yet"), so
+/// they have to go down the plain text protocol (`Conn::query*`) rather than
+/// `Conn::exec*`, which always prepares first — even with zero bind params,
+/// which LOAD never has anyway (the filename and the FIELDS/LINES terminators
+/// must all be literals in the SQL text). GitHub #382.
+#[cfg(feature = "mysql_db")]
+#[derive(Debug, PartialEq)]
+enum MysqlLoadForm {
+    /// Not a LOAD statement: prepare and execute as usual.
+    NotLoad,
+    /// The server opens the file itself (`LOAD DATA INFILE`, no LOCAL). Needs
+    /// the text protocol, but no client-side handler.
+    ServerSide,
+    /// `LOAD DATA LOCAL INFILE '<path>'`, with the path decoded exactly as the
+    /// server will have parsed it — that decoded name is what it asks this
+    /// client for, so it is what we match on.
+    Local(String),
+    /// A LOCAL form whose path literal we could not decode. Never executed: see
+    /// `mysql_run_mutation` for why running it anyway is worse than failing.
+    LocalUnparsed,
+}
+
+/// Classifies a statement for `mysql_run_mutation`.
+///
+/// `backslash_escapes` is the session's escaping mode (false under
+/// `NO_BACKSLASH_ESCAPES`), which changes how the path literal decodes.
+#[cfg(feature = "mysql_db")]
+fn mysql_load_form(sql: &str, backslash_escapes: bool) -> MysqlLoadForm {
+    let trimmed = strip_leading_sql_noise(sql);
+    let chars: Vec<char> = trimmed.chars().collect();
+    let kw_len = chars.iter().take_while(|c| c.is_ascii_alphabetic()).count();
+    if !chars[..kw_len].iter().collect::<String>().eq_ignore_ascii_case("LOAD") {
+        return MysqlLoadForm::NotLoad;
+    }
+
+    // `LOAD {DATA|XML} [LOW_PRIORITY|CONCURRENT] [LOCAL] INFILE '<path>'` — at
+    // most four keywords stand between LOAD and INFILE, so the scan is bounded
+    // rather than hunting the whole statement for the word. That bound is the
+    // point: a table or column called `infile` further down the statement (or
+    // the letters "local" inside the path itself) must not be mistaken for the
+    // keyword.
+    let mut i = kw_len;
+    let mut saw_local = false;
+    let mut infile_end = None;
+    for _ in 0..6 {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        let token: String = chars[start..i].iter().collect();
+        if token.eq_ignore_ascii_case("LOCAL") {
+            saw_local = true;
+        } else if token.eq_ignore_ascii_case("INFILE") {
+            infile_end = Some(i);
+            break;
+        }
+    }
+
+    // No INFILE in the header, or no LOCAL: either way no client-side file is
+    // involved. Send it down the text protocol and let the server speak for
+    // itself — a malformed LOAD gets its own syntax error rather than 1295.
+    let Some(mut i) = infile_end.filter(|_| saw_local) else {
+        return MysqlLoadForm::ServerSide;
+    };
+
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    let quote = match chars.get(i) {
+        Some(&c) if c == '\'' || c == '"' => c,
+        _ => return MysqlLoadForm::LocalUnparsed,
+    };
+    match mysql_decode_string_literal(&chars, i, quote, backslash_escapes) {
+        Some(path) => MysqlLoadForm::Local(path),
+        None => MysqlLoadForm::LocalUnparsed,
+    }
+}
+
+/// Decodes a MySQL string literal starting at its opening quote, yielding the
+/// value the SERVER will have parsed — which is the name it echoes back in its
+/// local-infile request, and therefore what `mysql_run_mutation` matches on.
+///
+/// Both quoting styles escape their own quote by doubling it (`''`). Outside
+/// `NO_BACKSLASH_ESCAPES` a backslash also escapes the next character: the named
+/// ones (`\0`, `\b`, `\n`, `\r`, `\t`, `\Z`) become their control character and
+/// any other `\x` is simply `x`. That last rule is why a Windows path has to be
+/// written `'C:\\data\\x.csv'` — `'C:\data\x.csv'` really does decode to
+/// `C:datax.csv`, and agreeing with the server means reproducing that rather
+/// than quietly "fixing" it.
+///
+/// `None` for an unterminated literal.
+#[cfg(feature = "mysql_db")]
+fn mysql_decode_string_literal(
+    chars: &[char],
+    open_quote: usize,
+    quote: char,
+    backslash_escapes: bool,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut i = open_quote + 1;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == quote {
+            if chars.get(i + 1) == Some(&quote) {
+                out.push(quote);
+                i += 2;
+                continue;
+            }
+            return Some(out);
+        }
+        if c == '\\' && backslash_escapes {
+            let esc = *chars.get(i + 1)?;
+            out.push(match esc {
+                '0' => '\0',
+                'b' => '\u{8}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'Z' => '\u{1a}',
+                other => other,
+            });
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    None
+}
+
+/// A mutation fails one of two ways: the server (or the wire) rejected it, or
+/// this engine refused to send it. The two call sites word server errors
+/// differently, so they stay apart rather than being flattened to a string here.
+#[cfg(feature = "mysql_db")]
+enum MysqlMutationError {
+    Server(mysql::Error),
+    Refused(String),
+}
+
+/// Runs a non-row-returning statement, routing `LOAD DATA` / `LOAD XML` around
+/// MySQL's prepared-statement protocol (error 1295 — see `MysqlLoadForm`) and,
+/// for the `LOCAL` form, serving the file the statement named.
+///
+/// The file handler is installed for exactly this one statement and cleared
+/// again immediately after. The narrowness is the security property, not tidiness:
+/// the `mysql` crate advertises `CLIENT_LOCAL_FILES` on every connection it
+/// opens, so while a handler is registered the SERVER may answer *any* query
+/// with "send me local file X" — a `SELECT 1` included. A handler that lives for
+/// the connection's lifetime is therefore a standing exfiltration channel; this
+/// one exists for the span of the statement that asked for it and refuses every
+/// name but the one that statement itself wrote.
+#[cfg(feature = "mysql_db")]
+fn mysql_run_mutation(
+    conn: &mut mysql::PooledConn,
+    sql: &str,
+    params: &mysql::Params,
+) -> Result<(), MysqlMutationError> {
+    use mysql::prelude::*;
+    use MysqlMutationError::{Refused, Server};
+
+    let path = match mysql_load_form(sql, !conn.no_backslash_escape()) {
+        MysqlLoadForm::NotLoad => return conn.exec_drop(sql, params).map_err(Server),
+        MysqlLoadForm::ServerSide => return conn.query_drop(sql).map_err(Server),
+        MysqlLoadForm::Local(path) => path,
+        // Refusing beats running it. With no handler registered the crate answers
+        // the server's file request with an EMPTY buffer rather than an error
+        // (mysql-28 `Conn::send_local_infile` has no `else` arm), so the statement
+        // would report success having imported nothing at all — a far worse
+        // outcome than a loud failure the caller can see.
+        MysqlLoadForm::LocalUnparsed => {
+            return Err(Refused(
+                "LOAD DATA LOCAL INFILE: could not read the file path out of the \
+                 statement, so it was NOT run. The path must be a single quoted \
+                 string literal directly after INFILE (bind parameters are not \
+                 supported there by MySQL). Running it unparsed would have \
+                 reported success while importing nothing."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let expected = path.clone();
+    conn.set_local_infile_handler(Some(mysql::LocalInfileHandler::new(
+        move |requested, writer| {
+            if requested != expected.as_bytes() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing LOAD DATA LOCAL INFILE request for '{}': the statement asked for '{}'",
+                        String::from_utf8_lossy(requested),
+                        expected
+                    ),
+                ));
+            }
+            // Streamed rather than read into memory: a bulk import is routinely
+            // hundreds of MB (the #382 reporter's is 119 MB).
+            let mut file = std::fs::File::open(&expected)?;
+            std::io::copy(&mut file, writer)?;
+            Ok(())
+        },
+    )));
+    let result = conn.query_drop(sql);
+    conn.set_local_infile_handler(None);
+    result.map_err(Server)
+}
+
+/// GitHub #382. The routing decision these cover is not cosmetic: get it wrong
+/// one way and the statement hits server error 1295, get it wrong the other and
+/// MySQL reports success having imported zero rows.
+#[cfg(all(test, feature = "mysql_db"))]
+mod mysql_load_data_tests {
+    use super::{MysqlLoadForm, mysql_load_form};
+
+    fn form(sql: &str) -> MysqlLoadForm {
+        mysql_load_form(sql, true)
+    }
+
+    #[test]
+    fn ordinary_mutations_are_not_load_statements() {
+        for sql in [
+            "insert into t (a) values (1)",
+            "UPDATE t SET a = 1",
+            "delete from t where id = 1",
+            "  /* header */ -- note\n  INSERT INTO loader VALUES (1)",
+        ] {
+            assert_eq!(form(sql), MysqlLoadForm::NotLoad, "{}", sql);
+        }
+    }
+
+    #[test]
+    fn server_side_load_needs_the_text_protocol_but_no_handler() {
+        assert_eq!(
+            form("LOAD DATA INFILE '/var/lib/mysql-files/x.csv' INTO TABLE t"),
+            MysqlLoadForm::ServerSide
+        );
+        assert_eq!(
+            form("load xml infile '/tmp/x.xml' into table t"),
+            MysqlLoadForm::ServerSide
+        );
+    }
+
+    #[test]
+    fn local_form_yields_the_path_the_server_will_ask_for() {
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE '/tmp/hd.csv' INTO TABLE hdcatalog"),
+            MysqlLoadForm::Local("/tmp/hd.csv".to_string())
+        );
+        // Case, the optional priority keyword, LOAD XML, and a double-quoted
+        // literal all reach the same place.
+        assert_eq!(
+            form("load data low_priority local infile \"/tmp/hd.csv\" into table t"),
+            MysqlLoadForm::Local("/tmp/hd.csv".to_string())
+        );
+        assert_eq!(
+            form("LOAD XML CONCURRENT LOCAL INFILE '/tmp/a.xml' INTO TABLE t"),
+            MysqlLoadForm::Local("/tmp/a.xml".to_string())
+        );
+        // A newline-formatted statement, as CFML heredoc-style SQL arrives.
+        assert_eq!(
+            form("\n  LOAD DATA LOCAL INFILE '/tmp/x.csv'\n  INTO TABLE t\n  FIELDS TERMINATED BY ','\n"),
+            MysqlLoadForm::Local("/tmp/x.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn the_word_local_inside_the_path_is_not_the_keyword() {
+        // `find("local")` over the whole statement matches the path here, which
+        // is why the keyword scan is bounded to the statement's header.
+        assert_eq!(
+            form("LOAD DATA INFILE '/var/local/x.csv' INTO TABLE t"),
+            MysqlLoadForm::ServerSide
+        );
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE '/var/local/infile.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("/var/local/infile.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn path_literal_decodes_the_way_the_server_parsed_it() {
+        // Doubled quote.
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE '/tmp/o''brien.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("/tmp/o'brien.csv".to_string())
+        );
+        // Escaped backslashes: the well-worn Windows path.
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE 'C:\\\\data\\\\hd.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("C:\\data\\hd.csv".to_string())
+        );
+        // Unescaped ones really do collapse — matching the server matters more
+        // than being helpful.
+        assert_eq!(
+            form("LOAD DATA LOCAL INFILE 'C:\\data\\hd.csv' INTO TABLE t"),
+            MysqlLoadForm::Local("C:datahd.csv".to_string())
+        );
+        // ...unless the session is in NO_BACKSLASH_ESCAPES.
+        assert_eq!(
+            mysql_load_form("LOAD DATA LOCAL INFILE 'C:\\data\\hd.csv' INTO TABLE t", false),
+            MysqlLoadForm::Local("C:\\data\\hd.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn an_undecodable_local_path_is_refused_rather_than_run_empty() {
+        for sql in [
+            // Bind parameter — MySQL does not accept one here at all, and with
+            // no handler the import would silently land zero rows.
+            "LOAD DATA LOCAL INFILE ? INTO TABLE t",
+            "LOAD DATA LOCAL INFILE :filepath INTO TABLE t",
+            // Unterminated literal.
+            "LOAD DATA LOCAL INFILE '/tmp/x.csv INTO TABLE t",
+        ] {
+            assert_eq!(form(sql), MysqlLoadForm::LocalUnparsed, "{}", sql);
+        }
+    }
+}
+
 #[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
 fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
     let chars: Vec<char> = sql.chars().collect();
@@ -12650,8 +13011,12 @@ fn execute_mysql_on_conn(
 
         build_query_result(columns, rows, sql, return_type)
     } else {
-        conn.exec_drop(sql, &params)
-            .map_err(|e| map_err(e, "error"))?;
+        mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
+            MysqlMutationError::Server(e) => map_err(e, "error"),
+            MysqlMutationError::Refused(msg) => {
+                CfmlError::database(format!("queryExecute: {}", msg))
+            }
+        })?;
 
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
@@ -14417,8 +14782,14 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         }
         build_query_result(columns, rows, sql, return_type)
     } else {
-        conn.exec_drop(sql, &params)
-            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL error: {}", e)))?;
+        mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
+            MysqlMutationError::Server(e) => {
+                CfmlError::database(format!("queryExecute: MySQL error: {}", e))
+            }
+            MysqlMutationError::Refused(msg) => {
+                CfmlError::database(format!("queryExecute: {}", msg))
+            }
+        })?;
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
         build_mutation_result(affected, last_id, sql)
@@ -15053,10 +15424,39 @@ pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
     // positional over the FILTERED sequence, so this pass can't be fused into
     // the decode loop below (the `i + 2` / `i + 3` lookaheads need the filtered
     // length). One sized allocation instead of growth-by-doubling.
-    let mut chars: Vec<u8> = Vec::with_capacity(s.len());
-    chars.extend(s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' '));
+    // Fast path: base64 that carries no MIME wrapping (the common case — our own
+    // `toBase64`, JWT segments, a DiskStore blob) needs no filtered copy at all,
+    // so decode straight out of the borrowed input. Only genuinely wrapped input
+    // pays for the extra buffer.
+    let raw = s.as_bytes();
+    let needs_filter = raw.iter().any(|&b| b == b'\n' || b == b'\r' || b == b' ');
+    let filtered: Vec<u8>;
+    let chars: &[u8] = if needs_filter {
+        let mut c: Vec<u8> = Vec::with_capacity(raw.len());
+        c.extend(raw.iter().copied().filter(|&b| b != b'\n' && b != b'\r' && b != b' '));
+        filtered = c;
+        &filtered
+    } else {
+        raw
+    };
     let mut bytes = Vec::with_capacity(chars.len() / 4 * 3 + 3);
     let mut i = 0;
+    // Hot loop: every quad that carries no padding decodes to exactly three
+    // bytes with no per-byte branching. Padding can only appear in the FINAL
+    // quad, so this runs the whole input bar the tail; the general loop below
+    // then finishes from wherever this stopped. Splitting it out is worth ~30%:
+    // the general form re-tests `has2`/`has3` for every group in the input to
+    // serve a case only the last group can hit.
+    while i + 4 <= chars.len() {
+        let (c0, c1, c2, c3) = (chars[i], chars[i + 1], chars[i + 2], chars[i + 3]);
+        if c0 == b'=' || c1 == b'=' || c2 == b'=' || c3 == b'=' {
+            break;
+        }
+        let triple =
+            (b64_val(c0) << 18) | (b64_val(c1) << 12) | (b64_val(c2) << 6) | b64_val(c3);
+        bytes.extend_from_slice(&[(triple >> 16) as u8, (triple >> 8) as u8, triple as u8]);
+        i += 4;
+    }
     while i < chars.len() {
         if i + 1 >= chars.len() {
             break;
@@ -15181,171 +15581,502 @@ fn uu_decode(s: &str) -> Vec<u8> {
 
 // ==== CIPHER HELPERS ====
 
-fn cfmx_compat_encrypt(data: &[u8], key: &str) -> Vec<u8> {
-    // CFMX_COMPAT is a simple XOR cipher with a key-derived seed
-    let seed: u32 = key.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-    let mut rng = seed;
-    data.iter().map(|&b| {
-        rng = rng.wrapping_mul(214013).wrapping_add(2531011);
-        let keystream = ((rng >> 16) & 0xFF) as u8;
-        b ^ keystream
-    }).collect()
+/// Lucee's `lucee.runtime.crypt.CFMXCompat` — the three-LFSR stream cipher CFML
+/// has used for `CFMX_COMPAT` since CF MX, ported line for line from
+/// CFMXCompat.java. It is the DEFAULT algorithm for `encrypt()`/`decrypt()` when
+/// the caller names none, so its keystream has to be byte-identical to Lucee's:
+/// values encrypted by a Lucee-served request are sitting in application
+/// databases waiting to be read back by a RustCFML-served one.
+struct CfmxCompat {
+    lfsr_a: u32,
+    lfsr_b: u32,
+    lfsr_c: u32,
 }
 
-fn cfmx_compat_decrypt(data: &[u8], key: &str) -> Vec<u8> {
-    // XOR is symmetric, so decrypt = encrypt
-    cfmx_compat_encrypt(data, key)
-}
+impl CfmxCompat {
+    const MASK_A: u32 = 0x8000_0062;
+    const MASK_B: u32 = 0x4000_0020;
+    const MASK_C: u32 = 0x1000_0002;
+    const ROT0_A: u32 = 0x7fff_ffff;
+    const ROT0_B: u32 = 0x3fff_ffff;
+    const ROT0_C: u32 = 0x0fff_ffff;
+    const ROT1_A: u32 = 0x8000_0000;
+    const ROT1_B: u32 = 0xc000_0000;
+    const ROT1_C: u32 = 0xf000_0000;
 
-fn aes_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use aes::Aes128;
-    use aes::Aes192;
-    use aes::Aes256;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
+    /// Port of `setKey`. Two Java-isms are load-bearing and deliberately kept:
+    /// the seed array is sized from `"Default Seed"` when the key is empty but
+    /// *filled* from the original (still empty) key, so an empty key seeds from
+    /// NUL chars; and the seed is UTF-16 code units, not bytes, so a non-ASCII
+    /// key seeds per-char rather than per-byte.
+    fn new(key: &str) -> Self {
+        let mut lfsr_a: u32 = 0x1357_9bdf;
+        let mut lfsr_b: u32 = 0x2468_ace0;
+        let mut lfsr_c: u32 = 0xfdb9_7531;
 
-    let iv = vec![0u8; 16]; // Zero IV (CFML default)
+        let key_chars: Vec<u16> = key.encode_utf16().collect();
+        let sized_len = if key_chars.is_empty() {
+            "Default Seed".encode_utf16().count()
+        } else {
+            key_chars.len()
+        };
+        let mut seed = vec![0u16; sized_len.max(12)];
+        seed[..key_chars.len()].copy_from_slice(&key_chars);
 
-    match key.len() {
-        16 => {
-            let encryptor = Encryptor::<Aes128>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-128 init error: {}", e))?;
-            Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+        // Repeat the key over the first 12 seed chars.
+        let original_len = key_chars.len();
+        let mut i = 0;
+        while original_len + i < 12 {
+            seed[original_len + i] = seed[i];
+            i += 1;
         }
-        24 => {
-            let encryptor = Encryptor::<Aes192>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-192 init error: {}", e))?;
-            Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+
+        for i in 0..4 {
+            lfsr_a = (lfsr_a << 8) | seed[i + 4] as u32;
+            lfsr_b = (lfsr_b << 8) | seed[i + 4] as u32;
+            lfsr_c = (lfsr_c << 8) | seed[i + 4] as u32;
         }
-        32 => {
-            let encryptor = Encryptor::<Aes256>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-256 init error: {}", e))?;
-            Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+        if lfsr_a == 0 {
+            lfsr_a = 0x1357_9bdf;
         }
-        _ => Err(format!("Invalid AES key length: {} bytes (expected 16, 24, or 32)", key.len()))
+        if lfsr_b == 0 {
+            lfsr_b = 0x2468_ace0;
+        }
+        if lfsr_c == 0 {
+            lfsr_c = 0xfdb9_7531;
+        }
+
+        Self { lfsr_a, lfsr_b, lfsr_c }
+    }
+
+    /// Port of `transformByte`. The shifts are Java's `>>>` (logical), which is
+    /// what `u32 >>` already is.
+    fn transform_byte(&mut self, target: u8) -> u8 {
+        let mut crypto: u8 = 0;
+        let mut b = self.lfsr_b & 1;
+        let mut c = self.lfsr_c & 1;
+        for _ in 0..8 {
+            if self.lfsr_a & 1 != 0 {
+                self.lfsr_a = (self.lfsr_a ^ (Self::MASK_A >> 1)) | Self::ROT1_A;
+                if self.lfsr_b & 1 != 0 {
+                    self.lfsr_b = (self.lfsr_b ^ (Self::MASK_B >> 1)) | Self::ROT1_B;
+                    b = 1;
+                } else {
+                    self.lfsr_b = (self.lfsr_b >> 1) & Self::ROT0_B;
+                    b = 0;
+                }
+            } else {
+                self.lfsr_a = (self.lfsr_a >> 1) & Self::ROT0_A;
+                if self.lfsr_c & 1 != 0 {
+                    self.lfsr_c = (self.lfsr_c ^ (Self::MASK_C >> 1)) | Self::ROT1_C;
+                    c = 1;
+                } else {
+                    self.lfsr_c = (self.lfsr_c >> 1) & Self::ROT0_C;
+                    c = 0;
+                }
+            }
+            crypto = (crypto << 1) | ((b ^ c) as u8 & 1);
+        }
+        target ^ crypto
+    }
+
+    /// The cipher is a keystream XOR, so encrypt and decrypt are the same pass.
+    /// Lucee builds a fresh `CFMXCompat` per call; so do we (`new` per transform).
+    fn transform(key: &str, data: &[u8]) -> Vec<u8> {
+        let mut state = Self::new(key);
+        data.iter().map(|&b| state.transform_byte(b)).collect()
     }
 }
 
-fn aes_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use aes::Aes128;
-    use aes::Aes192;
-    use aes::Aes256;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
+/// `CFMXCompat.isCfmxCompat` — an empty/blank algorithm means CFMX_COMPAT too.
+fn is_cfmx_compat(algorithm: &str) -> bool {
+    algorithm.trim().is_empty() || algorithm.eq_ignore_ascii_case("cfmx_compat")
+}
 
-    let iv = vec![0u8; 16];
+/// The block ciphers `encrypt()`/`decrypt()` can drive, with the key rules Lucee
+/// applies to each (`Cryptor.getTargetKeyLength` + its `isValidLength` checks).
+#[derive(Clone, Copy, PartialEq)]
+enum BlockAlgo {
+    Aes,
+    Des,
+    DesEde,
+    Blowfish,
+}
 
-    match key.len() {
-        16 => {
-            let decryptor = Decryptor::<Aes128>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-128 init error: {}", e))?;
-            decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                .map_err(|e| format!("AES decryption error: {}", e))
+impl BlockAlgo {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "AES" => Some(Self::Aes),
+            "DES" => Some(Self::Des),
+            "DESEDE" | "DESEDE3" | "TRIPLEDES" => Some(Self::DesEde),
+            "BLOWFISH" => Some(Self::Blowfish),
+            _ => None,
         }
-        24 => {
-            let decryptor = Decryptor::<Aes192>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-192 init error: {}", e))?;
-            decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                .map_err(|e| format!("AES decryption error: {}", e))
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Aes => "AES",
+            Self::Des => "DES",
+            Self::DesEde => "DESEDE",
+            Self::Blowfish => "BLOWFISH",
         }
-        32 => {
-            let decryptor = Decryptor::<Aes256>::new_from_slices(key, &iv)
-                .map_err(|e| format!("AES-256 init error: {}", e))?;
-            decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                .map_err(|e| format!("AES decryption error: {}", e))
+    }
+
+    fn block_size(self) -> usize {
+        match self {
+            Self::Aes => 16,
+            _ => 8,
         }
-        _ => Err(format!("Invalid AES key length: {} bytes", key.len()))
+    }
+
+    /// `Cryptor.getTargetKeyLength` — the length a raw (non-base64) key is
+    /// padded or truncated to.
+    fn target_key_len(self) -> usize {
+        match self {
+            Self::Aes => 16,
+            Self::Des => 8,
+            Self::DesEde => 24,
+            Self::Blowfish => 16,
+        }
+    }
+
+    /// Whether a base64-decoded key is usable as-is for this algorithm.
+    fn accepts_key_len(self, len: usize) -> bool {
+        match self {
+            Self::Aes => matches!(len, 16 | 24 | 32),
+            Self::Des => len == 8,
+            Self::DesEde => len == 16 || len == 24,
+            Self::Blowfish => (4..=56).contains(&len),
+        }
     }
 }
 
-fn des_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::Des;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
+#[derive(Clone, Copy, PartialEq)]
+enum CipherMode {
+    Ecb,
+    Cbc,
+}
 
-    if key.len() != 8 {
-        return Err(format!("DES key must be 8 bytes, got {}", key.len()));
+/// A parsed JCE transformation string — `AES`, `AES/CBC/PKCS5Padding`, ...
+/// A bare algorithm name is ECB, because that is what `Cipher.getInstance("AES")`
+/// resolves to on the JVM. (RustCFML used to read a bare `AES` as CBC with a zero
+/// IV, which agrees with ECB for the first block only and silently produced
+/// undecryptable ciphertext for anything longer.)
+struct Transformation {
+    algo: BlockAlgo,
+    mode: CipherMode,
+    padded: bool,
+}
+
+impl Transformation {
+    fn parse(spec: &str, verb: &str) -> Result<Self, CfmlError> {
+        let upper = spec.to_uppercase();
+        let mut parts = upper.split('/');
+        let algo_name = parts.next().unwrap_or("");
+        let algo = BlockAlgo::parse(algo_name).ok_or_else(|| {
+            CfmlError::runtime(format!("Unsupported {} algorithm: {}", verb, upper))
+        })?;
+        let mode = match parts.next() {
+            None | Some("") | Some("ECB") => CipherMode::Ecb,
+            Some("CBC") => CipherMode::Cbc,
+            Some(other) => {
+                return Err(CfmlError::runtime(format!(
+                    "Unsupported {} mode [{}] in [{}]: RustCFML implements ECB and CBC",
+                    verb, other, upper
+                )))
+            }
+        };
+        let padded = match parts.next() {
+            None | Some("") | Some("PKCS5PADDING") | Some("PKCS7PADDING") => true,
+            Some("NOPADDING") => false,
+            Some(other) => {
+                return Err(CfmlError::runtime(format!(
+                    "Unsupported {} padding [{}] in [{}]: RustCFML implements \
+                     PKCS5Padding, PKCS7Padding and NoPadding",
+                    verb, other, upper
+                )))
+            }
+        };
+        Ok(Self { algo, mode, padded })
     }
-    let iv = [0u8; 8];
-    let encryptor = Encryptor::<Des>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DES init error: {}", e))?;
-    Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
 }
 
-fn des_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::Des;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    if key.len() != 8 {
-        return Err(format!("DES key must be 8 bytes, got {}", key.len()));
+/// Lucee's `Base64Coder`/`Base64Encoder.decode(data, precise)`. With `precise`
+/// (the default for encrypt/decrypt) the string is validated before decoding and
+/// the failures arrive as `lucee.runtime.coder.CoderException`, which is what
+/// CFML code catches by type.
+fn lucee_base64_decode(data: &str, precise: bool) -> Result<Vec<u8>, CfmlError> {
+    let coder_error = |msg: String| {
+        CfmlError::new(
+            msg,
+            CfmlErrorType::Custom("lucee.runtime.coder.CoderException".to_string()),
+        )
+    };
+    if data.is_empty() {
+        return Ok(Vec::new());
     }
-    let iv = [0u8; 8];
-    let decryptor = Decryptor::<Des>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DES init error: {}", e))?;
-    decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-        .map_err(|e| format!("DES decryption error: {}", e))
-}
-
-fn desede_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::TdesEde3;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    if key.len() != 24 {
-        return Err(format!("DESEDE key must be 24 bytes, got {}", key.len()));
+    if precise {
+        let chars: Vec<char> = data.chars().collect();
+        let len = chars.len();
+        if len % 4 != 0 {
+            return Err(coder_error(format!(
+                "cannot convert the input to a binary, invalid length ({}) of the string",
+                len
+            )));
+        }
+        // Lucee scans BACKWARDS: trailing padding first, then the body — so the
+        // reported position is the LAST offending character, not the first.
+        let mut i = len as isize - 1;
+        let mut padding = 0;
+        while i >= 0 && chars[i as usize] == '=' {
+            padding += 1;
+            i -= 1;
+        }
+        if padding > 3 {
+            return Err(coder_error(format!(
+                "invalid padding length [{}], maximal length is [3]",
+                padding
+            )));
+        }
+        while i >= 0 {
+            let c = chars[i as usize];
+            let ok = c.is_ascii_alphanumeric() || c == '+' || c == '/';
+            if !ok {
+                return Err(coder_error(format!(
+                    "invalid character [{}] in base64 string at position [{}]",
+                    c,
+                    i + 1
+                )));
+            }
+            i -= 1;
+        }
     }
-    let iv = [0u8; 8];
-    let encryptor = Encryptor::<TdesEde3>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DESEDE init error: {}", e))?;
-    Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
-}
-
-fn desede_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use des::TdesEde3;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    if key.len() != 24 {
-        return Err(format!("DESEDE key must be 24 bytes, got {}", key.len()));
+    let decoded = base64_decode_bytes(data);
+    if decoded.is_empty() {
+        return Err(coder_error(
+            "cannot convert the input to a binary".to_string(),
+        ));
     }
-    let iv = [0u8; 8];
-    let decryptor = Decryptor::<TdesEde3>::new_from_slices(key, &iv)
-        .map_err(|e| format!("DESEDE init error: {}", e))?;
-    decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-        .map_err(|e| format!("DESEDE decryption error: {}", e))
+    Ok(decoded)
 }
 
-fn blowfish_cbc_encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use blowfish::Blowfish;
-    use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
-    use cbc::cipher::KeyIvInit;
+/// `Cryptor._crypt`'s key resolution for AES/DES/DESEDE/BLOWFISH.
+///
+/// A key of 8 characters or more is treated as base64 and must decode to a
+/// length the algorithm accepts. Anything shorter — or, when `precise` is false,
+/// anything that fails those checks — is taken as raw UTF-8 bytes, then padded
+/// with NULs or truncated to the algorithm's target length.
+///
+/// Not ported: the two ACF-bug-compat retries in `Cryptor.crypt` (double a
+/// 4-character key; drop the last 4 characters on "Illegal key size"). Both fire
+/// only on JCE policy messages that a pure-Rust cipher never produces, so there
+/// is nothing here for them to catch.
+fn resolve_cipher_key(key: &str, algo: BlockAlgo, precise: bool) -> Result<Vec<u8>, CfmlError> {
+    let raw_key = || {
+        let mut bytes = key.as_bytes().to_vec();
+        bytes.resize(algo.target_key_len(), 0);
+        bytes
+    };
 
-    let iv = [0u8; 8];
-    let encryptor = Encryptor::<Blowfish>::new_from_slices(key, &iv)
-        .map_err(|e| format!("Blowfish init error: {}", e))?;
-    Ok(encryptor.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext))
+    // Lucee's `looksLikeBase64` regex ends in `.*`, so it matches any string;
+    // the length check is the only part that actually decides.
+    if key.encode_utf16().count() < 8 {
+        return Ok(raw_key());
+    }
+
+    match lucee_base64_decode(key, precise) {
+        Ok(decoded) if algo.accepts_key_len(decoded.len()) => Ok(decoded),
+        Ok(decoded) => {
+            if precise {
+                // Lucee raises a bare java.lang.RuntimeException here.
+                Err(CfmlError::new(
+                    format!(
+                        "Invalid key length for {}: {} bytes",
+                        algo.label(),
+                        decoded.len()
+                    ),
+                    CfmlErrorType::Custom("java.lang.RuntimeException".to_string()),
+                ))
+            } else {
+                Ok(raw_key())
+            }
+        }
+        Err(e) => {
+            if precise {
+                Err(e)
+            } else {
+                Ok(raw_key())
+            }
+        }
+    }
 }
 
-fn blowfish_cbc_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    use blowfish::Blowfish;
-    use cbc::Decryptor;
-    use cbc::cipher::BlockDecryptMut;
-    use cbc::cipher::KeyIvInit;
-
-    let iv = [0u8; 8];
-    let decryptor = Decryptor::<Blowfish>::new_from_slices(key, &iv)
-        .map_err(|e| format!("Blowfish init error: {}", e))?;
-    decryptor.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-        .map_err(|e| format!("Blowfish decryption error: {}", e))
+fn pkcs_pad(data: &[u8], block: usize) -> Vec<u8> {
+    let pad = block - (data.len() % block);
+    let mut out = data.to_vec();
+    out.extend(std::iter::repeat(pad as u8).take(pad));
+    out
 }
+
+fn pkcs_unpad(mut data: Vec<u8>, block: usize) -> Result<Vec<u8>, String> {
+    let pad = *data.last().ok_or_else(|| "Given final block not properly padded".to_string())? as usize;
+    if pad == 0 || pad > block || pad > data.len() {
+        return Err("Given final block not properly padded".to_string());
+    }
+    let keep = data.len() - pad;
+    if data[keep..].iter().any(|&b| b as usize != pad) {
+        return Err("Given final block not properly padded".to_string());
+    }
+    data.truncate(keep);
+    Ok(data)
+}
+
+/// Generate the ECB/CBC pair for one concrete block cipher. A macro rather than a
+/// generic function because the RustCrypto `BlockEncrypt`/`KeyIvInit` bounds
+/// differ per mode and would have to be spelled out three times anyway.
+macro_rules! block_cipher_ops {
+    ($name:ident, $cipher:ty) => {
+        fn $name(
+            t: &Transformation,
+            key: &[u8],
+            iv: &[u8],
+            data: &[u8],
+            encrypt: bool,
+        ) -> Result<Vec<u8>, String> {
+            use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, KeyIvInit};
+            use cbc::cipher::{BlockDecryptMut, BlockEncryptMut};
+            let block = t.algo.block_size();
+
+            if !t.padded && data.len() % block != 0 {
+                return Err(format!(
+                    "Input length not multiple of {} bytes",
+                    block
+                ));
+            }
+
+            match t.mode {
+                CipherMode::Ecb => {
+                    let cipher = <$cipher>::new_from_slice(key)
+                        .map_err(|e| format!("{} init error: {}", t.algo.label(), e))?;
+                    if encrypt {
+                        let mut out = if t.padded { pkcs_pad(data, block) } else { data.to_vec() };
+                        for chunk in out.chunks_mut(block) {
+                            cipher.encrypt_block(chunk.into());
+                        }
+                        Ok(out)
+                    } else {
+                        let mut out = data.to_vec();
+                        for chunk in out.chunks_mut(block) {
+                            cipher.decrypt_block(chunk.into());
+                        }
+                        if t.padded { pkcs_unpad(out, block) } else { Ok(out) }
+                    }
+                }
+                CipherMode::Cbc => {
+                    if encrypt {
+                        let enc = cbc::Encryptor::<$cipher>::new_from_slices(key, iv)
+                            .map_err(|e| format!("{} init error: {}", t.algo.label(), e))?;
+                        if t.padded {
+                            Ok(enc.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(data))
+                        } else {
+                            Ok(enc.encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(data))
+                        }
+                    } else {
+                        let dec = cbc::Decryptor::<$cipher>::new_from_slices(key, iv)
+                            .map_err(|e| format!("{} init error: {}", t.algo.label(), e))?;
+                        if t.padded {
+                            dec.decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(data)
+                                .map_err(|e| format!("{} decryption error: {}", t.algo.label(), e))
+                        } else {
+                            dec.decrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(data)
+                                .map_err(|e| format!("{} decryption error: {}", t.algo.label(), e))
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+block_cipher_ops!(cipher_ops_aes128, aes::Aes128);
+block_cipher_ops!(cipher_ops_aes192, aes::Aes192);
+block_cipher_ops!(cipher_ops_aes256, aes::Aes256);
+block_cipher_ops!(cipher_ops_des, des::Des);
+block_cipher_ops!(cipher_ops_desede, des::TdesEde3);
+block_cipher_ops!(cipher_ops_blowfish, blowfish::Blowfish);
+
+/// Run one block-cipher operation, picking the concrete cipher from the key
+/// length the way JCE picks an AES/DESede variant from the SecretKeySpec.
+fn run_block_cipher(
+    t: &Transformation,
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+    encrypt: bool,
+) -> Result<Vec<u8>, CfmlError> {
+    let result = match t.algo {
+        BlockAlgo::Aes => match key.len() {
+            16 => cipher_ops_aes128(t, key, iv, data, encrypt),
+            24 => cipher_ops_aes192(t, key, iv, data, encrypt),
+            32 => cipher_ops_aes256(t, key, iv, data, encrypt),
+            other => Err(format!(
+                "Invalid AES key length: {} bytes (expected 16, 24, or 32)",
+                other
+            )),
+        },
+        BlockAlgo::Des => cipher_ops_des(t, key, iv, data, encrypt),
+        BlockAlgo::DesEde => {
+            // JCE accepts a 16-byte DESede key as the two-key form (K1 K2 K1).
+            let mut full = key.to_vec();
+            if full.len() == 16 {
+                full.extend_from_slice(&key[..8]);
+            }
+            cipher_ops_desede(t, &full, iv, data, encrypt)
+        }
+        BlockAlgo::Blowfish => cipher_ops_blowfish(t, key, iv, data, encrypt),
+    };
+    result.map_err(CfmlError::runtime)
+}
+
+/// The `ivOrSalt` argument: absent/null means "none", a binary value is used as
+/// bytes and any other simple value as its UTF-8 bytes (Lucee's `Decision`
+/// branch in Encrypt/Decrypt).
+fn cipher_iv_arg(args: &[CfmlValue]) -> Option<Vec<u8>> {
+    match args.get(4) {
+        None | Some(CfmlValue::Null) => None,
+        Some(CfmlValue::Binary(b)) => Some(b.clone()),
+        Some(other) => Some(other.as_string().into_bytes()),
+    }
+}
+
+/// The `precise` argument (7th) — defaults to true, as every Lucee
+/// `Encrypt`/`Decrypt` overload passes.
+fn cipher_precise_arg(args: &[CfmlValue]) -> bool {
+    match args.get(6) {
+        None | Some(CfmlValue::Null) => true,
+        Some(v) => v.is_true(),
+    }
+}
+
+/// A fresh random IV for a feedback-mode encrypt with no caller-supplied IV.
+#[cfg(feature = "security")]
+fn random_iv(len: usize) -> Result<Vec<u8>, CfmlError> {
+    use rand::RngCore;
+    let mut iv = vec![0u8; len];
+    rand::rngs::OsRng.fill_bytes(&mut iv);
+    Ok(iv)
+}
+
+#[cfg(not(feature = "security"))]
+fn random_iv(_len: usize) -> Result<Vec<u8>, CfmlError> {
+    Err(CfmlError::runtime(
+        "A feedback-mode cipher (e.g. AES/CBC) with no explicit IV needs a secure \
+         random source: rebuild with the `security` feature, or pass an IV."
+            .to_string(),
+    ))
+}
+
 
 // ==== SECURITY BUILTIN FUNCTIONS ====
 
@@ -15691,45 +16422,53 @@ fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(base64_encode_bytes(&key_bytes)))
 }
 
+/// `encrypt( input, key [, algorithm [, encoding [, ivOrSalt [, iterations
+/// [, precise ]]]]] )`.
+///
+/// The algorithm defaults to CFMX_COMPAT, NOT AES — Lucee's
+/// `Cryptor.DEFAULT_ALGORITHM`. Getting this wrong made a two-argument
+/// `Encrypt( value, "somekey" )` (Preside's crm-base config does exactly that at
+/// boot) fail with "Invalid AES key length: 12 bytes", because a 16-character
+/// passphrase base64-decodes to 12 bytes.
 fn fn_encrypt(args: Vec<CfmlValue>) -> CfmlResult {
     let plaintext = get_str(&args, 0);
-    let key_b64 = get_str(&args, 1);
-    let algorithm = if args.len() >= 3 {
-        get_str(&args, 2).to_uppercase()
-    } else {
-        "AES".to_string()
-    };
+    let key = get_str(&args, 1);
+    let algorithm = if args.len() >= 3 { get_str(&args, 2) } else { String::new() };
     let encoding = if args.len() >= 4 {
         get_str(&args, 3).to_uppercase()
     } else {
         "UU".to_string()
     };
 
-    let ciphertext = if algorithm == "CFMX_COMPAT" {
-        cfmx_compat_encrypt(plaintext.as_bytes(), &key_b64)
+    let ciphertext = if is_cfmx_compat(&algorithm) {
+        CfmxCompat::transform(&key, plaintext.as_bytes())
     } else {
-        let key_bytes = base64_decode_bytes(&key_b64);
-        let plaintext_bytes = plaintext.as_bytes();
+        let t = Transformation::parse(&algorithm, "encryption")?;
+        let precise = cipher_precise_arg(&args);
+        let key_bytes = resolve_cipher_key(&key, t.algo, precise)?;
+        let block = t.algo.block_size();
 
-        match algorithm.as_str() {
-            "AES" | "AES/CBC/PKCS5PADDING" | "AES/CBC/PKCS7PADDING" => {
-                aes_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "DES" | "DES/CBC/PKCS5PADDING" => {
-                des_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "DESEDE" | "DESEDE/CBC/PKCS5PADDING" => {
-                desede_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "BLOWFISH" | "BLOWFISH/CBC/PKCS5PADDING" => {
-                blowfish_cbc_encrypt(plaintext_bytes, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            _ => return Err(CfmlError::runtime(format!("Unsupported encryption algorithm: {}", algorithm)))
+        // Lucee prepends a generated IV to the ciphertext, and ONLY then — an IV
+        // the caller supplied is theirs to keep track of.
+        let (iv, prefix_iv) = match (cipher_iv_arg(&args), t.mode) {
+            (Some(iv), _) => (iv, false),
+            (None, CipherMode::Cbc) => (random_iv(block)?, true),
+            (None, CipherMode::Ecb) => (Vec::new(), false),
+        };
+        if t.mode != CipherMode::Ecb && iv.len() != block {
+            return Err(CfmlError::runtime(format!(
+                "Wrong IV length: must be {} bytes long",
+                block
+            )));
         }
+
+        let mut out = run_block_cipher(&t, &key_bytes, &iv, plaintext.as_bytes(), true)?;
+        if prefix_iv {
+            let mut with_iv = iv;
+            with_iv.append(&mut out);
+            out = with_iv;
+        }
+        out
     };
 
     let encoded = match encoding.as_str() {
@@ -15742,56 +16481,66 @@ fn fn_encrypt(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(encoded))
 }
 
+/// `decrypt( input, key [, algorithm [, encoding [, ivOrSalt [, iterations
+/// [, precise ]]]]] )` — the inverse of [`fn_encrypt`], sharing its defaults.
 fn fn_decrypt(args: Vec<CfmlValue>) -> CfmlResult {
     let encoded_str = get_str(&args, 0);
-    let key_b64 = get_str(&args, 1);
-    let algorithm = if args.len() >= 3 {
-        get_str(&args, 2).to_uppercase()
-    } else {
-        "AES".to_string()
-    };
+    let key = get_str(&args, 1);
+    let algorithm = if args.len() >= 3 { get_str(&args, 2) } else { String::new() };
     let encoding = if args.len() >= 4 {
         get_str(&args, 3).to_uppercase()
     } else {
         "UU".to_string()
     };
+    let precise = cipher_precise_arg(&args);
 
     let ciphertext = match encoding.as_str() {
         "UU" => uu_decode(&encoded_str),
-        "BASE64" => base64_decode_bytes(&encoded_str),
-        "HEX" => hex_decode(&encoded_str).map_err(|e| CfmlError::runtime(e))?,
+        "BASE64" => lucee_base64_decode(&encoded_str, precise)?,
+        "HEX" => hex_decode(&encoded_str).map_err(CfmlError::runtime)?,
         _ => return Err(CfmlError::runtime(format!("Unsupported encoding: {}", encoding)))
     };
 
-    let plaintext_bytes = if algorithm == "CFMX_COMPAT" {
-        cfmx_compat_decrypt(&ciphertext, &key_b64)
+    let plaintext_bytes = if is_cfmx_compat(&algorithm) {
+        CfmxCompat::transform(&key, &ciphertext)
     } else {
-        let key_bytes = base64_decode_bytes(&key_b64);
+        let t = Transformation::parse(&algorithm, "decryption")?;
+        let key_bytes = resolve_cipher_key(&key, t.algo, precise)?;
+        let block = t.algo.block_size();
 
-        match algorithm.as_str() {
-            "AES" | "AES/CBC/PKCS5PADDING" | "AES/CBC/PKCS7PADDING" => {
-                aes_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
+        // With no caller-supplied IV a feedback-mode ciphertext carries its IV in
+        // the leading block, exactly where encrypt put it.
+        let (iv, body) = match (cipher_iv_arg(&args), t.mode) {
+            (Some(iv), _) => (iv, ciphertext.as_slice()),
+            (None, CipherMode::Cbc) => {
+                if ciphertext.len() < block {
+                    return Err(CfmlError::runtime(format!(
+                        "Input too short: a {} ciphertext carries its {}-byte IV in the \
+                         first block",
+                        t.algo.label(),
+                        block
+                    )));
+                }
+                (ciphertext[..block].to_vec(), &ciphertext[block..])
             }
-            "DES" | "DES/CBC/PKCS5PADDING" => {
-                des_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "DESEDE" | "DESEDE/CBC/PKCS5PADDING" => {
-                desede_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            "BLOWFISH" | "BLOWFISH/CBC/PKCS5PADDING" => {
-                blowfish_cbc_decrypt(&ciphertext, &key_bytes)
-                    .map_err(|e| CfmlError::runtime(e))?
-            }
-            _ => return Err(CfmlError::runtime(format!("Unsupported decryption algorithm: {}", algorithm)))
+            (None, CipherMode::Ecb) => (Vec::new(), ciphertext.as_slice()),
+        };
+        if t.mode != CipherMode::Ecb && iv.len() != block {
+            return Err(CfmlError::runtime(format!(
+                "Wrong IV length: must be {} bytes long",
+                block
+            )));
         }
+
+        run_block_cipher(&t, &key_bytes, &iv, body, false)?
     };
 
-    let result = String::from_utf8(plaintext_bytes)
-        .map_err(|e| CfmlError::runtime(format!("Decrypted data is not valid UTF-8: {}", e)))?;
-    Ok(CfmlValue::string(result))
+    // Lucee builds the result with `new String(bytes, charset)`, which SUBSTITUTES
+    // U+FFFD for undecodable bytes rather than throwing — code that probes a key
+    // by decrypting and comparing depends on getting a (wrong) string back.
+    Ok(CfmlValue::string(
+        String::from_utf8_lossy(&plaintext_bytes).into_owned(),
+    ))
 }
 
 // ==== SYSTEM FUNCTIONS ====
@@ -17575,6 +18324,13 @@ fn fn_cfloop_file_lines_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfloop_file_lines requires VM intercept".into()))
 }
 
+/// The `loop file=` streaming cursor trio (GH #367). Genuinely unusable outside
+/// the VM — the cursor lives in VM state — so the stub is an error rather than a
+/// standalone implementation.
+fn fn_cfloop_file_cursor_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("cfloop file cursor requires VM intercept".into()))
+}
+
 fn fn_cfexecute_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfexecute requires VM intercept".into()))
 }
@@ -19066,9 +19822,22 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
     use zip::write::SimpleFileOptions;
     use std::io::{Read, Write, Cursor};
 
-    let opts = match args.into_iter().next() {
+    let mut args_iter = args.into_iter();
+    let opts = match args_iter.next() {
         Some(CfmlValue::Struct(s)) => s,
         _ => return Err(CfmlError::runtime("cfzip requires a struct argument".into())),
+    };
+    // Second argument: the `<cfzipparam>` / `cfzipparam(...)` entries collected
+    // by the tag or script body, each a struct of that child tag's attributes.
+    let params: Vec<ValueMap> = match args_iter.next() {
+        Some(CfmlValue::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                CfmlValue::Struct(s) => Some(s.snapshot()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     };
 
     let action = opts.get("action").map(|v| v.as_string().to_lowercase()).unwrap_or_else(|| "zip".to_string());
@@ -19085,13 +19854,84 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
     match action.as_str() {
         "zip" => {
-            if file_path.is_empty() || source.is_empty() {
-                return Err(CfmlError::runtime("cfzip action=zip requires file and source attributes".into()));
+            if file_path.is_empty() || (source.is_empty() && params.is_empty()) {
+                return Err(CfmlError::runtime(
+                    "cfzip action=zip requires a file attribute and either a source \
+                     attribute or at least one cfzipparam".into(),
+                ));
             }
             let out_file = std::fs::File::create(&file_path)
                 .map_err(|e| CfmlError::runtime(format!("cfzip: cannot create file '{}': {}", file_path, e)))?;
             let mut zip_writer = zip::ZipWriter::new(out_file);
             let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+            // Each cfzipparam contributes its own source (file or directory) with
+            // its own prefix/entrypath/filter/recurse, or literal `content`
+            // written at `entrypath`. Params are added BEFORE the tag-level
+            // `source`, matching the document order of the child tags.
+            for p in &params {
+                let p_str = |k: &str| p.get(k).map(|v| v.as_string()).unwrap_or_default();
+                let p_entry = p_str("entrypath");
+                let p_prefix = p_str("prefix");
+                let p_filter = p_str("filter");
+                let p_recurse = p.get("recurse").map(|v| v.is_true()).unwrap_or(recurse);
+                if let Some(content) = p.get("content") {
+                    // Literal content — `entrypath` names it inside the archive.
+                    let name = if p_entry.is_empty() {
+                        return Err(CfmlError::runtime(
+                            "cfzipparam with content requires an entrypath".into(),
+                        ));
+                    } else {
+                        p_entry.clone()
+                    };
+                    let bytes = match content {
+                        CfmlValue::Binary(b) => b.clone(),
+                        other => other.as_string().into_bytes(),
+                    };
+                    zip_writer.start_file(&name, options).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    zip_writer.write_all(&bytes).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    continue;
+                }
+                let p_source = p_str("source");
+                if p_source.is_empty() {
+                    return Err(CfmlError::runtime(
+                        "cfzipparam requires a source or content attribute".into(),
+                    ));
+                }
+                let sp = std::path::Path::new(&p_source);
+                if sp.is_dir() {
+                    cfzip_add_directory(&mut zip_writer, sp, sp, &options, p_recurse, store_path, &p_prefix, &p_filter)?;
+                } else if sp.is_file() {
+                    // `entrypath` names the entry outright; otherwise the file
+                    // name, under `prefix` when one is given.
+                    let name = if !p_entry.is_empty() {
+                        p_entry.clone()
+                    } else {
+                        let base = sp.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if p_prefix.is_empty() {
+                            base
+                        } else {
+                            format!("{}/{}", p_prefix.trim_end_matches('/'), base)
+                        }
+                    };
+                    let mut f = std::fs::File::open(sp)
+                        .map_err(|e| CfmlError::runtime(format!("cfzip: cannot read '{}': {}", p_source, e)))?;
+                    let mut buf = Vec::new();
+                    f.read_to_end(&mut buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    zip_writer.start_file(&name, options).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    zip_writer.write_all(&buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                } else {
+                    return Err(CfmlError::runtime(format!(
+                        "cfzip: cfzipparam source '{}' does not exist",
+                        p_source
+                    )));
+                }
+            }
+
+            if source.is_empty() {
+                zip_writer.finish().map_err(|e| CfmlError::runtime(e.to_string()))?;
+                return Ok(CfmlValue::Null);
+            }
 
             let source_path = std::path::Path::new(&source);
             if source_path.is_dir() {
@@ -19114,6 +19954,12 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
             zip_writer.finish().map_err(|e| CfmlError::runtime(e.to_string()))?;
             Ok(CfmlValue::Null)
         }
+        // A cfzipparam on any other action would be silently dropped, so refuse
+        // it: those forms (per-entry unzip/delete filters) are not implemented.
+        _ if !params.is_empty() => Err(CfmlError::runtime(format!(
+            "cfzipparam is only supported for action=\"zip\"; action=\"{}\" ignores it",
+            action
+        ))),
         "unzip" => {
             if file_path.is_empty() || destination.is_empty() {
                 return Err(CfmlError::runtime("cfzip action=unzip requires file and destination attributes".into()));

@@ -49,7 +49,7 @@ http-body-util = "0.1"
 httpdate = "1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal", "fs"] }
 regex = "1"
 multer = "3"
 uuid = { version = "1", features = ["v4"] }

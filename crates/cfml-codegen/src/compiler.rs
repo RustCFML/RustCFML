@@ -5,6 +5,10 @@ pub use cfml_common::name::Name;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// Per-`loop file=` id, so the synthesised handle/line temporaries are unique
+/// across nested and sibling file loops.
+static NEXT_FILE_LOOP_ID: AtomicU32 = AtomicU32::new(0);
+
 /// Process-global monotonic counter assigning every compiled `BytecodeFunction`
 /// a unique, stable `global_id`. The id is stable for the lifetime of a cached
 /// program (the VM's bytecode cache reuses the same `Arc`s), so a stored
@@ -206,6 +210,15 @@ pub struct BytecodeFunction {
     /// per-request cache shared it within a request: the marker is filtered
     /// from user-visible introspection, so nothing can mutate it.
     pub params_marker: std::sync::OnceLock<cfml_common::dynamic::CfmlValue>,
+    /// The `__cfc_body__` variant of this function: a CFC's `__main__` renamed
+    /// and flagged as a template frame, which is what the pseudo-constructor
+    /// actually executes. Built ONCE per process, same rationale as the
+    /// `OnceLock`s above. Previously every single component construction did
+    /// `(*cfc_func).clone()` — a full deep copy of the instruction `Vec` (and
+    /// every other field) purely to change a name and set one `bool`, then
+    /// dropped it again on return. `new Expectation()` in TestBox's `expect()`
+    /// paid that per assertion.
+    pub cfc_body: std::sync::OnceLock<std::sync::Arc<BytecodeFunction>>,
     /// Which params are required (parallel to `params`; true = required)
     pub required_params: Vec<bool>,
     /// Which params declare a default value (parallel to `params`; true = has
@@ -1548,6 +1561,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: Vec::new(),
@@ -1729,6 +1743,32 @@ impl CfmlCompiler {
         instructions.shrink_to_fit();
         let main = Arc::get_mut(&mut self.program.functions[0]).unwrap();
         main.instructions = instructions;
+        // A component's PSEUDO-CONSTRUCTOR is this `__main__` body (the VM clones
+        // it as `__cfc_body__`), so `<cfcomponent output="false">` has to reach it
+        // the same way `<cffunction output="false">` reaches a method: as an
+        // `output` entry in the frame's metadata, which `finalize()` turns into
+        // `output_suppressed`. Without this the component attribute was parsed,
+        // stored in `__metadata`, and then ignored at execution — every
+        // instantiation of a TAG-BASED CFC emitted its own inter-tag whitespace
+        // into the response. Lucee emits nothing for `output="false"` and leaks
+        // the whitespace for `output="true"`/no attribute (verified against
+        // 7.1.0+204), which is exactly what this reproduces. Component metadata
+        // keys are lower-cased by the tag preprocessor and the script parser, but
+        // compare loosely anyway — the same shape a method's `finalize()` accepts.
+        if let Some(CfmlNode::Statement(Statement::ComponentDecl(cd))) = ast
+            .statements
+            .iter()
+            .find(|n| matches!(n, CfmlNode::Statement(Statement::ComponentDecl(_))))
+        {
+            if let Some((k, v)) = cd
+                .component
+                .metadata
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("output"))
+            {
+                main.metadata.push((k.clone(), v.clone()));
+            }
+        }
         main.finalize();
         self.program.functions.shrink_to_fit();
 
@@ -3601,7 +3641,167 @@ impl CfmlCompiler {
         }
     }
 
+    /// `loop file="…" item="line"` — pump a VFS line cursor instead of
+    /// iterating a materialised array (GH #367).
+    ///
+    /// Synthesises this and compiles it through the ordinary statement path:
+    ///
+    /// ```text
+    ///   __filehandle_N = __cfloop_file_open(path);
+    ///   try {
+    ///       while (true) {
+    ///           __fileline_N = __cfloop_file_next(__filehandle_N);
+    ///           if (isNull(__fileline_N)) { break; }
+    ///           <loop variable> = __fileline_N;
+    ///           <body>
+    ///       }
+    ///   } finally {
+    ///       __cfloop_file_close(__filehandle_N);
+    ///   }
+    /// ```
+    ///
+    /// The `try`/`finally` is the whole reason this builds AST rather than
+    /// emitting the loop directly: a cursor holds an OS file descriptor, and
+    /// the body can leave through `return`, `break`, or a thrown exception as
+    /// well as by running out. Hand-emitted bytecode covered the first two and
+    /// leaked the descriptor on the third; `finally` covers all of them through
+    /// the same machinery that already stops `break` skipping a
+    /// `transaction {}` rollback (GH #308). The leak was not academic — a
+    /// function that returns from inside the loop leaks one descriptor per
+    /// call, so a few thousand calls in one request exhaust a default 1024-fd
+    /// limit and fail with EMFILE far from the cause.
+    ///
+    /// Null is the EOF sentinel. A line is always a string and a blank line is
+    /// `""`, so an interior empty line cannot end the loop early.
+    fn compile_for_in_file(
+        &mut self,
+        for_in: &ForIn,
+        path: &Expression,
+        instructions: &mut Vec<BytecodeOp>,
+    ) {
+        let loc = for_in.location;
+        // `__`-prefixed and suffixed with a per-loop id so nested file loops
+        // get distinct handles and neither name reaches the variables-scope
+        // writeback.
+        let uniq = NEXT_FILE_LOOP_ID.fetch_add(1, Ordering::Relaxed);
+        let handle = format!("__filehandle_{}", uniq);
+        let line = format!("__fileline_{}", uniq);
+
+        // A dotted loop variable (`item="ctx.item"`, `item="local.v"` — the
+        // lucee-spreadsheet lib does the latter) must become a MemberAccess
+        // chain, not an `Identifier` whose name literally contains a dot:
+        // codegen cannot resolve `ctx.item` as one opaque name and throws
+        // "Variable 'item' is undefined". Same construction the tag lowering
+        // uses for the other loop forms.
+        let ident = |n: &str| -> Expression {
+            match n.find('.') {
+                None => Expression::Identifier(Identifier {
+                    name: n.to_string(),
+                    location: loc,
+                }),
+                Some(pos) => {
+                    let mut expr = Expression::Identifier(Identifier {
+                        name: n[..pos].to_string(),
+                        location: loc,
+                    });
+                    for part in n[pos + 1..].split('.') {
+                        expr = Expression::MemberAccess(Box::new(MemberAccess {
+                            object: Box::new(expr),
+                            member: part.to_string(),
+                            null_safe: false,
+                            location: loc,
+                        }));
+                    }
+                    expr
+                }
+            }
+        };
+        let call = |n: &str, args: Vec<Expression>| {
+            Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: n.to_string(),
+                    location: loc,
+                })),
+                arguments: args,
+                location: loc,
+            }))
+        };
+        let assign = |target: Expression, value: Expression| {
+            Statement::Expression(ExpressionStatement {
+                expr: Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(target),
+                    operator: BinaryOpType::Assign,
+                    right: Box::new(value),
+                    location: loc,
+                })),
+                location: loc,
+            })
+        };
+
+        // __filehandle_N = __cfloop_file_open(path)
+        self.compile_statement(
+            &assign(ident(&handle), call("__cfloop_file_open", vec![path.clone()])),
+            instructions,
+        );
+
+        // while (true) { ... }
+        let mut while_body = vec![
+            assign(ident(&line), call("__cfloop_file_next", vec![ident(&handle)])),
+            Statement::If(If {
+                condition: call("isNull", vec![ident(&line)]),
+                then_branch: vec![Statement::Break(Break { label: None, location: loc })],
+                else_if: Vec::new(),
+                else_branch: None,
+                location: loc,
+            }),
+            // The loop variable is assigned exactly as the source spells it, so
+            // `item="local.x"` / `item="ctx.item"` route through the ordinary
+            // assignment path rather than a second implementation of it.
+            assign(ident(&for_in.variable), ident(&line)),
+        ];
+        while_body.extend(for_in.body.iter().cloned());
+
+        let loop_stmt = Statement::While(While {
+            condition: Expression::Literal(Literal {
+                value: LiteralValue::Bool(true),
+                location: loc,
+            }),
+            body: while_body,
+            location: loc,
+        });
+
+        // try { <loop> } finally { __cfloop_file_close(__filehandle_N) }
+        self.compile_statement(
+            &Statement::Try(Try {
+                body: vec![loop_stmt],
+                catches: Vec::new(),
+                finally_body: Some(vec![Statement::Expression(ExpressionStatement {
+                    expr: call("__cfloop_file_close", vec![ident(&handle)]),
+                    location: loc,
+                })]),
+                location: loc,
+            }),
+            instructions,
+        );
+    }
+
     fn compile_for_in(&mut self, for_in: &ForIn, instructions: &mut Vec<BytecodeOp>) {
+        // `loop file=` / `<cfloop file=>` lower to `for (x in
+        // __cfloop_file_lines(path))` — a name no user source can produce.
+        // Iterating that array is what forced the whole file to be resident
+        // (GH #367), so re-shape it into a streaming pump instead. Detected
+        // here, at the single point both lowerings converge on, so the tag and
+        // script spellings cannot drift apart.
+        if let Expression::FunctionCall(call) = &for_in.iterable {
+            if let Expression::Identifier(name) = &*call.name {
+                if name.name.eq_ignore_ascii_case("__cfloop_file_lines") && call.arguments.len() == 1
+                {
+                    self.compile_for_in_file(for_in, &call.arguments[0], instructions);
+                    return;
+                }
+            }
+        }
+
         // Compile iterable
         self.compile_expression(&for_in.iterable, instructions);
 
@@ -3723,7 +3923,6 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::DeclareLocal(Name::from(&loop_var_name)));
             instructions.push(BytecodeOp::StoreLocal(Name::from(loop_var_name)));
         }
-
         self.loop_stack.push((
             Vec::new(),
             Vec::new(),
@@ -4219,6 +4418,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
@@ -4501,6 +4701,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
@@ -4596,6 +4797,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: vec![true],
                     has_default: vec![false],
                     instructions: setter_instructions,
@@ -4781,6 +4983,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                 required_params: Vec::new(),
                 has_default: Vec::new(),
                 instructions: static_instrs,
@@ -5824,6 +6027,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
@@ -5920,6 +6124,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
+                    cfc_body: Default::default(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,

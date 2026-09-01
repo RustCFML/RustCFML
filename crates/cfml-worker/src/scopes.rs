@@ -54,7 +54,9 @@ pub async fn build_from_request(
     Ok(cfml_vm::web::build_web_scopes(
         &method,
         &headers,
-        &body_bytes,
+        // The worker has no filesystem to stream file parts to, so a multipart
+        // body stays buffered here (see `RequestBody`).
+        cfml_vm::web::RequestBody::Buffered(&body_bytes),
         script_name,
         path_info,
         &query_string,

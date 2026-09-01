@@ -15,6 +15,9 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_keyword_loop_variables.cfm">
+<cf_runtest file="core/test_parser_lucee_shapes.cfm">
+<cf_runtest file="core/test_throw_mixed_args_superset.cfm" rustcfmlOnly="true" why="Lucee refuses to COMPILE a file containing throw( type=.., 'msg' ); RustCFML accepts it and raises at the call, so the assertion cannot run there">
 <cf_runtest file="core/test_elvis_error_scope.cfm">
 <cf_runtest file="core/test_arguments_scope_dispatch.cfm">
 <cf_runtest file="core/test_unscoped_scope_cascade.cfm">
@@ -27,6 +30,9 @@ include "harness.cfm";
 <cf_runtest file="core/test_gcm_leading_dot_path.cfm">
 <cf_runtest file="core/test_var_indexed_assignment.cfm">
 <cf_runtest file="core/test_function_scope_capture.cfm">
+<cf_runtest file="core/test_component_method_named_url_scope.cfm">
+<cf_runtest file="core/test_component_output_attribute.cfm">
+<cf_runtest file="core/test_component_outside_element.cfm">
 <cf_runtest file="core/test_cfthread_component_method_scope.cfm">
 <cf_runtest file="core/test_bare_call_caller_stack_leak.cfm">
 <cf_runtest file="core/test_defaulted_param_variables_clobber.cfm">
@@ -48,6 +54,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_recursive_closure_var.cfm">
 <cf_runtest file="core/test_caller_local_no_leak.cfm">
 <cf_runtest file="core/test_scope_member_mutators.cfm">
+<cf_runtest file="core/test_cgi_scope_readonly.cfm">
 <cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
 <cf_runtest file="core/test_closure_unscoped_reset.cfm">
 <cf_runtest file="core/test_closure_param_defaults.cfm">
@@ -286,6 +293,7 @@ include "harness.cfm";
 <!--- binding, runtime mapping via application action="update". --->
 <cf_runtest file="stdlib/test_coldbox_preside_boot_fixes.cfm">
 <cf_runtest file="stdlib/test_security.cfm">
+<cf_runtest file="stdlib/test_encrypt_lucee_vectors.cfm">
 <cf_runtest file="stdlib/test_password_hashing.cfm">
 <cf_runtest file="stdlib/test_xml.cfm">
 <cf_runtest file="stdlib/test_utility.cfm">
@@ -354,6 +362,8 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_relative_component_metadata.cfm">
+<cf_runtest file="oop/test_pseudo_constructor_errors.cfm">
 <cf_runtest file="oop/test_flyweight_instance.cfm">
 <cf_runtest file="oop/test_reserved_key_visibility.cfm">
 <cf_runtest file="oop/test_component_introspection_surface.cfm">
@@ -396,6 +406,8 @@ include "harness.cfm";
 <cf_runtest file="oop/test_unqualified_new_package_relative.cfm">
 <cf_runtest file="oop/test_unqualified_new_inherited_package.cfm">
 <cf_runtest file="oop/test_inherited_new_mapping_qualified_fqn.cfm">
+<cf_runtest file="oop/test_component_ctor_method_hoist.cfm">
+<cf_runtest file="gc/test_incremental_cycle_sweep.cfm">
 <cf_runtest file="oop/test_runtime_added_method_via_structappend.cfm">
 <cf_runtest file="oop/test_injected_method_instance_isolation.cfm">
 <cf_runtest file="oop/test_metadata.cfm">
@@ -479,6 +491,8 @@ include "harness.cfm";
 
 <!--- --- Tags --- --->
 <cf_runtest file="tags/test_cfdump_tag.cfm">
+<cf_runtest file="tags/test_script_child_tags.cfm">
+<cf_runtest file="tags/test_zip_tag_params.cfm">
 <cf_runtest file="tags/test_tag_preprocessor_masa_fixes.cfm">
 <cf_runtest file="tags/test_cfmodule_script_form.cfm">
 <cf_runtest file="tags/test_seethrough_udf_variables.cfm">
@@ -650,6 +664,11 @@ include "harness.cfm";
 <cf_runtest file="lifecycle/test_mapping_symlink_paths.cfm">
 <cf_runtest file="lifecycle/test_application_lifecycle_case_override.cfm">
 <cf_runtest file="lifecycle/test_application_load_errors.cfm">
+
+<!--- onApplicationStart must gate ALL concurrent requests, not just the one that
+     triggers it: bypassers observe the half-built application scope (boot-window
+     500s/404s under live traffic). --->
+<cf_runtest file="lifecycle/test_application_start_serialisation.cfm">
 <cf_runtest file="lifecycle/test_application_scope_custom_tag.cfm">
 <cf_runtest file="lifecycle/test_application_onerror_onabort.cfm">
 <cf_runtest file="lifecycle/test_appscope_receiver_no_resurrect.cfm">
@@ -676,6 +695,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_property_bundle.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 <cf_runtest file="java_shims/test_commons_imaging.cfm">
+<cf_runtest file="java_shims/test_esapi_security_config.cfm" rustcfmlOnly="true" why="asserts RustCFML's ESAPI class-name shim; a CommandBox Lucee has no ESAPI on the classpath, so createObject fails there at the first line">
 
 <!--- Adobe XMPCore, the JCE crypto surface, opencsv + java.io writers,
      java.util.StringTokenizer/Properties and JavaMail's connection probe. --->
@@ -1103,5 +1123,20 @@ include "harness.cfm";
 
 <!--- createUUID / createUniqueID shape (docs/known-issues.md §34). --->
 <cf_runtest file="stdlib/test_uuid_shape.cfm">
+
+<!--- hash() must digest binary BYTES, not a lossy string form of them (GH #376). --->
+<cf_runtest file="stdlib/test_hash_binary.cfm">
+
+<!--- java.io.File two-argument (parent, child) constructor (GH #378). --->
+<cf_runtest file="java_shims/test_java_file_two_arg.cfm">
+
+<!--- getTempDirectory() ends with a separator, so `& name` joins inside it (GH #380). --->
+<cf_runtest file="stdlib/test_gettempdirectory_separator.cfm">
+
+<!--- A keyword-named component-path segment keeps its source case (GH #381). --->
+<cf_runtest file="core/test_keyword_component_path_case.cfm">
+
+<!--- <cfapplication> is implemented, not a "tag not implemented" 500 (GH #374). --->
+<cf_runtest file="tags/test_cfapplication_tag.cfm">
 
 <cfscript> printSummary(); </cfscript>
