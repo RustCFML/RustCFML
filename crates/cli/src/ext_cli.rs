@@ -98,6 +98,12 @@ fn cmd_new(args: &[String]) -> i32 {
         dir.display(),
         name
     );
+    if name.contains('-') {
+        eprintln!(
+            "Note: \"{name}\" contains a hyphen, so `new {name}.Foo()` will not parse. \
+             Use `new \"{name}.Foo\"()` or createObject(\"component\", \"{name}.Foo\")."
+        );
+    }
     0
 }
 

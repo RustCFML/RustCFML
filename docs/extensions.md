@@ -470,6 +470,16 @@ mapping set** — `Application.cfc`'s `this.mappings`, the application lifecycle
 thread seed, `application action="update"`. All four replace wholesale, and an
 extension's CFCs are not the application's to drop.
 
+A hyphenated extension name is legal and mounts fine, but the mapping it creates
+cannot be used in a bare `new` — `new wheels-core.Formatter()` parses as a
+subtraction, not a path (Lucee behaves the same). Use the quoted form, or
+`createObject`:
+
+```cfml
+o = new "wheels-core.Formatter"();
+o = createObject( "component", "wheels-core.Formatter" );
+```
+
 ## The command line
 
 ```

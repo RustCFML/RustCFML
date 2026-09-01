@@ -1242,6 +1242,21 @@ pub fn compile_file_cached(
     Ok(program)
 }
 
+/// The lock behind a `<cflock name=…>` / `scope=` entry in `named_locks`.
+///
+/// `parking_lot`, not `std`, specifically because acquisition must PARK rather
+/// than poll. This used to be a `std::sync::RwLock` acquired by `try_write()` in
+/// a 10ms sleep loop, which meant a waiter did not wake when the lock was
+/// released — it woke on the next tick — so every contended acquisition
+/// quantised to 10ms and, because waiters raced on wake with no queue, a loser
+/// re-slept a full interval and could be starved repeatedly (GH #401: a lock
+/// held 3.5 ms produced a 380 ms wait, and p99 went 4.8 ms → 331.8 ms from 1 to
+/// 16 concurrent requests while p50 never moved).
+///
+/// `parking_lot` also gives eventual fairness on unlock, which bounds the
+/// starvation the old loop had no answer to.
+type NamedLock = parking_lot::RwLock<()>;
+
 /// Bound the `named_locks` map so long-lived `--serve` processes using
 /// dynamic lock names (e.g. `name="user_#id#"`) don't grow it unboundedly.
 /// When the map is at/over `cap` and `new_name` isn't already present, evict
@@ -1250,7 +1265,7 @@ pub fn compile_file_cached(
 /// invalidate a live `held_locks` guard. Entries with `strong_count > 1` (held
 /// or contended) are always kept.
 fn evict_idle_named_locks(
-    locks: &mut HashMap<String, Arc<RwLock<()>>>,
+    locks: &mut HashMap<String, Arc<NamedLock>>,
     new_name: &str,
     cap: usize,
 ) {
@@ -1553,7 +1568,7 @@ pub struct ServerState {
     pub applications: Arc<dyn ApplicationStore>,
     pub sessions: Arc<dyn SessionStore>,
     /// Named locks for cflock: name → RwLock (exclusive = write, readonly = read)
-    pub named_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
+    pub named_locks: Arc<Mutex<HashMap<String, Arc<NamedLock>>>>,
     /// Bytecode cache — skips recompilation when file mtime is unchanged
     pub bytecode_cache: BytecodeCache,
     /// Document root for `--serve` mode. Used as a fallback search path
@@ -1785,12 +1800,12 @@ impl ServerState {
 #[allow(dead_code)]
 enum HeldLock {
     Write(
-        std::sync::RwLockWriteGuard<'static, ()>,
-        Arc<RwLock<()>>,
+        parking_lot::RwLockWriteGuard<'static, ()>,
+        Arc<NamedLock>,
     ),
     Read(
-        std::sync::RwLockReadGuard<'static, ()>,
-        Arc<RwLock<()>>,
+        parking_lot::RwLockReadGuard<'static, ()>,
+        Arc<NamedLock>,
     ),
     /// A reentrant re-acquire of a lock already held by this request/thread.
     /// Holds no real guard — named locks are reentrant per thread, so the inner
@@ -13843,11 +13858,12 @@ impl CfmlVirtualMachine {
                     evict_idle_named_locks(&mut locks, lock_name.as_str(), NAMED_LOCK_CAP);
                     locks
                         .entry(lock_name.clone())
-                        .or_insert_with(|| Arc::new(RwLock::new(())))
+                        .or_insert_with(|| Arc::new(NamedLock::new(())))
                         .clone()
                 };
 
-                // Acquire lock with timeout using try_lock in a spin loop.
+                // Acquire the lock, PARKING until it is released.
+                //
                 // `timeout_ms == 0` means NO timeout — wait indefinitely, which is
                 // also what an omitted `timeout` means. Lucee semantics, measured
                 // against 7.0.4.34 (it waits 1594ms / 6600ms for a held lock
@@ -13862,31 +13878,35 @@ impl CfmlVirtualMachine {
                 // framework — 8 concurrent cold requests did 8 boots (~7s each).
                 // Do NOT reintroduce a snapshot application scope without also
                 // reverting this to fail-fast.
-                let deadline = (timeout_ms > 0).then(|| {
-                    cfml_common::clock::Monotonic::now()
-                        + std::time::Duration::from_millis(timeout_ms)
-                });
-                let timed_out = |deadline: Option<cfml_common::clock::Monotonic>| {
-                    deadline.is_some_and(|d| cfml_common::clock::Monotonic::now() >= d)
-                };
+                //
+                // ⚠️ Do NOT reintroduce a `try_*` + `sleep` poll here. That was the
+                // shape until GH #401: a waiter did not wake on release but on the
+                // next 10ms tick, so contended latency quantised to the poll
+                // interval and, with no queue, waiters raced on wake and a loser
+                // re-slept a whole interval. `try_write_for`/`try_read_for` park on
+                // the lock's own queue and wake on handover.
                 let is_exclusive = lock_type != "readonly";
+                let timeout = (timeout_ms > 0)
+                    .then(|| std::time::Duration::from_millis(timeout_ms));
 
+                // SAFETY (both arms): the lifetime extension is sound because we
+                // store the owning `Arc<NamedLock>` (`lock`) alongside the guard in
+                // the same `HeldLock`. The Arc keeps the RwLock allocation alive for
+                // at least as long as the guard, and HeldLock's field order drops the
+                // guard (unlock) before the Arc (free). See HeldLock docs.
                 if is_exclusive {
-                    loop {
-                        if let Ok(guard) = lock.try_write() {
-                            // SAFETY: the lifetime extension is sound because we
-                            // store the owning `Arc<RwLock<()>>` (`lock`) alongside
-                            // the guard in the same `HeldLock`. The Arc keeps the
-                            // RwLock allocation alive for at least as long as the
-                            // guard, and HeldLock's field order drops the guard
-                            // (unlock) before the Arc (free). See HeldLock docs.
-                            let guard: std::sync::RwLockWriteGuard<'static, ()> =
+                    let acquired = match timeout {
+                        Some(d) => lock.try_write_for(d),
+                        None => Some(lock.write()),
+                    };
+                    match acquired {
+                        Some(guard) => {
+                            let guard: parking_lot::RwLockWriteGuard<'static, ()> =
                                 unsafe { std::mem::transmute(guard) };
                             self.held_locks
                                 .push((lock_name.clone(), HeldLock::Write(guard, lock.clone())));
-                            break;
                         }
-                        if timed_out(deadline) {
+                        None => {
                             if !throw_on_timeout {
                                 // throwOnTimeout="false": the body is skipped and
                                 // execution continues. The lowering guards the body
@@ -13895,27 +13915,25 @@ impl CfmlVirtualMachine {
                             }
                             return Err(lock_timeout_error(timeout_ms, true, &lock_label));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 } else {
-                    loop {
-                        if let Ok(guard) = lock.try_read() {
-                            // SAFETY: see the exclusive branch above — the owning
-                            // Arc is stored next to the guard, keeping the RwLock
-                            // alive (and unevictable) for the guard's whole life.
-                            let guard: std::sync::RwLockReadGuard<'static, ()> =
+                    let acquired = match timeout {
+                        Some(d) => lock.try_read_for(d),
+                        None => Some(lock.read()),
+                    };
+                    match acquired {
+                        Some(guard) => {
+                            let guard: parking_lot::RwLockReadGuard<'static, ()> =
                                 unsafe { std::mem::transmute(guard) };
                             self.held_locks
                                 .push((lock_name.clone(), HeldLock::Read(guard, lock.clone())));
-                            break;
                         }
-                        if timed_out(deadline) {
+                        None => {
                             if !throw_on_timeout {
                                 return Ok(false);
                             }
                             return Err(lock_timeout_error(timeout_ms, false, &lock_label));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 }
             }
@@ -38592,17 +38610,56 @@ fn query_sort_by_columns(
 
 #[cfg(test)]
 mod named_lock_tests {
-    use super::evict_idle_named_locks;
+    use super::{evict_idle_named_locks, NamedLock};
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
-    fn lock() -> Arc<RwLock<()>> {
-        Arc::new(RwLock::new(()))
+    fn lock() -> Arc<NamedLock> {
+        Arc::new(NamedLock::new(()))
+    }
+
+    /// GH #401 regression guard.
+    ///
+    /// The defect was not a wrong result — it was an acquisition that POLLED
+    /// (`try_write()` + `sleep(10ms)`) instead of parking, so a waiter woke on
+    /// the next tick rather than on handover. Nothing about the engine's
+    /// observable behaviour changes when that regresses: every lock test still
+    /// passes, the suite stays green, and only tail latency under concurrency
+    /// moves. A behavioural test would have to race to see it, and a racing test
+    /// on a loaded box is a flaky test.
+    ///
+    /// So this reads the source instead, the way `no_mutable_statics` does. Fast,
+    /// deterministic, and it fails the build the moment someone reintroduces a
+    /// poll loop here.
+    #[test]
+    fn named_lock_acquisition_parks_rather_than_polling() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read own source");
+        let start = src.find("fn acquire_named_lock").expect("acquire_named_lock exists");
+        // The body ends at the next item at the same indentation.
+        let rest = &src[start..];
+        let end = rest[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Built at run time so this assertion cannot match its own source text
+        // if the scan is ever widened past the extracted body.
+        let sleep_needle = format!("thread::{}", "sleep");
+        assert!(
+            !body.contains(&sleep_needle),
+            "acquire_named_lock sleeps — a contended lock must PARK on the lock's \
+             own queue and wake on handover, not poll on a timer. See GH #401: a \
+             10ms poll made a 3.5ms lock cost up to 380ms and cut throughput ~30%."
+        );
+        assert!(
+            body.contains("try_write_for") && body.contains("try_read_for"),
+            "acquire_named_lock should acquire with parking_lot's timed, parking \
+             try_write_for/try_read_for (or an equivalent blocking wait)."
+        );
     }
 
     #[test]
     fn evicts_idle_entries_when_over_cap() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         for i in 0..1024 {
             locks.insert(format!("idle_{i}"), lock());
         }
@@ -38621,10 +38678,10 @@ mod named_lock_tests {
 
     #[test]
     fn never_evicts_a_held_lock() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         let held = lock();
         let held_clone = held.clone();
-        let _guard = held_clone.write().unwrap(); // simulate a live held_locks guard
+        let _guard = held_clone.write(); // simulate a live held_locks guard
         locks.insert("held".to_string(), held);
         for i in 0..2000 {
             locks.insert(format!("idle_{i}"), lock());
@@ -38635,7 +38692,7 @@ mod named_lock_tests {
 
     #[test]
     fn no_eviction_below_cap() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         for i in 0..10 {
             locks.insert(format!("idle_{i}"), lock());
         }
@@ -38645,7 +38702,7 @@ mod named_lock_tests {
 
     #[test]
     fn no_eviction_when_name_already_present() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         for i in 0..1024 {
             locks.insert(format!("idle_{i}"), lock());
         }
