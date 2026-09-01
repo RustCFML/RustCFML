@@ -1688,6 +1688,42 @@ the bytes to expose in any case.
 > reaper for the rest, which also covers what request-end deletion structurally
 > cannot: crashes, `kill -9`, and files left by a previous run.
 
+## 75. Template lookup is case-insensitive; file I/O is not — a deliberate superset *(GH [#387](https://github.com/RustCFML/RustCFML/issues/387))*
+
+On a case-sensitive filesystem (Linux/ext4) the engine resolves a **component
+or template** path case-insensitively, folding every segment: `SqlRunner.cfc`
+answers `createObject("component","...database.sqlRunner")`, and an on-disk
+`siteTree/` answers `...system.sitetree.SiteService`. macOS (APFS) and Windows
+fold in the filesystem and never reach this code.
+
+**This is a superset, not Lucee parity.** Verified against Lucee 7.1.0.204 on a
+case-sensitive APFS volume: Lucee raises `invalid component definition, can't
+find component [sqlRunner]` for both the relative and the mapped form. We are
+deliberately more permissive, because ACF-on-Windows and macOS development have
+made case-insensitive component lookup a de-facto part of the language, and a
+codebase that runs everywhere else should not fail only on Linux.
+
+**File I/O deliberately does NOT fold**, and that is where Lucee parity is
+kept: `fileExists`, `fileRead`, `fileReadBinary`, `getFileInfo`,
+`directoryExists` and `directoryList` all stay case-sensitive. Folding them was
+tried (PR [#388](https://github.com/RustCFML/RustCFML/pull/388)) and is a trap:
+with `filedelete`/`directorydelete`/`fileopen` in the same path-resolution
+list, `fileDelete("./Foo.txt")` deletes an on-disk `foo.txt` and
+`directoryDelete("./Cache", true)` recursively removes `cache/` — a file the
+caller never named. It also splits `fileExists` from `fileWrite`: the former
+reports a file present under a casing the latter will not write to, so
+`if (!fileExists(p)) fileWrite(p, ...)` silently skips a legitimate write.
+Component lookup has no such hazard: it only ever reads, and the worst case is
+finding a file.
+
+Cost is zero when nothing is mis-cased. Every resolution order runs exactly as
+before, and the case-insensitive pass runs only once the whole order has missed
+— which is also what keeps priority intact: an exact match in the last mapping
+still beats a case-folded one in the first. The fold reads one directory
+listing, cached per **directory** (not per path) behind the same two layers and
+the same negative-answer generation as the existence memo, so a tree that
+probes many absent override CFCs in one directory pays a single listing.
+
 ## 8. Environment-specific 🌍
 
 | Feature | Restriction |
