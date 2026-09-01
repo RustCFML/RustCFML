@@ -839,9 +839,14 @@ fn a_native_write_and_a_cfml_lock_mutually_exclude() {
     let state = vm.server_state.clone().unwrap();
     let lock = {
         let mut locks = state.named_locks.lock().unwrap();
-        locks.entry(key).or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(()))).clone()
+        locks
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(parking_lot::RwLock::new(())))
+            .clone()
     };
-    let held = lock.write().unwrap();
+    // parking_lot, not std: the named-lock registry parks rather than polls
+    // (GH #401), so its guards are not `LockResult`-wrapped.
+    let held = lock.write();
 
     // A native write with a 200 ms timeout must NOT get in.
     let fb = bif(&m, "abiScopeWriteLocked");
