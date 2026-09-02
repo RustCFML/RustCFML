@@ -572,6 +572,24 @@ impl Instance {
     /// shared table is returned as its `Function` value. `None` on a genuine miss
     /// (the caller decides Null vs throw). Mirrors the marker path's lenient
     /// public→variables fallthrough (RustCFML does not gate data-member access).
+    /// The PUBLIC member view: `this` scope only.
+    ///
+    /// GH #417. A component's public surface is `this.*` plus its public
+    /// methods — the private `variables` scope is not part of it. Verified
+    /// against Lucee 7, which answers `c.p` with "has no accessible Member with
+    /// name [P]" even for a declared `property` under `accessors=true`,
+    /// exposing the value only through the generated `getP()`.
+    ///
+    /// Deliberately a separate method from [`Self::get_member`] rather than a
+    /// change to it: several engine-internal paths resolve through the full
+    /// view on purpose (unscoped resolution inside a method, `super`
+    /// dispatch, serialization). Only reads through a component RECEIVER —
+    /// the external view — belong here, so the two cannot be confused at a
+    /// call site.
+    pub fn get_public_member(&self, name: &str) -> Option<CfmlValue> {
+        self.this_members.get_ci(name)
+    }
+
     pub fn get_member(&self, name: &str) -> Option<CfmlValue> {
         // Compat shim: `instance.__variables` exposes the private scope as a struct,
         // the way the marker representation did (a few RustCFML tests / helpers poke

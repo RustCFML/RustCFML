@@ -6247,13 +6247,12 @@ impl CfmlVirtualMachine {
                 // get_ci does exact-then-CI under one read lock, cloning only the
                 // matched value — replaces the old get/get(upper)/get(lower) chain
                 // plus a full `s.iter()` snapshot (whole-IndexMap clone) per miss.
-                let val = s.get_ci(name).or_else(|| {
-                    if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                        vars.get_ci(name)
-                    } else {
-                        None
-                    }
-                });
+                // GH #417 — no fall-back into `__variables`; see
+                // `Instance::get_public_member`. This is the path
+                // `LoadLocalProperty` takes, which is what the fused `c.x` read
+                // actually compiles to — gating only `GetProperty` and
+                // `lookup_property_opt` left the leak wide open through here.
+                let val = s.get_ci(name);
                 if let Some(v) = val {
                     return v;
                 }
@@ -6321,7 +6320,9 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
                 let g = inst.read();
-                if let Some(v) = g.get_member(name) {
+                // GH #417 — PUBLIC view only; the private `variables` scope is
+                // not part of a component's external surface.
+                if let Some(v) = g.get_public_member(name) {
                     v
                 } else if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
                     parent
@@ -6352,7 +6353,8 @@ impl CfmlVirtualMachine {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = obj {
             let g = inst.read();
-            if let Some(v) = g.get_member(name) {
+            // GH #417 — PUBLIC view only (see `get_public_member`).
+            if let Some(v) = g.get_public_member(name) {
                 return Some(v);
             }
             // Fall through to a `rust:` native parent's `get_property` before
@@ -6369,13 +6371,13 @@ impl CfmlVirtualMachine {
             return None;
         }
         if let CfmlValue::Struct(s) = obj {
-            let val = s.get_ci(name).or_else(|| {
-                if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                    vars.get_ci(name)
-                } else {
-                    None
-                }
-            });
+            // GH #417 — no fall-back into `__variables`: the private member
+            // scope is not part of a component's public surface. The marker
+            // (Struct) representation keeps it as a sentinel key inside the
+            // component's own map, so without this gate every private member
+            // was externally readable and `c.__variables` handed out the live
+            // map. The `Instance` arm above gates the same way.
+            let val = s.get_ci(name);
             if let Some(v) = val {
                 return Some(v);
             }
@@ -22092,7 +22094,11 @@ impl CfmlVirtualMachine {
                         ns
                     }
                 },
-                CfmlValue::Instance(inst) => match inst.read().get_member(k) {
+                // GH #409/#417 — PUBLIC view for the intermediate segment of an
+                // external nested write. `c.__variables.x = v` was resolving the
+                // private map here and mutating it in place; Lucee's equivalent
+                // write lands on an inert public key instead.
+                CfmlValue::Instance(inst) => match inst.read().get_public_member(k) {
                     Some(v @ CfmlValue::Struct(_)) => v,
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {

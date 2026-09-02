@@ -9,9 +9,13 @@ suiteBegin( "CFC pseudo-constructor method hoist (fast path)" );
 o = new dotdotprobe.ctorfast.Many();
 
 // The hoist: own, inherited and private methods are all callable from the body.
-assert( "own method callable during ctor",      o.ctorSawOwn,     "own-ctor"   );
-assert( "inherited method callable during ctor",o.ctorSawParent,  "base-greet" );
-assert( "private method callable during ctor",  o.ctorSawPrivate, "priv1"      );
+// Read through the component's public witness rather than `o.ctorSawOwn`: those
+// are `variables.*` writes, and a component's private member scope is not
+// externally readable (GH #417 — Lucee: "has no accessible Member").
+witness = o.ctorWitness();
+assert( "own method callable during ctor",      witness.own,    "own-ctor"   );
+assert( "inherited method callable during ctor",witness.parent, "base-greet" );
+assert( "private method callable during ctor",  witness.priv,   "priv1"      );
 
 // Access modifiers survive the shared-Arc reuse.
 assert( "public method dispatches",  o.pub1(),       "p1"   );
