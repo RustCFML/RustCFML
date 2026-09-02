@@ -27618,17 +27618,30 @@ impl CfmlVirtualMachine {
                 }
                 // isDefined("q.col") — a query column counts as defined (Lucee).
                 CfmlValue::Query(q) => return q.has_column_ci(segment),
-                // Flyweight instance: resolve the member through the Instance
-                // (public then private data maps, each table-aware so METHODS
-                // resolve too). Without this arm, walking a path THROUGH an
-                // Instance hit `_ => return false`, so `IsDefined(
+                // Flyweight instance: resolve the member through the Instance's
+                // PUBLIC view (table-aware, so public METHODS resolve). Without
+                // this arm at all, walking a path THROUGH an Instance hit
+                // `_ => return false`, so `IsDefined(
                 // "application.cbBootstrap.getController")` was false — Preside's
-                // `_getColdboxController()` then returned null, `_getSessionStorage()`
-                // returned null, and `_persistSession()` silently skipped persist,
-                // so admin login never stuck (no session row, no `psid` cookie).
+                // `_getColdboxController()` then returned null,
+                // `_getSessionStorage()` returned null, and `_persistSession()`
+                // silently skipped persist, so admin login never stuck (no
+                // session row, no `psid` cookie). That is why the arm exists.
+                //
+                // It uses the PUBLIC view, not the full one: `isDefined` must
+                // not claim a member exists that a read cannot reach (GH #417).
+                // This is Lucee PARITY, verified member by member — private
+                // data, private methods and a genuine miss all answer `false`
+                // there, while public data and public methods answer `true`.
+                //
+                // Beware the probe that suggests otherwise: `isDefined("c.x")`
+                // DOES read `true` on Lucee once an external `c.x = …` has run
+                // in the same request, because that write creates a real public
+                // key. Measure it on an untouched instance or the write
+                // contaminates the answer.
                 #[cfg(feature = "component-instance")]
                 CfmlValue::Instance(inst) => {
-                    let member = inst.read().get_member(&seg_lower);
+                    let member = inst.read().get_public_member(&seg_lower);
                     match member {
                         Some(v) => current = v,
                         None => return false,

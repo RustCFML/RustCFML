@@ -587,7 +587,25 @@ impl Instance {
     /// the external view — belong here, so the two cannot be confused at a
     /// call site.
     pub fn get_public_member(&self, name: &str) -> Option<CfmlValue> {
-        self.this_members.get_ci(name)
+        let found = self.this_members.get_ci(name)?;
+        // `this_members` is method-table aware, so a DECLARED PRIVATE method
+        // resolves through it. Gate on the same `method_access` map that gates
+        // an external call, so `isDefined("c.privMethod")` agrees with
+        // `c.privMethod()` throwing — and matches Lucee, which answers `false`.
+        // An injected public stub (`this.x = fn`, the FW/1 beanProxy shape)
+        // stays visible: Lucee widens an assigned UDF to public.
+        if matches!(found, CfmlValue::Function(_)) && !self.has_injected_public_method(name) {
+            let is_public = matches!(
+                self.class.method_access.get(&name.to_ascii_lowercase()),
+                Some(crate::dynamic::CfmlAccess::Public)
+                    | Some(crate::dynamic::CfmlAccess::Remote)
+                    | None
+            );
+            if !is_public {
+                return None;
+            }
+        }
+        Some(found)
     }
 
     pub fn get_member(&self, name: &str) -> Option<CfmlValue> {
