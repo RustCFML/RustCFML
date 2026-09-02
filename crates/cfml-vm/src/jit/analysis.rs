@@ -322,6 +322,37 @@ pub fn analyze_no_udfs(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<
 /// cache entry for the matching arg-kind signature, and `None` otherwise (in
 /// which case the caller is also rejected — Phase 1 only admits leaf-first
 /// warmup, not mutual recursion or forward references to uncompiled UDFs).
+/// Does `func` write to any name that is neither a parameter nor a local it
+/// declares? See the call site in [`analyze`] for why that disqualifies it.
+///
+/// Slot ops are absent here by construction: `normalize_slot_ops` rewrites
+/// every one back to its named twin before analysis.
+fn writes_a_name_it_does_not_own(func: &BytecodeFunction) -> bool {
+    let mut owned: std::collections::HashSet<&str> =
+        func.params.iter().map(|p| p.as_str()).collect();
+    // Declaration can follow first write in the op stream (a loop body reached
+    // by a back edge), so gather every declaration before judging any write.
+    for op in &func.instructions {
+        if let BytecodeOp::DeclareLocal(name) = op {
+            owned.insert(name.as_str());
+        }
+    }
+    func.instructions.iter().any(|op| {
+        let written = match op {
+            BytecodeOp::StoreLocal(name)
+            | BytecodeOp::StoreLocalProperty(name, _)
+            | BytecodeOp::Increment(name)
+            | BytecodeOp::Decrement(name)
+            | BytecodeOp::AddLocalConst(name, _)
+            | BytecodeOp::MulLocalConst(name, _)
+            | BytecodeOp::ArrayAppendLocal(name) => Some(name),
+            BytecodeOp::ForLoopStep(name, _, _, _, _) => Some(name),
+            _ => None,
+        };
+        matches!(written, Some(n) if !owned.contains(n.as_str()))
+    })
+}
+
 pub fn analyze(
     func: &BytecodeFunction,
     param_kinds: &[Kind],
@@ -333,6 +364,24 @@ pub fn analyze(
         return None;
     }
     if param_kinds.len() != func.params.len() {
+        return None;
+    }
+    // A frame that writes a name it does not OWN participates in the
+    // interpreter's parent-scope writeback, and a compiled body cannot: its
+    // locals are native storage, so the diff-and-propagate that the frame
+    // teardown performs has nothing to read. Two live cases, both silent:
+    //
+    //   * a closure assigning an enclosing `var` (`function(v){ captured = v; }`)
+    //     — the defining frame never saw the write, so `captured` stayed "";
+    //   * classic localMode, where an unscoped write inside a function is a
+    //     write to the CALLER's scope by definition.
+    //
+    // A parameter and a `var`-declared local are frame-owned and stay
+    // admissible, which is what keeps ordinary numeric bodies compilable.
+    // Deliberately mode-independent: the effective localMode depends on the
+    // application default, which is VM state the analyser cannot see, and
+    // guessing it wrong here is a wrong ANSWER rather than a slow one.
+    if writes_a_name_it_does_not_own(func) {
         return None;
     }
     // Admissible ABI param kinds: Int, Float, Boxed.
@@ -1375,16 +1424,21 @@ mod tests {
         let f = mkfn(
             &[],
             vec![
+                // `var sum` / `var i` — real codegen emits a declaration for a
+                // var-declared local, and without one these writes are UNSCOPED
+                // and inadmissible (they would need parent-scope writeback).
+                BytecodeOp::DeclareLocal("sum".into()),
+                BytecodeOp::DeclareLocal("i".into()),
                 BytecodeOp::Integer(0),
                 BytecodeOp::StoreLocal("sum".into()),
                 BytecodeOp::Integer(1),
                 BytecodeOp::StoreLocal("i".into()),
-                BytecodeOp::JumpIfLocalCmpConstFalse("i".into(), 10, CmpOp::Lte, 9),
+                BytecodeOp::JumpIfLocalCmpConstFalse("i".into(), 10, CmpOp::Lte, 11),
                 BytecodeOp::LoadLocal("sum".into()),
                 BytecodeOp::LoadLocal("i".into()),
                 BytecodeOp::Add,
                 BytecodeOp::StoreLocal("sum".into()),
-                BytecodeOp::ForLoopStep("i".into(), 10, CmpOp::Lte, 1, 5),
+                BytecodeOp::ForLoopStep("i".into(), 10, CmpOp::Lte, 1, 7),
                 BytecodeOp::LoadLocal("sum".into()),
                 BytecodeOp::Return,
             ],
@@ -1414,6 +1468,10 @@ mod tests {
         let f = mkfn(
             &[],
             vec![
+                // The `var` in the comment above, which real codegen emits and
+                // this body needs: an undeclared write is UNSCOPED and would
+                // require parent-scope writeback the compiled body cannot do.
+                BytecodeOp::DeclareLocal("s".into()),
                 BytecodeOp::Double(0.0),
                 BytecodeOp::StoreLocal("s".into()),
                 BytecodeOp::LoadLocal("s".into()),

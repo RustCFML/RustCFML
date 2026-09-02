@@ -7271,6 +7271,17 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
                             .map(|(_, v)| v)
                     })?;
+                    // §29 — refuse to bind a callee that declares parameter
+                    // types. A bound callee is invoked by the caller's COMPILED
+                    // body as a direct native call: it never re-enters the VM,
+                    // so the declared-type validation on the dispatch path
+                    // below cannot run and `function f( numeric n )` accepted
+                    // anything. Declining the binding costs this caller its
+                    // compilation, not its correctness; the callee itself stays
+                    // JIT-eligible through the checked dispatch path.
+                    if f.param_types.iter().any(|t| t.is_some()) {
+                        return None;
+                    }
                     Some(jit::UdfMeta {
                         global_id: f.global_id,
                         nparams: f.params.len(),
