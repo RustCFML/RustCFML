@@ -1363,6 +1363,27 @@ pub struct DirFoldEntry {
     pub index: FoldIndex,
 }
 
+/// One open `loop file=` line cursor, plus the line window the loop asked for
+/// (`startLine`/`endLine`, spelled `from`/`to` in the reporter's code — Lucee
+/// accepts both, GH #367).
+///
+/// The window is enforced here rather than by materialising and slicing,
+/// because slicing would give back exactly the whole-file residency the
+/// streaming cursor exists to avoid. `skip` lines are consumed and dropped
+/// before the first line is yielded; `remaining` counts the lines still
+/// allowed out, and `None` means "to EOF".
+struct FileLineCursor {
+    lines: Box<dyn cfml_common::vfs::VfsLines>,
+    /// Lines still to be consumed and discarded before the window opens
+    /// (`startLine - 1`). Applied lazily on the first `next` so `open` does no
+    /// I/O — a `startLine` past EOF simply ends the loop with zero iterations.
+    skip: i64,
+    /// Lines still allowed out of the window; `None` = unbounded. Zero ends
+    /// the loop, which is also how an `endLine` below `startLine` behaves
+    /// (Lucee runs the body no times, it does not error).
+    remaining: Option<i64>,
+}
+
 /// Cap on `ServerState::dir_fold_cache` entries. One entry per *directory* that
 /// has ever needed a case-folded lookup — orders of magnitude smaller than the
 /// per-path existence cache, and only populated on a case mismatch, so this is
@@ -2863,7 +2884,7 @@ pub struct CfmlVirtualMachine {
     /// cursor — and the file descriptor under it — is dropped at request end.
     /// Unwinding a handle through every `?` in the interpreter would buy
     /// nothing over that.
-    file_line_cursors: HashMap<i64, Box<dyn cfml_common::vfs::VfsLines>>,
+    file_line_cursors: HashMap<i64, FileLineCursor>,
     /// Monotonic handle counter. Never reused, so a stale handle from a closed
     /// cursor reports "closed" rather than silently reading someone else's file.
     next_file_line_cursor: i64,
@@ -14095,6 +14116,31 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Resolve one optional `loop file=` line bound (`startLine`/`endLine`,
+    /// a.k.a. `from`/`to`) to a line number. `None`/Null means the loop did not
+    /// give that bound.
+    ///
+    /// Lucee truncates a fractional bound (`to=3.7` stops at line 3) and
+    /// rejects a non-numeric one with an `expression` error rather than
+    /// silently treating it as 0 — which would read as "no lines" and look
+    /// like a broken file.
+    fn cfloop_file_line_bound(
+        value: Option<&CfmlValue>,
+        attr: &str,
+    ) -> Result<Option<i64>, CfmlError> {
+        match value {
+            None | Some(CfmlValue::Null) => Ok(None),
+            Some(v) => match to_number(v) {
+                Some(n) => Ok(Some(n.trunc() as i64)),
+                None => Err(CfmlError::expression(format!(
+                    "cfloop file: {} [{}] cannot be cast to a number value",
+                    attr,
+                    v.as_string()
+                ))),
+            },
+        }
+    }
+
     fn call_function(
         &mut self,
         func_ref: &CfmlValue,
@@ -19970,14 +20016,29 @@ impl CfmlVirtualMachine {
                 // iteration, so on the reporter's million-row files it was
                 // strictly worse than the fileRead()+listToArray() workaround
                 // it is meant to replace.
+                //
+                // Args 2 and 3 are the optional line window
+                // (`startLine`/`endLine`, a.k.a. `from`/`to`), Null when the
+                // loop did not give one. Enforced on the cursor rather than by
+                // slicing a materialised array — see `FileLineCursor`.
                 "__cfloop_file_open" => {
                     let path = args.first().map(|v| v.as_string()).unwrap_or_default();
-                    let cursor = self.vfs.open_lines(&path).map_err(|e| {
+                    let start = Self::cfloop_file_line_bound(args.get(1), "startLine")?;
+                    let end = Self::cfloop_file_line_bound(args.get(2), "endLine")?;
+                    let lines = self.vfs.open_lines(&path).map_err(|e| {
                         CfmlError::runtime(format!("cfloop file: cannot read '{}': {}", path, e))
                     })?;
+                    // A `startLine` below 1 clamps to the first line (Lucee
+                    // takes `from=-3` as line 1); an `endLine` below the start
+                    // yields nothing.
+                    let start = start.unwrap_or(1).max(1);
+                    let remaining = end.map(|e| (e - start + 1).max(0));
                     let handle = self.next_file_line_cursor;
                     self.next_file_line_cursor += 1;
-                    self.file_line_cursors.insert(handle, cursor);
+                    self.file_line_cursors.insert(
+                        handle,
+                        FileLineCursor { lines, skip: start - 1, remaining },
+                    );
                     return Ok(CfmlValue::Int(handle));
                 }
                 // Null means end of file. Unambiguous: a line is always a
@@ -19996,8 +20057,32 @@ impl CfmlVirtualMachine {
                             "cfloop file: line cursor is closed or invalid".to_string(),
                         ));
                     };
-                    return match cursor.next_line() {
-                        Ok(Some(line)) => Ok(CfmlValue::string(line)),
+                    // Everything before `startLine` is read and dropped here,
+                    // on the first `next`, so the skipped region costs one
+                    // line of memory like the window itself does.
+                    while cursor.skip > 0 {
+                        match cursor.lines.next_line() {
+                            Ok(Some(_)) => cursor.skip -= 1,
+                            // `startLine` past EOF: zero iterations.
+                            Ok(None) => return Ok(CfmlValue::Null),
+                            Err(e) => {
+                                return Err(CfmlError::runtime(format!(
+                                    "cfloop file: error reading line: {}",
+                                    e
+                                )))
+                            }
+                        }
+                    }
+                    if cursor.remaining == Some(0) {
+                        return Ok(CfmlValue::Null);
+                    }
+                    return match cursor.lines.next_line() {
+                        Ok(Some(line)) => {
+                            if let Some(left) = cursor.remaining.as_mut() {
+                                *left -= 1;
+                            }
+                            Ok(CfmlValue::string(line))
+                        }
                         Ok(None) => Ok(CfmlValue::Null),
                         Err(e) => Err(CfmlError::runtime(format!(
                             "cfloop file: error reading line: {}",
@@ -20017,10 +20102,23 @@ impl CfmlVirtualMachine {
 
                 "__cfloop_file_lines" => {
                     let path = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    // Same optional line window as `__cfloop_file_open`. Both
+                    // spellings of the loop lower to the streaming cursor, so
+                    // this eager form is only reached by a direct call — it
+                    // still honours the window so the two cannot disagree.
+                    let start = Self::cfloop_file_line_bound(args.get(1), "startLine")?
+                        .unwrap_or(1)
+                        .max(1);
+                    let end = Self::cfloop_file_line_bound(args.get(2), "endLine")?;
                     return match self.vfs.read_to_string(&path) {
                         Ok(content) => {
                             let lines: Vec<CfmlValue> = content
                                 .lines()
+                                .skip(start as usize - 1)
+                                .take(match end {
+                                    Some(e) => (e - start + 1).max(0) as usize,
+                                    None => usize::MAX,
+                                })
                                 .map(|l| CfmlValue::string(l.to_string()))
                                 .collect();
                             Ok(CfmlValue::array(lines))

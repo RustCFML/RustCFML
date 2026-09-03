@@ -3699,11 +3699,18 @@ fn parse_cfloop_tag(
     consumed: usize,
     uniq: usize,
 ) -> (String, usize) {
-    // Different loop types based on attributes
-    if let (Some(from), Some(to), Some(index)) = (
+    // Different loop types based on attributes.
+    //
+    // The counted `from`/`to` form is checked FIRST but must not swallow a
+    // file loop: with `file=` present, `from`/`to` are LINE BOUNDS (Lucee
+    // takes them as aliases of `startLine`/`endLine` — GH #367), and
+    // `<cfloop file="f" index="l" from="3" to="5">` iterates lines 3-5, not
+    // the numbers 3-5 with the file unopened.
+    if let (Some(from), Some(to), Some(index), None) = (
         attrs.get("from"),
         attrs.get("to"),
         attrs.get("index"),
+        attrs.get("file"),
     ) {
         let step = attrs.get("step").cloned().unwrap_or("1".to_string());
         let from = strip_hashes(from);
@@ -3906,8 +3913,26 @@ fn parse_cfloop_tag(
         // file form fell through to `while(true)` and hung (GitHub issue #158).
         let file = strip_hashes(file);
         let index = strip_hashes(index);
+        // Optional line window. `startLine`/`endLine` are the documented
+        // Lucee names and win over the `from`/`to` aliases when both are
+        // given (verified against Lucee 7.1). An absent bound is passed as
+        // `null` rather than 0, because `to="0"` is a real value there
+        // meaning "no lines" — see `__cfloop_file_open` in the VM.
+        let bound = |names: [&str; 2]| -> String {
+            names
+                .iter()
+                .find_map(|n| attrs.get(*n))
+                .map(|v| strip_hashes(v))
+                .unwrap_or_else(|| "null".to_string())
+        };
         (
-            format!("for (var {} in __cfloop_file_lines({})) {{\n", index, file),
+            format!(
+                "for (var {} in __cfloop_file_lines({}, {}, {})) {{\n",
+                index,
+                file,
+                bound(["startline", "from"]),
+                bound(["endline", "to"]),
+            ),
             consumed,
         )
     } else {

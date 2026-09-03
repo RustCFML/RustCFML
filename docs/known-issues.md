@@ -1533,6 +1533,38 @@ Two properties worth knowing rather than rediscovering:
   reader behaves the same way; the alternative is scanning the whole file
   up-front, which is the cost being removed.
 
+### The line window (`startLine`/`endLine`, a.k.a. `from`/`to`)
+
+Reading a file's header to validate it is the case the streaming loop still
+handled badly: the only way to stop early was `break`, and stopping early is
+the whole point. Both bounds are honoured as of v0.651.0, in both spellings —
+`startLine`/`endLine` are Lucee's documented attribute names and `from`/`to`
+are aliases, with the documented pair winning if both appear:
+
+```cfml
+loop file=p item="line" from=1 to=1 { validateHeader( line ); }   // reads ONE line
+<cfloop file="#p#" index="line" startline="2" endline="10"> ... </cfloop>
+```
+
+Behaviour matches Lucee 7.1 on every edge the alias pair has (all asserted
+cross-engine in `tests/tags/test_loop_file_lines.cfm`): a start below 1 clamps
+to line 1, a start past EOF or an `endLine` below the start runs the body no
+times rather than erroring, a fractional bound truncates, and a non-numeric one
+throws an `expression` error instead of reading as 0 — which would look like an
+empty file. The window is enforced on the cursor, so `to=1` on a 214MB file
+still reads one line; slicing a materialised array would have handed back the
+residency the cursor exists to avoid.
+
+Note the trap the guard exists for: `from`/`to` **with** `index` is also the
+shape of the counted index loop, and that lowering ignores `file` entirely. Both
+lowerings therefore check `file=` first — before the guard,
+`<cfloop file="f" index="l" from="3" to="5">` bound `l` to the numbers 3, 4, 5
+and never opened the file.
+
+Still not implemented: `characters` (chunked reads rather than lines) and
+`charset`. Both are currently accepted and ignored, so a `characters=` loop
+yields whole lines instead of fixed-size chunks.
+
 ## 70. An operator word used as a plain variable is read as the operator 🏗
 
 A reserved word may **name** a variable on Lucee, and RustCFML now agrees for

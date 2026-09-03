@@ -2394,7 +2394,16 @@ impl Parser {
         let item = get("item");
 
         // 1) Index loop: from / to / index (+ optional step).
-        if let (Some(from), Some(to), Some(index)) = (from.clone(), to.clone(), index.clone()) {
+        //
+        // `file=` wins over this shape: on a file loop `from`/`to` are LINE
+        // BOUNDS, not a counter (Lucee accepts them as aliases of
+        // `startLine`/`endLine` — GH #367). Without this guard
+        // `loop file=p index="line" from=1 to=1 {}` compiled to a numeric
+        // count from 1 to 1 with the file never opened, so the body ran once
+        // with `line` bound to `1`.
+        if let (Some(from), Some(to), Some(index), None) =
+            (from.clone(), to.clone(), index.clone(), get("file"))
+        {
             let idx = var_name(&index).unwrap_or_else(|| "i".to_string());
             let step = get("step").unwrap_or_else(|| int(1));
             // Direction chosen from the sign of step (Lucee): when step < 0 the
@@ -2654,9 +2663,17 @@ impl Parser {
         if let Some(file) = get("file") {
             if let Some(binding) = item.clone().or(index.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "line".to_string());
+                // Optional line window. `startLine`/`endLine` are the
+                // documented Lucee attribute names and win over `from`/`to`
+                // when both are given (verified against Lucee 7.1); an absent
+                // bound is a Null argument, since 0 is a real `to` value.
+                let null_lit =
+                    || Expression::Literal(Literal { value: LiteralValue::Null, location: loc });
+                let start = get("startline").or(from.clone()).unwrap_or_else(null_lit);
+                let end = get("endline").or(to.clone()).unwrap_or_else(null_lit);
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
                     variable: name,
-                    iterable: call("__cfloop_file_lines", vec![file]),
+                    iterable: call("__cfloop_file_lines", vec![file, start, end]),
                     body,
                     location: loc,
                 })));
