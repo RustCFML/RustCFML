@@ -127,10 +127,16 @@ impl Vfs for EngineCfcOverlay {
 
     /// Forwarded so a `loop file=` on an ordinary path still streams; only the
     /// handful of overlaid engine CFCs (already in-memory strings) go eager.
-    fn open_lines(&self, path: &str) -> io::Result<Box<dyn cfml_common::vfs::VfsLines>> {
+    /// `opts.charset` is not applied to those: they are Rust `&str` already
+    /// decoded, not bytes on disk.
+    fn open_chunks(
+        &self,
+        path: &str,
+        opts: cfml_common::vfs::FileCursorOpts,
+    ) -> io::Result<Box<dyn cfml_common::vfs::VfsFileChunks>> {
         match self.overlaid(path) {
-            Some(src) => Ok(Box::new(cfml_common::vfs::EagerLines::new(src))),
-            None => self.base.open_lines(path),
+            Some(src) => Ok(Box::new(cfml_common::vfs::EagerChunks::new(src, opts.chunking))),
+            None => self.base.open_chunks(path, opts),
         }
     }
 

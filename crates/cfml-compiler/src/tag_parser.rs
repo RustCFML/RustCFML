@@ -3913,25 +3913,37 @@ fn parse_cfloop_tag(
         // file form fell through to `while(true)` and hung (GitHub issue #158).
         let file = strip_hashes(file);
         let index = strip_hashes(index);
-        // Optional line window. `startLine`/`endLine` are the documented
-        // Lucee names and win over the `from`/`to` aliases when both are
-        // given (verified against Lucee 7.1). An absent bound is passed as
-        // `null` rather than 0, because `to="0"` is a real value there
-        // meaning "no lines" — see `__cfloop_file_open` in the VM.
-        let bound = |names: [&str; 2]| -> String {
+        // The read options, positional, absent ones as `null` rather than 0
+        // (`to="0"` is a real value meaning "no lines" — see
+        // `__cfloop_file_open` in the VM). `startLine`/`endLine` are the
+        // documented Lucee names and win over the `from`/`to` aliases when
+        // both are given; `characters` switches from lines to fixed-size
+        // chunks and `charset` decodes the bytes. Verified against Lucee 7.1.
+        //
+        // `charset` is a plain string attribute, so it needs quoting when it
+        // is not an interpolation — `charset="iso-8859-1"` must reach the VM
+        // as a string, not as the expression `iso - 8859 - 1`.
+        let opt = |names: [&str; 2]| -> String {
             names
                 .iter()
                 .find_map(|n| attrs.get(*n))
                 .map(|v| strip_hashes(v))
                 .unwrap_or_else(|| "null".to_string())
         };
+        let charset = match attrs.get("charset") {
+            None => "null".to_string(),
+            Some(v) if v.contains('#') => strip_hashes(v),
+            Some(v) => format!("\"{}\"", escape_for_string_literal(v)),
+        };
         (
             format!(
-                "for (var {} in __cfloop_file_lines({}, {}, {})) {{\n",
+                "for (var {} in __cfloop_file_lines({}, {}, {}, {}, {})) {{\n",
                 index,
                 file,
-                bound(["startline", "from"]),
-                bound(["endline", "to"]),
+                opt(["startline", "from"]),
+                opt(["endline", "to"]),
+                opt(["characters", "characters"]),
+                charset,
             ),
             consumed,
         )

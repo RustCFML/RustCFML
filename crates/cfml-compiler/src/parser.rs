@@ -2663,17 +2663,25 @@ impl Parser {
         if let Some(file) = get("file") {
             if let Some(binding) = item.clone().or(index.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "line".to_string());
-                // Optional line window. `startLine`/`endLine` are the
-                // documented Lucee attribute names and win over `from`/`to`
-                // when both are given (verified against Lucee 7.1); an absent
-                // bound is a Null argument, since 0 is a real `to` value.
+                // The read options, positional, absent ones as Null (0 could
+                // not mean "unset" — `to=0` is a real value meaning "no
+                // lines"). `startLine`/`endLine` are the documented Lucee
+                // attribute names and win over the `from`/`to` aliases when
+                // both are given; `characters` switches from lines to
+                // fixed-size chunks and `charset` decodes the bytes. All
+                // verified against Lucee 7.1.
                 let null_lit =
                     || Expression::Literal(Literal { value: LiteralValue::Null, location: loc });
                 let start = get("startline").or(from.clone()).unwrap_or_else(null_lit);
                 let end = get("endline").or(to.clone()).unwrap_or_else(null_lit);
+                let characters = get("characters").unwrap_or_else(null_lit);
+                let charset = get("charset").unwrap_or_else(null_lit);
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
                     variable: name,
-                    iterable: call("__cfloop_file_lines", vec![file, start, end]),
+                    iterable: call(
+                        "__cfloop_file_lines",
+                        vec![file, start, end, characters, charset],
+                    ),
                     body,
                     location: loc,
                 })));

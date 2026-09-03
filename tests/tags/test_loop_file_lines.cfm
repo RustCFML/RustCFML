@@ -286,3 +286,139 @@ assert("return out of a windowed loop closes the cursor (2000x)", headerOk, 2000
 fileDelete(winPath);
 suiteEnd();
 </cfscript>
+
+<cfscript>
+suiteBegin("Loop: file= chunks by characters= and decodes with charset=");
+
+// `characters=N` and `charset=` were accepted and IGNORED — a `characters=`
+// loop yielded whole lines, and a file in any single-byte encoding either came
+// back with replacement characters or, on invalid UTF-8, threw. Both are now
+// honoured, streaming, and every assertion here was probed against Lucee 7.1
+// first (GH #367).
+
+chPath = getTempDirectory() & "rcf_loop_chars_" & createUUID() & ".txt";
+chBuf = [];
+for (ci = 1; ci <= 10; ci++) { arrayAppend(chBuf, "line" & ci); }
+// A trailing newline, so the last chunk is a short remainder.
+fileWrite(chPath, arrayToList(chBuf, chr(10)) & chr(10));
+
+// Collect the chunks a `characters=N` loop yields.
+function chunksOf( required string path, required numeric n ) {
+    var out = [];
+    loop file=arguments.path item="chunk" characters=arguments.n { arrayAppend(out, chunk); }
+    return out;
+}
+// Chunks rendered visibly, so a boundary landing on a newline is legible in a
+// failure message.
+function showChunks( required array chunks ) {
+    var shown = [];
+    for (var c in arguments.chunks) { arrayAppend(shown, replace(c, chr(10), "\n", "all")); }
+    return arrayToList(shown, "|");
+}
+
+// --- fixed-size chunks, terminators included verbatim ---
+assert(
+    "characters=3 yields 3-character chunks with the newlines kept",
+    showChunks(chunksOf(chPath, 3)),
+    "lin|e1\n|lin|e2\n|lin|e3\n|lin|e4\n|lin|e5\n|lin|e6\n|lin|e7\n|lin|e8\n|lin|e9\n|lin|e10|\n"
+);
+assert("characters=4 chunks across line boundaries", showChunks(chunksOf(chPath, 4)), "line|1\nli|ne2\n|line|3\nli|ne4\n|line|5\nli|ne6\n|line|7\nli|ne8\n|line|9\nli|ne10|\n");
+assert("the last chunk is the short remainder", arrayLen(chunksOf(chPath, 3)), 21);
+
+// A chunk size past the file's length yields the whole file, once.
+bigChunks = chunksOf(chPath, 1000);
+assert("characters past the file length yields one chunk", arrayLen(bigChunks), 1);
+assert("that chunk is the whole file", len(bigChunks[1]), 61);
+
+// A fractional size truncates, and a numeric string is accepted (both Lucee).
+assert("a fractional characters truncates", showChunks(chunksOf(chPath, 3.7)), showChunks(chunksOf(chPath, 3)));
+strChars = [];
+loop file=chPath item="chunk" characters="4" { arrayAppend(strChars, chunk); }
+assert("a numeric-string characters is accepted", showChunks(strChars), showChunks(chunksOf(chPath, 4)));
+
+// An unusable chunk size throws rather than yielding empty strings for ever.
+assertThrows("a negative characters throws", function() {
+    loop file=chPath item="chunk" characters=-2 { writeOutput(chunk); }
+});
+if (isRustCFML()) {
+    // Lucee loops FOREVER on characters=0, yielding "" until the request is
+    // killed, so this assertion cannot run there — it would hang the suite.
+    assertThrows("characters=0 throws rather than looping for ever", function() {
+        loop file=chPath item="chunk" characters=0 { writeOutput(chunk); }
+    });
+}
+
+// An empty file yields no chunks, exactly as it yields no lines.
+chEmpty = getTempDirectory() & "rcf_loop_chars_empty_" & createUUID() & ".txt";
+fileWrite(chEmpty, "");
+assert("an empty file yields no chunks", arrayLen(chunksOf(chEmpty, 5)), 0);
+fileDelete(chEmpty);
+
+// --- CHARACTERS, not bytes: a multi-byte character counts once ---
+mbPath = getTempDirectory() & "rcf_loop_mb_" & createUUID() & ".txt";
+// "aé€b" / "cé€d" — 1, 2 and 3 UTF-8 bytes per character.
+fileWrite(mbPath, "a" & chr(233) & chr(8364) & "b" & chr(10) & "c" & chr(233) & chr(8364) & "d");
+mbChunks = chunksOf(mbPath, 2);
+mbLens = [];
+for (mc in mbChunks) { arrayAppend(mbLens, len(mc)); }
+assert("characters=2 counts characters, not bytes", arrayToList(mbLens, ","), "2,2,2,2,1");
+assert("the multibyte chunks read back intact", showChunks(mbChunks), "a" & chr(233) & "|" & chr(8364) & "b|\nc|" & chr(233) & chr(8364) & "|d");
+mbLines = [];
+loop file=mbPath item="line" { arrayAppend(mbLines, len(line)); }
+assert("a line of multibyte characters has its character length", arrayToList(mbLines, ","), "4,4");
+fileDelete(mbPath);
+
+// --- charset= ---
+csPath = getTempDirectory() & "rcf_loop_cs_" & createUUID() & ".txt";
+fileWrite(csPath, "caf" & chr(233) & " na" & chr(239) & "ve" & chr(10) & "second", "iso-8859-1");
+
+csLines = [];
+loop file=csPath item="line" charset="iso-8859-1" { arrayAppend(csLines, line); }
+assert("charset= decodes the file's encoding", arrayToList(csLines, "|"), "caf" & chr(233) & " na" & chr(239) & "ve|second");
+assert("and the decoded line has its character length", len(csLines[1]), 10);
+
+// Reading single-byte content as the default UTF-8 substitutes U+FFFD per bad
+// byte rather than throwing — Lucee's lenient decoder, and the reason a
+// mis-declared file degrades instead of aborting the loop.
+defLines = [];
+loop file=csPath item="line" { arrayAppend(defLines, line); }
+assert("an undecodable byte becomes one replacement character", len(defLines[1]), 10);
+assert("the decodable part is unaffected", left(defLines[1], 3), "caf");
+assert("the bad byte is U+FFFD", mid(defLines[1], 4, 1), chr(65533));
+assert("a later line is unaffected", defLines[2], "second");
+
+// charset and characters together.
+csChunks = [];
+loop file=csPath item="chunk" charset="iso-8859-1" characters=4 { arrayAppend(csChunks, chunk); }
+assert("charset= applies to characters= chunks too", showChunks(csChunks), "caf" & chr(233) & "| na" & chr(239) & "|ve\ns|econ|d");
+
+assertThrows("an unsupported charset name throws", function() {
+    loop file=csPath item="line" charset="not-a-charset" { writeOutput(line); }
+});
+
+// --- the window counts ITERATIONS, so with characters= it counts chunks ---
+winChunks = [];
+loop file=chPath item="chunk" characters=7 from=3 to=4 { arrayAppend(winChunks, chunk); }
+assert("from/to select the Nth and Mth chunk, not lines", showChunks(winChunks), "ne3\nlin|e4\nline");
+toOnly = [];
+loop file=chPath item="chunk" characters=7 to=2 { arrayAppend(toOnly, chunk); }
+assert("to= caps the chunk count", showChunks(toOnly), "line1\nl|ine2\nli");
+</cfscript>
+
+<!--- --- tag form: characters=, charset=, and both with a window --- --->
+<cfset tagChars = []>
+<cfloop file="#chPath#" index="tc" characters="9"><cfset arrayAppend(tagChars, tc)></cfloop>
+<cfset tagCs = []>
+<cfloop file="#csPath#" index="tcs" charset="iso-8859-1" characters="6"><cfset arrayAppend(tagCs, tcs)></cfloop>
+<cfset tagChWin = []>
+<cfloop file="#chPath#" index="tcw" characters="9" from="2" to="3"><cfset arrayAppend(tagChWin, tcw)></cfloop>
+
+<cfscript>
+assert("tag form characters= chunks the file", showChunks(tagChars), "line1\nlin|e2\nline3\n|line4\nlin|e5\nline6\n|line7\nlin|e8\nline9\n|line10\n");
+assert("tag form charset= decodes, quoted attribute and all", showChunks(tagCs), "caf" & chr(233) & " n|a" & chr(239) & "ve\ns|econd");
+assert("tag form window counts chunks", showChunks(tagChWin), "e2\nline3\n|line4\nlin");
+
+fileDelete(csPath);
+fileDelete(chPath);
+suiteEnd();
+</cfscript>

@@ -3647,7 +3647,7 @@ impl CfmlCompiler {
     /// Synthesises this and compiles it through the ordinary statement path:
     ///
     /// ```text
-    ///   __filehandle_N = __cfloop_file_open(path, startLine, endLine);
+    ///   __filehandle_N = __cfloop_file_open(path, <read options>);
     ///   try {
     ///       while (true) {
     ///           __fileline_N = __cfloop_file_next(__filehandle_N);
@@ -3677,8 +3677,9 @@ impl CfmlCompiler {
         &mut self,
         for_in: &ForIn,
         path: &Expression,
-        start_line: Option<&Expression>,
-        end_line: Option<&Expression>,
+        // `startLine`, `endLine`, `characters`, `charset` — in that order,
+        // any trailing ones absent.
+        read_opts: &[Expression],
         instructions: &mut Vec<BytecodeOp>,
     ) {
         let loc = for_in.location;
@@ -3740,25 +3741,20 @@ impl CfmlCompiler {
             })
         };
 
-        // __filehandle_N = __cfloop_file_open(path, startLine, endLine)
+        // __filehandle_N = __cfloop_file_open(path, startLine, endLine,
+        //                                      characters, charset)
         //
-        // The window is always passed positionally, with an absent bound sent
-        // as a Null literal: 0 could not stand for "unbounded", because
-        // `to=0` is a real value there and means "no lines" (Lucee runs the
-        // body no times, it does not read the whole file).
+        // Options are always passed positionally, with an absent one sent as a
+        // Null literal: 0 could not stand for "unset", because `to=0` is a
+        // real value there and means "no lines" (Lucee runs the body no times,
+        // it does not read the whole file).
         let null_lit = || Expression::Literal(Literal { value: LiteralValue::Null, location: loc });
+        let mut open_args = vec![path.clone()];
+        for i in 0..4 {
+            open_args.push(read_opts.get(i).cloned().unwrap_or_else(null_lit));
+        }
         self.compile_statement(
-            &assign(
-                ident(&handle),
-                call(
-                    "__cfloop_file_open",
-                    vec![
-                        path.clone(),
-                        start_line.cloned().unwrap_or_else(null_lit),
-                        end_line.cloned().unwrap_or_else(null_lit),
-                    ],
-                ),
-            ),
+            &assign(ident(&handle), call("__cfloop_file_open", open_args)),
             instructions,
         );
 
@@ -3812,17 +3808,17 @@ impl CfmlCompiler {
         // script spellings cannot drift apart.
         if let Expression::FunctionCall(call) = &for_in.iterable {
             if let Expression::Identifier(name) = &*call.name {
-                // Args 2/3, when present, are the optional line window
-                // (`startLine`/`endLine`, a.k.a. `from`/`to` — GH #367); a
-                // Null argument means that bound was not given.
+                // Args 2..=5, when present, are the loop's read options: the
+                // iteration window (`startLine`/`endLine`, a.k.a. `from`/`to`),
+                // `characters=` and `charset=` (GH #367). A Null argument means
+                // that option was not given.
                 if name.name.eq_ignore_ascii_case("__cfloop_file_lines")
-                    && (1..=3).contains(&call.arguments.len())
+                    && (1..=5).contains(&call.arguments.len())
                 {
                     self.compile_for_in_file(
                         for_in,
                         &call.arguments[0],
-                        call.arguments.get(1),
-                        call.arguments.get(2),
+                        &call.arguments[1..],
                         instructions,
                     );
                     return;

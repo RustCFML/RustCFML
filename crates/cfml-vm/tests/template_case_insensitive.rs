@@ -22,7 +22,7 @@ use std::time::SystemTime;
 
 use cfml_codegen::{compiler::CfmlCompiler, BytecodeProgram};
 use cfml_common::dynamic::{CfmlValue, ValueMap};
-use cfml_common::vfs::{RealFs, Vfs, VfsDirEntry, VfsLines};
+use cfml_common::vfs::{FileCursorOpts, RealFs, Vfs, VfsDirEntry, VfsFileChunks};
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
 use cfml_vm::{CfmlMapping, CfmlVirtualMachine};
@@ -105,11 +105,15 @@ impl Vfs for CaseSensitiveFs {
         }
         self.0.canonicalize(path)
     }
-    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+    fn open_chunks(
+        &self,
+        path: &str,
+        opts: FileCursorOpts,
+    ) -> io::Result<Box<dyn VfsFileChunks>> {
         if !self.exact(path) {
             return Self::miss();
         }
-        self.0.open_lines(path)
+        self.0.open_chunks(path, opts)
     }
 }
 

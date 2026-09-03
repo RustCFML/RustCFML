@@ -17,43 +17,164 @@ pub struct VfsDirEntry {
     pub is_dir: bool,
 }
 
-/// A streaming line reader over one file.
+/// A streaming reader over one file, yielding one `loop file=` iteration at a
+/// time.
 ///
-/// Exists so `loop file=` can bound its memory to a single line instead of
+/// Exists so `loop file=` can bound its memory to a single chunk instead of
 /// materialising the whole file (GH #367): the reporter's files run to over a
 /// million rows, and the eager path cost file-size + one `String` per line
 /// *before the first iteration* — strictly worse than the `fileRead()` +
 /// `listToArray()` workaround the construct is supposed to replace.
-///
-/// Line semantics match the eager path exactly (`str::lines`): the terminator
-/// is stripped, `\r\n` and `\n` both end a line, a trailing newline does NOT
-/// yield a final empty line, and interior blank lines ARE yielded so line
-/// numbers stay accurate.
-pub trait VfsLines: Send {
-    /// The next line, or `None` at end of file.
-    fn next_line(&mut self) -> io::Result<Option<String>>;
+pub trait VfsFileChunks: Send {
+    /// The next chunk, or `None` at end of file.
+    fn next_chunk(&mut self) -> io::Result<Option<String>>;
 }
 
-/// Eager fallback: the whole file split up-front, handed back one line at a time.
+/// What one iteration of `loop file=` yields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileChunking {
+    /// One line, `str::lines` semantics: the terminator is stripped, `\r\n`
+    /// and `\n` both end a line, a trailing newline does NOT yield a final
+    /// empty line, and interior blank lines ARE yielded so line numbers stay
+    /// accurate.
+    Lines,
+    /// Exactly N **characters** (not bytes — a multi-byte character counts
+    /// once), terminators included verbatim, with the last chunk holding
+    /// whatever is left. This is `<cfloop file= characters=N>`.
+    Chars(usize),
+}
+
+/// How to read a file for `loop file=`: what a chunk is, and how to decode
+/// bytes into characters (`charset=`).
+#[derive(Clone, Copy, Debug)]
+pub struct FileCursorOpts {
+    pub chunking: FileChunking,
+    pub charset: crate::charset::Charset,
+}
+
+impl Default for FileCursorOpts {
+    fn default() -> Self {
+        FileCursorOpts {
+            chunking: FileChunking::Lines,
+            charset: crate::charset::Charset::Utf8,
+        }
+    }
+}
+
+/// Decoded-but-not-yet-yielded text, split into chunks on demand. Shared by
+/// the streaming and eager readers so the two cannot disagree about what a
+/// chunk is.
+///
+/// Consumed text is left in place behind a read cursor and dropped once per
+/// refill, not once per chunk. Draining from the front per chunk instead
+/// memmoves the whole remaining buffer every time — with 16KB buffered and
+/// ~40-byte lines that was ~6MB of shifting per block read, and it cost the
+/// million-line loop ~10% of its wall clock.
+struct ChunkBuf {
+    text: String,
+    /// Byte offset of the first unconsumed character.
+    pos: usize,
+}
+
+impl ChunkBuf {
+    fn new(text: String) -> Self {
+        ChunkBuf { text, pos: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos >= self.text.len()
+    }
+
+    fn rest(&self) -> &str {
+        &self.text[self.pos..]
+    }
+
+    /// Append more decoded text, first discarding what has been consumed.
+    fn refill_with(&mut self, decoder: &mut crate::charset::StreamDecoder, bytes: &[u8]) {
+        self.compact();
+        decoder.push_into(bytes, &mut self.text);
+    }
+
+    fn refill_finish(&mut self, decoder: &mut crate::charset::StreamDecoder) {
+        self.compact();
+        let tail = decoder.finish();
+        self.text.push_str(&tail);
+    }
+
+    fn compact(&mut self) {
+        if self.pos > 0 {
+            self.text.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
+
+    /// The next chunk, or `None` when more text is needed (`at_eof` false) or
+    /// the file is exhausted (`at_eof` true).
+    fn take(&mut self, chunking: FileChunking, at_eof: bool) -> Option<String> {
+        match chunking {
+            FileChunking::Lines => match self.rest().find('\n') {
+                Some(nl) => {
+                    let end = self.pos + nl;
+                    // `\r\n` — strip the carriage return with the newline, as
+                    // `str::lines` and `BufRead::lines` both do.
+                    let stop = if self.text[self.pos..end].ends_with('\r') { end - 1 } else { end };
+                    let line = self.text[self.pos..stop].to_string();
+                    self.pos = end + 1;
+                    Some(line)
+                }
+                // A final line with no terminator is still a line; a trailing
+                // newline leaves nothing behind, which is why this is not
+                // `Some("")`.
+                None if at_eof && !self.is_empty() => {
+                    let line = self.rest().to_string();
+                    self.pos = self.text.len();
+                    Some(line)
+                }
+                None => None,
+            },
+            FileChunking::Chars(n) => match self.rest().char_indices().nth(n) {
+                Some((offset, _)) => {
+                    let end = self.pos + offset;
+                    let chunk = self.text[self.pos..end].to_string();
+                    self.pos = end;
+                    Some(chunk)
+                }
+                // Fewer than N characters buffered: at EOF that is the last
+                // (short) chunk, mid-stream it means read more.
+                None if at_eof && !self.is_empty() => {
+                    let chunk = self.rest().to_string();
+                    self.pos = self.text.len();
+                    Some(chunk)
+                }
+                None => None,
+            },
+        }
+    }
+}
+
+/// Eager fallback: the whole file decoded up-front, handed back one chunk at a
+/// time.
 ///
 /// The default for VFS implementations that have nothing to stream *from* — an
 /// embedded archive is already resident in memory, so a "streaming" read of it
 /// would save nothing. Callers get the same values either way; only the peak
 /// memory differs, and for those implementations it cannot be improved.
-pub struct EagerLines {
-    lines: std::vec::IntoIter<String>,
+pub struct EagerChunks {
+    buf: ChunkBuf,
+    chunking: FileChunking,
 }
 
-impl EagerLines {
-    pub fn new(content: &str) -> Self {
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        EagerLines { lines: lines.into_iter() }
+impl EagerChunks {
+    pub fn new(content: &str, chunking: FileChunking) -> Self {
+        EagerChunks { buf: ChunkBuf::new(content.to_string()), chunking }
     }
 }
 
-impl VfsLines for EagerLines {
-    fn next_line(&mut self) -> io::Result<Option<String>> {
-        Ok(self.lines.next())
+impl VfsFileChunks for EagerChunks {
+    fn next_chunk(&mut self) -> io::Result<Option<String>> {
+        // Everything is already in hand, so "not enough text yet" cannot
+        // happen — at_eof is always true here.
+        Ok(self.buf.take(self.chunking, true))
     }
 }
 
@@ -71,16 +192,21 @@ pub trait Vfs: Send + Sync {
     /// Canonicalize a path (resolve symlinks, make absolute).
     fn canonicalize(&self, path: &str) -> io::Result<String>;
 
-    /// Open a file for line-by-line streaming (see [`VfsLines`]).
+    /// Open a file for chunk-by-chunk streaming (see [`VfsFileChunks`]).
     ///
     /// Defaults to reading the file whole and iterating the result, which is
     /// correct for every implementation and optimal for the in-memory ones.
     /// [`RealFs`] overrides it with a buffered reader so a large file on disk
-    /// costs one line of resident memory rather than its whole size.
+    /// costs one chunk of resident memory rather than its whole size.
     /// Delegating implementations must forward this, or they silently drop
     /// back to the eager path for the files that most need streaming.
-    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
-        Ok(Box::new(EagerLines::new(&self.read_to_string(path)?)))
+    fn open_chunks(
+        &self,
+        path: &str,
+        opts: FileCursorOpts,
+    ) -> io::Result<Box<dyn VfsFileChunks>> {
+        let text = crate::charset::decode(&self.read(path)?, opts.charset);
+        Ok(Box::new(EagerChunks::new(&text, opts.chunking)))
     }
 }
 
@@ -138,21 +264,24 @@ impl Vfs for RealFs {
         std::fs::metadata(path)?.modified()
     }
 
-    /// Buffered, one line resident at a time — this is the whole point of
-    /// [`Vfs::open_lines`]. `BufRead::lines` strips the terminator and a
-    /// preceding `\r` exactly as `str::lines` does, so the values are
-    /// identical to the eager path's.
-    ///
-    /// One deliberate divergence from the eager path: invalid UTF-8 surfaces
-    /// when the loop reaches the offending line rather than before the first
-    /// iteration, because nothing reads ahead of the cursor. That is what
-    /// Lucee's buffered reader does too, and it is inherent to streaming — the
-    /// alternative is to scan the whole file first, which is the cost being
-    /// removed.
-    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+    /// Buffered, one chunk resident at a time — this is the whole point of
+    /// [`Vfs::open_chunks`]. Chunk boundaries and decoding both go through the
+    /// same helpers the eager path uses ([`take_chunk`],
+    /// [`crate::charset::StreamDecoder`], which is asserted equivalent to
+    /// `charset::decode` of the whole file), so the values are identical
+    /// either way and only peak memory differs.
+    fn open_chunks(
+        &self,
+        path: &str,
+        opts: FileCursorOpts,
+    ) -> io::Result<Box<dyn VfsFileChunks>> {
         let file = std::fs::File::open(path)?;
-        Ok(Box::new(BufReaderLines {
-            lines: io::BufRead::lines(io::BufReader::new(file)),
+        Ok(Box::new(StreamFileChunks {
+            reader: io::BufReader::new(file),
+            decoder: crate::charset::StreamDecoder::new(opts.charset),
+            buf: ChunkBuf::new(String::new()),
+            chunking: opts.chunking,
+            at_eof: false,
         }))
     }
 
@@ -257,14 +386,44 @@ impl EmbeddedFs {
     }
 }
 
-/// [`RealFs`]'s streaming reader — a `BufReader` over the open file.
-struct BufReaderLines {
-    lines: io::Lines<io::BufReader<std::fs::File>>,
+/// [`RealFs`]'s streaming reader — a `BufReader` over the open file, decoded
+/// incrementally, with only the current chunk (plus at most one read block)
+/// resident.
+struct StreamFileChunks {
+    reader: io::BufReader<std::fs::File>,
+    decoder: crate::charset::StreamDecoder,
+    /// Decoded text not yet handed out. Never larger than one chunk plus one
+    /// read block.
+    buf: ChunkBuf,
+    chunking: FileChunking,
+    at_eof: bool,
 }
 
-impl VfsLines for BufReaderLines {
-    fn next_line(&mut self) -> io::Result<Option<String>> {
-        self.lines.next().transpose()
+/// Bytes read per refill. Large enough that a line-at-a-time loop does not
+/// syscall per line, small enough to stay irrelevant next to the engine's
+/// baseline footprint.
+const CHUNK_READ_BLOCK: usize = 16 * 1024;
+
+impl VfsFileChunks for StreamFileChunks {
+    fn next_chunk(&mut self) -> io::Result<Option<String>> {
+        loop {
+            if let Some(chunk) = self.buf.take(self.chunking, self.at_eof) {
+                return Ok(Some(chunk));
+            }
+            if self.at_eof {
+                return Ok(None);
+            }
+            let mut block = [0u8; CHUNK_READ_BLOCK];
+            let read = io::Read::read(&mut self.reader, &mut block)?;
+            if read == 0 {
+                self.at_eof = true;
+                // A character left half-decoded by a truncated file becomes
+                // U+FFFD here rather than being dropped.
+                self.buf.refill_finish(&mut self.decoder);
+            } else {
+                self.buf.refill_with(&mut self.decoder, &block[..read]);
+            }
+        }
     }
 }
 
@@ -400,10 +559,14 @@ impl Vfs for FallbackFs {
     /// Forwarded, not defaulted — the whole point of a `--build` binary reading
     /// a large data file off disk is that it streams. Resolution order mirrors
     /// `read_to_string`: embedded first, then the real FS unless sandboxed.
-    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
-        let result = self.embedded.open_lines(path);
+    fn open_chunks(
+        &self,
+        path: &str,
+        opts: FileCursorOpts,
+    ) -> io::Result<Box<dyn VfsFileChunks>> {
+        let result = self.embedded.open_chunks(path, opts);
         if result.is_ok() || self.sandbox { return result; }
-        self.real.open_lines(path)
+        self.real.open_chunks(path, opts)
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         let result = self.embedded.read(path);

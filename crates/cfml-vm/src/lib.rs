@@ -1363,22 +1363,26 @@ pub struct DirFoldEntry {
     pub index: FoldIndex,
 }
 
-/// One open `loop file=` line cursor, plus the line window the loop asked for
+/// One open `loop file=` cursor, plus the iteration window the loop asked for
 /// (`startLine`/`endLine`, spelled `from`/`to` in the reporter's code — Lucee
 /// accepts both, GH #367).
 ///
-/// The window is enforced here rather than by materialising and slicing,
-/// because slicing would give back exactly the whole-file residency the
-/// streaming cursor exists to avoid. `skip` lines are consumed and dropped
-/// before the first line is yielded; `remaining` counts the lines still
-/// allowed out, and `None` means "to EOF".
-struct FileLineCursor {
-    lines: Box<dyn cfml_common::vfs::VfsLines>,
-    /// Lines still to be consumed and discarded before the window opens
+/// The window counts ITERATIONS, not lines, which is the same thing until
+/// `characters=N` is in play: there Lucee's `from`/`to` select the Nth CHUNK
+/// (probed against 7.1), so both modes share this one counter.
+///
+/// It is enforced here rather than by materialising and slicing, because
+/// slicing would give back exactly the whole-file residency the streaming
+/// cursor exists to avoid. `skip` chunks are consumed and dropped before the
+/// first one is yielded; `remaining` counts those still allowed out, and
+/// `None` means "to EOF".
+struct FileLoopCursor {
+    chunks: Box<dyn cfml_common::vfs::VfsFileChunks>,
+    /// Chunks still to be consumed and discarded before the window opens
     /// (`startLine - 1`). Applied lazily on the first `next` so `open` does no
     /// I/O — a `startLine` past EOF simply ends the loop with zero iterations.
     skip: i64,
-    /// Lines still allowed out of the window; `None` = unbounded. Zero ends
+    /// Chunks still allowed out of the window; `None` = unbounded. Zero ends
     /// the loop, which is also how an `endLine` below `startLine` behaves
     /// (Lucee runs the body no times, it does not error).
     remaining: Option<i64>,
@@ -2884,7 +2888,7 @@ pub struct CfmlVirtualMachine {
     /// cursor — and the file descriptor under it — is dropped at request end.
     /// Unwinding a handle through every `?` in the interpreter would buy
     /// nothing over that.
-    file_line_cursors: HashMap<i64, FileLineCursor>,
+    file_line_cursors: HashMap<i64, FileLoopCursor>,
     /// Monotonic handle counter. Never reused, so a stale handle from a closed
     /// cursor reports "closed" rather than silently reading someone else's file.
     next_file_line_cursor: i64,
@@ -14141,6 +14145,46 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Resolve `characters=` and `charset=` into the VFS cursor options.
+    ///
+    /// Two deliberate divergences from Lucee, both in the direction of a clear
+    /// error over a broken run: `characters=0` loops forever there, yielding
+    /// empty strings until the request is killed, and a negative value throws
+    /// a raw `java.lang.NegativeArraySizeException`. An unusable chunk size is
+    /// rejected here instead.
+    fn cfloop_file_cursor_opts(
+        characters: Option<&CfmlValue>,
+        charset: Option<&CfmlValue>,
+    ) -> Result<cfml_common::vfs::FileCursorOpts, CfmlError> {
+        use cfml_common::vfs::{FileChunking, FileCursorOpts};
+        let chunking = match Self::cfloop_file_line_bound(characters, "characters")? {
+            None => FileChunking::Lines,
+            Some(n) if n >= 1 => FileChunking::Chars(n as usize),
+            Some(n) => {
+                return Err(CfmlError::expression(format!(
+                    "cfloop file: characters must be 1 or more, got [{}]",
+                    n
+                )))
+            }
+        };
+        let charset = match charset {
+            None | Some(CfmlValue::Null) => cfml_common::charset::Charset::Utf8,
+            Some(v) => {
+                let name = v.as_string();
+                match cfml_common::charset::resolve(&name) {
+                    Some(cs) => cs,
+                    None => {
+                        return Err(CfmlError::expression(format!(
+                            "cfloop file: [{}] is not a supported character encoding",
+                            name
+                        )))
+                    }
+                }
+            }
+        };
+        Ok(FileCursorOpts { chunking, charset })
+    }
+
     fn call_function(
         &mut self,
         func_ref: &CfmlValue,
@@ -20025,7 +20069,8 @@ impl CfmlVirtualMachine {
                     let path = args.first().map(|v| v.as_string()).unwrap_or_default();
                     let start = Self::cfloop_file_line_bound(args.get(1), "startLine")?;
                     let end = Self::cfloop_file_line_bound(args.get(2), "endLine")?;
-                    let lines = self.vfs.open_lines(&path).map_err(|e| {
+                    let opts = Self::cfloop_file_cursor_opts(args.get(3), args.get(4))?;
+                    let chunks = self.vfs.open_chunks(&path, opts).map_err(|e| {
                         CfmlError::runtime(format!("cfloop file: cannot read '{}': {}", path, e))
                     })?;
                     // A `startLine` below 1 clamps to the first line (Lucee
@@ -20037,7 +20082,7 @@ impl CfmlVirtualMachine {
                     self.next_file_line_cursor += 1;
                     self.file_line_cursors.insert(
                         handle,
-                        FileLineCursor { lines, skip: start - 1, remaining },
+                        FileLoopCursor { chunks, skip: start - 1, remaining },
                     );
                     return Ok(CfmlValue::Int(handle));
                 }
@@ -20061,7 +20106,7 @@ impl CfmlVirtualMachine {
                     // on the first `next`, so the skipped region costs one
                     // line of memory like the window itself does.
                     while cursor.skip > 0 {
-                        match cursor.lines.next_line() {
+                        match cursor.chunks.next_chunk() {
                             Ok(Some(_)) => cursor.skip -= 1,
                             // `startLine` past EOF: zero iterations.
                             Ok(None) => return Ok(CfmlValue::Null),
@@ -20076,7 +20121,7 @@ impl CfmlVirtualMachine {
                     if cursor.remaining == Some(0) {
                         return Ok(CfmlValue::Null);
                     }
-                    return match cursor.lines.next_line() {
+                    return match cursor.chunks.next_chunk() {
                         Ok(Some(line)) => {
                             if let Some(left) = cursor.remaining.as_mut() {
                                 *left -= 1;
@@ -20110,18 +20155,33 @@ impl CfmlVirtualMachine {
                         .unwrap_or(1)
                         .max(1);
                     let end = Self::cfloop_file_line_bound(args.get(2), "endLine")?;
-                    return match self.vfs.read_to_string(&path) {
-                        Ok(content) => {
-                            let lines: Vec<CfmlValue> = content
-                                .lines()
-                                .skip(start as usize - 1)
-                                .take(match end {
-                                    Some(e) => (e - start + 1).max(0) as usize,
-                                    None => usize::MAX,
-                                })
-                                .map(|l| CfmlValue::string(l.to_string()))
-                                .collect();
-                            Ok(CfmlValue::array(lines))
+                    let opts = Self::cfloop_file_cursor_opts(args.get(3), args.get(4))?;
+                    // Chunking and decoding come from the same cursor the loop
+                    // uses, so `characters=`/`charset=` cannot mean one thing
+                    // here and another there.
+                    return match self.vfs.open_chunks(&path, opts) {
+                        Ok(mut cursor) => {
+                            let mut out: Vec<CfmlValue> = Vec::new();
+                            let mut n = 0i64;
+                            let limit = end.map(|e| (e - start + 1).max(0));
+                            while limit.is_none_or(|l| (out.len() as i64) < l) {
+                                match cursor.next_chunk() {
+                                    Ok(Some(chunk)) => {
+                                        n += 1;
+                                        if n >= start {
+                                            out.push(CfmlValue::string(chunk));
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        return Err(CfmlError::runtime(format!(
+                                            "cfloop file: error reading '{}': {}",
+                                            path, e
+                                        )))
+                                    }
+                                }
+                            }
+                            Ok(CfmlValue::array(out))
                         }
                         Err(e) => Err(CfmlError::runtime(format!(
                             "cfloop file: cannot read '{}': {}",

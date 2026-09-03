@@ -1528,10 +1528,12 @@ Two properties worth knowing rather than rediscovering:
   calls in one request exhaust a default 1024-fd limit and fail with EMFILE far
   from the cause. Regression cover: 40,000 early exits (returns and throws)
   under a deliberately-set 256-fd limit.
-- **Invalid UTF-8 surfaces at the offending line, not before the first
-  iteration**, because nothing reads ahead of the cursor. Lucee's buffered
-  reader behaves the same way; the alternative is scanning the whole file
-  up-front, which is the cost being removed.
+- **Undecodable bytes become U+FFFD, one per bad byte, rather than ending the
+  loop.** That is Lucee's lenient decoder, and it is what makes a
+  mis-declared file degrade instead of aborting. (Until v0.651.0 the streaming
+  reader used `BufRead::lines`, which *errored* on invalid UTF-8 — so a
+  Latin-1 file with no `charset=` threw "stream did not contain valid UTF-8"
+  where Lucee returned text.)
 
 ### The line window (`startLine`/`endLine`, a.k.a. `from`/`to`)
 
@@ -1561,9 +1563,45 @@ lowerings therefore check `file=` first — before the guard,
 `<cfloop file="f" index="l" from="3" to="5">` bound `l` to the numbers 3, 4, 5
 and never opened the file.
 
-Still not implemented: `characters` (chunked reads rather than lines) and
-`charset`. Both are currently accepted and ignored, so a `characters=` loop
-yields whole lines instead of fixed-size chunks.
+### `characters=` and `charset=`
+
+Both were accepted and **ignored** before v0.651.0 — a `characters=` loop
+yielded whole lines, and a file in a single-byte encoding came back with
+replacement characters (or threw, see above). Both now work, streaming, and
+both compose with the window:
+
+```cfml
+loop file=p item="chunk" characters=8192 { … }              // 8192-char chunks
+loop file=p item="line" charset="iso-8859-1" { … }          // decoded, per line
+<cfloop file="#p#" index="c" charset="utf-16" characters="6"> … </cfloop>
+```
+
+`characters=N` yields exactly N **characters** — not bytes, so a multi-byte
+character counts once — with line terminators included verbatim and the last
+chunk holding the remainder. `charset=` takes the same names as
+`fileRead`/`fileWrite` (`charset::resolve`), and a byte-order mark still wins
+over the declared charset, as it does everywhere else in the engine.
+
+**The window counts iterations, so with `characters=` it counts chunks**, not
+lines: `characters=7 from=3 to=4` yields the 3rd and 4th 7-character chunk.
+Probed against Lucee 7.1, which does the same.
+
+Two deliberate divergences, both trading a Lucee defect for an error:
+`characters=0` loops **forever** there, yielding `""` until the request is
+killed, and a negative value throws a raw
+`java.lang.NegativeArraySizeException`. Here an unusable chunk size is
+rejected with an `expression` error. (The cross-engine test for `characters=0`
+is guarded `isRustCFML()` — running it on Lucee hangs the suite.)
+
+Implementation note: decoding is incremental (`charset::StreamDecoder`, a
+Rust unit test asserts it is byte-for-byte equivalent to `charset::decode` of
+the whole file at every block size), and consumed text is dropped once per
+16KB refill rather than per chunk. Both matter: the naive versions of each
+cost the million-line loop ~10% of its wall clock, and a "streaming" reader
+that is 20% slower than the array walk it replaces is a poor trade. Measured
+on an 84MB / 2M-row CSV: line loop 985ms vs 997ms for the pre-charset reader,
+`characters=8192` 368ms, peak RSS flat at the engine's baseline, and
+`from=1 to=1` returns in 0ms.
 
 ## 70. An operator word used as a plain variable is read as the operator 🏗
 

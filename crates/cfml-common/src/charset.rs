@@ -163,6 +163,177 @@ pub fn decode(bytes: &[u8], cs: Charset) -> String {
     }
 }
 
+/// Incremental form of [`decode`], for a reader that must yield text before it
+/// has seen the whole file — `loop file=`, whose entire purpose is to not hold
+/// the file (GH #367).
+///
+/// Byte blocks arrive in order and text comes out. Two things make this more
+/// than a per-block `decode` call: a multi-byte character can straddle a block
+/// boundary (so an incomplete tail is held back until the next block completes
+/// it), and a byte-order mark is only meaningful at the very start of the
+/// stream (so the sniff happens once, not per block).
+///
+/// Undecodable input becomes U+FFFD exactly as [`decode`] does — including a
+/// tail still incomplete at end of stream, which is what a truncated file has.
+pub struct StreamDecoder {
+    cs: Charset,
+    /// Bytes received but not yet decodable — an incomplete trailing character.
+    /// Bounded by the longest encoded character (4 bytes), except before the
+    /// BOM sniff, where it holds at most the BOM's 3.
+    tail: Vec<u8>,
+    /// Whether the leading BOM has been looked for yet.
+    sniffed: bool,
+}
+
+impl StreamDecoder {
+    pub fn new(cs: Charset) -> Self {
+        StreamDecoder { cs, tail: Vec::new(), sniffed: false }
+    }
+
+    /// Decode what `bytes` completes, holding back an incomplete tail.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        let mut out = String::new();
+        self.push_into(bytes, &mut out);
+        out
+    }
+
+    /// [`push`](Self::push) appending into a caller's buffer.
+    ///
+    /// The reason this exists rather than just `push`: a UTF-8 (or ASCII)
+    /// block that is wholly valid — every block of a plain text file — appends
+    /// with no allocation and no copy beyond the `push_str`, which is what a
+    /// million-line `loop file=` does on every block. Going through an
+    /// intermediate `String` cost ~10% of the line loop's wall clock.
+    pub fn push_into(&mut self, bytes: &[u8], out: &mut String) {
+        if self.sniffed && self.tail.is_empty() && matches!(self.cs, Charset::Utf8) {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    out.push_str(text);
+                    return;
+                }
+                // Only the FINAL character is incomplete: emit the rest and
+                // hold those bytes for the next block.
+                Err(e) if e.error_len().is_none() => {
+                    let valid = e.valid_up_to();
+                    if let Ok(text) = std::str::from_utf8(&bytes[..valid]) {
+                        out.push_str(text);
+                        self.tail.extend_from_slice(&bytes[valid..]);
+                        return;
+                    }
+                }
+                // A genuinely invalid byte in the middle — fall through to the
+                // lossy path below, which substitutes U+FFFD.
+                Err(_) => {}
+            }
+        }
+        self.push_slow(bytes, out);
+    }
+
+    fn push_slow(&mut self, bytes: &[u8], out: &mut String) {
+        self.tail.extend_from_slice(bytes);
+        // A single-byte encoding cannot carry a BOM, and `decode` does not
+        // sniff for one there — so neither does this, or a Latin-1 file whose
+        // first two bytes happen to be `FE FF` would lose them as a "mark".
+        if !self.sniffed && matches!(self.cs, Charset::Latin1 | Charset::Cp1252 | Charset::UsAscii)
+        {
+            self.sniffed = true;
+        }
+        if !self.sniffed {
+            // The BOM wins over the declared charset (see `decode`), but only
+            // once the first bytes could not be a *prefix* of one — otherwise a
+            // block boundary landing inside `FE FF` would be read as content.
+            if let Some((bom_cs, skip)) = sniff_bom(&self.tail) {
+                self.cs = bom_cs;
+                self.tail.drain(..skip);
+                self.sniffed = true;
+            } else if self.tail.len() >= 3 || !could_start_bom(&self.tail) {
+                self.sniffed = true;
+            } else {
+                // Still ambiguous — wait for more bytes rather than guess.
+                return;
+            }
+        }
+        let split = self.decodable_prefix_len();
+        let ready: Vec<u8> = self.tail.drain(..split).collect();
+        out.push_str(&self.decode_whole(&ready));
+    }
+
+    /// Decode whatever is left, U+FFFD-ing an incomplete final character.
+    pub fn finish(&mut self) -> String {
+        let rest: Vec<u8> = std::mem::take(&mut self.tail);
+        if rest.is_empty() {
+            return String::new();
+        }
+        self.decode_whole(&rest)
+    }
+
+    /// `decode` minus the BOM sniff, which this type does once for the stream.
+    fn decode_whole(&self, bytes: &[u8]) -> String {
+        match self.cs {
+            Charset::Latin1 => bytes.iter().map(|&b| b as char).collect(),
+            Charset::Cp1252 => bytes
+                .iter()
+                .map(|&b| {
+                    if (0x80..=0x9F).contains(&b) {
+                        CP1252_HIGH[(b - 0x80) as usize]
+                    } else {
+                        b as char
+                    }
+                })
+                .collect(),
+            Charset::UsAscii => bytes
+                .iter()
+                .map(|&b| if b <= 0x7F { b as char } else { '\u{FFFD}' })
+                .collect(),
+            Charset::Utf16Be | Charset::Utf16Bom => decode_utf16(bytes, true),
+            Charset::Utf16Le => decode_utf16(bytes, false),
+            Charset::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+        }
+    }
+
+    /// How much of `tail` ends on a character boundary and can be decoded now.
+    fn decodable_prefix_len(&self) -> usize {
+        let tail = &self.tail;
+        match self.cs {
+            // Every byte is one character.
+            Charset::Latin1 | Charset::Cp1252 | Charset::UsAscii => tail.len(),
+            Charset::Utf8 => match std::str::from_utf8(tail) {
+                Ok(_) => tail.len(),
+                Err(e) => match e.error_len() {
+                    // A genuinely invalid byte: decode through it so the
+                    // U+FFFD comes out now rather than blocking the stream.
+                    Some(_) => tail.len(),
+                    // Incomplete final character — hold it for the next block.
+                    None => e.valid_up_to(),
+                },
+            },
+            Charset::Utf16Be | Charset::Utf16Bom | Charset::Utf16Le => {
+                let whole = tail.len() - tail.len() % 2;
+                // Do not split a surrogate pair: a trailing HIGH surrogate
+                // needs its LOW half, which is in the next block.
+                if whole >= 2 {
+                    let (a, b) = (tail[whole - 2], tail[whole - 1]);
+                    let unit = if matches!(self.cs, Charset::Utf16Le) {
+                        u16::from_le_bytes([a, b])
+                    } else {
+                        u16::from_be_bytes([a, b])
+                    };
+                    if (0xD800..0xDC00).contains(&unit) {
+                        return whole - 2;
+                    }
+                }
+                whole
+            }
+        }
+    }
+}
+
+/// Whether `bytes` could still be the start of a byte-order mark. Only called
+/// with fewer than 3 bytes in hand.
+fn could_start_bom(bytes: &[u8]) -> bool {
+    matches!(bytes, [] | [0xEF] | [0xEF, 0xBB] | [0xFE] | [0xFF])
+}
+
 /// The encoding a leading byte-order mark declares, plus its length in bytes.
 fn sniff_bom(bytes: &[u8]) -> Option<(Charset, usize)> {
     match bytes {
@@ -189,6 +360,51 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `StreamDecoder` fed one byte at a time must produce exactly what
+    /// `decode` produces from the whole slice — that equivalence is the only
+    /// reason `loop file=` can stream and still agree with `fileRead`.
+    #[test]
+    fn stream_decoder_matches_whole_slice_decode() {
+        let samples: Vec<(Charset, Vec<u8>)> = vec![
+            // ASCII, multi-byte UTF-8, a 4-byte astral char, and a truncated
+            // final character.
+            (Charset::Utf8, b"hello\nworld".to_vec()),
+            (Charset::Utf8, "a\u{E9}\u{20AC}\u{1F600}z".as_bytes().to_vec()),
+            (Charset::Utf8, vec![0x61, 0xE2, 0x82]),
+            // Invalid UTF-8 mid-stream becomes U+FFFD, as Lucee's lenient
+            // decoder does (a Latin-1 file read as UTF-8 is the common case).
+            (Charset::Utf8, vec![0x63, 0x61, 0x66, 0xE9, 0x20, 0x6E, 0x61, 0xEF, 0x76, 0x65]),
+            (Charset::Latin1, vec![0x63, 0x61, 0x66, 0xE9, 0x0A, 0xFE, 0xFF, 0x41]),
+            (Charset::Cp1252, vec![0x61, 0x80, 0x9D, 0xE9]),
+            (Charset::UsAscii, vec![0x61, 0xFF, 0x62]),
+            // UTF-16 with a BOM, without one, and with a surrogate pair that a
+            // one-byte-at-a-time feed must not split.
+            (Charset::Utf16Bom, encode("a\u{E9}\u{1F600}", Charset::Utf16Bom)),
+            (Charset::Utf16Be, encode("a\u{E9}\u{1F600}", Charset::Utf16Be)),
+            (Charset::Utf16Le, encode("a\u{E9}\u{1F600}", Charset::Utf16Le)),
+            // A UTF-8 BOM is dropped; and a BOM'd UTF-16 file wins over a
+            // declared UTF-8, which is what Lucee does.
+            (Charset::Utf8, encode("a\u{E9}", Charset::Utf8)),
+            (Charset::Utf8, encode("a\u{E9}", Charset::Utf16Bom)),
+        ];
+        for (cs, bytes) in samples {
+            let want = decode(&bytes, cs);
+            for block in [1usize, 2, 3, 5, bytes.len().max(1)] {
+                let mut dec = StreamDecoder::new(cs);
+                let mut got = String::new();
+                for part in bytes.chunks(block) {
+                    got.push_str(&dec.push(part));
+                }
+                got.push_str(&dec.finish());
+                assert_eq!(
+                    got, want,
+                    "charset {:?}, block size {}, bytes {:02X?}",
+                    cs, block, bytes
+                );
+            }
+        }
+    }
 
     /// The byte sequences in the module docs, taken from Lucee 7.0.4.
     #[test]
