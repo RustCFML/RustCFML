@@ -1347,6 +1347,28 @@ static EXISTS_NEG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// attacker- or user-shaped paths.
 const EXISTS_L2_MAX_ENTRIES: usize = 100_000;
 
+/// One directory's case-folding index: lowercased entry name -> (on-disk
+/// spelling, is_dir). Behind an `Arc` so a lookup clones a pointer rather than
+/// the map.
+pub type FoldIndex = Arc<HashMap<String, (String, bool)>>;
+
+/// A cached directory listing used for case-insensitive template lookup.
+///
+/// Stamped with the negative-answer generation for the same reason an absent
+/// `ExistsEntry` is: the *absence* of a name from this index is a negative
+/// answer, and a file created since the listing was taken must be visible.
+#[derive(Clone)]
+pub struct DirFoldEntry {
+    pub neg_gen: u64,
+    pub index: FoldIndex,
+}
+
+/// Cap on `ServerState::dir_fold_cache` entries. One entry per *directory* that
+/// has ever needed a case-folded lookup — orders of magnitude smaller than the
+/// per-path existence cache, and only populated on a case mismatch, so this is
+/// a runaway guard rather than a working limit.
+const DIR_FOLD_L2_MAX_ENTRIES: usize = 10_000;
+
 /// Retire every cached NEGATIVE existence answer in the process, leaving every
 /// positive intact. O(1) — see [`EXISTS_NEG_GENERATION`].
 #[cfg_attr(feature = "exists-census", track_caller)]
@@ -1647,6 +1669,10 @@ pub struct ServerState {
     /// unconditionally — see that static for why the guard is a process-global
     /// generation and not a per-path invalidation list.
     pub exists_cache: Arc<parking_lot::RwLock<HashMap<String, ExistsEntry>>>,
+    /// Application-lifetime layer for the per-directory case-folding index used
+    /// by case-insensitive template lookup (GH #387). Production serve mode
+    /// only, under the same `exists_l2()` contract as `exists_cache`.
+    pub dir_fold_cache: Arc<parking_lot::RwLock<HashMap<String, DirFoldEntry>>>,
     /// Persistent `application` scope for the Application.cfc *pseudo-constructor*
     /// phase, keyed by Application.cfc path.
     ///
@@ -1735,6 +1761,7 @@ impl ServerState {
             canonicalize_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             custom_tag_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             exists_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            dir_fold_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
@@ -2824,6 +2851,9 @@ pub struct CfmlVirtualMachine {
     /// can only go stale via a *delete*, and every filesystem-mutating BIF clears
     /// this cache (see `builtin_may_remove_path`). Dropped at request end.
     pub request_exists_cache: parking_lot::RwLock<HashMap<String, ExistsEntry>>,
+    /// Request-lifetime layer for the per-directory case-folding index (GH
+    /// #387). Every mode, mirroring `request_exists_cache`.
+    pub request_dir_fold_cache: parking_lot::RwLock<HashMap<String, DirFoldEntry>>,
     /// Open `loop file=` line cursors, keyed by the handle the loop lowering
     /// carries in a local (GH #367).
     ///
@@ -3590,6 +3620,7 @@ impl CfmlVirtualMachine {
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
+            request_dir_fold_cache: parking_lot::RwLock::new(HashMap::new()),
             file_line_cursors: HashMap::new(),
             next_file_line_cursor: 1,
             #[cfg(feature = "exists-census")]
@@ -6216,13 +6247,12 @@ impl CfmlVirtualMachine {
                 // get_ci does exact-then-CI under one read lock, cloning only the
                 // matched value — replaces the old get/get(upper)/get(lower) chain
                 // plus a full `s.iter()` snapshot (whole-IndexMap clone) per miss.
-                let val = s.get_ci(name).or_else(|| {
-                    if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                        vars.get_ci(name)
-                    } else {
-                        None
-                    }
-                });
+                // GH #417 — no fall-back into `__variables`; see
+                // `Instance::get_public_member`. This is the path
+                // `LoadLocalProperty` takes, which is what the fused `c.x` read
+                // actually compiles to — gating only `GetProperty` and
+                // `lookup_property_opt` left the leak wide open through here.
+                let val = s.get_ci(name);
                 if let Some(v) = val {
                     return v;
                 }
@@ -6290,7 +6320,9 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
                 let g = inst.read();
-                if let Some(v) = g.get_member(name) {
+                // GH #417 — PUBLIC view only; the private `variables` scope is
+                // not part of a component's external surface.
+                if let Some(v) = g.get_public_member(name) {
                     v
                 } else if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
                     parent
@@ -6321,7 +6353,8 @@ impl CfmlVirtualMachine {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = obj {
             let g = inst.read();
-            if let Some(v) = g.get_member(name) {
+            // GH #417 — PUBLIC view only (see `get_public_member`).
+            if let Some(v) = g.get_public_member(name) {
                 return Some(v);
             }
             // Fall through to a `rust:` native parent's `get_property` before
@@ -6338,13 +6371,13 @@ impl CfmlVirtualMachine {
             return None;
         }
         if let CfmlValue::Struct(s) = obj {
-            let val = s.get_ci(name).or_else(|| {
-                if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                    vars.get_ci(name)
-                } else {
-                    None
-                }
-            });
+            // GH #417 — no fall-back into `__variables`: the private member
+            // scope is not part of a component's public surface. The marker
+            // (Struct) representation keeps it as a sentinel key inside the
+            // component's own map, so without this gate every private member
+            // was externally readable and `c.__variables` handed out the live
+            // map. The `Instance` arm above gates the same way.
+            let val = s.get_ci(name);
             if let Some(v) = val {
                 return Some(v);
             }
@@ -7160,8 +7193,20 @@ impl CfmlVirtualMachine {
         // falls through to the interpreter unchanged. `func`/`args` are the
         // caller's, not borrowed from `self.jit`, so there is no borrow conflict;
         // with the feature off the whole block compiles away. See `jit/mod.rs`.
+        // §29 — a declared parameter type is enforced by the binding prologue
+        // below, which a JIT-compiled body never runs. Validate here, BEFORE
+        // the compiled body can execute (a type violation must throw instead of
+        // running the function), and record it so the prologue does not repeat
+        // the work when the JIT declines the call. Costs nothing for a function
+        // that declares no parameter types, which is the common case.
+        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+        let mut param_types_checked = false;
         #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
         {
+            if self.jit.is_some() && func.param_types.iter().any(|t| t.is_some()) {
+                self.check_declared_param_types(func, &args)?;
+                param_types_checked = true;
+            }
             // The shadowing guard makes sure a user-defined function or
             // global with the same name as an allowlisted builtin (e.g.
             // `function abs(x) { … }`) wins over the JIT's native call. We
@@ -7228,6 +7273,17 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
                             .map(|(_, v)| v)
                     })?;
+                    // §29 — refuse to bind a callee that declares parameter
+                    // types. A bound callee is invoked by the caller's COMPILED
+                    // body as a direct native call: it never re-enters the VM,
+                    // so the declared-type validation on the dispatch path
+                    // below cannot run and `function f( numeric n )` accepted
+                    // anything. Declining the binding costs this caller its
+                    // compilation, not its correctness; the callee itself stays
+                    // JIT-eligible through the checked dispatch path.
+                    if f.param_types.iter().any(|t| t.is_some()) {
+                        return None;
+                    }
                     Some(jit::UdfMeta {
                         global_id: f.global_id,
                         nparams: f.params.len(),
@@ -7691,8 +7747,14 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                        _p4_typechecks += 1;
-                        self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                        let already = param_types_checked;
+                        #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
+                        let already = false;
+                        if !already {
+                            _p4_typechecks += 1;
+                            self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                        }
                     }
                     _p4_supplied += 1;
                     locals.insert(param_keys[i].clone(), value.clone());
@@ -13034,10 +13096,12 @@ impl CfmlVirtualMachine {
                     // serve-mode webroot, then CLI-mode base_template_path's
                     // parent. The prefix check MUST come first: relative
                     // includes never need the existence probe.
-                    let resolved = if let Some(real) = self.resolve_existing_cf_path(&resolved) {
-                        real
-                    } else if path.starts_with('/') {
-                        self.resolve_leading_slash_include(&path)
+                    let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+                        self.resolve_leading_slash_include(&path, false)
+                            // GH #387: only once the whole order has missed
+                            // exactly, re-walk it accepting a case-insensitive
+                            // match. `or_else` keeps this off the hot path.
+                            .or_else(|| self.resolve_leading_slash_include(&path, true))
                             .unwrap_or(resolved)
                     } else {
                         resolved
@@ -13236,10 +13300,12 @@ impl CfmlVirtualMachine {
                         path.clone()
                     };
 
-                    let resolved = if let Some(real) = self.resolve_existing_cf_path(&resolved) {
-                        real
-                    } else if path.starts_with('/') {
-                        self.resolve_leading_slash_include(&path)
+                    let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+                        self.resolve_leading_slash_include(&path, false)
+                            // GH #387: only once the whole order has missed
+                            // exactly, re-walk it accepting a case-insensitive
+                            // match. `or_else` keeps this off the hot path.
+                            .or_else(|| self.resolve_leading_slash_include(&path, true))
                             .unwrap_or(resolved)
                     } else {
                         resolved
@@ -13757,11 +13823,11 @@ impl CfmlVirtualMachine {
         } else {
             path.clone()
         };
-        let resolved = if let Some(real) = self.resolve_existing_cf_path(&resolved) {
-            real
-        } else if path.starts_with('/') {
-            self.resolve_leading_slash_include(&path)
-                .or_else(|| self.resolve_include_with_mappings(&path))
+        let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
+            self.resolve_leading_slash_include(&path, false)
+                .or_else(|| self.resolve_include_with_mappings(&path, false))
+                .or_else(|| self.resolve_leading_slash_include(&path, true))
+                .or_else(|| self.resolve_include_with_mappings(&path, true))
                 .unwrap_or(resolved)
         } else {
             resolved
@@ -22028,7 +22094,11 @@ impl CfmlVirtualMachine {
                         ns
                     }
                 },
-                CfmlValue::Instance(inst) => match inst.read().get_member(k) {
+                // GH #409/#417 — PUBLIC view for the intermediate segment of an
+                // external nested write. `c.__variables.x = v` was resolving the
+                // private map here and mutating it in place; Lucee's equivalent
+                // write lands on an inert public key instead.
+                CfmlValue::Instance(inst) => match inst.read().get_public_member(k) {
                     Some(v @ CfmlValue::Struct(_)) => v,
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {
@@ -23024,6 +23094,39 @@ impl CfmlVirtualMachine {
             type_check::value_label(value, &Self::component_type_label),
             declared.trim()
         ))))
+    }
+
+    /// §29 — validate every supplied argument against its declared parameter
+    /// type, in parameter order.
+    ///
+    /// Extracted so the interpreter's binding prologue and the JIT dispatch
+    /// path cannot drift. They did: a JIT-compiled body is the function's
+    /// BODY, and it is entered without the prologue that performs this check,
+    /// so `function f( numeric n )` silently accepted `"1,000"`, `"0x10"`,
+    /// `[]` and `{}` for as long as the compiled body served the call. The
+    /// declared RETURN type never had this hole — it is enforced in the call
+    /// wrapper (`execute_function_with_args`), which the JIT path still
+    /// returns through.
+    ///
+    /// `Null` is "not supplied" in CFML and is never checked, matching the
+    /// prologue: an omitted optional argument is simply absent.
+    fn check_declared_param_types(
+        &mut self,
+        func: &BytecodeFunction,
+        args: &[CfmlValue],
+    ) -> Result<(), CfmlError> {
+        for (i, param_name) in func.params.iter().enumerate() {
+            let Some(Some(ptype)) = func.param_types.get(i) else {
+                continue;
+            };
+            match args.get(i) {
+                Some(value) if !matches!(value, CfmlValue::Null) => {
+                    self.check_declared_param_type(func, i, param_name, ptype, value)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// §29 — enforce a declared RETURN type, on the way out of a call.
@@ -27515,17 +27618,30 @@ impl CfmlVirtualMachine {
                 }
                 // isDefined("q.col") — a query column counts as defined (Lucee).
                 CfmlValue::Query(q) => return q.has_column_ci(segment),
-                // Flyweight instance: resolve the member through the Instance
-                // (public then private data maps, each table-aware so METHODS
-                // resolve too). Without this arm, walking a path THROUGH an
-                // Instance hit `_ => return false`, so `IsDefined(
+                // Flyweight instance: resolve the member through the Instance's
+                // PUBLIC view (table-aware, so public METHODS resolve). Without
+                // this arm at all, walking a path THROUGH an Instance hit
+                // `_ => return false`, so `IsDefined(
                 // "application.cbBootstrap.getController")` was false — Preside's
-                // `_getColdboxController()` then returned null, `_getSessionStorage()`
-                // returned null, and `_persistSession()` silently skipped persist,
-                // so admin login never stuck (no session row, no `psid` cookie).
+                // `_getColdboxController()` then returned null,
+                // `_getSessionStorage()` returned null, and `_persistSession()`
+                // silently skipped persist, so admin login never stuck (no
+                // session row, no `psid` cookie). That is why the arm exists.
+                //
+                // It uses the PUBLIC view, not the full one: `isDefined` must
+                // not claim a member exists that a read cannot reach (GH #417).
+                // This is Lucee PARITY, verified member by member — private
+                // data, private methods and a genuine miss all answer `false`
+                // there, while public data and public methods answer `true`.
+                //
+                // Beware the probe that suggests otherwise: `isDefined("c.x")`
+                // DOES read `true` on Lucee once an external `c.x = …` has run
+                // in the same request, because that write creates a real public
+                // key. Measure it on an untouched instance or the write
+                // contaminates the answer.
                 #[cfg(feature = "component-instance")]
                 CfmlValue::Instance(inst) => {
-                    let member = inst.read().get_member(&seg_lower);
+                    let member = inst.read().get_public_member(&seg_lower);
                     match member {
                         Some(v) => current = v,
                         None => return false,
@@ -28521,7 +28637,7 @@ impl CfmlVirtualMachine {
         self.mappings_fingerprint = compute_mappings_fingerprint(&self.mappings);
     }
 
-    fn resolve_path_with_mappings(&self, class_name: &str) -> Option<String> {
+    fn resolve_path_with_mappings(&self, class_name: &str, fold: bool) -> Option<String> {
         // Convert dot-path to slash-path: "taffy.core.api" → "/taffy/core/api"
         let slash_path = format!("/{}", class_name.replace('.', "/"));
         let slash_lower = slash_path.to_lowercase();
@@ -28559,7 +28675,7 @@ impl CfmlVirtualMachine {
                     path.trim_end_matches('/'),
                     remainder.replace('/', std::path::MAIN_SEPARATOR_STR)
                 );
-                if let Some(real) = self.resolve_existing_cf_path(&cfc_path) {
+                if let Some(real) = self.template_path_exists(&cfc_path, fold) {
                     return Some(real);
                 }
             }
@@ -28574,14 +28690,14 @@ impl CfmlVirtualMachine {
     /// directory. Returns `None` only if none of those produce an existing
     /// file. Leading-slash means "webroot-relative" in CFML — it must not be
     /// interpreted as OS-absolute.
-    fn resolve_leading_slash_include(&self, include_path: &str) -> Option<String> {
-        if let Some(via_mapping) = self.resolve_include_with_mappings(include_path) {
+    fn resolve_leading_slash_include(&self, include_path: &str, fold: bool) -> Option<String> {
+        if let Some(via_mapping) = self.resolve_include_with_mappings(include_path, fold) {
             return Some(via_mapping);
         }
         let stripped = include_path.trim_start_matches('/');
         if let Some(webroot) = self.server_state.as_ref().and_then(|s| s.webroot.as_ref()) {
             let candidate = webroot.join(stripped).to_string_lossy().to_string();
-            if let Some(real) = self.resolve_existing_cf_path(&candidate) {
+            if let Some(real) = self.template_path_exists(&candidate, fold) {
                 return Some(real);
             }
         }
@@ -28590,14 +28706,14 @@ impl CfmlVirtualMachine {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
             let candidate = base_dir.join(stripped).to_string_lossy().to_string();
-            if let Some(real) = self.resolve_existing_cf_path(&candidate) {
+            if let Some(real) = self.template_path_exists(&candidate, fold) {
                 return Some(real);
             }
         }
         None
     }
 
-    fn resolve_include_with_mappings(&self, include_path: &str) -> Option<String> {
+    fn resolve_include_with_mappings(&self, include_path: &str, fold: bool) -> Option<String> {
         if self.mappings.is_empty() {
             return None;
         }
@@ -28614,7 +28730,7 @@ impl CfmlVirtualMachine {
                 };
                 let remainder = remainder.trim_start_matches('/');
                 let resolved = format!("{}/{}", mapping.path.trim_end_matches('/'), remainder);
-                if let Some(real) = self.resolve_existing_cf_path(&resolved) {
+                if let Some(real) = self.template_path_exists(&resolved, fold) {
                     return Some(real);
                 }
             }
@@ -28902,7 +29018,12 @@ impl CfmlVirtualMachine {
             // through this.mappings (Application.cfc), then webroot, then the
             // entry template dir. Must NOT be treated as OS-absolute or as a
             // source-relative path.
-            if let Some(resolved) = self.resolve_leading_slash_include(path_spec) {
+            if let Some(resolved) = self
+                .resolve_leading_slash_include(path_spec, false)
+                // GH #387 second pass — same reason as the include sites: an
+                // exact hit in a later candidate must beat a folded one here.
+                .or_else(|| self.resolve_leading_slash_include(path_spec, true))
+            {
                 Ok(resolved)
             } else {
                 Err(CfmlError::runtime(format!(
@@ -30504,7 +30625,32 @@ impl CfmlVirtualMachine {
                 }
             }
         }
-        let program = compile_file_cached(path, cache, self.vfs.as_ref())?;
+        let program = match compile_file_cached(path, cache, self.vfs.as_ref()) {
+            Ok(program) => program,
+            // GH #387: on a case-sensitive filesystem the only thing wrong with
+            // the path may be its spelling. Retry once against the on-disk
+            // casing. Deliberately on the ERROR path — a template that reads
+            // pays nothing, and this covers every template read (includes,
+            // components, custom tags) from one place. Only a genuine
+            // "cannot read" is retried; a parse error in a file we did find
+            // must surface as itself.
+            Err(e) => {
+                let folded = e
+                    .message
+                    .starts_with("Cannot read '")
+                    .then(|| self.fold_template_path(path))
+                    .flatten()
+                    .filter(|f| f != path);
+                match folded {
+                    Some(f) => {
+                        let program = compile_file_cached(&f, cache, self.vfs.as_ref())?;
+                        self.request_validated_files.write().insert(f);
+                        return Ok(program);
+                    }
+                    None => return Err(e),
+                }
+            }
+        };
         self.request_validated_files.write().insert(path.to_string());
         Ok(program)
     }
@@ -30617,6 +30763,149 @@ impl CfmlVirtualMachine {
             }
         }
         self.resolve_component_template_impl(class_name, locals)
+    }
+
+    /// One pass of the component-name -> template-path resolution order.
+    ///
+    /// Run twice by `resolve_component_template_impl`: first with `fold =
+    /// false` (exact spelling only, today's behaviour and today's cost), and
+    /// only if that produced nothing that exists, again with `fold = true`.
+    ///
+    /// Two passes rather than folding inside one is what preserves priority.
+    /// Folding in-place would let a case-insensitive match in an early mapping
+    /// beat an EXACT match in a later one — silently loading the wrong CFC on a
+    /// tree where both spellings exist.
+    fn probe_component_template_path(&self, class_name: &str, fold: bool) -> String {
+        // If class_name is already an absolute path or has .cfc extension, use directly
+        let as_path = std::path::Path::new(class_name);
+        if class_name.starts_with('/') {
+            // A CFML leading-slash component path ("/oop/Widget") is
+            // webroot/mapping-relative, NOT OS-absolute. Resolve it the same
+            // way as a leading-slash include: configured mappings, then the
+            // serve-mode webroot, then the entry template's parent directory.
+            // Only fall back to treating it as a literal filesystem path when
+            // none of those produce an existing file (preserving the case
+            // where a genuinely OS-absolute .cfc is passed).
+            //
+            // Lucee treats BOTH '/' and '.' as path separators after the
+            // leading slash, so a slash-rooted *dotted* component path
+            // ("/wheels/tests/_assets/plugins/cat.Plugin.Plugin") maps to
+            // ".../plugins/cat/Plugin/Plugin.cfc". The literal form is tried
+            // first (a genuinely slash-only path like "/oop/Widget", or an
+            // OS-absolute .cfc, keeps its existing behavior); the
+            // dot-normalized form is the fallback. (Wheels' plugin loader
+            // builds exactly this slash-rooted dotted path — fixes ~64 specs.)
+            let ends_cfc = class_name.to_lowercase().ends_with(".cfc");
+            let literal = if ends_cfc {
+                class_name.to_string()
+            } else {
+                format!("{}.cfc", class_name)
+            };
+            let mut candidates = vec![literal.clone()];
+            if !ends_cfc && class_name[1..].contains('.') {
+                let body = class_name.trim_start_matches('/').replace('.', "/");
+                candidates.push(format!("/{}.cfc", body));
+            }
+            let mut resolved_path = None;
+            for cand in &candidates {
+                if let Some(real) = self.template_path_exists(cand, fold) {
+                    resolved_path = Some(real);
+                    break;
+                } else if let Some(resolved) = self.resolve_leading_slash_include(cand, fold) {
+                    resolved_path = Some(resolved);
+                    break;
+                }
+            }
+            resolved_path.unwrap_or(literal)
+        } else if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
+            let p = if class_name.to_lowercase().ends_with(".cfc") {
+                class_name.to_string()
+            } else {
+                format!("{}.cfc", class_name)
+            };
+            if let Some(real) = self.template_path_exists(&p, fold) {
+                real
+            } else if let Some(ref source) = self.source_file {
+                // Try relative to source file
+                let source_dir = std::path::Path::new(source)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let joined = source_dir.join(&p).to_string_lossy().to_string();
+                self.template_path_exists(&joined, fold).unwrap_or(joined)
+            } else {
+                p
+            }
+        } else {
+            // Dot-path: convert dots to path separators
+            let relative_path = if let Some(ref source) = self.source_file {
+                let source_dir = std::path::Path::new(source)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                source_dir
+                    .join(format!("{}.cfc", file_name))
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                format!(
+                    "{}.cfc",
+                    class_name.replace('.', std::path::MAIN_SEPARATOR_STR)
+                )
+            };
+            if let Some(real) = self.template_path_exists(&relative_path, fold) {
+                real
+            } else if let Some(mapped) = self.resolve_path_with_mappings(class_name, fold) {
+                mapped
+            } else if let Some(ref base) = self.base_template_path {
+                // Try resolving relative to the base template (web root equivalent)
+                let base_dir = std::path::Path::new(base)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                let base_path = base_dir
+                    .join(format!("{}.cfc", file_name))
+                    .to_string_lossy()
+                    .to_string();
+                if let Some(real) = self.template_path_exists(&base_path, fold) {
+                    real
+                } else if let Some(webroot_path) = self
+                    .server_state
+                    .as_ref()
+                    .and_then(|s| s.webroot.as_ref())
+                    .map(|w| {
+                        w.join(format!("{}.cfc", &file_name))
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                {
+                    if let Some(real) = self.template_path_exists(&webroot_path, fold) {
+                        real
+                    } else {
+                        relative_path
+                    }
+                } else {
+                    relative_path
+                }
+            } else if let Some(webroot_path) = self
+                .server_state
+                .as_ref()
+                .and_then(|s| s.webroot.as_ref())
+                .map(|w| {
+                    let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                    w.join(format!("{}.cfc", file_name))
+                        .to_string_lossy()
+                        .to_string()
+                })
+            {
+                if let Some(real) = self.template_path_exists(&webroot_path, fold) {
+                    real
+                } else {
+                    relative_path
+                }
+            } else {
+                relative_path // Fall back to relative (will fail at read_to_string below)
+            }
+        }
     }
 
     fn resolve_component_template_impl(
@@ -30778,137 +31067,24 @@ impl CfmlVirtualMachine {
             hit
         } else {
             cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_PROBE_WALKS);
-            let resolved = {
-            // If class_name is already an absolute path or has .cfc extension, use directly
-            let as_path = std::path::Path::new(class_name);
-            if class_name.starts_with('/') {
-                // A CFML leading-slash component path ("/oop/Widget") is
-                // webroot/mapping-relative, NOT OS-absolute. Resolve it the same
-                // way as a leading-slash include: configured mappings, then the
-                // serve-mode webroot, then the entry template's parent directory.
-                // Only fall back to treating it as a literal filesystem path when
-                // none of those produce an existing file (preserving the case
-                // where a genuinely OS-absolute .cfc is passed).
-                //
-                // Lucee treats BOTH '/' and '.' as path separators after the
-                // leading slash, so a slash-rooted *dotted* component path
-                // ("/wheels/tests/_assets/plugins/cat.Plugin.Plugin") maps to
-                // ".../plugins/cat/Plugin/Plugin.cfc". The literal form is tried
-                // first (a genuinely slash-only path like "/oop/Widget", or an
-                // OS-absolute .cfc, keeps its existing behavior); the
-                // dot-normalized form is the fallback. (Wheels' plugin loader
-                // builds exactly this slash-rooted dotted path — fixes ~64 specs.)
-                let ends_cfc = class_name.to_lowercase().ends_with(".cfc");
-                let literal = if ends_cfc {
-                    class_name.to_string()
-                } else {
-                    format!("{}.cfc", class_name)
-                };
-                let mut candidates = vec![literal.clone()];
-                if !ends_cfc && class_name[1..].contains('.') {
-                    let body = class_name.trim_start_matches('/').replace('.', "/");
-                    candidates.push(format!("/{}.cfc", body));
-                }
-                let mut resolved_path = None;
-                for cand in &candidates {
-                    if let Some(real) = self.resolve_existing_cf_path(cand) {
-                        resolved_path = Some(real);
-                        break;
-                    } else if let Some(resolved) = self.resolve_leading_slash_include(cand) {
-                        resolved_path = Some(resolved);
-                        break;
-                    }
-                }
-                resolved_path.unwrap_or(literal)
-            } else if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
-                let p = if class_name.to_lowercase().ends_with(".cfc") {
-                    class_name.to_string()
-                } else {
-                    format!("{}.cfc", class_name)
-                };
-                if let Some(real) = self.resolve_existing_cf_path(&p) {
-                    real
-                } else if let Some(ref source) = self.source_file {
-                    // Try relative to source file
-                    let source_dir = std::path::Path::new(source)
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let joined = source_dir.join(&p).to_string_lossy().to_string();
-                    self.resolve_existing_cf_path(&joined).unwrap_or(joined)
-                } else {
-                    p
-                }
+            let resolved = self.probe_component_template_path(class_name, false);
+            // GH #387: on a case-sensitive filesystem the dotted component name
+            // may disagree with the on-disk spelling of the file OR of any
+            // directory above it (Preside ships `SqlRunner.cfc` for
+            // `...database.sqlRunner`). Re-run the whole order accepting a
+            // case-insensitive match, but ONLY once the exact order has failed,
+            // so a tree that resolves exactly pays nothing beyond the probe the
+            // fallback already needed. This is the cold side of
+            // `component_path_cache`, so it happens once per class name.
+            let resolved = if self.exists_cached_path(&resolved) {
+                resolved
             } else {
-                // Dot-path: convert dots to path separators
-                let relative_path = if let Some(ref source) = self.source_file {
-                    let source_dir = std::path::Path::new(source)
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
-                    source_dir
-                        .join(format!("{}.cfc", file_name))
-                        .to_string_lossy()
-                        .to_string()
+                let folded = self.probe_component_template_path(class_name, true);
+                if self.exists_cached_path(&folded) {
+                    folded
                 } else {
-                    format!(
-                        "{}.cfc",
-                        class_name.replace('.', std::path::MAIN_SEPARATOR_STR)
-                    )
-                };
-                if let Some(real) = self.resolve_existing_cf_path(&relative_path) {
-                    real
-                } else if let Some(mapped) = self.resolve_path_with_mappings(class_name) {
-                    mapped
-                } else if let Some(ref base) = self.base_template_path {
-                    // Try resolving relative to the base template (web root equivalent)
-                    let base_dir = std::path::Path::new(base)
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
-                    let base_path = base_dir
-                        .join(format!("{}.cfc", file_name))
-                        .to_string_lossy()
-                        .to_string();
-                    if let Some(real) = self.resolve_existing_cf_path(&base_path) {
-                        real
-                    } else if let Some(webroot_path) = self
-                        .server_state
-                        .as_ref()
-                        .and_then(|s| s.webroot.as_ref())
-                        .map(|w| {
-                            w.join(format!("{}.cfc", &file_name))
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                    {
-                        if let Some(real) = self.resolve_existing_cf_path(&webroot_path) {
-                            real
-                        } else {
-                            relative_path
-                        }
-                    } else {
-                        relative_path
-                    }
-                } else if let Some(webroot_path) = self
-                    .server_state
-                    .as_ref()
-                    .and_then(|s| s.webroot.as_ref())
-                    .map(|w| {
-                        let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
-                        w.join(format!("{}.cfc", file_name))
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                {
-                    if let Some(real) = self.resolve_existing_cf_path(&webroot_path) {
-                        real
-                    } else {
-                        relative_path
-                    }
-                } else {
-                    relative_path // Fall back to relative (will fail at read_to_string below)
+                    resolved
                 }
-            }
             };
             let resolved: Arc<str> = Arc::from(resolved);
             // Entry-with-parts, built once here on the miss path (the only place
@@ -33243,98 +33419,148 @@ impl CfmlVirtualMachine {
         self.exists_cached(path, EXISTS_DIR, |vfs| vfs.is_dir(path))
     }
 
-    /// Resolve `path` to an existing CFML template (`.cfc` / `.cfm` / `.cfs`).
-    ///
-    /// Exact-case `exists` is the fast path. On a miss, list the parent
-    /// directory and match the filename case-insensitively — Lucee does this
-    /// on case-sensitive filesystems, and Preside ships CFC names whose dotted
-    /// `createObject` form disagrees with the on-disk spelling (`sqlRunner` vs
-    /// `SqlRunner.cfc`, `TaskManagerLogAppender` vs `TaskmanagerLogAppender.cfc`).
-    /// Returns the on-disk path so a subsequent `read` succeeds (GH #387).
-    ///
-    /// A negative existence-cache entry for the *requested* (wrong-case) string
-    /// must not hide the case-folded hit: those are different cache keys. We
-    /// only `read_dir` when the parent directory itself exists, so the common
-    /// "override CFC absent" probe does not pay a directory listing.
-    fn resolve_existing_cf_path(&self, path: &str) -> Option<String> {
-        // Cache-first: the common exact-case / overlay miss stays a memoised
-        // probe. When VFS says the path exists, RealFs may have matched a
-        // different on-disk spelling (`storage/testDir` vs `testdir`) — return
-        // that spelling so std::fs consumers and compile/include cache keys
-        // stay stable. Overlay-only hits (lucee_case_fold_path = None) keep
-        // the requested string; EmbeddedFs already lowercases.
-        if self.exists_cached_path(path) {
-            return Some(
-                cfml_common::vfs::lucee_case_fold_path(path).unwrap_or_else(|| path.to_string()),
-            );
-        }
-        self.resolve_case_folded_cf_path(path)
+    /// `vfs.exists` behind the two-layer existence memo.
+    fn exists_cached_path(&self, path: &str) -> bool {
+        self.exists_cached(path, EXISTS_ANY, |vfs| vfs.exists(path))
     }
 
-    fn resolve_case_folded_cf_path(&self, path: &str) -> Option<String> {
+    /// Does a template exist at `path`, and under what on-disk spelling?
+    ///
+    /// The exact spelling is always tried first and is the answer in every
+    /// normal case, so this costs one memoised existence probe — the same one
+    /// the call sites already paid. `RealFs` is deliberately NOT case-folding,
+    /// so "exists" means the requested spelling IS the on-disk spelling and no
+    /// second probe is needed to learn it.
+    ///
+    /// `fold` is the GH #387 second pass: only when an entire resolution order
+    /// has failed exactly do we re-walk it accepting a case-insensitive
+    /// filename match. Running it as a distinct second pass (rather than
+    /// folding inside the first) is what keeps priority intact — an exact hit
+    /// in the *last* mapping must still beat a case-folded hit in the first.
+    ///
+    /// Scope note: this is template/component lookup only. `fileRead`,
+    /// `fileExists`, `directoryList` and friends stay case-sensitive, which is
+    /// what Lucee does on a case-sensitive filesystem (verified against Lucee
+    /// 7.1.0.204 on a case-sensitive APFS volume). Folding those too would make
+    /// `fileDelete("./Foo.txt")` delete an on-disk `foo.txt`.
+    fn template_path_exists(&self, path: &str, fold: bool) -> Option<String> {
+        if self.exists_cached_path(path) {
+            return Some(path.to_string());
+        }
+        if fold {
+            return self.fold_template_path(path);
+        }
+        None
+    }
+
+    /// Walk `path` a segment at a time, accepting a case-insensitive match for
+    /// any segment that does not exist exactly, and return the on-disk
+    /// spelling. `None` when no case folding of the path exists.
+    ///
+    /// Every segment folds, not just the filename: a dotted component name
+    /// disagrees with directory spelling as readily as with the file's
+    /// (`preside.system.sitetree.SiteService` over an on-disk `siteTree/`).
+    ///
+    /// Only reached after an exact probe missed, so on a case-insensitive
+    /// filesystem (macOS, Windows) this never runs at all.
+    fn fold_template_path(&self, path: &str) -> Option<String> {
         let p = std::path::Path::new(path);
-        // Every segment, any extension — not just last-segment `.cfc`/`.cfm`.
-        // Preside FileStorage asks for `testDir/loading.gif` while the fixture
-        // is `testdir/loading.gif`. Overlay/embedded VFS still needs this
-        // walk when the path is not on the real filesystem.
-        // Walk every segment. Preside also disagrees with on-disk *directory*
-        // spelling (`sitetree` vs `siteTree`, `assetmanager` vs `assetManager`,
-        // `cfmlScopes` vs `cfmlscopes`), and Lucee matches those too. Exact
-        // exists is still the per-segment fast path; a negative cache entry
-        // for a wrong-case segment is a different key from the real name.
-        let mut acc = std::path::PathBuf::new();
         let comps: Vec<_> = p.components().collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let mut acc = std::path::PathBuf::new();
         for (i, comp) in comps.iter().enumerate() {
             match comp {
                 std::path::Component::Prefix(pre) => acc.push(pre.as_os_str()),
                 std::path::Component::RootDir => acc.push(std::path::MAIN_SEPARATOR_STR),
                 std::path::Component::CurDir | std::path::Component::ParentDir => {
-                    acc.push(comp.as_os_str());
+                    acc.push(comp.as_os_str())
                 }
                 std::path::Component::Normal(seg) => {
                     let next = acc.join(seg);
-                    let next_str = next.to_string_lossy();
-                    let last = i + 1 == comps.len();
-                    if self.exists_cached_path(next_str.as_ref()) {
+                    if self.exists_cached_path(next.to_string_lossy().as_ref()) {
                         acc = next;
                         continue;
                     }
-                    // Missing overlay segments must not pay a listing when the
-                    // parent directory itself is absent.
-                    if acc.as_os_str().is_empty() || !self.is_dir_cached(acc.to_string_lossy().as_ref()) {
+                    // The parent must itself be a directory before a listing is
+                    // worth taking: the common "override CFC absent" probe walks
+                    // real directories and must not pay for a missing one.
+                    let parent = acc.to_string_lossy().into_owned();
+                    if parent.is_empty() || !self.is_dir_cached(&parent) {
                         return None;
                     }
-                    let want = seg.to_str()?;
-                    let entries = self.vfs.read_dir(acc.to_string_lossy().as_ref()).ok()?;
-                    let mut hit = None;
-                    for entry in entries {
-                        if !entry.name.eq_ignore_ascii_case(want) {
-                            continue;
-                        }
-                        if last && !entry.is_file {
-                            continue;
-                        }
-                        if !last && !entry.is_dir {
-                            continue;
-                        }
-                        hit = Some(entry.name);
-                        break;
+                    let index = self.dir_fold_index(&parent)?;
+                    let (name, is_dir) = index.get(&seg.to_str()?.to_lowercase())?;
+                    // A path segment must be a directory; only the final one may
+                    // be the file.
+                    if *is_dir == (i + 1 == comps.len()) {
+                        return None;
                     }
-                    acc.push(hit?);
+                    acc.push(name);
                 }
             }
         }
         Some(acc.to_string_lossy().into_owned())
     }
 
-    /// `vfs.exists` behind the two-layer existence memo.
+    /// The case-folding index for one directory, behind the same two layers as
+    /// the existence memo (request-scoped always, application-scoped in
+    /// production).
     ///
-    /// RealFs folds **every** path segment (GH #387), so a wrong-case mid-path
-    /// (`storage/testDir/loading.gif` vs on-disk `testdir`) is a positive hit
-    /// and is cached under the requested spelling. Overlay/embedded VFS still
-    /// goes through `resolve_case_folded_cf_path` when RealFs has no match.
-    fn exists_cached_path(&self, path: &str) -> bool {
-        self.exists_cached(path, EXISTS_ANY, |vfs| vfs.exists(path))
+    /// Indexed per DIRECTORY rather than per path on purpose. Preside probes
+    /// many absent override CFCs in the same directory; a per-path fold cache
+    /// would pay one `read_dir` per absent name, while one listing answers
+    /// every name in that directory, present or absent.
+    ///
+    /// An unreadable directory caches as an empty index — "nothing to fold to"
+    /// is the same answer either way, and caching it stops a re-listing.
+    fn dir_fold_index(&self, dir: &str) -> Option<FoldIndex> {
+        let gen_now = exists_neg_generation();
+        let l1 = self.request_dir_fold_cache.read().get(dir).cloned();
+        if let Some(e) = l1 {
+            if e.neg_gen == gen_now {
+                return Some(e.index);
+            }
+        }
+        if let Some(ss) = self.exists_l2() {
+            let l2 = ss.dir_fold_cache.read().get(dir).cloned();
+            if let Some(e) = l2 {
+                if e.neg_gen == gen_now {
+                    self.request_dir_fold_cache
+                        .write()
+                        .insert(dir.to_string(), e.clone());
+                    return Some(e.index);
+                }
+            }
+        }
+        let mut map: HashMap<String, (String, bool)> = HashMap::new();
+        for entry in self.vfs.read_dir(dir).unwrap_or_default() {
+            let lower = entry.name.to_lowercase();
+            // Two on-disk spellings differing only in case can both fold to the
+            // same request. Neither is more correct, and `read_dir` order is not
+            // stable, so pick deterministically rather than by listing order.
+            match map.get(&lower) {
+                Some((have, _)) if have.as_str() <= entry.name.as_str() => {}
+                _ => {
+                    map.insert(lower, (entry.name, entry.is_dir));
+                }
+            }
+        }
+        let e = DirFoldEntry {
+            neg_gen: gen_now,
+            index: Arc::new(map),
+        };
+        self.request_dir_fold_cache
+            .write()
+            .insert(dir.to_string(), e.clone());
+        if let Some(ss) = self.exists_l2() {
+            let mut w = ss.dir_fold_cache.write();
+            if w.len() < DIR_FOLD_L2_MAX_ENTRIES {
+                w.insert(dir.to_string(), e.clone());
+            }
+        }
+        Some(e.index)
     }
 
     /// Is the application-lifetime layer 2 in play?
@@ -33496,8 +33722,10 @@ impl CfmlVirtualMachine {
     /// which ones.
     fn clear_exists_caches_wholesale(&self) {
         self.request_exists_cache.write().clear();
+        self.request_dir_fold_cache.write().clear();
         if let Some(ss) = self.server_state.as_ref() {
             ss.exists_cache.write().clear();
+            ss.dir_fold_cache.write().clear();
         }
         invalidate_exists_negatives();
     }
@@ -33522,6 +33750,18 @@ impl CfmlVirtualMachine {
         self.request_exists_cache.write().retain(|k, _| !matches(k));
         if let Some(ss) = self.server_state.as_ref() {
             ss.exists_cache.write().retain(|k, _| !matches(k));
+        }
+        // A create or delete changes the PARENT directory's listing, which is
+        // what the fold index caches. Generation stamping alone would not cover
+        // a delete: `invalidate_exists_path` deliberately does not bump it.
+        if let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+        {
+            self.request_dir_fold_cache.write().remove(&parent);
+            if let Some(ss) = self.server_state.as_ref() {
+                ss.dir_fold_cache.write().remove(&parent);
+            }
         }
         // Deliberately NO global negative retirement here. This function exists to
         // invalidate exactly one path, and bumping the generation on top of that
@@ -33826,15 +34066,7 @@ impl CfmlVirtualMachine {
                     "filecopy" | "filemove" | "directorycopy" | "directoryrename" => i == 0,
                     _ => true,
                 };
-                let mut resolved = self.resolve_template_relative(cur, allow_fallback);
-                // Fold existing paths so fileReadBinary(".../testDir/x.gif")
-                // finds testdir/x.gif on Linux (GH #387). Skip for brand-new
-                // write/create targets.
-                if allow_fallback {
-                    if let Some(folded) = cfml_common::vfs::lucee_case_fold_path(&resolved) {
-                        resolved = folded;
-                    }
-                }
+                let resolved = self.resolve_template_relative(cur, allow_fallback);
                 if resolved.as_str() != cur {
                     args[i] = CfmlValue::string(resolved);
                 }
@@ -34416,7 +34648,7 @@ impl CfmlVirtualMachine {
             return Some(path.to_string());
         }
         if path.starts_with('/') {
-            return self.resolve_include_with_mappings(path);
+            return self.resolve_include_with_mappings(path, false);
         }
         if let Some(ref base) = self.base_template_path {
             let base_dir = std::path::Path::new(base)

@@ -37,16 +37,25 @@ pub(crate) fn op_get_property(
                 // 6.3% of all keyed lookups on a warm Preside render) collapses
                 // into it. Same answer: every rung differed only in the casing
                 // it tried.
-                let val = s.get(name).or_else(|| {
-                    // Fall back to __variables for component properties.
-                    if let Some(CfmlValue::Struct(vars)) =
-                        s.get(&*cfml_common::key::well_known::VARIABLES)
-                    {
-                        vars.get(name)
-                    } else {
-                        None
-                    }
-                });
+                // GH #417 — NO fall-back into `__variables`. A component's
+                // private member scope is not part of its public surface, and
+                // this fall-back exposed every one of it: `c.someVar` returned
+                // a value set by `variables.someVar = …` inside a method, and
+                // `c.__variables.x` handed out the live private map.
+                //
+                // Verified against Lucee 7: the public surface of a component
+                // is `this.*` plus its public methods, FULL STOP. Even a
+                // declared `property` is not directly readable — the fall-back's
+                // "for component properties" comment was the justification, but
+                // `component accessors=true { property name="p"; }` answers
+                // `c.p` with "has no accessible Member with name [P]" there and
+                // exposes the value only through the generated `getP()`.
+                //
+                // Unscoped resolution INSIDE a method still reaches the private
+                // scope — that path is the locals/`__variables` chain in
+                // ops/locals.rs, not this one. This gates only reads through a
+                // component RECEIVER, which is exactly the external view.
+                let val = s.get(name);
                 let val = match val {
                     Some(v) => {
                         // A component method extracted as a VALUE
@@ -430,9 +439,16 @@ pub(crate) fn op_get_index(
         // private DATA (tolerant — Null on miss, like struct index).
         #[cfg(feature = "component-instance")]
         CfmlValue::Instance(inst) => {
+            // GH #417 — PUBLIC view. Bracket access is the same external read
+            // as dot access and Lucee gates it identically: `c["secret"]` and
+            // `c["__variables"]` both answer "has no accessible Member".
+            // Gating only the dot paths left this one handing out the private
+            // scope, and with it the write escape in #409 — the nested
+            // assignment `c.__variables.x = v` resolves its intermediate
+            // segment through here.
             let key = index.as_str_cow();
             stack.push(
-                inst.read().get_member(&key).unwrap_or(CfmlValue::Null),
+                inst.read().get_public_member(&key).unwrap_or(CfmlValue::Null),
             );
         }
         // Lucee/ACF/BoxLang: `str[n]` is 1-based CHARACTER access

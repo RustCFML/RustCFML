@@ -17,6 +17,18 @@ component extends="Base" {
 	// this pins that skipping it is correct for component methods).
 	public string function ucase()          { return "method-not-bif"; }
 	public string function collides()       { return "method-not-data"; }
+	// Public witness for the three ctor-time captures. The test used to read
+	// `o.ctorSawOwn` etc. directly, which only worked because a component's
+	// private member scope was externally readable (GH #417) — Lucee answers
+	// that with "has no accessible Member". Same values, through the public
+	// surface, so the hoist coverage is unchanged.
+	public struct function ctorWitness() {
+		return {
+			  own    = variables.ctorSawOwn
+			, parent = variables.ctorSawParent
+			, priv   = variables.ctorSawPrivate
+		};
+	}
 	public string function getPrivate()     { return privateOne(); }
 	public string function getPkg()         { return pkgOne(); }
 }

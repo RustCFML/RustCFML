@@ -395,7 +395,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_component_return_type.cfm">
 <cf_runtest file="oop/test_inheritance.cfm">
 <cf_runtest file="oop/test_super_case_insensitive_this.cfm">
-<cf_runtest file="oop/test_inherited_helpers.cfm" rustcfmlOnly="true" why="reads __variables, a RustCFML-internal backing marker">
+<cf_runtest file="oop/test_inherited_helpers.cfm">
 <cf_runtest file="oop/test_mixin_self_dispatch.cfm">
 <cf_runtest file="oop/test_component_body_chained_assignment_aliasing.cfm">
 <cf_runtest file="oop/test_inherited_chained_assignment_aliasing.cfm">

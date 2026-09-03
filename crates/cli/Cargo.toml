@@ -32,7 +32,21 @@ cfml-config = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-codegen = { workspace = true }
 cfml-qoq = { workspace = true }
-cfml-vm = { workspace = true, features = ["s3"] }
+# `default-features = false` is load-bearing: cfml-vm's own default set
+# includes `jit`, so taking its defaults here made the CLI's `jit` feature a
+# no-op — `--no-default-features` still linked all of Cranelift and still ran
+# the JIT, while `--jit-stats` reported "not built in" (that message is behind
+# the CLI crate's cfg, not the VM's). Every default EXCEPT `jit` is listed
+# explicitly; `jit` comes back via this crate's own default feature set below,
+# so a plain build is unchanged and only an explicit opt-out drops it.
+cfml-vm = { workspace = true, default-features = false, features = [
+    "s3",
+    "std",
+    "real-threads",
+    "observability",
+    "scope-pool",
+    "component-instance",
+] }
 cfml-module-abi = { workspace = true }
 indexmap = { workspace = true }
 cfml-stdlib = { workspace = true, features = ["default", "all-databases", "s3"] }
@@ -148,10 +162,11 @@ memprofile = ["dep:backtrace"]
 mimalloc = ["dep:mimalloc"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
-# Passthrough to the VM's Cranelift JIT (native only). **On by default** via
-# `cfml-vm`'s default feature set; this feature exists so that a downstream
-# build that opts out of cfml-vm defaults can still flip the JIT back on
-# explicitly from the CLI side. Runtime kill-switch: `RUSTCFML_JIT=0`.
+# Passthrough to the VM's Cranelift JIT (native only). On by default via THIS
+# crate's `default` list (see the cfml-vm dependency above, which deliberately
+# does NOT take cfml-vm's defaults). Dropping it from `--features` genuinely
+# removes the Cranelift dependency and the engine from the binary. Runtime
+# kill-switch, independent of the build: `RUSTCFML_JIT=0`.
 jit = ["cfml-vm/jit"]
 # Phase C (component-model flyweight): passthrough to the VM's `Instance` backing.
 # DEFAULT-ON as of v0.519.0 (the Slice-6 flip); also reaches the binary transitively
