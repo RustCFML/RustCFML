@@ -24114,6 +24114,20 @@ impl CfmlVirtualMachine {
         thread_name: Option<String>,
         pool: Option<CfmlValue>,
     ) -> CfmlResult {
+        // DIAGNOSTIC kill-switch: RUSTCFML_NO_PERIODIC=1 makes every periodic
+        // schedule a one-shot, so a memory question can be A/B'd against "are
+        // the long-lived relay threads holding anything?" without editing the
+        // application. A relay keeps its ThreadSeed alive for the life of the
+        // schedule, and a seed clones the globals snapshot and the application
+        // scope handle — so it is a plausible retainer by construction.
+        static NO_PERIODIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let (every_ms, spaced_ms) = if *NO_PERIODIC
+            .get_or_init(|| std::env::var("RUSTCFML_NO_PERIODIC").is_ok())
+        {
+            (None, None)
+        } else {
+            (every_ms, spaced_ms)
+        };
                 #[cfg(feature = "real-threads")]
                 let spawn = self.thread_spawn_fn;
                 #[cfg(not(feature = "real-threads"))]
@@ -36608,10 +36622,20 @@ impl CfmlVirtualMachine {
                     // execute_with_lifecycle: every in-flight request on this
                     // application shares the one live scope.
                     self.application_scope = Some(snapshot.variables.clone());
+                    // Persistent scope: a value displaced from here may be a cyclic graph
+                    // allocated in an EARLIER request, which the request-bounded cycle
+                    // collector would never examine. The flag makes the overwrite re-enter
+                    // the displaced subgraph into this request's collection set.
+                    if let Some(ref s) = self.application_scope { s.mark_persistent_scope(); }
                 }
             } else if self.application_scope.is_none() {
                 // CLI single-run: no ServerState to hold the scope.
                 self.application_scope = Some(CfmlStruct::empty());
+                // Persistent scope: a value displaced from here may be a cyclic graph
+                // allocated in an EARLIER request, which the request-bounded cycle
+                // collector would never examine. The flag makes the overwrite re-enter
+                // the displaced subgraph into this request's collection set.
+                if let Some(ref s) = self.application_scope { s.mark_persistent_scope(); }
             }
             self.current_application_name = Some(app_name.clone());
             if let Some(ref scope) = self.application_scope {
@@ -37564,6 +37588,11 @@ impl CfmlVirtualMachine {
                 // scope above and never reach here.
                 if self.application_scope.is_none() {
                     self.application_scope = Some(CfmlStruct::empty());
+                    // Persistent scope: a value displaced from here may be a cyclic graph
+                    // allocated in an EARLIER request, which the request-bounded cycle
+                    // collector would never examine. The flag makes the overwrite re-enter
+                    // the displaced subgraph into this request's collection set.
+                    if let Some(ref s) = self.application_scope { s.mark_persistent_scope(); }
                 }
                 // cfconfig `mappings` / `customTagPaths` are CONTEXT-level, not
                 // application-level: Lucee applies its config mappings whether or
@@ -37622,6 +37651,11 @@ impl CfmlVirtualMachine {
                 CfmlStruct::empty()
             };
             self.application_scope = Some(pc_scope);
+            // Persistent scope: a value displaced from here may be a cyclic graph
+            // allocated in an EARLIER request, which the request-bounded cycle
+            // collector would never examine. The flag makes the overwrite re-enter
+            // the displaced subgraph into this request's collection set.
+            if let Some(ref s) = self.application_scope { s.mark_persistent_scope(); }
         }
 
         // 2. Load Application.cfc. A pseudo-constructor throw (or compile error)
@@ -37869,6 +37903,11 @@ impl CfmlVirtualMachine {
             // semantics. Cloning the map here instead is what broke guard-once
             // idioms; see `ApplicationState::variables`.
             self.application_scope = Some(app_snapshot.variables.clone());
+            // Persistent scope: a value displaced from here may be a cyclic graph
+            // allocated in an EARLIER request, which the request-bounded cycle
+            // collector would never examine. The flag makes the overwrite re-enter
+            // the displaced subgraph into this request's collection set.
+            if let Some(ref s) = self.application_scope { s.mark_persistent_scope(); }
             // Expose the implicit `application.applicationName` key that Lucee/ACF
             // auto-populate from the app name. Frameworks (Wheels) build lock names
             // like `"controllerLock" & application.applicationName`, so a missing

@@ -633,6 +633,15 @@ pub struct StructInner {
     /// Enforced by [`CfmlValue::check_struct_writable`] at the mutation entry
     /// points; see its callers.
     pub read_only: bool,
+    /// Set on a PERSISTENT scope struct (application / session / server).
+    ///
+    /// A value displaced from such a scope may be a cyclic graph that was
+    /// allocated in an earlier request, which the request-bounded cycle
+    /// collector would otherwise never examine — see
+    /// [`CfmlValue::relog_cycle_nodes`], which this flag gates. Lives on the
+    /// STRUCT, like `read_only`, so an alias of the scope is treated the same
+    /// way the scope itself is.
+    pub persistent_scope: bool,
     /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
     /// private `__variables` struct, a read of the `this` key resolves to the
     /// upgraded handle — the component's live public scope — rather than a
@@ -942,6 +951,106 @@ pub struct DispatchShape {
     pub method_is_fn: bool,
 }
 
+/// Maximum containers walked by one [`CfmlValue::relog_cycle_nodes`] call. A
+/// displaced persistent-scope value is usually a small graph, but frameworks
+/// also cache large query structs there, and an unbounded walk on a write path
+/// would trade a leak for a latency spike. Exceeding the budget stops early:
+/// the un-walked remainder simply is not collected this time, which is exactly
+/// the behaviour before this hook existed.
+fn relog_budget() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("RUSTCFML_RELOG_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000)
+    })
+}
+
+impl CfmlValue {
+    /// Enter an ALREADY-ALLOCATED value graph into the current request's cycle
+    /// collection set.
+    ///
+    /// The collector is bounded to containers *this* request allocated, which is
+    /// sound for per-request garbage but misses one real case: a cyclic graph
+    /// that escaped into a persistent scope in an EARLIER request and is
+    /// displaced in this one. No request's survivor set ever contains it, and
+    /// refcounting cannot free it because it is a cycle — so it leaks forever.
+    ///
+    /// That is the shape every DI container has: WireBox wires services to each
+    /// other, so replacing the registry on a framework reload stranded the whole
+    /// previous object graph. Measured on Preside, ~100MB per `?fwreinit=true`,
+    /// linear and unbounded. A graph of MUTUALLY-referencing components leaks;
+    /// self-referencing ones do not, because the flyweight component model keeps
+    /// methods in a per-class table rather than per instance.
+    ///
+    /// Re-logging the displaced subgraph lets the existing trial-deletion pass
+    /// evaluate it. The correctness argument is unchanged: a node still owned
+    /// from outside the survivor set reads `external > 0` and is kept, so a
+    /// value merely ALIASED elsewhere (another key, a session, an in-flight
+    /// request) is never collected. The WHOLE subgraph is entered, not just its
+    /// root — an un-entered parent's reference would read as external and pin
+    /// its children.
+    pub fn relog_cycle_nodes(&self) {
+        if !crate::cycle_gc::is_armed() {
+            return;
+        }
+        // Diagnostic: RUSTCFML_RELOG_DEBUG=1 reports how often the hook fires
+        // and how much graph it enters, so "is this path even taken?" is a
+        // measurement rather than a guess.
+        static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let debug = *DEBUG.get_or_init(|| std::env::var("RUSTCFML_RELOG_DEBUG").is_ok());
+        let mut budget = relog_budget();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut stack: Vec<CfmlValue> = vec![self.clone()];
+        while let Some(v) = stack.pop() {
+            if budget == 0 {
+                if debug {
+                    eprintln!("[relog] BUDGET EXHAUSTED after {} nodes", seen.len());
+                }
+                return;
+            }
+            match &v {
+                CfmlValue::Struct(s) => {
+                    if !seen.insert(Arc::as_ptr(&s.0) as *const () as usize) {
+                        continue;
+                    }
+                    budget -= 1;
+                    crate::cycle_gc::log_struct(&s.0);
+                    s.0.read().map.values().for_each(|c| stack.push(c.clone()));
+                }
+                CfmlValue::Array(a) => {
+                    if !seen.insert(Arc::as_ptr(&a.0) as *const () as usize) {
+                        continue;
+                    }
+                    budget -= 1;
+                    crate::cycle_gc::log_array(&a.0);
+                    a.0.read().iter().for_each(|c| stack.push(c.clone()));
+                }
+                #[cfg(feature = "component-instance")]
+                CfmlValue::Instance(inst) => {
+                    if !seen.insert(Arc::as_ptr(inst) as *const () as usize) {
+                        continue;
+                    }
+                    budget -= 1;
+                    crate::cycle_gc::log_instance(inst);
+                    // Same handles the collector itself walks for an Instance.
+                    if let Some(g) = inst.try_read() {
+                        let (pub_m, priv_m) = (g.public_map_handle(), g.private_map_handle());
+                        drop(g);
+                        pub_m.with_read(|m| m.values().for_each(|c| stack.push(c.clone())));
+                        priv_m.with_read(|m| m.values().for_each(|c| stack.push(c.clone())));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if debug && !seen.is_empty() {
+            eprintln!("[relog] entered {} containers", seen.len());
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
@@ -956,6 +1065,7 @@ impl CfmlStruct {
             map: m,
             shape_id: next_shape_id(),
             read_only: false,
+            persistent_scope: false,
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -990,6 +1100,7 @@ impl CfmlStruct {
             map: m,
             shape_id: next_shape_id(),
             read_only: false,
+            persistent_scope: false,
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -1003,6 +1114,13 @@ impl CfmlStruct {
     #[inline]
     pub fn mark_read_only(&self) {
         self.0.write().read_only = true;
+    }
+
+    /// Mark this struct as a persistent scope (application / session / server),
+    /// so a displaced value's cycle nodes are re-entered into the collector.
+    /// See [`StructInner::persistent_scope`].
+    pub fn mark_persistent_scope(&self) {
+        self.0.write().persistent_scope = true;
     }
 
     /// True for a scope CFML code may not write — see [`StructInner::read_only`].
@@ -1390,6 +1508,18 @@ impl CfmlStruct {
         if prev.is_none() {
             g.shape_id = next_shape_id();
         }
+        // Overwriting a key in a PERSISTENT scope can strand a cyclic graph the
+        // request-bounded collector would never look at (it was allocated in an
+        // earlier request). Enter the displaced subgraph into this request's
+        // collection set. The lock is released first: the walk clones values and
+        // must not re-enter this struct's own lock.
+        let persistent = g.persistent_scope;
+        drop(g);
+        if persistent {
+            if let Some(ref old) = prev {
+                old.relog_cycle_nodes();
+            }
+        }
         prev
     }
 
@@ -1427,6 +1557,15 @@ impl CfmlStruct {
         if prev.is_some() {
             g.shape_id = next_shape_id();
         }
+        let persistent = g.persistent_scope;
+        drop(g);
+        // See the note in `insert`: a value leaving a persistent scope may be a
+        // cyclic graph from an earlier request.
+        if persistent {
+            if let Some(ref old) = prev {
+                old.relog_cycle_nodes();
+            }
+        }
         prev
     }
 
@@ -1441,9 +1580,22 @@ impl CfmlStruct {
     #[inline]
     pub fn clear(&self) {
         let mut g = self.0.write();
+        // Clearing a persistent scope displaces EVERYTHING in it at once — this
+        // is the `applicationStop()` / framework-reload path, and it is the
+        // single biggest source of stranded cycles. Take the values out before
+        // dropping them so the subgraphs can be entered into the collector.
+        let displaced: Vec<CfmlValue> = if g.persistent_scope {
+            g.map.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
         if !g.map.is_empty() {
             g.map.clear();
             g.shape_id = next_shape_id();
+        }
+        drop(g);
+        for v in &displaced {
+            v.relog_cycle_nodes();
         }
     }
 

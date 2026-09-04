@@ -547,6 +547,36 @@ impl NodeHandle {
         }
     }
 
+    /// A short human description used by the pinned-roots diagnostic: the node
+    /// kind plus, for maps, its first few keys — which is what identifies the
+    /// object to a CFML developer.
+    fn describe(&self) -> String {
+        fn keys_of(m: &ValueMap) -> String {
+            let ks: Vec<String> = m.iter().take(6).map(|(k, _)| k.to_string()).collect();
+            format!("{} keys [{}]", m.len(), ks.join(", "))
+        }
+        match self {
+            NodeHandle::Struct(a) => match a.try_read() {
+                Some(g) => format!("Struct {}", keys_of(&g.map)),
+                None => "Struct <locked>".to_string(),
+            },
+            NodeHandle::Array(a) => match a.try_read() {
+                Some(g) => format!("Array len={}", g.len()),
+                None => "Array <locked>".to_string(),
+            },
+            NodeHandle::Query(_) => "Query".to_string(),
+            NodeHandle::Scope(a) => match a.try_read() {
+                Ok(g) => format!("ClosureScope {}", keys_of(&g)),
+                Err(_) => "ClosureScope <locked>".to_string(),
+            },
+            #[cfg(feature = "component-instance")]
+            NodeHandle::Instance(a) => match a.try_read() {
+                Some(g) => format!("Instance of {}", g.class.name),
+                None => "Instance <locked>".to_string(),
+            },
+        }
+    }
+
     /// Break this node's cycle by clearing its contents (drops its outgoing refs).
     fn clear(&self) {
         match self {
@@ -867,9 +897,26 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
     //    external(n) = strong_count − 1 (probe handle) − internal_in(n).
     let mut live: HashSet<usize> = HashSet::with_capacity(nodes.len());
     let mut worklist: Vec<usize> = Vec::new();
+    // RUSTCFML_GC_ROOTS=N reports the N largest PINNED ROOTS — survivors whose
+    // external count is non-zero, i.e. the nodes something outside this
+    // collection set still points at. Their transitive closure is what gets
+    // marked live, so when a sweep keeps far more than expected, these names
+    // are the answer to "held by what?". Structs report their first keys, which
+    // identifies them in CFML terms rather than as addresses.
+    static ROOT_DEBUG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let root_debug = *ROOT_DEBUG.get_or_init(|| {
+        std::env::var("RUSTCFML_GC_ROOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    let mut root_report: Vec<(usize, String)> = Vec::new();
     for (&p, h) in &nodes {
         let internal = *internal_in.get(&p).unwrap_or(&0);
         let external = h.strong_count().saturating_sub(1).saturating_sub(internal);
+        if root_debug > 0 && external > 0 {
+            root_report.push((external, h.describe()));
+        }
         if external > 0 && live.insert(p) {
             worklist.push(p);
         }
@@ -889,6 +936,14 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
 
     // 5. Everything not live is an unreachable cycle: clear it to break the
     //    cycle, then dropping the probe handles frees the whole subgraph.
+    if root_debug > 0 && !root_report.is_empty() {
+        root_report.sort_by(|a, b| b.0.cmp(&a.0));
+        root_report.truncate(root_debug);
+        eprintln!("[cycle_gc] pinned roots (external refs, descending):");
+        for (ext, what) in &root_report {
+            eprintln!("    ext={:<6} {}", ext, what);
+        }
+    }
     let survivors = nodes.len();
     let mut collected = 0usize;
     for (&p, h) in &nodes {
