@@ -137,6 +137,36 @@ pub fn make_scheduled_executor() -> CfmlValue {
     CfmlValue::strukt(m)
 }
 
+/// A `ThreadPoolExecutor$*Policy` marker. Unlike the other opaque markers this
+/// one carries its class name: the pool reads it to decide what to do with a
+/// task submitted to a full queue.
+pub fn make_rejection_policy(class: &str) -> CfmlValue {
+    let mut m = java_shim_map(class);
+    m.insert(
+        "__reject_policy".to_string(),
+        CfmlValue::string(class.to_string()),
+    );
+    CfmlValue::strukt(m)
+}
+
+/// The rejection-policy name carried by a policy marker, if this is one.
+pub fn rejection_policy_name(v: &CfmlValue) -> Option<String> {
+    match v {
+        CfmlValue::Struct(s) => s.get("__reject_policy").map(|p| p.as_string()),
+        _ => None,
+    }
+}
+
+/// The bounded capacity recorded on a work-queue shim, if it has one.
+pub fn queue_capacity(v: &CfmlValue) -> Option<i64> {
+    match v {
+        CfmlValue::Struct(s) => s
+            .get("__queue_capacity")
+            .and_then(|c| c.as_string().parse::<i64>().ok()),
+        _ => None,
+    }
+}
+
 /// `java.util.concurrent.TimeUnit` — an enum holder. Reads of `.SECONDS` etc.
 /// (property access) return the token string; `.toString()` on a token is the
 /// token itself. RustCFML never feeds these to a live executor, so opaque
@@ -157,6 +187,94 @@ pub fn make_timeunit() -> CfmlValue {
     CfmlValue::strukt(m)
 }
 
+thread_local! {
+    /// The name `java.lang.Thread.currentThread().getName()` reports on THIS
+    /// OS thread. Set when an executor task's child VM starts (from the CFML
+    /// ThreadFactory's `${poolno}`/`${threadno}` pattern) and never cleared —
+    /// the thread is the task. Defaults to "main" on the request thread, which
+    /// is what a CFML page sees on Lucee too.
+    static CURRENT_THREAD_NAME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Name this OS thread for `Thread.currentThread().getName()`.
+pub fn set_current_thread_name(name: String) {
+    CURRENT_THREAD_NAME.with(|c| *c.borrow_mut() = Some(name));
+}
+
+/// The name this OS thread reports. "main" when unnamed.
+pub fn current_thread_name() -> String {
+    CURRENT_THREAD_NAME.with(|c| c.borrow().clone()).unwrap_or_else(|| "main".to_string())
+}
+
+/// Monotonic pool / thread counters behind `Executors.defaultThreadFactory()`.
+/// The JVM names its threads `pool-<N>-thread-<M>`, and Preside's
+/// `ThreadFactory.cfc` REGEX-PARSES exactly that shape to pull N and M out
+/// before substituting them into its own pattern — so the shim must produce
+/// it verbatim or the rename silently leaves `${poolno}` literal in the name.
+static POOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static THREAD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn next_pool_number() -> u64 {
+    POOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+pub fn next_thread_number() -> u64 {
+    THREAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+pub const LUCEE_RUNNABLE_CLASS: &str = "org.pixl8.cfconcurrent.luceerunnable";
+pub const LUCEE_CALLABLE_CLASS: &str = "org.pixl8.cfconcurrent.luceecallable";
+
+/// `org.pixl8.cfconcurrent.LuceeRunnable` / `LuceeCallable` — Preside's own
+/// 4.7KB helper jar (`system/externals/cfconcurrent/luceelib/`). On Lucee it
+/// wraps a CFC in a java Runnable/Callable that rebuilds a PageContext on the
+/// worker thread. RustCFML's thread seed already carries the application
+/// context, so the ctor's contextRoot/appContext/host arguments are not needed
+/// — the shim collapses to the same wrapper `createDynamicProxy` produces, and
+/// the executor shims unwrap it identically. This is what lets UNMODIFIED
+/// upstream cfconcurrent run: its `_isLucee5()` gate sends RustCFML down the
+/// jar path (server.lucee.version is "7.x"), not the createDynamicProxy path.
+pub fn make_lucee_proxy_class(class: &str) -> CfmlValue {
+    CfmlValue::strukt(java_shim_map(class))
+}
+
+/// `.init( cfc, contextRoot, appContext, host )` on the above — build the proxy.
+pub fn lucee_proxy_init(class: &str, args: &[CfmlValue]) -> CfmlValue {
+    let sam = if class == LUCEE_CALLABLE_CLASS { "call" } else { "run" };
+    let mut w = ValueMap::default();
+    w.insert("__dynamic_proxy".to_string(), CfmlValue::Bool(true));
+    w.insert(
+        "__proxy_target".to_string(),
+        args.first().cloned().unwrap_or(CfmlValue::Null),
+    );
+    w.insert("__proxy_method".to_string(), CfmlValue::string(sam.to_string()));
+    // init( runnableCfc, contextRoot, appContext, host ) — the 4th argument is
+    // the hostname the task must see as `cgi.server_name`. Preside uses it so a
+    // background heartbeat resolves the right SITE (`autoSetSiteByHost`), so
+    // dropping it silently runs every task against the wrong site.
+    if let Some(h) = args.get(3) {
+        let h = h.as_string();
+        if !h.is_empty() {
+            w.insert("__proxy_hostname".to_string(), CfmlValue::string(h));
+        }
+    }
+    CfmlValue::strukt(w)
+}
+
+/// The `cgi.server_name` a proxied task must run under, if it carries one.
+pub fn proxy_hostname(v: &CfmlValue) -> Option<String> {
+    if let CfmlValue::Struct(s) = v {
+        if let Some(h) = s.get("__proxy_hostname") {
+            let h = h.as_string();
+            if !h.is_empty() {
+                return Some(h);
+            }
+        }
+    }
+    None
+}
+
 /// `java.util.concurrent.ThreadFactory` (or Executors.defaultThreadFactory()).
 pub fn make_threadfactory() -> CfmlValue {
     CfmlValue::strukt(java_shim_map(THREADFACTORY_CLASS))
@@ -169,7 +287,11 @@ pub fn make_threadfactory() -> CfmlValue {
 pub fn make_completion_service(executor: CfmlValue) -> CfmlValue {
     let mut m = java_shim_map(COMPLETION_SERVICE_CLASS);
     m.insert("__cs_executor".to_string(), executor);
-    m.insert("__cs_completed".to_string(), CfmlValue::array(vec![]));
+    // Shared by Arc, NOT copied per struct — see CompletionQueueNative.
+    m.insert(
+        "__cs_queue".to_string(),
+        crate::async_kernel::CompletionQueueNative::new_value(),
+    );
     CfmlValue::strukt(m)
 }
 
@@ -242,7 +364,15 @@ pub fn handle_java_threadfactory(
         if let Some(r) = args.into_iter().next() {
             m.insert("__runnable".to_string(), r);
         }
-        m.insert("__thread_name".to_string(), CfmlValue::string("rustcfml-worker".to_string()));
+        // `pool-N-thread-M`, the exact JVM shape ThreadFactory.cfc parses.
+        m.insert(
+            "__name".to_string(),
+            CfmlValue::string(format!(
+                "pool-{}-thread-{}",
+                next_pool_number(),
+                next_thread_number()
+            )),
+        );
         return Ok(CfmlValue::strukt(m));
     }
     Ok(CfmlValue::Null)
@@ -262,6 +392,12 @@ pub fn handle_java_executor_service_pure(
     let is_shut = matches!(object, CfmlValue::Struct(s)
         if s.get("__shutdown").map(|v| v.is_true()).unwrap_or(false));
     match m.as_str() {
+        // `createObject("java", "...ThreadPoolExecutor").init( … )` — the JVM
+        // constructor. The shim is already fully formed by make_executor_service /
+        // make_scheduled_executor, so init() just hands the object back. Returning
+        // Null here (the old `_` arm) is why cfconcurrent's `variables.workExecutor`
+        // came out undefined: it ALWAYS constructs via `.init()`.
+        "init" => (Ok(object.clone()), None),
         "shutdown" => {
             let mut ns = match object {
                 CfmlValue::Struct(s) => s.snapshot(),
@@ -291,6 +427,22 @@ pub fn handle_java_executor_service_pure(
         "getcorepoolsize" | "getmaximumpoolsize" => (Ok(CfmlValue::Int(0)), None),
         "getqueue" => (Ok(CfmlValue::array(vec![])), None),
         _ => (Ok(CfmlValue::Null), None),
+    }
+}
+
+/// Convert a `java.util.concurrent.TimeUnit` token (the shim's opaque string,
+/// e.g. "MILLISECONDS") plus a magnitude into milliseconds. Unknown/absent
+/// units default to MILLISECONDS, matching how Preside's cfconcurrent passes
+/// its heartbeat intervals (already in ms with `objectFactory.MILLISECONDS`).
+pub fn timeunit_to_millis(amount: i64, unit: &str) -> i64 {
+    match unit.trim().to_ascii_uppercase().as_str() {
+        "NANOSECONDS" => amount / 1_000_000,
+        "MICROSECONDS" => amount / 1_000,
+        "SECONDS" => amount.saturating_mul(1_000),
+        "MINUTES" => amount.saturating_mul(60_000),
+        "HOURS" => amount.saturating_mul(3_600_000),
+        "DAYS" => amount.saturating_mul(86_400_000),
+        _ => amount,
     }
 }
 
@@ -984,7 +1136,7 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
     }
 }
 
-pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+pub fn handle_java_thread(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     // "threadgroup" is a nested shim for java.lang.ThreadGroup accessed via
     // Thread.getThreadGroup(). We route its own methods here too.
     if let CfmlValue::Struct(ref shim) = object {
@@ -1010,8 +1162,25 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
                 CfmlValue::string("java.lang.thread".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__name".to_string(), CfmlValue::string("main".to_string()));
+            shim.insert(
+                "__name".to_string(),
+                CfmlValue::string(current_thread_name()),
+            );
             Ok(CfmlValue::strukt(shim))
+        }
+        // Thread.setName(x) — ThreadFactory.cfc renames the thread it just got
+        // from the default factory, then hands it to the pool. The name must
+        // survive on the shim so the executor can read it back.
+        "setname" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                let mut m = shim.snapshot();
+                m.insert(
+                    "__name".to_string(),
+                    CfmlValue::string(args.first().map(|v| v.as_string()).unwrap_or_default()),
+                );
+                return Ok(CfmlValue::strukt(m));
+            }
+            Ok(CfmlValue::Null)
         }
         "getname" => {
             if let CfmlValue::Struct(ref shim) = object {
@@ -3100,6 +3269,17 @@ pub fn handle_java_concurrentlinkedqueue(
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("__queue".to_string(), CfmlValue::array(Vec::new()));
+            // `new LinkedBlockingQueue( capacity )` — the bound the owning
+            // ThreadPoolExecutor enforces. It arrives HERE, at .init(), not at
+            // createObject(), so reading it off the createObject args finds
+            // nothing and every pool silently becomes unbounded.
+            if let Some(c) = args
+                .first()
+                .and_then(|v| v.as_string().trim().parse::<i64>().ok())
+                .filter(|c| *c > 0)
+            {
+                shim.insert("__queue_capacity".to_string(), CfmlValue::Int(c));
+            }
             Ok(CfmlValue::strukt(shim))
         }
         "add" | "offer" => {

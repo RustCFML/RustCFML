@@ -1794,6 +1794,40 @@ listing, cached per **directory** (not per path) behind the same two layers and
 the same negative-answer generation as the existence memo, so a tree that
 probes many absent override CFCs in one directory pays a single listing.
 
+## 76. `java.util.concurrent` is a native executor, not a JVM thread pool 🏗
+
+`ThreadPoolExecutor` / `ScheduledThreadPoolExecutor` / `ExecutorCompletionService`
+and friends are backed by RustCFML's own threading, not by a JVM. The observable
+contract is kept: `maxPoolSize` bounds how many tasks run at once, the work
+queue's capacity is enforced, all four `RejectedExecutionHandler` policies
+(`DiscardPolicy`, `DiscardOldestPolicy`, `AbortPolicy`, `CallerRunsPolicy`)
+behave as documented, `invokeAll` blocks and cancels stragglers on timeout,
+`invokeAny` raises `java.util.concurrent.TimeoutException`, and a periodic
+`ScheduledFuture` stays pending until it is cancelled. cfconcurrent's own
+TestBox suite passes 30/30, matching Lucee 7.1.0.204 spec for spec.
+
+Two divergences are deliberate:
+
+**A rejected or cancelled-before-it-ran task resolves as CANCELLED.** The JVM's
+`DiscardPolicy` returns a `Future` that never completes, so `get()` blocks
+forever. We resolve it instead: `isCancelled()` is true and `get()` returns
+null. Being bug-compatible here would mean deadlocking a request thread on a
+task the pool deliberately threw away.
+
+**The pool bounds concurrency and queueing, it does not pool VMs.** Each task
+still gets a fresh child VM, as `cfthread` does; worker threads gate execution
+rather than being long-lived interpreters. Nothing observable from CFML depends
+on this, but a task cannot leave state behind in "its" thread for the next task
+on that thread to find — which is true of `cfthread` too.
+
+`org.pixl8.cfconcurrent.LuceeRunnable` / `LuceeCallable` (Preside's 4.7KB helper
+jar) are shimmed to the same proxy `createDynamicProxy` produces: RustCFML
+reports `server.lucee.version` as `7.x`, so cfconcurrent's `_isLucee5()` gate
+sends it down the jar path, and the jar's job — rebuilding a page context on the
+worker thread — is already done by the engine's thread seed.
+
+---
+
 ## 8. Environment-specific 🌍
 
 | Feature | Restriction |

@@ -27,10 +27,10 @@
 //! `&mut VM`. The CFML async port composes via `runAsync(() => cb(prev.get()))`
 //! instead.
 
-use crate::{ThreadHandle, ThreadResult};
+use crate::{ThreadHandle, ThreadResult, ThreadSeed, ThreadSpawnFn};
 use cfml_common::dynamic::{CfmlNative, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 /// A Future wrapping one spawned async task. Either holds a live
 /// `ThreadHandle` (waiting/running) or a cached `ThreadResult` (resolved).
@@ -50,6 +50,14 @@ pub struct FutureNative {
     /// `True` when the task was inline-run (wasm / `real-threads` off) and
     /// the result was injected at construction. `cancel()` is a no-op then.
     inline_resolved: bool,
+    /// `True` for a `java.util.concurrent` task, where the SAM's return value
+    /// IS the future value — including when that value is null. A `Runnable`
+    /// returns nothing and `Future.get()` must yield null; the cfthread-style
+    /// fallbacks below (thread.result, then the whole `thread` scope) would
+    /// otherwise hand back whatever the AMBIENT thread scope happened to hold.
+    /// That is not hypothetical: under TestBox it returned the runner's own
+    /// `thread` vars (testResults/suiteStats/target/closures/suite/spec).
+    strict_value: bool,
 }
 
 impl std::fmt::Debug for FutureNative {
@@ -71,6 +79,18 @@ impl FutureNative {
             handle: Mutex::new(Some(handle)),
             result: None,
             inline_resolved: false,
+            strict_value: false,
+        }
+    }
+
+    /// As `from_handle`, but with JVM `Future` value semantics — see
+    /// [`FutureNative::strict_value`].
+    pub fn from_handle_strict(handle: ThreadHandle) -> Self {
+        Self {
+            handle: Mutex::new(Some(handle)),
+            result: None,
+            inline_resolved: false,
+            strict_value: true,
         }
     }
 
@@ -80,6 +100,17 @@ impl FutureNative {
             handle: Mutex::new(None),
             result: Some(result),
             inline_resolved: true,
+            strict_value: false,
+        }
+    }
+
+    /// Pre-resolved future with JVM `Future` value semantics.
+    pub fn resolved_strict(result: ThreadResult) -> Self {
+        Self {
+            handle: Mutex::new(None),
+            result: Some(result),
+            inline_resolved: true,
+            strict_value: true,
         }
     }
 
@@ -139,6 +170,10 @@ impl FutureNative {
             if !matches!(v, CfmlValue::Null) {
                 return Ok(v.clone());
             }
+        }
+        // JVM Future: the SAM's value is the answer, null included.
+        if self.strict_value {
+            return Ok(CfmlValue::Null);
         }
         if let Some(v) = r.thread_vars.get("result") {
             return Ok(v.clone());
@@ -259,6 +294,392 @@ impl CfmlNative for FutureNative {
             "status" => Some(CfmlValue::string(self.status_str())),
             "error" => Some(CfmlValue::string(self.error_message())),
             _ => None,
+        }
+    }
+}
+
+/// The completion queue behind `java.util.concurrent.ExecutorCompletionService`.
+///
+/// This has to be a NativeObject rather than a plain struct key: the completion
+/// service is passed around BY VALUE in CFML (cfconcurrent hands the same
+/// service to `AbstractCompletionTask` while keeping its own reference, and
+/// `AbstractCompletionTask.run()` polls through its copy). A struct + method
+/// writeback gives each holder its own private queue, so tasks submitted
+/// through one copy are invisible to the poller — which is exactly why
+/// `poll()` used to return nothing. An `Arc` inside the struct makes every
+/// copy share one queue, matching the JVM's object identity.
+#[derive(Debug, Default)]
+pub struct CompletionQueueNative {
+    /// Futures submitted but not yet handed out by poll()/take().
+    pending: Vec<CfmlValue>,
+}
+
+impl CompletionQueueNative {
+    pub fn new_value() -> CfmlValue {
+        CfmlValue::NativeObject(Arc::new(RwLock::new(Self::default())))
+    }
+
+    /// Is this future finished? Asks the Future itself, so a task that
+    /// completed on its own thread is visible without anyone calling get().
+    fn future_done(f: &CfmlValue) -> bool {
+        match f {
+            CfmlValue::NativeObject(o) => o
+                .write()
+                .ok()
+                .and_then(|mut g| g.call_method("isDone", vec![]).ok())
+                .map(|v| v.is_true())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+}
+
+impl CfmlNative for CompletionQueueNative {
+    fn class_name(&self) -> &str {
+        "CompletionQueue"
+    }
+
+    fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        match name.to_ascii_lowercase().as_str() {
+            "add" => {
+                if let Some(f) = args.into_iter().next() {
+                    self.pending.push(f);
+                }
+                Ok(CfmlValue::Bool(true))
+            }
+            // poll() — non-blocking: the first COMPLETED future, else null.
+            // Completion order, not submission order, per the JVM contract.
+            "poll" => {
+                if let Some(i) = self.pending.iter().position(Self::future_done) {
+                    return Ok(self.pending.remove(i));
+                }
+                Ok(CfmlValue::Null)
+            }
+            // take() — blocks until one is available.
+            "take" => loop {
+                if let Some(i) = self.pending.iter().position(Self::future_done) {
+                    return Ok(self.pending.remove(i));
+                }
+                if self.pending.is_empty() {
+                    return Ok(CfmlValue::Null);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            },
+            "size" => Ok(CfmlValue::Int(self.pending.len() as i64)),
+            "clear" => {
+                self.pending.clear();
+                Ok(CfmlValue::Null)
+            }
+            other => Err(CfmlError::runtime(format!(
+                "CompletionQueue has no method [{}]",
+                other
+            ))),
+        }
+    }
+}
+
+
+// ─────────────────────────────────────────────
+// Bounded executor pool
+//
+// `ThreadPoolExecutor(corePoolSize, maxPoolSize, …, workQueue, factory, policy)`
+// is not just a place to fling threads: the JVM runs at most `maxPoolSize`
+// tasks at once, holds the overflow in a queue of bounded capacity, and applies
+// a RejectedExecutionHandler when that queue is full. Running every submitted
+// task immediately on its own detached thread gets the happy path right and
+// every back-pressure property wrong — an app that submits 10k tasks would
+// spawn 10k threads instead of queueing 10k and discarding the overflow.
+// ─────────────────────────────────────────────
+
+/// What to do with a task submitted to a pool whose queue is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectPolicy {
+    /// Silently drop the new task (java: DiscardPolicy).
+    Discard,
+    /// Drop the longest-waiting queued task, then enqueue this one.
+    DiscardOldest,
+    /// Throw RejectedExecutionException.
+    Abort,
+    /// Run it on the submitting thread.
+    CallerRuns,
+}
+
+impl RejectPolicy {
+    pub fn from_name(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        if n.contains("discardoldest") {
+            RejectPolicy::DiscardOldest
+        } else if n.contains("abort") {
+            RejectPolicy::Abort
+        } else if n.contains("callerruns") {
+            RejectPolicy::CallerRuns
+        } else {
+            RejectPolicy::Discard
+        }
+    }
+}
+
+/// A task waiting for a worker.
+struct PendingTask {
+    seed: ThreadSeed,
+    tx: std::sync::mpsc::Sender<ThreadResult>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PoolShared {
+    max_concurrent: usize,
+    queue_capacity: usize,
+    policy: RejectPolicy,
+    queue: std::collections::VecDeque<PendingTask>,
+    /// Worker threads alive right now (each runs at most one task at a time,
+    /// so this is also the count of concurrently-executing tasks).
+    live_workers: usize,
+    /// Permits held by scheduled runs, which bypass the queue (the JVM's
+    /// ScheduledThreadPoolExecutor uses its own delayed queue) but are still
+    /// bounded by the pool size.
+    scheduled_running: usize,
+    spawn_fn: Option<ThreadSpawnFn>,
+}
+
+/// The pool behind an executor shim. Held as a NativeObject so every CFML copy
+/// of the executor struct shares one pool (same reasoning as the completion
+/// queue: cfconcurrent passes executors around by value).
+pub struct ExecutorPoolNative {
+    inner: Arc<(std::sync::Mutex<PoolShared>, std::sync::Condvar)>,
+}
+
+impl std::fmt::Debug for ExecutorPoolNative {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let g = self.inner.0.lock().unwrap();
+        f.debug_struct("ExecutorPool")
+            .field("maxConcurrent", &g.max_concurrent)
+            .field("queued", &g.queue.len())
+            .field("active", &g.live_workers)
+            .finish()
+    }
+}
+
+/// A failed result: the task could not run for a reason the caller should see
+/// as an error from `Future.get()`.
+fn terminated(reason: &str) -> ThreadResult {
+    ThreadResult {
+        status: "TERMINATED".to_string(),
+        output: String::new(),
+        error: reason.to_string(),
+        elapsed: 0,
+        thread_vars: ValueMap::default(),
+        return_value: None,
+    }
+}
+
+/// A task that was deliberately dropped (a rejection policy, or cancelled
+/// before it ran). The JVM leaves such a future permanently incomplete, so
+/// `get()` blocks forever; we resolve it as CANCELLED instead — `isCancelled()`
+/// is true and `get()` returns null. Deadlocking a request to be bug-compatible
+/// with the JVM would be the worse trade. No `error` is set, because nothing
+/// went wrong: the pool did exactly what its policy asked.
+fn discarded() -> ThreadResult {
+    ThreadResult {
+        status: "TERMINATED".to_string(),
+        output: String::new(),
+        error: String::new(),
+        elapsed: 0,
+        thread_vars: ValueMap::default(),
+        return_value: None,
+    }
+}
+
+impl ExecutorPoolNative {
+    pub fn new_value(
+        max_concurrent: usize,
+        queue_capacity: usize,
+        policy: RejectPolicy,
+        spawn_fn: Option<ThreadSpawnFn>,
+    ) -> CfmlValue {
+        let pool = ExecutorPoolNative {
+            inner: Arc::new((
+                std::sync::Mutex::new(PoolShared {
+                    max_concurrent: max_concurrent.max(1),
+                    queue_capacity: queue_capacity.max(1),
+                    policy,
+                    queue: std::collections::VecDeque::new(),
+                    live_workers: 0,
+                    scheduled_running: 0,
+                    spawn_fn,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        };
+        CfmlValue::NativeObject(Arc::new(RwLock::new(pool)))
+    }
+
+    pub fn max_concurrent(&self) -> usize {
+        self.inner.0.lock().unwrap().max_concurrent
+    }
+
+    /// Enqueue `seed` and return the handle its Future will resolve from.
+    /// `Err` is only produced by the Abort policy.
+    pub fn submit(&self, seed: ThreadSeed) -> Result<ThreadHandle, CfmlError> {
+        let cancel = seed.cancel_flag.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
+        let handle = ThreadHandle {
+            name: String::new(),
+            rx,
+            cancel: cancel.clone(),
+            join: None,
+            result: None,
+        };
+
+        let mut seed = Some(seed);
+        let mut caller_runs_seed: Option<ThreadSeed> = None;
+        let mut caller_tx: Option<std::sync::mpsc::Sender<ThreadResult>> = None;
+        {
+            let (lock, cv) = &*self.inner;
+            let mut g = lock.lock().unwrap();
+
+            if g.queue.len() >= g.queue_capacity {
+                match g.policy {
+                    RejectPolicy::Discard => {
+                        let _ = tx.send(discarded());
+                        return Ok(handle);
+                    }
+                    RejectPolicy::DiscardOldest => {
+                        if let Some(old) = g.queue.pop_front() {
+                            let _ = old.tx.send(discarded());
+                        }
+                    }
+                    RejectPolicy::Abort => {
+                        return Err(CfmlError::new(
+                            "Task rejected: executor queue is full".to_string(),
+                            cfml_common::vm::CfmlErrorType::Custom(
+                                "java.util.concurrent.RejectedExecutionException".to_string(),
+                            ),
+                        ));
+                    }
+                    RejectPolicy::CallerRuns => {
+                        caller_runs_seed = seed.take();
+                        caller_tx = Some(tx.clone());
+                    }
+                }
+            }
+
+            if let Some(seed) = seed.take() {
+                g.queue.push_back(PendingTask { seed, tx, cancel });
+                // Start a worker only while we are under the concurrency limit.
+                if g.live_workers < g.max_concurrent {
+                    g.live_workers += 1;
+                    let inner = Arc::clone(&self.inner);
+                    if std::thread::Builder::new()
+                        .name("rustcfml-pool-worker".to_string())
+                        .spawn(move || Self::worker_loop(inner))
+                        .is_err()
+                    {
+                        g.live_workers -= 1;
+                    }
+                }
+                cv.notify_all();
+            }
+        }
+
+        // CallerRuns happens outside the lock — it runs the body here, on the
+        // submitting thread, exactly as the JVM policy does.
+        if let (Some(seed), Some(tx)) = (caller_runs_seed, caller_tx) {
+            let spawn = { self.inner.0.lock().unwrap().spawn_fn };
+            if let Some(spawn_fn) = spawn {
+                let inner_handle = spawn_fn(seed);
+                if let Ok(res) = inner_handle.rx.recv() {
+                    let _ = tx.send(res);
+                } else {
+                    let _ = tx.send(terminated("Task produced no result"));
+                }
+            } else {
+                let _ = tx.send(terminated("No thread spawner available"));
+            }
+        }
+        Ok(handle)
+    }
+
+    fn worker_loop(inner: Arc<(std::sync::Mutex<PoolShared>, std::sync::Condvar)>) {
+        loop {
+            let (task, spawn) = {
+                let (lock, _cv) = &*inner;
+                let mut g = lock.lock().unwrap();
+                match g.queue.pop_front() {
+                    Some(t) => (t, g.spawn_fn),
+                    None => {
+                        // Check-and-exit must be atomic with the decrement, or a
+                        // concurrent submit could see a worker that is leaving.
+                        g.live_workers -= 1;
+                        return;
+                    }
+                }
+            };
+
+            if task.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = task.tx.send(discarded());
+                continue;
+            }
+            match spawn {
+                Some(spawn_fn) => {
+                    let mut h = spawn_fn(task.seed);
+                    let res = h.rx.recv().ok();
+                    if let Some(j) = h.join.take() {
+                        let _ = j.join();
+                    }
+                    let _ = task
+                        .tx
+                        .send(res.unwrap_or_else(|| terminated("Task produced no result")));
+                }
+                None => {
+                    let _ = task.tx.send(terminated("No thread spawner available"));
+                }
+            }
+        }
+    }
+
+    /// Block until a scheduled run may start, honouring the pool size. The
+    /// JVM's ScheduledThreadPoolExecutor bounds concurrent runs by corePoolSize
+    /// too — Preside builds its heartbeat pool with exactly 1 — so periodic
+    /// tasks must not each get a free thread.
+    pub fn acquire_scheduled(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        while g.scheduled_running >= g.max_concurrent {
+            g = cv.wait(g).unwrap();
+        }
+        g.scheduled_running += 1;
+    }
+
+    pub fn release_scheduled(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        g.scheduled_running = g.scheduled_running.saturating_sub(1);
+        cv.notify_all();
+    }
+}
+
+impl CfmlNative for ExecutorPoolNative {
+    fn class_name(&self) -> &str {
+        "ExecutorPool"
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn call_method(&mut self, name: &str, _args: Vec<CfmlValue>) -> CfmlResult {
+        let g = self.inner.0.lock().unwrap();
+        match name.to_ascii_lowercase().as_str() {
+            // Pool statistics the JVM exposes and cfconcurrent surfaces.
+            "getactivecount" => Ok(CfmlValue::Int(g.live_workers as i64)),
+            "getqueuesize" => Ok(CfmlValue::Int(g.queue.len() as i64)),
+            "getcorepoolsize" | "getmaximumpoolsize" => {
+                Ok(CfmlValue::Int(g.max_concurrent as i64))
+            }
+            other => Err(CfmlError::runtime(format!(
+                "ExecutorPool has no method [{}]",
+                other
+            ))),
         }
     }
 }

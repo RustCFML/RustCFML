@@ -3042,6 +3042,10 @@ pub struct ThreadSeed {
     pub attributes: Option<CfmlValue>,
     /// Cooperative-cancellation flag the child polls (set by thread terminate).
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Name `java.lang.Thread.currentThread().getName()` reports inside this
+    /// thread. Set by the executor shims from the CFML ThreadFactory's pattern
+    /// (e.g. `CFConcurrentPool-1-Thread-3`); `None` keeps the ambient default.
+    pub thread_name: Option<String>,
 }
 
 /// A spawned `cfthread`'s live handle, held by the parent until join. Lives on
@@ -4797,6 +4801,7 @@ impl CfmlVirtualMachine {
             closure: body,
             attributes,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            thread_name: None,
         }
     }
 
@@ -4807,6 +4812,12 @@ impl CfmlVirtualMachine {
     /// !Send fields (`held_locks`, `transaction_conn`) are intentionally left
     /// at their fresh-VM defaults — a child starts with no locks/transaction.
     pub fn apply_thread_seed(&mut self, seed: ThreadSeed) -> (CfmlValue, Option<CfmlValue>) {
+        // Name the OS thread this child VM is about to run on, so
+        // `Thread.currentThread().getName()` inside the body reports the
+        // executor's ThreadFactory name rather than "main".
+        if let Some(ref n) = seed.thread_name {
+            java_shims::set_current_thread_name(n.clone());
+        }
         self.vfs = seed.vfs;
         self.server_state = seed.server_state;
         self.application_scope = seed.application_scope;
@@ -17572,11 +17583,15 @@ impl CfmlVirtualMachine {
                                 }
                                 // Work queue (Preside builds one explicitly). Reuse
                                 // the ConcurrentLinkedQueue shim (offer/poll/size).
+                                // Bounded work queues: the capacity argument is
+                                // the pool's queue limit, so it must survive.
                                 "java.util.concurrent.linkedblockingqueue"
                                 | "java.util.concurrent.arrayblockingqueue" => {
+                                    // Capacity is passed to .init(), handled in
+                                    // the queue shim itself.
                                     handle_java_concurrentlinkedqueue(
                                         "init",
-                                        empty_args,
+                                        args.iter().skip(2).cloned().collect(),
                                         &CfmlValue::Null,
                                     )
                                 }
@@ -17590,8 +17605,11 @@ impl CfmlVirtualMachine {
                                 // Rejected-execution policies ($DiscardPolicy etc.)
                                 // are only passed to a pool ctor we ignore — an
                                 // opaque marker is enough.
+                                // Rejection policies ($DiscardPolicy etc.). The
+                                // NAME matters — it selects the pool's
+                                // back-pressure behaviour — so keep it.
                                 s if s.starts_with("java.util.concurrent.threadpoolexecutor$") => {
-                                    Ok(java_shims::make_executors_static())
+                                    Ok(java_shims::make_rejection_policy(s))
                                 }
                                 "java.util.collections" => {
                                     handle_java_collections(
@@ -17751,6 +17769,12 @@ impl CfmlVirtualMachine {
                                 // methods dispatched via handle_java_optional_method.
                                 "java.util.optional" => {
                                     java_shims::handle_java_optional("init", empty_args, &CfmlValue::Null)
+                                }
+                                // Preside's cfconcurrent helper jar — see
+                                // java_shims::make_lucee_proxy_class.
+                                java_shims::LUCEE_RUNNABLE_CLASS
+                                | java_shims::LUCEE_CALLABLE_CLASS => {
+                                    Ok(java_shims::make_lucee_proxy_class(class_name.as_str()))
                                 }
                                 // java.time.* (JSR-310) — ColdBox scheduler date
                                 // library. Constructible shims backed by chrono.
@@ -20531,164 +20555,13 @@ impl CfmlVirtualMachine {
                         None => (0, None, None),
                     };
 
-                    #[cfg(feature = "real-threads")]
-                    let spawn = self.thread_spawn_fn;
-                    #[cfg(not(feature = "real-threads"))]
-                    let spawn: Option<ThreadSpawnFn> = None;
-
-                    // Periodic mode. `everyMs` is FIXED-RATE (next run measured
-                    // from the previous run's START, like
-                    // ScheduledExecutorService.scheduleAtFixedRate); `spacedMs`
-                    // is FIXED-DELAY (measured from the previous run's END, like
-                    // scheduleWithFixedDelay). If both are supplied `everyMs`
-                    // wins. Non-positive values mean "not periodic".
-                    let period = every_ms
-                        .filter(|v| *v > 0)
-                        .map(|v| (v, true))
-                        .or_else(|| spaced_ms.filter(|v| *v > 0).map(|v| (v, false)));
-
-                    #[cfg(feature = "real-threads")]
-                    if let Some(spawn_fn) = spawn {
-                        let seed = self.build_thread_seed(callback, None);
-                        let outer_cancel = seed.cancel_flag.clone();
-
-                        if delay_ms <= 0 && period.is_none() {
-                            let handle = spawn_fn(seed);
-                            let fut = async_kernel::FutureNative::from_handle(handle);
-                            return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
-                        }
-
-                        // Relay thread: sleep `delayMs`, then spawn the real
-                        // cfthread worker via spawn_fn, then forward its
-                        // ThreadResult out our own channel. The Future holds
-                        // our channel's rx side so .get() blocks until the
-                        // relay forwards. When a period is set the relay keeps
-                        // re-spawning instead of returning after the first run;
-                        // the Future still resolves on the FIRST run's result
-                        // (a periodic schedule has no single "final" outcome).
-                        let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
-                        let cancel_for_relay = outer_cancel.clone();
-                        let join = std::thread::Builder::new()
-                            .name("rustcfml-schedule-relay".to_string())
-                            .spawn(move || {
-                                // Cooperative-cancellable sleep: poll every
-                                // 50ms so cancel() takes effect promptly.
-                                // Returns false if cancelled while waiting.
-                                let step = std::time::Duration::from_millis(50);
-                                let sleep_until = |deadline: std::time::Instant| -> bool {
-                                    loop {
-                                        if cancel_for_relay
-                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                        {
-                                            return false;
-                                        }
-                                        let now = std::time::Instant::now();
-                                        if now >= deadline {
-                                            return true;
-                                        }
-                                        std::thread::sleep((deadline - now).min(step));
-                                    }
-                                };
-
-                                let epoch = std::time::Instant::now();
-                                let first_at = epoch
-                                    + std::time::Duration::from_millis(delay_ms.max(0) as u64);
-                                if !sleep_until(first_at) {
-                                    let _ = tx.send(ThreadResult {
-                                        status: "TERMINATED".to_string(),
-                                        ..Default::default()
-                                    });
-                                    return;
-                                }
-
-                                let mut first = true;
-                                let mut run_at = first_at;
-                                loop {
-                                    let inner = spawn_fn(seed.clone());
-                                    // Wait for the inner cfthread to publish.
-                                    let res = inner.rx.recv().ok();
-                                    if let Some(j) = {
-                                        let mut h = inner;
-                                        h.join.take()
-                                    } {
-                                        let _ = j.join();
-                                    }
-                                    let terminated = res
-                                        .as_ref()
-                                        .map(|r| r.status == "TERMINATED")
-                                        .unwrap_or(true);
-                                    if first {
-                                        if let Some(r) = res {
-                                            let _ = tx.send(r);
-                                        }
-                                        first = false;
-                                    }
-                                    // One-shot, or a run that threw: a periodic
-                                    // task that fails is NOT rescheduled (same
-                                    // as ScheduledExecutorService — otherwise a
-                                    // permanently-broken body spins forever).
-                                    let Some((period_ms, fixed_rate)) = period else {
-                                        return;
-                                    };
-                                    if terminated
-                                        || cancel_for_relay
-                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        return;
-                                    }
-                                    let period_dur =
-                                        std::time::Duration::from_millis(period_ms as u64);
-                                    let next = if fixed_rate {
-                                        // Fixed-rate: advance from the previous
-                                        // run's start. If the body overran its
-                                        // period, SKIP the missed ticks rather
-                                        // than firing a catch-up burst (the
-                                        // classic scheduleAtFixedRate surprise);
-                                        // the schedule stays on its phase.
-                                        let mut n = run_at + period_dur;
-                                        let now = std::time::Instant::now();
-                                        while n <= now {
-                                            n += period_dur;
-                                        }
-                                        n
-                                    } else {
-                                        // Fixed-delay: measured from the end of
-                                        // the run that just finished.
-                                        std::time::Instant::now() + period_dur
-                                    };
-                                    if !sleep_until(next) {
-                                        return;
-                                    }
-                                    run_at = next;
-                                }
-                            })
-                            .map_err(|e| {
-                                CfmlError::runtime(format!(
-                                    "_schedule: failed to spawn relay thread: {}",
-                                    e
-                                ))
-                            })?;
-
-                        let handle = ThreadHandle {
-                            name: String::new(),
-                            rx,
-                            cancel: outer_cancel,
-                            join: Some(join),
-                            result: None,
-                        };
-                        let fut = async_kernel::FutureNative::from_handle(handle);
-                        return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
-                    }
-
-                    // Inline fallback (wasm / real-threads off): no real
-                    // scheduling — run immediately ONCE and return a resolved
-                    // Future. There is no thread to park, so delay/period can't
-                    // be honoured here (documented in docs/known-issues.md).
-                    let _ = spawn;
-                    let _ = (delay_ms, period);
-                    let r = self.run_thread_body(&callback, None, parent_locals);
-                    let fut = async_kernel::FutureNative::resolved(r);
-                    return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                    return self.spawn_scheduled_body(
+                        callback,
+                        delay_ms,
+                        every_ms,
+                        spaced_ms,
+                        parent_locals,
+                    );
                 }
 
                 "getfunctioncalledname" => {
@@ -24127,7 +24000,46 @@ impl CfmlVirtualMachine {
     /// background thread via the native async kernel, returning a `FutureNative`
     /// (get/isDone/isCancelled/cancel). Inline fallback on wasm / real-threads
     /// off. This is the bridge that lets ColdBox/Preside executor shims run CFML.
+    /// Build a thread seed for `body`, optionally overriding the `cgi.server_name`
+    /// the task will see. cgi lives in `globals`, which the seed snapshots, so the
+    /// override is a targeted edit of that snapshot — it never touches the parent
+    /// request's own cgi scope.
+    fn build_task_seed(
+        &self,
+        body: CfmlValue,
+        hostname: Option<String>,
+        thread_name: Option<String>,
+    ) -> ThreadSeed {
+        let mut seed = self.build_thread_seed(body, None);
+        if let Some(h) = hostname {
+            let mut cgi = match seed.variables_snapshot.get("cgi") {
+                Some(CfmlValue::Struct(s)) => s.snapshot(),
+                _ => ValueMap::default(),
+            };
+            // Overwrite the existing key whatever its casing, so a lookup of
+            // `cgi.server_name` cannot find a stale sibling entry.
+            let key = cgi
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("server_name"))
+                .map(|(k, _)| k.clone())
+                .unwrap_or_else(|| "server_name".into());
+            cgi.insert(key, CfmlValue::string(h));
+            seed.variables_snapshot
+                .insert("cgi".to_string(), CfmlValue::strukt(cgi));
+        }
+        seed.thread_name = thread_name;
+        seed
+    }
+
     fn spawn_async_body(&mut self, arg: CfmlValue) -> CfmlResult {
+        self.spawn_task(arg, None)
+    }
+
+    /// Spawn one executor task. `thread_name` is the name
+    /// `Thread.currentThread().getName()` reports inside the body (the
+    /// ThreadFactory pattern); the hostname rides on the proxy itself.
+    fn spawn_task(&mut self, arg: CfmlValue, thread_name: Option<String>) -> CfmlResult {
+        let hostname = java_shims::proxy_hostname(&arg);
         let body = Self::to_async_body(arg);
         #[cfg(feature = "real-threads")]
         let spawn = self.thread_spawn_fn;
@@ -24136,23 +24048,420 @@ impl CfmlVirtualMachine {
 
         #[cfg(feature = "real-threads")]
         if let Some(spawn_fn) = spawn {
-            let seed = self.build_thread_seed(body, None);
+            let seed = self.build_task_seed(body, hostname, thread_name);
             let handle = spawn_fn(seed);
-            let fut = async_kernel::FutureNative::from_handle(handle);
+            let fut = async_kernel::FutureNative::from_handle_strict(handle);
             return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
         }
 
         let _ = spawn;
         let r = self.run_thread_body(&body, None, &ValueMap::default());
-        let fut = async_kernel::FutureNative::resolved(r);
+        let fut = async_kernel::FutureNative::resolved_strict(r);
         Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))))
+    }
+
+
+    /// Schedule `body` (a closure, or a `createDynamicProxy` wrapper / task CFC
+    /// via `to_async_body`) on a detached relay thread: run it after `delay_ms`,
+    /// then repeat on `every_ms` (FIXED-RATE, measured from the previous run's
+    /// start) or `spaced_ms` (FIXED-DELAY, from its end). Returns a Future whose
+    /// `cancel()` stops the schedule. Shared by the `_schedule` BIF and the
+    /// java.util.concurrent `scheduleAtFixedRate`/`scheduleWithFixedDelay` shims
+    /// — one scheduler, one set of semantics.
+    fn spawn_scheduled_body(
+        &mut self,
+        body: CfmlValue,
+        delay_ms: i64,
+        every_ms: Option<i64>,
+        spaced_ms: Option<i64>,
+        parent_locals: &ValueMap,
+    ) -> CfmlResult {
+        self.spawn_scheduled_task(body, delay_ms, every_ms, spaced_ms, parent_locals, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_scheduled_task(
+        &mut self,
+        body: CfmlValue,
+        delay_ms: i64,
+        every_ms: Option<i64>,
+        spaced_ms: Option<i64>,
+        parent_locals: &ValueMap,
+        hostname: Option<String>,
+        thread_name: Option<String>,
+    ) -> CfmlResult {
+        self.spawn_scheduled_pooled(
+            body,
+            delay_ms,
+            every_ms,
+            spaced_ms,
+            parent_locals,
+            hostname,
+            thread_name,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_scheduled_pooled(
+        &mut self,
+        body: CfmlValue,
+        delay_ms: i64,
+        every_ms: Option<i64>,
+        spaced_ms: Option<i64>,
+        parent_locals: &ValueMap,
+        hostname: Option<String>,
+        thread_name: Option<String>,
+        pool: Option<CfmlValue>,
+    ) -> CfmlResult {
+                #[cfg(feature = "real-threads")]
+                let spawn = self.thread_spawn_fn;
+                #[cfg(not(feature = "real-threads"))]
+                let spawn: Option<ThreadSpawnFn> = None;
+
+                // Periodic mode. `everyMs` is FIXED-RATE (next run measured
+                // from the previous run's START, like
+                // ScheduledExecutorService.scheduleAtFixedRate); `spacedMs`
+                // is FIXED-DELAY (measured from the previous run's END, like
+                // scheduleWithFixedDelay). If both are supplied `everyMs`
+                // wins. Non-positive values mean "not periodic".
+                let period = every_ms
+                    .filter(|v| *v > 0)
+                    .map(|v| (v, true))
+                    .or_else(|| spaced_ms.filter(|v| *v > 0).map(|v| (v, false)));
+
+                #[cfg(feature = "real-threads")]
+                if let Some(spawn_fn) = spawn {
+                    let seed = self.build_task_seed(body, hostname, thread_name);
+                    let outer_cancel = seed.cancel_flag.clone();
+                    let pool_for_relay = pool.clone();
+
+                    if delay_ms <= 0 && period.is_none() {
+                        let handle = spawn_fn(seed);
+                        let fut = async_kernel::FutureNative::from_handle(handle);
+                        return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                    }
+
+                    // Relay thread: sleep `delayMs`, then spawn the real
+                    // cfthread worker via spawn_fn, then forward its
+                    // ThreadResult out our own channel. The Future holds
+                    // our channel's rx side so .get() blocks until the
+                    // relay forwards. When a period is set the relay keeps
+                    // re-spawning instead of returning after the first run;
+                    // the Future still resolves on the FIRST run's result
+                    // (a periodic schedule has no single "final" outcome).
+                    let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
+                    let cancel_for_relay = outer_cancel.clone();
+                    let join = std::thread::Builder::new()
+                        .name("rustcfml-schedule-relay".to_string())
+                        .spawn(move || {
+                            // Cooperative-cancellable sleep: poll every
+                            // 50ms so cancel() takes effect promptly.
+                            // Returns false if cancelled while waiting.
+                            let step = std::time::Duration::from_millis(50);
+                            let sleep_until = |deadline: std::time::Instant| -> bool {
+                                loop {
+                                    if cancel_for_relay
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        return false;
+                                    }
+                                    let now = std::time::Instant::now();
+                                    if now >= deadline {
+                                        return true;
+                                    }
+                                    std::thread::sleep((deadline - now).min(step));
+                                }
+                            };
+
+                            let epoch = std::time::Instant::now();
+                            let first_at = epoch
+                                + std::time::Duration::from_millis(delay_ms.max(0) as u64);
+                            if !sleep_until(first_at) {
+                                let _ = tx.send(ThreadResult {
+                                    status: "TERMINATED".to_string(),
+                                    ..Default::default()
+                                });
+                                return;
+                            }
+
+                            let mut first = true;
+                            let mut run_at = first_at;
+                            loop {
+                                let inner = spawn_fn(seed.clone());
+                                // Wait for the inner cfthread to publish.
+                                let res = inner.rx.recv().ok();
+                                if let Some(j) = {
+                                    let mut h = inner;
+                                    h.join.take()
+                                } {
+                                    let _ = j.join();
+                                }
+                                let terminated = res
+                                    .as_ref()
+                                    .map(|r| r.status == "TERMINATED")
+                                    .unwrap_or(true);
+                                // A PERIODIC schedule's Future must NOT resolve
+                                // on the first run. The JVM's ScheduledFuture
+                                // stays pending for the life of the schedule —
+                                // `isDone()` is how callers ask "is this
+                                // heartbeat still running?". Publishing the
+                                // first result made isDone() true after one
+                                // tick, so Preside's AbstractHeartBeat.start()
+                                // saw its own heartbeat as stopped and
+                                // scheduled ANOTHER one on every call: relays
+                                // piled up until the adhoc-task heartbeat was
+                                // firing hundreds of times a second.
+                                // One-shot schedules keep first-run semantics.
+                                if first && period.is_none() {
+                                    if let Some(r) = res {
+                                        let _ = tx.send(r);
+                                    }
+                                    first = false;
+                                }
+                                // One-shot, or a run that threw: a periodic
+                                // task that fails is NOT rescheduled (same
+                                // as ScheduledExecutorService — otherwise a
+                                // permanently-broken body spins forever).
+                                let Some((period_ms, fixed_rate)) = period else {
+                                    return;
+                                };
+                                if terminated
+                                    || cancel_for_relay
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    // The schedule is over (cancelled, or a run
+                                    // threw). Only now does the Future resolve.
+                                    let _ = tx.send(ThreadResult {
+                                        status: "TERMINATED".to_string(),
+                                        ..Default::default()
+                                    });
+                                    return;
+                                }
+                                let period_dur =
+                                    std::time::Duration::from_millis(period_ms as u64);
+                                let next = if fixed_rate {
+                                    // Fixed-rate: advance from the previous
+                                    // run's start. If the body overran its
+                                    // period, SKIP the missed ticks rather
+                                    // than firing a catch-up burst (the
+                                    // classic scheduleAtFixedRate surprise);
+                                    // the schedule stays on its phase.
+                                    let mut n = run_at + period_dur;
+                                    let now = std::time::Instant::now();
+                                    while n <= now {
+                                        n += period_dur;
+                                    }
+                                    n
+                                } else {
+                                    // Fixed-delay: measured from the end of
+                                    // the run that just finished.
+                                    std::time::Instant::now() + period_dur
+                                };
+                                if !sleep_until(next) {
+                                    // Cancelled mid-wait: resolve the
+                                    // Future so isDone() reports true, the way
+                                    // a cancelled JVM ScheduledFuture does.
+                                    let _ = tx.send(ThreadResult {
+                                        status: "TERMINATED".to_string(),
+                                        ..Default::default()
+                                    });
+                                    return;
+                                }
+                                run_at = next;
+                            }
+                        })
+                        .map_err(|e| {
+                            CfmlError::runtime(format!(
+                                "_schedule: failed to spawn relay thread: {}",
+                                e
+                            ))
+                        })?;
+
+                    let handle = ThreadHandle {
+                        name: String::new(),
+                        rx,
+                        cancel: outer_cancel,
+                        join: Some(join),
+                        result: None,
+                    };
+                    let fut = async_kernel::FutureNative::from_handle(handle);
+                    return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                }
+
+                // Inline fallback (wasm / real-threads off): no real
+                // scheduling — run immediately ONCE and return a resolved
+                // Future. There is no thread to park, so delay/period can't
+                // be honoured here (documented in docs/known-issues.md).
+                let _ = spawn;
+                let _ = (delay_ms, period);
+                let r = self.run_thread_body(&body, None, parent_locals);
+                let fut = async_kernel::FutureNative::resolved(r);
+                return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+    }
+
+    /// `(tasks, timeout, unit)` — the trailing timeout in milliseconds, or
+    /// None when the caller passed no timeout (wait forever). A timeout of 0
+    /// still means "0ms", not "forever": the JVM treats it as an immediate
+    /// deadline, and cfconcurrent relies on that for its cancel test.
+    fn executor_timeout_ms(args: &[CfmlValue]) -> Option<i64> {
+        let raw = args.get(1)?;
+        let n = raw.as_string().trim().parse::<f64>().ok()? as i64;
+        let unit = args.get(2).map(|v| v.as_string()).unwrap_or_default();
+        Some(java_shims::timeunit_to_millis(n, &unit))
+    }
+
+    /// Invoke a method on a Future NativeObject, swallowing dispatch errors
+    /// (used for best-effort cancel()).
+    fn future_call(&mut self, f: &CfmlValue, method: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        match f {
+            CfmlValue::NativeObject(o) => {
+                let mut guard = o.write().map_err(|_| {
+                    CfmlError::runtime("Future lock poisoned".to_string())
+                })?;
+                guard.call_method(method, args)
+            }
+            _ => Ok(CfmlValue::Null),
+        }
+    }
+
+    fn future_is_done(&mut self, f: &CfmlValue) -> bool {
+        self.future_call(f, "isDone", vec![])
+            .map(|v| v.is_true())
+            .unwrap_or(true)
+    }
+
+    /// Block until every future is done, or `timeout_ms` elapses. Returns true
+    /// if it gave up on the timeout with work still outstanding.
+    fn await_futures(&mut self, futs: &[CfmlValue], timeout_ms: Option<i64>) -> bool {
+        let deadline = timeout_ms.map(|ms| {
+            std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64)
+        });
+        loop {
+            if futs.iter().all(|f| {
+                self.future_call(f, "isDone", vec![])
+                    .map(|v| v.is_true())
+                    .unwrap_or(true)
+            }) {
+                return false;
+            }
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The shared bounded pool hanging off an executor shim, if it has one.
+    fn executor_pool(object: &CfmlValue) -> Option<CfmlValue> {
+        match object {
+            CfmlValue::Struct(s) => s.get("__pool"),
+            _ => None,
+        }
+    }
+
+    /// Borrow the pool out of its NativeObject wrapper and run `f` on it.
+    fn with_pool<R>(
+        pool: &CfmlValue,
+        f: impl FnOnce(&async_kernel::ExecutorPoolNative) -> R,
+    ) -> Option<R> {
+        match pool {
+            CfmlValue::NativeObject(o) => {
+                let guard = o.read().ok()?;
+                let p = guard
+                    .as_any()?
+                    .downcast_ref::<async_kernel::ExecutorPoolNative>()?;
+                Some(f(p))
+            }
+            _ => None,
+        }
+    }
+
+    /// Submit a task to the executor's bounded pool: at most `maxConcurrent`
+    /// run at once, the rest queue, and an overflow is handled by the
+    /// configured rejection policy.
+    fn spawn_pooled_task(
+        &mut self,
+        pool: &CfmlValue,
+        arg: CfmlValue,
+        thread_name: Option<String>,
+    ) -> CfmlResult {
+        let hostname = java_shims::proxy_hostname(&arg);
+        let body = Self::to_async_body(arg);
+        let seed = self.build_task_seed(body, hostname, thread_name);
+        match Self::with_pool(pool, |p| p.submit(seed)) {
+            Some(Ok(handle)) => {
+                let fut = async_kernel::FutureNative::from_handle_strict(handle);
+                Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))))
+            }
+            // The Abort policy surfaces as a catchable RejectedExecutionException.
+            Some(Err(e)) => Err(e),
+            // No usable pool (e.g. real-threads off): fall back to running the
+            // body inline so the task is never silently dropped.
+            None => Ok(CfmlValue::Null),
+        }
+    }
+
+    /// The shared completion queue hanging off an ExecutorCompletionService shim.
+    fn completion_queue(object: &CfmlValue) -> Option<CfmlValue> {
+        match object {
+            CfmlValue::Struct(s) => s.get("__cs_queue"),
+            _ => None,
+        }
+    }
+
+    /// Is this value the `createDynamicProxy`-wrapped CFML ThreadFactory?
+    fn is_thread_factory(v: &CfmlValue) -> bool {
+        matches!(v, CfmlValue::Struct(s)
+            if s.get("__dynamic_proxy").map(|b| b.is_true()).unwrap_or(false)
+                && s.get("__proxy_method")
+                    .map(|m| m.as_string().eq_ignore_ascii_case("newThread"))
+                    .unwrap_or(false))
+    }
+
+    /// Ask the executor's ThreadFactory to name the thread this task will run
+    /// on. cfconcurrent's `ThreadFactory.cfc` takes the default factory's
+    /// `pool-N-thread-M`, regex-parses N and M out of it, and substitutes them
+    /// into the caller's `${poolno}`/`${threadno}` pattern — so the name comes
+    /// back from CFML, not from us. Returns None when no factory was supplied.
+    fn executor_thread_name(
+        &mut self,
+        executor: &CfmlValue,
+        task: &CfmlValue,
+    ) -> Option<String> {
+        let factory = match executor {
+            CfmlValue::Struct(s) => s.get("__thread_factory")?,
+            _ => return None,
+        };
+        let target = match &factory {
+            CfmlValue::Struct(s) => s.get("__proxy_target")?,
+            _ => return None,
+        };
+        let mut args = vec![task.clone()];
+        let thread = self
+            .call_member_function(&target, "newThread", &mut args, None, &ValueMap::default())
+            .ok()?;
+        match thread {
+            CfmlValue::Struct(s) => s.get("__name").map(|v| v.as_string()).filter(|n| !n.is_empty()),
+            _ => None,
+        }
     }
 
     /// `java.util.concurrent.Executors` static factory methods. Each returns an
     /// executor-service shim; the pool sizing arg is accepted but ignored (tasks
     /// run on the OS scheduler via detached threads, not a fixed pool).
-    fn handle_java_executors_method(&mut self, method: &str, _args: Vec<CfmlValue>) -> CfmlResult {
+    fn handle_java_executors_method(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        _args: Vec<CfmlValue>,
+    ) -> CfmlResult {
         Ok(match method {
+            // Rejection policies (ThreadPoolExecutor$DiscardPolicy etc.) are
+            // constructed as `…$DiscardPolicy.init()`; hand the marker back.
+            "init" => object.clone(),
             "newfixedthreadpool" => java_shims::make_executor_service("fixed"),
             "newcachedthreadpool" => java_shims::make_executor_service("cached"),
             "newsinglethreadexecutor" => java_shims::make_executor_service("single"),
@@ -24176,41 +24485,201 @@ impl CfmlVirtualMachine {
         mut args: Vec<CfmlValue>,
     ) -> CfmlResult {
         match method {
-            "submit" | "execute" | "schedule" | "scheduleatfixedrate"
-            | "schedulewithfixeddelay" => {
-                // NOTE: periodic scheduling (scheduleAtFixedRate/WithFixedDelay)
-                // currently fires the task once (detached). True recurring
-                // scheduling is a follow-up (needs a cross-request driver).
+            // `.init( … )` — the JVM constructor. Both cfconcurrent signatures
+            // pass a ThreadFactory (ThreadPoolExecutor at index 5,
+            // ScheduledThreadPoolExecutor at index 1), so rather than hard-code
+            // an index we take the first argument that IS one. It is kept on the
+            // shim because every task's thread name comes from it.
+            "init" => {
+                let mut ns = match object {
+                    CfmlValue::Struct(s) => s.snapshot(),
+                    _ => ValueMap::default(),
+                };
+                if let Some(tf) = args.iter().find(|a| Self::is_thread_factory(a)) {
+                    ns.insert("__thread_factory".to_string(), tf.clone());
+                }
+                // ThreadPoolExecutor( core, max, keepAlive, unit, queue, factory, policy )
+                // ScheduledThreadPoolExecutor( core, factory, policy )
+                // Both start with the pool size; the queue and policy are found
+                // by shape so one arm covers both signatures.
+                let max_concurrent = args
+                    .first()
+                    .map(|v| v.as_string())
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(1) as usize;
+                let queue_capacity = args
+                    .iter()
+                    .find_map(java_shims::queue_capacity)
+                    .filter(|c| *c > 0)
+                    .unwrap_or(i64::from(u16::MAX)) as usize;
+                let policy = args
+                    .iter()
+                    .find_map(java_shims::rejection_policy_name)
+                    .map(|n| async_kernel::RejectPolicy::from_name(&n))
+                    .unwrap_or(async_kernel::RejectPolicy::Discard);
+                #[cfg(feature = "real-threads")]
+                let spawn = self.thread_spawn_fn;
+                #[cfg(not(feature = "real-threads"))]
+                let spawn: Option<ThreadSpawnFn> = None;
+                ns.insert(
+                    "__pool".to_string(),
+                    async_kernel::ExecutorPoolNative::new_value(
+                        max_concurrent,
+                        queue_capacity,
+                        policy,
+                        spawn,
+                    ),
+                );
+                Ok(CfmlValue::strukt(ns))
+            }
+            "submit" | "execute" => {
                 let task = if args.is_empty() {
                     CfmlValue::Null
                 } else {
                     args.remove(0)
                 };
-                self.spawn_async_body(task)
+                let name = self.executor_thread_name(object, &task);
+                match Self::executor_pool(object) {
+                    Some(pool) => self.spawn_pooled_task(&pool, task, name),
+                    None => self.spawn_task(task, name),
+                }
             }
+            // schedule( task, delay, unit )
+            // scheduleAtFixedRate( task, initialDelay, period, unit )   — fixed RATE
+            // scheduleWithFixedDelay( task, initialDelay, delay, unit ) — fixed DELAY
+            // All route to the same relay used by the `_schedule` BIF, so the
+            // recurrence semantics (and cancel()) are identical.
+            "schedule" | "scheduleatfixedrate" | "schedulewithfixeddelay" => {
+                let task = if args.is_empty() {
+                    CfmlValue::Null
+                } else {
+                    args.remove(0)
+                };
+                let num = |v: Option<&CfmlValue>| -> i64 {
+                    v.map(|x| x.as_string().trim().parse::<f64>().unwrap_or(0.0) as i64)
+                        .unwrap_or(0)
+                };
+                // After the task is removed the args are
+                //   schedule:  [ delay, unit ]
+                //   periodic:  [ initialDelay, period, unit ]
+                // so the TimeUnit is the LAST argument. Reading one past it
+                // silently defaulted every schedule to MILLISECONDS — which is
+                // right for Preside's heartbeats (already in ms) but turned
+                // cfconcurrent's 30-SECOND completion-queue poll into a 30ms
+                // one, i.e. 1000x too fast.
+                let periodic = method != "schedule";
+                let unit_idx = if periodic { 2 } else { 1 };
+                let unit = args
+                    .get(unit_idx)
+                    .map(|v| v.as_string())
+                    .unwrap_or_default();
+                let delay_ms =
+                    java_shims::timeunit_to_millis(num(args.first()), &unit);
+                let period_ms = if periodic {
+                    Some(java_shims::timeunit_to_millis(num(args.get(1)), &unit))
+                        .filter(|v| *v > 0)
+                } else {
+                    None
+                };
+                let hostname = java_shims::proxy_hostname(&task);
+                let name = self.executor_thread_name(object, &task);
+                let body = Self::to_async_body(task);
+                let (every, spaced) = if method == "schedulewithfixeddelay" {
+                    (None, period_ms)
+                } else {
+                    (period_ms, None)
+                };
+                let pool = Self::executor_pool(object);
+                self.spawn_scheduled_pooled(
+                    body,
+                    delay_ms,
+                    every,
+                    spaced,
+                    &ValueMap::default(),
+                    hostname,
+                    name,
+                    pool,
+                )
+            }
+            // invokeAll( tasks [, timeout, unit] ) — JVM contract: BLOCK until
+            // every task finishes (or the timeout expires), then return the
+            // futures. With a timeout, tasks still running when it expires are
+            // cancelled, so the caller sees `isCancelled()`. Returning
+            // not-yet-done futures immediately (what we used to do) breaks both
+            // the "all done" and the "stragglers cancelled" contracts.
             "invokeall" => {
-                let tasks = match args.into_iter().next() {
+                let tasks = match args.first() {
                     Some(CfmlValue::Array(a)) => a.snapshot(),
                     _ => vec![],
                 };
+                let timeout_ms = Self::executor_timeout_ms(&args);
                 let mut futs = Vec::with_capacity(tasks.len());
                 for t in tasks {
-                    futs.push(self.spawn_async_body(t)?);
+                    let name = self.executor_thread_name(object, &t);
+                    futs.push(self.spawn_task(t, name)?);
+                }
+                let timed_out = self.await_futures(&futs, timeout_ms);
+                if timed_out {
+                    for f in &futs {
+                        if !self.future_is_done(f) {
+                            self.future_call(f, "cancel", vec![CfmlValue::Bool(true)]);
+                        }
+                    }
                 }
                 Ok(CfmlValue::array(futs))
             }
+            // invokeAny( tasks [, timeout, unit] ) — return the result of ONE
+            // task that completed. With a timeout and nothing finished in time,
+            // the JVM throws TimeoutException; CFML catches it by that type.
             "invokeany" => {
-                // Run the first task inline and return its value (best-effort).
-                match args.into_iter().next() {
-                    Some(CfmlValue::Array(a)) => {
-                        if let Some(first) = a.snapshot().into_iter().next() {
-                            let body = Self::to_async_body(first);
-                            let r = self.run_thread_body(&body, None, &ValueMap::default());
-                            return Ok(r.return_value.unwrap_or(CfmlValue::Null));
+                let tasks = match args.first() {
+                    Some(CfmlValue::Array(a)) => a.snapshot(),
+                    _ => vec![],
+                };
+                let timeout_ms = Self::executor_timeout_ms(&args);
+                if tasks.is_empty() {
+                    return Ok(CfmlValue::Null);
+                }
+                let mut futs = Vec::with_capacity(tasks.len());
+                for t in tasks {
+                    let name = self.executor_thread_name(object, &t);
+                    futs.push(self.spawn_task(t, name)?);
+                }
+                // Wait for the FIRST completion (not all of them).
+                let deadline = timeout_ms.map(|ms| {
+                    std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64)
+                });
+                loop {
+                    for f in &futs {
+                        if self.future_is_done(f) {
+                            let winner = f.clone();
+                            for other in &futs {
+                                if !self.future_is_done(other) {
+                                    self.future_call(
+                                        other,
+                                        "cancel",
+                                        vec![CfmlValue::Bool(true)],
+                                    );
+                                }
+                            }
+                            return self.future_call(&winner, "get", vec![]);
                         }
-                        Ok(CfmlValue::Null)
                     }
-                    _ => Ok(CfmlValue::Null),
+                    if let Some(d) = deadline {
+                        if std::time::Instant::now() >= d {
+                            for f in &futs {
+                                self.future_call(f, "cancel", vec![CfmlValue::Bool(true)]);
+                            }
+                            return Err(CfmlError::new(
+                                "Timed out waiting for a task to complete".to_string(),
+                                cfml_common::vm::CfmlErrorType::Custom(
+                                    "java.util.concurrent.TimeoutException".to_string(),
+                                ),
+                            ));
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
             _ => {
@@ -24234,41 +24703,49 @@ impl CfmlVirtualMachine {
         mut args: Vec<CfmlValue>,
     ) -> CfmlResult {
         match method {
+            // `new ExecutorCompletionService( executor, completionQueue )` is
+            // written in CFML as createObject(...).init( executor, queue ), so
+            // the backing executor arrives HERE, not at createObject time.
+            // Returning Null (the old `_` arm) left cfconcurrent's
+            // `variables.executorCompletionService` undefined.
+            "init" => {
+                let mut ns = match object {
+                    CfmlValue::Struct(s) => s.snapshot(),
+                    _ => ValueMap::default(),
+                };
+                ns.insert(
+                    "__cs_executor".to_string(),
+                    args.first().cloned().unwrap_or(CfmlValue::Null),
+                );
+                // Keep the queue the constructor already made: re-creating it
+                // here would hand this holder a private queue again.
+                ns.entry("__cs_queue".to_string()).or_insert_with(
+                    crate::async_kernel::CompletionQueueNative::new_value,
+                );
+                Ok(CfmlValue::strukt(ns))
+            }
             "submit" => {
                 let task = if args.is_empty() {
                     CfmlValue::Null
                 } else {
                     args.remove(0)
                 };
-                let fut = self.spawn_async_body(task)?;
-                if let CfmlValue::Struct(s) = object {
-                    let mut ns = s.snapshot();
-                    let mut completed = match ns.get("__cs_completed") {
-                        Some(CfmlValue::Array(a)) => a.snapshot(),
-                        _ => vec![],
-                    };
-                    completed.push(fut.clone());
-                    ns.insert("__cs_completed".to_string(), CfmlValue::array(completed));
-                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
+                let name = self.executor_thread_name(object, &task);
+                let fut = self.spawn_task(task, name)?;
+                // The queue is shared by Arc, so no writeback is needed (and
+                // none would help: other holders have their own struct copy).
+                if let Some(q) = Self::completion_queue(object) {
+                    self.future_call(&q, "add", vec![fut.clone()])?;
                 }
                 Ok(fut)
             }
+            // poll() is non-blocking and yields the next COMPLETED task; take()
+            // waits for one. Both come off the shared queue.
             "poll" | "take" => {
-                if let CfmlValue::Struct(s) = object {
-                    let mut completed = match s.get("__cs_completed") {
-                        Some(CfmlValue::Array(a)) => a.snapshot(),
-                        _ => vec![],
-                    };
-                    if completed.is_empty() {
-                        return Ok(CfmlValue::Null);
-                    }
-                    let head = completed.remove(0);
-                    let mut ns = s.snapshot();
-                    ns.insert("__cs_completed".to_string(), CfmlValue::array(completed));
-                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
-                    return Ok(head);
+                match Self::completion_queue(object) {
+                    Some(q) => self.future_call(&q, method, vec![]),
+                    None => Ok(CfmlValue::Null),
                 }
-                Ok(CfmlValue::Null)
             }
             _ => Ok(CfmlValue::Null),
         }
@@ -25072,7 +25549,18 @@ impl CfmlVirtualMachine {
                     "java.util.uuid" => handle_java_uuid(&m, all_args, object),
                     "java.util.date" => handle_java_date(&m, all_args, object),
                     "java.lang.thread" | "java.lang.threadgroup" => {
-                        handle_java_thread(&m, all_args, object)
+                        let r = handle_java_thread(&m, all_args, object);
+                        // setName() mutates the shim; write the renamed struct
+                        // back so `theThread.getName()` reflects it afterwards
+                        // (ThreadFactory.cfc renames then returns the object).
+                        if m == "setname" {
+                            if let Ok(ref new_self) = r {
+                                if matches!(new_self, CfmlValue::Struct(_)) {
+                                    self.method_this_writeback = Some(new_self.clone());
+                                }
+                            }
+                        }
+                        r
                     }
                     "java.net.inetaddress" => handle_java_inetaddress(&m, all_args, object),
                     "java.net.url" => java_shims::handle_java_url(&m, all_args, object),
@@ -25095,9 +25583,22 @@ impl CfmlVirtualMachine {
                     "java.util.concurrent.concurrenthashmap" => {
                         handle_java_concurrenthashmap(&m, all_args, object)
                     }
+                    // Rejection-policy markers: `.init()` hands the marker back
+                    // (cfconcurrent constructs them as `…$DiscardPolicy.init()`).
+                    c if c.starts_with("java.util.concurrent.threadpoolexecutor$") => {
+                        Ok(object.clone())
+                    }
+                    // ---- Preside cfconcurrent helper jar ----
+                    java_shims::LUCEE_RUNNABLE_CLASS | java_shims::LUCEE_CALLABLE_CLASS => {
+                        if m == "init" {
+                            Ok(java_shims::lucee_proxy_init(java_class.as_str(), &all_args))
+                        } else {
+                            Ok(CfmlValue::Null)
+                        }
+                    }
                     // ---- executor family ----
                     "java.util.concurrent.executors" => {
-                        self.handle_java_executors_method(&m, all_args)
+                        self.handle_java_executors_method(object, &m, all_args)
                     }
                     "java.util.concurrent.threadpoolexecutor"
                     | "java.util.concurrent.scheduledthreadpoolexecutor"
@@ -33921,12 +34422,25 @@ impl CfmlVirtualMachine {
                 ss.dir_fold_cache.write().remove(&parent);
             }
         }
-        // Deliberately NO global negative retirement here. This function exists to
-        // invalidate exactly one path, and bumping the generation on top of that
-        // would retire every cached negative in the process — which is precisely
-        // what made cross-request negatives recover nothing: Preside does one
-        // `fileWrite` per request, so one attributed write was wiping the whole
-        // negative cache on every render.
+        // ONE exception to "no global retirement": a write performed inside a
+        // THREAD body. `request_exists_cache` is per-VM, and a spawned thread
+        // gets its own child VM — so clearing "this VM's" layer 1 above clears
+        // the CHILD's map and leaves the parent (and every sibling) holding the
+        // negative that the write just falsified. The parent then denies the
+        // existence of a file it can successfully `fileRead`. Retiring negatives
+        // process-wide is the only cross-VM channel available, and it costs
+        // nothing on the request thread's own writes, which is where the
+        // per-render regression this comment warns about actually came from.
+        if self.in_thread_body > 0 {
+            invalidate_exists_negatives();
+        }
+
+        // Otherwise deliberately NO global negative retirement here. This
+        // function exists to invalidate exactly one path, and bumping the
+        // generation on top of that would retire every cached negative in the
+        // process — which is precisely what made cross-request negatives recover
+        // nothing: Preside does one `fileWrite` per request, so one attributed
+        // write was wiping the whole negative cache on every render.
         //
         // The residue: a *creation* also falsifies cached negatives held under a
         // different spelling of the same path, because a not-yet-existing target

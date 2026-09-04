@@ -1639,6 +1639,14 @@ pub trait CfmlNative: Send + Sync + fmt::Debug {
     /// `Err(CfmlError::…)` for unknown methods or argument mismatches.
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult;
 
+    /// Optional downcast hook. Engine-internal natives (the executor pool)
+    /// need their concrete type back from a `dyn CfmlNative`. Defaulted to
+    /// `None` so external `.rcx` module authors implementing this trait are
+    /// unaffected; implement it as `Some(self)` if you need the same.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Optional property read. Used when a CFC declares
     /// `extends="rust:Name"` and host code reads `this.X` (or `inst.X`)
     /// for a key the CFC struct doesn't define. Default returns `None` —
