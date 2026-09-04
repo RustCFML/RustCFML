@@ -430,6 +430,14 @@ struct PoolShared {
     max_concurrent: usize,
     queue_capacity: usize,
     policy: RejectPolicy,
+    /// Cancel flags for every PERIODIC schedule this executor started. The JVM
+    /// cancels periodic tasks on `shutdown()`
+    /// (ContinueExistingPeriodicTasksAfterShutdownPolicy defaults to false), and
+    /// we must too: a relay that outlives its executor keeps its `ThreadSeed`
+    /// alive, and a seed owns a clone of the whole compiled program, the globals
+    /// snapshot and the application scope. Preside rebuilds its executors on
+    /// every `?fwreinit=true`, so leaking them cost ~100MB per reload.
+    scheduled_cancels: Vec<Arc<std::sync::atomic::AtomicBool>>,
     queue: std::collections::VecDeque<PendingTask>,
     /// Worker threads alive right now (each runs at most one task at a time,
     /// so this is also the count of concurrently-executing tasks).
@@ -502,6 +510,7 @@ impl ExecutorPoolNative {
                     max_concurrent: max_concurrent.max(1),
                     queue_capacity: queue_capacity.max(1),
                     policy,
+                    scheduled_cancels: Vec::new(),
                     queue: std::collections::VecDeque::new(),
                     live_workers: 0,
                     scheduled_running: 0,
@@ -511,6 +520,33 @@ impl ExecutorPoolNative {
             )),
         };
         CfmlValue::NativeObject(Arc::new(RwLock::new(pool)))
+    }
+
+    /// Track a periodic schedule so `shutdown()` can stop it.
+    pub fn register_schedule(&self, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        let mut g = self.inner.0.lock().unwrap();
+        // Drop flags whose relay has already exited, so a long-lived executor
+        // that reschedules repeatedly does not accumulate dead entries.
+        g.scheduled_cancels
+            .retain(|c| !c.load(std::sync::atomic::Ordering::Relaxed));
+        g.scheduled_cancels.push(cancel);
+    }
+
+    /// `shutdown()` / `shutdownNow()`: stop every periodic schedule this
+    /// executor started, and (for shutdownNow) discard anything still queued.
+    pub fn shutdown_all(&self, drop_queued: bool) {
+        let (lock, cv) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        for c in g.scheduled_cancels.drain(..) {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if drop_queued {
+            for t in g.queue.drain(..) {
+                t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = t.tx.send(discarded());
+            }
+        }
+        cv.notify_all();
     }
 
     pub fn max_concurrent(&self) -> usize {

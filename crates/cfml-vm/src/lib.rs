@@ -24135,6 +24135,12 @@ impl CfmlVirtualMachine {
                     let seed = self.build_task_seed(body, hostname, thread_name);
                     let outer_cancel = seed.cancel_flag.clone();
                     let pool_for_relay = pool.clone();
+                    // Let the owning executor stop this schedule on shutdown();
+                    // otherwise the relay outlives it and keeps a whole
+                    // ThreadSeed — program, globals, application scope — alive.
+                    if let Some(ref p) = pool {
+                        Self::with_pool(p, |pl| pl.register_schedule(outer_cancel.clone()));
+                    }
 
                     if delay_ms <= 0 && period.is_none() {
                         let handle = spawn_fn(seed);
@@ -24683,6 +24689,15 @@ impl CfmlVirtualMachine {
                 }
             }
             _ => {
+                // shutdown() stops accepting work AND cancels periodic tasks —
+                // the JVM default for a ScheduledThreadPoolExecutor
+                // (ContinueExistingPeriodicTasksAfterShutdownPolicy = false).
+                // shutdownNow() additionally discards whatever is still queued.
+                if method == "shutdown" || method == "shutdownnow" {
+                    if let Some(pool) = Self::executor_pool(object) {
+                        Self::with_pool(&pool, |p| p.shutdown_all(method == "shutdownnow"));
+                    }
+                }
                 let (res, writeback) =
                     java_shims::handle_java_executor_service_pure(method, object);
                 if let Some(new_self) = writeback {

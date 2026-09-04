@@ -175,5 +175,30 @@ secTicks = listLen( fileRead( secLog ), chr(10) );
 assertTrue( "a 1-SECOND period fires ~twice in 1.4s, not hundreds of times (got " & secTicks & ")", secTicks >= 1 && secTicks <= 4 );
 fileDelete( secLog );
 
+// ---- shutdown() cancels the executor's periodic schedules ----
+// The JVM cancels periodic tasks on shutdown()
+// (ContinueExistingPeriodicTasksAfterShutdownPolicy defaults to false). Leaving
+// them running is not merely untidy: each orphaned schedule holds its thread
+// seed, which owns a clone of the compiled program, the globals snapshot and the
+// application scope. Preside rebuilds its executors on every ?fwreinit=true, so
+// this leaked ~100MB per reload.
+shutLog = getTempDirectory() & "/rustcfml_pool_shut_" & createUUID() & ".log";
+shutExec = createObject( "java", "java.util.concurrent.ScheduledThreadPoolExecutor" ).init( 2, javacast( "null", "" ), javacast( "null", "" ) );
+shutExec.scheduleAtFixedRate(
+	  createDynamicProxy( new java_shims.ConcurrentTickTask( shutLog ), [ "java.lang.Runnable" ] )
+	, 0
+	, 50
+	, timeUnit.MILLISECONDS
+);
+sleep( 250 );
+assertTrue( "the schedule is running before shutdown", fileExists( shutLog ) && listLen( fileRead( shutLog ), chr(10) ) > 0 );
+
+shutExec.shutdown();
+sleep( 250 );
+ticksAtShutdown = listLen( fileRead( shutLog ), chr(10) );
+sleep( 400 );
+assert( "shutdown() stops the executor's periodic schedules", listLen( fileRead( shutLog ), chr(10) ), ticksAtShutdown );
+fileDelete( shutLog );
+
 suiteEnd();
 </cfscript>
