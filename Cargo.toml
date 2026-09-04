@@ -26,7 +26,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.651.0"
+version = "0.652.0"
 authors = ["RustCFML Team"]
 edition = "2021"
 rust-version = "1.75.0"
@@ -35,10 +35,10 @@ homepage = "https://github.com/RustCFML/RustCFML"
 license = "MIT"
 
 [workspace.dependencies]
-cfml-common = { path = "crates/cfml-common", version = "0.651.0" }
-cfml-config = { path = "crates/cfml-config", version = "0.651.0" }
-cfml-compiler = { path = "crates/cfml-compiler", version = "0.651.0" }
-cfml-codegen = { path = "crates/cfml-codegen", version = "0.651.0" }
+cfml-common = { path = "crates/cfml-common", version = "0.652.0" }
+cfml-config = { path = "crates/cfml-config", version = "0.652.0" }
+cfml-compiler = { path = "crates/cfml-compiler", version = "0.652.0" }
+cfml-codegen = { path = "crates/cfml-codegen", version = "0.652.0" }
 # `default-features = false` here is what makes a member's own
 # `default-features = false` take effect at all: cargo IGNORES that key on an
 # inherited (`workspace = true`) dependency unless the workspace entry declares
@@ -47,10 +47,10 @@ cfml-codegen = { path = "crates/cfml-codegen", version = "0.651.0" }
 # still linked all of Cranelift AND still ran the JIT, and `--jit-stats` said
 # "not built in" because that message sits behind the CLI crate's cfg.
 # Members list the cfml-vm features they want explicitly.
-cfml-vm = { path = "crates/cfml-vm", version = "0.651.0", default-features = false }
-cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.651.0", default-features = false }
-cfml-qoq = { path = "crates/cfml-qoq", version = "0.651.0" }
-cfml-sanitize = { path = "crates/cfml-sanitize", version = "0.651.0" }
+cfml-vm = { path = "crates/cfml-vm", version = "0.652.0", default-features = false }
+cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.652.0", default-features = false }
+cfml-qoq = { path = "crates/cfml-qoq", version = "0.652.0" }
+cfml-sanitize = { path = "crates/cfml-sanitize", version = "0.652.0" }
 # The extension ABI. Zero deps and `#[repr(C)]` only, so it is safe to carry
 # into the wasm graph as well as the native one.
 cfml-module-abi = { path = "crates/cfml-module-abi", version = "0.1.0" }
