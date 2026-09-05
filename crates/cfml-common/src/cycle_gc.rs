@@ -1244,6 +1244,7 @@ fn collect_from_log_carrying(
             .unwrap_or(0)
     });
     let mut root_report: Vec<(usize, String)> = Vec::new();
+    let mut deferred_roots: Vec<usize> = Vec::new();
     // Index built once (not per root) so the diagnostic stays linear: a pass with
     // 250k survivors can have tens of thousands of roots.
     #[cfg(feature = "component-instance")]
@@ -1293,8 +1294,14 @@ fn collect_from_log_carrying(
                 ),
             ));
         }
-        if external > 0 && live.insert(p) {
-            worklist.push(p);
+        if external > 0 {
+            if root_debug > 0 {
+                // Attribution mode seeds one root at a time (below) so each can
+                // be charged with what it alone keeps alive.
+                deferred_roots.push(p);
+            } else if live.insert(p) {
+                worklist.push(p);
+            }
         }
     }
 
@@ -1319,6 +1326,54 @@ fn collect_from_log_carrying(
                     }
                 })
             });
+        }
+    }
+
+    // 3c. RETENTION ATTRIBUTION (diagnostics only; identical final live set).
+    //     Seeding every root at once answers "what is pinned", which is the wrong
+    //     question when thousands of roots are individually harmless: a function's
+    //     process-lifetime `params_marker` array is a root forever and retains
+    //     nothing but its own strings. The question that ends a leak hunt is which
+    //     root is RESPONSIBLE for the bulk of the retained graph. Seeding one root
+    //     at a time and charging it with the nodes its own walk newly marks answers
+    //     exactly that, for the cost of the mark phase we were doing anyway (each
+    //     node is still marked at most once). Shared nodes are charged to whichever
+    //     root reaches them first, which is fine: one dominant retainer still
+    //     dominates.
+    let mut retention: Vec<(usize, usize)> = Vec::new(); // (nodes retained, root ptr)
+    if root_debug > 0 {
+        for &r in &deferred_roots {
+            if !live.insert(r) {
+                continue; // already reached from an earlier root
+            }
+            let before = live.len();
+            worklist.push(r);
+            while let Some(p) = worklist.pop() {
+                if let Some(h) = nodes.get(&p) {
+                    h.for_each_child_node(&in_set, &mut |child| {
+                        if live.insert(child) {
+                            worklist.push(child);
+                        }
+                    });
+                    #[cfg(feature = "component-instance")]
+                    if let NodeHandle::Instance(a) = h {
+                        let bp = a.try_read().map(|g| g.class.clone());
+                        if let Some(bp) = bp {
+                            let bpp = Arc::as_ptr(&bp) as *const () as usize;
+                            if live_bps.insert(bpp) {
+                                blueprint_values(&bp, |v| {
+                                    classify(v, &in_set, &mut |child| {
+                                        if live.insert(child) {
+                                            worklist.push(child);
+                                        }
+                                    })
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            retention.push((live.len() - before + 1, r));
         }
     }
 
@@ -1380,6 +1435,16 @@ fn collect_from_log_carrying(
         );
         for (shape, (n, ext)) in &shapes {
             eprintln!("    n={:<7} ext={:<7} {}", n, ext, shape);
+        }
+        // The ranking that actually names a leak: who RETAINS the most.
+        retention.sort_by(|a, b| b.0.cmp(&a.0));
+        eprintln!(
+            "[cycle_gc] top retainers (nodes kept alive, of {} live):",
+            live.len()
+        );
+        for (n, r) in retention.iter().take(root_debug) {
+            let what = nodes.get(r).map(|h| h.describe()).unwrap_or_default();
+            eprintln!("    retains={:<8} {}", n, what);
         }
     }
     let survivors = nodes.len();
