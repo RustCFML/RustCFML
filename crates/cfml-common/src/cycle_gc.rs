@@ -562,16 +562,36 @@ impl NodeHandle {
                     .try_read()
                     .map(|g| (g.public_map_handle(), g.private_map_handle()));
                 if let Some((this_m, vars_m)) = maps {
-                    this_m.with_read(|m| {
-                        for v in m.values() {
-                            classify(v, in_set, emit);
+                    for m in [this_m, vars_m] {
+                        // A data map is USUALLY untracked and owned solely by this
+                        // Arc, so its values are walked from here. But it is not
+                        // always: a component that defines a closure keeps its LIVE
+                        // `variables` scope (the closure captured it) instead of the
+                        // partitioned copy, and that scope IS a tracked node. When
+                        // it is, emit the MAP — the Instance genuinely references
+                        // it, and leaving that edge uncounted made the map's own
+                        // external count read 1, turning every such instance's
+                        // scope into a pinned root and marking its whole object
+                        // graph live. On a Preside `?fwreinit=true` that stranded a
+                        // complete generation per reload.
+                        //
+                        // Emitting it is also why the values must NOT be walked in
+                        // that case: the map is its own survivor and walks them
+                        // itself, so doing both would double-count `internal_in`
+                        // for every shared child, deflate its external count and
+                        // over-collect live data (the double-walk that dropped a
+                        // live `EventHandlerBean`'s `viewDispatch`, 2026-07-22).
+                        let p = m.backing_ptr();
+                        if in_set.contains(&p) {
+                            emit(p);
+                        } else {
+                            m.with_read(|mm| {
+                                for v in mm.values() {
+                                    classify(v, in_set, emit);
+                                }
+                            });
                         }
-                    });
-                    vars_m.with_read(|m| {
-                        for v in m.values() {
-                            classify(v, in_set, emit);
-                        }
-                    });
+                    }
                 }
             }
         }
@@ -715,6 +735,44 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
             }
         }
         _ => {}
+    }
+}
+
+/// Enumerate every `CfmlValue` a class blueprint holds.
+///
+/// A blueprint is `Arc<ClassBlueprint>`, NOT a `CfmlValue`, so it is invisible
+/// to [`classify`] — and it is held by every `Instance` of its class. Left out
+/// of the graph, each of these fields reads as an EXTERNAL reference into the
+/// tracked set and pins its whole transitive closure, while the blueprint itself
+/// is kept alive by the very instances it is pinning. That is a cycle straddling
+/// an untracked node: refcounting cannot break it and trial-deletion never sees
+/// it. On a Preside `?fwreinit=true` it stranded ~111,000 nodes per reload —
+/// one blueprint set per class per request, so every reload leaked a generation.
+#[cfg(feature = "component-instance")]
+fn blueprint_values(bp: &crate::component::ClassBlueprint, mut f: impl FnMut(&CfmlValue)) {
+    f(&bp.metadata);
+    for v in bp.method_values.values() {
+        f(v);
+    }
+    for v in [
+        &bp.static_scope,
+        &bp.super_handle,
+        &bp.super_map,
+        &bp.source_names,
+        &bp.properties,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        f(v);
+    }
+    // `try_read`: skipping a contended lock can only UNDER-count this carrier's
+    // outgoing edges, which inflates its children's external count and protects
+    // them — conservative, never over-collects.
+    if let Some(g) = bp.metadata_cache.try_read() {
+        if let Some(v) = g.as_ref() {
+            f(v);
+        }
     }
 }
 
@@ -1096,12 +1154,61 @@ fn collect_from_log_carrying(
 
     let in_set: HashSet<usize> = nodes.keys().copied().collect();
 
-    // 2. internal_in[n] = number of references to n from other survivors.
+    // 1b. The class blueprints held by the surviving instances, DE-DUPLICATED by
+    //     Arc identity. A blueprint is a CARRIER, not a node: it participates in
+    //     the counts and the mark so that the values it holds are not mistaken
+    //     for externally-owned roots, but it is never cleared — breaking the
+    //     instances that hold it drops it by refcounting. De-duplication is
+    //     load-bearing: walking one blueprint once per instance would count each
+    //     of its edges N times, deflate its children's external count and
+    //     OVER-COLLECT live data (the failure mode that dropped a live
+    //     `EventHandlerBean`'s `viewDispatch` when the Instance data maps were
+    //     double-walked).
+    #[cfg(feature = "component-instance")]
+    let blueprints: HashMap<usize, std::sync::Arc<crate::component::ClassBlueprint>> = {
+        let mut bps = HashMap::new();
+        for h in nodes.values() {
+            if let NodeHandle::Instance(a) = h {
+                if let Some(g) = a.try_read() {
+                    let bp = g.class.clone();
+                    bps.entry(Arc::as_ptr(&bp) as *const () as usize)
+                        .or_insert(bp);
+                }
+            }
+        }
+        bps
+    };
+
+    // 2. internal_in[n] = number of references to n from other survivors, plus
+    //    the references held by the carrier blueprints (counted once each).
     let mut internal_in: HashMap<usize, usize> = HashMap::with_capacity(nodes.len());
     for h in nodes.values() {
         h.for_each_child_node(&in_set, &mut |child| {
             *internal_in.entry(child).or_insert(0) += 1;
         });
+    }
+    #[cfg(feature = "component-instance")]
+    for bp in blueprints.values() {
+        blueprint_values(bp, |v| {
+            classify(v, &in_set, &mut |child| {
+                *internal_in.entry(child).or_insert(0) += 1;
+            })
+        });
+    }
+
+    // 2b. A blueprint's own ownership: held by each surviving instance of its
+    //     class (internal) and by anything else — a live request's blueprint
+    //     cache, an instance outside this set (external). `-1` is our own clone.
+    #[cfg(feature = "component-instance")]
+    let mut bp_internal: HashMap<usize, usize> = HashMap::with_capacity(blueprints.len());
+    #[cfg(feature = "component-instance")]
+    for h in nodes.values() {
+        if let NodeHandle::Instance(a) = h {
+            if let Some(g) = a.try_read() {
+                let p = Arc::as_ptr(&g.class) as *const () as usize;
+                *bp_internal.entry(p).or_insert(0) += 1;
+            }
+        }
     }
 
     // 3. Roots = survivors with an owner OUTSIDE the survivor set.
@@ -1122,19 +1229,88 @@ fn collect_from_log_carrying(
             .unwrap_or(0)
     });
     let mut root_report: Vec<(usize, String)> = Vec::new();
+    // Index built once (not per root) so the diagnostic stays linear: a pass with
+    // 250k survivors can have tens of thousands of roots.
+    #[cfg(feature = "component-instance")]
+    let data_map_owners: HashMap<usize, String> = if root_debug > 0 {
+        let mut m = HashMap::new();
+        for oh in nodes.values() {
+            if let NodeHandle::Instance(a) = oh {
+                if let Some(g) = a.try_read() {
+                    m.insert(
+                        g.public_map_handle().backing_ptr(),
+                        format!("this-map of {}", g.class.name),
+                    );
+                    m.insert(
+                        g.private_map_handle().backing_ptr(),
+                        format!("variables-map of {}", g.class.name),
+                    );
+                }
+            }
+        }
+        m
+    } else {
+        HashMap::new()
+    };
     for (&p, h) in &nodes {
         let internal = *internal_in.get(&p).unwrap_or(&0);
         let external = h.strong_count().saturating_sub(1).saturating_sub(internal);
         if root_debug > 0 && external > 0 {
-            root_report.push((external, h.describe()));
+            // Is this pinned root one of the surviving instances' OWN data maps?
+            // Those are deliberately untracked and owned by the Instance Arc, so
+            // if a tracked struct turns out to BE one, the Instance's reference
+            // to it is an uncounted external ref — which pins it and everything
+            // it reaches.
+            #[allow(unused_mut)]
+            let mut owner = String::new();
+            #[cfg(feature = "component-instance")]
+            if let Some(what) = data_map_owners.get(&p) {
+                owner = format!(" [== {}]", what);
+            }
+            root_report.push((
+                external,
+                format!(
+                    "strong={} internal={} {}{}",
+                    h.strong_count(),
+                    internal,
+                    h.describe(),
+                    owner
+                ),
+            ));
         }
         if external > 0 && live.insert(p) {
             worklist.push(p);
         }
     }
 
+    // 3b. A blueprint owned from outside this set — by a concurrent request's
+    //     blueprint cache, or by an instance that is not a survivor here — keeps
+    //     everything it holds alive. One whose only owners ARE survivors here is
+    //     carried by the mark instead: it goes live exactly when one of its
+    //     instances does (step 4).
+    #[cfg(feature = "component-instance")]
+    let mut live_bps: HashSet<usize> = HashSet::new();
+    #[cfg(feature = "component-instance")]
+    for (&p, bp) in &blueprints {
+        let internal = *bp_internal.get(&p).unwrap_or(&0);
+        let external = Arc::strong_count(bp)
+            .saturating_sub(1)
+            .saturating_sub(internal);
+        if external > 0 && live_bps.insert(p) {
+            blueprint_values(bp, |v| {
+                classify(v, &in_set, &mut |child| {
+                    if live.insert(child) {
+                        worklist.push(child);
+                    }
+                })
+            });
+        }
+    }
+
     // 4. Mark the transitive closure of the roots live (a node reachable from a
-    //    live root is live even if its own external count is 0).
+    //    live root is live even if its own external count is 0). A live Instance
+    //    also makes its blueprint live — it holds it — so everything that
+    //    blueprint carries is live with it.
     while let Some(p) = worklist.pop() {
         if let Some(h) = nodes.get(&p) {
             h.for_each_child_node(&in_set, &mut |child| {
@@ -1142,6 +1318,22 @@ fn collect_from_log_carrying(
                     worklist.push(child);
                 }
             });
+            #[cfg(feature = "component-instance")]
+            if let NodeHandle::Instance(a) = h {
+                let bp = a.try_read().map(|g| g.class.clone());
+                if let Some(bp) = bp {
+                    let bpp = Arc::as_ptr(&bp) as *const () as usize;
+                    if live_bps.insert(bpp) {
+                        blueprint_values(&bp, |v| {
+                            classify(v, &in_set, &mut |child| {
+                                if live.insert(child) {
+                                    worklist.push(child);
+                                }
+                            })
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -1156,6 +1348,19 @@ fn collect_from_log_carrying(
         }
     }
     let survivors = nodes.len();
+    #[cfg(feature = "component-instance")]
+    if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        let insts = nodes
+            .values()
+            .filter(|h| matches!(h, NodeHandle::Instance(_)))
+            .count();
+        eprintln!(
+            "[cycle_gc]   survivors by kind: instances={} blueprints={} of {} nodes",
+            insts,
+            blueprints.len(),
+            nodes.len()
+        );
+    }
     let mut collected = 0usize;
     for (&p, h) in &nodes {
         if !live.contains(&p) {

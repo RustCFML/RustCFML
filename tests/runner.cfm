@@ -8,6 +8,7 @@ include "harness.cfm";
 
 
 <!--- --- cfconfig --- --->
+<cf_runtest file="gc/test_instance_scope_not_pinned.cfm">
 <cf_runtest file="config/test_cfconfig_loading.cfm">
 <cf_runtest file="config/test_cfconfig_datasource.cfm" rustcfmlOnly="true">
 <cf_runtest file="config/test_cfconfig_security.cfm">
