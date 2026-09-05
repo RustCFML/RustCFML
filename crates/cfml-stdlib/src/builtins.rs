@@ -8170,8 +8170,17 @@ fn with_optional_newline(args: &[CfmlValue], data_index: usize, flag_index: usiz
     }
 }
 
+
+/// Resolve `path` to its on-disk spelling (every segment, any extension).
+/// Lucee does this on case-sensitive filesystems; Preside FileStorage tests
+/// ask for `storage/testDir/loading.gif` while the fixture is `testdir/`.
+fn lucee_fs_path(path: &str) -> String {
+    cfml_common::vfs::lucee_case_fold_path(path).unwrap_or_else(|| path.to_string())
+}
+
 fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
-    let path = get_str(&args, 0);
+    let requested = get_str(&args, 0);
+    let path = lucee_fs_path(&requested);
     // Optional second argument: the charset to decode with (`fileRead(path,
     // charset)` / `<cffile action="read" charset=…>`). It used to be ignored, so
     // a UTF-16 file came back as mojibake.
@@ -8181,7 +8190,7 @@ fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
         // Lucee surfaces a missing file from fileRead() as an `expression` error
         // (only fileReadBinary uses FileNotFoundException) — match that asymmetry.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(CfmlError::expression(format!("The file [{}] does not exist", path)))
+            Err(CfmlError::expression(format!("The file [{}] does not exist", requested)))
         }
         Err(e) => Err(CfmlError::runtime(format!("fileRead: {}", e))),
     }
@@ -8246,7 +8255,12 @@ fn fn_file_append(args: Vec<CfmlValue>) -> CfmlResult {
 /// VFS so an embedded archive / engine-CFC overlay / S3 root is visible too.
 fn fn_file_exists(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
-    Ok(CfmlValue::Bool(std::path::Path::new(&path).is_file()))
+    Ok(CfmlValue::Bool(
+        std::path::Path::new(&path).is_file()
+            || cfml_common::vfs::lucee_case_fold_path(&path)
+                .map(|p| std::path::Path::new(&p).is_file())
+                .unwrap_or(false),
+    ))
 }
 
 fn fn_file_delete(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8373,7 +8387,12 @@ fn fn_directory_create(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_directory_exists(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
-    Ok(CfmlValue::Bool(std::path::Path::new(&path).is_dir()))
+    Ok(CfmlValue::Bool(
+        std::path::Path::new(&path).is_dir()
+            || cfml_common::vfs::lucee_case_fold_path(&path)
+                .map(|p| std::path::Path::new(&p).is_dir())
+                .unwrap_or(false),
+    ))
 }
 
 fn fn_directory_delete(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8392,7 +8411,7 @@ fn fn_directory_delete(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // directoryList(path [, recurse [, listInfo [, filter [, sort [, type]]]]])
-    let path = get_str(&args, 0);
+    let path = lucee_fs_path(&get_str(&args, 0));
     let recurse = if args.len() >= 2 { args[1].is_true() } else { false };
     let list_info = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "path".to_string() };
     let filter = if args.len() >= 4 { get_str(&args, 3) } else { String::new() };
@@ -8642,13 +8661,14 @@ fn fn_get_temp_file(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
-    let path_str = get_str(&args, 0);
+    let requested = get_str(&args, 0);
+    let path_str = lucee_fs_path(&requested);
     let path = std::path::Path::new(&path_str);
     let meta = std::fs::metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             // Lucee/ACF message contains "does not exist"; Preside's
             // FileSystemStorageProvider.getObjectInfo branches on it.
-            CfmlError::file_not_found(format!("file or directory [{}] does not exist", path_str))
+            CfmlError::file_not_found(format!("file or directory [{}] does not exist", requested))
         } else {
             CfmlError::runtime(format!("getFileInfo: {}", e))
         }
@@ -18080,11 +18100,12 @@ fn fn_profile_now_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 // ---- File functions ----
 
 fn fn_file_read_binary(args: Vec<CfmlValue>) -> CfmlResult {
-    let path = get_str(&args, 0);
+    let requested = get_str(&args, 0);
+    let path = lucee_fs_path(&requested);
     match std::fs::read(&path) {
         Ok(bytes) => Ok(CfmlValue::Binary(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(CfmlError::file_not_found(format!("The file [{}] does not exist", path)))
+            Err(CfmlError::file_not_found(format!("The file [{}] does not exist", requested)))
         }
         Err(e) => Err(CfmlError::runtime(format!("fileReadBinary(): {}", e))),
     }
