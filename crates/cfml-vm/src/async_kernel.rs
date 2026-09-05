@@ -456,6 +456,42 @@ pub struct ExecutorPoolNative {
     inner: Arc<(std::sync::Mutex<PoolShared>, std::sync::Condvar)>,
 }
 
+/// An executor that goes out of scope WITHOUT `shutdown()` must still stop its
+/// periodic schedules.
+///
+/// A relay keeps its `ThreadSeed` alive for the life of the schedule, and a seed
+/// owns the task body — for a `java.util.concurrent` submission that body is the
+/// `{__async_invoke_target, __async_invoke_method}` sentinel holding the RECEIVER
+/// COMPONENT, which reaches the framework's whole object graph. So an abandoned
+/// executor does not merely leak a thread: it pins an entire generation of the
+/// application, forever, and keeps ticking.
+///
+/// `shutdown_all` covered the explicit call. Nothing covered the far more common
+/// case of a framework simply REPLACING its executors — Preside rebuilds its
+/// heartbeats and thread pools and drops the old handles on the floor, so every
+/// rebuild stranded another generation. Measured on a live Preside, one pinned
+/// generation of ~111,000 nodes per abandoned executor.
+///
+/// Safe as a `Drop`: this handle is never cloned (the workers and relays share
+/// `PoolShared` through its own `Arc`, not through this struct), so the drop
+/// happens exactly when CFML lets go of the executor.
+impl Drop for ExecutorPoolNative {
+    fn drop(&mut self) {
+        // Cancel schedules only — queued one-shot work is left to finish, which
+        // is what `shutdown()` (as opposed to `shutdownNow()`) means.
+        if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+            let n = self
+                .inner
+                .0
+                .lock()
+                .map(|g| g.scheduled_cancels.len())
+                .unwrap_or(0);
+            eprintln!("[executor] abandoned executor dropped; cancelling {} schedule(s)", n);
+        }
+        self.shutdown_all(false);
+    }
+}
+
 impl std::fmt::Debug for ExecutorPoolNative {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let g = self.inner.0.lock().unwrap();
@@ -731,4 +767,41 @@ pub fn struct_get_i64(s: &ValueMap, key: &str) -> Option<i64> {
             CfmlValue::Bool(b) => Some(if *b { 1 } else { 0 }),
             other => other.as_string().parse::<i64>().ok(),
         })
+}
+
+/// Live count of periodic schedule relays, for the leak diagnostics.
+///
+/// A relay holds a `ThreadSeed` for the life of its schedule, and a seed owns the
+/// task body. For a `java.util.concurrent` submission that body is the
+/// `{__async_invoke_target, __async_invoke_method}` sentinel holding the RECEIVER
+/// COMPONENT, which reaches the framework's entire object graph — so each live
+/// relay pins one generation of the application. A count that climbs on an idle
+/// server therefore means schedules are being started faster than they are
+/// cancelled, and says so in units of "generations retained".
+pub static LIVE_SCHEDULE_RELAYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII counter for [`LIVE_SCHEDULE_RELAYS`] — a relay exits down several paths
+/// (cancelled, body threw, one-shot completed), and a manual decrement on each
+/// is exactly the kind of thing that goes stale.
+pub struct ScheduleRelayGuard;
+
+impl ScheduleRelayGuard {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let n = LIVE_SCHEDULE_RELAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+            eprintln!("[executor] schedule relay started; {} live", n);
+        }
+        ScheduleRelayGuard
+    }
+}
+
+impl Drop for ScheduleRelayGuard {
+    fn drop(&mut self) {
+        let n = LIVE_SCHEDULE_RELAYS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+        if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+            eprintln!("[executor] schedule relay ended; {} live", n);
+        }
+    }
 }

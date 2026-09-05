@@ -24148,7 +24148,6 @@ impl CfmlVirtualMachine {
                 if let Some(spawn_fn) = spawn {
                     let seed = self.build_task_seed(body, hostname, thread_name);
                     let outer_cancel = seed.cancel_flag.clone();
-                    let pool_for_relay = pool.clone();
                     // Let the owning executor stop this schedule on shutdown();
                     // otherwise the relay outlives it and keeps a whole
                     // ThreadSeed — program, globals, application scope — alive.
@@ -24172,9 +24171,20 @@ impl CfmlVirtualMachine {
                     // (a periodic schedule has no single "final" outcome).
                     let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
                     let cancel_for_relay = outer_cancel.clone();
+                    // Census of LIVE schedule relays. Each one holds a ThreadSeed
+                    // for the life of its schedule, and for a
+                    // java.util.concurrent submission that seed's body is the
+                    // `{__async_invoke_target, __async_invoke_method}` sentinel
+                    // holding the receiver component — which reaches the whole
+                    // framework object graph. So the live relay count IS the
+                    // number of application generations pinned in memory, and a
+                    // count that climbs on an idle server means schedules are
+                    // being started faster than they are being cancelled.
+                    let _relay_guard = async_kernel::ScheduleRelayGuard::new();
                     let join = std::thread::Builder::new()
                         .name("rustcfml-schedule-relay".to_string())
                         .spawn(move || {
+                            let _relay_guard = _relay_guard;
                             // Cooperative-cancellable sleep: poll every
                             // 50ms so cancel() takes effect promptly.
                             // Returns false if cancelled while waiting.
@@ -24469,25 +24479,87 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// `java.util.concurrent.Executors` static factory methods. Each returns an
-    /// executor-service shim; the pool sizing arg is accepted but ignored (tasks
-    /// run on the OS scheduler via detached threads, not a fixed pool).
+    /// `java.util.concurrent.Executors` static factory methods.
+    ///
+    /// Each returns an executor-service shim WITH a real bounded pool attached,
+    /// exactly as the `new ThreadPoolExecutor(...).init(...)` path does. That
+    /// symmetry is load-bearing and was missing: `__pool` used to be attached
+    /// only by `init`, so an executor built through this factory — the idiomatic
+    /// JVM way — silently had no pool at all. Everything hanging off the pool
+    /// went with it: `submit` fell back to an UNBOUNDED detached thread per task
+    /// (no `maxConcurrent`, no queue bound, no rejection policy), and, worse,
+    /// `scheduleAtFixedRate` could not register its schedule, so `shutdown()`
+    /// had nothing to cancel and the periodic relay ran forever — holding a
+    /// `ThreadSeed` whose body pins the receiver component and the whole object
+    /// graph behind it. Repro: five executors created and shut down left five
+    /// live relays and five stranded generations.
+    ///
+    /// cfconcurrent constructs via `init()`, which is why its 30/30 parity suite
+    /// never covered this path.
     fn handle_java_executors_method(
         &mut self,
         object: &CfmlValue,
         method: &str,
-        _args: Vec<CfmlValue>,
+        args: Vec<CfmlValue>,
     ) -> CfmlResult {
+        // `newFixedThreadPool(n)` / `newScheduledThreadPool(n)` take the size as
+        // the first arg; the single-threaded factories are 1 by definition;
+        // cached/work-stealing are "as many as needed", which is the widest
+        // bound rather than an unbounded one.
+        let sized = |dflt: usize| -> usize {
+            args.first()
+                .map(|v| v.as_string())
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|n| *n > 0)
+                .map(|n| n as usize)
+                .unwrap_or(dflt)
+        };
+        #[cfg(feature = "real-threads")]
+        let spawn = self.thread_spawn_fn;
+        #[cfg(not(feature = "real-threads"))]
+        let spawn: Option<ThreadSpawnFn> = None;
+        let with_pool = |shim: CfmlValue, max_concurrent: usize| -> CfmlValue {
+            let mut m = match &shim {
+                CfmlValue::Struct(s) => s.snapshot(),
+                _ => return shim,
+            };
+            m.insert(
+                "__pool".to_string(),
+                async_kernel::ExecutorPoolNative::new_value(
+                    max_concurrent,
+                    i64::from(u16::MAX) as usize,
+                    // The JVM factories use an UNBOUNDED queue, so a task is
+                    // never rejected; CallerRuns is the policy that preserves
+                    // "everything submitted eventually runs" if the bound is
+                    // ever reached.
+                    async_kernel::RejectPolicy::CallerRuns,
+                    spawn,
+                ),
+            );
+            CfmlValue::strukt(m)
+        };
         Ok(match method {
             // Rejection policies (ThreadPoolExecutor$DiscardPolicy etc.) are
             // constructed as `…$DiscardPolicy.init()`; hand the marker back.
             "init" => object.clone(),
-            "newfixedthreadpool" => java_shims::make_executor_service("fixed"),
-            "newcachedthreadpool" => java_shims::make_executor_service("cached"),
-            "newsinglethreadexecutor" => java_shims::make_executor_service("single"),
-            "newworkstealingpool" => java_shims::make_executor_service("workstealing"),
-            "newscheduledthreadpool" | "newsinglethreadscheduledexecutor" => {
-                java_shims::make_scheduled_executor()
+            "newfixedthreadpool" => {
+                with_pool(java_shims::make_executor_service("fixed"), sized(1))
+            }
+            "newcachedthreadpool" => {
+                with_pool(java_shims::make_executor_service("cached"), usize::from(u16::MAX))
+            }
+            "newsinglethreadexecutor" => {
+                with_pool(java_shims::make_executor_service("single"), 1)
+            }
+            "newworkstealingpool" => with_pool(
+                java_shims::make_executor_service("workstealing"),
+                sized(usize::from(u16::MAX)),
+            ),
+            "newscheduledthreadpool" => {
+                with_pool(java_shims::make_scheduled_executor(), sized(1))
+            }
+            "newsinglethreadscheduledexecutor" => {
+                with_pool(java_shims::make_scheduled_executor(), 1)
             }
             "defaultthreadfactory" => java_shims::make_threadfactory(),
             _ => CfmlValue::Null,
