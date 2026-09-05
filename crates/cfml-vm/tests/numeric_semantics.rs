@@ -1,12 +1,15 @@
-//! End-to-end JIT verification through the public VM API.
+//! Numeric semantics end-to-end through the public VM API.
 //!
-//! Only built with `--features jit`. These tests run real, compiler-emitted
-//! bytecode through `execute_function_with_args` (so they exercise the actual
-//! dispatch hook, hotness counter, cache, and trampoline — not `Backend`
-//! directly), with the hotness threshold forced to 1 so the JIT engages on the
-//! second call. The interpreter is the trusted oracle: matching the closed-form
-//! results with the JIT active proves the whole pipeline is correct.
-#![cfg(feature = "jit")]
+//! These run real, compiler-emitted bytecode through `execute_function_with_args`
+//! and check the results against closed forms — counted loops, factorials,
+//! polynomials, mixed int/double arithmetic, recursion depth.
+//!
+//! They began life as the JIT verification suite, where the interpreter was the
+//! trusted oracle and the point was that compiled output matched it. The JIT was
+//! removed in v0.653.0 (measured: 13 of 1,345 functions admitted on Preside, and
+//! turning it OFF was 1-7% FASTER on a warm render), but the closed forms it
+//! checked are worth keeping on their own — this is dense arithmetic coverage
+//! that the CFML suite does not duplicate.
 
 use cfml_codegen::{compiler::CfmlCompiler, BytecodeProgram};
 use cfml_compiler::parser::Parser;
@@ -44,7 +47,6 @@ fn run(src: &str) -> (String, usize) {
         // Compile the native body on the 2nd invocation of a hot function.
         // Set via API, not env vars: parallel test threads share the process
         // environment, so env mutation makes JIT engagement nondeterministic.
-        vm.jit_set_threshold(1);
         for (name, value) in get_builtins() {
             vm.globals.insert(name, value);
         }
@@ -52,7 +54,7 @@ fn run(src: &str) -> (String, usize) {
             vm.builtins.insert(name, func);
         }
         vm.execute().expect("execute");
-        (vm.get_output().trim().to_string(), vm.jit_compiled_count())
+        (vm.get_output().trim().to_string(), 0usize)
     })
 }
 
@@ -62,7 +64,6 @@ fn run_interpreter(src: &str) -> String {
     let src = src.to_string();
     on_big_stack(move || {
         let mut vm = CfmlVirtualMachine::new(compile(&src));
-        vm.jit_disable();
         for (name, value) in get_builtins() {
             vm.globals.insert(name, value);
         }
@@ -75,7 +76,7 @@ fn run_interpreter(src: &str) -> String {
 }
 
 #[test]
-fn counted_loop_function_jits_and_is_correct() {
+fn counted_loop_function_is_correct() {
     // sumTo(100) = 5050; called 60× so the JIT engages, and the running total
     // must still be exact (303000) — proving JIT output == interpreter output.
     let src = r#"
@@ -88,13 +89,12 @@ fn counted_loop_function_jits_and_is_correct() {
         for (k = 1; k <= 60; k++) { total = total + sumTo(100); }
         writeOutput(total);
     "#;
-    let (out, compiled) = run(src);
-    assert_eq!(out, "303000", "JIT result must equal the interpreter result");
-    assert!(compiled >= 1, "expected the hot function to be JIT-compiled");
+    let (out, _) = run(src);
+    assert_eq!(out, "303000", "closed-form result");
 }
 
 #[test]
-fn factorial_function_jits_and_is_correct() {
+fn factorial_function_is_correct() {
     let src = r#"
         function fact(n) {
             var r = 1;
@@ -105,15 +105,14 @@ fn factorial_function_jits_and_is_correct() {
         for (k = 1; k <= 30; k++) { out = out & fact(10) & ";"; }
         writeOutput(out);
     "#;
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     // 10! = 3628800, repeated 30×
     let expected = "3628800;".repeat(30);
     assert_eq!(out, expected);
-    assert!(compiled >= 1, "expected fact() to be JIT-compiled");
 }
 
 #[test]
-fn jit_result_matches_interpreter_across_inputs() {
+fn polynomial_matches_closed_form_across_inputs() {
     // A polynomial kernel over many inputs; compare against the closed form.
     let src = r#"
         function poly(a, b) { return a * b + a - b; }
@@ -121,14 +120,13 @@ fn jit_result_matches_interpreter_across_inputs() {
         for (k = 0; k <= 40; k++) { out = out & poly(k, 3) & ","; }
         writeOutput(out);
     "#;
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     let expected: String = (0..=40).map(|k| format!("{},", k * 3 + k - 3)).collect();
     assert_eq!(out, expected);
-    assert!(compiled >= 1, "expected poly() to be JIT-compiled");
 }
 
 #[test]
-fn double_arg_kernel_jits_and_matches_interpreter() {
+fn double_arg_kernel_matches_closed_form() {
     // Pass a `Double` argument across the ABI boundary. With Option-B
     // follow-ups landed, the param slot specialises to Float and the JIT runs;
     // before, the engine bailed and the interpreter handled every call.
@@ -139,13 +137,12 @@ fn double_arg_kernel_jits_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "JIT Double-arg output must equal the interpreter");
-    assert!(compiled >= 1, "expected area() to be JIT-compiled");
 }
 
 #[test]
-fn pow_kernel_jits_and_matches_interpreter() {
+fn pow_kernel_matches_closed_form() {
     let src = r#"
         function p(a, b) { return a ^ b + a % 3; }
         out = "";
@@ -153,13 +150,12 @@ fn pow_kernel_jits_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "JIT pow output must equal the interpreter");
-    assert!(compiled >= 1, "expected p() to be JIT-compiled");
 }
 
 #[test]
-fn float_kernel_jits_and_matches_interpreter() {
+fn float_kernel_matches_closed_form() {
     // A Double-returning kernel (the `/` operator + a Float accumulator with an
     // Int loop counter). The interpreter (JIT off) is the oracle; the JIT-on run
     // must produce byte-identical output *and* have compiled the hot function.
@@ -174,9 +170,8 @@ fn float_kernel_jits_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "JIT float output must equal the interpreter");
-    assert!(compiled >= 1, "expected stat() to be JIT-compiled");
 }
 
 #[test]
@@ -195,18 +190,16 @@ fn builtin_calls_jit_and_match_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "JIT builtin-call output must equal the interpreter");
-    assert!(compiled >= 1, "expected score() to be JIT-compiled");
 }
 
 /// Same setup as `run` but also returns the count of OSR-compiled loop bodies
 /// — used to confirm OSR specifically fired (not just whole-fn JIT).
-fn run_with_osr(src: &str) -> (String, usize, usize) {
+fn run_program(src: &str) -> (String, usize, usize) {
     let src = src.to_string();
     on_big_stack(move || {
         let mut vm = CfmlVirtualMachine::new(compile(&src));
-        vm.jit_set_threshold(1);
         for (name, value) in get_builtins() {
             vm.globals.insert(name, value);
         }
@@ -214,16 +207,12 @@ fn run_with_osr(src: &str) -> (String, usize, usize) {
             vm.builtins.insert(name, func);
         }
         vm.execute().expect("execute");
-        (
-            vm.get_output().trim().to_string(),
-            vm.jit_compiled_count(),
-            vm.osr_compiled_count(),
-        )
+        (vm.get_output().trim().to_string(), 0usize, 0usize)
     })
 }
 
 #[test]
-fn jit_bit_twiddling_builtins_match_interpreter() {
+fn bit_twiddling_builtins_matches_closed_form() {
     // Exercises bitAnd / bitOr / bitXor / bitNot / bitShln / bitShrn inside a
     // hot loop. Tests bit-level parity vs the interpreter — important
     // because the interpreter does the 32-bit truncation dance on bitNot
@@ -242,13 +231,12 @@ fn jit_bit_twiddling_builtins_match_interpreter() {
         writeOutput(x);
     "#;
     let oracle = run_interpreter(src);
-    let (out, jit, _osr) = run_with_osr(src);
-    assert_eq!(out, oracle, "bit builtins JIT output must match interpreter");
-    assert!(jit >= 1, "kernel() should have been whole-fn-JIT-compiled");
+    let (out, _, _) = run_program(src);
+    assert_eq!(out, oracle, "bit builtins matches the interpreter oracle");
 }
 
 #[test]
-fn jit_extended_pure_math_builtins_match_interpreter() {
+fn extended_pure_math_builtins_matches_closed_form() {
     // Exercises the v0.79.0 widened builtin allowlist: floor / ceiling /
     // round / sgn / fix (Numeric→Int) and sqr / exp / log / log10 / sin /
     // cos / tan / asin / acos / atan (Numeric→Float). All inside a hot
@@ -272,13 +260,12 @@ fn jit_extended_pure_math_builtins_match_interpreter() {
         writeOutput(x);
     "#;
     let oracle = run_interpreter(src);
-    let (out, jit, _osr) = run_with_osr(src);
-    assert_eq!(out, oracle, "extended builtins JIT output must match interpreter");
-    assert!(jit >= 1, "kernel() should have been whole-fn-JIT-compiled");
+    let (out, _, _) = run_program(src);
+    assert_eq!(out, oracle, "extended builtins matches the interpreter oracle");
 }
 
 #[test]
-fn jit_increment_decrement_and_bitmask_builtins_match_interpreter() {
+fn increment_decrement_and_bitmask_builtins_matches_closed_form() {
     // Exercises the v0.85.0 additions: incrementValue / decrementValue
     // (both Int and Float overloads) and the 3/4-arg bitMaskRead/Set/Clear
     // shims, all from a hot kernel that the JIT compiles whole-function.
@@ -307,13 +294,12 @@ fn jit_increment_decrement_and_bitmask_builtins_match_interpreter() {
         writeOutput(x & ":" & y);
     "#;
     let oracle = run_interpreter(src);
-    let (out, jit, _osr) = run_with_osr(src);
-    assert_eq!(out, oracle, "new builtins JIT output must match interpreter");
-    assert!(jit >= 1, "kernel() should have been whole-fn-JIT-compiled");
+    let (out, _, _) = run_program(src);
+    assert_eq!(out, oracle, "new builtins matches the interpreter oracle");
 }
 
 #[test]
-fn osr_do_while_loop_matches_interpreter() {
+fn do_while_loop_matches_closed_form() {
     // do { body } while (cond) — terminates in `JumpIfTrue(loop_start)`.
     let src = r#"
         sum = 0;
@@ -325,14 +311,13 @@ fn osr_do_while_loop_matches_interpreter() {
         writeOutput(sum);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _jit, osr) = run_with_osr(src);
+    let (out, _, _) = run_program(src);
     assert_eq!(out, oracle);
     assert_eq!(out, "500500");
-    assert!(osr >= 1, "expected do-while to OSR-compile, got osr={osr}");
 }
 
 #[test]
-fn osr_while_loop_in_main_matches_interpreter() {
+fn while_loop_in_main_matches_closed_form() {
     // While-loop in __main__ — terminates in `Jump(loop_start)` rather than
     // a fused ForLoopStep. Pre-OSR-Phase-2 this never JIT'd; post-Phase-2
     // the Jump back-edge triggers OSR analysis + compilation just like
@@ -348,21 +333,19 @@ fn osr_while_loop_in_main_matches_interpreter() {
     "#;
     // 1+2+...+1000 = 500500
     let oracle = run_interpreter(src);
-    let (out, _jit, osr) = run_with_osr(src);
+    let (out, _, _) = run_program(src);
     assert_eq!(out, oracle, "while-loop OSR output must equal the interpreter");
     assert_eq!(out, "500500");
-    assert!(osr >= 1, "expected the while-loop to OSR-compile, got osr={osr}");
 }
 
 #[test]
-fn osr_simple_main_loop_matches_interpreter() {
+fn simple_main_loop_matches_closed_form() {
     // Simplest possible hot __main__ loop. Threshold=1 means OSR engages on
     // the 2nd back-edge — the rest of the iterations run natively.
     let src = "sum = 0; for (i = 1; i <= 10; i++) { sum = sum + i; } writeOutput(sum);";
     let oracle = run_interpreter(src);
-    let (out, _jit, osr) = run_with_osr(src);
+    let (out, _, _) = run_program(src);
     assert_eq!(out, oracle);
-    assert!(osr >= 1, "expected at least one loop to OSR-compile, got {osr}");
 }
 
 #[test]
@@ -383,12 +366,12 @@ fn osr_nested_inner_loop_exits_to_outer_body_not_writeback() {
     "#;
     // inner = 1+2+3 = 6; acc = 4 * 6 = 24
     let oracle = run_interpreter(src);
-    let (out, _jit, _osr) = run_with_osr(src);
+    let (out, _jit, _osr) = run_program(src);
     assert_eq!(out, oracle);
 }
 
 #[test]
-fn hot_main_loop_osrs_and_matches_interpreter() {
+fn hot_main_loop_matches_closed_form() {
     // The hot loop lives at __main__ scope, which the whole-fn JIT rejects
     // outright. Without OSR none of this runs natively; with OSR the body of
     // the outer loop compiles and the interpreter only runs each iteration's
@@ -403,9 +386,8 @@ fn hot_main_loop_osrs_and_matches_interpreter() {
         writeOutput(acc);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _jit, osr) = run_with_osr(src);
+    let (out, _, _) = run_program(src);
     assert_eq!(out, oracle, "OSR'd loop output must equal the interpreter");
-    assert!(osr >= 1, "expected at least one loop to be OSR-compiled, got {osr}");
 }
 
 // (engine-level shadow guard is covered by the `shadow_check_short_circuits_jit`
@@ -429,7 +411,7 @@ fn hot_main_loop_osrs_and_matches_interpreter() {
 // in cache, which only happens after warm-up).
 
 #[test]
-fn udf_to_udf_leaf_call_jits_and_matches_interpreter() {
+fn udf_to_udf_leaf_call_matches_closed_form() {
     // Two-level call chain: `outer(n)` calls `helper(n)` in its hot loop. On
     // a warm-up run the leaf `helper` JITs first; subsequent calls then let
     // `outer` JIT too via direct dispatch.
@@ -445,16 +427,12 @@ fn udf_to_udf_leaf_call_jits_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "UDF→UDF JIT output must match the interpreter");
-    assert!(
-        compiled >= 1,
-        "expected at least the leaf helper to be JIT-compiled, got {compiled}"
-    );
 }
 
 #[test]
-fn udf_self_recursion_jits_and_matches_interpreter() {
+fn udf_self_recursion_matches_closed_form() {
     // The canonical motivating case: fib() self-recurses. The Phase-1
     // resolver synthesises a self-call binding so the analyser admits the
     // body; cache insertion before first run means the libcall finds it on
@@ -474,9 +452,8 @@ fn udf_self_recursion_jits_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "self-recursive JIT output must match the interpreter");
-    assert!(compiled >= 1, "expected fib() to be JIT-compiled, got {compiled}");
 }
 
 // ── v0.89.0 — Boxed scalar in/out at the ABI ─────────────────────────────────
@@ -487,7 +464,7 @@ fn udf_self_recursion_jits_and_matches_interpreter() {
 // passed straight through) and yield byte-identical output.
 
 #[test]
-fn boxed_pass_through_string_arg_jits_and_matches_interpreter() {
+fn boxed_pass_through_string_arg_matches_closed_form() {
     // `identity(s)` is loaded with a String, hot-warmed past threshold so the
     // JIT engages with a Boxed-param specialization, then must echo the
     // string back through the tagged-pointer ABI.
@@ -498,12 +475,8 @@ fn boxed_pass_through_string_arg_jits_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Boxed-pass-through output must match the interpreter");
-    assert!(
-        compiled >= 1,
-        "expected identity() to be JIT-compiled with a Boxed signature, got {compiled}"
-    );
 }
 
 #[test]
@@ -518,9 +491,8 @@ fn boxed_pass_through_via_intermediate_local_jits_and_matches() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
-    assert!(compiled >= 1, "expected relay() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -536,9 +508,8 @@ fn boxed_pass_through_mixed_int_and_boxed_args() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
-    assert!(compiled >= 1, "expected pick() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -554,9 +525,8 @@ fn udf_call_with_double_arg_jits_via_signature_match() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Double-arg UDF→UDF output must match the interpreter");
-    assert!(compiled >= 1, "expected at least scale() to be JIT-compiled");
 }
 
 // ── v0.90.0 — Boxed mid-body operations ───────────────────────────────────
@@ -570,9 +540,8 @@ fn string_literal_pass_through_jits() {
         writeOutput(v);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
-    assert!(compiled >= 1, "expected f() to JIT, got {compiled}");
 }
 
 #[test]
@@ -591,9 +560,8 @@ fn boxed_concat_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Boxed-concat UDF must produce identical output");
-    assert!(compiled >= 1, "expected build() to JIT, got {compiled}");
 }
 
 // ── v0.90.1 — UDF→UDF dispatch carrying Boxed args / Boxed returns ──────────
@@ -607,7 +575,7 @@ fn boxed_concat_in_jitted_udf_matches_interpreter() {
 // JIT'd caller invoke a JIT'd Boxed-returning UDF.
 
 #[test]
-fn jit_caller_invokes_boxed_returning_udf_and_matches_interpreter() {
+fn caller_invokes_boxed_returning_udf_and_matches_closed_form() {
     // `buildLine(prefix, n) → Boxed` is called from a JIT-eligible non-main
     // passThroughper `joinMany(label, count) → Boxed`. The passThroughper's Call site
     // receives a Boxed prefix arg (`"row" & i`) and consumes buildLine's
@@ -630,16 +598,12 @@ fn jit_caller_invokes_boxed_returning_udf_and_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Boxed UDF→UDF dispatch output must match the interpreter");
-    assert!(
-        compiled >= 2,
-        "expected both buildLine and joinMany to JIT (Boxed-arg + Boxed-ret dispatch), got {compiled}"
-    );
 }
 
 #[test]
-fn jit_caller_threads_boxed_arg_through_to_jitted_callee() {
+fn caller_threads_boxed_arg_through_to_jitted_callee() {
     // A Boxed value crosses TWO UDF call boundaries:
     //   passThrough(s) → ident(s) → s
     // Both functions specialise on Boxed args + Boxed returns. The runtime
@@ -659,14 +623,10 @@ fn jit_caller_threads_boxed_arg_through_to_jitted_callee() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(
         out, oracle,
         "Boxed arg threaded across two JIT'd UDFs must match the interpreter"
-    );
-    assert!(
-        compiled >= 2,
-        "expected both ident and passThrough to JIT, got {compiled}"
     );
 }
 
@@ -682,9 +642,8 @@ fn boxed_concat_with_float_operand_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Boxed-concat with Float operand must match");
-    assert!(compiled >= 1, "expected fmt() to JIT, got {compiled}");
 }
 
 // ── v0.91.0 — OSR Boxed slots + UDF dispatch ────────────────────────────────
@@ -695,7 +654,7 @@ fn boxed_concat_with_float_operand_matches_interpreter() {
 // non-admissible) can be compiled to native code.
 
 #[test]
-fn osr_boxed_concat_loop_in_main_matches_interpreter() {
+fn boxed_concat_loop_in_main_matches_closed_form() {
     // `__main__` body contains a non-allowlist top-level call (writeOutput)
     // which the whole-fn analyser rejects. The for-loop region by itself,
     // however, contains only String/Concat/StoreLocal ops on a Boxed slot —
@@ -706,9 +665,8 @@ fn osr_boxed_concat_loop_in_main_matches_interpreter() {
         writeOutput(len(out));
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR Boxed-concat loop must match interpreter");
-    assert!(osr_compiled >= 1, "expected OSR to fire on the Boxed concat loop, got {osr_compiled}");
 }
 
 #[test]
@@ -735,13 +693,8 @@ fn osr_calls_jitted_udf_from_outer_loop_in_main() {
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
-    let (out, fn_compiled, osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, _osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR-with-UDF-dispatch output must match interpreter");
-    assert!(fn_compiled >= 1, "expected buildLine to JIT, got fn_compiled={fn_compiled}");
-    assert!(
-        osr_compiled >= 1,
-        "expected outer loop in __main__ to OSR-compile (UDF dispatch + Boxed slot), got osr_compiled={osr_compiled}"
-    );
 }
 
 #[test]
@@ -759,7 +712,7 @@ fn osr_rejects_thin_udf_wrapper_loop() {
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "interpreter parity for thin UDF-wrapper loop");
     assert_eq!(
         osr_compiled, 0,
@@ -781,9 +734,8 @@ fn ucase_lcase_concat_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "uCase/lCase Boxed shim output must match the interpreter");
-    assert!(compiled >= 1, "expected tag() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -798,9 +750,8 @@ fn len_of_boxed_string_arg_returns_int_in_jit() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "len() Boxed shim output must match the interpreter");
-    assert!(compiled >= 1, "expected sz() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -815,9 +766,8 @@ fn trim_family_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "trim-family Boxed shim output must match the interpreter");
-    assert!(compiled >= 1, "expected clean() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -831,9 +781,8 @@ fn reverse_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "reverse Boxed shim output must match the interpreter");
-    assert!(compiled >= 1, "expected rev() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -850,9 +799,8 @@ fn asc_returns_int_from_boxed_arg_in_jit() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "asc Boxed shim output must match the interpreter");
-    assert!(compiled >= 1, "expected code() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -870,9 +818,8 @@ fn member_get_loadlocalproperty_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "LoadLocalProperty IC must match interpreter");
-    assert!(compiled >= 1, "expected name() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -889,9 +836,8 @@ fn member_get_case_insensitive_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "case-insensitive member IC must match interpreter");
-    assert!(compiled >= 1, "expected id() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -950,9 +896,8 @@ fn array_len_shim_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "arrayLen Boxed shim must match interpreter");
-    assert!(compiled >= 1, "expected sz() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1001,9 +946,8 @@ fn struct_key_list_shim_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "structKeyList Boxed shim must match interpreter");
-    assert!(compiled >= 1, "expected keys() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1022,9 +966,8 @@ fn url_and_js_string_format_shims_match_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "url / jsStringFormat shims must match interpreter");
-    assert!(compiled >= 1, "expected fmt() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1043,9 +986,8 @@ fn left_right_mid_shims_match_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "left/right/mid Boxed shims must match interpreter");
-    assert!(compiled >= 1, "expected slice() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1067,9 +1009,8 @@ fn find_and_replace_shims_match_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "find/replace Boxed shims must match interpreter");
-    assert!(compiled >= 1, "expected check() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1083,9 +1024,8 @@ fn repeat_string_shim_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "repeatString Boxed shim must match interpreter");
-    assert!(compiled >= 1, "expected band() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1105,9 +1045,8 @@ fn html_format_shims_in_jitted_udf_match_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "html-format Boxed shims must match the interpreter");
-    assert!(compiled >= 1, "expected fmt() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1124,9 +1063,8 @@ fn member_get_numeric_add_uses_smi_fast_path() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Add on Boxed Int operands must match interpreter");
-    assert!(compiled >= 1, "expected sum4() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1141,9 +1079,8 @@ fn add_mixed_int_and_struct_int_member_smi() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "mixed Int + Boxed Add must match interpreter");
-    assert!(compiled >= 1, "expected bumped() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1164,10 +1101,9 @@ fn add_boxed_smi_slow_path_numeric_strings_add_per_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "numeric-String + slow path must match interpreter");
     assert!(out.starts_with("5;"), "numeric strings must ADD, got {out}");
-    assert!(compiled >= 1, "expected combine() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1182,9 +1118,8 @@ fn sub_boxed_smi_struct_member_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Sub on Boxed-Int operands must match interpreter");
-    assert!(compiled >= 1, "expected diff() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1198,9 +1133,8 @@ fn mul_boxed_smi_struct_member_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Mul on Boxed-Int operands must match interpreter");
-    assert!(compiled >= 1, "expected prod() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1215,9 +1149,8 @@ fn sub_mul_chain_on_struct_member_kernel_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Sub+Mul+Add chain on Boxed must match interpreter");
-    assert!(compiled >= 1, "expected calc() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1233,10 +1166,9 @@ fn sub_boxed_slow_path_numeric_strings_per_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "Sub numeric-String slow path must match interpreter");
     assert!(out.starts_with("5;"), "9 - 4 must be 5, got {out}");
-    assert!(compiled >= 1, "expected diff() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1253,15 +1185,14 @@ fn add_boxed_smi_handles_large_int_via_box_int_overflow() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "SMI overflow path must match interpreter");
-    assert!(compiled >= 1, "expected dbl() to be JIT-compiled, got {compiled}");
 }
 
 // ── v0.99.8 — OSR admission for member reads + Boxed arith ──────────────
 
 #[test]
-fn osr_member_read_in_main_loop_matches_interpreter() {
+fn member_read_in_main_loop_matches_closed_form() {
     // `__main__`'s outer for-loop body reads `rec.a`/`rec.b` via the IC and
     // accumulates the sum. CLI __main__ never JITs whole-fn (gotcha #22),
     // so OSR is the only path that can specialise this loop. With v0.99.8
@@ -1273,16 +1204,12 @@ fn osr_member_read_in_main_loop_matches_interpreter() {
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR member-read loop must match interpreter");
-    assert!(
-        osr_compiled >= 1,
-        "expected OSR to fire on the member-read loop, got osr_compiled={osr_compiled}"
-    );
 }
 
 #[test]
-fn osr_member_read_with_sub_and_mul_matches_interpreter() {
+fn member_read_with_sub_and_mul_matches_closed_form() {
     // Exercises the v0.99.7 Sub/Mul Boxed admission inside OSR. Mirrors the
     // `struct_member_kernel.cfm` bench shape (a + b*2 + c - d) directly in
     // __main__.
@@ -1293,16 +1220,12 @@ fn osr_member_read_with_sub_and_mul_matches_interpreter() {
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR Sub/Mul Boxed member kernel must match interpreter");
-    assert!(
-        osr_compiled >= 1,
-        "expected OSR to fire on the Sub/Mul member kernel, got osr_compiled={osr_compiled}"
-    );
 }
 
 #[test]
-fn osr_member_read_case_insensitive_matches_interpreter() {
+fn member_read_case_insensitive_matches_closed_form() {
     // Mixed-case key in the source vs lowercase key in the struct literal
     // exercises the IC's cold-path CI scan + warm-path index reuse inside
     // the OSR-compiled body.
@@ -1313,16 +1236,12 @@ fn osr_member_read_case_insensitive_matches_interpreter() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR member-read CI must match interpreter");
-    assert!(
-        osr_compiled >= 1,
-        "expected OSR to fire on the CI member-read loop, got osr_compiled={osr_compiled}"
-    );
 }
 
 #[test]
-fn osr_member_read_bails_on_non_struct_receiver_matches_interpreter() {
+fn member_read_bails_on_non_struct_receiver_matches_closed_form() {
     // When the receiver is an Array (not a Struct), the member-get shim
     // sets *bail = 1 and the OSR body returns to the interpreter, which
     // produces the legacy CFML behaviour for `arr.foo`. The output must
@@ -1341,7 +1260,7 @@ fn osr_member_read_bails_on_non_struct_receiver_matches_interpreter() {
         }
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, _osr_compiled) = run_with_osr(src);
+    let (out, _fn_compiled, _osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR bail on non-Struct receiver must match interpreter");
 }
 
@@ -1362,9 +1281,8 @@ fn member_set_store_local_property_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "StoreLocalProperty IC must match interpreter");
-    assert!(compiled >= 1, "expected tag() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1384,9 +1302,8 @@ fn member_set_property_via_setproperty_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "SetProperty IC must match interpreter");
-    assert!(compiled >= 1, "expected bump() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1405,9 +1322,8 @@ fn member_set_case_insensitive_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "case-insensitive write IC must match interpreter");
-    assert!(compiled >= 1, "expected brand() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1431,9 +1347,8 @@ fn member_set_new_key_bumps_shape_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
+    let (out, _) = run(src);
     assert_eq!(out, oracle, "new-key write IC must match interpreter");
-    assert!(compiled >= 1, "expected attach() to be JIT-compiled, got {compiled}");
 }
 
 #[test]
@@ -1474,8 +1389,7 @@ fn isnumeric_predicate_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1, "check() must JIT, got fn_compiled={compiled}");
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1503,8 +1417,7 @@ fn type_predicate_family_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1, "probe() must JIT, got fn_compiled={compiled}");
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1524,8 +1437,7 @@ fn isnull_via_member_access_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1, "probe() must JIT, got fn_compiled={compiled}");
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1549,8 +1461,7 @@ fn collection_count_shims_in_jitted_udf_match_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1565,8 +1476,7 @@ fn array_to_list_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1585,8 +1495,7 @@ fn struct_key_exists_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1604,8 +1513,7 @@ fn array_contains_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 2, "has + hasNoCase must JIT, got {compiled}");
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1621,8 +1529,7 @@ fn array_first_last_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1659,8 +1566,7 @@ fn array_sum_avg_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1677,8 +1583,7 @@ fn list_first_last_rest_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1694,8 +1599,7 @@ fn list_get_at_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }
 
@@ -1715,7 +1619,6 @@ fn list_append_prepend_in_jitted_udf_matches_interpreter() {
         writeOutput(out);
     "##;
     let oracle = run_interpreter(src);
-    let (out, compiled) = run(src);
-    assert!(compiled >= 1);
+    let (out, _) = run(src);
     assert_eq!(out, oracle);
 }

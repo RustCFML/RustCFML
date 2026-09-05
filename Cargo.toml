@@ -71,15 +71,6 @@ rustc-hash = "1.1"
 # regardless of casing (CFML is case-insensitive everywhere).
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 
-# Cranelift JIT — pulled in only by cfml-vm's optional `jit` feature, and only
-# on native targets (the cfml-vm manifest target-gates them off wasm32).
-# Pinned to the 0.132.x line verified to build/run here.
-cranelift-jit = "0.132"
-cranelift-module = "0.132"
-cranelift-codegen = "0.132"
-cranelift-frontend = "0.132"
-cranelift-native = "0.132"
-
 # Debug builds default to full DWARF for the whole graph, which is what took
 # target/debug past 250G. Line tables keep backtraces and profiler symbols
 # working; what goes is variable inspection in a debugger, which we can get

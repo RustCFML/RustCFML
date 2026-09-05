@@ -61,10 +61,6 @@ mod ops;
 mod java_time;
 pub mod tz;
 pub mod type_check;
-/// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
-/// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-pub mod jit;
 #[cfg(feature = "s3")]
 mod s3_vfs;
 pub mod session_store;
@@ -1220,17 +1216,6 @@ pub fn compile_file_cached(
         cfml_codegen::compiler::CfmlCompiler::new().with_source_file(Some(path.to_string()));
     let program = compiler.compile(ast);
 
-    // --jit-coverage / RUSTCFML_JIT_COVERAGE=1: dump the Option-γ forecast
-    // for this compilation unit before it gets cached. Cheap, side-effect-
-    // free walk of the bytecode (see `JIT_POLY_DESIGN.md` and v0.88.0).
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    if matches!(
-        std::env::var("RUSTCFML_JIT_COVERAGE").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-    ) {
-        let report = jit::coverage::scan_program(&program);
-        eprintln!("=== {} ===\n{}", path, report.render());
-    }
 
     // Cache the result
     if let Some(c) = cache {
@@ -2903,13 +2888,6 @@ pub struct CfmlVirtualMachine {
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
     pub last_component_compile_error: Option<CfmlError>,
-    /// Optional Cranelift JIT engine. `Some` only under `--features jit` on a
-    /// native target when not disabled via `RUSTCFML_JIT=0`. Consulted at the
-    /// top of `execute_function_with_args`; the interpreter is always the
-    /// fallback, so this never changes behaviour. Field absent entirely when
-    /// the feature is off.
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    jit: Option<jit::JitEngine>,
 
     /// The composed hook-bus observer (Phase 0). `None` ⇒ no subscriber, so
     /// every hook site is a `bitand`+branch and nothing else. Today the only
@@ -3851,8 +3829,6 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "exists-census")]
             exists_census_epoch: cfml_common::perf_counters::exists_census::next_epoch(),
             last_component_compile_error: None,
-            #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-            jit: jit::JitEngine::maybe_new(),
             #[cfg(feature = "observability")]
             observer: None,
             #[cfg(feature = "observability")]
@@ -3875,186 +3851,18 @@ impl CfmlVirtualMachine {
         vm
     }
 
-    /// Number of user functions the JIT has compiled to native code so far.
-    /// `0` when the `jit` feature is off or the engine is disabled. Exposed for
-    /// observability and tests that need to confirm the JIT actually fired.
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    pub fn jit_compiled_count(&self) -> usize {
-        self.jit.as_ref().map_or(0, |j| j.compiled_count())
-    }
 
-    /// Number of loop bodies the OSR engine has compiled. `0` when the `jit`
-    /// feature is off or the engine is disabled. Exposed for tests asserting
-    /// OSR fired (distinct from whole-function JIT).
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    pub fn osr_compiled_count(&self) -> usize {
-        self.jit.as_ref().map_or(0, |j| j.osr_compiled_count())
-    }
 
-    /// Replace this VM's JIT engine with one at an explicit hotness threshold,
-    /// ignoring `RUSTCFML_JIT` / `RUSTCFML_JIT_THRESHOLD`. Tests use this for
-    /// deterministic JIT engagement: mutating the process environment instead
-    /// races when the test runner executes other tests on parallel threads.
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    pub fn jit_set_threshold(&mut self, threshold: u32) {
-        self.jit = jit::JitEngine::new_with_threshold(threshold);
-    }
 
-    /// Force-disable the JIT for this VM regardless of environment — the
-    /// deterministic equivalent of `RUSTCFML_JIT=0` (interpreter oracle).
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    pub fn jit_disable(&mut self) {
-        self.jit = None;
-    }
 
-    /// Adopt this thread's persistent JIT engine into `self.jit`, replacing the
-    /// empty per-request engine `new()` installed. Used by serve mode so the
-    /// hotness counters and compiled native code accumulate across requests
-    /// landing on the same `spawn_blocking` worker thread, instead of being
-    /// rebuilt cold every request. The Cranelift module is `!Send`, so it can
-    /// never be *shared* across threads — but a `thread_local!` keeps one engine
-    /// per worker thread, and the module never leaves the thread that built it.
-    ///
-    /// First use per thread lazily constructs the engine via `maybe_new()`
-    /// (honouring `RUSTCFML_JIT` / `RUSTCFML_JIT_THRESHOLD`). A `None` engine
-    /// (JIT disabled) round-trips cleanly. Pair with [`Self::jit_return_persistent`]
-    /// — or, better, use [`JitLease`] which guarantees the return even on unwind.
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    pub fn jit_take_persistent(&mut self) {
-        self.jit = PERSISTENT_JIT.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                // `take()` below would yield `None` and the worker would never
-                // warm up. `Some(None)` marks "constructed, but disabled" so we
-                // don't re-run `maybe_new()` (and its env reads) every request.
-                *slot = Some(jit::JitEngine::maybe_new());
-            }
-            slot.take().flatten()
-        });
-    }
 
-    /// Return this VM's JIT engine to the thread-local so the next request on
-    /// this worker reuses its warmed cache. Inverse of [`Self::jit_take_persistent`].
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    pub fn jit_return_persistent(&mut self) {
-        let engine = self.jit.take();
-        PERSISTENT_JIT.with(|cell| {
-            *cell.borrow_mut() = Some(engine);
-        });
-    }
 }
 
-// Per-worker-thread persistent JIT engine for serve mode. `None` = not yet
-// initialised on this thread; `Some(None)` = initialised but JIT disabled.
-// The engine is moved out into the executing VM for the duration of a request
-// (so all the hot-path `self.jit.as_mut()` sites are unchanged) and moved back
-// afterwards. The Cranelift `JITModule` it owns is `!Send`, so it lives and
-// dies on a single thread — never shared, only persisted per thread.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-thread_local! {
-    static PERSISTENT_JIT: std::cell::RefCell<Option<Option<jit::JitEngine>>> =
-        const { std::cell::RefCell::new(None) };
-}
 
-/// RAII guard that adopts the thread-local persistent JIT engine into a VM for
-/// the lifetime of the guard and returns it on `Drop` — even on an early return
-/// or panic unwind. This is what makes serve-mode persistence panic-safe: a
-/// panic inside `execute_with_lifecycle` costs at most a one-thread cold engine
-/// rebuild, never a permanently-lost engine. No-op when the `jit` feature is off.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-pub struct JitLease<'a> {
-    vm: &'a mut CfmlVirtualMachine,
-}
 
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-impl<'a> JitLease<'a> {
-    pub fn new(vm: &'a mut CfmlVirtualMachine) -> Self {
-        vm.jit_take_persistent();
-        JitLease { vm }
-    }
-    /// Borrow the leased VM (so callers can drive execution through the guard).
-    pub fn vm(&mut self) -> &mut CfmlVirtualMachine {
-        self.vm
-    }
-}
 
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-impl Drop for JitLease<'_> {
-    fn drop(&mut self) {
-        self.vm.jit_return_persistent();
-    }
-}
 
-/// Shared OSR/JIT shadow-guard predicate: `true` when calling the canonical
-/// builtin named `name` would be wrong because the live VM has been told to
-/// resolve it differently (user-defined function with the same name, or a
-/// non-canonical entry in `globals`). Hot-path: every cached compiled body
-/// re-runs this for each builtin it references. Pulled out of the inline
-/// closures in `execute_function_with_args` so the whole-fn JIT hook and
-/// the OSR hooks (ForLoopStep / Jump / JumpIfTrue / JumpIfFalse) all share
-/// one implementation.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-fn jit_is_shadowed(
-    user_functions: &HashMap<String, Arc<BytecodeFunction>>,
-    globals: &ValueMap,
-    name: &str,
-) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let ufn_hit = user_functions.contains_key(name)
-        || user_functions.keys().any(|k| k.eq_ignore_ascii_case(&lower));
-    if ufn_hit {
-        return true;
-    }
-    let g = globals.get(name).or_else(|| {
-        globals
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-            .map(|(_, v)| v)
-    });
-    match g {
-        Some(v) => {
-            // Canonical builtin wrapper = `Function{ body: Expression(Null),
-            // params: [], captured_scope: None }` produced by
-            // `cfml_stdlib::create_builtin_func`. Anything else for an
-            // allowlist name is real shadowing.
-            if let CfmlValue::Function(f) = v {
-                if !f.params.is_empty() || f.captured_scope.is_some() {
-                    return true;
-                }
-                let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
-                !matches!(
-                    body,
-                    cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
-                )
-            } else {
-                true
-            }
-        }
-        None => false,
-    }
-}
 
-/// v0.91.0 — case-insensitive lookup against `user_functions` returning the
-/// `(global_id, arity)` pair OSR / whole-fn JIT need to bind a `LoadGlobal`
-/// of a non-builtin name to a UDF. Pulled out of the inline closures so the
-/// OSR hooks (4 sites) and the whole-fn try_call site share one impl.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-fn jit_udf_lookup(
-    user_functions: &HashMap<String, Arc<BytecodeFunction>>,
-    name: &str,
-) -> Option<jit::UdfMeta> {
-    let lower = name.to_ascii_lowercase();
-    let f = user_functions.get(name).or_else(|| {
-        user_functions
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-            .map(|(_, v)| v)
-    })?;
-    Some(jit::UdfMeta {
-        global_id: f.global_id,
-        nparams: f.params.len(),
-    })
-}
 
 /// The per-application start gate — one lock per application NAME.
 ///
@@ -4123,7 +3931,6 @@ fn app_start_in_flight_on_this_thread(app_name: &str) -> bool {
 
 impl CfmlVirtualMachine {
     // continuation of the previous impl block (split only to insert the
-    // free `jit_is_shadowed` helper above with the matching cfg gates).
 
     /// Register every function in `prog` into `fn_registry` by its `global_id`
     /// (idempotent — a cached program registers the same Arc into the same slot).
@@ -7424,112 +7231,6 @@ impl CfmlVirtualMachine {
         // frame after every bare helper call (the Preside sitetree regression:
         // a helper's env `args` clobbered the rendering frame's `args`).
         let fused_env_baseline = fused_plan.as_ref().and_then(|p| p.env.clone());
-        // Tier-1 JIT fast path. Returns `Some` only when a compiled native body
-        // ran to completion for these exact (all-Int) arguments; otherwise this
-        // falls through to the interpreter unchanged. `func`/`args` are the
-        // caller's, not borrowed from `self.jit`, so there is no borrow conflict;
-        // with the feature off the whole block compiles away. See `jit/mod.rs`.
-        // §29 — a declared parameter type is enforced by the binding prologue
-        // below, which a JIT-compiled body never runs. Validate here, BEFORE
-        // the compiled body can execute (a type violation must throw instead of
-        // running the function), and record it so the prologue does not repeat
-        // the work when the JIT declines the call. Costs nothing for a function
-        // that declares no parameter types, which is the common case.
-        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-        let mut param_types_checked = false;
-        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-        {
-            if self.jit.is_some() && func.param_types.iter().any(|t| t.is_some()) {
-                self.check_declared_param_types(func, &args)?;
-                param_types_checked = true;
-            }
-            // The shadowing guard makes sure a user-defined function or
-            // global with the same name as an allowlisted builtin (e.g.
-            // `function abs(x) { … }`) wins over the JIT's native call. We
-            // peek directly at the VM's lookup tables; matches the
-            // case-insensitive lookup the interpreter does in LoadGlobal.
-            // Borrowing `self.jit` and `self.user_functions` / `self.globals`
-            // simultaneously is fine via split borrows on the field pattern,
-            // but to keep it simple we snapshot the field references first.
-            let user_functions = &self.user_functions;
-            let globals = &self.globals;
-            if let Some(engine) = self.jit.as_mut() {
-                // A canonical builtin entry in `globals` is the no-op wrapper
-                // `Function{ body: Expression(Null), params: [], captured_scope: None }`
-                // produced by `cfml_stdlib::create_builtin_func`. Anything else
-                // for an allowlist name (a user-assigned value, a redefined
-                // function, etc.) is real shadowing — we must bail so the
-                // interpreter resolves the user's version through LoadGlobal's
-                // normal lookup order. User-defined `function abs(){}` lives in
-                // `user_functions` *behind* the globals entry in CFML's lookup,
-                // so by itself it doesn't shadow — but we still bail on it as
-                // a conservative second guard: the user clearly intended an
-                // override, and the analysis is cheap.
-                let is_canonical_builtin_wrapper = |v: &CfmlValue| -> bool {
-                    if let CfmlValue::Function(f) = v {
-                        if !f.params.is_empty() || f.captured_scope.is_some() {
-                            return false;
-                        }
-                        let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
-                        return matches!(
-                            body,
-                            cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
-                        );
-                    }
-                    false
-                };
-                let mut is_shadowed = |name: &str| -> bool {
-                    let lower = name.to_ascii_lowercase();
-                    let ufn_hit = user_functions.contains_key(name)
-                        || user_functions.keys().any(|k| k.eq_ignore_ascii_case(&lower));
-                    if ufn_hit {
-                        return true;
-                    }
-                    let g = globals.get(name).or_else(|| {
-                        globals
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-                            .map(|(_, v)| v)
-                    });
-                    match g {
-                        Some(v) => !is_canonical_builtin_wrapper(v),
-                        None => false,
-                    }
-                };
-                // UDF resolver: case-insensitive lookup against the live
-                // `user_functions` map, returning (global_id, arity). Used
-                // by the JIT analyser to bind `LoadGlobal(name)` calls to
-                // already-compiled UDFs in the cache; rejecting the
-                // caller's analysis when the callee isn't yet warm.
-                let udf_lookup = |name: &str| -> Option<jit::UdfMeta> {
-                    let lower = name.to_ascii_lowercase();
-                    let f = user_functions.get(name).or_else(|| {
-                        user_functions
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-                            .map(|(_, v)| v)
-                    })?;
-                    // §29 — refuse to bind a callee that declares parameter
-                    // types. A bound callee is invoked by the caller's COMPILED
-                    // body as a direct native call: it never re-enters the VM,
-                    // so the declared-type validation on the dispatch path
-                    // below cannot run and `function f( numeric n )` accepted
-                    // anything. Declining the binding costs this caller its
-                    // compilation, not its correctness; the callee itself stays
-                    // JIT-eligible through the checked dispatch path.
-                    if f.param_types.iter().any(|t| t.is_some()) {
-                        return None;
-                    }
-                    Some(jit::UdfMeta {
-                        global_id: f.global_id,
-                        nparams: f.params.len(),
-                    })
-                };
-                if let Some(result) = engine.try_call(func, &args, &mut is_shadowed, &udf_lookup) {
-                    return result;
-                }
-            }
-        }
 
         // Guard against runaway recursion — checked before allocating locals
         // to avoid blowing the native Rust stack.
@@ -7983,10 +7684,7 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-                        let already = param_types_checked;
-                        #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
-                        let already = false;
+                                                let already = false;
                         if !already {
                             _p4_typechecks += 1;
                             self.check_declared_param_type(func, i, param_name, ptype, &value)?;
@@ -9772,72 +9470,11 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    // OSR (Phase 2): back-edge from a while/until/repeat loop.
-                    // `ip` was already incremented past this Jump, so `ip - 1`
-                    // is the Jump's own ip and a strictly backward `target`
-                    // means we're at the end of a loop body about to loop
-                    // back. Region = `[target, ip)`. On success the compiled
-                    // body writes back locals and we resume at `exit_ip`
-                    // (== region_end_excl == ip), so the `continue` simply
-                    // skips the `ip = *target` reassignment below. On bail
-                    // we fall through and re-execute the body once more.
-                    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-                    {
-                        if *target < ip - 1 {
-                            let user_functions = &self.user_functions;
-                            let globals = &self.globals;
-                            if let Some(engine) = self.jit.as_mut() {
-                                let mut is_shadowed =
-                                    |name: &str| jit_is_shadowed(user_functions, globals, name);
-                                if let Some(exit_ip) = engine.try_run_loop(
-                                    func,
-                                    *target,
-                                    ip,
-                                    &mut locals,
-                                    closure_env.as_ref(),
-                                    &mut is_shadowed,
-                                    &|name: &str| jit_udf_lookup(user_functions, name),
-                                ) {
-                                    ip = exit_ip;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
                     ip = *target;
                 }
                 BytecodeOp::JumpIfFalse(target) => {
                     if let Some(cond) = stack.pop() {
                         if !cond.is_true() {
-                            // OSR Phase 2: a JumpIfFalse whose target is
-                            // strictly behind this op is the back-edge of a
-                            // `do { body } until (cond)` shape (i.e. loop
-                            // back when cond is false). Same region/hook
-                            // mechanics as the unconditional Jump case.
-                            #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-                            {
-                                if *target < ip - 1 {
-                                    let user_functions = &self.user_functions;
-                                    let globals = &self.globals;
-                                    if let Some(engine) = self.jit.as_mut() {
-                                        let mut is_shadowed = |name: &str| {
-                                            jit_is_shadowed(user_functions, globals, name)
-                                        };
-                                        if let Some(exit_ip) = engine.try_run_loop(
-                                            func,
-                                            *target,
-                                            ip,
-                                            &mut locals,
-                                            closure_env.as_ref(),
-                                            &mut is_shadowed,
-                                            &|name: &str| jit_udf_lookup(user_functions, name),
-                                        ) {
-                                            ip = exit_ip;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
                             ip = *target;
                         }
                     }
@@ -9981,75 +9618,12 @@ impl CfmlVirtualMachine {
                         _ => false,
                     };
                     if matched {
-                        // OSR (on-stack replacement) hook. When a hot back-edge
-                        // crosses the JIT threshold we compile the loop's body
-                        // region `[*target, ip)` to native code; subsequent
-                        // back-edges marshal locals across, run the compiled
-                        // body to completion (or until a runtime bail), and
-                        // resume the interpreter at `ip` (the natural
-                        // fall-through after this ForLoopStep). On bail we
-                        // simply fall through to the existing `ip = *target`
-                        // path and let the interpreter re-execute the body
-                        // once more — the compiled body has written back
-                        // the in-flight slot values so the next iteration
-                        // resumes from exactly the trapping point. With the
-                        // `jit` feature off the whole block compiles away.
-                        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-                        {
-                            let user_functions = &self.user_functions;
-                            let globals = &self.globals;
-                            if let Some(engine) = self.jit.as_mut() {
-                                let mut is_shadowed =
-                                    |name: &str| jit_is_shadowed(user_functions, globals, name);
-                                if let Some(exit_ip) = engine.try_run_loop(
-                                    func,
-                                    *target,
-                                    ip,
-                                    &mut locals,
-                                    closure_env.as_ref(),
-                                    &mut is_shadowed,
-                                    &|name: &str| jit_udf_lookup(user_functions, name),
-                                ) {
-                                    ip = exit_ip;
-                                    continue;
-                                }
-                            }
-                        }
                         ip = *target;
                     }
                 }
                 BytecodeOp::JumpIfTrue(target) => {
                     if let Some(cond) = stack.pop() {
                         if cond.is_true() {
-                            // OSR Phase 2: a JumpIfTrue whose target is
-                            // strictly behind this op is the back-edge of a
-                            // `do { body } while (cond)` shape (loop back
-                            // when cond is true). Same region/hook mechanics
-                            // as the unconditional Jump case.
-                            #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-                            {
-                                if *target < ip - 1 {
-                                    let user_functions = &self.user_functions;
-                                    let globals = &self.globals;
-                                    if let Some(engine) = self.jit.as_mut() {
-                                        let mut is_shadowed = |name: &str| {
-                                            jit_is_shadowed(user_functions, globals, name)
-                                        };
-                                        if let Some(exit_ip) = engine.try_run_loop(
-                                            func,
-                                            *target,
-                                            ip,
-                                            &mut locals,
-                                            closure_env.as_ref(),
-                                            &mut is_shadowed,
-                                            &|name: &str| jit_udf_lookup(user_functions, name),
-                                        ) {
-                                            ip = exit_ip;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
                             ip = *target;
                         }
                     }

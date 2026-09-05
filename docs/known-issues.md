@@ -751,21 +751,14 @@ Edges:
 
 <a id="16"></a>
 
-## 16. Sampling profiler — JIT-compiled numeric leaves not attributed 🏗
+## 16. Sampling profiler — JIT-compiled numeric leaves not attributed ✅ RESOLVED (v0.653.0)
 
-The threshold-gated sampling profiler (`observability.profiler`, `profileNow()` /
-`getRequestProfile()` — see [debugging.md](debugging.md)) samples the CFML call
-stack at the interpreter's per-line hook. Small hot **numeric functions the JIT
-compiles to native code bypass the interpreter loop**, so they neither push a
-call frame nor fire the sampling hook. Time spent inside such a function is
-therefore folded into its **caller's** self-time instead of appearing as its own
-node in the call tree.
+Small hot numeric functions the JIT compiled to native code bypassed the
+interpreter loop, so they neither pushed a call frame nor fired the sampling
+hook, and their time was folded into the caller's self-time.
 
-This is a deliberate trade-off, not a silent drop: JIT'd numeric leaves are tiny
-and fast by definition, and in serve mode the per-request JIT rarely warms up at
-all (see the JIT-in-serve-mode notes), so interpreted frames — the overwhelming
-majority of a real request — are attributed correctly. Breaking JIT'd leaves out
-separately would require the JIT to push frames it currently elides for speed.
+Resolved by removing the JIT (see §77): every frame is interpreted now, so the
+profiler attributes all of them.
 
 <a id="18"></a>
 
@@ -1148,9 +1141,8 @@ So an external caller can still reach a private method by extracting the
 reference first (`f = obj.priv; f()`). Closing that means gating member reads
 (`GetProperty`/`GetIndex` and the other `Instance::get_member` callers), which are
 the hottest ops in the engine and have no caller context threaded to them today —
-a separate change with a much wider blast radius than the dispatch gate, and one
-that would also have to cover the JIT's member-access inline caches to stay
-consistent. Treated as a follow-up rather than folded into the dispatch fix.
+a separate change with a much wider blast radius than the dispatch gate.
+Treated as a follow-up rather than folded into the dispatch fix.
 
 Also worth knowing: the refusal is raised as error type `Runtime`, where Lucee
 uses `expression`. That is the type of every "no such method" error in this
@@ -1844,3 +1836,53 @@ worker thread — is already done by the engine's thread seed.
 
 ---
 
+
+<a id="77"></a>
+
+## 77. The Cranelift JIT was removed (v0.653.0) 📌
+
+The optional Cranelift JIT (`--features jit`, ~10,500 lines under
+`crates/cfml-vm/src/jit/`, five Cranelift crates) is gone. This records why, so
+nobody re-derives it.
+
+**It compiled almost nothing.** On a Preside boot plus 20 renders, with the
+hotness threshold forced to 1 so every function attempted admission, **13 of
+1,345** distinct functions were admitted — 1.0%. 99.0% were rejected by the body
+analyser, and the top blocking opcodes were `CallMethod` (123) and
+`CallMethodNamed` (43): **component method dispatch**, which is what a real CFML
+application mostly is. Even a hand-written ideal numeric benchmark — a hot pure
+arithmetic loop and a recursive `fib` — compiled **zero** functions, because a
+`while` loop, `%`, `int()` and `arguments.n` are each outside the admitted
+subset. A bare `function add(a,b){ return a+b; }` did compile.
+
+**It was a net slowdown.** Warm Preside homepage, interleaved A/B, CPU time,
+three rounds: JIT off was **1.1%, 7.0% and 3.2% faster**. You paid admission
+checks and compilation for coverage that never materialised.
+
+**It was a second, permanently-diverging semantics surface.** v0.649.0 found
+three real divergences in one session (unchecked declared param types on the
+compiled entry path; a compiled→compiled direct native call that bypassed the
+dispatch-level check; a closure's writes to an enclosing `var` silently lost).
+It also never polled the cooperative-cancellation flag the interpreter checks on
+every loop back-edge, so `thread action="terminate"` and `Future.cancel(true)`
+silently failed on hot loops — a JIT'd runaway loop could not be stopped. And a
+CLI run can never catch a JIT bug (nothing gets hot in one request), so
+`tests/runner.cfm` stayed green through all of it.
+
+**Independent confirmation.** MatchBox (`ortus-boxlang/matchbox`) is the same
+idea with more machinery — four tiers, real side-exit deopt, inline caches in
+Tier-2 loops — and hits the identical exclusion list: no member/index access, no
+`new`/array/struct literals, no dynamic calls, no exceptions. Its own docs say
+"most effective for pure computational functions", it publishes no perf numbers,
+and it ships opt-in and off in WASM/embedded builds.
+
+Removed: the module, the `jit` feature on `cfml-vm` and `rustcfml-cli`, five
+Cranelift dependencies (29 crates in the tree), and the `--no-jit`,
+`--jit-threshold`, `--jit-stats`, `--jit-coverage` flags with their
+`RUSTCFML_JIT*` env vars. Binary 62M → 59M. The numeric closed-form checks it
+carried live on as `crates/cfml-vm/tests/numeric_semantics.rs`.
+
+**What replaces it:** nothing, and deliberately. The measured cost centre is
+frames and member access, not arithmetic — see
+`docs/inline-caches-plan.md` for the one idea worth taking from the JIT
+(inline caches for member reads), sized against the interpreter instead.

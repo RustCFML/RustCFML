@@ -32,13 +32,8 @@ cfml-config = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-codegen = { workspace = true }
 cfml-qoq = { workspace = true }
-# `default-features = false` is load-bearing: cfml-vm's own default set
-# includes `jit`, so taking its defaults here made the CLI's `jit` feature a
-# no-op — `--no-default-features` still linked all of Cranelift and still ran
-# the JIT, while `--jit-stats` reported "not built in" (that message is behind
-# the CLI crate's cfg, not the VM's). Every default EXCEPT `jit` is listed
-# explicitly; `jit` comes back via this crate's own default feature set below,
-# so a plain build is unchanged and only an explicit opt-out drops it.
+# Features listed explicitly rather than taking cfml-vm's defaults, so what the
+# CLI links is visible here.
 cfml-vm = { workspace = true, default-features = false, features = [
     "s3",
     "std",
@@ -116,7 +111,7 @@ opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true }
 
 [features]
-default = ["memcached", "cluster", "jit", "component-instance", "mimalloc"]
+default = ["memcached", "cluster", "component-instance", "mimalloc"]
 # OpenTelemetry distributed traces (OTLP push) + RED metrics (native Prometheus
 # scrape endpoint). Host-only; never enabled by the wasm crates. Implies the VM's
 # `observability` hook bus.
@@ -167,7 +162,6 @@ cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # does NOT take cfml-vm's defaults). Dropping it from `--features` genuinely
 # removes the Cranelift dependency and the engine from the binary. Runtime
 # kill-switch, independent of the build: `RUSTCFML_JIT=0`.
-jit = ["cfml-vm/jit"]
 # Phase C (component-model flyweight): passthrough to the VM's `Instance` backing.
 # DEFAULT-ON as of v0.519.0 (the Slice-6 flip); also reaches the binary transitively
 # via cfml-vm's default. The wasm crates opt out (default-features = false), so the

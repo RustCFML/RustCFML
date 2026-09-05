@@ -432,35 +432,6 @@ struct Args {
     #[arg(long, default_value = "main.cfm")]
     entry: String,
 
-    /// Disable the optional Cranelift JIT at runtime. Equivalent to setting
-    /// `RUSTCFML_JIT=0` in the environment — the interpreter handles every
-    /// op and the JIT engine isn't initialised. Has no effect on builds
-    /// produced without `--features jit`.
-    #[arg(long)]
-    no_jit: bool,
-
-    /// Override the JIT hotness threshold (number of invocations before a
-    /// candidate function or loop is compiled). Equivalent to setting
-    /// `RUSTCFML_JIT_THRESHOLD=N`. Defaults to 50.
-    #[arg(long, value_name = "N")]
-    jit_threshold: Option<u32>,
-
-    /// After execution, print JIT statistics to stderr: number of whole
-    /// functions compiled and number of OSR loop bodies compiled. Useful
-    /// for diagnostics, threshold tuning, and confirming a hot path
-    /// actually engaged the JIT. No effect when the JIT feature is off.
-    #[arg(long)]
-    jit_stats: bool,
-
-    /// Before executing, walk the compiled bytecode and print an
-    /// Option-γ coverage report to stderr: per-op classification
-    /// (supported / boxed-promising / hopeless) and the fraction of
-    /// functions that would become admissible once polymorphic
-    /// tag-pointer values land (see `JIT_POLY_DESIGN.md`). Forward-
-    /// looking diagnostic only — does not change execution behaviour.
-    #[arg(long)]
-    jit_coverage: bool,
-
     /// Native CPU/wall-clock sampling profiler (observability Phase 6). Samples
     /// the Rust call stack at ~100 Hz and, on exit, writes `rustcfml-profile.svg`
     /// (flamegraph) + `rustcfml-profile.pb` (pprof protobuf, loadable in
@@ -485,20 +456,6 @@ struct Args {
     #[arg(long)]
     memprofile: bool,
 }
-
-/// Process-global flag set by the `--jit-stats` CLI option. Polled after
-/// each VM run (`execute_with_session_handling`) to print a one-line
-/// diagnostic to stderr. Static-atomic so we don't have to thread an extra
-/// param through every nested call site (compile_and_run → … → the per-VM
-/// execute) just for a debug knob; the JIT itself is also a process-global
-/// per-VM init, so the scope matches.
-static JIT_STATS_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Process-global flag set by `--jit-coverage`. Triggers the Option-γ
-/// coverage scan + render after compile, before run.
-static JIT_COVERAGE_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Encapsulates the full response from CFML execution, including HTTP metadata.
 struct CfmlResponse {
@@ -617,34 +574,6 @@ fn real_main() {
 
     if args.verbose {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    }
-
-    // JIT control flags (mirror the existing RUSTCFML_JIT / RUSTCFML_JIT_THRESHOLD
-    // env vars). Must be set BEFORE the first `CfmlVirtualMachine::new` since
-    // `JitEngine::maybe_new` reads these at construction time.
-    if args.no_jit {
-        // SAFETY: single-threaded startup; no races with other env readers.
-        unsafe {
-            std::env::set_var("RUSTCFML_JIT", "0");
-        }
-    }
-    if let Some(n) = args.jit_threshold {
-        // SAFETY: same — pre-VM-init.
-        unsafe {
-            std::env::set_var("RUSTCFML_JIT_THRESHOLD", n.to_string());
-        }
-    }
-    if args.jit_stats {
-        JIT_STATS_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    if args.jit_coverage {
-        JIT_COVERAGE_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Also propagate via env var so the in-cfml-vm compile path (which
-        // doesn't see the CLI args struct directly) can dump too. Set
-        // BEFORE the first VM init for the same reason as RUSTCFML_JIT.
-        unsafe {
-            std::env::set_var("RUSTCFML_JIT_COVERAGE", "1");
-        }
     }
 
     // Handle --build <app-dir>
@@ -989,7 +918,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     }
     let cli_vfs: Arc<dyn vfs::Vfs> =
         Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs()));
-    let result = compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, false);
+    let result = compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false);
     // Buffered `<cflog>` lines must reach disk before we return or `exit(1)`
     // — the error path below never unwinds, so no Drop guard would run.
     logging::flush_all();
@@ -1060,7 +989,7 @@ fn compile_and_run_with_session(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true, true)
+    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true)
 }
 
 /// Run the Application.cfc lifecycle for a requested template that does NOT
@@ -1081,7 +1010,7 @@ fn run_missing_template(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true, true)
+    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true)
 }
 
 /// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
@@ -1147,34 +1076,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     }
 }
 
-/// `--jit-stats` dump (jit builds): cumulative per-worker compile counts.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-fn dump_jit_stats(vm: &CfmlVirtualMachine) {
-    if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!(
-            "jit-stats: fn_compiled={} osr_compiled={}",
-            vm.jit_compiled_count(),
-            vm.osr_compiled_count()
-        );
-    }
-}
 
-/// Whether serve-mode cross-request JIT persistence is enabled. On by default;
-/// set `RUSTCFML_JIT_PERSIST=0` (or false/off/no) to fall back to a per-request
-/// engine without a rebuild.
-#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-fn jit_persist_enabled() -> bool {
-    // Read once: this is consulted per request and `env::var` takes the
-    // process-wide environment lock.
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RUSTCFML_JIT_PERSIST")
-            .map(|v| {
-                !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
-            })
-            .unwrap_or(true)
-    })
-}
 
 #[allow(clippy::too_many_arguments)]
 fn compile_and_run(
@@ -1188,7 +1090,6 @@ fn compile_and_run(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
     missing_template: Option<String>,
-    persist_jit: bool,
     web_context: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
     // Connection-per-request DB isolation. Serve-mode requests run on reused
@@ -1279,14 +1180,6 @@ fn compile_and_run(
         let compiler = CfmlCompiler::new();
         let program = compiler.compile(ast);
 
-        // --jit-coverage: dump the Option-γ forecast before running. Cheap,
-        // pure read of the bytecode; doesn't change execution. Stderr so
-        // it doesn't interleave with the program's stdout.
-        #[cfg(feature = "jit")]
-        if JIT_COVERAGE_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            let report = cfml_vm::jit::coverage::scan_program(&program);
-            eprintln!("{}", report.render());
-        }
 
         if debug {
             println!("=== BYTECODE ===");
@@ -1378,38 +1271,12 @@ fn compile_and_run(
         cfml_common::cycle_gc::enable();
     }
 
-    // Run the lifecycle. In serve mode (`persist_jit`), adopt this worker
-    // thread's persistent JIT engine for the duration via `JitLease` so
-    // compiled native code + hotness counters accumulate across requests
-    // instead of being rebuilt cold every request. The lease returns the
-    // engine to the thread-local on scope exit (incl. panic/early return).
-    // The `--jit-stats` read must happen while the engine is still in the VM
-    // (before the lease drops), so it reports the cumulative per-worker count.
     // Perf-plan 3.2 stage-2 sizing: per-request delta of the call-parent
     // seeding counters (RCFML_FUSED_COUNTERS=1). Measurement-only.
     let fuse_before = cfml_vm::fuse_counters::enabled()
         .then(|| (cfml_vm::fuse_counters::snapshot(), std::time::Instant::now()));
 
-    let result;
-    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-    {
-        if persist_jit && jit_persist_enabled() {
-            let mut lease = cfml_vm::JitLease::new(&mut vm);
-            result = lease.vm().execute_with_lifecycle();
-            dump_jit_stats(lease.vm());
-        } else {
-            result = vm.execute_with_lifecycle();
-            dump_jit_stats(&vm);
-        }
-    }
-    #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
-    {
-        let _ = persist_jit;
-        result = vm.execute_with_lifecycle();
-        if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("jit-stats: JIT feature not built in (rebuild with --features jit)");
-        }
-    }
+    let result = vm.execute_with_lifecycle();
 
     if let Some((before, started)) = fuse_before {
         let after = cfml_vm::fuse_counters::snapshot();
@@ -3444,7 +3311,6 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
                 state.sandbox,
                 None,
                 true,
-                true,
             ) {
                 let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
                     resp.response_content_type.as_deref(),
@@ -4466,7 +4332,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute
-    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false, false) {
+    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);

@@ -65,10 +65,6 @@ p521 = { version = "0.13", default-features = false, features = ["std", "ecdsa",
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
 
-# Cranelift JIT backend. Optional, native-only: the `jit` feature turns these
-# on, and they are gated off wasm32 entirely so enabling `jit` on a wasm target
-# is a build-time impossibility (mirrors MatchBox). The interpreter is always
-# the default and the universal fallback; nothing here changes a default build.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # P-521 is the one curve whose signing is NOT deterministic: p521 0.13 has no
 # RFC 6979 support yet (its own TODO), so it draws a random nonce and gates
@@ -80,12 +76,6 @@ p521 = { version = "0.13", default-features = false, features = ["getrandom"] }
 # see the p256/p384/p521 note above — key generation is the ONLY shim operation
 # that draws from an RNG, so this is the only place a random backend is needed.
 rand_core = { version = "0.6", features = ["getrandom"] }
-rustc-hash = { workspace = true, optional = true }
-cranelift-jit = { workspace = true, optional = true }
-cranelift-module = { workspace = true, optional = true }
-cranelift-codegen = { workspace = true, optional = true }
-cranelift-frontend = { workspace = true, optional = true }
-cranelift-native = { workspace = true, optional = true }
 
 [dev-dependencies]
 cfml-stdlib = { workspace = true, default-features = false }
@@ -94,7 +84,7 @@ cfml-stdlib = { workspace = true, default-features = false }
 rustcfml-module = { path = "../rustcfml-module" }
 
 [features]
-default = ["std", "real-threads", "jit", "observability", "scope-pool", "component-instance"]
+default = ["std", "real-threads", "observability", "scope-pool", "component-instance"]
 std = []
 # Observability & debugging hook bus + the classic CF debug footer (Phase 0/1
 # of docs/observability-implementation-plan.md). Pure-Rust, host-only: it pulls
@@ -136,19 +126,3 @@ frame-census = ["cfml-common/frame-census"]
 # Existence-probe outcome census — see cfml-common's `exists-census`. Probe
 # builds only.
 exists-census = ["cfml-common/exists-census"]
-# Multi-tier Cranelift JIT. **Default-on for native targets** — included in the
-# `default` feature set above. The wasm crates (`cfml-worker`, `rustcfml-wasm`)
-# depend on cfml-vm with `default-features = false`, and the cranelift deps
-# themselves live under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`
-# above, so wasm builds get neither the deps nor the code (the `mod jit;`
-# declaration in `lib.rs` is also `cfg(not(target_arch = "wasm32"))`). To opt
-# out on native, build with `--no-default-features --features std,real-threads`
-# or set the runtime kill-switch `RUSTCFML_JIT=0`. See `crates/cfml-vm/src/jit/`.
-jit = [
-    "dep:rustc-hash",
-    "dep:cranelift-jit",
-    "dep:cranelift-module",
-    "dep:cranelift-codegen",
-    "dep:cranelift-frontend",
-    "dep:cranelift-native",
-]
