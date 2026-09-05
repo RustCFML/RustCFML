@@ -286,6 +286,18 @@ where
     }
 }
 
+/// `(slots, live)` for [`SHARED_FN_REGISTRY`]. Diagnostic only
+/// (`RUSTCFML_CACHE_CENSUS`). `slots` is the Vec length — it only ever grows,
+/// because the table is INDEXED by `global_id` and ids are handed out by a
+/// monotonic counter. A `slots` figure that climbs while `live` stays flat means
+/// recompilation is minting fresh ids for the same templates.
+pub fn shared_fn_registry_stats() -> (usize, usize) {
+    match SHARED_FN_REGISTRY.read() {
+        Ok(reg) => (reg.len(), reg.iter().filter(|w| w.strong_count() > 0).count()),
+        Err(_) => (0, 0),
+    }
+}
+
 /// Resolve a `global_id` through [`SHARED_FN_REGISTRY`]. Only reached on a
 /// per-request registry miss, so the read lock is off the hot path.
 fn resolve_shared_fn(id: usize) -> Option<Arc<BytecodeFunction>> {
@@ -725,6 +737,17 @@ impl BytecodeCache {
             entries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             trusted,
         }
+    }
+
+    /// Number of cached programs. Diagnostic only (`RUSTCFML_CACHE_CENSUS`).
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    /// True when no program is cached. Present because clippy asks for it
+    /// alongside `len`; the census only reads `len`.
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
     }
 
     /// Return a cached program if present. In trusted (production) mode the
@@ -2005,6 +2028,9 @@ enum DispatchCaller<'a> {
 }
 
 pub struct CfmlVirtualMachine {
+    /// Live-VM counter (see [`VmLiveGuard`]). First field so it is constructed
+    /// and dropped with the VM itself.
+    pub _live: VmLiveGuard,
     pub program: BytecodeProgram,
     pub globals: ValueMap,
     pub builtins: HashMap<String, BuiltinFunction>,
@@ -3051,6 +3077,37 @@ static LIVE_BODIES: std::sync::Mutex<Option<std::collections::BTreeMap<u64, Stri
     std::sync::Mutex::new(None);
 static BODY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// The `variables` scope of each RUNNING thread body, keyed by census id.
+///
+/// A running `cfthread` holds its scopes in Rust — `ThreadSeed::variables_snapshot`
+/// and the child VM's globals — none of which is a tracked node, so every value
+/// it references reads to the collector as externally owned with no visible
+/// holder. That is a CORRECT pin (the thread really can still touch them) but an
+/// invisible one, and it is indistinguishable in the reports from an engine leak.
+/// Registering the scope here lets the request loop hand it to the collector as a
+/// named probe root, so a retained generation can be attributed to the thread
+/// keeping it alive instead of showing up as an anonymous orphan.
+///
+/// Populated only under `RUSTCFML_GC_DEBUG`, and cleared by the same RAII guard
+/// that deregisters the body, so it can never outlive the thread.
+static LIVE_BODY_ROOTS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, Vec<CfmlValue>>>> =
+    std::sync::Mutex::new(None);
+
+/// Snapshot the probe roots of every thread body still running.
+pub fn live_body_roots() -> Vec<(String, CfmlValue)> {
+    let g = LIVE_BODY_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (id, vs) in m.iter() {
+        for v in vs {
+            out.push((format!("thread body #{}", id), v.clone()));
+        }
+    }
+    out
+}
+
 pub struct BodyCensus(u64);
 
 impl BodyCensus {
@@ -3084,9 +3141,28 @@ impl BodyCensus {
     }
 }
 
+impl BodyCensus {
+    /// Register the scopes this running body holds, so the collector can name
+    /// them as probe roots (see [`LIVE_BODY_ROOTS`]).
+    pub fn set_roots(&self, roots: Vec<CfmlValue>) {
+        LIVE_BODY_ROOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(self.0, roots);
+    }
+}
+
 impl Drop for BodyCensus {
     fn drop(&mut self) {
         if let Some(m) = LIVE_BODIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            m.remove(&self.0);
+        }
+        if let Some(m) = LIVE_BODY_ROOTS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
@@ -3127,6 +3203,87 @@ pub fn report_live_bodies() {
 /// Report the `ThreadSeed`s still alive, grouped by creating call site. A site
 /// whose count climbs with each framework reload is leaking a seed — and with it
 /// a whole generation of the application.
+/// Census of the process-lifetime caches, printed at request end when
+/// `RUSTCFML_CACHE_CENSUS=1`.
+///
+/// Every map named here outlives an application restart, so a `?fwreinit=true`
+/// that grows the heap while thread counts stay flat has to be growing ONE of
+/// them (or the object graph they pin). Sizes are printed as absolutes; run the
+/// same request twice and diff. This is the view neither the heap profiler
+/// (which attributes to allocation SITES, not owners) nor the cycle collector
+/// (which only sees tracked nodes) can give.
+impl CfmlVirtualMachine {
+    /// The application this request resolved to, if any. Exposed for the
+    /// request loop's diagnostic probe roots (`RUSTCFML_GC_ROOTS`), which need
+    /// to look the stored `ApplicationState` up by name.
+    pub fn application_name(&self) -> Option<&str> {
+        self.current_application_name.as_deref()
+    }
+}
+
+/// Live `CfmlVirtualMachine` count. A request VM owns that request's whole world
+/// — `globals`, `static_holders`, per-request blueprint and metadata caches — so
+/// a VM that is never dropped retains everything its request touched, invisibly:
+/// it is Rust state, so no tracked node holds it and the collector can only see
+/// its effect as an unexplained external refcount. Counted so "is a VM leaking?"
+/// is answerable rather than arguable.
+static LIVE_VMS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static VMS_MADE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// `(live, ever created)` VMs.
+pub fn vm_census() -> (i64, i64) {
+    (
+        LIVE_VMS.load(std::sync::atomic::Ordering::Relaxed),
+        VMS_MADE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// RAII counter for [`LIVE_VMS`], held as a field of the VM so it tracks the
+/// VM's real lifetime without needing a `Drop` impl on the VM itself (which
+/// would forbid the partial moves the codebase relies on).
+pub struct VmLiveGuard;
+
+impl VmLiveGuard {
+    fn new() -> Self {
+        LIVE_VMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        VMS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        VmLiveGuard
+    }
+}
+
+impl Drop for VmLiveGuard {
+    fn drop(&mut self) {
+        LIVE_VMS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn report_cache_census(ss: &ServerState) {
+    let (slots, live) = shared_fn_registry_stats();
+    eprintln!(
+        "[cache_census] fn_ids_issued={} shared_fn_slots={} shared_fn_live={} \
+bytecode={} component_path={} canonicalize={} exists={} dir_fold={} \
+custom_tag={} app_cfc_path={} app_cfconfig={} named_locks={} names_interned={}",
+        cfml_codegen::compiler::global_fn_ids_issued(),
+        slots,
+        live,
+        ss.bytecode_cache.len(),
+        ss.component_path_cache.read().len(),
+        ss.canonicalize_cache.read().len(),
+        ss.exists_cache.read().len(),
+        ss.dir_fold_cache.read().len(),
+        ss.custom_tag_path_cache.read().len(),
+        ss.app_cfc_path_cache.read().len(),
+        ss.app_cfconfig_cache.read().len(),
+        ss.named_locks.lock().map(|m| m.len()).unwrap_or(0),
+        cfml_common::name::Name::interned_count(),
+    );
+    let (live_vms, made_vms) = vm_census();
+    eprintln!(
+        "[cache_census] live_vms={} (created {})",
+        live_vms, made_vms
+    );
+}
+
 pub fn report_live_seeds() {
     let g = LIVE_SEEDS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = g.as_ref() else { return };
@@ -3658,6 +3815,7 @@ fn is_engine_frame_local(name: &str) -> bool {
 impl CfmlVirtualMachine {
     pub fn new(program: BytecodeProgram) -> Self {
         let mut vm = Self {
+            _live: VmLiveGuard::new(),
             program,
             globals: ValueMap::default(),
             builtins: HashMap::new(),
@@ -4896,6 +5054,17 @@ impl CfmlVirtualMachine {
         if let Some(attrs) = attributes {
             self.globals.insert("attributes".to_string(), attrs);
             self.thread_attrs_tag_depth = self.base_tag_stack.len();
+        }
+        // Hand the collector the scopes this body can still reach, so a
+        // generation pinned by a long-running thread is ATTRIBUTED to that
+        // thread instead of surfacing as an anonymous orphan with an
+        // unexplained external refcount (see `LIVE_BODY_ROOTS`). Diagnostic
+        // only: `set_roots` is never reached unless `RUSTCFML_GC_DEBUG` is set,
+        // because `BodyCensus::new` returns `None` otherwise.
+        if let Some(c) = _body_census.as_ref() {
+            let mut roots: Vec<CfmlValue> = self.globals.values().cloned().collect();
+            roots.push(closure.clone());
+            c.set_roots(roots);
         }
         // Capture body output separately (same pattern as cfsavecontent).
         self.saved_output_buffers
@@ -8347,7 +8516,23 @@ impl CfmlVirtualMachine {
                             )),
                             return_type: bc_func.return_type.clone(),
                             access: cfml_common::dynamic::CfmlAccess::Public,
-                            captured_scope: Some(scope),
+                            captured_scope: Some({
+                                // A closure's captured scope is a COLLECTIBLE
+                                // node, but nothing logs it at creation — only
+                                // `relog_cycle_nodes` did, and only for a
+                                // subgraph displaced from a persistent scope. An
+                                // unlogged scope is invisible to the collector,
+                                // so every reference it holds reads as EXTERNAL
+                                // ownership and pins that object's whole graph.
+                                // That is precisely a DI container's shape
+                                // (WireBox wires providers and listeners as
+                                // closures over the injector), which is why a
+                                // Preside reload stranded a generation per
+                                // reload. Logging here is a no-op unless the
+                                // collector is armed.
+                                cfml_common::cycle_gc::log_scope(&scope);
+                                scope
+                            }),
                         }))
                     } else {
                         // Variable not found — check try_stack for error handler
@@ -11634,7 +11819,12 @@ impl CfmlVirtualMachine {
                         // Carry the declared modifier so for-in over a component
                         // instance can hide private/package methods (Lucee parity).
                         access: bc_func_ref.access.clone(),
-                        captured_scope: Some(Arc::clone(env)),
+                        captured_scope: Some({
+                            // See the sibling site: an unlogged captured scope is
+                            // an invisible carrier that pins everything it holds.
+                            cfml_common::cycle_gc::log_scope(env);
+                            Arc::clone(env)
+                        }),
                     })));
                 }
 
@@ -28986,7 +29176,12 @@ impl CfmlVirtualMachine {
                 body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
                 return_type: None,
                 access: cfml_common::dynamic::CfmlAccess::Public,
-                captured_scope: Some(Arc::clone(parent)),
+                captured_scope: Some({
+                    // The lexical-parent env link is a captured scope like any
+                    // other; unlogged it hides the whole parent chain.
+                    cfml_common::cycle_gc::log_scope(parent);
+                    Arc::clone(parent)
+                }),
             })),
         );
         map.insert(Self::CLOSURE_OWN_KEYS.to_string(), CfmlValue::array(own_keys));

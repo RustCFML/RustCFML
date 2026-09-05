@@ -1059,10 +1059,48 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let join = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
+            // The allocation log is THREAD-LOCAL, armed per thread by `enable()`,
+            // and until now only the request path ever called it. So every
+            // struct, array, scope or component instance allocated on a cfthread
+            // was never logged: invisible to the collector, it could never be
+            // freed as part of a cycle, and — worse — every reference it held
+            // read as EXTERNAL ownership of its target, pinning that target's
+            // whole graph. Preside's reload spawns ~37 threads (task manager,
+            // heartbeats, log listeners, module loaders) whose products land in
+            // the application graph; the singletons they referenced came out with
+            // a small unexplained refcount surplus and dragged a complete
+            // ~111,000-node generation along per reload. Enabling the log here
+            // makes those allocations ordinary nodes, and the collect at the end
+            // carries the survivors into the cross-request set — after which
+            // their edges are counted like anyone else's.
+            let armed = cfml_common::cycle_gc::is_armed();
+            if armed {
+                cfml_common::cycle_gc::enable();
+            }
             let mut vm = CfmlVirtualMachine::new(seed.program.clone());
             register_vm_runtime(&mut vm);
             let (closure, attributes) = vm.apply_thread_seed(seed);
             let result = vm.run_thread_body(&closure, attributes, &ValueMap::default());
+            if armed {
+                // Same contract as the request path: a nested cfthread still
+                // running can race the refcounts, so defer this log to it rather
+                // than collect under it — and never discard it.
+                let running_joins: Vec<std::thread::JoinHandle<()>> = vm
+                    .live_threads
+                    .values_mut()
+                    .filter_map(|h| match &h.join {
+                        Some(j) if !j.is_finished() => h.join.take(),
+                        _ => None,
+                    })
+                    .collect();
+                drop(vm);
+                if running_joins.is_empty() {
+                    cfml_common::cycle_gc::collect();
+                    cfml_common::cycle_gc::disable_and_clear();
+                } else {
+                    cfml_common::cycle_gc::defer_current_log(running_joins);
+                }
+            }
             // Receiver may be gone if the parent never joined; ignore.
             let _ = tx.send(result);
         })
@@ -1403,6 +1441,12 @@ fn compile_and_run(
             );
             cfml_vm::report_live_seeds();
             cfml_vm::report_live_bodies();
+        }
+        static CACHE_CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHE_CENSUS.get_or_init(|| std::env::var("RUSTCFML_CACHE_CENSUS").is_ok()) {
+            if let Some(ss) = vm.server_state.as_ref() {
+                cfml_vm::report_cache_census(ss);
+            }
             if let Some(sites) = cfml_common::cycle_gc::drain_top_sites(25) {
                 eprintln!("[cycle_gc] top sampled struct/array allocation sites this request:");
                 for (site, n) in sites {
@@ -1432,6 +1476,35 @@ fn compile_and_run(
                     .collect();
                 for (i, v) in pcs.into_iter().enumerate() {
                     probes.push((format!("pseudo-ctor app scope #{}", i), v));
+                }
+                // `ApplicationState::config` is the OTHER half of a stored
+                // application — Application.cfc's `this.*` — and it is a plain
+                // `ValueMap` held by the store, so it is neither a tracked node
+                // nor probed. Anything it holds therefore reads as externally
+                // owned with no visible holder, which is exactly the shape this
+                // hunt keeps ending on. Probe it so "unreachable from any
+                // persistent scope" means what it says.
+                // Live sessions. The in-process store holds real object
+                // references, so a session is a persistent root exactly like the
+                // application scope — and it is the one the reports were missing.
+                for (id, vars) in ss.sessions.probe_variables() {
+                    for (k, v) in vars.iter() {
+                        probes.push((format!("session {}.{}", id, k), v.clone()));
+                    }
+                }
+                // Scopes held by threads that are STILL RUNNING. Anything only
+                // they can reach is legitimately retained, not leaked — but it
+                // is invisible to the collector, so without this it reads as an
+                // unexplained orphan and sends the hunt down a blind alley.
+                for (n, v) in cfml_vm::live_body_roots() {
+                    probes.push((n, v));
+                }
+                if let Some(name) = vm.application_name() {
+                    if let Some(state) = ss.applications.get(name) {
+                        for (k, v) in state.config.iter() {
+                            probes.push((format!("app config.{}", k), v.clone()));
+                        }
+                    }
                 }
             }
         }

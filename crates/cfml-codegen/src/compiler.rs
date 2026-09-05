@@ -20,6 +20,13 @@ static NEXT_FILE_LOOP_ID: AtomicU32 = AtomicU32::new(0);
 static NEXT_GLOBAL_FN_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Allocate the next process-global function id.
+/// How many function ids have been handed out. Diagnostic only
+/// (`RUSTCFML_CACHE_CENSUS`): this counter only rises, so its per-reinit delta
+/// is a direct count of functions COMPILED by that reinit.
+pub fn global_fn_ids_issued() -> u32 {
+    NEXT_GLOBAL_FN_ID.load(Ordering::Relaxed)
+}
+
 pub fn next_global_fn_id() -> u32 {
     NEXT_GLOBAL_FN_ID.fetch_add(1, Ordering::Relaxed)
 }

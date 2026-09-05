@@ -364,6 +364,16 @@ impl CfmlNative for CompletionQueueNative {
         "CompletionQueue"
     }
 
+    /// The queued futures reference whatever their tasks were submitted
+    /// against, so the collector must see them. Without this the default no-op
+    /// applies and every pending future reads as externally owned, pinning its
+    /// whole object graph (see `CfmlNative::visit_values`).
+    fn visit_values(&self, f: &mut dyn FnMut(&CfmlValue)) {
+        for v in &self.pending {
+            f(v);
+        }
+    }
+
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         match name.to_ascii_lowercase().as_str() {
             "add" => {

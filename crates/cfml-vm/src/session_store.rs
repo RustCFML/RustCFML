@@ -68,6 +68,20 @@ pub trait SessionStore: Send + Sync + 'static {
         None
     }
 
+    /// Every live session's `variables`, for diagnostics only.
+    ///
+    /// The session store is a persistent root the collector cannot see: the
+    /// in-process store holds LIVE object references (a CFC put in `session` is
+    /// the real instance, not a copy — see `persists_by_serialization`), so a
+    /// session created under one application generation keeps that generation
+    /// reachable. Without this the request loop can only probe the application
+    /// and server scopes, and anything a session holds shows up as an orphan
+    /// with an unexplained external refcount. Default is empty so serializing
+    /// stores — which cannot hold live references anyway — opt out for free.
+    fn probe_variables(&self) -> Vec<(String, ValueMap)> {
+        Vec::new()
+    }
+
     /// Whether this store persists session data by SERIALIZING it (an external
     /// store: memcached, datasource, KV, cluster). Serializing stores can only
     /// hold plain data — a live CFC / closure / native object cannot survive the
@@ -123,6 +137,16 @@ impl Default for MemoryStore {
 }
 
 impl SessionStore for MemoryStore {
+    fn probe_variables(&self) -> Vec<(String, ValueMap)> {
+        match self.inner.lock() {
+            Ok(g) => g
+                .iter()
+                .map(|(k, d)| (id_from_key(k).to_string(), d.variables.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn get(&self, app: &str, id: &str) -> Option<SessionData> {
         // Read-path exactness (G1): a session is invisible the instant it is
         // past `last_accessed + timeout`, independent of any sweep. Remove the

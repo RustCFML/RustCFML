@@ -72,6 +72,18 @@ impl Name {
         name
     }
 
+    /// Number of distinct spellings currently interned. Diagnostic only
+    /// (`RUSTCFML_CACHE_CENSUS`): the interner is process-lifetime and never
+    /// pruned, so a count that climbs across identical workloads means something
+    /// is interning DYNAMIC strings, which this table can never give back.
+    pub fn interned_count() -> usize {
+        INTERNER
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|m| m.len()))
+            .unwrap_or(0)
+    }
+
     fn new_unshared(s: &str) -> Name {
         let lower = if s.bytes().any(|b| b.is_ascii_uppercase()) || s.chars().any(|c| !c.is_ascii())
         {

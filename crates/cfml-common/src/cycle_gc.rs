@@ -44,7 +44,9 @@
 //! share `application`/`request` scope by Arc — the VM caller MUST skip
 //! collection while `live_threads` is non-empty. See `CYCLE_GC_PLAN.md`.
 
-use crate::dynamic::{CfmlQueryData, CfmlValue, StructInner, ValueMap};
+use crate::dynamic::{
+    CfmlClosureBody, CfmlFunction, CfmlQueryData, CfmlStatement, CfmlValue, StructInner, ValueMap,
+};
 #[cfg(feature = "component-instance")]
 use crate::component::Instance;
 use parking_lot::RwLock as PlRwLock;
@@ -696,6 +698,81 @@ impl NodeHandle {
 /// (Component/Closure boxes, QueryColumn) are descended into, since they are not
 /// separately collectible. `NativeObject` is opaque and treated as an external
 /// owner (anything it holds stays protected — conservative, never over-collects).
+/// One-line shape of a value, for the diagnostic reports only.
+/// Diagnostic tally of nodes the pass could not lock. A `try_read` that fails
+/// makes the pass SKIP that node's outgoing edges, which inflates its children's
+/// external count and pins them — conservative, but a leak. Counted so "is lock
+/// contention pinning the graph?" is answerable instead of arguable.
+static LOCK_SKIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn note_lock_skip() {
+    LOCK_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn describe_value(v: &CfmlValue) -> String {
+    match v {
+        CfmlValue::Struct(s) => {
+            let keys: Vec<String> = s
+                .with_read(|m| m.keys().take(5).map(|k| k.to_string()).collect());
+            format!("Struct [{}]", keys.join(", "))
+        }
+        CfmlValue::Array(a) => format!("Array len={}", a.with_read(|x| x.len())),
+        CfmlValue::Function(f) => format!("Function {}", f.name),
+        CfmlValue::Closure(_) => "Closure".to_string(),
+        CfmlValue::Query(_) => "Query".to_string(),
+        CfmlValue::NativeObject(n) => n
+            .read()
+            .map(|g| format!("Native {}", g.class_name()))
+            .unwrap_or_else(|_| "Native <locked>".to_string()),
+        CfmlValue::String(s) => format!("String {:?}", &s.chars().take(40).collect::<String>()),
+        other => format!("{:?}", std::mem::discriminant(other)),
+    }
+}
+
+/// Emit the edges a function-like body carries.
+///
+/// `CfmlClosureBody` is not a leaf: both of its arms hold `CfmlValue`s, and a
+/// `Statements` body holds one per statement. A body is therefore a perfectly
+/// ordinary edge into the tracked graph, and leaving it out means anything
+/// reachable ONLY through a function body reads as externally owned — a pinned
+/// root whose whole transitive closure is then marked live. Walked from
+/// [`classify`] so the count phase and the mark phase descend identically (the
+/// invariant that keeps over-counting `internal_in` safe).
+fn classify_body(body: &CfmlClosureBody, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
+    match body {
+        CfmlClosureBody::Expression(v) => classify(v, in_set, emit),
+        CfmlClosureBody::Statements(sts) => {
+            for st in sts {
+                match st {
+                    CfmlStatement::Expression(v) | CfmlStatement::Assignment(_, v) => {
+                        classify(v, in_set, emit)
+                    }
+                    CfmlStatement::Return(Some(v)) => classify(v, in_set, emit),
+                    CfmlStatement::Return(None) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Emit the edges a `CfmlFunction` carries: its captured scope, its DEFAULT
+/// PARAMETER VALUES (`CfmlParam::default` is a `CfmlValue` like any other) and
+/// its body. All three were previously invisible except the scope.
+fn classify_function(f: &CfmlFunction, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
+    if let Some(sc) = &f.captured_scope {
+        let p = Arc::as_ptr(sc) as *const () as usize;
+        if in_set.contains(&p) {
+            emit(p);
+        }
+    }
+    for prm in &f.params {
+        if let Some(d) = &prm.default {
+            classify(d, in_set, emit);
+        }
+    }
+    classify_body(&f.body, in_set, emit);
+}
+
 fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
     match v {
         CfmlValue::Struct(s) => {
@@ -716,31 +793,20 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
                 emit(p);
             }
         }
-        CfmlValue::Function(f) => {
-            if let Some(sc) = &f.captured_scope {
-                let p = Arc::as_ptr(sc) as *const () as usize;
-                if in_set.contains(&p) {
-                    emit(p);
-                }
-            }
-        }
+        CfmlValue::Function(f) => classify_function(f, in_set, emit),
         CfmlValue::Component(c) => {
             for pv in c.properties.values() {
                 classify(pv, in_set, emit);
             }
             for m in c.methods.values() {
-                if let Some(sc) = &m.captured_scope {
-                    let p = Arc::as_ptr(sc) as *const () as usize;
-                    if in_set.contains(&p) {
-                        emit(p);
-                    }
-                }
+                classify_function(m, in_set, emit);
             }
         }
         CfmlValue::Closure(c) => {
             for cv in c.captured_vars.values() {
                 classify(cv, in_set, emit);
             }
+            classify_body(&c.body, in_set, emit);
         }
         CfmlValue::QueryColumn(col, _) => {
             for cv in col.iter() {
@@ -1022,12 +1088,41 @@ static PERSISTENT: parking_lot::Mutex<Option<PersistentSet>> = parking_lot::Mute
 /// restoring the drop-on-request-end behaviour).
 const PERSISTENT_BASE_DEFAULT: usize = 50_000;
 
+thread_local! {
+    /// True only while [`sweep_entries`] is running. The orphan-sweep experiment
+    /// must apply ONLY there: a request-end or mid-request pass runs while the
+    /// probe roots are stale (they are installed at the END of a request) and
+    /// while the running request's own locals — which no probe covers — are
+    /// live, so suppressing unreachable roots in those passes frees data that is
+    /// genuinely in use.
+    static IN_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Diagnostic: sweep the cross-request set at EVERY request end instead of on
 /// the doubling rule (`RUSTCFML_GC_PERSISTENT_ALWAYS=1`). The budget exists so a
 /// steady-state request pays nothing, which is right for production and wrong
 /// for answering "is this reload's generation being reclaimed or pinned?" — with
 /// this on, every request prints its own reclaimed/still-tracked line, and
 /// pairing it with `RUSTCFML_GC_ROOTS=N` names whatever is doing the pinning.
+/// Diagnostic: `RUSTCFML_GC_UNREACHABLE_REPORT=1`. During a cross-request sweep,
+/// list (by shape) every survivor that NO installed probe root can reach. It
+/// touches nothing.
+///
+/// Why it exists: a dead generation that will not collect shows its hub objects
+/// with a small external refcount surplus and no visible holder. Two different
+/// defects produce that picture — a holder the walk cannot see (the Preside
+/// reload case: allocations made on cfthreads were never logged), or an edge
+/// type the walk cannot follow. This report separates them: anything the engine
+/// still USES that appears here is reachable in reality but not by our walk.
+/// An earlier variant also SUPPRESSED those roots to test the hypothesis; that
+/// mode is gone, because the probes do not enumerate every legitimate root (a
+/// running request's frame, for one) and it freed live data.
+fn unreachable_report() -> bool {
+    use std::sync::OnceLock;
+    static O: OnceLock<bool> = OnceLock::new();
+    *O.get_or_init(|| std::env::var("RUSTCFML_GC_UNREACHABLE_REPORT").is_ok())
+}
+
 fn persistent_always() -> bool {
     use std::sync::OnceLock;
     static A: OnceLock<bool> = OnceLock::new();
@@ -1128,7 +1223,9 @@ pub fn sweep_persistent() -> usize {
 /// safe against concurrent requests.
 fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
     let mut still_live: Vec<(usize, TrackedAlloc)> = Vec::new();
+    IN_SWEEP.with(|c| c.set(true));
     let reclaimed = collect_from_log_carrying(entries, Some(&mut still_live));
+    IN_SWEEP.with(|c| c.set(false));
     let live_count = still_live.len();
     {
         let mut guard = PERSISTENT.lock();
@@ -1231,10 +1328,13 @@ fn collect_from_log_carrying(
         let mut bps = HashMap::new();
         for h in nodes.values() {
             if let NodeHandle::Instance(a) = h {
-                if let Some(g) = a.try_read() {
-                    let bp = g.class.clone();
-                    bps.entry(Arc::as_ptr(&bp) as *const () as usize)
-                        .or_insert(bp);
+                match a.try_read() {
+                    Some(g) => {
+                        let bp = g.class.clone();
+                        bps.entry(Arc::as_ptr(&bp) as *const () as usize)
+                            .or_insert(bp);
+                    }
+                    None => note_lock_skip(),
                 }
             }
         }
@@ -1252,13 +1352,39 @@ fn collect_from_log_carrying(
     let method_tables: HashMap<usize, Arc<ValueMap>> = {
         let mut t = HashMap::new();
         for h in nodes.values() {
-            if let NodeHandle::Struct(a) = h {
-                if let Some(g) = a.try_read() {
-                    if let Some(mt) = g.method_table.as_ref() {
-                        t.entry(Arc::as_ptr(mt) as *const () as usize)
-                            .or_insert_with(|| Arc::clone(mt));
+            match h {
+                NodeHandle::Struct(a) => match a.try_read() {
+                    Some(g) => {
+                        if let Some(mt) = g.method_table.as_ref() {
+                            t.entry(Arc::as_ptr(mt) as *const () as usize)
+                                .or_insert_with(|| Arc::clone(mt));
+                        }
                     }
-                }
+                    None => note_lock_skip(),
+                },
+                // A flyweight Instance's data maps carry the SAME per-class
+                // method table, and they are usually UNTRACKED — so gathering
+                // tables only from tracked `Struct` nodes misses every instance
+                // whose scopes were partitioned into plain data maps, which is
+                // the common case. The table's entries are `CfmlFunction`s whose
+                // captured scopes reach back into the instance graph; left
+                // uncounted those scopes read as externally owned, become pinned
+                // roots, and mark the whole generation live. Deduplicated by Arc
+                // identity with the Struct-sourced ones, so a table reachable
+                // both ways is still counted exactly once.
+                #[cfg(feature = "component-instance")]
+                NodeHandle::Instance(a) => match a.try_read() {
+                    Some(g) => {
+                        for m in [g.public_map_handle(), g.private_map_handle()] {
+                            if let Some(mt) = m.method_table() {
+                                t.entry(Arc::as_ptr(&mt) as *const () as usize)
+                                    .or_insert(mt);
+                            }
+                        }
+                    }
+                    None => note_lock_skip(),
+                },
+                _ => {}
             }
         }
         t
@@ -1299,6 +1425,63 @@ fn collect_from_log_carrying(
             if let Some(g) = a.try_read() {
                 let p = Arc::as_ptr(&g.class) as *const () as usize;
                 *bp_internal.entry(p).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Probe reachability computed UP FRONT, but only for the
+    // unreachable report (see `unreachable_report`), which needs it before roots
+    // are chosen rather than after the mark.
+    if unreachable_report() && IN_SWEEP.with(|c| c.get()) {
+        let probes = PROBE_ROOT.lock().clone();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for (_, pr) in probes.iter() {
+            classify(pr, &in_set, &mut |c| {
+                if seen.insert(c) {
+                    stack.push(c);
+                }
+            });
+        }
+        while let Some(p) = stack.pop() {
+            if let Some(h) = nodes.get(&p) {
+                h.for_each_child_node(&in_set, &mut |c| {
+                    if seen.insert(c) {
+                        stack.push(c);
+                    }
+                });
+                #[cfg(feature = "component-instance")]
+                if let NodeHandle::Instance(a) = h {
+                    if let Some(bp) = a.try_read().map(|g| g.class.clone()) {
+                        blueprint_values(&bp, |v| {
+                            classify(v, &in_set, &mut |c| {
+                                if seen.insert(c) {
+                                    stack.push(c);
+                                }
+                            })
+                        });
+                    }
+                }
+            }
+        }
+        {
+            let mut would: HashMap<String, usize> = HashMap::new();
+            for (&p, h) in &nodes {
+                if !seen.contains(&p) {
+                    *would.entry(h.describe()).or_insert(0) += 1;
+                }
+            }
+            let mut v: Vec<(String, usize)> = would.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: usize = v.iter().map(|(_, n)| *n).sum();
+            eprintln!(
+                "[cycle_gc] UNREACHABLE-FROM-PROBES ({} node(s)) — anything the \
+                 engine still USES in this list is reached by an edge our walk \
+                 cannot follow:",
+                total
+            );
+            for (d, n) in v.iter().filter(|(d, _)| d.starts_with("Instance")).take(30) {
+                eprintln!("    n={:<5} {}", n, d);
             }
         }
     }
@@ -1484,17 +1667,39 @@ fn collect_from_log_carrying(
                     }
                 }
             }
-            // A live component scope makes its shared method table live too.
+            // A live component scope makes its shared method table live too —
+            // whether that scope is a tracked Struct node or one of a live
+            // Instance's untracked data maps (the mirror of how the tables are
+            // gathered for `internal_in`; the two walks must agree or the mark
+            // phase under-marks exactly what the count over-charged).
+            let mut mark_table = |mt: Arc<ValueMap>,
+                                  live: &mut HashSet<usize>,
+                                  worklist: &mut Vec<usize>| {
+                if live_tables.insert(Arc::as_ptr(&mt) as *const () as usize) {
+                    for v in mt.values() {
+                        classify(v, &in_set, &mut |child| {
+                            if live.insert(child) {
+                                worklist.push(child);
+                            }
+                        });
+                    }
+                }
+            };
             if let NodeHandle::Struct(a) = h {
                 let mt = a.try_read().and_then(|g| g.method_table.clone());
                 if let Some(mt) = mt {
-                    if live_tables.insert(Arc::as_ptr(&mt) as *const () as usize) {
-                        for v in mt.values() {
-                            classify(v, &in_set, &mut |child| {
-                                if live.insert(child) {
-                                    worklist.push(child);
-                                }
-                            });
+                    mark_table(mt, &mut live, &mut worklist);
+                }
+            }
+            #[cfg(feature = "component-instance")]
+            if let NodeHandle::Instance(a) = h {
+                let maps = a
+                    .try_read()
+                    .map(|g| (g.public_map_handle(), g.private_map_handle()));
+                if let Some((this_m, vars_m)) = maps {
+                    for m in [this_m, vars_m] {
+                        if let Some(mt) = m.method_table() {
+                            mark_table(mt, &mut live, &mut worklist);
                         }
                     }
                 }
@@ -1660,6 +1865,140 @@ fn collect_from_log_carrying(
                 }
             }
         }
+        // THE UNHELD SET. The ranked anchor list above is ordered by how much
+        // each node RETAINS, which is dominated by whichever few nodes sit near
+        // the top of a generation's object graph — and those are held by other
+        // dead nodes, so chasing them is chasing downstream symptoms. The nodes
+        // that actually keep a dead generation alive are the ones carrying an
+        // external reference that NO tracked node accounts for: something in
+        // Rust owns an `Arc` the collector cannot see, so trial deletion can
+        // never zero them. This lists exactly that set, complete and grouped by
+        // shape rather than truncated to a top-N, because the whole question is
+        // how many distinct carriers there are and what they look like.
+        if !probe_reachable.is_empty() {
+            let mut tracked_holders: HashSet<usize> = HashSet::new();
+            for h in nodes.values() {
+                h.for_each_child_node(&in_set, &mut |child| {
+                    tracked_holders.insert(child);
+                });
+            }
+            #[cfg(feature = "component-instance")]
+            for bp in blueprints.values() {
+                blueprint_values(bp, |v| {
+                    classify(v, &in_set, &mut |c| {
+                        tracked_holders.insert(c);
+                    })
+                });
+            }
+            for mt in method_tables.values() {
+                for v in mt.values() {
+                    classify(v, &in_set, &mut |c| {
+                        tracked_holders.insert(c);
+                    })
+                }
+            }
+            let mut unheld: HashMap<String, (usize, usize)> = HashMap::new();
+            for (&p, h) in &nodes {
+                if probe_reachable.contains(&p) || tracked_holders.contains(&p) {
+                    continue;
+                }
+                let ext = root_ext.get(&p).copied().unwrap_or(0);
+                if ext == 0 {
+                    continue;
+                }
+                // An `Array len=1` tells you nothing about which array it is.
+                // Group by the shape of what it CONTAINS as well, because that
+                // is what identifies the carrier in engine terms.
+                let inner = match h {
+                    NodeHandle::Array(x) => x
+                        .read()
+                        .iter()
+                        .take(4)
+                        .map(describe_value)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    NodeHandle::Struct(x) => x
+                        .read()
+                        .map
+                        .values()
+                        .next()
+                        .map(describe_value)
+                        .unwrap_or_else(|| "<empty>".to_string()),
+                    _ => String::new(),
+                };
+                let e = unheld
+                    .entry(format!("{}  -> [{}]", h.describe(), inner))
+                    .or_insert((0, 0));
+                e.0 += 1;
+                e.1 += ext;
+            }
+            // How big is the pinned set, and how much of it carries an external
+            // reference at all? If only a handful of orphans report `ext > 0`
+            // the generation is pinned by those few and they are the whole
+            // hunt; if nearly ALL of them do, `internal_in` is undercounting
+            // and the bug is in the edge walk, not in some carrier.
+            let orphan_total = nodes.keys().filter(|p| !probe_reachable.contains(p)).count();
+            let orphan_ext = nodes
+                .keys()
+                .filter(|p| {
+                    !probe_reachable.contains(p) && root_ext.get(*p).copied().unwrap_or(0) > 0
+                })
+                .count();
+            eprintln!(
+                "[cycle_gc] lock skips this pass: {}",
+                LOCK_SKIPS.swap(0, std::sync::atomic::Ordering::Relaxed)
+            );
+            eprintln!(
+                "[cycle_gc] orphans: {} unreachable from any probe, {} of them carry \
+                 an external ref ({} have none)",
+                orphan_total,
+                orphan_ext,
+                orphan_total - orphan_ext
+            );
+            // The complement of the UNHELD set: orphan roots that DO have a
+            // tracked holder yet still report an external reference. These are
+            // the ones whose arithmetic does not close — `strong_count` exceeds
+            // `1 + internal_in` — so something outside every walked carrier owns
+            // them, and their transitive closure is what marks a dead generation
+            // live. Listed COMPLETE, not top-N: the set is small and the whole
+            // question is what is in it.
+            let mut held: HashMap<String, (usize, usize)> = HashMap::new();
+            for (&p, h) in &nodes {
+                if probe_reachable.contains(&p) || !tracked_holders.contains(&p) {
+                    continue;
+                }
+                let ext = root_ext.get(&p).copied().unwrap_or(0);
+                if ext == 0 {
+                    continue;
+                }
+                let e = held.entry(h.describe()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += ext;
+            }
+            let mut hv: Vec<(String, (usize, usize))> = held.into_iter().collect();
+            hv.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            let htotal: usize = hv.iter().map(|(_, (n, _))| *n).sum();
+            eprintln!(
+                "[cycle_gc] HELD-BUT-EXTERNAL orphans — tracked holder AND an \
+                 unaccounted external ref ({} node(s)):",
+                htotal
+            );
+            for (desc, (n, ext)) in hv.iter().take(60) {
+                eprintln!("    n={:<5} ext={:<5} {}", n, ext, desc);
+            }
+            let mut v: Vec<(String, (usize, usize))> = unheld.into_iter().collect();
+            v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            let total: usize = v.iter().map(|(_, (n, _))| *n).sum();
+            eprintln!(
+                "[cycle_gc] UNHELD orphans — external ref, no tracked holder \
+                 ({} node(s), {} shape(s)):",
+                total,
+                v.len()
+            );
+            for (desc, (n, ext)) in v.into_iter().take(25) {
+                eprintln!("    n={:<6} ext={:<6} {}", n, ext, desc);
+            }
+        }
         if !anchors.is_empty() {
             eprintln!(
                 "[cycle_gc] ORPHAN anchors — retained but unreachable from any \
@@ -1681,9 +2020,15 @@ fn collect_from_log_carrying(
                         }
                         let mut v: Vec<(&&str, &usize)> = counts.iter().collect();
                         v.sort_by(|a, b| b.1.cmp(a.1));
-                        for (desc, c) in v.into_iter().take(3) {
+                        let shown: usize = v.iter().map(|(_, c)| **c).sum();
+                        for (desc, c) in v.iter().take(12) {
                             eprintln!("        held by x{:<4} {}", c, desc);
                         }
+                        eprintln!(
+                            "        -> {} tracked holder edge(s) in total from {} distinct shape(s)",
+                            shown,
+                            v.len()
+                        );
                     }
                     None => {
                         eprintln!("        held by      <nothing tracked — Rust-side state>")

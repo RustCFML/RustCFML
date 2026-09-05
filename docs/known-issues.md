@@ -1886,3 +1886,58 @@ carried live on as `crates/cfml-vm/tests/numeric_semantics.rs`.
 frames and member access, not arithmetic — see
 `docs/inline-caches-plan.md` for the one idea worth taking from the JIT
 (inline caches for member reads), sized against the interpreter instead.
+
+## 78. Allocations made on a `cfthread` were invisible to the cycle collector (fixed v0.653.3) 📌
+
+**Symptom.** Preside `?fwreinit=true` retained ~110 MB and exactly ~111,000
+tracked nodes per reload — 1.0 G → 1.9 G over eight reloads, linear, never
+reclaimed. The cross-request sweep walked every dead generation and freed ~1,500
+nodes of it. Every hub object of a dead generation (the WireBox `Injector`,
+`LogBox`, `Controller`, `Logger`) read `strong_count = 1 + internal_in + 1..26`:
+a small refcount surplus that no tracked holder, blueprint, method table,
+native, thread, VM, cache, session or app-config entry accounted for. The
+surplus was real — an experiment that ignored it made memory flat and broke the
+next reload with `Variable 'siteTemplate' is undefined`.
+
+**Cause.** The collector's allocation log is **thread-local**, armed per thread by
+`cycle_gc::enable()`, and only the request path (`compile_and_run`) ever called
+it. `spawn_cfthread` never did. So `log_struct`/`log_array`/`log_scope` were
+no-ops on every spawned thread, and nothing a cfthread allocated was in any
+survivor set. Two consequences: a cycle built on a thread could never be freed,
+and — the one that mattered — every reference such an allocation held read to the
+collector as EXTERNAL ownership of its target, pinning the target's whole
+transitive closure. Preside's reload spawns ~37 threads (task manager,
+heartbeats, log listeners, module loaders) whose products land in the
+application graph, so each generation's singletons carried a few invisible
+holders and the whole generation stayed live.
+
+**Fix.** `spawn_cfthread` now arms the log before the body and, when the body
+returns, either `collect()`s (carrying survivors into the cross-request set) or
+`defer_current_log` if a nested cfthread is still running — the same contract as
+the request path. Measured: the sweep now reclaims whole generations
+(112,333 / 112,336 / 341,512 in one pass under the production doubling rule);
+tracked nodes oscillate between one and three generations instead of doubling;
+footprint holds at 1.1–1.3 G over eleven reloads. Regression test:
+`crates/cli/tests/thread_alloc_gc.rs` (verified non-vacuous).
+
+**Also closed on the way, all real gaps in the "the two walks must mirror"
+invariant, none of which moved the Preside number on its own:** the shared
+`method_table` reached through an Instance's untracked data maps is now counted
+and marked; `classify` walks function/closure bodies and `CfmlParam::default`;
+`CompletionQueueNative` implements `visit_values`; closure captured scopes are
+logged at creation (`log_scope` was previously only reached by the relog hook).
+
+**Diagnostics added (env-gated, off by default).** `RUSTCFML_CACHE_CENSUS=1`
+(sizes of every process-lifetime cache + live-VM count), `RUSTCFML_GC_ROOTS`
+now also reports `orphans: N unreachable, M carry an external ref`, the complete
+`HELD-BUT-EXTERNAL` / `UNHELD` orphan sets with contents, per-anchor total holder
+edges, lock skips, and probes for sessions, app config and running thread
+bodies. `RUSTCFML_GC_UNREACHABLE_REPORT=1` lists what no probe root can reach
+during a sweep (report only — an earlier suppressing variant freed live data and
+is gone).
+
+**Still true.** Under the production doubling rule the set is allowed to reach
+2× live before a sweep, so up to three generations coexist briefly and mimalloc
+keeps the high-water mark; that is the designed trade-off, not a leak. The
+`SHARED_FN_REGISTRY` Vec is indexed by a monotonic id and grows ~2 MB per reload
+in dead `Weak` slots — small, real, untouched.
