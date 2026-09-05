@@ -42,10 +42,9 @@ cfml-codegen = { path = "crates/cfml-codegen", version = "0.653.1" }
 # `default-features = false` here is what makes a member's own
 # `default-features = false` take effect at all: cargo IGNORES that key on an
 # inherited (`workspace = true`) dependency unless the workspace entry declares
-# it too, warning but building anyway. Without this, `cfml-vm`'s default `jit`
-# was unconditional — the CLI's `jit` feature was a no-op, `--no-default-features`
-# still linked all of Cranelift AND still ran the JIT, and `--jit-stats` said
-# "not built in" because that message sits behind the CLI crate's cfg.
+# it too, warning but building anyway. Without it a member's opt-out is silently
+# ignored and the crate's own defaults come back — which is how the CLI once
+# linked an entire optional backend it had explicitly disabled.
 # Members list the cfml-vm features they want explicitly.
 cfml-vm = { path = "crates/cfml-vm", version = "0.653.1", default-features = false }
 cfml-stdlib = { path = "crates/cfml-stdlib", version = "0.653.1", default-features = false }

@@ -42,7 +42,6 @@ OWNER_RULES = [
     ("query/database",          r"mysql|sqlx|postgres|tiberius|rusqlite|CfmlQuery|query_cache|QueryResult"),
     ("cache providers",         r"cfml_stdlib::cache|memcache|CacheProvider|ehcache"),
     ("QoQ",                     r"cfml_qoq"),
-    ("JIT",                     r"cranelift|jit::"),
     ("regex",                   r"regex|aho_corasick"),
     ("VFS/filesystem",          r"vfs::|std::fs::|canonicalize|read_to_string|DirEntry|read_dir"),
     ("logging",                 r"env_logger|cflog|log::__"),

@@ -1,6 +1,6 @@
 <cfscript>
 // Struct member access — the surface v0.91.0 (member ICs) will target.
-// Today's JIT can't enter a body that touches `obj.prop`. Baseline must
+// Member access dominates real CFML. Baseline must
 // stay flat or improve once Boxed ICs land.
 obj = { x: 1, y: 2, z: 3, w: 4 };
 total = 0;

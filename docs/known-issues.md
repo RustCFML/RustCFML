@@ -69,7 +69,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [12](#12) | Session storage, lazy sessions, expiry, cookies | 🏗/🌟 edges |
 | [13](#13) | `<cfoutput query>` / grouped output | 🏗 edges |
 | [14](#14) | `cfparam` `type=` validation | 🏗 edges |
-| [16](#16) | Sampling profiler vs JIT'd numeric leaves | 🏗 by design |
+| [16](#16) | Sampling profiler vs JIT'd numeric leaves | ✅ resolved (v0.653.0) |
 | [18](#18) | Image functions — not pixel-identical to Java2D | 🏗 edges |
 | [22](#22) | Within-request template freshness (GH #284) | 🏗 by design |
 | [26](#26) | Locale table is hand-maintained (GH #304) | 🏗 edges |

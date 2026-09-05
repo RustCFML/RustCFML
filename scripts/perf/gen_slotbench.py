@@ -22,7 +22,7 @@ WIDTH is swept because the hypothesis is that unslotted cost scales with the
 locals map: a slot read is an array index, a by-name read is a hash probe into
 a map that a real Preside frame fills far past what a microbench builds.
 
-Run with --no-jit: Preside admits ~0% and the JIT would compile these.
+Interpreter-only since v0.653.0 (the JIT was removed).
 """
 
 WIDTHS = [1, 4, 8, 16, 32, 64]

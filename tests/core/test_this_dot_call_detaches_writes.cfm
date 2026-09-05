@@ -42,8 +42,7 @@ suiteBegin("Core: this.-dot method call must not detach the frame's this binding
 //     pinned below as documented behaviour so a fix can't silently
 //     regress reference semantics for nested containers.
 //
-// The failure is JIT-independent (identical under RUSTCFML_JIT=0 and
-// RUSTCFML_JIT_THRESHOLD=1) and depth-independent (pure recursion to
+// The failure is depth-independent (pure recursion to
 // depth 200 without a dot-call stays green). The detach does not
 // propagate upward: caller writes after a poisoned callee returns are
 // fine, and a fresh method call on the same object sees true state.

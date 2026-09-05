@@ -60,8 +60,7 @@ off. Enable under `observability.profiler` (`docs/debugging.md`).
 - `GET /__rustcfml/profiler` — recent slow requests as JSON, in serve mode
 
 Use it when one request type is slow and you do not know which function is
-responsible. Caveat: time inside a JIT-compiled numeric leaf is attributed to its
-caller.
+responsible. Every frame is interpreted, so all of them are attributed.
 
 ## 3. Where the native time goes — `--profile`
 

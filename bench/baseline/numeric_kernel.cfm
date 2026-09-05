@@ -1,5 +1,5 @@
 <cfscript>
-// Pure-numeric kernel — Tier-1/Tier-1.5 + Option-A sweet spot. v0.86.0 JIT
+// Pure-numeric kernel — dense arithmetic, no member access. Historically the
 // should be ~100x faster than the interpreter here. Baseline for any
 // future polymorphic-rep change to compare against: this number must not
 // regress.

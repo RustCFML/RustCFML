@@ -3,7 +3,7 @@ suiteBegin("Arithmetic + on numeric strings");
 
 // CFML `+` is ARITHMETIC ONLY (`&` is concatenation). Two numeric strings must
 // ADD, not concatenate. RustCFML previously had a String+String fast path in
-// the Add op (and its JIT shim) that concatenated "2"+"1" → "21", inverting
+// the Add op that concatenated "2"+"1" → "21", inverting
 // Wheels' if/unless method-mixin validations (`stupid_mixin(a,b){return a+b}`).
 assert("two numeric strings add", "2" + "1", 3);
 assert("multi-digit numeric strings add", "20" + "13", 33);

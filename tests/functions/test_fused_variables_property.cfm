@@ -1,8 +1,8 @@
 <!--- In-function `variables.x` semantics, pinned (2026-08-22).
       Written for the 3B #3 LoadVariablesProperty fusion, which was BUILT, measured
-      ZERO on all four real workloads (+-0.5%), found to shrink JIT admission (the
-      translators handle the LoadLocal+GetProperty pair via member-IC shims but would
-      decline the fused op), and REVERTED. The assertions are lowering-independent and
+      ZERO on all four real workloads (+-0.5%) — though see docs/inline-caches-plan.md
+      on the null floor of that measurement — and REVERTED (it also shrank the
+      then-existing JIT's admission; that engine was removed in v0.653.0). The assertions are lowering-independent and
       stay: they pin CFC private-scope reads, method-table fall-through, page-scope UDF
       `variables`, mutation visibility, and the miss -> throw contract — plus the
       Lucee-verified parity note below. --->

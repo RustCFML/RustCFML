@@ -5,7 +5,7 @@
 the reconciliation failure is the finding."
 
 Counts: Step 0 op census, one warm Preside homepage render (213,966 ops).
-Costs:  Step 2 op bench, RustCFML --no-jit (Preside admits ~0% to the JIT, so
+Costs:  Step 2 op bench, RustCFML interpreter (figures predate v0.653.0, when
         the interpreted number is the honest one), net of an empty loop.
 """
 # op -> (count per warm render, ns each, how the cost was derived)
@@ -59,7 +59,7 @@ BIF_CALLS, BIF_MS = 8343, 1.4965           # directly measured by the BIF bench
 FRAMES = 8193                              # = Return count
 METHOD_CALLS = 3669 + 763
 UDF_CALLS = FRAMES - METHOD_CALLS
-NS_METHOD, NS_UDF = 268.1, 870.3           # --no-jit, empty callee, same empty-loop baseline
+NS_METHOD, NS_UDF = 268.1, 870.3           # interpreter, empty callee, same empty-loop baseline
 
 RENDER_MS_PGO = 20.7                       # roadmap baseline, PGO, warm homepage
 RENDER_CPU_MS = 18.9                       # 91% CPU-bound in-request
@@ -79,8 +79,8 @@ print(f"{'ORDINARY OPS':<20}{'':>8}{'':>8}{sub:>9.4f}\n")
 print(f"{'construct':<20}{'count':>8}{'ns':>8}{'ms':>9}  source")
 frames_ms = (METHOD_CALLS * NS_METHOD + UDF_CALLS * NS_UDF) / 1e6
 print(f"{'BIF calls':<20}{BIF_CALLS:>8}{BIF_MS*1e6/BIF_CALLS:>8.1f}{BIF_MS:>9.4f}  BIF bench, measured directly")
-print(f"{'CFC method frames':<20}{METHOD_CALLS:>8}{NS_METHOD:>8.1f}{METHOD_CALLS*NS_METHOD/1e6:>9.4f}  sibling() call, --no-jit")
-print(f"{'other UDF frames':<20}{UDF_CALLS:>8}{NS_UDF:>8.1f}{UDF_CALLS*NS_UDF/1e6:>9.4f}  page UDF call, --no-jit")
+print(f"{'CFC method frames':<20}{METHOD_CALLS:>8}{NS_METHOD:>8.1f}{METHOD_CALLS*NS_METHOD/1e6:>9.4f}  sibling() call")
+print(f"{'other UDF frames':<20}{UDF_CALLS:>8}{NS_UDF:>8.1f}{UDF_CALLS*NS_UDF/1e6:>9.4f}  page UDF call")
 total = sub + BIF_MS + frames_ms
 print(f"\n{'MODELLED TOTAL':<20}{'':>24}{total:>9.4f} ms")
 print(f"{'measured render':<20}{'':>24}{RENDER_MS_PGO:>9.4f} ms wall (PGO baseline)")

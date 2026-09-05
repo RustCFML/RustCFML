@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# JIT BASELINE — run all four workloads under interpreter + default JIT,
-# 3 trials each, report min wall-clock + speedup. Use as the reference
-# point for v0.88.0/v0.89.0/v0.90.0 perf claims.
+# KERNEL BASELINE — run all four workloads, 3 trials each, report min
+# wall-clock. Use as a reference point for engine perf claims.
+#
+# Was a JIT A/B (interpreter vs default) until v0.653.0 removed the JIT; the
+# kernels themselves remain useful as breadth benchmarks, so the harness now
+# just times them.
 #
 # Usage: from repo root,
 #   cargo build --release
@@ -14,21 +17,15 @@ BIN="$REPO_ROOT/target/release/rustcfml"
 
 bench_one() {
     local label="$1" file="$2"
-    local mins_off=99999 mins_on=99999 t
-    for i in 1 2 3; do
-        t=$(/usr/bin/time -p env RUSTCFML_JIT=0 "$BIN" "$file" 2>&1 >/dev/null | awk '/^real/{print $2}')
-        awk -v a="$t" -v b="$mins_off" 'BEGIN{ exit !(a<b) }' && mins_off="$t"
-    done
+    local best=99999 t
     for i in 1 2 3; do
         t=$(/usr/bin/time -p "$BIN" "$file" 2>&1 >/dev/null | awk '/^real/{print $2}')
-        awk -v a="$t" -v b="$mins_on" 'BEGIN{ exit !(a<b) }' && mins_on="$t"
+        awk -v a="$t" -v b="$best" 'BEGIN{ exit !(a<b) }' && best="$t"
     done
-    local speedup
-    speedup=$(awk -v a="$mins_off" -v b="$mins_on" 'BEGIN{ if (b>0) printf "%.2fx", a/b; else print "?" }')
-    printf "%-26s  interp %6ss   jit %6ss   %s\n" "$label" "$mins_off" "$mins_on" "$speedup"
+    printf "%-26s  %6ss (min of 3)\n" "$label" "$best"
 }
 
-echo "JIT BASELINE  $(date '+%Y-%m-%d %H:%M:%S')  $(cd "$REPO_ROOT" && git describe --tags --dirty 2>/dev/null || echo 'unknown')"
+echo "KERNEL BASELINE  $(date '+%Y-%m-%d %H:%M:%S')  $(cd "$REPO_ROOT" && git describe --tags --dirty 2>/dev/null || echo 'unknown')"
 echo "==================================================================="
 bench_one "numeric_kernel"        "$REPO_ROOT/bench/baseline/numeric_kernel.cfm"
 bench_one "udf_call_graph"        "$REPO_ROOT/bench/baseline/udf_call_graph.cfm"
