@@ -1042,6 +1042,67 @@ impl CfmlValue {
                         priv_m.with_read(|m| m.values().for_each(|c| stack.push(c.clone())));
                     }
                 }
+                CfmlValue::Query(q) => {
+                    if !seen.insert(Arc::as_ptr(&q.0) as *const () as usize) {
+                        continue;
+                    }
+                    budget -= 1;
+                    crate::cycle_gc::log_query(&q.0);
+                    let g = q.0.read();
+                    for col in &g.data {
+                        col.iter().for_each(|c| stack.push(c.clone()));
+                    }
+                }
+                // A closure's captured scope is its OWN collectible node type
+                // (`TrackedAlloc::Scope`), and the collector treats it exactly
+                // like a Struct: terminal in `classify`, walked as a survivor in
+                // its own right. Entering the struct that holds a closure but not
+                // the scope the closure captured is worse than entering neither —
+                // the un-entered scope's reference to the struct reads as
+                // EXTERNAL ownership, so the whole graph is pinned live. That is
+                // the shape a DI container has (WireBox wires providers and
+                // listeners as closures over the injector), and it is why the
+                // relog hook alone did not reclaim Preside's displaced graph.
+                CfmlValue::Function(f) => {
+                    if let Some(sc) = &f.captured_scope {
+                        if !seen.insert(Arc::as_ptr(sc) as *const () as usize) {
+                            continue;
+                        }
+                        budget -= 1;
+                        crate::cycle_gc::log_scope(sc);
+                        if let Ok(g) = sc.read() {
+                            g.values().for_each(|c| stack.push(c.clone()));
+                        }
+                    }
+                }
+                // Marker-path component: not a node itself (no shared backing of
+                // its own), so descend into the parts that can carry nodes —
+                // mirroring `cycle_gc::classify`.
+                CfmlValue::Component(c) => {
+                    for pv in c.properties.values() {
+                        stack.push(pv.clone());
+                    }
+                    for m in c.methods.values() {
+                        if let Some(sc) = &m.captured_scope {
+                            if !seen.insert(Arc::as_ptr(sc) as *const () as usize) {
+                                continue;
+                            }
+                            budget -= 1;
+                            crate::cycle_gc::log_scope(sc);
+                            if let Ok(g) = sc.read() {
+                                g.values().for_each(|c| stack.push(c.clone()));
+                            }
+                        }
+                    }
+                }
+                CfmlValue::Closure(c) => {
+                    for cv in c.captured_vars.values() {
+                        stack.push(cv.clone());
+                    }
+                }
+                CfmlValue::QueryColumn(col, _) => {
+                    col.iter().for_each(|c| stack.push(c.clone()));
+                }
                 _ => {}
             }
         }

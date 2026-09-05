@@ -436,6 +436,20 @@ pub fn log_instance(arc: &Arc<PlRwLock<Instance>>) {
     }
 }
 
+/// Track an ALREADY-ALLOCATED closure-capture scope as a cycle node. Sibling of
+/// [`log_struct`] / [`log_array`] for the one node type that has no constructor
+/// of its own here — [`tracked_scope`] allocates and logs in one step, but a
+/// scope reached by walking an existing graph (see
+/// [`CfmlValue::relog_cycle_nodes`](crate::dynamic::CfmlValue::relog_cycle_nodes))
+/// must be entered after the fact. Logging the same scope twice is harmless: the
+/// collector de-duplicates survivors by backing pointer.
+#[inline]
+pub fn log_scope(arc: &Arc<RwLock<ValueMap>>) {
+    if is_armed() {
+        log_push(TrackedAlloc::Scope(Arc::downgrade(arc)));
+    }
+}
+
 /// Allocate a closure-capture scope, tracking it as a cycle node. Use this in
 /// place of `Arc::new(RwLock::new(map))` for every `captured_scope`/`closure_env`
 /// so closure↔scope cycles are reclaimable.
