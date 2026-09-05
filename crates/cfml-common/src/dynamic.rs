@@ -1157,7 +1157,7 @@ impl CfmlStruct {
         crate::perf_counters::bump(&crate::perf_counters::STRUCT_NEW_UNTRACKED);
         #[cfg(feature = "alloc-sizing")]
         crate::perf_counters::alloc_sites::record(false);
-        CfmlStruct(Arc::new(PlRwLock::new(StructInner {
+        let arc = Arc::new(PlRwLock::new(StructInner {
             map: m,
             shape_id: next_shape_id(),
             read_only: false,
@@ -1166,7 +1166,15 @@ impl CfmlStruct {
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
             method_table: None,
-        })))
+        }));
+        // Diagnostics only: `RUSTCFML_GC_TRACK_ALL=1` makes even the deliberately
+        // untracked allocations visible, so a pinned root's holder can be NAMED
+        // instead of reported as an anonymous external reference. Off by default,
+        // and the check is one cached bool.
+        if crate::cycle_gc::track_all() {
+            crate::cycle_gc::log_struct(&arc);
+        }
+        CfmlStruct(arc)
     }
 
     /// Marks this struct as one CFML code may read but not write (GitHub #372).

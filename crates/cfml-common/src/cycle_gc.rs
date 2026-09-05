@@ -417,6 +417,22 @@ pub fn drain_top_sites(k: usize) -> Option<Vec<(String, usize)>> {
 // --- Allocation hooks (called from the container constructors) ---------------
 // Each is gated by `is_armed()` so the disarmed path is a single relaxed load.
 
+/// Diagnostic: `RUSTCFML_GC_TRACK_ALL=1` logs even the allocations that are
+/// DELIBERATELY untracked ([`crate::dynamic::CfmlStruct::new_untracked`] and the
+/// component data maps).
+///
+/// Those are untracked for good reasons — they cannot escape their frame, or they
+/// are owned solely by an `Instance` Arc — and leaving them out is what keeps the
+/// collector's hot path cheap. But it also makes them INVISIBLE as holders: a
+/// pinned root reports `external = 1` with no way to say what the 1 is, because
+/// the holder is not a node. Turning them all on trades throughput for the
+/// ability to name that holder, which is exactly the trade a leak hunt wants.
+pub fn track_all() -> bool {
+    use std::sync::OnceLock;
+    static A: OnceLock<bool> = OnceLock::new();
+    *A.get_or_init(|| std::env::var("RUSTCFML_GC_TRACK_ALL").is_ok())
+}
+
 #[inline]
 pub fn log_struct(arc: &Arc<PlRwLock<StructInner>>) {
     if is_armed() {
@@ -1576,6 +1592,57 @@ fn collect_from_log_carrying(
             "[cycle_gc] top retainers (nodes kept alive, of {} live):",
             live.len()
         );
+        // WHO HOLDS IT. A pinned root reports `external > 0`; this names the
+        // survivors that actually reference it, which is the question every round
+        // of a leak hunt ends on. Reverse edges are built ONLY for the top
+        // retainers (one extra pass over the graph, under the flag), because a
+        // full reverse index of a 450k-node graph is not worth building to answer
+        // a question about ten nodes.
+        //
+        // A root whose holders are listed here is held by TRACKED data; a root
+        // that reports none is held by something outside the collector's world —
+        // Rust-side state, or an allocation deliberately excluded from the log
+        // (run again with `RUSTCFML_GC_TRACK_ALL=1` to make those visible too).
+        let targets: HashSet<usize> = retention
+            .iter()
+            .take(root_debug)
+            .map(|(_, r)| *r)
+            .collect();
+        let mut holders: HashMap<usize, Vec<String>> = HashMap::new();
+        if !targets.is_empty() {
+            for (&p, h) in &nodes {
+                h.for_each_child_node(&in_set, &mut |child| {
+                    if targets.contains(&child) {
+                        holders.entry(child).or_default().push(
+                            nodes.get(&p).map(|n| n.describe()).unwrap_or_default(),
+                        );
+                    }
+                });
+            }
+            #[cfg(feature = "component-instance")]
+            for bp in blueprints.values() {
+                let name = format!("ClassBlueprint of {}", bp.name);
+                blueprint_values(bp, |v| {
+                    classify(v, &in_set, &mut |child| {
+                        if targets.contains(&child) {
+                            holders.entry(child).or_default().push(name.clone());
+                        }
+                    })
+                });
+            }
+            for mt in method_tables.values() {
+                for v in mt.values() {
+                    classify(v, &in_set, &mut |child| {
+                        if targets.contains(&child) {
+                            holders
+                                .entry(child)
+                                .or_default()
+                                .push("shared method table".to_string());
+                        }
+                    });
+                }
+            }
+        }
         for (n, r) in retention.iter().take(root_debug) {
             let what = nodes.get(r).map(|h| h.describe()).unwrap_or_default();
             let strong = nodes.get(r).map(|h| h.strong_count()).unwrap_or(0);
@@ -1588,6 +1655,23 @@ fn collect_from_log_carrying(
                 internal,
                 what
             );
+            match holders.get(r) {
+                Some(hs) => {
+                    let mut counts: HashMap<&str, usize> = HashMap::new();
+                    for h in hs {
+                        *counts.entry(h.as_str()).or_insert(0) += 1;
+                    }
+                    let mut v: Vec<(&&str, &usize)> = counts.iter().collect();
+                    v.sort_by(|a, b| b.1.cmp(a.1));
+                    for (desc, c) in v.into_iter().take(4) {
+                        eprintln!("        held by x{:<4} {}", c, desc);
+                    }
+                }
+                None => eprintln!(
+                    "        held by      <nothing tracked — Rust-side state, or an \
+                     untracked allocation; retry with RUSTCFML_GC_TRACK_ALL=1>"
+                ),
+            }
         }
     }
     let survivors = nodes.len();

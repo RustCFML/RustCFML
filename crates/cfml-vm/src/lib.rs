@@ -2985,6 +2985,104 @@ pub struct ThreadResult {
 /// run gets its own child VM seeded from the same spawn-time state. The
 /// `cancel_flag` is deliberately shared across clones — one `cancel()` stops
 /// the schedule and the run currently in flight.
+/// Live-seed census (`RUSTCFML_GC_DEBUG`): who created a `ThreadSeed` that is
+/// still alive?
+///
+/// A seed owns the task body AND the spawning frame's `variables` snapshot, and
+/// a task body for a component method holds the RECEIVER — so a single stranded
+/// seed pins an entire generation of the application's object graph. That makes
+/// "a seed leaked" and "100MB leaked" the same event, and it is invisible to the
+/// cycle collector: a seed is Rust-side state, so everything it holds reads as
+/// externally owned. Such a root reports `held by <nothing tracked>`, which is
+/// precisely the dead end this census exists to open up.
+///
+/// Held as an `Arc` inside the seed, so the DERIVED `Clone` shares it and the
+/// drop fires only when the last clone of that seed is gone — which is the event
+/// we actually care about (a periodic schedule clones its seed per tick).
+pub struct SeedCensus {
+    id: u64,
+    site: String,
+}
+
+static SEED_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static LIVE_SEEDS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, String>>> =
+    std::sync::Mutex::new(None);
+
+fn seed_census_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("RUSTCFML_GC_DEBUG").is_ok())
+}
+
+impl SeedCensus {
+    fn new() -> Option<Arc<SeedCensus>> {
+        if !seed_census_enabled() {
+            return None;
+        }
+        let id = SEED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The creating CFML/engine call site, trimmed to the frames that identify
+        // it. A raw backtrace is unreadable and most of it is the same prologue
+        // on every seed.
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let site: Vec<String> = bt
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.contains("cfml_vm") || l.contains("rustcfml"))
+            .filter(|l| !l.contains("SeedCensus") && !l.contains("build_thread_seed"))
+            .take(4)
+            .map(|l| {
+                let l = l.splitn(2, ": ").nth(1).unwrap_or(l);
+                l.split("::h").next().unwrap_or(l).to_string()
+            })
+            .collect();
+        let site = site.join(" <- ");
+        LIVE_SEEDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(id, site.clone());
+        Some(Arc::new(SeedCensus { id, site }))
+    }
+}
+
+impl Drop for SeedCensus {
+    fn drop(&mut self) {
+        if let Some(m) = LIVE_SEEDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            m.remove(&self.id);
+        }
+    }
+}
+
+impl std::fmt::Debug for SeedCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SeedCensus#{} {}", self.id, self.site)
+    }
+}
+
+/// Report the `ThreadSeed`s still alive, grouped by creating call site. A site
+/// whose count climbs with each framework reload is leaking a seed — and with it
+/// a whole generation of the application.
+pub fn report_live_seeds() {
+    let g = LIVE_SEEDS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref() else { return };
+    if m.is_empty() {
+        return;
+    }
+    let mut by_site: HashMap<&str, usize> = HashMap::new();
+    for site in m.values() {
+        *by_site.entry(site.as_str()).or_insert(0) += 1;
+    }
+    let mut v: Vec<(&&str, &usize)> = by_site.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    eprintln!("[seeds] {} live ThreadSeed(s), by creating site:", m.len());
+    for (site, n) in v.into_iter().take(10) {
+        eprintln!("    x{:<5} {}", n, site);
+    }
+}
+
 #[derive(Clone)]
 pub struct ThreadSeed {
     pub program: BytecodeProgram,
@@ -3046,6 +3144,9 @@ pub struct ThreadSeed {
     /// thread. Set by the executor shims from the CFML ThreadFactory's pattern
     /// (e.g. `CFConcurrentPool-1-Thread-3`); `None` keeps the ambient default.
     pub thread_name: Option<String>,
+    /// Live-seed census handle (see [`SeedCensus`]). `None` unless
+    /// `RUSTCFML_GC_DEBUG` is set, so the normal path allocates nothing.
+    pub census: Option<Arc<SeedCensus>>,
 }
 
 /// A spawned `cfthread`'s live handle, held by the parent until join. Lives on
@@ -4802,6 +4903,7 @@ impl CfmlVirtualMachine {
             attributes,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thread_name: None,
+            census: SeedCensus::new(),
         }
     }
 
