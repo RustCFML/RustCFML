@@ -1535,6 +1535,7 @@ fn compile_and_run(
                 cfml_common::cycle_gc::deferred_pending(),
             );
             cfml_vm::report_live_seeds();
+            cfml_vm::report_live_bodies();
             if let Some(sites) = cfml_common::cycle_gc::drain_top_sites(25) {
                 eprintln!("[cycle_gc] top sampled struct/array allocation sites this request:");
                 for (site, n) in sites {

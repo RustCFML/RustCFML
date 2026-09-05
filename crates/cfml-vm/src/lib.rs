@@ -3062,6 +3062,90 @@ impl std::fmt::Debug for SeedCensus {
     }
 }
 
+/// Live cfthread BODIES, by description.
+///
+/// `apply_thread_seed` consumes the seed — so the seed census stops watching at
+/// exactly the moment the child VM starts running, while the child still holds
+/// the body and the variables snapshot for as long as it executes. A thread body
+/// that never returns (a framework heartbeat looping on a sleep, say) therefore
+/// pins its whole generation with nothing watching. This closes that gap.
+static LIVE_BODIES: std::sync::Mutex<Option<std::collections::BTreeMap<u64, String>>> =
+    std::sync::Mutex::new(None);
+static BODY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub struct BodyCensus(u64);
+
+impl BodyCensus {
+    /// Register a running thread body. `None` unless `RUSTCFML_GC_DEBUG`.
+    pub fn new(what: &CfmlValue, source: Option<&str>) -> Option<BodyCensus> {
+        if !seed_census_enabled() {
+            return None;
+        }
+        let id = BODY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let desc = match what {
+            CfmlValue::Struct(s) => {
+                let keys: Vec<String> =
+                    s.snapshot().iter().take(4).map(|(k, _)| k.to_string()).collect();
+                format!("Struct [{}]", keys.join(", "))
+            }
+            CfmlValue::Function(f) if !f.name.is_empty() => format!("closure {}", f.name),
+            other => format!("{:?}", std::mem::discriminant(other)),
+        };
+        // The spawning template is what makes this actionable: it names the CFML
+        // file whose thread never returned.
+        let desc = match source {
+            Some(f) => format!("{}  from {}", desc, f),
+            None => desc,
+        };
+        LIVE_BODIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(id, desc);
+        Some(BodyCensus(id))
+    }
+}
+
+impl Drop for BodyCensus {
+    fn drop(&mut self) {
+        if let Some(m) = LIVE_BODIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            m.remove(&self.0);
+        }
+    }
+}
+
+/// Report the thread bodies still RUNNING, with their ids (= age). A body whose
+/// id never advances is a thread that has not returned since it started, and it
+/// is holding everything its receiver can reach.
+pub fn report_live_bodies() {
+    let g = LIVE_BODIES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref() else { return };
+    if m.is_empty() {
+        return;
+    }
+    let mut by: HashMap<&str, (usize, u64, u64)> = HashMap::new();
+    for (id, d) in m.iter() {
+        let e = by.entry(d.as_str()).or_insert((0, u64::MAX, 0));
+        e.0 += 1;
+        e.1 = e.1.min(*id);
+        e.2 = e.2.max(*id);
+    }
+    let mut v: Vec<(&&str, &(usize, u64, u64))> = by.iter().collect();
+    v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    eprintln!(
+        "[bodies] {} thread body/bodies still RUNNING (next id {}):",
+        m.len(),
+        BODY_ID.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    for (d, (n, lo, hi)) in v.into_iter().take(10) {
+        eprintln!("    x{:<5} ids {}..{}  {}", n, lo, hi, d);
+    }
+}
+
 /// Report the `ThreadSeed`s still alive, grouped by creating call site. A site
 /// whose count climbs with each framework reload is leaking a seed — and with it
 /// a whole generation of the application.
@@ -3071,15 +3155,26 @@ pub fn report_live_seeds() {
     if m.is_empty() {
         return;
     }
-    let mut by_site: HashMap<&str, usize> = HashMap::new();
-    for site in m.values() {
-        *by_site.entry(site.as_str()).or_insert(0) += 1;
+    // Ids are monotonic, so they double as AGE. That matters more than the count:
+    // a fixed population of seeds whose ids never advance means the SAME seeds are
+    // still alive from an earlier generation, pinning it — which looks identical
+    // to a healthy steady state if you only count them.
+    let mut by_site: HashMap<&str, (usize, u64, u64)> = HashMap::new();
+    for (id, site) in m.iter() {
+        let e = by_site.entry(site.as_str()).or_insert((0, u64::MAX, 0));
+        e.0 += 1;
+        e.1 = e.1.min(*id);
+        e.2 = e.2.max(*id);
     }
-    let mut v: Vec<(&&str, &usize)> = by_site.iter().collect();
-    v.sort_by(|a, b| b.1.cmp(a.1));
-    eprintln!("[seeds] {} live ThreadSeed(s), by creating site:", m.len());
-    for (site, n) in v.into_iter().take(10) {
-        eprintln!("    x{:<5} {}", n, site);
+    let mut v: Vec<(&&str, &(usize, u64, u64))> = by_site.iter().collect();
+    v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    eprintln!(
+        "[seeds] {} live ThreadSeed(s) (next id {}), by creating site:",
+        m.len(),
+        SEED_ID.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    for (site, (n, lo, hi)) in v.into_iter().take(10) {
+        eprintln!("    x{:<5} ids {}..{}  {}", n, lo, hi, site);
     }
 }
 
@@ -4976,6 +5071,9 @@ impl CfmlVirtualMachine {
         attributes: Option<CfmlValue>,
         parent_locals: &ValueMap,
     ) -> ThreadResult {
+        // Census of RUNNING bodies (diagnostics; see `BodyCensus`). Dropped when
+        // this call returns, so what remains is what has not finished.
+        let _body_census = BodyCensus::new(closure, self.source_file.as_deref());
         // Fresh `thread` scope the body writes into (thread.x = ...), seeded
         // with any `thread.x = ...` values written BEFORE the cfthread — the
         // standard CFML idiom for passing data into a thread (issue #217). On a

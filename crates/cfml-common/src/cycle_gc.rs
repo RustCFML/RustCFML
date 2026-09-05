@@ -1322,6 +1322,7 @@ fn collect_from_log_carrying(
     });
     let mut root_report: Vec<(usize, String)> = Vec::new();
     let mut deferred_roots: Vec<usize> = Vec::new();
+    let mut root_ext: HashMap<usize, usize> = HashMap::new();
     // Index built once (not per root) so the diagnostic stays linear: a pass with
     // 250k survivors can have tens of thousands of roots.
     #[cfg(feature = "component-instance")]
@@ -1373,6 +1374,7 @@ fn collect_from_log_carrying(
         }
         if external > 0 {
             if root_debug > 0 {
+                root_ext.insert(p, external);
                 // Attribution mode seeds one root at a time (below) so each can
                 // be charged with what it alone keeps alive.
                 deferred_roots.push(p);
@@ -1531,13 +1533,14 @@ fn collect_from_log_carrying(
         }
         // Engine-or-application: how much of the surviving graph hangs off the
         // application scope?
+        let mut probe_reachable: HashSet<usize> = HashSet::new();
         {
             let probes = PROBE_ROOT.lock();
             if !probes.is_empty() {
                 // Cumulative: each named carrier is charged only with what no
                 // EARLIER carrier already reached, so the numbers sum to the
                 // covered total and one dominant holder stands out.
-                let mut seen: HashSet<usize> = HashSet::new();
+                let seen = &mut probe_reachable;
                 for (name, pr) in probes.iter() {
                     let before = seen.len();
                     let mut stack: Vec<usize> = Vec::new();
@@ -1603,10 +1606,24 @@ fn collect_from_log_carrying(
         // that reports none is held by something outside the collector's world —
         // Rust-side state, or an allocation deliberately excluded from the log
         // (run again with `RUSTCFML_GC_TRACK_ALL=1` to make those visible too).
+        // ORPHAN ANCHORS. A generation no persistent scope can reach is alive only
+        // because some node in it carries an external reference. Those nodes are
+        // the anchors — and they are what a leak hunt needs, because the plain
+        // retainer ranking is dominated by the CURRENT generation, which is
+        // legitimately held and looks identical on every reload.
+        let mut anchors: Vec<(usize, usize)> = retention
+            .iter()
+            .filter(|(_, r)| !probe_reachable.is_empty() && !probe_reachable.contains(r))
+            .map(|(n, r)| (*n, *r))
+            .collect();
+        anchors.sort_by(|a, b| b.0.cmp(&a.0));
+        anchors.truncate(root_debug);
+
         let targets: HashSet<usize> = retention
             .iter()
             .take(root_debug)
             .map(|(_, r)| *r)
+            .chain(anchors.iter().map(|(_, r)| *r))
             .collect();
         let mut holders: HashMap<usize, Vec<String>> = HashMap::new();
         if !targets.is_empty() {
@@ -1643,6 +1660,38 @@ fn collect_from_log_carrying(
                 }
             }
         }
+        if !anchors.is_empty() {
+            eprintln!(
+                "[cycle_gc] ORPHAN anchors — retained but unreachable from any \
+                 persistent scope:"
+            );
+            for (n, r) in anchors.iter() {
+                let what = nodes.get(r).map(|h| h.describe()).unwrap_or_default();
+                eprintln!(
+                    "    retains={:<8} ext={:<4} {}",
+                    n,
+                    root_ext.get(r).copied().unwrap_or(0),
+                    what
+                );
+                match holders.get(r) {
+                    Some(hs) => {
+                        let mut counts: HashMap<&str, usize> = HashMap::new();
+                        for h in hs {
+                            *counts.entry(h.as_str()).or_insert(0) += 1;
+                        }
+                        let mut v: Vec<(&&str, &usize)> = counts.iter().collect();
+                        v.sort_by(|a, b| b.1.cmp(a.1));
+                        for (desc, c) in v.into_iter().take(3) {
+                            eprintln!("        held by x{:<4} {}", c, desc);
+                        }
+                    }
+                    None => {
+                        eprintln!("        held by      <nothing tracked — Rust-side state>")
+                    }
+                }
+            }
+        }
+
         for (n, r) in retention.iter().take(root_debug) {
             let what = nodes.get(r).map(|h| h.describe()).unwrap_or_default();
             let strong = nodes.get(r).map(|h| h.strong_count()).unwrap_or(0);
