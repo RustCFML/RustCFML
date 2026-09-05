@@ -252,6 +252,31 @@ impl CfmlNative for FutureNative {
         "Future"
     }
 
+    /// A resolved Future holds the body's return value and its `thread` scope.
+    /// Both can reference the object graph the task ran against, so the collector
+    /// must be able to see them — otherwise they read as externally owned and pin
+    /// it (see `CfmlNative::visit_values`).
+    fn visit_values(&self, f: &mut dyn FnMut(&CfmlValue)) {
+        if let Some(r) = self.result.as_ref() {
+            if let Some(rv) = r.return_value.as_ref() {
+                f(rv);
+            }
+            for v in r.thread_vars.values() {
+                f(v);
+            }
+        }
+        if let Ok(h) = self.handle.lock() {
+            if let Some(r) = h.as_ref().and_then(|h| h.result.as_ref()) {
+                if let Some(rv) = r.return_value.as_ref() {
+                    f(rv);
+                }
+                for v in r.thread_vars.values() {
+                    f(v);
+                }
+            }
+        }
+    }
+
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         match name.to_ascii_lowercase().as_str() {
             "get" => {
@@ -730,7 +755,31 @@ impl ExecutorPoolNative {
     }
 }
 
+impl ExecutorPoolNative {
+    /// The task bodies still sitting in the queue. Each `PendingTask` owns a
+    /// `ThreadSeed`, and a seed owns the body — for a `java.util.concurrent`
+    /// submission that body is the receiver component, which reaches the whole
+    /// application graph.
+    fn visit_queued_values(&self, f: &mut dyn FnMut(&CfmlValue)) {
+        if let Ok(g) = self.inner.0.try_lock() {
+            for t in &g.queue {
+                f(&t.seed.closure);
+                if let Some(a) = t.seed.attributes.as_ref() {
+                    f(a);
+                }
+                for v in t.seed.page_thread_scope.values() {
+                    f(v);
+                }
+            }
+        }
+    }
+}
+
 impl CfmlNative for ExecutorPoolNative {
+    fn visit_values(&self, f: &mut dyn FnMut(&CfmlValue)) {
+        self.visit_queued_values(f);
+    }
+
     fn class_name(&self) -> &str {
         "ExecutorPool"
     }

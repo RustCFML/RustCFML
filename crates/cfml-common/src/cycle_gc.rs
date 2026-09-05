@@ -731,6 +731,19 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
                 classify(cv, in_set, emit);
             }
         }
+        // A native object is not a node of its own, but it CAN hold CfmlValues —
+        // a Future's result, an executor's queued task bodies. Descend through it
+        // exactly like a Component or Closure box, or everything it holds reads as
+        // externally owned and is pinned forever (see `CfmlNative::visit_values`).
+        // A native reachable from several survivors has its edges counted once per
+        // holder; over-counting `internal_in` is corrected by the mark phase (a
+        // child reachable from any LIVE holder is marked live through this same
+        // descent), so it can only under-collect, never over-collect.
+        CfmlValue::NativeObject(n) => {
+            if let Ok(g) = n.read() {
+                g.visit_values(&mut |v| classify(v, in_set, emit));
+            }
+        }
         // A flyweight component `Instance` (`Arc<RwLock<Instance>>`) is a TRACKED,
         // collectible node (`TrackedAlloc::Instance` / `NodeHandle::Instance`), so
         // it is TERMINAL here exactly like Struct/Array/Query: emit the Instance
@@ -1016,6 +1029,24 @@ fn persistent_base() -> usize {
     })
 }
 
+/// A value the collector should treat as a NAMED probe root for diagnostics —
+/// in practice the live `application` scope, handed over by the request loop
+/// just before `collect()`.
+///
+/// It answers the one question that separates an engine leak from an application
+/// one: of the nodes that survive a request, how many are reachable from the
+/// application scope? Nodes reachable from it are retained BY THE APPLICATION and
+/// the engine is behaving. Nodes that survive while unreachable from it are held
+/// by something else — an untracked engine carrier — and that is ours to fix.
+static PROBE_ROOT: parking_lot::Mutex<Vec<(String, CfmlValue)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Install the diagnostic probe root (see [`PROBE_ROOT`]). Cheap no-op unless
+/// `RUSTCFML_GC_ROOTS` is set; the value is dropped again after each pass.
+pub fn set_probe_root(v: Vec<(String, CfmlValue)>) {
+    *PROBE_ROOT.lock() = v;
+}
+
 /// Number of nodes currently carried across requests (observability).
 pub fn persistent_tracked() -> usize {
     PERSISTENT.lock().as_ref().map_or(0, |p| p.entries.len())
@@ -1194,6 +1225,29 @@ fn collect_from_log_carrying(
         bps
     };
 
+    // 1c. The shared per-class METHOD TABLES hung off component scope structs.
+    //     Like a blueprint this is an `Arc<ValueMap>` carrier, not a node: its
+    //     entries are `CfmlFunction`s whose captured scopes reach back into the
+    //     instance graph. Walking it from each holder would count every edge once
+    //     per instance of the class (the double-count that over-collects), and
+    //     NOT walking it leaves those edges uncounted — which reads as external
+    //     ownership and pins the graph. De-duplicated by Arc identity, it is
+    //     counted exactly once, like `blueprints` above.
+    let method_tables: HashMap<usize, Arc<ValueMap>> = {
+        let mut t = HashMap::new();
+        for h in nodes.values() {
+            if let NodeHandle::Struct(a) = h {
+                if let Some(g) = a.try_read() {
+                    if let Some(mt) = g.method_table.as_ref() {
+                        t.entry(Arc::as_ptr(mt) as *const () as usize)
+                            .or_insert_with(|| Arc::clone(mt));
+                    }
+                }
+            }
+        }
+        t
+    };
+
     // 2. internal_in[n] = number of references to n from other survivors, plus
     //    the references held by the carrier blueprints (counted once each).
     let mut internal_in: HashMap<usize, usize> = HashMap::with_capacity(nodes.len());
@@ -1209,6 +1263,13 @@ fn collect_from_log_carrying(
                 *internal_in.entry(child).or_insert(0) += 1;
             })
         });
+    }
+    for mt in method_tables.values() {
+        for v in mt.values() {
+            classify(v, &in_set, &mut |child| {
+                *internal_in.entry(child).or_insert(0) += 1;
+            });
+        }
     }
 
     // 2b. A blueprint's own ownership: held by each surviving instance of its
@@ -1312,6 +1373,7 @@ fn collect_from_log_carrying(
     //     instances does (step 4).
     #[cfg(feature = "component-instance")]
     let mut live_bps: HashSet<usize> = HashSet::new();
+    let mut live_tables: HashSet<usize> = HashSet::new();
     #[cfg(feature = "component-instance")]
     for (&p, bp) in &blueprints {
         let internal = *bp_internal.get(&p).unwrap_or(&0);
@@ -1404,6 +1466,21 @@ fn collect_from_log_carrying(
                     }
                 }
             }
+            // A live component scope makes its shared method table live too.
+            if let NodeHandle::Struct(a) = h {
+                let mt = a.try_read().and_then(|g| g.method_table.clone());
+                if let Some(mt) = mt {
+                    if live_tables.insert(Arc::as_ptr(&mt) as *const () as usize) {
+                        for v in mt.values() {
+                            classify(v, &in_set, &mut |child| {
+                                if live.insert(child) {
+                                    worklist.push(child);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1436,6 +1513,63 @@ fn collect_from_log_carrying(
         for (shape, (n, ext)) in &shapes {
             eprintln!("    n={:<7} ext={:<7} {}", n, ext, shape);
         }
+        // Engine-or-application: how much of the surviving graph hangs off the
+        // application scope?
+        {
+            let probes = PROBE_ROOT.lock();
+            if !probes.is_empty() {
+                // Cumulative: each named carrier is charged only with what no
+                // EARLIER carrier already reached, so the numbers sum to the
+                // covered total and one dominant holder stands out.
+                let mut seen: HashSet<usize> = HashSet::new();
+                for (name, pr) in probes.iter() {
+                    let before = seen.len();
+                    let mut stack: Vec<usize> = Vec::new();
+                    classify(pr, &in_set, &mut |c| {
+                        if seen.insert(c) {
+                            stack.push(c);
+                        }
+                    });
+                    while let Some(p) = stack.pop() {
+                        if let Some(h) = nodes.get(&p) {
+                            h.for_each_child_node(&in_set, &mut |c| {
+                                if seen.insert(c) {
+                                    stack.push(c);
+                                }
+                            });
+                            // Follow the same blueprint edge the MARK phase does,
+                            // or the probe under-reports what a scope really keeps
+                            // alive and blames the engine for the application.
+                            #[cfg(feature = "component-instance")]
+                            if let NodeHandle::Instance(a) = h {
+                                let bp = a.try_read().map(|g| g.class.clone());
+                                if let Some(bp) = bp {
+                                    blueprint_values(&bp, |v| {
+                                        classify(v, &in_set, &mut |c| {
+                                            if seen.insert(c) {
+                                                stack.push(c);
+                                            }
+                                        })
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[cycle_gc]   reachable from {:<28} {}",
+                        name,
+                        seen.len() - before
+                    );
+                }
+                eprintln!(
+                    "[cycle_gc] of {} live nodes, {} reached by the probes, {} NOT \
+                     (held by something else)",
+                    live.len(),
+                    seen.len(),
+                    live.len().saturating_sub(seen.len())
+                );
+            }
+        }
         // The ranking that actually names a leak: who RETAINS the most.
         retention.sort_by(|a, b| b.0.cmp(&a.0));
         eprintln!(
@@ -1444,7 +1578,16 @@ fn collect_from_log_carrying(
         );
         for (n, r) in retention.iter().take(root_debug) {
             let what = nodes.get(r).map(|h| h.describe()).unwrap_or_default();
-            eprintln!("    retains={:<8} {}", n, what);
+            let strong = nodes.get(r).map(|h| h.strong_count()).unwrap_or(0);
+            let internal = *internal_in.get(r).unwrap_or(&0);
+            eprintln!(
+                "    retains={:<8} ext={:<4} strong={:<4} internal={:<4} {}",
+                n,
+                strong.saturating_sub(1).saturating_sub(internal),
+                strong,
+                internal,
+                what
+            );
         }
     }
     let survivors = nodes.len();

@@ -1541,6 +1541,32 @@ fn compile_and_run(
                 }
             }
         }
+        // Diagnostic probe root: the live application scope, so the roots report
+        // can say how much of the surviving graph the APPLICATION is holding.
+        let mut probes: Vec<(String, cfml_common::dynamic::CfmlValue)> = Vec::new();
+        if std::env::var("RUSTCFML_GC_ROOTS").is_ok() {
+            use cfml_common::dynamic::CfmlValue;
+            if let Some(a) = vm.application_scope.clone() {
+                probes.push(("application scope".to_string(), CfmlValue::Struct(a)));
+            }
+            if let Some(ss) = vm.server_state.as_ref() {
+                probes.push((
+                    "server scope".to_string(),
+                    CfmlValue::Struct(ss.server_scope.clone()),
+                ));
+                let pcs: Vec<CfmlValue> = ss
+                    .pseudo_ctor_app_scopes
+                    .read()
+                    .values()
+                    .cloned()
+                    .map(CfmlValue::Struct)
+                    .collect();
+                for (i, v) in pcs.into_iter().enumerate() {
+                    probes.push((format!("pseudo-ctor app scope #{}", i), v));
+                }
+            }
+        }
+        cfml_common::cycle_gc::set_probe_root(probes);
         drop(vm);
         if any_running {
             cfml_common::cycle_gc::defer_current_log(running_joins);
@@ -1548,6 +1574,7 @@ fn compile_and_run(
             cfml_common::cycle_gc::collect();
             cfml_common::cycle_gc::disable_and_clear();
         }
+        cfml_common::cycle_gc::set_probe_root(Vec::new());
         // Reclaim any previously-deferred logs whose threads have since finished.
         cfml_common::cycle_gc::collect_ready_deferred();
     }

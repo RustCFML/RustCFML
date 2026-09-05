@@ -1860,6 +1860,22 @@ pub trait CfmlNative: Send + Sync + fmt::Debug {
     /// `Err(CfmlError::…)` for unknown methods or argument mismatches.
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult;
 
+    /// Optional hook exposing the `CfmlValue`s this native holds, so the cycle
+    /// collector can see THROUGH it.
+    ///
+    /// A `NativeObject` is not a collectible node and the collector does not
+    /// descend into one, so every value reachable only from a native reads as
+    /// EXTERNALLY owned — which pins it and its whole transitive closure. That is
+    /// how a finished async task's body (`{logevent, thisappender}` from a
+    /// framework's async log appender) kept an entire generation of the
+    /// application alive: one untracked holder, `external = 1`, ~111,000 nodes
+    /// behind it.
+    ///
+    /// Defaulted to a no-op so external `.rcx` modules are unaffected — a native
+    /// that does not implement this is simply treated as an external owner, which
+    /// is the conservative direction (it can under-collect, never over-collect).
+    fn visit_values(&self, _f: &mut dyn FnMut(&CfmlValue)) {}
+
     /// Optional downcast hook. Engine-internal natives (the executor pool)
     /// need their concrete type back from a `dyn CfmlNative`. Defaulted to
     /// `None` so external `.rcx` module authors implementing this trait are
