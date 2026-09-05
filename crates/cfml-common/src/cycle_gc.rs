@@ -519,6 +519,13 @@ impl NodeHandle {
                 for v in g.map.values() {
                     classify(v, in_set, emit);
                 }
+                // NOTE: `method_table` (the shared per-class `Arc<ValueMap>` hung
+                // off a component's scope structs) is deliberately NOT walked here.
+                // It is the blueprint's `method_values`, and the blueprint carrier
+                // walks it EXACTLY ONCE per pass. Walking it from each holder would
+                // count every one of its edges once per instance of the class,
+                // deflating its children's external count — the double-count that
+                // over-collects live data.
             }
             NodeHandle::Array(a) => {
                 let g = a.read();
@@ -561,6 +568,14 @@ impl NodeHandle {
                 let maps = a
                     .try_read()
                     .map(|g| (g.public_map_handle(), g.private_map_handle()));
+                // A CFC extending a Rust class holds the parent OBJECT here; it
+                // is a plain `CfmlValue` field of the Instance, walked nowhere
+                // else.
+                if let Some(g) = a.try_read() {
+                    if let Some(np) = g.native_parent.as_ref() {
+                        classify(np, in_set, emit);
+                    }
+                }
                 if let Some((this_m, vars_m)) = maps {
                     for m in [this_m, vars_m] {
                         // A data map is USUALLY untracked and owned solely by this
@@ -1270,7 +1285,7 @@ fn collect_from_log_carrying(
             root_report.push((
                 external,
                 format!(
-                    "strong={} internal={} {}{}",
+                    "[strong={} internal={}] {}{}",
                     h.strong_count(),
                     internal,
                     h.describe(),
@@ -1340,11 +1355,31 @@ fn collect_from_log_carrying(
     // 5. Everything not live is an unreachable cycle: clear it to break the
     //    cycle, then dropping the probe handles frees the whole subgraph.
     if root_debug > 0 && !root_report.is_empty() {
-        root_report.sort_by(|a, b| b.0.cmp(&a.0));
-        root_report.truncate(root_debug);
-        eprintln!("[cycle_gc] pinned roots (external refs, descending):");
+        // Ranked by COUNT, not by size. A leak shows up as tens of thousands of
+        // roots of ONE shape — sampling the twenty largest just re-lists the
+        // application's legitimately-live singletons every time, which is what
+        // made the first two rounds of this hunt so slow. The shape whose count
+        // grows by a generation per reload is the leak.
+        let mut by_shape: HashMap<String, (usize, usize)> = HashMap::new();
         for (ext, what) in &root_report {
-            eprintln!("    ext={:<6} {}", ext, what);
+            // Strip the per-node arithmetic prefix so identical shapes group.
+            let shape = what
+                .split_once("] ")
+                .map(|(_, rest)| rest)
+                .unwrap_or(what.as_str());
+            let e = by_shape.entry(shape.to_string()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ext;
+        }
+        let mut shapes: Vec<(String, (usize, usize))> = by_shape.into_iter().collect();
+        shapes.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        shapes.truncate(root_debug);
+        eprintln!(
+            "[cycle_gc] {} pinned roots, by shape (count, total ext):",
+            root_report.len()
+        );
+        for (shape, (n, ext)) in &shapes {
+            eprintln!("    n={:<7} ext={:<7} {}", n, ext, shape);
         }
     }
     let survivors = nodes.len();
