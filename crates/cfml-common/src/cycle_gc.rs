@@ -920,6 +920,18 @@ static PERSISTENT: parking_lot::Mutex<Option<PersistentSet>> = parking_lot::Mute
 /// restoring the drop-on-request-end behaviour).
 const PERSISTENT_BASE_DEFAULT: usize = 50_000;
 
+/// Diagnostic: sweep the cross-request set at EVERY request end instead of on
+/// the doubling rule (`RUSTCFML_GC_PERSISTENT_ALWAYS=1`). The budget exists so a
+/// steady-state request pays nothing, which is right for production and wrong
+/// for answering "is this reload's generation being reclaimed or pinned?" — with
+/// this on, every request prints its own reclaimed/still-tracked line, and
+/// pairing it with `RUSTCFML_GC_ROOTS=N` names whatever is doing the pinning.
+fn persistent_always() -> bool {
+    use std::sync::OnceLock;
+    static A: OnceLock<bool> = OnceLock::new();
+    *A.get_or_init(|| std::env::var("RUSTCFML_GC_PERSISTENT_ALWAYS").is_ok())
+}
+
 fn persistent_base() -> usize {
     use std::sync::OnceLock;
     static B: OnceLock<usize> = OnceLock::new();
@@ -956,7 +968,7 @@ fn carry_survivors(live: Vec<(usize, TrackedAlloc)>) -> usize {
                 set.entries.push(t);
             }
         }
-        if set.entries.len() >= set.next_sweep {
+        if persistent_always() || set.entries.len() >= set.next_sweep {
             // Take the whole set out under the lock; the pass itself runs
             // unlocked, and the surviving remainder is put back below.
             set.seen.clear();
