@@ -110,7 +110,7 @@ use cfml_codegen::compiler::CfmlCompiler;
 /// Labels for the `call-phases` prologue report, in phase order.
 #[cfg(feature = "call-phases")]
 const CALL_PHASE_LABELS: [&str; 32] = [
-    "0 entry: fused-plan take, JIT probe, recursion guard",
+    "0 entry: fused-plan take, recursion guard",
     "1 allocate: locals map, operand stack, slots, declared_locals",
     "2 parent-scope seed copy",
     "3 frame_ctx push",

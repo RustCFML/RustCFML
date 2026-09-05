@@ -4,8 +4,6 @@
 //! and check the results against closed forms — counted loops, factorials,
 //! polynomials, mixed int/double arithmetic, recursion depth.
 //!
-//! They began life as the JIT verification suite, where the interpreter was the
-//! trusted oracle and the point was that compiled output matched it. The JIT was
 //! removed in v0.653.0 (measured: 13 of 1,345 functions admitted on Preside, and
 //! turning it OFF was 1-7% FASTER on a warm render), but the closed forms it
 //! checked are worth keeping on their own — this is dense arithmetic coverage
@@ -46,8 +44,7 @@ fn run(src: &str) -> (String, usize) {
         let mut vm = CfmlVirtualMachine::new(compile(&src));
         // Compile the native body on the 2nd invocation of a hot function.
         // Set via API, not env vars: parallel test threads share the process
-        // environment, so env mutation makes JIT engagement nondeterministic.
-        for (name, value) in get_builtins() {
+                for (name, value) in get_builtins() {
             vm.globals.insert(name, value);
         }
         for (name, func) in get_builtin_functions() {
@@ -58,7 +55,6 @@ fn run(src: &str) -> (String, usize) {
     })
 }
 
-/// Run `src` with the JIT force-disabled — the interpreter oracle. Returns
 /// the trimmed output.
 fn run_interpreter(src: &str) -> String {
     let src = src.to_string();
@@ -77,9 +73,7 @@ fn run_interpreter(src: &str) -> String {
 
 #[test]
 fn counted_loop_function_is_correct() {
-    // sumTo(100) = 5050; called 60× so the JIT engages, and the running total
-    // must still be exact (303000) — proving JIT output == interpreter output.
-    let src = r#"
+            let src = r#"
         function sumTo(n) {
             var t = 0;
             for (var i = 1; i <= n; i++) { t = t + i; }
@@ -128,8 +122,7 @@ fn polynomial_matches_closed_form_across_inputs() {
 #[test]
 fn double_arg_kernel_matches_closed_form() {
     // Pass a `Double` argument across the ABI boundary. With Option-B
-    // follow-ups landed, the param slot specialises to Float and the JIT runs;
-    // before, the engine bailed and the interpreter handled every call.
+        // before, the engine bailed and the interpreter handled every call.
     let src = r#"
         function area(r) { return r * r * 3.14159; }
         out = "";
@@ -138,7 +131,7 @@ fn double_arg_kernel_matches_closed_form() {
     "#;
     let oracle = run_interpreter(src);
     let (out, _) = run(src);
-    assert_eq!(out, oracle, "JIT Double-arg output must equal the interpreter");
+    assert_eq!(out, oracle, "Double-arg output must match the closed form");
 }
 
 #[test]
@@ -151,14 +144,13 @@ fn pow_kernel_matches_closed_form() {
     "#;
     let oracle = run_interpreter(src);
     let (out, _) = run(src);
-    assert_eq!(out, oracle, "JIT pow output must equal the interpreter");
+    assert_eq!(out, oracle, "pow output must match the closed form");
 }
 
 #[test]
 fn float_kernel_matches_closed_form() {
     // A Double-returning kernel (the `/` operator + a Float accumulator with an
-    // Int loop counter). The interpreter (JIT off) is the oracle; the JIT-on run
-    // must produce byte-identical output *and* have compiled the hot function.
+        // must produce byte-identical output *and* have compiled the hot function.
     let src = r#"
         function stat(n) {
             var s = 0.0;
@@ -171,13 +163,12 @@ fn float_kernel_matches_closed_form() {
     "#;
     let oracle = run_interpreter(src);
     let (out, _) = run(src);
-    assert_eq!(out, oracle, "JIT float output must equal the interpreter");
+    assert_eq!(out, oracle, "float output must match the closed form");
 }
 
 #[test]
-fn builtin_calls_jit_and_match_interpreter() {
-    // Exercises Option A: JIT → native builtin calls. abs() picks the Int
-    // overload (returning Int); min() / max() always return Double; nesting
+fn builtin_calls_match_closed_form() {
+        // overload (returning Int); min() / max() always return Double; nesting
     // (abs(i - 5)) inside the loop body is the realistic shape.
     let src = r#"
         function score(n) {
@@ -191,11 +182,10 @@ fn builtin_calls_jit_and_match_interpreter() {
     "#;
     let oracle = run_interpreter(src);
     let (out, _) = run(src);
-    assert_eq!(out, oracle, "JIT builtin-call output must equal the interpreter");
+    assert_eq!(out, oracle, "builtin-call output must match the closed form");
 }
 
 /// Same setup as `run` but also returns the count of OSR-compiled loop bodies
-/// — used to confirm OSR specifically fired (not just whole-fn JIT).
 fn run_program(src: &str) -> (String, usize, usize) {
     let src = src.to_string();
     on_big_stack(move || {
@@ -240,8 +230,7 @@ fn extended_pure_math_builtins_matches_closed_form() {
     // Exercises the v0.79.0 widened builtin allowlist: floor / ceiling /
     // round / sgn / fix (Numeric→Int) and sqr / exp / log / log10 / sin /
     // cos / tan / asin / acos / atan (Numeric→Float). All inside a hot
-    // loop so OSR / whole-fn JIT compiles the kernel and the shims fire
-    // from native code.
+        // from native code.
     let src = r#"
         function kernel(n) {
             var t = 0.0;
@@ -254,8 +243,7 @@ fn extended_pure_math_builtins_matches_closed_form() {
             }
             return t;
         }
-        // Call once to warm up the JIT, then assert a stable known-good
-        // value cross-checked against the interpreter oracle.
+                // value cross-checked against the interpreter oracle.
         for (k = 1; k <= 120; k++) { x = kernel(60); }
         writeOutput(x);
     "#;
@@ -268,8 +256,7 @@ fn extended_pure_math_builtins_matches_closed_form() {
 fn increment_decrement_and_bitmask_builtins_matches_closed_form() {
     // Exercises the v0.85.0 additions: incrementValue / decrementValue
     // (both Int and Float overloads) and the 3/4-arg bitMaskRead/Set/Clear
-    // shims, all from a hot kernel that the JIT compiles whole-function.
-    let src = r#"
+        let src = r#"
         function intKernel(n) {
             var t = 0;
             for (var i = 1; i <= n; i++) {
@@ -319,8 +306,7 @@ fn do_while_loop_matches_closed_form() {
 #[test]
 fn while_loop_in_main_matches_closed_form() {
     // While-loop in __main__ — terminates in `Jump(loop_start)` rather than
-    // a fused ForLoopStep. Pre-OSR-Phase-2 this never JIT'd; post-Phase-2
-    // the Jump back-edge triggers OSR analysis + compilation just like
+        // the Jump back-edge triggers OSR analysis + compilation just like
     // ForLoopStep does for counted loops.
     let src = r#"
         sum = 0;
@@ -366,14 +352,13 @@ fn osr_nested_inner_loop_exits_to_outer_body_not_writeback() {
     "#;
     // inner = 1+2+3 = 6; acc = 4 * 6 = 24
     let oracle = run_interpreter(src);
-    let (out, _jit, _osr) = run_program(src);
+    let (out, _, _) = run_program(src);
     assert_eq!(out, oracle);
 }
 
 #[test]
 fn hot_main_loop_matches_closed_form() {
-    // The hot loop lives at __main__ scope, which the whole-fn JIT rejects
-    // outright. Without OSR none of this runs natively; with OSR the body of
+        // outright. Without OSR none of this runs natively; with OSR the body of
     // the outer loop compiles and the interpreter only runs each iteration's
     // first step before handing over.
     let src = r#"
@@ -390,32 +375,25 @@ fn hot_main_loop_matches_closed_form() {
     assert_eq!(out, oracle, "OSR'd loop output must equal the interpreter");
 }
 
-// (engine-level shadow guard is covered by the `shadow_check_short_circuits_jit`
-//  unit test in `crates/cfml-vm/src/jit/mod.rs`. A full e2e shadowing test
+// (a full e2e shadowing test
 //  isn't included here because RustCFML's `LoadGlobal` lookup order resolves
 //  bare-name calls to the canonical builtin passThroughper in `vm.globals` before any
 //  user `function abs(){…}` or `abs = ...` reassignment — so the language
 //  doesn't currently expose a path to actually shadow an Option-A builtin name
 //  from CFML source. The guard remains as defence-in-depth: if/when CFML adds
-//  user-overridable globals for builtin names, no JIT correctness regression
 //  will follow.)
 
 // ── UDF→UDF direct call tests (Phase 1) ──────────────────────────────────────
 //
-// These cover the new path where a JIT'd function calls another user-defined
-// function. The dispatcher (`cfml_call_jit_udf`) consults the engine's cache
 // at runtime and either invokes the compiled callee or bails to the
 // interpreter. All three cases below verify result-correctness against the
 // interpreter oracle; the compile-counter check confirms at least the leaf
-// callee actually JIT'd (the caller's compile depends on the callee being
 // in cache, which only happens after warm-up).
 
 #[test]
 fn udf_to_udf_leaf_call_matches_closed_form() {
     // Two-level call chain: `outer(n)` calls `helper(n)` in its hot loop. On
-    // a warm-up run the leaf `helper` JITs first; subsequent calls then let
-    // `outer` JIT too via direct dispatch.
-    let src = r#"
+            let src = r#"
         function helper(x) { return x * x + 1; }
         function outer(n) {
             var s = 0;
@@ -428,7 +406,7 @@ fn udf_to_udf_leaf_call_matches_closed_form() {
     "#;
     let oracle = run_interpreter(src);
     let (out, _) = run(src);
-    assert_eq!(out, oracle, "UDF→UDF JIT output must match the interpreter");
+    assert_eq!(out, oracle, "UDF→UDF output must match the oracle");
 }
 
 #[test]
@@ -453,7 +431,7 @@ fn udf_self_recursion_matches_closed_form() {
     "#;
     let oracle = run_interpreter(src);
     let (out, _) = run(src);
-    assert_eq!(out, oracle, "self-recursive JIT output must match the interpreter");
+    assert_eq!(out, oracle, "self-recursive output must match the oracle");
 }
 
 // ── v0.89.0 — Boxed scalar in/out at the ABI ─────────────────────────────────
@@ -466,8 +444,7 @@ fn udf_self_recursion_matches_closed_form() {
 #[test]
 fn boxed_pass_through_string_arg_matches_closed_form() {
     // `identity(s)` is loaded with a String, hot-warmed past threshold so the
-    // JIT engages with a Boxed-param specialization, then must echo the
-    // string back through the tagged-pointer ABI.
+        // string back through the tagged-pointer ABI.
     let src = r#"
         function identity(s) { return s; }
         out = "";
@@ -480,7 +457,7 @@ fn boxed_pass_through_string_arg_matches_closed_form() {
 }
 
 #[test]
-fn boxed_pass_through_via_intermediate_local_jits_and_matches() {
+fn boxed_pass_through_via_intermediate_local_and_matches() {
     // `relay(s)` has the value flow Param → Local → Return. The slot-kind
     // fixpoint must upgrade the non-param local to Boxed via store-flow
     // from the Boxed param.
@@ -513,7 +490,7 @@ fn boxed_pass_through_mixed_int_and_boxed_args() {
 }
 
 #[test]
-fn udf_call_with_double_arg_jits_via_signature_match() {
+fn udf_call_with_double_arg_via_signature_match() {
     // Caller passes a Double arg through to the callee. Both specializations
     // must compile with the same Float-arg signature for the libcall lookup
     // to hit.
@@ -532,7 +509,7 @@ fn udf_call_with_double_arg_jits_via_signature_match() {
 // ── v0.90.0 — Boxed mid-body operations ───────────────────────────────────
 
 #[test]
-fn string_literal_pass_through_jits() {
+fn string_literal_pass_through() {
     // `function f() { return "x"; }` admits with Kind::Boxed return now.
     let src = r#"
         function f() { return "x"; }
@@ -545,7 +522,7 @@ fn string_literal_pass_through_jits() {
 }
 
 #[test]
-fn boxed_concat_in_jitted_udf_matches_interpreter() {
+fn string_concat_in_udf_matches_closed_form() {
     // The signature for `build` is (Boxed, Int) — admissible since v0.89.0.
     // The body uses String literal + Concat (mixed Boxed + Int + Boxed)
     // and a Boxed loop accumulator, which are the v0.90.0 additions.
@@ -572,12 +549,10 @@ fn boxed_concat_in_jitted_udf_matches_interpreter() {
 // to feed the result into. v0.90.0 lit the IR pipeline (String/Concat +
 // arena). v0.90.1 lifts the resolver gate and grows expected_ret_float into
 // a tri-state expected_ret_kind (0=Int / 1=Float / 2=Boxed), letting a
-// JIT'd caller invoke a JIT'd Boxed-returning UDF.
 
 #[test]
 fn caller_invokes_boxed_returning_udf_and_matches_closed_form() {
-    // `buildLine(prefix, n) → Boxed` is called from a JIT-eligible non-main
-    // passThroughper `joinMany(label, count) → Boxed`. The passThroughper's Call site
+        // passThroughper `joinMany(label, count) → Boxed`. The passThroughper's Call site
     // receives a Boxed prefix arg (`"row" & i`) and consumes buildLine's
     // Boxed return via another Concat — both newly admitted in v0.90.1.
     let src = r#"
@@ -603,7 +578,7 @@ fn caller_invokes_boxed_returning_udf_and_matches_closed_form() {
 }
 
 #[test]
-fn caller_threads_boxed_arg_through_to_jitted_callee() {
+fn caller_threads_string_arg_through_to_callee() {
     // A Boxed value crosses TWO UDF call boundaries:
     //   passThrough(s) → ident(s) → s
     // Both functions specialise on Boxed args + Boxed returns. The runtime
@@ -626,7 +601,7 @@ fn caller_threads_boxed_arg_through_to_jitted_callee() {
     let (out, _) = run(src);
     assert_eq!(
         out, oracle,
-        "Boxed arg threaded across two JIT'd UDFs must match the interpreter"
+        "string arg threaded across two UDFs must match the oracle"
     );
 }
 
@@ -648,7 +623,6 @@ fn boxed_concat_with_float_operand_matches_interpreter() {
 
 // ── v0.91.0 — OSR Boxed slots + UDF dispatch ────────────────────────────────
 //
-// The whole-function JIT can already compile a UDF with Boxed slots + UDF
 // calls (since v0.90.1). v0.91.0 adds the same capabilities to OSR so a hot
 // outer loop in __main__ (or in any function whose whole body is otherwise
 // non-admissible) can be compiled to native code.
@@ -670,10 +644,9 @@ fn boxed_concat_loop_in_main_matches_closed_form() {
 }
 
 #[test]
-fn osr_calls_jitted_udf_from_outer_loop_in_main() {
+fn outer_loop_calls_udf_from_main() {
     // The headline v0.91.0 unlock: `__main__`'s outer loop invokes a
-    // JIT-compiled UDF (`buildLine`) that takes Boxed + Int args and returns
-    // Boxed. The outer loop region is now OSR-eligible because OSR admits
+        // Boxed. The outer loop region is now OSR-eligible because OSR admits
     // UDF callsites (Phase-2 dispatcher) and Boxed slots.
     //
     // The body intentionally does meaningful work *between* the UDF calls
@@ -723,10 +696,9 @@ fn osr_rejects_thin_udf_wrapper_loop() {
 // ── v0.92.0 — Boxed-argument string shims (len / uCase / lCase / trim…) ──
 
 #[test]
-fn ucase_lcase_concat_in_jitted_udf_matches_interpreter() {
+fn ucase_lcase_concat_in_udf_matches_closed_form() {
     // `tag(s)` takes a Boxed param, calls uCase + lCase (both Boxed → Boxed
-    // shims), and concatenates. Whole-function JIT must engage and produce
-    // byte-identical output to the interpreter oracle.
+        // byte-identical output to the interpreter oracle.
     let src = r#"
         function tag(s) { return uCase(s) & ":" & lCase(s); }
         out = "";
@@ -739,7 +711,7 @@ fn ucase_lcase_concat_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn len_of_boxed_string_arg_returns_int_in_jit() {
+fn len_of_string_arg_returns_int() {
     // `sz(s)` calls len(s) which returns Int through a Boxed-arg shim. The
     // value flows back into arithmetic — proving the Int return kind plumbs
     // back into the standard numeric lattice from a Boxed callsite.
@@ -755,7 +727,7 @@ fn len_of_boxed_string_arg_returns_int_in_jit() {
 }
 
 #[test]
-fn trim_family_in_jitted_udf_matches_interpreter() {
+fn trim_family_in_udf_matches_closed_form() {
     // trim / ltrim / rtrim each accept Boxed → return Boxed. Compose them
     // through a Concat to confirm a chain of Boxed-producing shims survives
     // round-trip through the arena.
@@ -771,7 +743,7 @@ fn trim_family_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn reverse_in_jitted_udf_matches_interpreter() {
+fn reverse_in_udf_matches_closed_form() {
     // reverse(string) — Boxed → Boxed. Confirms chars().rev() round-trips
     // through the arena identically to the interpreter.
     let src = r#"
@@ -786,7 +758,7 @@ fn reverse_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn asc_returns_int_from_boxed_arg_in_jit() {
+fn asc_returns_int_from_string_arg() {
     // asc(s) is the second Boxed→Int shim after len(). Result feeds back
     // into arithmetic to prove the Int return kind plumbs correctly.
     let src = r##"
@@ -805,8 +777,7 @@ fn asc_returns_int_from_boxed_arg_in_jit() {
 
 #[test]
 fn member_get_loadlocalproperty_matches_interpreter() {
-    // v0.99.5 — JIT'd `local.prop` (fused LoadLocalProperty) over a
-    // Boxed-param struct receiver. First call populates the IC; every
+        // Boxed-param struct receiver. First call populates the IC; every
     // subsequent call hits `shape == cached_shape` and reads via
     // `map.get_index(cached_idx)` directly. Test runs 200 iterations on
     // the same struct shape to exercise the hot path.
@@ -843,10 +814,8 @@ fn member_get_case_insensitive_matches_interpreter() {
 #[test]
 fn member_get_missing_key_throws_matches_interpreter() {
     // A bare `obj.missing` read now THROWS "Variable 'absent' is undefined"
-    // (Lucee/ACF parity), replacing the old silent Null. The JIT member-IC shim
-    // bails to the interpreter on a struct miss, so the throw fires identically
-    // whether the caller is JIT-compiled or interpreted. A CFML try/catch
-    // confirms both modes reach the same catch every iteration.
+        // bails to the interpreter on a struct miss, so the throw fires identically
+        // confirms both modes reach the same catch every iteration.
     let src = r##"
         function maybe(p) {
             try { return "<" & p.absent & ">"; }
@@ -859,7 +828,7 @@ fn member_get_missing_key_throws_matches_interpreter() {
     "##;
     let oracle = run_interpreter(src);
     let (out, _compiled) = run(src);
-    assert_eq!(out, oracle, "missing-key read must throw identically under JIT and interpreter");
+    assert_eq!(out, oracle, "missing-key read must throw");
     assert_eq!(out, "MISS;".repeat(60), "each call must reach the catch");
 }
 
@@ -903,8 +872,7 @@ fn array_len_shim_matches_interpreter() {
 #[test]
 fn array_len_bails_on_query_column_and_matches_interpreter() {
     // v0.99.3 — arrayLen on a QueryColumn THROWS in Lucee/RustCFML. The
-    // JIT'd shim sets *bail = 1; the engine then re-interprets the call,
-    // and the interpreter throws the same `Can't cast` runtime error,
+        // and the interpreter throws the same `Can't cast` runtime error,
     // which the cftry/cfcatch grabs. The error message must match exactly.
     let src = r#"
         function probe(a) { return arrayLen(a); }
@@ -927,8 +895,7 @@ fn array_len_bails_on_query_column_and_matches_interpreter() {
         out, oracle,
         "arrayLen(QueryColumn) bail must re-interpret to same error as interpreter"
     );
-    // We deliberately don't assert compiled>=1 — under JIT the shim sets
-    // *bail every call, so the function may be evicted from cache. The
+        // *bail every call, so the function may be evicted from cache. The
     // critical guarantee is output parity with the interpreter.
 }
 
@@ -1029,7 +996,7 @@ fn repeat_string_shim_matches_interpreter() {
 }
 
 #[test]
-fn html_format_shims_in_jitted_udf_match_interpreter() {
+fn html_format_builtins_in_udf_match_closed_form() {
     // htmlEditFormat / htmlCodeFormat / encodeForHtml / stripCr — chained
     // through a Concat. Confirms the entity-escape semantics match interp
     // byte-for-byte.
@@ -1086,7 +1053,6 @@ fn add_mixed_int_and_struct_int_member_smi() {
 #[test]
 fn add_boxed_smi_slow_path_numeric_strings_add_per_interpreter() {
     // v0.99.6 — `obj.s + obj.t` where both members are Strings, so the shim's
-    // SMI tag-check fails and the slow path takes cfml_jit_add_boxed.
     //
     // The operands are NUMERIC strings: CFML `+` is arithmetic, so this must
     // ADD to 5, not concatenate to "23". (This test used to use "foo"/"bar"
@@ -1174,8 +1140,6 @@ fn sub_boxed_slow_path_numeric_strings_per_interpreter() {
 #[test]
 fn add_boxed_smi_handles_large_int_via_box_int_overflow() {
     // v0.99.6 — `p.big + p.big` where p.big is just under i61 max. The
-    // SMI Add overflows out of i61; the JIT must take the smi_overflow
-    // edge (call cfml_jit_box_int on the raw i64). Match interpreter.
     let src = r##"
         function dbl(p) { return p.big + p.big; }
         // 2^60 - 1 = 1152921504606846975 (i61 max). Doubled exceeds i61.
@@ -1194,8 +1158,7 @@ fn add_boxed_smi_handles_large_int_via_box_int_overflow() {
 #[test]
 fn member_read_in_main_loop_matches_closed_form() {
     // `__main__`'s outer for-loop body reads `rec.a`/`rec.b` via the IC and
-    // accumulates the sum. CLI __main__ never JITs whole-fn (gotcha #22),
-    // so OSR is the only path that can specialise this loop. With v0.99.8
+        // so OSR is the only path that can specialise this loop. With v0.99.8
     // OSR admits LoadLocalProperty + GetProperty + Boxed Add.
     let src = r#"
         rec = {a: 7, b: 3};
@@ -1250,8 +1213,7 @@ fn member_read_bails_on_non_struct_receiver_matches_closed_form() {
         rec = [10, 20, 30];
         // Read a property that does not exist on Array — interpreter
         // path is what produces the canonical result; we just verify
-        // the JIT bails cleanly and yields the same output.
-        try {
+                try {
             out = "";
             for (k = 1; k <= 50; k++) { out = out & rec.foo & ";"; }
             writeOutput(out);
@@ -1354,8 +1316,7 @@ fn member_set_new_key_bumps_shape_matches_interpreter() {
 #[test]
 fn member_set_bails_on_component_struct() {
     // v0.100.0 — Components carry `__variables`/`__properties` and have
-    // setter machinery the JIT shim doesn't replicate; the shim sets
-    // *bail = 1 and the interpreter re-runs the call. Hand-rolled
+        // *bail = 1 and the interpreter re-runs the call. Hand-rolled
     // "looks like a CFC" struct (carrying `__variables`) is enough to
     // exercise the bail path without needing real CFC machinery.
     let src = r##"
@@ -1376,9 +1337,8 @@ fn member_set_bails_on_component_struct() {
 // ── v0.101.0 — type/collection predicate shims ────────────────────────────
 
 #[test]
-fn isnumeric_predicate_in_jitted_udf_matches_interpreter() {
-    // isNumeric must bit-match the interpreter — JIT'd Boxed return must
-    // stringify as "YES"/"NO" (CfmlValue::Bool), not "1"/"0" (Int).
+fn isnumeric_predicate_in_udf_matches_closed_form() {
+        // stringify as "YES"/"NO" (CfmlValue::Bool), not "1"/"0" (Int).
     let src = r##"
         function check(x) { return isNumeric(x); }
         out = "";
@@ -1394,10 +1354,9 @@ fn isnumeric_predicate_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn type_predicate_family_in_jitted_udf_matches_interpreter() {
+fn type_predicate_family_in_udf_matches_closed_form() {
     // isArray / isStruct / isBoolean / isSimpleValue all flow as Boxed
-    // (CfmlValue::Bool) and chain through `&` concat — JIT output must
-    // bit-match interpreter across heterogeneous Boxed arg types (Array,
+        // bit-match interpreter across heterogeneous Boxed arg types (Array,
     // Struct, String, Bool). NOTE: `isNull(ident)` is codegen-special-cased
     // to TryLoadLocal+IsNull (bypasses the builtin Call path), so the
     // chained version uses isSimpleValue here. A separate test exercises
@@ -1422,7 +1381,7 @@ fn type_predicate_family_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn isnull_via_member_access_in_jitted_udf_matches_interpreter() {
+fn isnull_via_member_access_in_udf_matches_closed_form() {
     // `isNull(holder.value)` is NOT codegen-special-cased (only bare-
     // identifier args are), so this exercises the `isnull` shim's Boxed
     // Call path through the analyser + translator.
@@ -1442,7 +1401,7 @@ fn isnull_via_member_access_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn collection_count_shims_in_jitted_udf_match_interpreter() {
+fn collection_count_shims_in_udf_matches_closed_form() {
     // structCount + listLen return Int; arrayIsEmpty + structIsEmpty return
     // Boxed Bool. Mix them through `&` concat to exercise both ret kinds.
     let src = r##"
@@ -1466,7 +1425,7 @@ fn collection_count_shims_in_jitted_udf_match_interpreter() {
 }
 
 #[test]
-fn array_to_list_in_jitted_udf_matches_interpreter() {
+fn array_to_list_in_udf_matches_closed_form() {
     let src = r##"
         function join(arr) { return arrayToList(arr); }
         out = "";
@@ -1481,7 +1440,7 @@ fn array_to_list_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn struct_key_exists_in_jitted_udf_matches_interpreter() {
+fn struct_key_exists_in_udf_matches_closed_form() {
     // structKeyExists must be case-insensitive on the key and match the
     // interpreter exactly (Boxed Bool return).
     let src = r##"
@@ -1500,7 +1459,7 @@ fn struct_key_exists_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn array_contains_in_jitted_udf_matches_interpreter() {
+fn array_contains_in_udf_matches_closed_form() {
     let src = r##"
         function has(arr, v) { return arrayContains(arr, v); }
         function hasNoCase(arr, v) { return arrayContainsNoCase(arr, v); }
@@ -1518,7 +1477,7 @@ fn array_contains_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn array_first_last_in_jitted_udf_matches_interpreter() {
+fn array_first_last_in_udf_matches_closed_form() {
     let src = r##"
         function pick(arr) { return arrayFirst(arr) & "|" & arrayLast(arr); }
         out = "";
@@ -1535,9 +1494,7 @@ fn array_first_last_in_jitted_udf_matches_interpreter() {
 
 #[test]
 fn array_first_bails_on_non_array_matches_interpreter() {
-    // arrayFirst on a non-array must throw the same runtime error under JIT
-    // as under the interpreter — i.e. the JIT bails and the interp re-run
-    // surfaces the throw, which cftry/cfcatch catches.
+            // surfaces the throw, which cftry/cfcatch catches.
     let src = r##"
         function safeFirst(x) {
             try { return arrayFirst(x); } catch (any e) { return "ERR"; }
@@ -1554,7 +1511,7 @@ fn array_first_bails_on_non_array_matches_interpreter() {
 }
 
 #[test]
-fn array_sum_avg_in_jitted_udf_matches_interpreter() {
+fn array_sum_avg_in_udf_matches_closed_form() {
     let src = r##"
         function stats(arr) { return arraySum(arr) & "|" & arrayAvg(arr); }
         out = "";
@@ -1571,7 +1528,7 @@ fn array_sum_avg_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn list_first_last_rest_in_jitted_udf_matches_interpreter() {
+fn list_first_last_rest_in_udf_matches_closed_form() {
     let src = r##"
         function probe(list) {
             return listFirst(list) & "|" & listLast(list) & "|" & listRest(list);
@@ -1588,7 +1545,7 @@ fn list_first_last_rest_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn list_get_at_in_jitted_udf_matches_interpreter() {
+fn list_get_at_in_udf_matches_closed_form() {
     let src = r##"
         function at(list, i) { return listGetAt(list, i); }
         out = "";
@@ -1604,7 +1561,7 @@ fn list_get_at_in_jitted_udf_matches_interpreter() {
 }
 
 #[test]
-fn list_append_prepend_in_jitted_udf_matches_interpreter() {
+fn list_append_prepend_in_udf_matches_closed_form() {
     let src = r##"
         function build(seed) {
             var s = seed;

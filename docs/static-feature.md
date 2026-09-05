@@ -165,7 +165,7 @@ not in the CFML suite.
 # Whole CFML suite (CLI). Static suite should show "16/16 passed".
 cargo run -- tests/runner.cfm 2>/dev/null | grep -E "Static blocks|SUMMARY"
 
-# Full Rust + JIT gate
+# Full Rust gate
 cargo test --workspace
 
 # wasm targets (host build skips them)

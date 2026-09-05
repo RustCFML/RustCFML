@@ -41,7 +41,7 @@ Read these memory files (in `~/.claude/projects/.../memory/`) before touching co
   closure-scope fix; same scope-machinery neighbourhood (`StoreLocal` /
   `scope_aware_store` / `__variables`), useful background.
 
-Then read the **release gate** in `CLAUDE.md` (cargo test --workspace incl JIT,
+Then read the **release gate** in `CLAUDE.md` (cargo test --workspace,
 runner.cfm CLI+serve, wasm32 + wasm-pack) — this fix touches the component scope
 core, so the FULL gate is mandatory, plus a **serve-mode `leaks` check** (§7) and
 **Lucee parity** (§7).
@@ -255,7 +255,7 @@ pick, the **serve-mode `leaks` check is part of DoD.**
 
 ## 8. Verification gate (mandatory — this touches the scope core)
 
-1. **`cargo test --workspace`** (Rust + the 76 JIT tests).
+1. **`cargo test --workspace`** (all Rust tests).
 2. **`cargo run -- tests/runner.cfm`** (CLI) + **serve cold+warm** (serve from the
    PROJECT ROOT, readiness-probe a LIGHTWEIGHT path like `/tests/harness.cfm` — NOT
    `/tests/runner.cfm`, which runs the whole suite per probe; that bit me).
@@ -270,7 +270,7 @@ pick, the **serve-mode `leaks` check is part of DoD.**
    `RUSTCFML_MEMPROBE` tooling described in the Arc-cycle memory if needed.)
 6. **Wheels delta** — build a no-fix release, run the full suite both ways, diff the
    failing-spec lists. Expect pluginsSpec mixin specs to clear with **zero new
-   failures**. Recipe: `WHEELS_CI=true RUSTCFML_JIT=0 rustcfml --serve
+   failures**. Recipe: `WHEELS_CI=true rustcfml --serve
    <wheels>/public --port N`, then `curl
    ".../index.cfm/wheels/core/tests?db=sqlite&reload=true&format=json"` (output has
    ~31KB leading template whitespace — strip to first `{` before JSON parse).
@@ -286,7 +286,7 @@ pick, the **serve-mode `leaks` check is part of DoD.**
 - Regression test added + wired + green on RustCFML AND Lucee 7.
 - Wheels pluginsSpec mixin specs clear; **zero regressions** across all 2756 specs.
 - **Serve-mode `leaks` = 0 ROOT CYCLE** (no reintroduced Arc-cycle leak); RSS plateaus.
-- Full release gate green (workspace+JIT, CLI+serve, wasm32+wasm-pack).
+- Full release gate green (workspace, CLI+serve, wasm32+wasm-pack).
 - Version bump (workspace root `Cargo.toml` `version = "0.280.0"` AND the seven
   `[workspace.dependencies]` `cfml-* version = "..."` pins — both, or the build
   fails). Commit direct to main, NO Co-Authored-By line, **ask before push**, tag +

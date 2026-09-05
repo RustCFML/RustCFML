@@ -214,18 +214,6 @@ Enable it under the `observability` block:
 recent profiled (slow) requests as JSON — route, sample count, and the call
 tree. It 404s when the profiler is off.
 
-### Limitation — JIT-compiled numeric leaves
-
-RustCFML's JIT compiles small hot numeric functions straight to native code,
-bypassing the interpreter loop (and therefore the per-line sampling hook and the
-call-frame push). Time spent inside a JIT-compiled numeric leaf is therefore
-attributed to its **caller's** self-time rather than showing as its own frame.
-This is acceptable in practice — such functions are tiny and fast by definition
-(that is why they were JIT'd) — but a profile will not break them out
-separately. Interpreted functions (the overwhelming majority of a real request,
-and everything in serve mode where the per-request JIT rarely warms up) are
-attributed correctly.
-
 ## OpenTelemetry traces + metrics
 
 The third observability layer exports **distributed traces** and **RED metrics**
@@ -278,9 +266,7 @@ DB client (`db.system.name`, `db.query.text`, `db.operation.name`,
 > the core OTel line and would fork the dependency tree). **Traces** push over
 > OTLP; **metric** OTLP *push* is a documented follow-up — a collector scraping
 > the Prometheus endpoint (or its `prometheusexporter`) covers that case one hop
-> downstream. Transaction spans on functions the JIT compiles to native code
-> share the profiler's [attribution limitation](known-issues.md) (JIT'd numeric
-> leaves don't get their own span).
+> downstream.
 
 ## Native CPU/wall-clock profiler (`--profile`)
 

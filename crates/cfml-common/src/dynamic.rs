@@ -613,7 +613,7 @@ impl FromIterator<CfmlValue> for CfmlArray {
 /// v0.99.4 — inner struct payload. `shape_id` is bumped on every
 /// **structural** change (new key inserted, key removed, clear when
 /// non-empty, or any `with_write` access). Value-only updates do NOT
-/// bump shape — the same `(name → index)` mapping holds, and JIT inline
+/// bump shape — the same `(name → index)` mapping holds, and inline
 /// caches over `GetProperty(name)` stay valid. `with_write` exposes the
 /// inner `IndexMap` directly, so it must bump unconditionally (the
 /// closure could do anything). Shape IDs are allocated from a process-
@@ -1200,7 +1200,7 @@ impl CfmlStruct {
 
     /// Attach a shared per-class method table (component-model flyweight). After
     /// this, method lookups that miss the per-instance `map` fall through to
-    /// `table`. Bumps `shape_id` so JIT/IC caches re-resolve.
+    /// `table`. Bumps `shape_id` so any index cache re-resolves.
     #[inline]
     pub fn set_method_table(&self, table: Arc<ValueMap>) {
         let mut g = self.0.write();
@@ -1265,7 +1265,7 @@ impl CfmlStruct {
     }
 
     /// v0.99.4 — current shape generation. Bumped on every structural
-    /// change. JIT IC fast path: load this, compare with cached
+    /// change. Index-cache fast path: load this, compare with cached
     /// `shape_id`; on match the cached `(name → index)` is still valid
     /// so the IC can index directly into `map.get_index(cached_idx)`.
     /// On miss the slow path re-resolves the key and updates the IC.
@@ -1331,7 +1331,7 @@ impl CfmlStruct {
     /// write lock on the hot `variables` read path once the alias is stamped.
     /// Held as a `Weak`, so this never extends `target`'s lifetime. Does NOT
     /// bump `shape_id`: the key set is unchanged (the alias is resolved lazily
-    /// on read, never materialized into the map), so JIT inline caches stay
+    /// on read, never materialized into the map), so index caches stay
     /// valid.
     pub fn set_this_alias_if_changed(&self, target: &CfmlStruct) {
         // Fast path: already aliased to this exact backing store.
@@ -1423,7 +1423,7 @@ impl CfmlStruct {
     }
 
     /// v0.99.5 — case-insensitive lookup that also returns the IndexMap
-    /// entry index. Used by the JIT member-access inline cache:
+    /// entry index. For a member-access index cache:
     /// `(name → idx)` is stable while `shape_id` doesn't change, so the
     /// IC can hit `map.get_index(cached_idx)` on the fast path.
     /// v0.599 — one probe (the map key is itself case-insensitive); this used
@@ -1436,7 +1436,7 @@ impl CfmlStruct {
     }
 
     /// v0.99.5 — read the value at a specific IndexMap entry index. Used
-    /// by the JIT IC's fast path after the cached shape matched. Returns
+    /// by an index cache fast path after the cached shape matched. Returns
     /// `None` if the index is out of range (shouldn't happen when shape
     /// matched, but defensive).
     #[inline]
@@ -1445,7 +1445,7 @@ impl CfmlStruct {
     }
 
     /// v0.100.0 — write a value at a specific IndexMap entry index. Used by
-    /// the JIT member-write IC's fast path: when a cached `(shape, idx)` hit
+    /// a member-write index cache fast path: when a cached `(shape, idx)` hit
     /// confirms the key is at the position we recorded, replace the value
     /// in place. Does NOT bump `shape_id` — the key set is unchanged, only
     /// the value at that slot. Returns the previous value, or `None` if the
@@ -1566,7 +1566,7 @@ impl CfmlStruct {
     /// Insert (interior mutability — visible to all aliases). Returns the
     /// previous value if the key already existed. v0.99.4 — shape_id is
     /// bumped iff the key is genuinely new (no prior value); value-only
-    /// updates leave shape alone so JIT ICs stay warm.
+    /// updates leave shape alone so index caches stay warm.
     ///
     /// v0.116.0 — case-insensitive on write to match Lucee/ACF: when a key
     /// already exists under a different casing, update its value in place and
@@ -1988,7 +1988,7 @@ pub enum CfmlValue {
     /// heap allocation + copy. Mutating string ops (rare in CFML — strings
     /// are usually returned as new values from `uCase`/`trim`/...) should
     /// use `Arc::make_mut` for copy-on-write. The prerequisite for Option-γ
-    /// tag-pointer polymorphic values inside the JIT (`JIT_POLY_DESIGN.md`).
+    /// tag-pointer polymorphic values.
     String(Arc<String>),
     /// Reference-typed array (Lucee semantics): a shared, interior-mutable
     /// handle. Aliases see each other's mutations. See `CfmlArray`.

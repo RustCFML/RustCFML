@@ -6886,8 +6886,8 @@ impl CfmlVirtualMachine {
         // path as well as the normal one.
         //
         // Set HERE rather than in `execute_function_body` next to the local of the
-        // same name: the body has early returns before that point (the JIT
-        // fast-path `try_call`, the recursion guard), and a frame that took one of
+        // same name: the body has early returns before that point (the
+        // fast-path `try_call` and the recursion guard), and a frame that took one of
         // them would have run with the CALLER's flag — a CFC method invoked from a
         // pseudo-constructor would then be told it has no `local` scope. This
         // wrapper always runs. The inputs are exactly the body's: the function's
@@ -7197,7 +7197,7 @@ impl CfmlVirtualMachine {
         // existing phase covers teardown.
         #[cfg(feature = "frame-census")]
         let _fc = cfml_common::perf_counters::frame_census::enter(func.global_id, &func.name);
-        // Take the fused parent plan unconditionally at entry — a JIT
+        // Take the fused parent plan unconditionally at entry — a
         // fast-path early return below must not leave a stale plan behind for
         // an unrelated later call. When set, `parent_scope` is the RAW caller
         // locals and the frame seed below merges (env ∪ filtered caller)
@@ -7284,7 +7284,7 @@ impl CfmlVirtualMachine {
         let seed_cap = parent_len + func.params.len();
         #[cfg(feature = "call-phases")]
         {
-            // phase 0: entry: fused-plan take, JIT probe, recursion guard, depth
+            // phase 0: entry: fused-plan take, recursion guard, depth
             let _n = std::time::Instant::now();
             cfml_common::perf_counters::call_phases::add(
                 0, _n.duration_since(_cp_t).as_nanos() as u64);
@@ -7955,7 +7955,7 @@ impl CfmlVirtualMachine {
             ip += 1;
 
             // Dynamic op census (probe builds only — `--features op-census`).
-            // One relaxed add per executed op; sizes the Tier-0 JIT against the
+            // One relaxed add per executed op; sizes op-level work against the
             // mix the workload really runs rather than the static op-weight scan.
             #[cfg(feature = "op-census")]
             cfml_common::perf_counters::op_census::bump(op.census_index());
@@ -22904,14 +22904,13 @@ impl CfmlVirtualMachine {
     /// §29 — validate every supplied argument against its declared parameter
     /// type, in parameter order.
     ///
-    /// Extracted so the interpreter's binding prologue and the JIT dispatch
-    /// path cannot drift. They did: a JIT-compiled body is the function's
-    /// BODY, and it is entered without the prologue that performs this check,
-    /// so `function f( numeric n )` silently accepted `"1,000"`, `"0x10"`,
-    /// `[]` and `{}` for as long as the compiled body served the call. The
-    /// declared RETURN type never had this hole — it is enforced in the call
-    /// wrapper (`execute_function_with_args`), which the JIT path still
-    /// returns through.
+    /// Extracted so the binding prologue has exactly one definition. This is
+    /// not hypothetical tidiness: while a second, compiled entry path existed
+    /// it entered the body WITHOUT this prologue, and `function f( numeric n )`
+    /// silently accepted `"1,000"`, `"0x10"`, `[]` and `{}` for as long as that
+    /// path served the call. Declared RETURN types never had the hole — they
+    /// are enforced in the call wrapper (`execute_function_with_args`), which
+    /// every path returns through.
     ///
     /// `Null` is "not supplied" in CFML and is never checked, matching the
     /// prologue: an omitted optional argument is simply absent.

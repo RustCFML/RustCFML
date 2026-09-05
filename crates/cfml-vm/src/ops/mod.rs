@@ -3,16 +3,17 @@
 //!
 //! # Why this module exists
 //!
-//! The dispatch match is ~7,000 lines in one function. That shape blocks the
-//! only credible route to Lucee-class performance (roadmap P4/P5): a
-//! **admission-free Tier-0 baseline JIT** must be able to emit a direct call to
-//! the interpreter's own logic for any op it does not inline natively. You
-//! cannot call into the middle of a `match` arm — so every op's body has to be
-//! reachable as a function first. The 2026-08-10 admission scan is what forces
-//! this: 83.2% of Preside's functions are permanently ineligible for the
-//! current pure-kernel JIT and 97.6% of op-weight lives inside them, so
-//! *widening admission* is dead and *removing the admission requirement* is the
-//! only remaining architecture. Shimming needs handlers.
+//! The dispatch match is ~7,000 lines in one function, which is hostile to read,
+//! to profile per-op, and to change with any confidence about blast radius.
+//! Extracting each arm into a named handler makes an op's cost attributable and
+//! its behaviour testable in isolation.
+//!
+//! ⚠️ The ORIGINAL motivation was a planned admission-free Tier-0 baseline JIT,
+//! which needed every op body callable as a function (you cannot call into the
+//! middle of a `match` arm). **The JIT was removed in v0.653.0** — it admitted
+//! 13 of 1,345 functions on Preside and was a net slowdown; see known-issues
+//! §77. The extraction is kept on its own merits, above. Do not reintroduce a
+//! JIT-shaped constraint here on the strength of the old rationale.
 //!
 //! # Rules for this module (keep it boring)
 //!
@@ -23,19 +24,15 @@
 //!   is never ambiguous about which change caused it.
 //! * **Narrowest signature that suffices.** A handler takes only the frame
 //!   state it actually touches (`&mut Vec<CfmlValue>` for the stack-only ops
-//!   here). That is deliberate: Tier-0 emits a direct call per op, so fewer
-//!   arguments means a cheaper shim and no context struct to materialize — and
-//!   the signature doubles as machine-checked documentation of what each op can
-//!   reach. Later slices escalate as needed (`&mut CfmlVirtualMachine`, then a
+//!   here). The signature doubles as machine-checked documentation of what each
+//!   op can actually reach. Later slices escalate as needed (`&mut CfmlVirtualMachine`, then a
 //!   frame-context struct for the ops that jump or unwind).
 //! * **`#[inline]` everywhere.** These are hot and tiny; the extraction must not
 //!   cost a call. Perf-neutrality is a release gate, not an aspiration.
 //!
 //! Slice 1 (this commit): the 39 arms that touch *only* the operand stack and
 //! have no control flow — literals, arithmetic, comparison, logical operators,
-//! array/struct construction and the two container merge ops. These are also
-//! exactly the ops Tier-0 will inline natively first, so they are the natural
-//! starting point.
+//! array/struct construction and the two container merge ops.
 //!
 //! Slice 2: the arms needing the live VM plus `ip` — `Div`/`Concat` (catchable
 //! errors), `Throw`/`Rethrow`, `Print`, and the custom-tag/jump ops — in
@@ -50,8 +47,8 @@
 //!
 //! Slice 5: 22 more frame arms in `locals.rs` — try/except bookkeeping, the fused
 //! local arithmetic ops, local load/append, the super-call ops. The three
-//! OSR-entangled jump arms (`Jump`, `JumpIfFalse`, `JumpIfTrue`) are deferred to
-//! the `FrameCtx` slice, since they reach into the JIT loop-compilation path.
+//! jump arms (`Jump`, `JumpIfFalse`, `JumpIfTrue`) are deferred to the
+//! `FrameCtx` slice, since they drive `ip` directly.
 
 pub(crate) mod access;
 pub(crate) mod effect;

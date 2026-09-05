@@ -32,7 +32,7 @@ component-instance = []
 alloc-sizing = []
 probe-sites = []
 # Dynamic op census (P3/P4 sizing) — the VM's dispatch loop bumps one relaxed
-# atomic add per EXECUTED bytecode op, so the Tier-0 JIT can be sized against
+# atomic add per EXECUTED bytecode op, so op-level work can be sized against
 # the mix Preside really runs instead of the static op-weight scan. Probe builds
 # only; a default build has no counter and no branch. See PERFORMANCE_ROADMAP P3.
 op-census = []

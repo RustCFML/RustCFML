@@ -1,6 +1,7 @@
 # Inline caches for member reads — plan
 
-Status: **not started, and gated on a pre-flight measurement that may kill it.**
+Status: **not started. Genuinely open — the two prior attempts were
+under-powered, not refutations.**
 Written when the Cranelift JIT was removed (v0.653.0, known-issues §77), because
 member-access inline caches were the one idea worth carrying out of it.
 
@@ -8,26 +9,34 @@ Read this section before writing any code.
 
 ---
 
-## 1. This has been built twice and measured zero
+## 1. This has been built twice — and the measurements could not resolve the answer
 
 Both attempts were interpreter-level member ICs. Both were reverted.
 
 | attempt | keyed by | hit rate on live Preside | A/B result |
 |---|---|---|---|
 | v0.577 | `shape_id` | 38% | no win |
-| 2026-08-22 | class id (`method_table` `Arc` ptr) | **98.6%**, 0 stale | +0.1…+2.6%, all p≥0.11, **never faster** |
+| 2026-08-22 | class id (`method_table` `Arc` ptr) | **98.6%**, 0 stale | +0.1…+2.6%, all p≥0.11 |
 
-The second attempt is the important one: a 98.6% hit rate with zero staleness is
-as good as an IC gets, and it still did not produce a win. The reason is not
-subtle — **the probe it replaced was already cheap**. `Key` hashes and compares
-case-insensitively, so a member read is one `IndexMap` probe; the IC's fast path
-needs a second lock acquire to read the cached slot, and that costs about what
-the probe saved.
+Those were recorded at the time as "measured zero". **That conclusion was
+over-stated, and the numbers say so.** The A/B rig null-calibrates at
+**3.8–8.8%** on four legs, and has produced an apparent **−3.77% from identical
+binaries**. An instrument with a ±4-9% null floor cannot resolve a candidate
+whose plausible effect is 1-3%: "+0.1…+2.6%, p≥0.11" is *no signal*, which is not
+the same as *no effect*.
 
-It also sits inside a broader result recorded three separate times in this repo:
-**instruction-class levers measure zero on this engine.** Interned-key probes,
-the member IC, and `LoadVariablesProperty` op fusion all landed within noise.
-Time is in **frames** — 71% of an admin render, ~1,276 ns/frame — not in the ops.
+So the honest state is **unknown, not dead**. What the attempts do establish:
+
+- the mechanism works — 98.6% hit, zero staleness, so a third attempt should
+  reuse that design rather than rediscover it;
+- whatever the effect is, it is **smaller than the instrument's floor**, so the
+  first problem to solve is the instrument, not the cache.
+
+There is a real prior for it being small: `Key` hashes and compares
+case-insensitively, so the probe an IC replaces is already one `IndexMap`
+lookup, and the 2026-08 fast path needed a second lock acquire to read the
+cached slot. But "plausibly small" is a hypothesis, and it has never been
+measured with an instrument that could see it.
 
 ## 2. What changed that could make it different
 
@@ -45,24 +54,44 @@ So the honest position going in is: **the prior is strongly negative.** This pla
 is written so that we spend a day proving or refuting it cheaply, not a fortnight
 rebuilding it on hope.
 
-## 3. Pre-flight: the measurement that decides it
+## 3. Pre-flight: build the instrument first, then size the ceiling
 
-Do not build anything until this is done. It is half a day.
+Do not repeat the previous shape of this work — build, A/B on the suite rig,
+read noise, conclude nothing. Two steps, in this order.
 
-1. **Size the ceiling.** Instrument `op_get_property` / `op_get_index` with a
-   cycle counter (env-gated, `RCFML_MEMBER_TIMING=1`) and take a live Preside
-   admin render. Record total member-read time as a share of request CPU.
-2. **Apply the IC's best case.** The 2026-08-22 build hit 98.6% and saved,
-   optimistically, one hash probe per hit. Multiply.
-3. **Compare against the noise floor of the instrument.** `scripts/perf/ab_suites.py`
-   null-calibrates at **3.8–8.8%** on 4 legs — an apparent −3.77% has been
-   observed from *identical binaries*.
+### 3a. An instrument that can see a 1% effect
 
-**Kill criterion: if the modelled best case is below ~4%, stop.** A lever that
-cannot clear its own instrument's null floor cannot be validated, and shipping it
-means adding a cache-invalidation surface for a number we can never confirm.
+The suite-level A/B rig cannot, and no amount of care in the cache will fix
+that. Options, cheapest first:
 
-Both previous attempts would have been killed here. That is the point.
+- **Direct measurement instead of differencing.** Cycle-count
+  `op_get_property` / `op_get_index` in place (env-gated, e.g.
+  `RCFML_MEMBER_TIMING=1`) and report total member-read cycles per request.
+  A before/after on *that* number has none of the null floor of a whole-suite
+  wall-clock difference, because it is not a difference of two large numbers.
+- **More legs, paired, on a quiet box.** The 3.8–8.8% floor was measured at four
+  legs. Establish the floor at the leg count you actually intend to use, and
+  publish it alongside the result — a result without its null calibration is
+  not a result.
+- **Counter-based confirmation.** Hit/miss counters and probe counts prove the
+  cache is doing what you think, independent of timing.
+
+The deliverable of 3a is a stated, calibrated resolution: "this rig can detect
+X%". Everything downstream is judged against X.
+
+### 3b. Size the ceiling
+
+Take a live Preside admin render with the counter from 3a and record member-read
+cycles as a share of request CPU. The IC's best case is that share × the hit rate
+× the fraction of a probe it actually saves.
+
+**Decision rule: proceed only if the modelled ceiling is comfortably above the
+resolution X established in 3a.** If the ceiling is below what you can measure,
+you cannot validate the change — and shipping an unverifiable cache-invalidation
+surface is how you get a subtle staleness bug for no proven gain.
+
+That is a different rule from "the ceiling must beat 4%". The old number was an
+artefact of a blunt instrument, not a property of the lever.
 
 ## 4. If — and only if — it clears the floor
 
@@ -90,10 +119,12 @@ Design constraints learned the hard way:
   A/B, always.**
 - **One lock, not two.** The second acquire is roughly the probe being saved.
 
-## 5. Where the time actually is
+## 5. Where the time is otherwise
 
-If the pre-flight kills this — the likely outcome — these are the measured,
-open levers, all of them in frames rather than ops:
+If the pre-flight says the ceiling is below what you can resolve, these are the
+other open levers. They are all in frames rather than ops, and they are all
+*large* — which is why they survived a blunt instrument when a 1-3% member-read
+effect could not:
 
 - **The Preside frame surcharge**: +496 ns/frame over synthetic, with allocation
   volume identified as the currency (37.3 allocs/frame vs 17.0).
@@ -103,13 +134,18 @@ open levers, all of them in frames rather than ops:
   hard 2.5× cliff at 17 parameters.
 - **CFC construction**: ~1.06 µs per method vs Lucee's 0.07 µs (15×).
 
-Each of those is larger than the entire member-read budget this plan is about.
+Each of those is larger than the member-read budget this plan is about, and each
+is measurable with the rig as it stands. That is an argument about ORDER, not
+about this lever being dead.
 
 ## 6. Rules for whoever picks this up
 
 1. Measure the ceiling before building. If it cannot clear the null floor, close it.
 2. Instrument hit/miss counters before running any A/B.
-3. Use `scripts/perf/ab_suites.py` — interleaved, CPU seconds, per-leg sanity
-   strings, exact permutation p. Never a single wall-clock run.
-4. If it measures zero a third time, delete this document rather than leaving it
-   open for a fourth attempt.
+3. Never a single wall-clock run. If you use `scripts/perf/ab_suites.py`
+   (interleaved, CPU seconds, per-leg sanity strings, exact permutation p),
+   calibrate its null floor first at the leg count you are using.
+4. Publish the null calibration next to any result. A number without its floor
+   is what sent the first two attempts to the wrong conclusion.
+5. If a properly-powered measurement says zero, record THAT — with the
+   resolution it achieved — and close it for good.

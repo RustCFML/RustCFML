@@ -20,8 +20,8 @@
 //! transaction, error, log, bif) that the classic CF debug footer needs. The
 //! two hot hooks the plan calls out — `function_enter/exit` and `line` — are
 //! deliberately **not** fired yet: no stage-1 subscriber needs them, and adding
-//! calls to `call_function`/`LineInfo` risks the JIT-admission regressions
-//! CLAUDE.md warns about. They land with the profiler/DAP (phases 2/5), whose
+//! calls to `call_function`/`LineInfo` puts work in the hottest paths in the
+//! engine. They land with the profiler/DAP (phases 2/5), whose
 //! observers set the `FUNCTION`/`LINE` interest bits reserved below.
 
 #![cfg(feature = "observability")]

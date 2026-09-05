@@ -156,7 +156,7 @@ pub struct CfmlCompiler {
     /// the RHS of an enclosing assignment (`a = b = c`), so the assignment must
     /// leave its assigned value on the stack for the outer store to consume. A
     /// statement-level assignment leaves it false: the consuming store ops emit
-    /// NO extra `Dup`, keeping the exact bytecode the JIT admission analyzer
+    /// NO extra `Dup`, keeping the bytecode the static admission analyser
     /// accepts (a stray `Dup` in a hot setter disqualified the function).
     need_assign_value: bool,
     /// Source file path this program is being compiled from, stamped onto every
@@ -2155,10 +2155,8 @@ impl CfmlCompiler {
     /// A bare `Identifier` read is non-null by CFML semantics: a defined
     /// variable holds a non-null value, and reading an *undefined* one THROWS
     /// rather than yielding Null — so `x = someVar` never assigns Null. Keeping
-    /// identifier RHS unguarded matters beyond the hot path: the extra
-    /// `JumpIfNotNull`/`UnsetPath` ops are outside the JIT's admitted op-subset,
-    /// so guarding `var t = s` would silently disqualify the whole function
-    /// from native compilation (regressed in v0.137.0, restored here).
+    /// identifier RHS unguarded keeps the extra `JumpIfNotNull`/`UnsetPath`
+    /// ops off the hot path — guarding `var t = s` emits them for nothing.
     fn expr_may_be_null(expr: &Expression) -> bool {
         match expr {
             Expression::Literal(lit) => matches!(lit.value, LiteralValue::Null),
@@ -2279,7 +2277,7 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::TryLoadLocal(Name::from(&ident.name)));
             }
             Expression::MemberAccess(access) if !access.null_safe => {
-                // Mirror the normal read path's fusion peepholes so the JIT sees
+                // Mirror the normal read path's fusion peepholes so codegen emits
                 // the same op shapes it already specialises — just the Null-
                 // tolerant twins (`local.foo` → TryLoadLocalKey, `<ident>.foo` →
                 // TryLoadLocalProperty). Reserved-scope and nested roots recurse
@@ -5142,8 +5140,8 @@ impl CfmlCompiler {
                     match &*binop.left {
                         Expression::Identifier(ident) => {
                             // `Dup` only when the value is needed (chained
-                            // assignment); a statement-level store leaves the
-                            // bytecode JIT-admissible (no stray Dup).
+                            // assignment); a statement-level store leaves no
+                            // stray `Dup` on the stack.
                             if want_value {
                                 instructions.push(BytecodeOp::Dup);
                             }
@@ -5617,11 +5615,9 @@ impl CfmlCompiler {
                             return;
                         }
                         // `isNull(a.b.c)` must not throw on a missing member. Keep
-                        // isNull on the builtin-call path (which the JIT specialises
-                        // via the isnull shim) but read the member argument
-                        // null-tolerantly so a missing link is `true`, not a throw.
-                        // (Emitting the `IsNull` bytecode op here would work but is
-                        // not JIT-admissible, needlessly demoting the caller.)
+                        // isNull on the builtin-call path but read the member
+                        // argument null-tolerantly, so a missing link is `true`
+                        // rather than a throw.
                         if matches!(
                             call.arguments[0],
                             Expression::MemberAccess(_) | Expression::ArrayAccess(_)

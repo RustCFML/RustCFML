@@ -279,7 +279,7 @@ pub static SLOT_PARAMS_UNSLOTTED_FNS: AtomicU64 = AtomicU64::new(0);
 /// any slot widening).
 pub static FRAMES_UNSLOTTED_WITH_PARAMS: AtomicU64 = AtomicU64::new(0);
 /// Op counts for the same three classes (static body length — the same
-/// weighting the 2026-08 JIT admission scan used).
+/// weighting the 2026-08 static admission scan used).
 pub static SLOT_OPS_SLOTTED: AtomicU64 = AtomicU64::new(0);
 pub static SLOT_OPS_DISQ_CLOSURE: AtomicU64 = AtomicU64::new(0);
 pub static SLOT_OPS_DISQ_OTHER: AtomicU64 = AtomicU64::new(0);
@@ -482,7 +482,7 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
 
 /// Dynamic op census (`op-census` builds only) — how many times each bytecode
 /// op is actually EXECUTED, as opposed to how many times it appears in compiled
-/// bodies. The 2026-08 JIT admission scan weighted ops statically; a Tier-0
+/// bodies. The 2026-08 admission scan weighted ops statically; a dynamic
 /// design has to be sized against the dynamic mix, because loops mean a
 /// function's ops do not execute once per frame entry. Indexed by
 /// `BytecodeOp::census_index()`; the VM's dispatch loop bumps one relaxed add

@@ -157,11 +157,6 @@ memprofile = ["dep:backtrace"]
 mimalloc = ["dep:mimalloc"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
-# Passthrough to the VM's Cranelift JIT (native only). On by default via THIS
-# crate's `default` list (see the cfml-vm dependency above, which deliberately
-# does NOT take cfml-vm's defaults). Dropping it from `--features` genuinely
-# removes the Cranelift dependency and the engine from the binary. Runtime
-# kill-switch, independent of the build: `RUSTCFML_JIT=0`.
 # Phase C (component-model flyweight): passthrough to the VM's `Instance` backing.
 # DEFAULT-ON as of v0.519.0 (the Slice-6 flip); also reaches the binary transitively
 # via cfml-vm's default. The wasm crates opt out (default-features = false), so the
