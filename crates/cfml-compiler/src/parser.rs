@@ -11,7 +11,18 @@ pub struct Parser {
     current: usize,
     /// Map from token index → javadoc comment text immediately preceding it.
     doc_comments: std::collections::HashMap<usize, String>,
+    /// Current expression-recursion depth, bounded by `MAX_EXPR_DEPTH` so a
+    /// deeply nested expression (e.g. `((((...))))`) returns a parse error
+    /// instead of overflowing the stack.
+    expr_depth: usize,
 }
+
+/// Maximum expression nesting depth. Deeply nested untrusted source would
+/// otherwise recurse until the stack overflows and the process aborts. Each
+/// nesting level walks the full precedence chain (~10 frames), so this stays
+/// well below what a thread stack can hold while remaining far above any
+/// hand-written CFML expression.
+const MAX_EXPR_DEPTH: usize = 64;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -29,6 +40,7 @@ impl Parser {
             tokens,
             current: 0,
             doc_comments,
+            expr_depth: 0,
         }
     }
 
@@ -5760,7 +5772,16 @@ impl Parser {
     // ---- Expression Parsing (Pratt-style precedence climbing) ----
 
     fn parse_expression(&mut self) -> Result<Expression, ParseError> {
-        self.parse_assignment_expr()
+        // Bound expression recursion so deeply nested input (e.g. `((((...))))`)
+        // returns a parse error instead of overflowing the stack.
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_EXPR_DEPTH {
+            self.expr_depth -= 1;
+            return Err(self.parse_error("expression nesting too deep"));
+        }
+        let result = self.parse_assignment_expr();
+        self.expr_depth -= 1;
+        result
     }
 
     fn parse_assignment_expr(&mut self) -> Result<Expression, ParseError> {
