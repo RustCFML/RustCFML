@@ -1241,6 +1241,14 @@ impl CfmlStruct {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// A non-owning handle to the shared backing store. Lets a caller observe
+    /// whether this struct is still alive without keeping it alive — which is
+    /// how the collector's own tests assert that a cycle was reclaimed.
+    #[inline]
+    pub fn weak_backing(&self) -> std::sync::Weak<PlRwLock<StructInner>> {
+        Arc::downgrade(&self.0)
+    }
+
     /// Stable identity of the shared backing store, for cycle detection in
     /// recursive struct walks (reference-typed structs can alias / form cycles).
     #[inline]

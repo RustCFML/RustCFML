@@ -99,6 +99,22 @@ enum TrackedAlloc {
     Instance(Weak<PlRwLock<Instance>>),
 }
 
+impl NodeHandle {
+    /// Downgrade a survivor back to a tracking entry, so a node that outlived
+    /// its request can stay under observation without being kept alive by the
+    /// collector's own bookkeeping.
+    fn downgrade(&self) -> TrackedAlloc {
+        match self {
+            NodeHandle::Struct(a) => TrackedAlloc::Struct(Arc::downgrade(a)),
+            NodeHandle::Array(a) => TrackedAlloc::Array(Arc::downgrade(a)),
+            NodeHandle::Query(a) => TrackedAlloc::Query(Arc::downgrade(a)),
+            NodeHandle::Scope(a) => TrackedAlloc::Scope(Arc::downgrade(a)),
+            #[cfg(feature = "component-instance")]
+            NodeHandle::Instance(a) => TrackedAlloc::Instance(Arc::downgrade(a)),
+        }
+    }
+}
+
 thread_local! {
     /// Per-request allocation log. `Some` only while a TOP-LEVEL request body is
     /// executing on this worker thread; `None` everywhere else (CLI, between
@@ -717,7 +733,12 @@ pub fn collect() -> usize {
     let Some(log) = ALLOC_LOG.with(|c| c.borrow_mut().take()) else {
         return 0;
     };
-    collect_from_log(log)
+    // Survivors are carried into the cross-request set rather than abandoned —
+    // see [`PersistentSet`] for why dropping them was a permanent loss of
+    // tracking, and for the sweep's cost and correctness argument.
+    let mut live: Vec<(usize, TrackedAlloc)> = Vec::new();
+    let reclaimed = collect_from_log_carrying(log, Some(&mut live));
+    reclaimed + carry_survivors(live)
 }
 
 /// The collection pass over an explicit allocation log (the live request's,
@@ -846,7 +867,171 @@ pub fn collect_incremental() -> usize {
     reclaimed
 }
 
+/// --- The cross-request survivor set -----------------------------------------
+///
+/// A request's log is drained by [`collect`] and then GONE. Everything in it
+/// that was still alive — anything that escaped into application, session or
+/// server scope, and everything those graphs reach — therefore stopped being
+/// tracked the moment that request ended, and nothing ever looked at it again.
+/// On a live Preside request that is ~206,000 nodes abandoned per request. If
+/// any of them later became cyclic garbage, no pass would ever find it:
+/// refcounting cannot free a cycle, and the collector only ever saw containers
+/// the CURRENT request allocated.
+///
+/// [`CfmlValue::relog_cycle_nodes`](crate::dynamic::CfmlValue::relog_cycle_nodes)
+/// patched one shape of that hole (a value displaced from a scope struct flagged
+/// persistent), but it is a hook on specific mutations — it cannot cover a
+/// displacement one level down (`application.cache.x = y`, where `cache` is a
+/// plain struct), a session expiring, or any of the other ways a persistent
+/// graph becomes garbage. The general fix is not to stop tracking.
+///
+/// So survivors are carried forward here instead of being dropped:
+///
+///  * **De-duplicated by backing pointer**, so a steady-state application whose
+///    survivors are the same nodes every request adds nothing after the first.
+///    The set grows only when genuinely new long-lived objects appear.
+///  * **Swept on the doubling rule**, exactly like [`collect_incremental`]: a
+///    pass runs when the set has grown to twice its last live size. A normal
+///    request therefore pays a hash probe per survivor and nothing else; the
+///    sweep lands on the request that actually created a new generation (a
+///    framework reload), which is precisely the request that made the garbage.
+///  * **Weakly**, so the set never keeps anything alive and entries whose object
+///    was freed by refcounting fall out at the next sweep.
+///
+/// Correctness is the same conservative argument the request-scoped pass uses,
+/// and it does not depend on other requests being idle: a node still owned from
+/// outside the set — a live request's stack, a frame local, an untracked
+/// container, a `NativeObject` — has an external strong reference, is classified
+/// live, and its whole transitive closure is marked live with it. A concurrent
+/// mutation can only add references (protecting more), and a reference MOVED
+/// between two set members is still found by the mark phase via whichever member
+/// is live. Only a genuine cycle with no external owner is ever reclaimed.
+struct PersistentSet {
+    entries: Vec<TrackedAlloc>,
+    seen: HashSet<usize>,
+    next_sweep: usize,
+}
+
+static PERSISTENT: parking_lot::Mutex<Option<PersistentSet>> = parking_lot::Mutex::new(None);
+
+/// Floor for the cross-request sweep budget, so a small application does not
+/// sweep on every request just because its live set is tiny. Overridable with
+/// `RUSTCFML_GC_PERSISTENT` (`0` disables carrying survivors forward entirely,
+/// restoring the drop-on-request-end behaviour).
+const PERSISTENT_BASE_DEFAULT: usize = 50_000;
+
+fn persistent_base() -> usize {
+    use std::sync::OnceLock;
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("RUSTCFML_GC_PERSISTENT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(PERSISTENT_BASE_DEFAULT)
+    })
+}
+
+/// Number of nodes currently carried across requests (observability).
+pub fn persistent_tracked() -> usize {
+    PERSISTENT.lock().as_ref().map_or(0, |p| p.entries.len())
+}
+
+/// Carry this pass's still-live survivors into the cross-request set, then run a
+/// sweep over that set if it has doubled since the last one. Returns the nodes
+/// reclaimed by the sweep (0 if none ran).
+fn carry_survivors(live: Vec<(usize, TrackedAlloc)>) -> usize {
+    let base = persistent_base();
+    if base == 0 {
+        return 0;
+    }
+    let due = {
+        let mut guard = PERSISTENT.lock();
+        let set = guard.get_or_insert_with(|| PersistentSet {
+            entries: Vec::new(),
+            seen: HashSet::new(),
+            next_sweep: base,
+        });
+        for (ptr, t) in live {
+            if set.seen.insert(ptr) {
+                set.entries.push(t);
+            }
+        }
+        if set.entries.len() >= set.next_sweep {
+            // Take the whole set out under the lock; the pass itself runs
+            // unlocked, and the surviving remainder is put back below.
+            set.seen.clear();
+            Some(std::mem::take(&mut set.entries))
+        } else {
+            None
+        }
+    };
+
+    let Some(entries) = due else { return 0 };
+    sweep_entries(entries, base)
+}
+
+/// Force a cross-request sweep now, ignoring the doubling budget. Returns the
+/// nodes reclaimed. Intended for an idle server (nothing is arriving to trip the
+/// budget) and for the collector's own tests.
+pub fn sweep_persistent() -> usize {
+    let base = persistent_base();
+    if base == 0 {
+        return 0;
+    }
+    let entries = {
+        let mut guard = PERSISTENT.lock();
+        match guard.as_mut() {
+            Some(set) if !set.entries.is_empty() => {
+                set.seen.clear();
+                std::mem::take(&mut set.entries)
+            }
+            _ => return 0,
+        }
+    };
+    sweep_entries(entries, base)
+}
+
+/// The sweep itself: collect over the carried set, then put the remainder back
+/// and re-arm the budget. Runs UNLOCKED — see [`PersistentSet`] for why that is
+/// safe against concurrent requests.
+fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
+    let mut still_live: Vec<(usize, TrackedAlloc)> = Vec::new();
+    let reclaimed = collect_from_log_carrying(entries, Some(&mut still_live));
+    let live_count = still_live.len();
+    {
+        let mut guard = PERSISTENT.lock();
+        let set = guard.get_or_insert_with(|| PersistentSet {
+            entries: Vec::new(),
+            seen: HashSet::new(),
+            next_sweep: base,
+        });
+        for (ptr, t) in still_live {
+            if set.seen.insert(ptr) {
+                set.entries.push(t);
+            }
+        }
+        set.next_sweep = std::cmp::max(base, live_count.saturating_mul(2));
+    }
+    if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        eprintln!(
+            "[cycle_gc] cross-request sweep reclaimed {} node(s); {} still tracked, \
+             next sweep at {}",
+            reclaimed,
+            live_count,
+            std::cmp::max(base, live_count.saturating_mul(2))
+        );
+    }
+    reclaimed
+}
+
 fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
+    collect_from_log_carrying(log, None)
+}
+
+fn collect_from_log_carrying(
+    log: Vec<TrackedAlloc>,
+    carry: Option<&mut Vec<(usize, TrackedAlloc)>>,
+) -> usize {
     if log.is_empty() {
         return 0;
     }
@@ -964,6 +1149,17 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
         if !live.contains(&p) {
             h.clear();
             collected += 1;
+        }
+    }
+    // Hand the LIVE survivors back to the caller so they can stay tracked. Only
+    // live ones: a node cleared above has no external owner, so dropping the
+    // probe handles below frees it and a `Weak` to it would never upgrade again.
+    if let Some(carry) = carry {
+        carry.reserve(live.len());
+        for (&p, h) in &nodes {
+            if live.contains(&p) {
+                carry.push((p, h.downgrade()));
+            }
         }
     }
     drop(nodes);
