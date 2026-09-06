@@ -384,6 +384,7 @@ impl ClassBlueprint {
             _ => None,
         };
 
+        blueprint_census::note_built(&source_file);
         ClassBlueprint {
             name,
             source_file,
@@ -401,6 +402,76 @@ impl ClassBlueprint {
             properties,
             rust_extends,
         }
+    }
+}
+
+#[cfg(feature = "component-instance")]
+impl Drop for ClassBlueprint {
+    fn drop(&mut self) {
+        blueprint_census::note_dropped(&self.source_file);
+    }
+}
+
+/// Diagnostics: how many `ClassBlueprint`s are alive, and how many per class.
+/// Off unless `RUSTCFML_CACHE_CENSUS` is set (one env read per process); the
+/// counters answer "one blueprint per class, or one per class per generation?"
+/// which the heap profiler cannot (it sees the bytes, not the duplication).
+#[cfg(feature = "component-instance")]
+pub mod blueprint_census {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PER_CLASS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("RUSTCFML_CACHE_CENSUS").is_ok())
+    }
+
+    pub(super) fn note_built(source_file: &str) {
+        if !enabled() {
+            return;
+        }
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        let mut g = PER_CLASS.lock().unwrap_or_else(|e| e.into_inner());
+        *g.get_or_insert_with(HashMap::new)
+            .entry(source_file.to_string())
+            .or_insert(0) += 1;
+    }
+
+    pub(super) fn note_dropped(source_file: &str) {
+        if !enabled() {
+            return;
+        }
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+        let mut g = PER_CLASS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.as_mut() {
+            if let Some(n) = m.get_mut(source_file) {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
+
+    /// `(built_total, live, distinct_classes_live, max_live_for_one_class)`.
+    pub fn snapshot() -> (usize, usize, usize, usize) {
+        let g = PER_CLASS.lock().unwrap_or_else(|e| e.into_inner());
+        let (distinct, max) = g
+            .as_ref()
+            .map(|m| {
+                let live: Vec<usize> = m.values().copied().filter(|&n| n > 0).collect();
+                (live.len(), live.iter().copied().max().unwrap_or(0))
+            })
+            .unwrap_or((0, 0));
+        (
+            BUILT.load(Ordering::Relaxed),
+            LIVE.load(Ordering::Relaxed),
+            distinct,
+            max,
+        )
     }
 }
 

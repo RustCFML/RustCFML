@@ -3282,6 +3282,15 @@ custom_tag={} app_cfc_path={} app_cfconfig={} named_locks={} names_interned={}",
         "[cache_census] live_vms={} (created {})",
         live_vms, made_vms
     );
+    #[cfg(feature = "component-instance")]
+    {
+        let (built, live, classes, max) =
+            cfml_common::component::blueprint_census::snapshot();
+        eprintln!(
+            "[cache_census] blueprints built={} live={} distinct_classes={} max_per_class={}",
+            built, live, classes, max
+        );
+    }
 }
 
 pub fn report_live_seeds() {
