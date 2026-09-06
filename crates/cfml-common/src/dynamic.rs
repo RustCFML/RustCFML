@@ -4,7 +4,7 @@ use crate::key::{Key, KeyBuildHasher, KeyRef};
 use crate::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 use parking_lot::RwLock as PlRwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, RwLock, Weak};
 
@@ -2772,6 +2772,76 @@ impl CfmlValue {
         match self {
             CfmlValue::Struct(s) => Some(s.snapshot()),
             _ => None,
+        }
+    }
+
+    /// Approximate heap bytes owned by this value, DIAGNOSTICS ONLY: strings by
+    /// length, containers by entry count plus recursion, each shared backing
+    /// store (`Arc` identity) counted once via `seen`. Ignores function bodies
+    /// and bytecode (those are counted with the bytecode cache). Used by the
+    /// `RUSTCFML_CACHE_CENSUS` report to answer "which scope / cache holds the
+    /// heap" — a question a sampling heap profiler (allocation sites) cannot.
+    pub fn approx_heap_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        const HANDLE: usize = 32; // Arc header + lock + Vec/IndexMap headers, roughly
+        match self {
+            CfmlValue::String(s) => {
+                let p = Arc::as_ptr(s) as *const () as usize;
+                if seen.insert(p) { 24 + s.len() } else { 0 }
+            }
+            CfmlValue::Array(a) => {
+                if !seen.insert(a.backing_ptr()) { return 0; }
+                a.with_read(|v| HANDLE + v.len() * 24 + v.iter().map(|x| x.approx_heap_bytes(seen)).sum::<usize>())
+            }
+            CfmlValue::QueryColumn(col, _) => {
+                let p = Arc::as_ptr(col) as *const () as usize;
+                if !seen.insert(p) { return 0; }
+                col.len() * 24 + col.iter().map(|x| x.approx_heap_bytes(seen)).sum::<usize>()
+            }
+            CfmlValue::Struct(st) => {
+                if !seen.insert(st.backing_ptr()) { return 0; }
+                st.with_read(|m| {
+                    HANDLE + m.len() * 40
+                        + m.iter().map(|(k, v)| k.as_str().len() + v.approx_heap_bytes(seen)).sum::<usize>()
+                })
+            }
+            CfmlValue::Query(q) => {
+                if !seen.insert(q.backing_ptr()) { return 0; }
+                q.with_read(|d| {
+                    HANDLE + d.columns.iter().map(|c| c.len() + 24).sum::<usize>()
+                        + d.data.iter().map(|col| col.len() * 24 + col.iter().map(|x| x.approx_heap_bytes(seen)).sum::<usize>()).sum::<usize>()
+                })
+            }
+            CfmlValue::Closure(c) => {
+                c.captured_vars.iter().map(|(k, v)| k.as_str().len() + 40 + v.approx_heap_bytes(seen)).sum::<usize>()
+            }
+            CfmlValue::Component(c) => {
+                c.properties.iter().map(|(k, v)| k.as_str().len() + 40 + v.approx_heap_bytes(seen)).sum::<usize>()
+            }
+            CfmlValue::Function(f) => {
+                let p = Arc::as_ptr(f) as *const () as usize;
+                if !seen.insert(p) { return 0; }
+                let mut n = 96 + f.name.len() + f.params.len() * 64;
+                if let Some(sc) = &f.captured_scope {
+                    let sp = Arc::as_ptr(sc) as *const () as usize;
+                    if seen.insert(sp) {
+                        if let Ok(g) = sc.read() {
+                            n += g.iter().map(|(k, v)| k.as_str().len() + 40 + v.approx_heap_bytes(seen)).sum::<usize>();
+                        }
+                    }
+                }
+                n
+            }
+            CfmlValue::Binary(b) => 24 + b.len(),
+            #[cfg(feature = "component-instance")]
+            CfmlValue::Instance(inst) => {
+                let p = Arc::as_ptr(inst) as *const () as usize;
+                if !seen.insert(p) { return 0; }
+                let Some(g) = inst.try_read() else { return HANDLE };
+                let (pub_m, priv_m) = (g.public_map_handle(), g.private_map_handle());
+                drop(g);
+                HANDLE + CfmlValue::Struct(pub_m).approx_heap_bytes(seen) + CfmlValue::Struct(priv_m).approx_heap_bytes(seen)
+            }
+            _ => 0,
         }
     }
 

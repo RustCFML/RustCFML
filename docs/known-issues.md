@@ -2198,3 +2198,60 @@ wasm-pack).
 and the slot-property family, 16–18 B) and the loop ops (~17 B). 16 B needs
 every `Name` payload as a `u32` interner id, which turns every name-carrying op's
 dispatch into an interner lookup; measure before attempting.
+
+## 83. Where a booted Preside's memory actually is — the census that retired three "levers" (v0.653.10 diagnostics) 📌
+
+`RUSTCFML_CACHE_CENSUS=1` now reports, at every request end, live `ClassBlueprint`s
+per class and what they hold, and each application scope's approximate size with
+a one-pass shape breakdown (`CfmlValue::approx_heap_bytes` — diagnostics only,
+strings by length, containers by entry count, each shared backing counted once).
+Measured on the Preside test site after boot and after `?fwreinit=true`, with the
+sampling heap profiler alongside:
+
+| | after boot | 35 s after a reinit |
+|---|---|---|
+| physical footprint | 456 M | 520 M (other runs: 687–750 M) |
+| live heap (profiler exact counter) | 194 MiB | 206 MiB |
+| tracked collector nodes | ~116k | ~116k |
+| live blueprints | 518 for 483 classes | 525 (max 6 per class) |
+| blueprint payload | metadata 139 K, getMetadata cache 3.9 MiB | same |
+| application scope (est.) | 29.5 MiB, 99.9 % under `wireBox` | 29.7 MiB |
+| …of which getMetadata-shaped structs | 456 structs, 8.1 MiB | same |
+| …instances / functions / plain structs | 5,072 / 12,498 / 49,131 | same |
+
+**What this settles.**
+
+1. **Process-wide blueprint sharing is not a memory lever.** The duplication is
+   42 blueprints out of 525 and their payload is ~4 MiB; the static-scope
+   semantic change it needs is not worth that.
+2. **Component-metadata copies are ~8 MiB of the app graph plus ~4 MiB on the
+   blueprints, largely the same backings** (`instance_metadata` hands out the
+   cached handle, not a copy). Sharing them further risks a framework that
+   mutates the struct it was given (ColdBox's `getInheritedMetaData` does).
+   Single-digit percent of the live heap; retired.
+3. **The +240 MB a reinit adds to the footprint is allocator retention, not
+   data.** Live heap grows ~12 MiB per reinit — 8 MiB of it is ONE extra pooled
+   MySQL connection (mysql_common reserves two 4 MiB frame buffers per
+   connection), the rest is metadata churn within sampling noise — while the
+   footprint grows 64–290 MB. The reload allocates the new generation while the
+   old is still live, interleaved in the same mimalloc segments; when the old
+   one is freed 15 s later the segments are left partially used and cannot be
+   returned. Measured: `MIMALLOC_PURGE_DELAY=0` and
+   `MIMALLOC_ABANDONED_PAGE_PURGE=1` change nothing (687/735 → 697/748 →
+   708/749 M over two reinits), so it is fragmentation, not un-purged free
+   pages. It plateaus: the second reinit adds far less than the first, and
+   earlier runs held 840–970 M over eleven reloads. That is ~1.6× the live
+   heap — the same order as a JVM's heap headroom, and bounded.
+
+**Where the 194 MiB live heap is** (post-boot, profiler): bytecode cache ~62 MiB
+(1,913 files; instructions now 24 B/op), MySQL frame buffers 48 MiB *reserved*
+(resident only once a result set has touched them), application graph ~30 MiB
+(estimator; ~45 MiB by the profiler), regex caches ~15 MiB, interned keys/names
+~12 MiB, persistent collector set ~6.5 MiB. The remaining levers, in order:
+`Name` payloads as `u32` ids (16 B ops, ~6 MiB), and a generational sweep for
+Wheels-style workloads (CPU, not memory).
+
+**Trap.** A per-member drill-down with a fresh `seen` set is useless on a DI
+graph: every member of the WireBox injector reaches the whole 29.7 MiB, so each
+reports the total. Use one shared walk with a shape classifier, or a dominator
+tree.

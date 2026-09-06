@@ -425,6 +425,26 @@ pub mod blueprint_census {
     static BUILT: AtomicUsize = AtomicUsize::new(0);
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PER_CLASS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+    static REGISTRY: Mutex<Vec<std::sync::Weak<super::ClassBlueprint>>> = Mutex::new(Vec::new());
+
+    /// Remember a blueprint (weakly) so the census can size what the live ones
+    /// hold. Dead entries are pruned on each registration past 4,096.
+    pub fn register(bp: &std::sync::Arc<super::ClassBlueprint>) {
+        if !enabled() {
+            return;
+        }
+        let mut g = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() > 4096 {
+            g.retain(|w| w.strong_count() > 0);
+        }
+        g.push(std::sync::Arc::downgrade(bp));
+    }
+
+    /// Every blueprint still alive.
+    pub fn live_blueprints() -> Vec<std::sync::Arc<super::ClassBlueprint>> {
+        let g = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().filter_map(|w| w.upgrade()).collect()
+    }
 
     fn enabled() -> bool {
         static E: OnceLock<bool> = OnceLock::new();

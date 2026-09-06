@@ -3290,6 +3290,110 @@ custom_tag={} app_cfc_path={} app_cfconfig={} named_locks={} names_interned={}",
             "[cache_census] blueprints built={} live={} distinct_classes={} max_per_class={}",
             built, live, classes, max
         );
+        // What the live blueprints HOLD (metadata blob + cached getMetadata result),
+        // sized once per shared backing store. The heap profiler credits these
+        // bytes to the metadata builders, not to the blueprint.
+        let bps = cfml_common::component::blueprint_census::live_blueprints();
+        let mut seen = std::collections::HashSet::new();
+        let (mut meta_b, mut cache_b, mut cached_n) = (0usize, 0usize, 0usize);
+        for bp in &bps {
+            meta_b += bp.metadata.approx_heap_bytes(&mut seen);
+            if let Some(m) = bp.metadata_cache.read().as_ref() {
+                cached_n += 1;
+                cache_b += m.approx_heap_bytes(&mut seen);
+            }
+        }
+        eprintln!(
+            "[cache_census] blueprint payload: metadata={}K getMetadata_cache={}K ({} of {} filled)",
+            meta_b / 1024, cache_b / 1024, cached_n, bps.len()
+        );
+    }
+    // Application scopes: total and the heaviest top-level keys. Shared backing
+    // stores are counted once, credited to the first key that reaches them.
+    for (app, vars) in ss.applications.probe_states() {
+        let mut seen = std::collections::HashSet::new();
+        let mut per_key: Vec<(String, usize)> = vars.with_read(|m| {
+            m.iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.approx_heap_bytes(&mut seen)))
+                .collect()
+        });
+        let total: usize = per_key.iter().map(|(_, b)| b).sum();
+        per_key.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!(
+            "[cache_census] application[{}] approx {}K across {} keys; top: {}",
+            app,
+            total / 1024,
+            per_key.len(),
+            per_key.iter().take(12).map(|(k, b)| format!("{}={}K", k, b / 1024)).collect::<Vec<_>>().join(" ")
+        );
+        // One classified walk over the whole scope graph (shared `seen`, so a
+        // DI graph in which every member reaches everything is counted once):
+        // how much is getMetadata()-shaped structs, how much is component
+        // instance data, functions, strings.
+        #[derive(Default)]
+        struct Acc { meta_n: usize, meta_b: usize, inst_n: usize, fn_n: usize, str_b: usize, struct_n: usize, array_n: usize, query_b: usize }
+        fn is_metadata_shaped(m: &ValueMap) -> bool {
+            m.get("functions").is_some() && m.get("name").is_some()
+                && (m.get("extends").is_some() || m.get("fullname").is_some() || m.get("path").is_some())
+        }
+        fn walk(v: &CfmlValue, seen: &mut std::collections::HashSet<usize>, acc: &mut Acc) {
+            match v {
+                CfmlValue::String(st) => {
+                    let p = std::sync::Arc::as_ptr(st) as *const () as usize;
+                    if seen.insert(p) { acc.str_b += 24 + st.len(); }
+                }
+                CfmlValue::Struct(st) => {
+                    if seen.contains(&st.backing_ptr()) { return; }
+                    if st.with_read(|m| is_metadata_shaped(m)) {
+                        acc.meta_n += 1;
+                        acc.meta_b += v.approx_heap_bytes(seen);
+                        return;
+                    }
+                    seen.insert(st.backing_ptr());
+                    acc.struct_n += 1;
+                    let kids: Vec<CfmlValue> = st.with_read(|m| m.values().cloned().collect());
+                    for k in &kids { walk(k, seen, acc); }
+                }
+                CfmlValue::Array(a) => {
+                    if !seen.insert(a.backing_ptr()) { return; }
+                    acc.array_n += 1;
+                    let kids = a.snapshot();
+                    for k in &kids { walk(k, seen, acc); }
+                }
+                CfmlValue::Query(_) => { acc.query_b += v.approx_heap_bytes(seen); }
+                CfmlValue::Function(f) => {
+                    let p = std::sync::Arc::as_ptr(f) as *const () as usize;
+                    if !seen.insert(p) { return; }
+                    acc.fn_n += 1;
+                    if let Some(sc) = &f.captured_scope {
+                        let sp = std::sync::Arc::as_ptr(sc) as *const () as usize;
+                        if seen.insert(sp) {
+                            let kids: Vec<CfmlValue> = sc.read().map(|g| g.values().cloned().collect()).unwrap_or_default();
+                            for k in &kids { walk(k, seen, acc); }
+                        }
+                    }
+                }
+                #[cfg(feature = "component-instance")]
+                CfmlValue::Instance(inst) => {
+                    let p = std::sync::Arc::as_ptr(inst) as *const () as usize;
+                    if !seen.insert(p) { return; }
+                    acc.inst_n += 1;
+                    let Some(g) = inst.try_read() else { return };
+                    let (pub_m, priv_m) = (g.public_map_handle(), g.private_map_handle());
+                    drop(g);
+                    walk(&CfmlValue::Struct(pub_m), seen, acc);
+                    walk(&CfmlValue::Struct(priv_m), seen, acc);
+                }
+                _ => {}
+            }
+        }
+        let mut acc = Acc::default();
+        let mut seen2 = std::collections::HashSet::new();
+        walk(&CfmlValue::Struct(vars.clone()), &mut seen2, &mut acc);
+        eprintln!(
+            "[cache_census]   shape: metadata-structs n={} {}K | instances n={} | functions n={} | strings {}K | plain structs n={} arrays n={} | queries {}K | distinct backings {}",
+            acc.meta_n, acc.meta_b / 1024, acc.inst_n, acc.fn_n, acc.str_b / 1024, acc.struct_n, acc.array_n, acc.query_b / 1024, seen2.len()
+        );
     }
 }
 
@@ -30693,7 +30797,9 @@ impl CfmlVirtualMachine {
                     bp.static_scope = Some(CfmlValue::Struct(h.clone()));
                 }
             }
-            std::sync::Arc::new(bp)
+            let bp = std::sync::Arc::new(bp);
+            cfml_common::component::blueprint_census::register(&bp);
+            bp
         };
         let blueprint = if source_file.is_empty() {
             build_bp(self, &s, &source_file)

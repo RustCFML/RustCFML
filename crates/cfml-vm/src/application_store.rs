@@ -63,6 +63,12 @@ pub trait ApplicationStore: Send + Sync + 'static {
     fn publish_variables(&self, name: &str, variables: &crate::ValueMap) {
         let _ = (name, variables);
     }
+
+    /// Diagnostics: every application's live scope handle, for the
+    /// `RUSTCFML_CACHE_CENSUS` heap report. Serialising backends return nothing.
+    fn probe_states(&self) -> Vec<(String, cfml_common::dynamic::CfmlStruct)> {
+        Vec::new()
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -114,5 +120,12 @@ impl ApplicationStore for MemoryApplicationStore {
                 f(state);
             }
         }
+    }
+
+    fn probe_states(&self) -> Vec<(String, cfml_common::dynamic::CfmlStruct)> {
+        self.inner
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.variables.clone())).collect())
+            .unwrap_or_default()
     }
 }
