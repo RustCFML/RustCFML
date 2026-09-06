@@ -17,7 +17,14 @@ fn system_property_store(
 }
 
 /// Max distinct patterns held by [`java_cached_regex`].
-const JAVA_REGEX_CACHE_CAP: usize = 4096;
+// See `REGEX_CACHE_CAP` in cfml-stdlib for why this is 256 and not 4,096: a
+// compiled `regex::Regex` is up to ~3 MB (one-pass DFA + lazy-DFA cache), so the
+// old cap was a multi-GB ceiling, and a Wheels suite run filled 620 MB of this
+// cache alone with interpolated one-off patterns.
+const JAVA_REGEX_CACHE_CAP: usize = 256;
+/// Per-pattern lazy-DFA cache cap, matching cfml-stdlib's `cached_regex` (no NFA
+/// cap: see the note there).
+const JAVA_REGEX_DFA_CACHE_BYTES: usize = 256 * 1024;
 
 /// Compile `pattern`, memoized process-wide.
 ///
@@ -30,27 +37,48 @@ const JAVA_REGEX_CACHE_CAP: usize = 4096;
 ///
 /// This is a pure memoization: same input, same `Regex`, same compile errors
 /// (which stay uncached — they're cheap and vanishingly rare). Bounded exactly
-/// like `cfml-stdlib`'s `REGEX_CACHE`: on exceeding the cap the map is cleared
-/// wholesale, trading a rare cold rebuild for a hard memory ceiling so an
-/// adversarial workload minting unique patterns can't grow it without limit.
+/// like `cfml-stdlib`'s `REGEX_CACHE`: a small entry cap, per-pattern size
+/// limits, and least-recently-used eviction so a workload minting unique
+/// patterns cycles the cold ones out while the patterns the application reuses
+/// on every request stay compiled.
 pub(crate) fn java_cached_regex(
     pattern: &str,
 ) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct Entry {
+        re: std::sync::Arc<regex::Regex>,
+        last_used: AtomicU64,
+    }
     static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<regex::Regex>>>,
+        std::sync::RwLock<std::collections::HashMap<String, Entry>>,
     > = std::sync::OnceLock::new();
+    static CLOCK: AtomicU64 = AtomicU64::new(1);
     let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
-    if let Some(re) = cache.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
-        return Ok(std::sync::Arc::clone(re)); // refcount bump, not a recompile
+    if let Some(e) = cache.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
+        e.last_used.store(CLOCK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        return Ok(std::sync::Arc::clone(&e.re)); // refcount bump, not a recompile
     }
-    let re = std::sync::Arc::new(regex::Regex::new(pattern)?);
+    let re = std::sync::Arc::new(
+        regex::RegexBuilder::new(pattern)
+            .dfa_size_limit(JAVA_REGEX_DFA_CACHE_BYTES)
+            .build()?,
+    );
     let mut w = cache.write().unwrap_or_else(|e| e.into_inner());
     if w.len() >= JAVA_REGEX_CACHE_CAP {
-        w.clear();
+        // LRU quarter, not clear-all: keep what the application actually reuses.
+        // See `evict_lru_quarter` in cfml-stdlib.
+        let mut stamps: Vec<u64> = w.values().map(|e| e.last_used.load(Ordering::Relaxed)).collect();
+        stamps.sort_unstable();
+        let cutoff = stamps[stamps.len() / 4];
+        w.retain(|_, e| e.last_used.load(Ordering::Relaxed) > cutoff);
     }
-    w.insert(pattern.to_string(), std::sync::Arc::clone(&re));
-    Ok(re)
+    let now = CLOCK.fetch_add(1, Ordering::Relaxed);
+    let stored = w.entry(pattern.to_string()).or_insert_with(|| Entry {
+        re: std::sync::Arc::clone(&re),
+        last_used: AtomicU64::new(now),
+    });
+    Ok(std::sync::Arc::clone(&stored.re))
 }
 
 /// Coerce a CFML value used as a Java `byte[]` into raw bytes. Accepts:

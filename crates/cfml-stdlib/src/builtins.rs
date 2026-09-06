@@ -60,9 +60,52 @@ static SSN_REGEX: Lazy<Regex> = Lazy::new(|| {
 // cache *hit* nearly as expensive as a miss. On a live Preside request that was
 // ~1.6 GiB of allocation churn (`SparseSet::resize`, `Lazy::add_state`,
 // `Pool::new`). Sharing one `Arc` keeps the warm pool alive across calls.
-static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, std::sync::Arc<CfRegex>>>> =
+static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, RegexEntry>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
-const REGEX_CACHE_CAP: usize = 4096;
+/// Monotonic "clock" for LRU stamps (a counter, not time: cheap and total).
+static REGEX_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A cached compiled pattern with the tick it was last used. The stamp is an
+/// atomic so a cache HIT can refresh it under the shared read lock — no writer
+/// contention on the hot path.
+struct RegexEntry {
+    re: std::sync::Arc<CfRegex>,
+    last_used: std::sync::atomic::AtomicU64,
+}
+
+/// Evict the least-recently-used quarter of a full cache. Clearing everything
+/// (the previous policy) also dropped the handful of patterns a real application
+/// reuses on every request, so a workload that mints unique patterns (a test
+/// suite interpolating values) made every hot pattern recompile once per cycle.
+/// Sizing by REUSE is the point: what stays is what was used.
+fn evict_lru_quarter(cache: &mut HashMap<String, RegexEntry>) {
+    let mut stamps: Vec<u64> = cache
+        .values()
+        .map(|e| e.last_used.load(std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    stamps.sort_unstable();
+    let cutoff = stamps[stamps.len() / 4];
+    cache.retain(|_, e| e.last_used.load(std::sync::atomic::Ordering::Relaxed) > cutoff);
+}
+// Entry cap, not a byte cap — and the entries are BIG. A compiled `regex::Regex`
+// carries a one-pass DFA of up to 1 MB (not configurable through this crate's
+// builder) plus a lazy-DFA cache of 2 MB by default, so the old 4,096-entry cap
+// was a ~13 GB ceiling. A Wheels test-suite request mints ~1,100 distinct
+// patterns (interpolated values make each unique) and 1.3 GB of the request's
+// 2 GB live peak was these two regex caches. 256 entries keeps every pattern a
+// real application uses hot (a Preside render needs well under 100) while
+// bounding the worst case to a few hundred MB together with the size limits set
+// in `cached_regex`. Reclaiming the one-pass megabyte itself means building on
+// `regex_automata::meta::Regex` with `onepass_size_limit`; not done here.
+const REGEX_CACHE_CAP: usize = 256;
+/// Lazy-DFA cache per compiled pattern (the `regex` crate default is 2 MB). The
+/// lazy DFA is the main speed engine and 256 KB is ample for the patterns CFML
+/// code writes; a pattern that would need more transparently falls back to the
+/// slower engines rather than failing.
+const REGEX_DFA_CACHE_BYTES: usize = 256 * 1024;
+// No NFA `size_limit`: a pattern over the cap would FAIL to compile and fall
+// back to backtracking on every call, silently. The lazy-DFA cap above degrades
+// gracefully instead (a slower engine, same answer), so it is the only one set.
 
 /// A compiled CFML regex, backed by the fast `regex` crate where possible and
 /// falling back to `fancy-regex` for patterns the `regex` crate rejects —
@@ -268,16 +311,23 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
-    if let Some(re) = REGEX_CACHE.read().unwrap().get(pat) {
+    if let Some(e) = REGEX_CACHE.read().unwrap().get(pat) {
         // Refcount bump only — see REGEX_CACHE's note on why this must not be a
-        // deep clone.
-        return Ok(std::sync::Arc::clone(re));
+        // deep clone. Refresh the LRU stamp under the read lock.
+        e.last_used.store(
+            REGEX_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return Ok(std::sync::Arc::clone(&e.re));
     }
     let translated = translate_cfml_regex(pat);
     // Fast path: the `regex` crate. On a compile error, retry with `fancy-regex`,
     // which supports lookaround and backreferences (a genuinely-malformed pattern
     // fails both and the caller falls back to its no-match behavior).
-    let re = match Regex::new(&translated) {
+    let re = match regex::RegexBuilder::new(&translated)
+        .dfa_size_limit(REGEX_DFA_CACHE_BYTES)
+        .build()
+    {
         Ok(r) => CfRegex::Std(r),
         Err(_) => match fancy_regex::Regex::new(&translated) {
             Ok(r) => CfRegex::Fancy(r),
@@ -287,16 +337,17 @@ fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
     let re = std::sync::Arc::new(re);
     let mut cache = REGEX_CACHE.write().unwrap();
     if cache.len() >= REGEX_CACHE_CAP {
-        cache.clear();
+        evict_lru_quarter(&mut cache);
     }
     // Return the entry actually stored, not our local one: a racing thread may
     // have inserted first, and both callers should end up sharing that single
     // warm pool rather than each holding a private cold one.
-    Ok(std::sync::Arc::clone(
-        cache
-            .entry(pat.to_string())
-            .or_insert_with(|| std::sync::Arc::clone(&re)),
-    ))
+    let now = REGEX_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stored = cache.entry(pat.to_string()).or_insert_with(|| RegexEntry {
+        re: std::sync::Arc::clone(&re),
+        last_used: std::sync::atomic::AtomicU64::new(now),
+    });
+    Ok(std::sync::Arc::clone(&stored.re))
 }
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;

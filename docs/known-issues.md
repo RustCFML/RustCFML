@@ -2020,3 +2020,37 @@ allocation accounting wired to the abort path.
 Tests: `crates/cli/tests/max_memory.rs` (503 → finish → reopen, end to end) and
 the unit tests in `crates/cli/src/memory_limit.rs`.
 
+## 80. The regex caches were bounded by entry count, not by bytes — 1.3 GB of a Wheels run (fixed v0.653.6) 📌
+
+**What the heap profiler showed.** Of ~2 GB live at the peak of a Wheels
+test-suite request, 1.3 GB was compiled regular expressions: 676 MB in
+cfml-stdlib's `REGEX_CACHE` (`reFind`/`reMatch`/`reReplace`) and 620 MB in the
+`java.util.regex.Pattern` shim's cache. Both caps were 4,096 *entries* — but a
+compiled `regex::Regex` carries a one-pass DFA of up to 1 MB and a lazy-DFA cache
+of 2 MB by default, so the "hard memory ceiling" the comments promised was ~13 GB
+per cache. The suite mints ~1,100 distinct patterns per run (interpolated values
+make each one unique), and eviction was clear-all, which also threw away the
+handful of patterns every request reuses.
+
+**Fix.** Cap 256 entries per cache; **least-recently-used eviction** (a quarter
+at a time, stamps refreshed under the read lock on a hit) so what stays is what
+was reused; lazy-DFA cache per pattern 2 MB → 256 KB (a pattern that needs more
+falls back to a slower engine, never fails). Wheels: footprint after run 1
+6.4 G → 4.9 G, after run 2 10.0 G → 8.5 G, run time unchanged (37 s). Preside
+warm render p50 6.1–6.3 ms vs 5.8–6.0 baseline (±0.2 noise), server-side 4.88 ms.
+CFML suite 8827/8827.
+
+**Deliberately NOT done.** An NFA `size_limit` was tried and removed: a pattern
+over it fails to compile and silently falls back to backtracking on every call.
+The one-pass DFA megabyte per pattern is not reachable through the `regex`
+crate's builder; reclaiming it means building on `regex_automata::meta::Regex`
+with `onepass_size_limit`, a refactor of every regex call site.
+
+**Two measurement traps from this work.** (1) Timing a page without checking
+the HTTP status: MySQL had gone away under a Docker restart and three "1.5 s
+render regressions" were Preside's 500 error page. Always print `%{http_code}`
+next to `%{time_total}`. (2) The remaining ~3.5 GB live after a Wheels request is
+component-metadata deep copies from `resolve_component_template_impl` /
+`resolve_inheritance_chain` while only ~21k tracked nodes survive — i.e. it is
+not in tracked containers. Unattributed; next thread to pull for Wheels.
+
