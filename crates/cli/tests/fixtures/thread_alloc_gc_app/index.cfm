@@ -11,6 +11,9 @@
 // ?step=drop    — structDelete(application.holder, "gen"): the whole graph is now
 //                 garbage. A collector that never logged the thread's allocations
 //                 cannot see it, and can never free the cycle at its root.
+// ?step=dropscope — structDelete(application, "holder"): same graph, displaced
+//                 from the persistent scope itself, so the relog hook fires and
+//                 the DISPLACEMENT SWEEP (not the doubling budget) must free it.
 param name="url.step" default="noop";
 param name="url.n"    default="600";
 
@@ -37,6 +40,14 @@ switch ( url.step ) {
     case "drop":
         structDelete( application.holder, "gen" );
         writeOutput( "dropped left=#structCount(application.holder)#" );
+        break;
+    case "dropscope":
+        // Displace from the persistent scope itself: this is the path the relog
+        // hook watches, and a generation-sized displacement there must trigger
+        // the collector's displacement sweep at this request's end without any
+        // RUSTCFML_GC_PERSISTENT_ALWAYS help.
+        structDelete( application, "holder" );
+        writeOutput( "dropped-scope has=#structKeyExists(application, 'holder')#" );
         break;
     default:
         writeOutput( "noop" );

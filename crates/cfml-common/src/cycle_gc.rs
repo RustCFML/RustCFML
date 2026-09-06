@@ -1197,6 +1197,139 @@ fn carry_survivors(live: Vec<(usize, TrackedAlloc)>) -> usize {
     sweep_entries(entries, base)
 }
 
+/// A generation-sized subgraph has been DISPLACED from a persistent scope since
+/// the last cross-request sweep (an application restart, in practice). Set by
+/// [`note_displacement`], consumed by [`sweep_if_displaced`].
+///
+/// Why this exists: the cross-request sweep otherwise runs on a doubling budget
+/// (`next_sweep = 2 × live`), so after a reload the dead generation is not
+/// re-examined until two or three MORE reloads have accumulated — and mimalloc
+/// keeps the high-water mark, so the footprint records the peak of three
+/// generations (~1.3G on Preside) instead of two. The displacement itself is the
+/// precise moment a generation became garbage; sweeping then, and again once the
+/// reload's threads have finished (they legitimately hold the old generation
+/// while they run), frees it within seconds instead of reloads later.
+static DISPLACED_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Thread bodies currently executing (see `spawn_cfthread`). Maintained by
+/// [`body_started`] / [`body_finished`]; the last one out runs the pending sweep.
+static RUNNING_BODIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Smallest displaced subgraph that counts as "a generation" for the purposes
+/// of [`DISPLACED_PENDING`]. `application.counter++` displaces one node and must
+/// not trigger a sweep over a 300k-node set; `application.cbController = new`
+/// displaces ~100k. `RUSTCFML_GC_DISPLACE_SWEEP_MIN` overrides (0 disables).
+fn displace_sweep_min() -> usize {
+    use std::sync::OnceLock;
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("RUSTCFML_GC_DISPLACE_SWEEP_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000)
+    })
+}
+
+/// Record that `nodes` tracked nodes were just displaced from a persistent
+/// scope. Called by the relog hook with the size of the subgraph it re-entered.
+pub fn note_displacement(nodes: usize) {
+    let min = displace_sweep_min();
+    if min > 0 && nodes >= min && !DISPLACED_PENDING.swap(true, Ordering::Relaxed) {
+        DISPLACE_ATTEMPTS.store(0, Ordering::Relaxed);
+        // Remember how big the displacement was: a sweep only counts as having
+        // freed it if it reclaims a comparable amount, not just the request's
+        // ordinary churn. The relog walk is budget-capped, so this is a floor.
+        DISPLACE_SIZE.store(nodes, Ordering::Relaxed);
+        if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+            eprintln!(
+                "[cycle_gc] generation displaced ({} nodes re-entered): sweep pending",
+                nodes
+            );
+        }
+    }
+}
+
+/// A cfthread body has started executing.
+pub fn body_started() {
+    RUNNING_BODIES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// A cfthread body has finished (its VM is dropped). A reload's threads are what
+/// hold its predecessor generation alive after the request ends, so each exit
+/// is a chance the generation has just become free: retry the pending sweep,
+/// rate-limited (see [`sweep_if_displaced`]).
+pub fn body_finished() {
+    RUNNING_BODIES.fetch_sub(1, Ordering::AcqRel);
+    sweep_if_displaced();
+}
+
+/// Attempts made at the current pending displacement sweep, and when the last
+/// one ran. An application with continuous background threads (Preside's
+/// heartbeats) never reaches "no body running", so the sweep cannot wait for
+/// that; instead it runs, and if a thread still held the generation (nothing
+/// generation-sized was reclaimed) it is retried on later body exits — no more
+/// often than [`DISPLACE_RETRY_SECS`], and no more than [`DISPLACE_MAX_ATTEMPTS`]
+/// times, so a displacement that turns out to be genuinely live cannot turn into
+/// a sweep every few seconds forever.
+static DISPLACE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+/// Size (tracked nodes re-entered, a floor) of the pending displacement.
+static DISPLACE_SIZE: AtomicUsize = AtomicUsize::new(0);
+static DISPLACE_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const DISPLACE_RETRY_SECS: u64 = 5;
+const DISPLACE_MAX_ATTEMPTS: usize = 6;
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Run the pending displacement sweep, if there is one and the retry policy
+/// allows. Returns nodes reclaimed. The flag clears once a sweep reclaims at
+/// least a generation's worth ([`displace_sweep_min`]) — the displaced graph is
+/// gone — or after [`DISPLACE_MAX_ATTEMPTS`].
+pub fn sweep_if_displaced() -> usize {
+    if !DISPLACED_PENDING.load(Ordering::Relaxed) {
+        return 0;
+    }
+    // Rate limit: the first attempt runs immediately (request end), retries wait.
+    let now = now_ms();
+    let last = DISPLACE_LAST_MS.load(Ordering::Relaxed);
+    let attempts = DISPLACE_ATTEMPTS.load(Ordering::Relaxed);
+    if attempts > 0 && now.saturating_sub(last) < DISPLACE_RETRY_SECS * 1000 {
+        return 0;
+    }
+    // Claim this attempt; a concurrent caller that loses the race skips.
+    if DISPLACE_ATTEMPTS
+        .compare_exchange(attempts, attempts + 1, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return 0;
+    }
+    DISPLACE_LAST_MS.store(now, Ordering::Relaxed);
+    let n = sweep_persistent();
+    // "Freed it" means reclaiming at least half of what was displaced — a
+    // request's ordinary end-of-life churn (~1,500 nodes on Preside) must not
+    // clear a 20,000+-node displacement and cancel the retries that would have
+    // caught the generation once the reload's threads finished.
+    let target = std::cmp::max(displace_sweep_min(), DISPLACE_SIZE.load(Ordering::Relaxed) / 2);
+    let done = n >= target || attempts + 1 >= DISPLACE_MAX_ATTEMPTS;
+    if done {
+        DISPLACED_PENDING.store(false, Ordering::Relaxed);
+    }
+    if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        eprintln!(
+            "[cycle_gc] displacement sweep #{} reclaimed {} node(s){}",
+            attempts + 1,
+            n,
+            if done { "; done" } else { "; still held — will retry" }
+        );
+    }
+    n
+}
+
 /// Force a cross-request sweep now, ignoring the doubling budget. Returns the
 /// nodes reclaimed. Intended for an idle server (nothing is arriving to trip the
 /// budget) and for the collector's own tests.
@@ -1223,9 +1356,11 @@ pub fn sweep_persistent() -> usize {
 /// safe against concurrent requests.
 fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
     let mut still_live: Vec<(usize, TrackedAlloc)> = Vec::new();
+    let t0 = std::time::Instant::now();
     IN_SWEEP.with(|c| c.set(true));
     let reclaimed = collect_from_log_carrying(entries, Some(&mut still_live));
     IN_SWEEP.with(|c| c.set(false));
+    let took = t0.elapsed();
     let live_count = still_live.len();
     {
         let mut guard = PERSISTENT.lock();
@@ -1244,10 +1379,11 @@ fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
     if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
         eprintln!(
             "[cycle_gc] cross-request sweep reclaimed {} node(s); {} still tracked, \
-             next sweep at {}",
+             next sweep at {} ({} ms)",
             reclaimed,
             live_count,
-            std::cmp::max(base, live_count.saturating_mul(2))
+            std::cmp::max(base, live_count.saturating_mul(2)),
+            took.as_millis()
         );
     }
     reclaimed

@@ -1008,6 +1008,10 @@ impl CfmlValue {
                 if debug {
                     eprintln!("[relog] BUDGET EXHAUSTED after {} nodes", seen.len());
                 }
+                // Exhausting the budget IS the generation-sized case — the one
+                // the displacement sweep exists for — so it must set the flag
+                // too, not only the normal exit below.
+                crate::cycle_gc::note_displacement(seen.len());
                 return;
             }
             match &v {
@@ -1109,6 +1113,12 @@ impl CfmlValue {
         if debug && !seen.is_empty() {
             eprintln!("[relog] entered {} containers", seen.len());
         }
+        // A generation-sized displacement is the moment its subgraph became
+        // garbage: tell the collector so it sweeps at this request's end (or when
+        // the last thread of the reload finishes) instead of on the doubling
+        // budget, which would leave the dead generation resident for two or
+        // three more reloads. See `cycle_gc::note_displacement`.
+        crate::cycle_gc::note_displacement(seen.len());
     }
 }
 

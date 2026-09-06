@@ -1077,6 +1077,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             if armed {
                 cfml_common::cycle_gc::enable();
             }
+            cfml_common::cycle_gc::body_started();
             let mut vm = CfmlVirtualMachine::new(seed.program.clone());
             register_vm_runtime(&mut vm);
             let (closure, attributes) = vm.apply_thread_seed(seed);
@@ -1101,6 +1102,9 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
                     cfml_common::cycle_gc::defer_current_log(running_joins);
                 }
             }
+            // Last body out runs any pending displacement sweep — the old
+            // generation is no longer held by anyone once this returns.
+            cfml_common::cycle_gc::body_finished();
             // Receiver may be gone if the parent never joined; ignore.
             let _ = tx.send(result);
         })
@@ -1516,6 +1520,11 @@ fn compile_and_run(
             cfml_common::cycle_gc::collect();
             cfml_common::cycle_gc::disable_and_clear();
         }
+        // A reload displaced a generation this request: sweep it now rather than
+        // waiting for the doubling budget (see `cycle_gc::DISPLACED_PENDING`). If
+        // the reload's threads are still running this is a no-op and the last
+        // thread out does it instead.
+        cfml_common::cycle_gc::sweep_if_displaced();
         cfml_common::cycle_gc::set_probe_root(Vec::new());
         // Reclaim any previously-deferred logs whose threads have since finished.
         cfml_common::cycle_gc::collect_ready_deferred();

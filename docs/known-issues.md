@@ -1936,8 +1936,28 @@ bodies. `RUSTCFML_GC_UNREACHABLE_REPORT=1` lists what no probe root can reach
 during a sweep (report only — an earlier suppressing variant freed live data and
 is gone).
 
-**Still true.** Under the production doubling rule the set is allowed to reach
-2× live before a sweep, so up to three generations coexist briefly and mimalloc
-keeps the high-water mark; that is the designed trade-off, not a leak. The
+**Follow-up (v0.653.4): the displacement sweep.** With the leak fixed, the
+cross-request sweep still ran only on its doubling budget (`next_sweep = 2 ×
+live`), so a reload's dead generation was not re-examined until two or three
+MORE reloads had accumulated, and mimalloc keeps the high-water mark — footprint
+plateaued at ~1.3 G with three generations resident. The relog hook already knows
+the exact moment a generation is displaced, so it now tells the collector
+(`cycle_gc::note_displacement`, fired on both the normal and the
+budget-exhausted exit — the budget-exhausted one IS the generation-sized case).
+The request loop sweeps at that request's end; if the reload's threads still
+hold the old generation (they do, for ~15 s while the log listeners idle out),
+each thread exit retries, no oftener than every 5 s and at most 6 times, until a
+sweep reclaims at least half of what was displaced. Measured on Preside: retry
+#4 reclaims the full generation ~15 s after each reload; tracked nodes return to
+ONE resident generation (~117k) between reloads; footprint oscillates 840–970 M
+over eight reloads instead of plateauing at 1.3 G. A sweep of ~230k nodes costs
+170–370 ms. `RUSTCFML_GC_DISPLACE_SWEEP_MIN` (default 1,000 nodes; 0 disables)
+is the size a displacement must reach to count. Regression test: the second
+case in `crates/cli/tests/thread_alloc_gc.rs`, run with the relog budget capped
+so the sweep — not the ordinary request-end collect — is what has to free it;
+non-vacuous (with the trigger disabled the graph stays tracked).
+
+**Still true.** The remaining oscillation is mimalloc's high-water mark plus the
+~15 s window in which a reload's threads legitimately hold their predecessor. The
 `SHARED_FN_REGISTRY` Vec is indexed by a monotonic id and grows ~2 MB per reload
 in dead `Weak` slots — small, real, untouched.
