@@ -9734,7 +9734,7 @@ impl CfmlVirtualMachine {
                                 }
                             };
                             if matched {
-                                ip = *target;
+                                ip = *target as usize;
                             }
                             continue;
                         }
@@ -9812,7 +9812,7 @@ impl CfmlVirtualMachine {
                         _ => false,
                     };
                     if matched {
-                        ip = *target;
+                        ip = *target as usize;
                     }
                 }
                 BytecodeOp::JumpIfTrue(target) => {
@@ -11324,7 +11324,7 @@ impl CfmlVirtualMachine {
                     // Cloned eagerly to an owned value to avoid borrowing `op`
                     // across the &mut self init call below.
                     let ctor_arg_names: Option<Vec<String>> = match op {
-                        BytecodeOp::NewObjectNamed(names, _) => Some(names.clone()),
+                        BytecodeOp::NewObjectNamed(names, _) => Some((**names).clone()),
                         _ => None,
                     };
                     // Pop constructor arguments first
@@ -12752,12 +12752,12 @@ impl CfmlVirtualMachine {
                             );
                             let load_path = if path.len() == 1 || path0_is_scope {
                                 if path.len() == 1 {
-                                    path.clone()
+                                    (**path).clone()
                                 } else {
                                     path[..path.len() - 1].to_vec()
                                 }
                             } else {
-                                path.clone()
+                                (**path).clone()
                             };
                             // Navigation may fail to reach the receiver — a path
                             // segment can be absent (or, since struct `get` is
@@ -39238,7 +39238,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
         BytecodeOp::CatchMatch(_) => (1, 0), // peeks exception, pushes match bool
         // Method call: pops obj + args, pushes 1
-        BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n, _) => (1, n + 1),
+        BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n, _) => (1, *n as usize + 1),
         // Computed-name method call: pops obj + method-name + args, pushes 1.
         BytecodeOp::CallComputedMethod(n) | BytecodeOp::CallComputedMethodNamed(_, n) => {
             (1, n + 2)

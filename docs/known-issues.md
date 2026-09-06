@@ -2126,3 +2126,52 @@ workload.
 Tests: `crates/cfml-common` unit tests for the de-dup/compaction paths; the
 Wheels numbers above are the end-to-end evidence.
 
+
+## 82. `BytecodeOp` was 48 bytes wide — a payload added two days after the initial commit set the size of every instruction (fixed v0.653.8) 📌
+
+**What it costs.** Compiled CFML is a `Vec<BytecodeOp>` per function, and a Rust
+enum is as wide as its widest variant, so `Add`, `Pop` and `Jump` each occupied
+as many bytes as the fattest call op. Preside's ~790k compiled instructions were
+36 MiB of the 74 MiB bytecode cache, itself the largest item in a 265 MiB live
+heap after a reinit (§81's profile).
+
+**How it got there** (`git log -S` on the enum):
+
+| date | change | widest variant | size |
+|---|---|---|---|
+| 2026-02-21 | initial commit | `String(String)` | 32 B |
+| 2026-02-21 | mutating-method write-back | `CallMethod(String, usize, Option<(String, Option<String>)>)` | ~80 B |
+| 2026-02-23 | write-back path as a Vec | `CallMethod(String, usize, Option<Vec<String>>)` | 64 B |
+| 2026-05-30 | perf-plan size probe added | ceiling set at 64 B | 64 B |
+| 2026-08-09 | name interning (`Name` = 8 B) | `CallMethodNamed(Name, Box<Vec<String>>, usize, Option<Vec<String>>)` | 48 B |
+
+The op doubled two days in, for the receiver write-back path carried inline on
+every method call, and was only ever shrunk as a side effect of interning. The
+probe's ceiling followed the size down; it never drove it.
+
+**Fix.** The rare fat payloads move behind a pointer and the counts that never
+need 64 bits are narrowed, so the widest variant's payload plus the tag fits in
+32 bytes:
+
+- `CallMethod` / `CallMethodNamed`: write-back path `Option<Vec<String>>` →
+  `Option<Box<Vec<String>>>` (8 B, niche-optimised); arg count `usize` → `u32`.
+  With four 8-byte fields `CallMethodNamed` was exactly 32 B of payload and
+  forced a 40 B op — the count had to shrink too.
+- `NewObjectNamed` / `CallNamed`: `Vec<String>` → `Box<Vec<String>>`.
+- `ForLoopStep` / `ForSlotStep`: jump target `usize` → `u32`.
+
+Nothing on a hot path gained an indirection: the boxed fields are read only on a
+named-argument call or a write-back, and the loop ops copy `u32`s. The size probe
+in `crates/cfml-codegen/src/compiler.rs` now asserts `≤ 32` and its message
+records the history, so the next regression is caught at build time.
+
+**Measured.** `size_of::<BytecodeOp>()` 48 → 32 B; instruction storage on
+Preside 36 → 24 MiB (~12 MiB, ~4.5 % of the live heap). CFML suite 8827/8827 CLI
+and 8940/8940 served (both modes), workspace and cfml-vm green, wasm32 and
+wasm-pack built. Preside warm render, interleaved A/B with both servers alive (six alternating rounds of 40): v0.653.7 p50 6.14–6.60 ms, this build 5.96–6.72 ms, medians 6.32 vs 6.23 — no cost. A sequential A/B first read the new build 0.7 ms slower; that was run ordering, not the change — interleave.
+
+**Next step, not taken here.** 24 B needs the `String(String)` constants (24 B)
+in a per-function constant pool and the fused-loop ops' two `i64` constants
+narrowed; 16 B additionally needs every `Name` payload as a `u32` interner id.
+Both touch the hot literal/loop paths and need the render measurement before
+acceptance.

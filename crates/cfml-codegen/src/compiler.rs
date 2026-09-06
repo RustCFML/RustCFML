@@ -918,7 +918,7 @@ pub enum BytecodeOp {
     /// Fuses Increment + LoadLocal + Integer + Cmp + JumpIfFalse-style test into one
     /// dispatch. `step` is +1 (for `i++`) or -1 (for `i--`). The jump fires on the
     /// TRUE arm (back to body); falling through means the loop has finished.
-    ForLoopStep(Name, i64, CmpOp, i64, usize),
+    ForLoopStep(Name, i64, CmpOp, i64, u32),
     Call(usize),
     Return,
 
@@ -1027,7 +1027,7 @@ pub enum BytecodeOp {
     NewObject(usize),  // arg_count for constructor
     // arg_count for constructor + call-site argument names (empty string = positional).
     // Used when `new X(...)` supplies named arguments so init() binds by name, not position.
-    NewObjectNamed(Vec<String>, usize),
+    NewObjectNamed(Box<Vec<String>>, usize),
 
     // Function definition
     DefineFunction(usize), // BytecodeFunction.global_id (resolved via the VM's fn_registry)
@@ -1071,13 +1071,13 @@ pub enum BytecodeOp {
     //   - Some(vec!["this", "items"]) for this.items.method() — write result back to this.items
     //   - Some(vec!["local", "_taffy", "factory"]) for local._taffy.factory.method()
     //   - None — no write-back needed
-    CallMethod(Name, usize, Option<Vec<String>>),
+    CallMethod(Name, u32, Option<Box<Vec<String>>>),
     // Method call with named arguments: like CallMethod but carries the
     // call-site argument names (empty string for positional args), so the VM
     // can rebind them to the resolved method's parameters by name. Mirrors
     // CallNamed for free-function calls. The names are boxed so this variant
     // does not grow BytecodeOp past its size ceiling (it is the rare path).
-    CallMethodNamed(Name, Box<Vec<String>>, usize, Option<Vec<String>>),
+    CallMethodNamed(Name, Box<Vec<String>>, u32, Option<Box<Vec<String>>>),
 
     // Computed-name method call: `obj[ nameExpr ]( args )`. Stack layout (bottom
     // to top): object, method-name value, then `arg_count` positional args. The
@@ -1226,7 +1226,7 @@ pub enum BytecodeOp {
     AddSlotConst(u16, Name, i64),
     MulSlotConst(u16, Name, i64),
     JumpIfSlotCmpConstFalse(u16, Name, i64, CmpOp, usize),
-    ForSlotStep(u16, Name, i64, CmpOp, i64, usize),
+    ForSlotStep(u16, Name, i64, CmpOp, i64, u32),
     LoadSlotKey(u16, Name),
     TryLoadSlotKey(u16, Name),
     LoadSlotProperty(u16, Name, Name),
@@ -1236,7 +1236,7 @@ pub enum BytecodeOp {
 
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
-    CallNamed(Vec<String>, usize),
+    CallNamed(Box<Vec<String>>, usize),
 
     // Explicit super(args) constructor call for a CFC whose parent is a Rust class.
     // Pops arg_count values, looks up the constructor registered under
@@ -1627,7 +1627,7 @@ impl CfmlCompiler {
     /// Determine write-back target for a method call from the AST.
     /// Returns Some((var_name, Some(prop_name))) for obj.prop.method()
     /// or Some((var_name, None)) for var.method()
-    fn method_call_write_back(object: &Expression) -> Option<Vec<String>> {
+    fn method_call_write_back(object: &Expression) -> Option<Box<Vec<String>>> {
         // Recursively collect the member access chain: a.b.c.method()
         // returns vec!["a", "b", "c"]
         fn collect_path(expr: &Expression, path: &mut Vec<String>) -> bool {
@@ -1689,7 +1689,7 @@ impl CfmlCompiler {
 
         let mut path = Vec::new();
         if collect_path(object, &mut path) {
-            Some(path)
+            Some(Box::new(path))
         } else {
             None
         }
@@ -3625,7 +3625,7 @@ impl CfmlCompiler {
 
         // continue target = the step — continue runs the step, then re-tests.
         let continue_target = instructions.len();
-        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start,
+        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start as u32,
         ));
 
         let loop_end = instructions.len();
@@ -4112,7 +4112,7 @@ impl CfmlCompiler {
         }
 
         let continue_target = instructions.len();
-        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start,
+        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start as u32,
         ));
 
         let loop_end = instructions.len();
@@ -5054,7 +5054,7 @@ impl CfmlCompiler {
                     self.compile_expression(arg, instructions);
                 }
             }
-            instructions.push(BytecodeOp::NewObjectNamed(names, args.len()));
+            instructions.push(BytecodeOp::NewObjectNamed(Box::new(names), args.len()));
         } else {
             for arg in args {
                 self.compile_expression(arg, instructions);
@@ -5495,12 +5495,12 @@ impl CfmlCompiler {
                 if has_named {
                     instructions.push(BytecodeOp::CallMethodNamed(Name::from(&sc.method),
                         Box::new(names),
-                        sc.arguments.len(),
+                        sc.arguments.len() as u32,
                         None,
                     ));
                 } else {
                     instructions.push(BytecodeOp::CallMethod(Name::from(&sc.method),
-                        sc.arguments.len(),
+                        sc.arguments.len() as u32,
                         None,
                     ));
                 }
@@ -5712,7 +5712,7 @@ impl CfmlCompiler {
                             self.compile_expression(arg, instructions);
                         }
                     }
-                    instructions.push(BytecodeOp::CallNamed(names, call.arguments.len()));
+                    instructions.push(BytecodeOp::CallNamed(Box::new(names), call.arguments.len()));
                 } else {
                     // Compile-time-bound builtin: skip the LoadGlobal + generic
                     // Call dispatch entirely. Preside's warm admin render makes
@@ -5802,12 +5802,12 @@ impl CfmlCompiler {
                     if has_named {
                         instructions.push(BytecodeOp::CallMethodNamed(Name::from(&call.method),
                             Box::new(names),
-                            call.arguments.len(),
+                            call.arguments.len() as u32,
                             write_back.clone(),
                         ));
                     } else {
                         instructions.push(BytecodeOp::CallMethod(Name::from(&call.method),
-                            call.arguments.len(),
+                            call.arguments.len() as u32,
                             write_back.clone(),
                         ));
                     }
@@ -5817,12 +5817,12 @@ impl CfmlCompiler {
                     if has_named {
                         instructions.push(BytecodeOp::CallMethodNamed(Name::from(&call.method),
                             Box::new(names),
-                            call.arguments.len(),
+                            call.arguments.len() as u32,
                             write_back,
                         ));
                     } else {
                         instructions.push(BytecodeOp::CallMethod(Name::from(&call.method),
-                            call.arguments.len(),
+                            call.arguments.len() as u32,
                             write_back,
                         ));
                     }
@@ -6307,10 +6307,12 @@ mod size_probe {
         let op = size_of::<BytecodeOp>();
         eprintln!("size_of::<BytecodeOp>() = {op} B");
         assert!(
-            op <= 48,
-            "BytecodeOp grew to {op} B (ceiling 48 B, set when Phase 3.1 name \
-             interning shrank it from 64 B) — a perf regression. If \
-             intentional, justify and raise the ceiling."
+            op <= 32,
+            "BytecodeOp grew to {op} B (ceiling 32 B: 64 B at the May 2026 probe, 48 B \
+             after Phase 3.1 name interning, 32 B once the method write-back path \
+             was boxed and the fused-loop jump target narrowed to u32 — see \
+             known-issues §82). Every op pays the widest variant's size, so this is \
+             a memory AND icache regression. If intentional, justify and raise it."
         );
     }
 }
