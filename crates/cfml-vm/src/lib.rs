@@ -9674,9 +9674,13 @@ impl CfmlVirtualMachine {
                     }
                 }
                 BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, target)
-                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => { ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c, *cmp, *target); }
+                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => { ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize); }
                 BytecodeOp::ForLoopStep(name, limit, cmp, step, target)
                 | BytecodeOp::ForSlotStep(_, name, limit, cmp, step, target) => {
+                    // The op carries its constants as i32 (op-size budget); the
+                    // arithmetic below is i64.
+                    let (limit_w, step_w): (i64, i64) = (*limit as i64, *step as i64);
+                    let (limit, step) = (&limit_w, &step_w);
                     // Fused loop-step super-instruction emitted at the bottom
                     // of counted for-loops. Equivalent to:
                     //   Increment(name)   // or Decrement if step is -1
@@ -11854,18 +11858,22 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::CatchMatch(catch_type) => ops::value::op_catch_match(&mut stack, catch_type),
 
-                BytecodeOp::CallMethod(method_name, arg_count, write_back)
-                | BytecodeOp::CallMethodNamed(method_name, _, arg_count, write_back) => {
-                    // For the named variant, recover the call-site argument names
-                    // from the instruction (ip was already advanced past it). The
-                    // `|`-pattern can't bind the names field directly because the
-                    // two variants differ in shape, so read them back here. This
-                    // mirrors how CallNamed recovers arg sources via ip - 1.
-                    let method_arg_names: Option<&[String]> =
-                        match &func.instructions[ip - 1] {
-                            BytecodeOp::CallMethodNamed(_, names, _, _) => Some(names.as_slice()),
-                            _ => None,
-                        };
+                BytecodeOp::CallMethod(..) | BytecodeOp::CallMethodNamed(..) => {
+                    // The two variants differ in shape (the named one keeps its
+                    // argument names and write-back path in one out-of-line
+                    // `NamedMethodCall`), so bind the common parts explicitly.
+                    let (method_name, arg_count, write_back, method_arg_names): (
+                        &cfml_common::name::Name,
+                        &u32,
+                        Option<&Vec<String>>,
+                        Option<&[String]>,
+                    ) = match op {
+                        BytecodeOp::CallMethod(n, c, wb) => (n, c, wb.as_deref(), None),
+                        BytecodeOp::CallMethodNamed(n, nc, c) => {
+                            (n, c, nc.write_back.as_ref(), Some(nc.names.as_slice()))
+                        }
+                        _ => unreachable!(),
+                    };
                     let mut extra_args: Vec<CfmlValue> =
                         (0..*arg_count).filter_map(|_| stack.pop()).collect();
                     extra_args.reverse();
@@ -12290,13 +12298,13 @@ impl CfmlVirtualMachine {
                     // Write-back: emulate CFML pass-by-reference semantics for mutating methods.
                     // The compiler encodes a path vec: ["var"], ["var", "prop"], ["a", "b", "c"], etc.
                     // Skipped for super.method() — see is_super_call.
-                    let write_back = if is_super_call { &None } else { write_back };
+                    let write_back = if is_super_call { None } else { write_back };
                     // A shadowed plain-struct closure member never mutates its
                     // receiver — skip the value-writeback entirely (see above).
-                    let write_back = if plain_struct_fn_member_shadows { &None } else { write_back };
+                    let write_back = if plain_struct_fn_member_shadows { None } else { write_back };
                     // Map passthroughs mutate in place and return a VALUE — writing
                     // that value back would destroy the struct (see above).
-                    let write_back = if plain_struct_map_passthrough { &None } else { write_back };
+                    let write_back = if plain_struct_map_passthrough { None } else { write_back };
                     if let Some(ref path) = write_back {
                         if path.len() == 1 {
                             // Direct variable write-back: var.method(args)
@@ -13084,7 +13092,7 @@ impl CfmlVirtualMachine {
                     let path: String = if path.starts_with('/') || path.starts_with('\\') {
                         format!("/{}", path.trim_start_matches(['/', '\\']))
                     } else {
-                        path.clone()
+                        (**path).clone()
                     };
                     // Resolve path relative to source file or CWD.
                     // NB: source_dir.join(path) with an *absolute* path returns
@@ -31905,8 +31913,8 @@ impl CfmlVirtualMachine {
             // recursion through bound this/__variables (see TAFFY_NEXT_STEPS.md).
             let parent_name: Option<String> =
                 cfc_func.instructions.windows(2).find_map(|w| match w {
-                    [BytecodeOp::String(s1), BytecodeOp::String(s2)] if s1 == "__extends" => {
-                        Some(s2.clone())
+                    [BytecodeOp::String(s1), BytecodeOp::String(s2)] if s1.as_str() == "__extends" => {
+                        Some((**s2).clone())
                     }
                     _ => None,
                 });
@@ -36146,8 +36154,8 @@ impl CfmlVirtualMachine {
         // normal LoadSuper lookup would otherwise find nothing here.
         let parent_name: Option<String> =
             cfc_func.instructions.windows(2).find_map(|w| match w {
-                [BytecodeOp::String(s1), BytecodeOp::String(s2)] if s1 == "__extends" => {
-                    Some(s2.clone())
+                [BytecodeOp::String(s1), BytecodeOp::String(s2)] if s1.as_str() == "__extends" => {
+                    Some((**s2).clone())
                 }
                 _ => None,
             });
@@ -39238,7 +39246,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
         BytecodeOp::CatchMatch(_) => (1, 0), // peeks exception, pushes match bool
         // Method call: pops obj + args, pushes 1
-        BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n, _) => (1, *n as usize + 1),
+        BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n) => (1, *n as usize + 1),
         // Computed-name method call: pops obj + method-name + args, pushes 1.
         BytecodeOp::CallComputedMethod(n) | BytecodeOp::CallComputedMethodNamed(_, n) => {
             (1, n + 2)

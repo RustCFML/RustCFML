@@ -2127,7 +2127,7 @@ Tests: `crates/cfml-common` unit tests for the de-dup/compaction paths; the
 Wheels numbers above are the end-to-end evidence.
 
 
-## 82. `BytecodeOp` was 48 bytes wide — a payload added two days after the initial commit set the size of every instruction (fixed v0.653.8) 📌
+## 82. `BytecodeOp` was 48 bytes wide — a payload added two days after the initial commit set the size of every instruction (32 B in v0.653.8, 24 B in v0.653.9) 📌
 
 **What it costs.** Compiled CFML is a `Vec<BytecodeOp>` per function, and a Rust
 enum is as wide as its widest variant, so `Add`, `Pop` and `Jump` each occupied
@@ -2170,8 +2170,31 @@ Preside 36 → 24 MiB (~12 MiB, ~4.5 % of the live heap). CFML suite 8827/8827 C
 and 8940/8940 served (both modes), workspace and cfml-vm green, wasm32 and
 wasm-pack built. Preside warm render, interleaved A/B with both servers alive (six alternating rounds of 40): v0.653.7 p50 6.14–6.60 ms, this build 5.96–6.72 ms, medians 6.32 vs 6.23 — no cost. A sequential A/B first read the new build 0.7 ms slower; that was run ordering, not the change — interleave.
 
-**Next step, not taken here.** 24 B needs the `String(String)` constants (24 B)
-in a per-function constant pool and the fused-loop ops' two `i64` constants
-narrowed; 16 B additionally needs every `Name` payload as a `u32` interner id.
-Both touch the hot literal/loop paths and need the render measurement before
-acceptance.
+**Second step (v0.653.9): 32 → 24 B.**
+
+- `String` / `UnsetPath` / `Include` carry `Arc<String>` (8 B) instead of
+  `String` (24 B). This is also a CPU change on a hot path: `op_string` used to
+  build `Arc::new(s.to_string())` — a fresh allocation and copy — for EVERY
+  literal executed (struct keys, string arguments, every `"..."`); it now
+  clones the Arc the compiled function already holds, a refcount bump.
+- The fused loop ops (`ForLoopStep`, `ForSlotStep`, `JumpIfLocalCmpConstFalse`,
+  `JumpIfSlotCmpConstFalse`) carry their constants as `i32` and their jump
+  target as `u32`. The matchers that detect a counted loop refuse a literal
+  that does not fit an `i32`, so such a loop compiles to the generic shape;
+  the VM widens to `i64` at the arm head, so the arithmetic is unchanged.
+- `CallMethodNamed` keeps its argument names and write-back path in ONE boxed
+  `NamedMethodCall` (`Name` + `Box` + `u32` = 20 B); the VM arm binds the
+  common parts of both call variants explicitly instead of an or-pattern.
+
+`size_of::<BytecodeOp>()` 32 → 24 B (probe ceiling 24). Preside instruction
+storage 24 → 18 MiB. Interleaved warm-render A/B (six alternating rounds of 40,
+both servers alive): v0.653.8 p50 medians 6.07 ms, this build 6.24 ms, rounds
+split three and three — no measurable change either way; the literal-push
+saving is real but below the noise of a ~6 ms page. Gates green (workspace
+88 suites, cfml-vm 312, CFML 8827 CLI / 8940 served both modes, wasm32,
+wasm-pack).
+
+**Not taken: 16 B.** The floor is now the two-`Name` ops (`LoadLocalProperty`
+and the slot-property family, 16–18 B) and the loop ops (~17 B). 16 B needs
+every `Name` payload as a `u32` interner id, which turns every name-carrying op's
+dispatch into an interner lookup; measure before attempting.

@@ -51,8 +51,10 @@ pub(crate) fn op_double(stack: &mut Vec<CfmlValue>, d: f64) {
 }
 
 #[inline(always)]
-pub(crate) fn op_string(stack: &mut Vec<CfmlValue>, s: &str) {
-    stack.push(CfmlValue::string(s.to_string()))
+pub(crate) fn op_string(stack: &mut Vec<CfmlValue>, s: &std::sync::Arc<String>) {
+    // The literal is shared with the compiled function: a refcount bump, not a
+    // fresh allocation and copy per execution (it was `Arc::new(s.to_string())`).
+    stack.push(CfmlValue::String(std::sync::Arc::clone(s)))
 }
 
 // ---------------------------------------------------------------------------

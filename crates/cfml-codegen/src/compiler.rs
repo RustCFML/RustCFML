@@ -389,8 +389,13 @@ impl BytecodeFunction {
                 | BytecodeOp::Decrement(_)
                 | BytecodeOp::AddLocalConst(..)
                 | BytecodeOp::MulLocalConst(..) => tier = tier.min(1),
-                BytecodeOp::CallMethod(_, _, wb) | BytecodeOp::CallMethodNamed(_, _, _, wb) => {
+                BytecodeOp::CallMethod(_, _, wb) => {
                     if wb.is_some() {
+                        tier = tier.min(1);
+                    }
+                }
+                BytecodeOp::CallMethodNamed(_, nc, _) => {
+                    if nc.write_back.is_some() {
                         tier = tier.min(1);
                     }
                 }
@@ -534,8 +539,19 @@ impl BytecodeFunction {
                         }
                     }
                 }
-                BytecodeOp::CallMethod(_, _, Some(wb))
-                | BytecodeOp::CallMethodNamed(_, _, _, Some(wb)) => {
+                BytecodeOp::CallMethod(_, _, Some(wb)) => {
+                    if let Some(first) = wb.first() {
+                        let first_lower = first.to_lowercase();
+                        if first_lower == "local" {
+                            if let Some(second) = wb.get(1) {
+                                excluded.insert(second.to_lowercase());
+                            }
+                        }
+                        excluded.insert(first_lower);
+                    }
+                }
+                BytecodeOp::CallMethodNamed(_, nc, _) if nc.write_back.is_some() => {
+                    let wb = nc.write_back.as_ref().unwrap();
                     if let Some(first) = wb.first() {
                         let first_lower = first.to_lowercase();
                         if first_lower == "local" {
@@ -837,6 +853,16 @@ pub enum CmpOp {
     Neq,
 }
 
+/// Out-of-line payload of [`BytecodeOp::CallMethodNamed`]: the call-site
+/// argument names plus the receiver write-back path. Boxed as ONE allocation so
+/// the op stays within the 32-byte / 24-byte size budget (see the size probe);
+/// both fields are read only on a named-argument method call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedMethodCall {
+    pub names: Vec<String>,
+    pub write_back: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone)]
 pub enum BytecodeOp {
     // Literals
@@ -845,7 +871,7 @@ pub enum BytecodeOp {
     False,
     Integer(i64),
     Double(f64),
-    String(String),
+    String(std::sync::Arc<String>),
 
     // Variables
     LoadLocal(Name),
@@ -913,12 +939,12 @@ pub enum BytecodeOp {
     /// Loop-condition super-instruction: `if !(locals[name] CMP const) { jump offset }`.
     /// Fuses LoadLocal + Integer + Cmp + JumpIfFalse into one dispatch.
     /// Emitted by compile_for for conditions of the shape `<identifier> <cmp> <int-const>`.
-    JumpIfLocalCmpConstFalse(Name, i64, CmpOp, usize),
+    JumpIfLocalCmpConstFalse(Name, i32, CmpOp, u32),
     /// For-loop step super-instruction: `locals[name] += step; if (locals[name] CMP const) jump target`.
     /// Fuses Increment + LoadLocal + Integer + Cmp + JumpIfFalse-style test into one
     /// dispatch. `step` is +1 (for `i++`) or -1 (for `i--`). The jump fires on the
     /// TRUE arm (back to body); falling through means the loop has finished.
-    ForLoopStep(Name, i64, CmpOp, i64, u32),
+    ForLoopStep(Name, i32, CmpOp, i32, u32),
     Call(usize),
     Return,
 
@@ -1012,7 +1038,7 @@ pub enum BytecodeOp {
     /// fires when the RHS evaluated to Null. The string is the dotted target path
     /// ("rv", "local.rv", "variables.x", "obj.member", "a.b.c"). Pops/pushes
     /// nothing — the guard's `Pop` already cleared the Null. Lucee semantics.
-    UnsetPath(String),
+    UnsetPath(std::sync::Arc<String>),
 
     /// Delete a dynamically-named key from a named scope: pops a key value off
     /// the stack and removes `<scope>.<key>` from the real scope container.
@@ -1077,7 +1103,7 @@ pub enum BytecodeOp {
     // can rebind them to the resolved method's parameters by name. Mirrors
     // CallNamed for free-function calls. The names are boxed so this variant
     // does not grow BytecodeOp past its size ceiling (it is the rare path).
-    CallMethodNamed(Name, Box<Vec<String>>, u32, Option<Box<Vec<String>>>),
+    CallMethodNamed(Name, Box<NamedMethodCall>, u32),
 
     // Computed-name method call: `obj[ nameExpr ]( args )`. Stack layout (bottom
     // to top): object, method-name value, then `arg_count` positional args. The
@@ -1096,7 +1122,7 @@ pub enum BytecodeOp {
     GetKeys,  // Pop value: if struct, push array of keys; if array, leave as-is
 
     // Include
-    Include(String),  // Include and execute a file (static path)
+    Include(std::sync::Arc<String>),  // Include and execute a file (static path)
     IncludeDynamic,   // Include: pop path from stack (dynamic expression)
 
     /// Compile-time-bound builtin call: args are already on the stack, the
@@ -1225,8 +1251,8 @@ pub enum BytecodeOp {
     DecrementSlot(u16, Name),
     AddSlotConst(u16, Name, i64),
     MulSlotConst(u16, Name, i64),
-    JumpIfSlotCmpConstFalse(u16, Name, i64, CmpOp, usize),
-    ForSlotStep(u16, Name, i64, CmpOp, i64, u32),
+    JumpIfSlotCmpConstFalse(u16, Name, i32, CmpOp, u32),
+    ForSlotStep(u16, Name, i32, CmpOp, i32, u32),
     LoadSlotKey(u16, Name),
     TryLoadSlotKey(u16, Name),
     LoadSlotProperty(u16, Name, Name),
@@ -1995,7 +2021,7 @@ impl CfmlCompiler {
     ) {
         for (key, node) in children {
             match key {
-                StructKey::Static(s) => instructions.push(BytecodeOp::String(s.clone())),
+                StructKey::Static(s) => instructions.push(BytecodeOp::String(std::sync::Arc::new(s.clone()))),
                 StructKey::Computed(expr) => self.compile_expression(expr, instructions),
             }
             match node {
@@ -2680,7 +2706,7 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
                         let guard_idx = instructions.len() - 1;
                         instructions.push(BytecodeOp::Pop); // drop the Null
-                        instructions.push(BytecodeOp::UnsetPath(name.clone()));
+                        instructions.push(BytecodeOp::UnsetPath(std::sync::Arc::new(name.clone())));
                         instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
                         let end_idx = instructions.len() - 1;
                         instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
@@ -2773,7 +2799,7 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
                         let guard_idx = instructions.len() - 1;
                         instructions.push(BytecodeOp::Pop); // drop the Null
-                        instructions.push(BytecodeOp::UnsetPath(path));
+                        instructions.push(BytecodeOp::UnsetPath(std::sync::Arc::new(path)));
                         instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
                         unset_end_jump = Some(instructions.len() - 1);
                         // The store ops emitted next are the JumpIfNotNull target.
@@ -2802,7 +2828,7 @@ impl CfmlCompiler {
                         // elsewhere. Stack on entry is [value]; SetDynamicVar wants
                         // [path, value], so push the path and Swap.
                         if let Some(path) = Self::scope_rooted_nested_path(obj, member) {
-                            instructions.push(BytecodeOp::String(path));
+                            instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
                             instructions.push(BytecodeOp::Swap);
                             instructions.push(BytecodeOp::SetDynamicVar);
                             // SetDynamicVar pushes the value back; this is a
@@ -2814,7 +2840,7 @@ impl CfmlCompiler {
                             // runtime store as the scope-rooted case, so the
                             // missing `copies` container is created instead of
                             // throwing "Variable 'copies' is undefined".
-                            instructions.push(BytecodeOp::String(path));
+                            instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
                             instructions.push(BytecodeOp::Swap);
                             instructions.push(BytecodeOp::SetDynamicVar);
                             instructions.push(BytecodeOp::Pop);
@@ -2983,7 +3009,7 @@ impl CfmlCompiler {
                 if let Some(msg) = &throw_stmt.message {
                     self.compile_expression(msg, instructions);
                 } else {
-                    instructions.push(BytecodeOp::String("An error occurred".to_string()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("An error occurred".to_string())));
                 }
                 instructions.push(BytecodeOp::Throw);
             }
@@ -3038,7 +3064,7 @@ impl CfmlCompiler {
                 // Static path: emit Include(path) directly
                 if let Expression::Literal(lit) = &inc.path {
                     if let LiteralValue::String(path) = &lit.value {
-                        instructions.push(BytecodeOp::Include(path.clone()));
+                        instructions.push(BytecodeOp::Include(std::sync::Arc::new(path.clone())));
                         return;
                     }
                 }
@@ -3150,6 +3176,11 @@ impl CfmlCompiler {
             }
         };
         if let (Some(name), Some(c)) = (ident_name(&bin.left), int_lit(&bin.right)) {
+            // The fused ops carry the constant as an i32 (see the BytecodeOp size
+            // probe); a literal that does not fit takes the generic shape.
+            if i32::try_from(c).is_err() {
+                return None;
+            }
             Some((name, c, cmp))
         } else if let (Some(c), Some(name)) = (int_lit(&bin.left), ident_name(&bin.right)) {
             // `CONST <cmp> ident` — flip the op so the semantics stay right.
@@ -3178,7 +3209,7 @@ impl CfmlCompiler {
     ) -> usize {
         if let Some((name, c, cmp)) = Self::match_local_cmp_const(condition) {
             let idx = instructions.len();
-            instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::from(name), c, cmp, 0));
+            instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::from(name), c as i32, cmp, 0));
             idx
         } else {
             self.compile_expression(condition, instructions);
@@ -3193,7 +3224,7 @@ impl CfmlCompiler {
     fn patch_cond_jump_target(instructions: &mut [BytecodeOp], idx: usize, target: usize) {
         match &mut instructions[idx] {
             BytecodeOp::JumpIfFalse(off) => *off = target,
-            BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, off) => *off = target,
+            BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, off) => *off = target as u32,
             _ => unreachable!("patch_cond_jump_target on unexpected op"),
         }
     }
@@ -3310,7 +3341,8 @@ impl CfmlCompiler {
             }
         };
         match stmt {
-            Statement::Expression(es) => Self::match_inc_dec_identifier(&es.expr),
+            Statement::Expression(es) => Self::match_inc_dec_identifier(&es.expr)
+                .filter(|(_, step)| i32::try_from(*step).is_ok()),
             Statement::Assignment(a) => {
                 let name = match &a.target {
                     AssignTarget::Variable(n) => n.clone(),
@@ -3543,7 +3575,7 @@ impl CfmlCompiler {
                 Self::match_local_cmp_const(condition)
             {
                 let idx = instructions.len();
-                instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::from(name), c, cmp, 0));
+                instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::from(name), c as i32, cmp, 0));
                 idx
             } else {
                 self.compile_expression(condition, instructions);
@@ -3578,7 +3610,7 @@ impl CfmlCompiler {
             let loop_end = instructions.len();
             match &mut instructions[jump_false_idx] {
                 BytecodeOp::JumpIfFalse(off) => *off = loop_end,
-                BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, off) => *off = loop_end,
+                BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, off) => *off = loop_end as u32,
                 _ => unreachable!("compile_for exit jump slot has unexpected op"),
             }
 
@@ -3606,7 +3638,7 @@ impl CfmlCompiler {
         // Initial check: if the condition is already false at entry, skip
         // the loop entirely. Emits one op; the target is patched to loop_end.
         let entry_check_idx = instructions.len();
-        instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::intern(name), limit, cmp, 0,
+        instructions.push(BytecodeOp::JumpIfLocalCmpConstFalse(Name::intern(name), limit as i32, cmp, 0,
         ));
 
         let body_start = instructions.len();
@@ -3625,7 +3657,7 @@ impl CfmlCompiler {
 
         // continue target = the step — continue runs the step, then re-tests.
         let continue_target = instructions.len();
-        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start as u32,
+        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit as i32, cmp, step as i32, body_start as u32,
         ));
 
         let loop_end = instructions.len();
@@ -3634,7 +3666,7 @@ impl CfmlCompiler {
         if let BytecodeOp::JumpIfLocalCmpConstFalse(_, _, _, off) =
             &mut instructions[entry_check_idx]
         {
-            *off = loop_end;
+            *off = loop_end as u32;
         }
 
         let (break_indices, continue_indices, _, _, _) = self.loop_stack.pop().unwrap();
@@ -4112,7 +4144,7 @@ impl CfmlCompiler {
         }
 
         let continue_target = instructions.len();
-        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit, cmp, step, body_start as u32,
+        instructions.push(BytecodeOp::ForLoopStep(Name::intern(name), limit as i32, cmp, step as i32, body_start as u32,
         ));
 
         let loop_end = instructions.len();
@@ -4507,20 +4539,20 @@ impl CfmlCompiler {
         let mut prop_count = 0;
 
         // __is_interface marker
-        instructions.push(BytecodeOp::String("__is_interface".to_string()));
+        instructions.push(BytecodeOp::String(std::sync::Arc::new("__is_interface".to_string())));
         instructions.push(BytecodeOp::True);
         prop_count += 1;
 
         // __name
-        instructions.push(BytecodeOp::String("__name".to_string()));
-        instructions.push(BytecodeOp::String(interface.name.clone()));
+        instructions.push(BytecodeOp::String(std::sync::Arc::new("__name".to_string())));
+        instructions.push(BytecodeOp::String(std::sync::Arc::new(interface.name.clone())));
         prop_count += 1;
 
         // __extends array (interfaces can extend multiple parents)
         if !interface.extends.is_empty() {
-            instructions.push(BytecodeOp::String("__extends".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__extends".to_string())));
             for parent in &interface.extends {
-                instructions.push(BytecodeOp::String(parent.clone()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(parent.clone())));
             }
             instructions.push(BytecodeOp::BuildArray(interface.extends.len()));
             prop_count += 1;
@@ -4535,16 +4567,16 @@ impl CfmlCompiler {
         // resolve_interface_methods only reads the keys of this struct, so the
         // richer values are safe.
         if !interface.functions.is_empty() {
-            instructions.push(BytecodeOp::String("__methods".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__methods".to_string())));
             for func in &interface.functions {
                 let method_key = func.name.to_lowercase();
-                instructions.push(BytecodeOp::String(method_key));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(method_key)));
 
                 let mut method_prop_count = 0;
 
                 // name
-                instructions.push(BytecodeOp::String("name".to_string()));
-                instructions.push(BytecodeOp::String(func.name.clone()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new("name".to_string())));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(func.name.clone())));
                 method_prop_count += 1;
 
                 // access
@@ -4554,33 +4586,33 @@ impl CfmlCompiler {
                     AccessModifier::Package => "package",
                     AccessModifier::Remote => "remote",
                 };
-                instructions.push(BytecodeOp::String("access".to_string()));
-                instructions.push(BytecodeOp::String(access_str.to_string()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new("access".to_string())));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(access_str.to_string())));
                 method_prop_count += 1;
 
                 // returntype (default "any", matching Lucee/ACF)
-                instructions.push(BytecodeOp::String("returntype".to_string()));
-                instructions.push(BytecodeOp::String(
+                instructions.push(BytecodeOp::String(std::sync::Arc::new("returntype".to_string())));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(
                     func.return_type.clone().unwrap_or_else(|| "any".to_string()),
-                ));
+                )));
                 method_prop_count += 1;
 
                 // parameters: full param structs, always present
-                instructions.push(BytecodeOp::String("parameters".to_string()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new("parameters".to_string())));
                 for param in &func.params {
                     let mut param_prop_count = 0;
 
-                    instructions.push(BytecodeOp::String("name".to_string()));
-                    instructions.push(BytecodeOp::String(param.name.clone()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("name".to_string())));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(param.name.clone())));
                     param_prop_count += 1;
 
                     if let Some(ref t) = param.param_type {
-                        instructions.push(BytecodeOp::String("type".to_string()));
-                        instructions.push(BytecodeOp::String(t.clone()));
+                        instructions.push(BytecodeOp::String(std::sync::Arc::new("type".to_string())));
+                        instructions.push(BytecodeOp::String(std::sync::Arc::new(t.clone())));
                         param_prop_count += 1;
                     }
 
-                    instructions.push(BytecodeOp::String("required".to_string()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("required".to_string())));
                     instructions.push(if param.required {
                         BytecodeOp::True
                     } else {
@@ -4590,8 +4622,8 @@ impl CfmlCompiler {
 
                     // Javadoc-style param annotations (e.g. WireBox @x.inject)
                     for (k, v) in &param.annotations {
-                        instructions.push(BytecodeOp::String(k.clone()));
-                        instructions.push(BytecodeOp::String(v.clone()));
+                        instructions.push(BytecodeOp::String(std::sync::Arc::new(k.clone())));
+                        instructions.push(BytecodeOp::String(std::sync::Arc::new(v.clone())));
                         param_prop_count += 1;
                     }
 
@@ -4608,10 +4640,10 @@ impl CfmlCompiler {
 
         // __metadata
         if !interface.metadata.is_empty() {
-            instructions.push(BytecodeOp::String("__metadata".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__metadata".to_string())));
             for (k, v) in &interface.metadata {
-                instructions.push(BytecodeOp::String(k.clone()));
-                instructions.push(BytecodeOp::String(v.clone()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(k.clone())));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(v.clone())));
             }
             instructions.push(BytecodeOp::BuildStruct(interface.metadata.len()));
             prop_count += 1;
@@ -4634,22 +4666,22 @@ impl CfmlCompiler {
         let mut prop_count = 0;
 
         // Add __name metadata
-        instructions.push(BytecodeOp::String("__name".to_string()));
-        instructions.push(BytecodeOp::String(component.name.clone()));
+        instructions.push(BytecodeOp::String(std::sync::Arc::new("__name".to_string())));
+        instructions.push(BytecodeOp::String(std::sync::Arc::new(component.name.clone())));
         prop_count += 1;
 
         // Add __extends if component extends another
         if let Some(ref ext) = component.extends {
-            instructions.push(BytecodeOp::String("__extends".to_string()));
-            instructions.push(BytecodeOp::String(ext.clone()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__extends".to_string())));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new(ext.clone())));
             prop_count += 1;
         }
 
         // Add __implements if component implements interfaces
         if !component.implements.is_empty() {
-            instructions.push(BytecodeOp::String("__implements".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__implements".to_string())));
             for iface_name in &component.implements {
-                instructions.push(BytecodeOp::String(iface_name.clone()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(iface_name.clone())));
             }
             instructions.push(BytecodeOp::BuildArray(component.implements.len()));
             prop_count += 1;
@@ -4657,10 +4689,10 @@ impl CfmlCompiler {
 
         // Add __metadata sub-struct if component has metadata attributes
         if !component.metadata.is_empty() {
-            instructions.push(BytecodeOp::String("__metadata".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__metadata".to_string())));
             for (k, v) in &component.metadata {
-                instructions.push(BytecodeOp::String(k.clone()));
-                instructions.push(BytecodeOp::String(v.clone()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(k.clone())));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(v.clone())));
             }
             instructions.push(BytecodeOp::BuildStruct(component.metadata.len()));
             prop_count += 1;
@@ -4669,7 +4701,7 @@ impl CfmlCompiler {
         // Add __variables scope for component properties (needed for accessors)
         // Include property defaults here
         if component.accessors || !component.properties.is_empty() {
-            instructions.push(BytecodeOp::String("__variables".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__variables".to_string())));
             // Build __variables struct with property defaults. Only properties
             // that declare a `default` are seeded here — an unset property is
             // NOT a key in the variables scope until assigned (Lucee/ACF: a
@@ -4682,7 +4714,7 @@ impl CfmlCompiler {
             let mut vars_count = 0;
             for prop in &component.properties {
                 if let Some(default) = &prop.default {
-                    instructions.push(BytecodeOp::String(prop.name.clone()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(prop.name.clone())));
                     self.compile_expression(default, instructions);
                     vars_count += 1;
                 }
@@ -4697,7 +4729,7 @@ impl CfmlCompiler {
         // parity). `__`-prefixed keys are filtered out of all struct iteration /
         // serialization, so this never leaks into user-visible output.
         if component.accessors {
-            instructions.push(BytecodeOp::String("__accessors".to_string()));
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__accessors".to_string())));
             instructions.push(BytecodeOp::True);
             prop_count += 1;
         }
@@ -4893,8 +4925,8 @@ impl CfmlCompiler {
             if !func.metadata.is_empty() {
                 let meta_key = format!("__funcmeta_{}", func.name);
                 for (k, v) in &func.metadata {
-                    instructions.push(BytecodeOp::String(k.clone()));
-                    instructions.push(BytecodeOp::String(v.clone()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(k.clone())));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(v.clone())));
                 }
                 instructions.push(BytecodeOp::BuildStruct(func.metadata.len()));
                 instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
@@ -4910,8 +4942,8 @@ impl CfmlCompiler {
             for prop in &component.properties {
                 // Each property is a struct with name, type, required, and any custom attributes
                 let mut attr_count = 1; // always have "name"
-                instructions.push(BytecodeOp::String("name".to_string()));
-                instructions.push(BytecodeOp::String(prop.name.clone()));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new("name".to_string())));
+                instructions.push(BytecodeOp::String(std::sync::Arc::new(prop.name.clone())));
                 // `type` ALWAYS appears in property metadata — Lucee/ACF default an
                 // undeclared property's type to "any" (verified: getMetaData shows
                 // `type=any`). Preside's PresideObjectReader reads `prop.type`
@@ -4923,16 +4955,16 @@ impl CfmlCompiler {
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("type"));
                 if let Some(ref pt) = prop.prop_type {
-                    instructions.push(BytecodeOp::String("type".to_string()));
-                    instructions.push(BytecodeOp::String(pt.clone()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("type".to_string())));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(pt.clone())));
                     attr_count += 1;
                 } else if !has_type_attr {
-                    instructions.push(BytecodeOp::String("type".to_string()));
-                    instructions.push(BytecodeOp::String("any".to_string()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("type".to_string())));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("any".to_string())));
                     attr_count += 1;
                 }
                 if prop.required {
-                    instructions.push(BytecodeOp::String("required".to_string()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("required".to_string())));
                     instructions.push(BytecodeOp::True);
                     attr_count += 1;
                 }
@@ -4945,14 +4977,14 @@ impl CfmlCompiler {
                 // string Lucee stores. This mirrors the accessor-default emission
                 // above, so it is no riskier to evaluate here.
                 if let Some(ref default_expr) = prop.default {
-                    instructions.push(BytecodeOp::String("default".to_string()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new("default".to_string())));
                     self.compile_expression(default_expr, instructions);
                     attr_count += 1;
                 }
                 // Custom attributes (inject, hint, etc.)
                 for (key, val) in &prop.attributes {
-                    instructions.push(BytecodeOp::String(key.clone()));
-                    instructions.push(BytecodeOp::String(val.clone()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(key.clone())));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(val.clone())));
                     attr_count += 1;
                 }
                 instructions.push(BytecodeOp::BuildStruct(attr_count));
@@ -5071,7 +5103,7 @@ impl CfmlCompiler {
                 LiteralValue::Bool(false) => instructions.push(BytecodeOp::False),
                 LiteralValue::Int(i) => instructions.push(BytecodeOp::Integer(*i)),
                 LiteralValue::Double(d) => instructions.push(BytecodeOp::Double(*d)),
-                LiteralValue::String(s) => instructions.push(BytecodeOp::String(s.clone())),
+                LiteralValue::String(s) => instructions.push(BytecodeOp::String(std::sync::Arc::new(s.clone()))),
             },
             Expression::Identifier(id) => {
                 instructions.push(BytecodeOp::LoadLocal(Name::from(&id.name)));
@@ -5126,7 +5158,7 @@ impl CfmlCompiler {
                             instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
                             let guard_idx = instructions.len() - 1;
                             instructions.push(BytecodeOp::Pop); // drop the Null
-                            instructions.push(BytecodeOp::UnsetPath(path));
+                            instructions.push(BytecodeOp::UnsetPath(std::sync::Arc::new(path)));
                             instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
                             unset_end_jump = Some(instructions.len() - 1);
                             instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
@@ -5165,7 +5197,7 @@ impl CfmlCompiler {
                             if let Some(path) =
                                 Self::scope_rooted_nested_path(&access.object, &access.member)
                             {
-                                instructions.push(BytecodeOp::String(path));
+                                instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetDynamicVar);
                             } else if let Some(path) =
@@ -5175,7 +5207,7 @@ impl CfmlCompiler {
                                 // position (`x = (copies.request.cgi = v)`):
                                 // auto-vivify through the runtime store, which
                                 // pushes the value back for the outer store.
-                                instructions.push(BytecodeOp::String(path));
+                                instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetDynamicVar);
                             } else if want_value
@@ -5191,7 +5223,7 @@ impl CfmlCompiler {
                                     Expression::Identifier(id) => id.name.clone(),
                                     _ => unreachable!(),
                                 };
-                                instructions.push(BytecodeOp::String(format!("{}.{}", id, access.member)));
+                                instructions.push(BytecodeOp::String(std::sync::Arc::new(format!("{}.{}", id, access.member))));
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetDynamicVar);
                             } else if let Expression::Identifier(ref ident) = *access.object {
@@ -5494,9 +5526,8 @@ impl CfmlCompiler {
                 }
                 if has_named {
                     instructions.push(BytecodeOp::CallMethodNamed(Name::from(&sc.method),
-                        Box::new(names),
+                        Box::new(NamedMethodCall { names, write_back: None }),
                         sc.arguments.len() as u32,
-                        None,
                     ));
                 } else {
                     instructions.push(BytecodeOp::CallMethod(Name::from(&sc.method),
@@ -5801,9 +5832,8 @@ impl CfmlCompiler {
                     let names = compile_args(self, instructions);
                     if has_named {
                         instructions.push(BytecodeOp::CallMethodNamed(Name::from(&call.method),
-                            Box::new(names),
+                            Box::new(NamedMethodCall { names, write_back: write_back.clone().map(|b| *b) }),
                             call.arguments.len() as u32,
-                            write_back.clone(),
                         ));
                     } else {
                         instructions.push(BytecodeOp::CallMethod(Name::from(&call.method),
@@ -5816,9 +5846,8 @@ impl CfmlCompiler {
                     let names = compile_args(self, instructions);
                     if has_named {
                         instructions.push(BytecodeOp::CallMethodNamed(Name::from(&call.method),
-                            Box::new(names),
+                            Box::new(NamedMethodCall { names, write_back: write_back.map(|b| *b) }),
                             call.arguments.len() as u32,
-                            write_back,
                         ));
                     } else {
                         instructions.push(BytecodeOp::CallMethod(Name::from(&call.method),
@@ -5866,7 +5895,7 @@ impl CfmlCompiler {
                             // Normal pair: compile key/value, build 1-pair struct, merge
                             match key {
                                 Expression::Identifier(ident) => {
-                                    instructions.push(BytecodeOp::String(ident.name.clone()));
+                                    instructions.push(BytecodeOp::String(std::sync::Arc::new(ident.name.clone())));
                                 }
                                 _ => {
                                     self.compile_expression(key, instructions);
@@ -5918,7 +5947,7 @@ impl CfmlCompiler {
                         for (key, value) in &st.pairs {
                             match key {
                                 Expression::Identifier(ident) => {
-                                    instructions.push(BytecodeOp::String(ident.name.clone()));
+                                    instructions.push(BytecodeOp::String(std::sync::Arc::new(ident.name.clone())));
                                 }
                                 _ => {
                                     self.compile_expression(key, instructions);
@@ -5950,9 +5979,9 @@ impl CfmlCompiler {
                     Expression::FunctionCall(call) => {
                         // Try flattening dot-path: new a.b.c(args) parses as FunctionCall(MemberAccess(a,b).c, args)
                         if let Some(path) = Self::flatten_member_access(&call.name) {
-                            instructions.push(BytecodeOp::String(path));
+                            instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
                         } else if let Expression::Identifier(ident) = &*call.name {
-                            instructions.push(BytecodeOp::String(ident.name.clone()));
+                            instructions.push(BytecodeOp::String(std::sync::Arc::new(ident.name.clone())));
                         } else {
                             self.compile_expression(&call.name, instructions);
                         }
@@ -5960,13 +5989,13 @@ impl CfmlCompiler {
                     }
                     Expression::Identifier(ident) => {
                         // Push class name as string - VM will look up in locals, globals, or .cfc files
-                        instructions.push(BytecodeOp::String(ident.name.clone()));
+                        instructions.push(BytecodeOp::String(std::sync::Arc::new(ident.name.clone())));
                         self.compile_new_args(&new_expr.arguments, instructions);
                     }
                     Expression::MemberAccess(_) => {
                         // Handle bare dotted path: new a.b.c without parens
                         if let Some(path) = Self::flatten_member_access(&new_expr.class) {
-                            instructions.push(BytecodeOp::String(path));
+                            instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
                         } else {
                             self.compile_expression(&new_expr.class, instructions);
                         }
@@ -6185,7 +6214,7 @@ impl CfmlCompiler {
             }
             Expression::StringInterpolation(interp) => {
                 if interp.parts.is_empty() {
-                    instructions.push(BytecodeOp::String(String::new()));
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(String::new())));
                 } else if interp.parts.len() == 1 {
                     // Single-part interpolation: a quoted string whose ENTIRE
                     // content is one `#expr#` (or one literal). Lucee/ACF/BoxLang
@@ -6199,7 +6228,7 @@ impl CfmlCompiler {
                     self.compile_expression(&interp.parts[0], instructions);
                     // Convert to string via Concat with empty string if needed
                     if !matches!(&interp.parts[0], Expression::Literal(Literal { value: LiteralValue::String(_), .. })) {
-                        instructions.push(BytecodeOp::String(String::new()));
+                        instructions.push(BytecodeOp::String(std::sync::Arc::new(String::new())));
                         instructions.push(BytecodeOp::Concat);
                     }
                     // Concat remaining parts
@@ -6307,12 +6336,13 @@ mod size_probe {
         let op = size_of::<BytecodeOp>();
         eprintln!("size_of::<BytecodeOp>() = {op} B");
         assert!(
-            op <= 32,
-            "BytecodeOp grew to {op} B (ceiling 32 B: 64 B at the May 2026 probe, 48 B \
+            op <= 24,
+            "BytecodeOp grew to {op} B (ceiling 24 B: 64 B at the May 2026 probe, 48 B \
              after Phase 3.1 name interning, 32 B once the method write-back path \
-             was boxed and the fused-loop jump target narrowed to u32 — see \
-             known-issues §82). Every op pays the widest variant's size, so this is \
-             a memory AND icache regression. If intentional, justify and raise it."
+             was boxed, 24 B with Arc<String> literals, i32 loop constants and a \
+             single boxed NamedMethodCall — see known-issues §82). Every op pays \
+             the widest variant's size, so this is a memory AND icache regression. \
+             If intentional, justify and raise it."
         );
     }
 }
