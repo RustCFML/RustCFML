@@ -1957,6 +1957,26 @@ case in `crates/cli/tests/thread_alloc_gc.rs`, run with the relog budget capped
 so the sweep — not the ordinary request-end collect — is what has to free it;
 non-vacuous (with the trigger disabled the graph stays tracked).
 
+**Measured, not a regression — render cost.** Isolated warm-render A/B on the
+Preside homepage, published v0.653.2 vs v0.653.3 vs v0.653.4: p50 5.8 / 5.9 /
+6.0 ms end-to-end with ±0.2 ms round-to-round noise; server-side footer 5.22 /
+5.10 / 5.03 ms. On an ordinary page the displacement check is one atomic load
+and no GC line is emitted.
+
+**Measured, not a regression — the Wheels suite.** One suite request
+(2,737 tests, `?reload=true`) peaks at ~6.4 G and successive runs read 6.4 →
+10.0 → 13.9 G. Identical on the published v0.653.2 binary, so pre-existing. It
+is not collector garbage: the mid-request sweep finds 8–14 M nodes live and
+reclaims 0, and the request-end pass then sees only ~280k of the 16 M logged
+entries still alive — the rest were acyclic request-lifetime data freed by
+refcount when the test frames returned. The cross-run growth is mimalloc
+retaining the peak. Two things were tried and rejected with numbers: clamping
+the incremental budget to half the log cap (put the budget BELOW the live count
+→ a 330 ms sweep at every frame exit, 270 sweeps in 90 s) and polling the
+incremental sweep at frame exit (timely sweeps, nothing extra freed, run ~15%
+slower). The incremental debug line now always prints, with the log size taken
+and the pass duration, so this is visible next time.
+
 **Still true.** The remaining oscillation is mimalloc's high-water mark plus the
 ~15 s window in which a reload's threads legitimately hold their predecessor. The
 `SHARED_FN_REGISTRY` Vec is indexed by a monotonic id and grows ~2 MB per reload

@@ -1010,6 +1010,8 @@ pub fn collect_incremental() -> usize {
         }
     });
     let Some(log) = log else { return 0 };
+    let taken = log.len();
+    let t0 = std::time::Instant::now();
     let carry = log.clone();
     let reclaimed = collect_from_log(log);
     let mut live = 0usize;
@@ -1023,16 +1025,45 @@ pub fn collect_incremental() -> usize {
             }
         }
     });
-    NEXT_SWEEP.with(|c| c.set(std::cmp::max(base, live.saturating_mul(2))));
-    if reclaimed > 0 && std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+    // Doubling from the live count keeps the amortised cost linear: a budget
+    // that does not grow with the live set sweeps the same live nodes over and
+    // over (a fixed threshold is quadratic — and a clamp that put the budget
+    // BELOW the live count made every frame exit run a 330 ms sweep). The budget
+    // must therefore always exceed `live`; the log cap bounds the bookkeeping
+    // separately, and a request whose live set genuinely reaches it is holding
+    // that much data itself (the Wheels suite: 8M nodes live in one request).
+    let next = std::cmp::max(base, live.saturating_mul(2));
+    NEXT_SWEEP.with(|c| c.set(next));
+    if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
         eprintln!(
-            "[cycle_gc] incremental sweep reclaimed {} node(s); {} live, next sweep at {}",
+            "[cycle_gc] incremental sweep over {} reclaimed {} node(s); {} live, next sweep at {} ({} ms)",
+            taken,
             reclaimed,
             live,
-            std::cmp::max(base, live.saturating_mul(2))
+            next,
+            t0.elapsed().as_millis()
         );
     }
     reclaimed
+}
+
+/// Cheap poll for [`collect_incremental`]: is this thread's log past its
+/// budget? Two thread-local reads and no allocation.
+///
+/// Not wired into the frame-exit path. It was tried, to catch workloads that
+/// allocate heavily without constructing components (the Wheels suite runs its
+/// log from 322k to the 16M cap between two `new` checks). Measured: sweeps
+/// became timely (80 vs ~40 per suite run) but freed nothing extra — the suite's
+/// 8-14M "live" nodes are acyclic request-lifetime data that refcounting frees
+/// when the test frames return, so the collector had nothing to take — and the
+/// run got ~15% slower. Kept as a utility for a caller with a real need.
+#[inline]
+pub fn incremental_due() -> bool {
+    let budget = NEXT_SWEEP.with(|c| c.get());
+    if budget == usize::MAX {
+        return false;
+    }
+    ALLOC_LOG.with(|c| c.borrow().as_ref().is_some_and(|v| v.len() >= budget))
 }
 
 /// --- The cross-request survivor set -----------------------------------------
