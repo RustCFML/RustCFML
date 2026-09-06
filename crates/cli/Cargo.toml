@@ -94,7 +94,10 @@ backtrace = { version = "0.3", optional = true }
 # Alternative global allocator (feature `mimalloc`). ~27% of a warm request is
 # allocator work and the default build uses the system malloc, which on macOS is
 # libmalloc — the slowest mainstream allocator for high-churn small allocations.
-mimalloc = { version = "0.1", optional = true, default-features = false }
+mimalloc = { version = "0.1", optional = true, default-features = false, features = ["extended"] }
+# The raw bindings, for `mi_process_info` / `mi_collect` behind `--max-memory`.
+# Same feature gate as `mimalloc` so a build without the allocator has neither.
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 
 # ── OpenTelemetry (observability Phase 3) — host-only, behind `obs-otel` ──
 # Pinned as a compatible set (all track the opentelemetry 0.32 line). OTLP export
@@ -154,7 +157,7 @@ memprofile = ["dep:backtrace"]
 # exist); the cfg in `main.rs` gives `dhat-heap`/`memprofile` precedence so a
 # profiling build still profiles. Zero effect on the wasm crates, which never
 # depend on the CLI.
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # Phase C (component-model flyweight): passthrough to the VM's `Instance` backing.

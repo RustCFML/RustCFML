@@ -49,6 +49,18 @@ switch ( url.step ) {
         structDelete( application, "holder" );
         writeOutput( "dropped-scope has=#structKeyExists(application, 'holder')#" );
         break;
+    case "hog":
+        // --max-memory test: hold ~mb megabytes of LOCAL data for holdms, then
+        // let it go at request end. Strings, not structs, so the collector has
+        // nothing to do with it — this is pure footprint.
+        param name="url.mb"     default="200";
+        param name="url.holdms" default="0";
+        chunk = repeatString( "x", 1024 * 1024 );
+        hoard = [];
+        for ( i = 1; i <= url.mb; i++ ) { arrayAppend( hoard, chunk & i ); }
+        if ( url.holdms > 0 ) { sleep( url.holdms ); }
+        writeOutput( "hogged #arrayLen(hoard)#MB" );
+        break;
     default:
         writeOutput( "noop" );
 }

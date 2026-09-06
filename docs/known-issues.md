@@ -1981,3 +1981,42 @@ and the pass duration, so this is visible next time.
 ~15 s window in which a reload's threads legitimately hold their predecessor. The
 `SHARED_FN_REGISTRY` Vec is indexed by a monotonic id and grows ~2 MB per reload
 in dead `Weak` slots — small, real, untouched.
+
+## 79. `--max-memory`: a process-wide footprint limit with 503 back-pressure (v0.653.5) 📌
+
+**Why.** A JVM engine runs under `-Xmx`, so a container that says "2 GB" can
+hand the process 1.5 GB and know it will not be OOM-killed. RustCFML's footprint
+is live data plus the pages mimalloc retains after a peak, and nothing bounded
+it: one Wheels suite request peaked at 6.4 G and three in a row read 13.9 G.
+
+**What it does (the soft tier).** `--max-memory 1.5G` (or `RUSTCFML_MAX_MEMORY`,
+or `auto` = 75% of the cgroup limit). Above 85% of the limit the server refuses
+NEW requests with **503 + `Retry-After: 2`** — a healthy back-pressure signal for
+a load balancer or orchestrator — and sheds: the collector's cross-request sweep
+plus `mi_collect(true)` to return retained pages. In-flight requests finish.
+Admission reopens below 95% of the soft line (hysteresis: a process sitting on
+the line otherwise flaps 503/200 on alternate requests). Shedding is rate-limited
+to one pass per 2 s.
+
+**What it measures.** The number the OS or container kills on: cgroup
+`memory.current` when a cgroup limit exists, else `/proc/self/statm` resident
+(Linux), `proc_pid_rusage` `ri_phys_footprint` (macOS), mimalloc's `current_rss`
+as the last resort. ⚠️ mimalloc's RSS was tried first and is WRONG on macOS: it
+counts pages already released with `MADV_FREE` (reclaimed lazily), read 763 M
+against a real 585 M, refused traffic there was room for, and made shedding look
+inert because the meter never moved.
+
+**Sizing.** Leave room for the reload window: for ~15 s after a reload two
+application generations are legitimately resident. Preside idles at ~600 M and
+peaks ~950 M on reload, so a 700 M limit serves 503 for most of that window —
+correct behaviour for a limit set at 1.15× steady state, but not what you want.
+`auto` in a 2 G container gives 1.5 G, which is right for that app.
+
+**Not yet: the hard tier** — aborting the in-flight request that has allocated
+the most since it started, so a single runaway request (a Wheels suite run) gets
+a clean 500 instead of taking the process to the limit. Needs the per-request
+allocation accounting wired to the abort path.
+
+Tests: `crates/cli/tests/max_memory.rs` (503 → finish → reopen, end to end) and
+the unit tests in `crates/cli/src/memory_limit.rs`.
+

@@ -14,6 +14,33 @@ rustcfml --serve ./mywebroot --production
 
 See **[Web Server](web-server.md)** for serve-mode details, `Application.cfc` lifecycle, sessions, and URL rewriting.
 
+## Memory limit (`--max-memory`)
+
+Give the process a ceiling the way you would give a JVM `-Xmx`, sized to the
+container it runs in:
+
+```bash
+rustcfml --serve ./mywebroot --production --max-memory 1.5G   # or 1536M
+rustcfml --serve ./mywebroot --production --max-memory auto   # 75% of the cgroup limit
+RUSTCFML_MAX_MEMORY=1.5G rustcfml --serve ./mywebroot --production
+```
+
+Above **85%** of the limit the server stops admitting new requests — they get
+**503 + `Retry-After: 2`**, which a load balancer or orchestrator treats as
+back-pressure rather than a failure — while it sheds (a cycle-collector sweep and
+a return of retained allocator pages) and lets in-flight requests finish.
+Admission reopens once the footprint is back under. It measures real physical
+footprint: cgroup `memory.current` inside a container, the process's resident
+footprint otherwise.
+
+**Sizing.** Leave headroom for an application reload: for ~15 s after
+`?fwreinit=true`-style reloads two application generations are legitimately
+resident, so size for roughly twice the steady state. A Preside site idling at
+~600 M peaks near 950 M on reload; `auto` in a 2 G container (1.5 G) is right for
+it, a 700 M limit is not. There is no per-request abort yet: a single runaway
+request can still take the process to the limit, at which point everything else
+is refused until it finishes.
+
 ## Behind a reverse proxy (nginx + Unix socket)
 
 In production you typically run RustCFML behind a reverse proxy (nginx, Caddy, HAProxy) that terminates TLS, serves static assets, and load-balances. When the proxy and RustCFML run on the **same host** — the common single-box and containerised setup — **a Unix domain socket is the recommended way to connect them**, in preference to a loopback TCP port.

@@ -23,6 +23,8 @@ mod pprof_profile;
 /// install `SamplingAlloc` as `#[global_allocator]`.
 #[cfg(all(feature = "memprofile", unix))]
 pub mod memprofile;
+/// `--max-memory`: process-wide footprint limit with 503 back-pressure.
+pub mod memory_limit;
 
 /// The allocator a `rustcfml` binary installs when the `mimalloc` feature is on.
 /// Re-exported because a `#[global_allocator]` must be declared in the *binary*
@@ -415,6 +417,13 @@ struct Args {
     #[arg(long)]
     production: bool,
 
+    /// Process-wide memory limit for --serve: a size (1.5G, 1536M) or `auto`
+    /// (75% of the cgroup limit). Above 85% of it new requests get 503 +
+    /// Retry-After while the process sheds; in-flight requests finish. Env form:
+    /// RUSTCFML_MAX_MEMORY.
+    #[arg(long, value_name = "SIZE")]
+    max_memory: Option<String>,
+
     /// Build a self-contained binary: embed a CFML app into a single executable
     /// Usage: rustcfml --build <app-dir> [-o output-binary] [--mode serve|cli]
     #[arg(long, value_name = "APP_DIR")]
@@ -626,6 +635,21 @@ fn real_main() {
         if !doc_root.is_dir() {
             eprintln!("Error: Document root is not a directory: {}", doc_root.display());
             exit(1);
+        }
+        // --max-memory / RUSTCFML_MAX_MEMORY (flag wins; install is first-wins).
+        let max_memory_src = args
+            .max_memory
+            .clone()
+            .or_else(|| std::env::var("RUSTCFML_MAX_MEMORY").ok());
+        if let Some(v) = max_memory_src {
+            match memory_limit::parse_max_memory(&v) {
+                Ok(Some(limit)) => memory_limit::install(limit),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
         }
         let production = args.production
             || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
@@ -1525,6 +1549,11 @@ fn compile_and_run(
         // the reload's threads are still running this is a no-op and the last
         // thread out does it instead.
         cfml_common::cycle_gc::sweep_if_displaced();
+        // `--max-memory`: a request that pushed the process over the soft limit
+        // sheds now, rather than the next arrival paying for it with a 503.
+        if let Some(e) = memory_limit::enforcer() {
+            e.on_request_end();
+        }
         cfml_common::cycle_gc::set_probe_root(Vec::new());
         // Reclaim any previously-deferred logs whose threads have since finished.
         cfml_common::cycle_gc::collect_ready_deferred();
@@ -2352,6 +2381,21 @@ async fn async_run_server(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| format!("{host}:{port}"));
             print_ready_banner(&format!("running on http://{bound}"), mode, &banner_root);
+            if let Some(e) = memory_limit::enforcer() {
+                match memory_limit::footprint_bytes() {
+                    Some(fp) => eprintln!(
+                        "Memory limit: {} (new requests refused with 503 above {}; {} now {})",
+                        memory_limit::human(e.limit().max),
+                        memory_limit::human(e.limit().soft),
+                        memory_limit::footprint_source(),
+                        memory_limit::human(fp)
+                    ),
+                    None => eprintln!(
+                        "warning: --max-memory {} cannot be enforced: this build has no mimalloc process statistics",
+                        memory_limit::human(e.limit().max)
+                    ),
+                }
+            }
             // Disable Nagle's algorithm on accepted connections. For a request/response
             // HTTP server, Nagle adds latency by holding small writes, and can stall on
             // the classic Nagle + delayed-ACK interaction. axum::serve does not set this
@@ -2640,6 +2684,22 @@ async fn handle_request_inner(
     let method = parts.method.to_string();
     let remote_addr = addr.ip().to_string();
     let url = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    // `--max-memory` back-pressure: over the soft limit, refuse with 503 and a
+    // Retry-After before touching the body or the VM. The enforcer has already
+    // kicked a shed pass; in-flight requests finish normally.
+    if let Some(fp) = memory_limit::enforcer().and_then(|e| e.check_admission()) {
+        let limit = memory_limit::enforcer().map(|e| e.limit().max).unwrap_or(0);
+        return axum::response::Response::builder()
+            .status(503)
+            .header("Retry-After", memory_limit::RETRY_AFTER_SECS.to_string())
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(format!(
+                "503 Service Unavailable: process memory {} is over the configured limit {} (--max-memory); shedding, retry shortly\n",
+                memory_limit::human(fp),
+                memory_limit::human(limit)
+            )))
+            .unwrap();
+    }
 
     // Extract headers as Vec<(String, String)>
     let mut headers: Vec<(String, String)> = parts.headers.iter()
@@ -4447,6 +4507,18 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 port = cli_args[i + 1].parse().unwrap_or(8500);
                 i += 2;
             }
+            // --max-memory 1.5G|auto: process-wide footprint limit (see memory_limit).
+            "--max-memory" if i + 1 < cli_args.len() => {
+                match memory_limit::parse_max_memory(&cli_args[i + 1]) {
+                    Ok(Some(limit)) => memory_limit::install(limit),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
+                    }
+                }
+                i += 2;
+            }
             // --socket [PATH]: bind a Unix socket; bare flag uses the default path.
             "--socket" => {
                 if i + 1 < cli_args.len() && !cli_args[i + 1].starts_with('-') {
@@ -4484,6 +4556,17 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 i += 1;
             }
             _ => { i += 1; }
+        }
+    }
+    // RUSTCFML_MAX_MEMORY is the flag's environment form (containers set env,
+    // not argv). The flag wins if both are given because it installs first.
+    if memory_limit::enforcer().is_none() {
+        if let Ok(v) = std::env::var("RUSTCFML_MAX_MEMORY") {
+            match memory_limit::parse_max_memory(&v) {
+                Ok(Some(limit)) => memory_limit::install(limit),
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: RUSTCFML_MAX_MEMORY ignored: {e}"),
+            }
         }
     }
 
