@@ -1001,42 +1001,48 @@ impl CfmlValue {
         static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let debug = *DEBUG.get_or_init(|| std::env::var("RUSTCFML_RELOG_DEBUG").is_ok());
         let mut budget = relog_budget();
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Per-interval de-dup lives in the collector (`relog_first_sight`): a
+        // node already entered since the last sweep is in the log and needs no
+        // second entry. `entered` counts the nodes THIS call added.
+        let mut entered = 0usize;
         let mut stack: Vec<CfmlValue> = vec![self.clone()];
         while let Some(v) = stack.pop() {
             if budget == 0 {
                 if debug {
-                    eprintln!("[relog] BUDGET EXHAUSTED after {} nodes", seen.len());
+                    eprintln!("[relog] BUDGET EXHAUSTED after {} nodes", entered);
                 }
                 // Exhausting the budget IS the generation-sized case — the one
                 // the displacement sweep exists for — so it must set the flag
                 // too, not only the normal exit below.
-                crate::cycle_gc::note_displacement(seen.len());
+                crate::cycle_gc::note_displacement(entered);
                 return;
             }
             match &v {
                 CfmlValue::Struct(s) => {
-                    if !seen.insert(Arc::as_ptr(&s.0) as *const () as usize) {
+                    if !crate::cycle_gc::relog_first_sight(Arc::as_ptr(&s.0) as *const () as usize) {
                         continue;
                     }
                     budget -= 1;
+                    entered += 1;
                     crate::cycle_gc::log_struct(&s.0);
                     s.0.read().map.values().for_each(|c| stack.push(c.clone()));
                 }
                 CfmlValue::Array(a) => {
-                    if !seen.insert(Arc::as_ptr(&a.0) as *const () as usize) {
+                    if !crate::cycle_gc::relog_first_sight(Arc::as_ptr(&a.0) as *const () as usize) {
                         continue;
                     }
                     budget -= 1;
+                    entered += 1;
                     crate::cycle_gc::log_array(&a.0);
                     a.0.read().iter().for_each(|c| stack.push(c.clone()));
                 }
                 #[cfg(feature = "component-instance")]
                 CfmlValue::Instance(inst) => {
-                    if !seen.insert(Arc::as_ptr(inst) as *const () as usize) {
+                    if !crate::cycle_gc::relog_first_sight(Arc::as_ptr(inst) as *const () as usize) {
                         continue;
                     }
                     budget -= 1;
+                    entered += 1;
                     crate::cycle_gc::log_instance(inst);
                     // Same handles the collector itself walks for an Instance.
                     if let Some(g) = inst.try_read() {
@@ -1047,10 +1053,11 @@ impl CfmlValue {
                     }
                 }
                 CfmlValue::Query(q) => {
-                    if !seen.insert(Arc::as_ptr(&q.0) as *const () as usize) {
+                    if !crate::cycle_gc::relog_first_sight(Arc::as_ptr(&q.0) as *const () as usize) {
                         continue;
                     }
                     budget -= 1;
+                    entered += 1;
                     crate::cycle_gc::log_query(&q.0);
                     let g = q.0.read();
                     for col in &g.data {
@@ -1069,10 +1076,11 @@ impl CfmlValue {
                 // relog hook alone did not reclaim Preside's displaced graph.
                 CfmlValue::Function(f) => {
                     if let Some(sc) = &f.captured_scope {
-                        if !seen.insert(Arc::as_ptr(sc) as *const () as usize) {
+                        if !crate::cycle_gc::relog_first_sight(Arc::as_ptr(sc) as *const () as usize) {
                             continue;
                         }
                         budget -= 1;
+                        entered += 1;
                         crate::cycle_gc::log_scope(sc);
                         if let Ok(g) = sc.read() {
                             g.values().for_each(|c| stack.push(c.clone()));
@@ -1088,10 +1096,11 @@ impl CfmlValue {
                     }
                     for m in c.methods.values() {
                         if let Some(sc) = &m.captured_scope {
-                            if !seen.insert(Arc::as_ptr(sc) as *const () as usize) {
+                            if !crate::cycle_gc::relog_first_sight(Arc::as_ptr(sc) as *const () as usize) {
                                 continue;
                             }
                             budget -= 1;
+                            entered += 1;
                             crate::cycle_gc::log_scope(sc);
                             if let Ok(g) = sc.read() {
                                 g.values().for_each(|c| stack.push(c.clone()));
@@ -1110,15 +1119,15 @@ impl CfmlValue {
                 _ => {}
             }
         }
-        if debug && !seen.is_empty() {
-            eprintln!("[relog] entered {} containers", seen.len());
+        if debug && entered > 0 {
+            eprintln!("[relog] entered {} containers", entered);
         }
         // A generation-sized displacement is the moment its subgraph became
         // garbage: tell the collector so it sweeps at this request's end (or when
         // the last thread of the reload finishes) instead of on the doubling
         // budget, which would leave the dead generation resident for two or
         // three more reloads. See `cycle_gc::note_displacement`.
-        crate::cycle_gc::note_displacement(seen.len());
+        crate::cycle_gc::note_displacement(entered);
     }
 }
 

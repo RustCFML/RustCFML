@@ -167,6 +167,34 @@ fn log_cap() -> usize {
 pub fn enable() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = Some(Vec::new()));
     NEXT_SWEEP.with(|c| c.set(incremental_threshold()));
+    LOG_PAUSED.with(|c| c.set(false));
+    RELOG_SEEN.with(|c| c.borrow_mut().clear());
+}
+
+thread_local! {
+    /// Set once this request's log genuinely holds more DISTINCT live nodes
+    /// than the cap can take even after compaction; logging stops for the rest
+    /// of the request (the historical overflow behaviour, now reached only when
+    /// the request really is that large — see `log_push`).
+    static LOG_PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Nodes the relog hook has already entered into the log during the current
+    /// sweep interval — see [`relog_first_sight`].
+    static RELOG_SEEN: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// Whether `ptr` has NOT yet been re-logged during the current sweep interval,
+/// marking it as seen. The relog hook (`CfmlValue::relog_cycle_nodes`) enters a
+/// displaced subgraph into the log so trial deletion can evaluate it, and every
+/// overwrite of a key that holds a large graph enters the SAME nodes again: a
+/// node only needs to be in the log once, but the Wheels suite pushed the same
+/// ~260k nodes until the log held 16M entries and hit its cap — and with logging
+/// paused, everything the rest of the request allocated was invisible to the
+/// collector, so its cycles outlived the request (3.3 GB retained per run).
+/// Cleared whenever the log is swept, because a sweep rebuilds the log from the
+/// distinct survivors and a node displaced after that must be entered anew.
+#[inline]
+pub fn relog_first_sight(ptr: usize) -> bool {
+    RELOG_SEEN.with(|c| c.borrow_mut().insert(ptr))
 }
 
 /// Stop logging and drop the log without collecting.
@@ -304,28 +332,62 @@ fn log_push(t: TrackedAlloc) {
     ALLOC_LOG.with(|c| {
         let mut b = c.borrow_mut();
         if let Some(v) = b.as_mut() {
+            if LOG_PAUSED.with(|c| c.get()) {
+                // Genuine overflow (see below): drop `t`, keep the log as it is.
+                return;
+            }
             if v.len() >= log_cap() {
-                // Overflow: STOP logging further allocations for this request, but
-                // KEEP what we have so `collect()` still reclaims the cycles among
-                // the logged subset. Collecting a partial log is conservative
-                // (unlogged objects read as external roots → never over-collect),
-                // so this caps the collector's bookkeeping memory without ever
-                // disabling collection. The skip stays quiet unless debugging.
-                if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed)
-                    && std::env::var("RUSTCFML_GC_DEBUG").is_ok()
-                {
+                // At the cap. The log is a LOG, not a set: the relog hook and the
+                // closure-scope sites can enter one node many times, and entries
+                // whose node has already been freed by refcounting are dead
+                // weight. Compact it — drop dead entries, keep one per distinct
+                // live node — and carry on logging. No graph walk and no
+                // `upgrade()`: a `Weak::strong_count` read and a pointer per
+                // entry, so this is cheap enough to run exactly when it is
+                // needed. Only if the compacted log STILL nearly fills the cap
+                // does the request genuinely hold that many distinct containers,
+                // and only then does logging pause for the rest of the request:
+                // collecting a partial log is conservative (an unlogged node
+                // reads as an external root and is never over-collected), but
+                // every cycle minted after the pause survives the request — so
+                // the pause must be the last resort, not the first.
+                let before = v.len();
+                compact_log(v);
+                let after = v.len();
+                let debug = std::env::var("RUSTCFML_GC_DEBUG").is_ok();
+                if after >= log_cap() / 4 * 3 {
+                    LOG_PAUSED.with(|c| c.set(true));
+                    if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed) && debug {
+                        eprintln!(
+                            "[cycle_gc] log reached cap={} with {} distinct live nodes after \
+                             compaction — logging paused for this request; partial \
+                             (conservative) collection will still run",
+                            log_cap(),
+                            after
+                        );
+                    }
+                    return;
+                }
+                if debug {
                     eprintln!(
-                        "[cycle_gc] log reached cap={} — logging paused for this request; \
-                         partial (conservative) collection will still run",
-                        log_cap()
+                        "[cycle_gc] log reached cap={} — compacted {} entries to {} distinct live node(s)",
+                        log_cap(),
+                        before,
+                        after
                     );
                 }
-                // Leave the log in place (do not null it out); just drop `t`.
-            } else {
-                v.push(t);
             }
+            v.push(t);
         }
     });
+}
+
+/// Drop dead entries and duplicate entries from a log in place, keeping the
+/// first entry for each distinct live node. Order is preserved.
+fn compact_log(v: &mut Vec<TrackedAlloc>) {
+    let mut seen: HashSet<usize> = HashSet::with_capacity(v.len() / 8);
+    v.retain(|t| t.is_alive() && seen.insert(t.ptr()));
+    v.shrink_to_fit();
 }
 
 /// One-shot guard so the cap-reached notice is printed at most once per process
@@ -906,6 +968,7 @@ pub fn collect() -> usize {
     // tracking, and for the sweep's cost and correctness argument.
     let mut live: Vec<(usize, TrackedAlloc)> = Vec::new();
     let reclaimed = collect_from_log_carrying(log, Some(&mut live));
+    RELOG_SEEN.with(|c| c.borrow_mut().clear());
     reclaimed + carry_survivors(live)
 }
 
@@ -953,6 +1016,19 @@ fn incremental_threshold() -> usize {
 }
 
 impl TrackedAlloc {
+    /// Backing-pointer identity of the tracked node (the same key the collector
+    /// de-duplicates survivors by). Valid whether or not the node is alive.
+    fn ptr(&self) -> usize {
+        match self {
+            TrackedAlloc::Struct(w) => w.as_ptr() as *const () as usize,
+            TrackedAlloc::Array(w) => w.as_ptr() as *const () as usize,
+            TrackedAlloc::Query(w) => w.as_ptr() as *const () as usize,
+            TrackedAlloc::Scope(w) => w.as_ptr() as *const () as usize,
+            #[cfg(feature = "component-instance")]
+            TrackedAlloc::Instance(w) => w.as_ptr() as *const () as usize,
+        }
+    }
+
     /// Whether the tracked allocation is still alive (its `Weak` upgrades).
     fn is_alive(&self) -> bool {
         match self {
@@ -1012,27 +1088,33 @@ pub fn collect_incremental() -> usize {
     let Some(log) = log else { return 0 };
     let taken = log.len();
     let t0 = std::time::Instant::now();
-    let carry = log.clone();
-    let reclaimed = collect_from_log(log);
-    let mut live = 0usize;
+    // The survivors come back from the pass DE-DUPLICATED by backing pointer —
+    // one entry per distinct live node. They must not be re-entered from the
+    // raw log: that carried every duplicate entry forward and counted each as
+    // "live", so the relog hook's repeats inflated `live` to 15.8M for ~260k
+    // real nodes, the doubled budget landed above the log cap, no further sweep
+    // ever ran, and logging paused for the rest of the request (the Wheels
+    // suite retained 3.3 GB of untracked cycles per run that way).
+    let mut survivors: Vec<(usize, TrackedAlloc)> = Vec::new();
+    let reclaimed = collect_from_log_carrying(log, Some(&mut survivors));
+    let live = survivors.len();
     ALLOC_LOG.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            for t in carry {
-                if t.is_alive() {
-                    live += 1;
-                    v.push(t);
-                }
-            }
+            v.reserve(live);
+            v.extend(survivors.into_iter().map(|(_, t)| t));
         }
     });
+    // The relog de-dup set describes the log that was just replaced.
+    RELOG_SEEN.with(|c| c.borrow_mut().clear());
     // Doubling from the live count keeps the amortised cost linear: a budget
     // that does not grow with the live set sweeps the same live nodes over and
     // over (a fixed threshold is quadratic — and a clamp that put the budget
     // BELOW the live count made every frame exit run a 330 ms sweep). The budget
-    // must therefore always exceed `live`; the log cap bounds the bookkeeping
-    // separately, and a request whose live set genuinely reaches it is holding
-    // that much data itself (the Wheels suite: 8M nodes live in one request).
-    let next = std::cmp::max(base, live.saturating_mul(2));
+    // must therefore always exceed `live`. It is clamped to the log cap so a
+    // sweep still fires when the log fills; `log_push` compacts at the cap and
+    // pauses logging only for a request that genuinely holds more distinct
+    // containers than the cap allows.
+    let next = std::cmp::max(base, live.saturating_mul(2)).min(log_cap());
     NEXT_SWEEP.with(|c| c.set(next));
     if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
         eprintln!(
@@ -2367,6 +2449,79 @@ mod incremental_tests {
             "budget must rise to ~2x the live set (>=80 for 40 live cycles), got {after}"
         );
         drop(live);
+        disable_and_clear();
+    }
+
+    /// The log is a LOG, not a set: the relog hook and the closure-scope sites can
+    /// enter one node many times. The sweep must carry each distinct survivor back
+    /// ONCE. Carrying every raw entry inflated `live` (15.8M for ~260k nodes on the
+    /// Wheels suite), pushed the doubled budget above the log cap, and stopped all
+    /// further sweeps in that request — see known-issues §81.
+    #[test]
+    fn duplicate_log_entries_are_carried_once() {
+        arm();
+        enable();
+        // 80 live nodes (closure-capture scopes: logged once at creation).
+        let live: Vec<Arc<RwLock<ValueMap>>> =
+            (0..80).map(|_| tracked_scope(ValueMap::default())).collect();
+        // Enter every node another 50 times, the way repeated relogs do.
+        for _ in 0..50 {
+            for sc in &live {
+                log_scope(sc);
+            }
+        }
+        assert!(log_len().unwrap() >= 80 * 51, "precondition: the log holds duplicates");
+        NEXT_SWEEP.with(|c| c.set(1));
+        collect_incremental();
+        assert_eq!(
+            log_len(),
+            Some(80),
+            "after a sweep the log must hold exactly one entry per distinct live node"
+        );
+        drop(live);
+        disable_and_clear();
+    }
+
+    /// At the cap the log is compacted — dead entries dropped, one entry kept per
+    /// distinct live node — rather than logging being paused outright.
+    #[test]
+    fn compaction_keeps_one_entry_per_distinct_live_node() {
+        let keep: Vec<Arc<RwLock<ValueMap>>> =
+            (0..10).map(|_| Arc::new(RwLock::new(ValueMap::default()))).collect();
+        let mut log: Vec<TrackedAlloc> = Vec::new();
+        for _ in 0..7 {
+            for sc in &keep {
+                log.push(TrackedAlloc::Scope(Arc::downgrade(sc)));
+            }
+        }
+        // Dead entries: nodes that no longer exist.
+        for _ in 0..25 {
+            let dead = Arc::new(RwLock::new(ValueMap::default()));
+            log.push(TrackedAlloc::Scope(Arc::downgrade(&dead)));
+        }
+        assert_eq!(log.len(), 95);
+        compact_log(&mut log);
+        assert_eq!(log.len(), 10, "compaction must leave one live entry per node");
+        assert!(log.iter().all(|t| t.is_alive()));
+        drop(keep);
+    }
+
+    /// The relog hook's de-dup set is per sweep interval: a node entered since the
+    /// last sweep is not entered again, and a sweep (or a new request) resets it,
+    /// because the sweep rebuilds the log from the distinct survivors.
+    #[test]
+    fn relog_first_sight_is_per_sweep_interval() {
+        arm();
+        enable();
+        assert!(relog_first_sight(0x1000));
+        assert!(!relog_first_sight(0x1000), "second sight within an interval must be skipped");
+        NEXT_SWEEP.with(|c| c.set(1));
+        let _ = CfmlStruct::new(ValueMap::default());
+        collect_incremental();
+        assert!(relog_first_sight(0x1000), "a sweep must reset the de-dup set");
+        assert!(!relog_first_sight(0x1000));
+        enable();
+        assert!(relog_first_sight(0x1000), "a new request must start with an empty set");
         disable_and_clear();
     }
 }

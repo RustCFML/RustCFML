@@ -2049,8 +2049,80 @@ with `onepass_size_limit`, a refactor of every regex call site.
 **Two measurement traps from this work.** (1) Timing a page without checking
 the HTTP status: MySQL had gone away under a Docker restart and three "1.5 s
 render regressions" were Preside's 500 error page. Always print `%{http_code}`
-next to `%{time_total}`. (2) The remaining ~3.5 GB live after a Wheels request is
-component-metadata deep copies from `resolve_component_template_impl` /
-`resolve_inheritance_chain` while only ~21k tracked nodes survive — i.e. it is
-not in tracked containers. Unattributed; next thread to pull for Wheels.
+next to `%{time_total}`. (2) The remaining ~3.3 GB live after a Wheels request
+looked like component-metadata deep copies that were "not in tracked containers"
+because only ~21k tracked nodes survived. They were tracked containers — just
+never logged. See §81.
+
+## 81. The allocation log filled with duplicates, hit its cap, and paused — everything allocated afterwards leaked past the request (fixed v0.653.7) 📌
+
+**Symptom.** After one Wheels test-suite request (2,737 specs) the process held
+3.3 GiB of live heap that nothing referenced from CFML, and a second run stacked
+another ~4 GB on top (footprint 4.7 G → 8.6 G). The heap profiler attributed it to
+`resolve_component_template_impl` / `resolve_inheritance_chain` / `deep_copy`
+— component instances and their scopes — while the collector reported only
+~21k tracked nodes. The per-request VM was gone (`live_vms=1`).
+
+**Cause: three collector behaviours that were each harmless alone.**
+
+1. The allocation log is a *log*, not a set. The relog hook
+   (`CfmlValue::relog_cycle_nodes`, which enters a displaced subgraph so trial
+   deletion can evaluate it) and the closure-scope sites enter the SAME node
+   every time a key holding a big graph is overwritten. Wheels' reload and
+   test bookkeeping did that until ~260k distinct nodes occupied 16M entries.
+2. `collect_incremental` de-duplicated the survivors by pointer when it
+   collected them — but then re-entered every entry of the RAW log that still
+   upgraded, and counted each as live: `15,808,984 live` for ~260k real nodes.
+   Its doubling budget became 31M, above the 16M log cap, so no sweep ever ran
+   again in that request.
+3. At the cap, `log_push` *paused logging for the rest of the request* (by
+   design: "collecting a partial log is conservative"). Conservative is right —
+   nothing live is ever freed — but every cycle minted after the pause is
+   invisible to the collector, is in no survivor set, and is never swept. A CFC
+   instance is a cycle. The remaining ~50 s of the suite built ~3 GB of them.
+
+`[cycle_gc] incremental sweep over 16000000 reclaimed 62057 node(s); 15808984
+live, next sweep at 31617968` followed by `request end: log_len=Some(16000000)`
+is the signature.
+
+**Fix.**
+- `collect_incremental` carries the DE-DUPLICATED survivors back into the log
+  and takes `live` from that count; the next budget is clamped to the log cap.
+- The relog hook consults a per-sweep-interval de-dup set
+  (`cycle_gc::relog_first_sight`); a node already entered since the last sweep
+  is in the log and is not entered again. Cleared by every sweep and at request
+  end.
+- At the cap, `log_push` **compacts** the log (drops dead entries, keeps one per
+  distinct live node — a `strong_count` read and a pointer per entry, no graph
+  walk) and carries on. Only if the compacted log still fills three quarters
+  of the cap does the request genuinely hold that many distinct containers,
+  and only then does logging pause, as before.
+
+**Measured, Wheels suite (`?db=sqlite&reload=true`), same 2737/3/0/16 result:**
+
+| | before (v0.653.6) | after |
+|---|---|---|
+| live heap 25 s after run 1 | 3.3 GiB | 122 MiB |
+| footprint after run 1 / run 2 | 4.7 G / 8.6 G | 449 M / 393 M |
+| peak footprint during a run | 7.9 G | 1.1 G |
+| suite wall time | 71 s | 65–66 s |
+| mid-request sweeps per run | 35, then paused | ~98, ~12 s total |
+
+The log now never reaches the cap on this workload (no compaction fired). The
+sweeps that used to be paused now run for the whole request and cost ~12 s of
+the 65 s — yet the run is faster overall, because a 5 GB heap was costing more
+than that in allocation and paging. That sweep share (~20 %) is the next lever:
+a generational sweep that skips nodes which survived the previous pass would cut
+most of it, since the suite's ~300k-node live set is re-walked ~100 times.
+
+**The wrong conclusion this replaces.** An earlier pass on this workload
+concluded "the 6 G peak is the suite's own live request data; the collector
+sees 8–14 M nodes live and reclaims 0; nothing to take". The 8–14 M were
+duplicate log entries of a few hundred thousand nodes, and the "0 reclaimed"
+sweeps were the paused collector. When a sweep reports far more `live` than the
+request could plausibly hold as distinct containers, suspect the log, not the
+workload.
+
+Tests: `crates/cfml-common` unit tests for the de-dup/compaction paths; the
+Wheels numbers above are the end-to-end evidence.
 
