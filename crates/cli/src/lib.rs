@@ -1336,6 +1336,13 @@ fn compile_and_run(
     if cfml_common::cycle_gc::is_armed() {
         cfml_common::cycle_gc::enable();
     }
+    // `--max-memory` hard tier: publish this request so the watchdog can compare
+    // its allocation odometer with the other in-flight requests and abort the
+    // largest if the process reaches its ceiling. RAII — deregisters on every
+    // path out of this function, including a panic. No-op without a limit.
+    let _mem_slot = cfml_common::mem_guard::register(
+        vm.source_file.clone().unwrap_or_else(|| "unknown".to_string()),
+    );
 
     // Perf-plan 3.2 stage-2 sizing: per-request delta of the call-parent
     // seeding counters (RCFML_FUSED_COUNTERS=1). Measurement-only.

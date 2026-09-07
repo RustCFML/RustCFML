@@ -14,6 +14,13 @@
 // ?step=dropscope — structDelete(application, "holder"): same graph, displaced
 //                 from the persistent scope itself, so the relog hook fires and
 //                 the DISPLACEMENT SWEEP (not the doubling budget) must free it.
+// Used by ?step=runaway. A page-level UDF so every iteration of the runaway loop
+// passes through a function frame, which is where the `--max-memory` hard tier
+// polls for its abort.
+function makeNode( n, pad ) {
+    return { i = arguments.n, tags = [ 1, 2 ], pad = repeatString( "x", arguments.pad ) };
+}
+
 param name="url.step" default="noop";
 param name="url.n"    default="600";
 
@@ -48,6 +55,22 @@ switch ( url.step ) {
         // RUSTCFML_GC_PERSISTENT_ALWAYS help.
         structDelete( application, "holder" );
         writeOutput( "dropped-scope has=#structKeyExists(application, 'holder')#" );
+        break;
+    case "runaway":
+        // --max-memory HARD tier: allocate tracked containers without bound and
+        // KEEP them, so nothing in the engine can end this request — only the
+        // watchdog's abort. Each iteration goes through a user-function call,
+        // which is where the abort is polled, and each node is a struct plus an
+        // array (two tracked containers) so the request clears the victim floor
+        // long before it reaches the limit. The loop bound is finite only so a
+        // build where the hard tier does NOT fire fails the test instead of
+        // hanging.
+        param name="url.pad" default="2048";
+        keep = [];
+        for ( i = 1; i <= 10000000; i++ ) {
+            arrayAppend( keep, makeNode( i, url.pad ) );
+        }
+        writeOutput( "runaway completed unaborted len=#arrayLen(keep)#" );
         break;
     case "hog":
         // --max-memory test: hold ~mb megabytes of LOCAL data for holdms, then

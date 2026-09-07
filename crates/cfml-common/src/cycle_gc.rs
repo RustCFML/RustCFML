@@ -130,6 +130,12 @@ thread_local! {
     /// never logged and never accumulate). Taking the log out (`collect`) also
     /// leaves it `None`, so the collector's own allocations are never logged.
     static ALLOC_LOG: RefCell<Option<Vec<TrackedAlloc>>> = const { RefCell::new(None) };
+    /// Monotonic count of tracked containers this REQUEST has allocated, unlike
+    /// the log itself (which sweeps drain) and unaffected by the log cap. Read by
+    /// [`crate::mem_guard`] to decide which in-flight request built the heap when
+    /// `--max-memory`'s hard tier has to choose one to abort. A plain `Cell`
+    /// bump; the guard publishes it to an atomic only at safe points.
+    static ALLOC_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The OLD generation: survivors promoted by a minor sweep. Only re-walked by
     /// a MAJOR sweep (when it has doubled since the last one) or at request end.
     /// See `collect_incremental`.
@@ -201,6 +207,7 @@ fn log_cap() -> usize {
 /// request execution (serve mode only).
 pub fn enable() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    ALLOC_TOTAL.with(|n| n.set(0));
     OLD_LOG.with(|c| c.borrow_mut().clear());
     OLD_SET.with(|c| c.borrow_mut().clear());
     NEXT_SWEEP.with(|c| c.set(incremental_threshold()));
@@ -247,6 +254,13 @@ pub fn disable_and_clear() {
 pub fn log_len() -> Option<usize> {
     ALLOC_LOG.with(|c| c.borrow().as_ref().map(|v| v.len()))
         .map(|n| n + OLD_LOG.with(|c| c.borrow().len()))
+}
+
+/// Tracked containers allocated by the request running on this thread, counted
+/// from `enable()` and never reduced by a sweep or the log cap. See `ALLOC_TOTAL`.
+#[inline]
+pub fn alloc_total() -> u64 {
+    ALLOC_TOTAL.with(|n| n.get())
 }
 
 /// Composition of this thread's allocation log by container type
@@ -371,6 +385,7 @@ pub fn collect_ready_deferred() -> usize {
 
 #[inline]
 fn log_push(t: TrackedAlloc) {
+    ALLOC_TOTAL.with(|n| n.set(n.get().wrapping_add(1)));
     ALLOC_LOG.with(|c| {
         let mut b = c.borrow_mut();
         if let Some(v) = b.as_mut() {
@@ -1137,6 +1152,11 @@ pub fn collect_incremental() -> usize {
         }
     });
     let Some(young) = young else { return 0 };
+    // A sweep is the natural moment to tell `mem_guard` how much this request has
+    // allocated: it happens every `base` allocations regardless of what the
+    // request is doing, so the `--max-memory` watchdog sees a fresh odometer for
+    // every in-flight request without anything being published from the hot path.
+    crate::mem_guard::publish_progress();
     let t0 = std::time::Instant::now();
     // GENERATIONAL. A minor sweep runs trial deletion over the YOUNG entries
     // only (allocated since the last sweep); a node still owned from outside

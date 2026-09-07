@@ -2307,3 +2307,63 @@ on live growth, so mid-request retention of old cyclic garbage is bounded by
 Tests: `crates/cfml-common` `incremental_tests` (minor reclaims young cycles,
 promoted survivor reclaimed by a forced major, major budget backs off, duplicates
 carried once, compaction, relog de-dup).
+
+## 85. `--max-memory` hard tier: abort the in-flight request that is taking the process over (v0.653.12) 📌
+
+**The gap.** §79 shipped the soft tier: above 85% of the limit, new requests get
+503 + `Retry-After` and the server sheds. That protects against a rising tide of
+ordinary traffic, but not against the case the limit exists for — ONE request
+allocating without bound. Nothing arrives to be refused, and the request already
+inside runs until the OOM killer takes the process, and every other request with
+it. Measured on the fixture: with the hard tier disabled, a request building
+structs in a loop reached **6.9 GB** and was still going 125 s later.
+
+**The design.** A watchdog thread polls the footprint every 250 ms. Above 95% of
+the limit it asks `cfml_common::mem_guard` for a victim: the in-flight request
+with the largest allocation odometer. That request's next poll returns an
+uncatchable error — the same class as `requestTimeout`, so a framework's
+`catch( any )` cannot swallow it and let the heap keep filling — and every other
+request continues.
+
+- **Odometer.** A thread-local counter of tracked containers, bumped where the
+  cycle collector already logs allocations, published to the request's registry
+  slot at each poll point. Not bytes: bytes-per-request would need allocator
+  instrumentation on the hot path, and "which request built the containers" is
+  the question that actually identifies a runaway.
+- **Poll points.** Every user-function frame entry, plus the blocking boundaries
+  the request timeout uses. Frame entry costs one relaxed atomic load when no
+  limit is configured. A tight loop calling no function is not interruptible —
+  the same documented gap as `requestTimeout`.
+- **95%, not 100%.** The abort itself has to run: build an error, a stack trace,
+  a response. And a runaway can allocate a lot in one 250 ms tick.
+- **500, not 503.** A runaway request must not be retried elsewhere.
+
+**It never aborts an innocent request.** Only requests over a floor of 100,000
+tracked containers are eligible. Memory held by the application scope, the
+caches, or the allocator (§83: a Preside reload leaves a plateau of ~1.6× live
+data) belongs to no request; killing one would lose work and free nothing. When
+nothing clears the floor the watchdog logs that and sheds instead. The regression
+test for this is the §79 hog: it holds 600 MB of *strings* in two containers, so
+it takes the process over the hard line while staying far below the floor, and it
+must finish normally.
+
+**One trap worth recording.** The odometer was first published from the
+collector's incremental sweep, on the reasoning that it runs at a predictable
+allocation interval. It does not: that sweep runs at *component construction*
+(§25), so a request building plain structs and arrays never published, its
+odometer stayed at zero, and the watchdog could not tell it from an innocent
+request — the 6.9 GB run above is exactly that bug. Publishing moved to the frame
+-entry poll.
+
+**Measured.** Preside warm render, interleaved A/B against v0.653.11, six rounds
+of 40, all 200s: 6.01–7.12 ms vs 6.05–6.87 ms, medians 6.20 vs 6.28 — the
+frame-entry poll costs nothing measurable. CFML suite 8827/8827 CLI and
+8940/8940 served in both modes; workspace 88 suites; cfml-vm 312.
+
+Tests: `crates/cli/tests/max_memory.rs` — the runaway is aborted and the server
+still serves (verified non-vacuous: with `HARD_FRACTION` raised so the tier never
+fires, the request reaches 6.9 GB and the test fails at the client read timeout);
+a request that did not build the heap is not aborted; the soft tier's 503 and
+reopen. Unit tests in `crates/cfml-common/src/mem_guard.rs` cover victim
+selection, the floor, one-victim-at-a-time, and that an abort is visible only to
+the request it was armed on.

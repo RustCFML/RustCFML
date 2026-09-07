@@ -178,6 +178,13 @@ const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 /// `is_request_timeout_error`.
 const REQUEST_TIMEOUT_ERROR_TYPE: &str = "requesttimeout";
 
+/// `CfmlValue::Custom` tag marking the `--max-memory` hard-tier abort: this
+/// request was the largest allocator when the process crossed its memory
+/// ceiling. Uncatchable for the same reason as the timeout above — a framework's
+/// `catch( any )` swallowing it would let the request that is filling the heap
+/// carry on filling it. See `cfml_common::mem_guard`.
+const MEMORY_ABORT_ERROR_TYPE: &str = "memorylimit";
+
 /// Reserved `locals` key under which a frame's `arguments` scope is stored.
 /// CFML keeps `local` and `arguments` as fully independent scopes (Lucee and
 /// BoxLang both back them with separate scope objects), so the scope must NOT
@@ -6406,8 +6413,15 @@ impl CfmlVirtualMachine {
             // An abort/redirect inside onError means onError deliberately took
             // over the response, so it counts as handled. A requestTimeout does
             // NOT — the request is over, and reporting it as handled would let
-            // the remaining lifecycle run on past its own deadline (§3).
-            Err(oe) if Self::is_request_timeout_error(&oe) => Err(oe),
+            // the remaining lifecycle run on past its own deadline (§3). The
+            // `--max-memory` abort is the same case and for a sharper reason:
+            // letting the lifecycle continue would let the request that is
+            // filling the heap carry on filling it (§85).
+            Err(oe)
+                if Self::is_request_timeout_error(&oe) || Self::is_memory_abort_error(&oe) =>
+            {
+                Err(oe)
+            }
             Err(oe) if Self::is_control_flow_error(&oe) => Ok(CfmlValue::Null),
             Err(oe) => Err(oe),
         }
@@ -6424,6 +6438,13 @@ impl CfmlVirtualMachine {
         e.message == "__cfabort"
             || e.message == "__cflocation_redirect"
             || Self::is_request_timeout_error(e)
+            || Self::is_memory_abort_error(e)
+    }
+
+    /// The `--max-memory` hard-tier abort (docs/known-issues.md §85).
+    #[inline]
+    pub fn is_memory_abort_error(e: &CfmlError) -> bool {
+        matches!(&e.error_type, CfmlErrorType::Custom(t) if t == MEMORY_ABORT_ERROR_TYPE)
     }
 
     /// The `requestTimeout` abort (docs/known-issues.md §3).
@@ -6526,6 +6547,42 @@ impl CfmlVirtualMachine {
             }
             None => Ok(()),
         }
+    }
+
+    /// Abort if `--max-memory`'s watchdog picked this request as the one taking
+    /// the process over its ceiling (`cfml_common::mem_guard`).
+    ///
+    /// Costs one relaxed atomic load when no limit is configured, which is why it
+    /// can sit at frame entry. Polled at the points a runaway allocator must pass
+    /// through: every user-function frame and the blocking boundaries the request
+    /// timeout also fires at.
+    ///
+    /// Frame entry is also where this request PUBLISHES its allocation odometer
+    /// for the watchdog to compare. Publishing from the collector's sweep alone
+    /// was not enough: the sweep runs at component construction, so a request
+    /// building plain structs and arrays in a loop never published, its odometer
+    /// stayed at zero, and the watchdog could not tell it apart from an innocent
+    /// request (it ran to 6.9 GB in the test that caught this).
+    #[inline]
+    fn check_memory_abort(&self) -> Result<(), CfmlError> {
+        if !cfml_common::mem_guard::checkpoint() {
+            return Ok(());
+        }
+        let (in_flight, largest) = cfml_common::mem_guard::census();
+        let mut err = CfmlError::new(
+            format!(
+                "Request [{}] was stopped: the process reached its configured memory \
+                 limit (--max-memory) and this request was the largest allocator \
+                 ({} tracked containers, {} request(s) in flight). Other requests were \
+                 left running.",
+                self.source_file.clone().unwrap_or_else(|| "unknown".to_string()),
+                largest,
+                in_flight
+            ),
+            CfmlErrorType::Custom(MEMORY_ABORT_ERROR_TYPE.to_string()),
+        );
+        err.stack_trace = self.build_stack_trace();
+        Err(err)
     }
 
     fn wrap_error(&self, mut err: CfmlError) -> CfmlError {
@@ -7161,6 +7218,10 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         #[cfg(feature = "call-phases")]
         let _cp_wrap = std::time::Instant::now();
+        // `--max-memory` hard tier. Frame entry is the poll point a runaway
+        // allocator cannot avoid for long, and it costs one relaxed atomic load
+        // against a ~1.3us frame when no limit is configured. See §85.
+        self.check_memory_abort()?;
         let call_depth_before = self.call_stack.len();
         let frame_ctx_before = self.frame_ctx.len();
         // GH #351 — restored unconditionally in the epilogue below, so the flag
@@ -16644,6 +16705,7 @@ impl CfmlVirtualMachine {
                     let mut slept = 0i64;
                     while slept < total_ms {
                         self.check_request_timeout()?;
+                        self.check_memory_abort()?;
                         let slice = SLICE_MS.min(total_ms - slept);
                         std::thread::sleep(std::time::Duration::from_millis(slice as u64));
                         slept += slice;
@@ -16651,6 +16713,7 @@ impl CfmlVirtualMachine {
                     // A sleep that exactly consumed the remaining budget must
                     // still abort rather than returning successfully.
                     self.check_request_timeout()?;
+                    self.check_memory_abort()?;
                     return Ok(CfmlValue::Null);
                 }
                 "gettimezone" => {
@@ -18423,6 +18486,7 @@ impl CfmlVirtualMachine {
                 "queryexecute" => {
                     // Blocking boundary — see the cfhttp note above (§3).
                     self.check_request_timeout()?;
+                    self.check_memory_abort()?;
                     let mut args = args;
                     // cfquery routes its name=/result= attributes through the
                     // options struct — they can only be known at runtime
@@ -18903,6 +18967,7 @@ impl CfmlVirtualMachine {
                     // call already in flight — that would need the remaining
                     // budget pushed into the HTTP client's own timeout.
                     self.check_request_timeout()?;
+                    self.check_memory_abort()?;
                     // `name=` (parse the response body into a query) and
                     // `file=`/`path=` (write the body to disk) are honoured HERE
                     // rather than inside `fn_cfhttp` because both need caller

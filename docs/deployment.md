@@ -25,13 +25,50 @@ rustcfml --serve ./mywebroot --production --max-memory auto   # 75% of the cgrou
 RUSTCFML_MAX_MEMORY=1.5G rustcfml --serve ./mywebroot --production
 ```
 
-Above **85%** of the limit the server stops admitting new requests — they get
+It measures real physical footprint: cgroup `memory.current` inside a container,
+the process's resident footprint otherwise, and enforces the limit in two tiers.
+
+**At 85% — back-pressure.** The server stops admitting new requests: they get
 **503 + `Retry-After: 2`**, which a load balancer or orchestrator treats as
-back-pressure rather than a failure — while it sheds (a cycle-collector sweep and
-a return of retained allocator pages) and lets in-flight requests finish.
-Admission reopens once the footprint is back under. It measures real physical
-footprint: cgroup `memory.current` inside a container, the process's resident
-footprint otherwise.
+back-pressure rather than a failure. Meanwhile it sheds (a cycle-collector sweep
+and a return of retained allocator pages) and lets in-flight requests finish.
+Admission reopens once the footprint is back under.
+
+**At 95% — abort the runaway.** Back-pressure cannot help against the case the
+limit is really for: one request allocating without bound. Nothing new arrives to
+be refused, and the request already inside runs until the OOM killer takes the
+whole process down. So a watchdog aborts **the in-flight request that has
+allocated the most**, with an error its own `try/catch` cannot swallow. Every
+other request keeps running, and the server keeps serving.
+
+The aborted client gets a plain **500** — deliberately not a 503, because a
+runaway request should not be retried elsewhere — and the reason goes to the
+server log, naming the request and the evidence:
+
+```
+[max-memory] footprint 684M is over the hard limit 665M of 700M — aborting
+request #2 [/app/report.cfm], the largest allocator (499915 tracked containers).
+Other requests continue.
+```
+
+**It will not abort a request that did not build the heap.** A request is only
+eligible once it has itself allocated more than 100,000 tracked containers. When
+memory is held by the application scope, the caches, or the allocator's retained
+pages, no request is responsible, killing one would free nothing, and the log
+says so instead:
+
+```
+[max-memory] footprint 765M is over the hard limit 475M of 500M, but none of the
+1 in-flight request(s) has allocated enough to be responsible — the memory is
+held by the application, the caches or the allocator. Not aborting anything;
+shedding instead.
+```
+
+The abort is polled at every user-function call and at the blocking boundaries
+(`sleep`, `cfhttp`, `queryExecute`), so a runaway is normally stopped within a
+watchdog tick. A request that allocates in a tight loop calling no function of
+its own is the exception — the same gap `requestTimeout` has, and for the same
+reason.
 
 **Sizing.** Size for roughly **twice the steady-state footprint**. Two things
 need the headroom: for ~15 s after a `?fwreinit=true`-style reload two

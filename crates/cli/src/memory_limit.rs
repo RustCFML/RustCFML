@@ -20,9 +20,16 @@
 //! normally; admission reopens the moment the footprint is back under. Shedding
 //! is rate-limited so a sustained overload does not turn into a sweep storm.
 //!
-//! Not here (yet): the hard tier — aborting the in-flight request that has
-//! allocated the most since it started. That needs the per-request accounting
-//! wired to the abort path and gets its own pass.
+//! The hard tier ([`cfml_common::mem_guard`], armed from here). The soft tier
+//! cannot help against the case it was really built for: ONE request that
+//! allocates without bound. Nothing new arrives to be refused, and the request
+//! already inside runs until the OOM killer takes the whole process down. So a
+//! watchdog thread polls the footprint, and above `hard` (95% of the limit) it
+//! aborts the in-flight request that has allocated the most — with an
+//! uncatchable error, like `requestTimeout` — leaving every other request
+//! running. It never aborts a request that has not itself built the heap: when
+//! the memory belongs to the application scope or the allocator, no request is
+//! responsible and only the soft tier applies.
 //!
 //! `auto` reads the cgroup limit (v2 `memory.max`, v1 `memory.limit_in_bytes`)
 //! and takes 75% of it, so a containerised deployment gets the right behaviour
@@ -45,6 +52,15 @@ const SHED_INTERVAL: Duration = Duration::from_secs(2);
 const REOPEN_FRACTION: f64 = 0.95;
 /// `Retry-After` handed to refused requests, in seconds.
 pub const RETRY_AFTER_SECS: u32 = 2;
+/// Fraction of the limit at which the hard tier aborts the largest in-flight
+/// allocator. Below the ceiling the operator named, so the abort itself — an
+/// error value, a stack trace, a response — has room to run, and above the soft
+/// line so back-pressure is always tried first.
+const HARD_FRACTION: f64 = 0.95;
+/// How often the watchdog reads the footprint. A runaway request can allocate a
+/// lot in 250ms, which is why `hard` leaves 5% of headroom; polling faster costs
+/// a syscall per tick for no benefit on a process that is not in trouble.
+const WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A configured limit. `max` is the hard ceiling the operator named; `soft` is
 /// where admission closes.
@@ -52,6 +68,8 @@ pub const RETRY_AFTER_SECS: u32 = 2;
 pub struct MemoryLimit {
     pub max: u64,
     pub soft: u64,
+    /// Where the hard tier aborts the largest in-flight allocator.
+    pub hard: u64,
 }
 
 impl MemoryLimit {
@@ -59,6 +77,7 @@ impl MemoryLimit {
         Self {
             max,
             soft: (max as f64 * SOFT_FRACTION) as u64,
+            hard: (max as f64 * HARD_FRACTION) as u64,
         }
     }
 }
@@ -346,6 +365,12 @@ impl Enforcer {
 
     /// One shed pass, rate-limited: sweep the collector's cross-request set,
     /// then return retained pages.
+    /// Shed from outside the request path (the watchdog). Rate-limited exactly
+    /// like the request-path shed it delegates to.
+    pub fn shed_now(&self) {
+        self.shed();
+    }
+
     fn shed(&self) {
         let now = self.epoch.elapsed().as_millis() as u64;
         let last = self.last_shed_ms.load(Ordering::Relaxed);
@@ -381,7 +406,65 @@ static ENFORCER: std::sync::OnceLock<Enforcer> = std::sync::OnceLock::new();
 
 /// Install the limit for this process. Later calls are ignored (first wins).
 pub fn install(limit: MemoryLimit) {
-    let _ = ENFORCER.set(Enforcer::new(limit));
+    if ENFORCER.set(Enforcer::new(limit)).is_err() {
+        return;
+    }
+    cfml_common::mem_guard::enable();
+    start_watchdog(limit);
+}
+
+/// The hard tier's watchdog: poll the footprint, and above `hard` abort the
+/// in-flight request that has allocated the most.
+///
+/// A thread rather than a check on the request path, because the request that
+/// needs stopping is by definition not returning: nothing on the serving path
+/// runs while it allocates. It exits with the process.
+fn start_watchdog(limit: MemoryLimit) {
+    std::thread::Builder::new()
+        .name("rustcfml-memory-watchdog".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(WATCHDOG_INTERVAL);
+            let Some(fp) = footprint_bytes() else { continue };
+            if fp < limit.hard {
+                cfml_common::mem_guard::set_pressure(false);
+                continue;
+            }
+            // Order matters: make the abort visible before arming, so the victim
+            // cannot miss its own flag by polling between the two stores.
+            cfml_common::mem_guard::set_pressure(true);
+            match cfml_common::mem_guard::arm_victim() {
+                cfml_common::mem_guard::Victim::Armed(id, label, allocs) => {
+                    eprintln!(
+                        "[max-memory] footprint {} is over the hard limit {} of {} — \
+                         aborting request #{} [{}], the largest allocator ({} tracked \
+                         containers). Other requests continue.",
+                        human(fp),
+                        human(limit.hard),
+                        human(limit.max),
+                        id,
+                        label,
+                        allocs
+                    );
+                }
+                cfml_common::mem_guard::Victim::NoneResponsible { in_flight } => {
+                    eprintln!(
+                        "[max-memory] footprint {} is over the hard limit {} of {}, but \
+                         none of the {} in-flight request(s) has allocated enough to be \
+                         responsible — the memory is held by the application, the caches \
+                         or the allocator. Not aborting anything; shedding instead.",
+                        human(fp),
+                        human(limit.hard),
+                        human(limit.max),
+                        in_flight
+                    );
+                    if let Some(e) = enforcer() {
+                        e.shed_now();
+                    }
+                }
+                cfml_common::mem_guard::Victim::AlreadyArmed => {}
+            }
+        })
+        .ok();
 }
 
 /// The installed enforcer, if `--max-memory` was given.
