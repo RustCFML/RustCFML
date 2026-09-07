@@ -68,8 +68,18 @@ assert("leading dot", fmt(".5.3"), "ERR");
 assert("letters", fmt("a.b.c"), "ERR");
 assert("version suffix", fmt("5.3.2-RC1"), "ERR");
 
-// A plain decimal is still a number, not a date: two components, not three.
-assert("5.3 is not a date", isDate("5.3"), false);
+// NOTE - an OPEN divergence, deliberately not asserted here because the two
+// engines disagree and it is not what GH #411 reported. Lucee also parses the
+// TWO-component dotted form as M.D with the current year implied:
+//
+//   Lucee 7.1.0:  isDate("5.3") true  -> 2026-05-03
+//                 isDate("1.5") true  -> 2026-01-05
+//   RustCFML:     isDate("5.3") false
+//
+// This predates the three-component work above and is unchanged by it. It is a
+// wider behavioural change than the reported case (two-component decimals are
+// far more common in real data than version triples), so it is left for a
+// separate decision rather than folded in here.
 
 // isNumeric() is NOT affected — it is false for "5.3.2" on BOTH engines. Only
 // the `numeric` TYPE CHECK (and isValid) take the date fallback.
