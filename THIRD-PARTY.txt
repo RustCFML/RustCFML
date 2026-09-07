@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 578 crate(s)
+  MIT License (MIT) — 579 crate(s)
   Apache License 2.0 (Apache-2.0) — 39 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -345,6 +345,7 @@ Dependencies
   des 0.8.1 — https://github.com/RustCrypto/block-ciphers
 [MIT]
   aligned 0.4.3 — https://github.com/rust-embedded-community/aligned
+  cty 0.2.2 — https://github.com/japaric/cty
 [MIT]
   enumflags2_derive 0.7.12 — https://github.com/meithecatte/enumflags2
 [MIT]
@@ -6001,6 +6002,7 @@ MIT License (MIT)
 
 Applies to:
   - aligned 0.4.3
+  - cty 0.2.2
 ================================================================================
 
 Copyright (c) 2017 Jorge Aparicio
