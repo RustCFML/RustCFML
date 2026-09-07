@@ -76,3 +76,74 @@ assert("clearProperty cleared the key",
 
 suiteEnd();
 </cfscript>
+
+<!---
+  GitHub #412: `var osInfo = System.getProperties()` left osInfo UNDEFINED with
+  nothing thrown, because the shim had no `getproperties` arm and the resulting
+  fall-through dispatch produced a silent null. Two fixes, both asserted below:
+  the method now exists and returns a java.util.Properties MAP, and an
+  unhandled method on a shimmed class now THROWS instead of yielding null (the
+  java-shim instalment of the GH #307 silent-no-op class).
+
+  Also asserted: the three property surfaces agree. They are now built from one
+  table in java_shims.rs; before, `System.getProperty` knew five keys where
+  `server.system.properties` knew eleven and disagreed with it on two of them.
+--->
+<cfscript>
+suiteBegin("java.lang.System.getProperties and unhandled-shim errors (GitHub 412)");
+
+sysP = createObject("java", "java.lang.System");
+
+// 1. The reported repro: the assignment must actually bind.
+function getPropsIsDefined() {
+    var osInfo = createObject("java","java.lang.System").getProperties();
+    return isDefined("osInfo");
+}
+assert("getProperties() assigns to a local", getPropsIsDefined(), true);
+
+props = sysP.getProperties();
+assert("getProperties returns a struct", isStruct(props), true);
+
+// 2. It is a MAP shim, so java.util.Map members dispatch on the result. A plain
+//    struct would fail every one of these.
+assert("map get() works", props.get("os.name"), props["os.name"]);
+assert("map getProperty() works", props.getProperty("os.name"), props["os.name"]);
+assert("map containsKey() works", props.containsKey("user.home"), true);
+
+// 3. os.name is the JVM spelling, not Rust's `std::env::consts::OS`. Real code
+//    string-matches the JVM value ("Mac OS", "Windows", "Linux"); "macos" can
+//    never match it. Assert the SHAPE rather than a platform, so this holds on
+//    every CI runner: the first letter is capitalised on every JVM os.name.
+osName = props["os.name"];
+assert("os.name is non-empty", len(osName) GT 0, true);
+assert("os.name is JVM-cased, not lowercase rust", osName, ucFirst(osName));
+
+// 4. All three surfaces must agree — they are one table now.
+assert("getProperties agrees with getProperty", props["os.name"], sysP.getProperty("os.name"));
+assert("getProperties agrees with server scope", props["os.name"], server.os.name);
+assert("server.system.properties agrees too", props["os.name"], server.system.properties["os.name"]);
+assert("file.encoding present in all", props["file.encoding"], server.system.properties["file.encoding"]);
+
+// 5. A runtime setProperty value shows up in the map and wins over a default.
+sysP.setProperty("probe.key.412", "visible");
+assert("setProperty value appears in getProperties",
+       createObject("java","java.lang.System").getProperties()["probe.key.412"], "visible");
+
+// 6. An unhandled method on a SHIMMED class throws rather than returning null.
+//    This is the whole point: a silent null is what made #412 surface far from
+//    its cause, as "Variable 'osInfo' is undefined" pointing at innocent code.
+threwUnhandled = false;
+try {
+    sysP.totallyBogusMethodName412();
+} catch (any e) {
+    threwUnhandled = true;
+}
+assert("unhandled shim method throws", threwUnhandled, true);
+
+// 7. lineSeparator() — a real java.lang.System method that the silent null had
+//    been hiding. Same value as the line.separator property.
+assert("lineSeparator matches the property",
+       sysP.lineSeparator(), sysP.getProperty("line.separator"));
+
+suiteEnd();
+</cfscript>

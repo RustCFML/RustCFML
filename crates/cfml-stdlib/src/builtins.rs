@@ -4463,7 +4463,29 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             // a struct/array/query/component is not a valid string (TestBox
             // notTypeOf("string", this)). Was unconditionally true.
             "string" => fn_is_simple_value(vec![value.clone()]),
-            "numeric" | "float" | "double" => fn_is_numeric(vec![value.clone()]),
+            // `float` is STRICT — only a real number. `numeric` and `double`
+            // additionally accept a date written in digits and separators,
+            // because Lucee's numeric cast falls back to a date cast (GH #411).
+            // Measured on Lucee 7.1.0:
+            //   isValid("numeric","5.3.2")      true   (3 May 2002)
+            //   isValid("double", "2026-08-25") true
+            //   isValid("float",  "5.3.2")      FALSE
+            //   isValid("numeric","Jan 5, 2020") FALSE  <- a month NAME does not
+            //                                              participate, though
+            //                                              isDate() is true
+            // Note isNumeric("5.3.2") stays FALSE on both engines; only isValid
+            // and the declared-type check take the fallback.
+            "float" => fn_is_numeric(vec![value.clone()]),
+            "numeric" | "double" => {
+                let numeric = matches!(
+                    fn_is_numeric(vec![value.clone()]),
+                    Ok(CfmlValue::Bool(true))
+                );
+                let s = value.as_string();
+                let date_shaped = !s.chars().any(|c| c.is_alphabetic())
+                    && matches!(fn_is_date(vec![value.clone()]), Ok(CfmlValue::Bool(true)));
+                Ok(CfmlValue::Bool(numeric || date_shaped))
+            }
             "integer" => {
                 let s = value.as_string();
                 Ok(CfmlValue::Bool(s.trim().parse::<i64>().is_ok()))
@@ -5009,6 +5031,90 @@ pub(crate) fn parse_datetime_to_epoch_secs(s: &str) -> Option<i64> {
     }
 }
 
+/// Expand a bare year the way Lucee's date parser does: a value below 100 is a
+/// two-digit year in the fixed window **1930–2029**.
+///
+/// Probed on Lucee 7.1.0 — `1.1.29` → 2029 but `1.1.30` → 1930, `1.1.00` → 2000,
+/// `1.1.99` → 1999. Note this is a FIXED window, not the JDK's default
+/// "80 years before now" sliding one (which in 2026 would put the break at 1946
+/// and read `30` as 2030). Three-or-more-digit values are literal years, so
+/// `1.1.026` is 2026 and `1.1.2020` is 2020.
+fn expand_two_digit_year(y: i32) -> i32 {
+    match y {
+        0..=29 => 2000 + y,
+        30..=99 => 1900 + y,
+        other => other,
+    }
+}
+
+/// Parse Lucee's dot-separated date forms: `A.B.C`, optionally followed by a
+/// time (`5.3.2 10:30:00`).
+///
+/// Which of A/B/C is the day, month and year is decided positionally, exactly as
+/// Lucee decides it — verified against Lucee 7.1.0 across 35 probes:
+///
+/// | input | Lucee | rule |
+/// |---|---|---|
+/// | `2020.11.5` | 2020-11-05 | A is a full year → Y.M.D |
+/// | `31.12.2020` | 2020-12-31 | A can't be a month, C is a full year → D.M.Y |
+/// | `13.1.2` | 2013-01-02 | A can't be a month, C isn't a year → Y.M.D |
+/// | `5.3.2` | 2002-05-03 | A could be a month → **M.D.Y** |
+/// | `10.20.30` | 1930-10-20 | M.D.Y, and `30` is 1930 |
+/// | `0.1.2` | rejected | month 0 — the M.D.Y reading is the ONLY one tried |
+///
+/// The last row is the subtle one and the reason this is not simply "try every
+/// ordering": `0.1.2` would parse fine as Y.M.D (2000-01-02), and Lucee still
+/// rejects it. A component that *could* be a month commits the string to M.D.Y,
+/// pass or fail. Getting that wrong would make us accept dates Lucee refuses,
+/// which for GH #411 means accepting a `numeric` argument Lucee rejects.
+///
+/// This is how `numeric` accepts `"5.3.2"`: Lucee's `numeric` cast falls back to
+/// a date cast, and `5.3.2` is 3 May 2002. It is not a version-string rule — the
+/// acceptance set tracks date validity exactly, leap years included (`2.29.2004`
+/// passes, `2.29.2005` does not).
+fn parse_dotted_date(s: &str) -> Option<NaiveDateTime> {
+    let (date_part, time_part) = match s.split_once(char::is_whitespace) {
+        Some((d, t)) => (d, t.trim()),
+        None => (s, ""),
+    };
+
+    let mut parts = date_part.split('.');
+    let (a, b, c) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None; // four or more components is not a date on either engine
+    }
+    // Digits only: no signs, no exponents, no empty components. This is what
+    // keeps `1.2.3.4`, `-1.2.3`, `5..3` and `a.b.c` out.
+    if [a, b, c].iter().any(|p| p.is_empty() || !p.bytes().all(|ch| ch.is_ascii_digit())) {
+        return None;
+    }
+    let (a, b, c): (i32, i32, i32) = (a.parse().ok()?, b.parse().ok()?, c.parse().ok()?);
+
+    let (year, month, day) = if a >= 100 {
+        (a, b, c)
+    } else if a > 12 {
+        if c >= 100 { (c, b, a) } else { (a, b, c) }
+    } else {
+        (c, a, b)
+    };
+
+    let date = NaiveDate::from_ymd_opt(
+        expand_two_digit_year(year),
+        u32::try_from(month).ok()?,
+        u32::try_from(day).ok()?,
+    )?;
+
+    if time_part.is_empty() {
+        return date.and_hms_opt(0, 0, 0);
+    }
+    for fmt in &["%H:%M:%S", "%I:%M:%S %p", "%H:%M", "%I:%M %p"] {
+        if let Ok(t) = NaiveTime::parse_from_str(time_part, fmt) {
+            return Some(date.and_time(t));
+        }
+    }
+    None
+}
+
 fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
     let s = s.trim();
     if s.is_empty() { return None; }
@@ -5096,6 +5202,12 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
             return d.and_hms_opt(0, 0, 0);
         }
+    }
+
+    // Dot-separated dates — `5.3.2`, `31.12.2020`, `2020.11.5`, with an optional
+    // trailing time. Lucee parses these; we rejected them outright (GH #411).
+    if let Some(dt) = parse_dotted_date(s) {
+        return Some(dt);
     }
 
     // Time-only → base date 2000-01-01

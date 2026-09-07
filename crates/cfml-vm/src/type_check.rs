@@ -186,6 +186,29 @@ fn is_xml_value(value: &CfmlValue) -> bool {
 /// whitespace is trimmed), `"+5"`, `"-5"`, `".5"` and `"1e3"` pass while `""`,
 /// `"  "`, `"1,000"`, `"0x10"`, `"5px"`, `"inf"` and `"NaN"` do not — the last
 /// two being why `str::parse::<f64>()` alone will not do.
+/// Lucee's `numeric` cast falls back to a DATE cast — but only for a date
+/// written in digits and separators.
+///
+/// Probed on Lucee 7.1.0, declared `function f( numeric n )`:
+///
+/// | value | Lucee | isDate |
+/// |---|---|---|
+/// | `"5.3.2"` | accepted | true |
+/// | `"2026-08-25"` | accepted | true |
+/// | `"10:30:00"` | accepted | true |
+/// | `"Jan 5, 2020"` | **rejected** | true |
+///
+/// So "is it a date" is necessary but not sufficient: a month NAME is reached by
+/// a different parser in Lucee and never participates in the numeric cast. The
+/// letter test is what separates the last row from the other three, and without
+/// it we would accept a value Lucee rejects.
+///
+/// `1e3` and other exponent forms never reach here — `numeric_string` has
+/// already claimed them.
+fn date_shaped_number(s: &str, value: &CfmlValue, env: &Env<'_>) -> bool {
+    !s.chars().any(|c| c.is_alphabetic()) && env.is_valid("date", value)
+}
+
 fn numeric_string(s: &str) -> bool {
     let s = s.trim();
     let bytes = s.as_bytes();
@@ -303,7 +326,15 @@ pub fn satisfies(value: &CfmlValue, declared: &str, env: &Env<'_>) -> bool {
             CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::TimeSpan(_) => true,
             // A boolean IS numeric to Lucee (true -> 1).
             CfmlValue::Bool(_) => true,
-            CfmlValue::String(s) => numeric_string(s),
+            // ...and so is a DATE, because Lucee's numeric cast falls back to a
+            // date cast and a date has a numeric value. This is the mirror of
+            // the `Target::DateTime` arm below, and it is why Lucee accepts
+            // `function f( numeric v )` called with `"5.3.2"` (GH #411): that
+            // string is 3 May 2002, not a tolerated version number. The
+            // acceptance set tracks date validity exactly — `2.29.2004` passes
+            // and `2.29.2005` does not — which is only reproducible by asking
+            // the date parser, never by pattern-matching the dots.
+            CfmlValue::String(s) => numeric_string(s) || date_shaped_number(s, value, env),
             _ => false,
         },
         Target::Boolean => match value {

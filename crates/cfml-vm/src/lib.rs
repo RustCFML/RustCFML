@@ -889,7 +889,7 @@ pub fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
 /// seeded, so a single `uname -r` on unix is cheap. Returns "" when the value
 /// cannot be determined (wasm, non-unix, or the command failing) — the key still
 /// exists, which is what unguarded consumers like Masa's admin nav require.
-fn os_version_string() -> String {
+pub(crate) fn os_version_string() -> String {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     {
         std::process::Command::new("uname")
@@ -1023,10 +1023,10 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     info.insert("railo".to_string(), CfmlValue::strukt_untracked(lucee));
 
     let mut os = ValueMap::default();
-    os.insert(
-        "name".to_string(),
-        CfmlValue::string(std::env::consts::OS.to_string()),
-    );
+    // JVM spelling ("Mac OS X"), not Rust's ("macos") — see `java_shims::os_name`.
+    // `server.os.name` is what portable CFML string-matches against, and Lucee
+    // reports the JVM value here.
+    os.insert("name".to_string(), CfmlValue::string(crate::java_shims::os_name()));
     os.insert(
         "arch".to_string(),
         CfmlValue::string(std::env::consts::ARCH.to_string()),
@@ -1078,40 +1078,12 @@ fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     }
     system.insert("environment".to_string(), CfmlValue::strukt_untracked(env));
 
+    // Built from the same table as `System.getProperty`/`getProperties` so the
+    // three surfaces cannot drift apart again — they had (GH #412).
     let mut props = ValueMap::default();
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_default();
-    let tmp = std::env::temp_dir().to_string_lossy().to_string();
-    props.insert(
-        "os.name".to_string(),
-        CfmlValue::string(std::env::consts::OS.to_string()),
-    );
-    props.insert(
-        "os.arch".to_string(),
-        CfmlValue::string(std::env::consts::ARCH.to_string()),
-    );
-    props.insert(
-        "os.version".to_string(),
-        CfmlValue::string(os_version_string()),
-    );
-    props.insert("user.dir".to_string(), CfmlValue::string(cwd));
-    props.insert("user.home".to_string(), CfmlValue::string(home));
-    props.insert("user.name".to_string(), CfmlValue::string(user));
-    props.insert("java.io.tmpdir".to_string(), CfmlValue::string(tmp));
-    props.insert("file.separator".to_string(), CfmlValue::string(file_sep));
-    props.insert("path.separator".to_string(), CfmlValue::string(path_sep));
-    props.insert("line.separator".to_string(), CfmlValue::string(line_sep));
-    props.insert(
-        "file.encoding".to_string(),
-        CfmlValue::string("UTF-8".to_string()),
-    );
+    for (k, v) in crate::java_shims::system_property_defaults() {
+        props.insert(k, CfmlValue::string(v));
+    }
     system.insert("properties".to_string(), CfmlValue::strukt_untracked(props));
 
     let args: Vec<CfmlValue> = std::env::args()
@@ -8058,10 +8030,22 @@ impl CfmlVirtualMachine {
         // default satisfies it (Lucee/ACF/BoxLang treat the contradictory
         // `required` as effectively ignored; TestBox's TestResult.cfc relies on
         // `required count = 1`). The default-application preamble then fills it.
+        //
+        // "Omitted" must be tested exactly as the binding loop above tests it: a
+        // slot holding `Null` is NOT supplied. The named-argument rebinder pads
+        // omitted slots with `Null` so that later named args land at the right
+        // index, so `args.get(i).is_none()` is only ever true for a positional
+        // call that ran out of arguments. Testing emptiness alone meant a named
+        // call skipped this check entirely — `installPackage( packageID="x" )`
+        // against `function installPackage( required string id )` bound nothing,
+        // raised nothing, and ran the body with `arguments.id` empty (GH #413).
+        // The mismatched label itself is not an error on either engine; it lands
+        // in `arguments` as an extra key. The MISSING REQUIRED PARAM is.
         for (i, param_name) in func.params.iter().enumerate() {
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
+            let supplied = matches!(args.get(i), Some(v) if !matches!(v, CfmlValue::Null));
             if func.required_params.get(i).copied().unwrap_or(false)
-                && args.get(i).is_none()
+                && !supplied
                 && !has_default
             {
                 return Err(self.wrap_error(CfmlError::runtime(format!(
@@ -28338,6 +28322,39 @@ impl CfmlVirtualMachine {
                 );
                 err.stack_trace = self.build_stack_trace();
                 return Err(err);
+            }
+
+            // GH #412 — the java-shim instalment of GH #307 above. A shim struct
+            // reaching here means its handler answered `shim_unhandled` ("not a
+            // method of mine") AND the generic fall-through found no key holding
+            // a function, so nothing in the engine implements this call. Falling
+            // out as `Ok(Null)` made every gap in every shim table a silent
+            // no-op: `System.getProperties()` yielded null, `var osInfo = …`
+            // left `osInfo` undefined, and the failure resurfaced far away as
+            // "Variable 'osInfo' is undefined" pointing at innocent code.
+            //
+            // Throwing names the class and the method, which is the same answer
+            // an unshimmed CLASS already gives ("java.util.ArrayList is not
+            // supported…"). An unimplemented METHOD on a shimmed class was the
+            // one hole left in that contract.
+            //
+            // Deliberately narrower than the plain-struct rule above: only when
+            // the receiver identifies a java class, and only for a call — shim
+            // PROPERTY reads (`system.out`) never reach here.
+            if s.contains_key("__java_shim") {
+                if let Some(CfmlValue::String(cls)) = s.get("__java_class") {
+                    let mut err = CfmlError::new(
+                        format!(
+                            "{}.{}() is not supported: RustCFML shims this class but not \
+                             this method. Open an issue at \
+                             github.com/RustCFML/RustCFML if you need it.",
+                            cls, method
+                        ),
+                        CfmlErrorType::Expression,
+                    );
+                    err.stack_trace = self.build_stack_trace();
+                    return Err(err);
+                }
             }
         }
 

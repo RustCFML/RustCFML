@@ -16,6 +16,95 @@ fn system_property_store(
     PROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// The JVM's `os.name`, not Rust's.
+///
+/// `std::env::consts::OS` is `"macos"`/`"windows"`; a JVM reports `"Mac OS X"`
+/// and `"Windows ..."`, and real code string-matches the JVM spelling —
+/// CommandBox's `preside start` does `FindNoCase( osInfo['os.name'], "Mac OS" )`,
+/// which cannot match `"macos"` however the properties map is populated (GH
+/// #412). Every consumer here is case-insensitive on the words themselves, so
+/// the substring a caller looks for ("Windows", "Mac OS", "Linux") is what
+/// matters, not the exact JVM build suffix.
+pub fn os_name() -> String {
+    match std::env::consts::OS {
+        "macos" => "Mac OS X".to_string(),
+        "linux" => "Linux".to_string(),
+        "windows" => "Windows".to_string(),
+        "freebsd" => "FreeBSD".to_string(),
+        "openbsd" => "OpenBSD".to_string(),
+        "netbsd" => "NetBSD".to_string(),
+        "android" => "Android".to_string(),
+        "ios" => "iOS".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Every system property this engine knows, as `(key, value)` in JVM-ish order.
+///
+/// SINGLE SOURCE OF TRUTH for all three surfaces that expose them:
+/// `server.system.properties`, `java.lang.System.getProperty(k)` and
+/// `java.lang.System.getProperties()`. They used to be built independently and
+/// had silently drifted apart — the `getProperty` shim knew five keys where the
+/// `server` scope knew eleven, disagreed with it on `line.separator` (hardcoded
+/// `"\n"` vs the platform's) and on `java.version`, and had no `os.arch`,
+/// `os.version`, `user.name`, `java.io.tmpdir` or `file.encoding` at all. A
+/// caller therefore got a different answer for the same property depending on
+/// which door it came through.
+///
+/// Values set at runtime by `System.setProperty` are NOT merged here — callers
+/// overlay the store themselves, because the store must win.
+pub fn system_property_defaults() -> Vec<(String, String)> {
+    let file_sep = std::path::MAIN_SEPARATOR.to_string();
+    let path_sep = if cfg!(windows) { ";" } else { ":" }.to_string();
+    let line_sep = if cfg!(windows) { "\r\n" } else { "\n" }.to_string();
+    vec![
+        ("os.name".to_string(), os_name()),
+        ("os.arch".to_string(), std::env::consts::ARCH.to_string()),
+        ("os.version".to_string(), crate::os_version_string()),
+        (
+            "user.dir".to_string(),
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "user.home".to_string(),
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default(),
+        ),
+        (
+            "user.name".to_string(),
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_default(),
+        ),
+        (
+            "java.io.tmpdir".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+        ),
+        ("file.separator".to_string(), file_sep),
+        ("path.separator".to_string(), path_sep),
+        ("line.separator".to_string(), line_sep),
+        ("file.encoding".to_string(), "UTF-8".to_string()),
+    ]
+}
+
+/// One system property, with a `setProperty` override taking precedence over the
+/// built-in default. `None` for a key we do not know — the JVM returns null for
+/// an unset property, and a `""` there flipped portable isNull() save/restore
+/// guards (GitHub #249).
+fn system_property(key: &str) -> Option<String> {
+    if let Some(v) = system_property_store().lock().unwrap().get(key) {
+        return Some(v.clone());
+    }
+    let lower = key.to_lowercase();
+    system_property_defaults()
+        .into_iter()
+        .find(|(k, _)| *k == lower)
+        .map(|(_, v)| v)
+}
+
 /// Max distinct patterns held by [`java_cached_regex`].
 // See `REGEX_CACHE_CAP` in cfml-stdlib for why this is 256 and not 4,096: a
 // compiled `regex::Regex` is up to ~3 MB (one-pass DFA + lazy-DFA cache), so the
@@ -2364,39 +2453,51 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 .filter(|a| !matches!(a, CfmlValue::Struct(s) if s.contains_key("__java_shim")))
                 .collect();
             let key = reals.first().map(|v| v.as_string()).unwrap_or_default();
-            // A previously set property wins over the built-in fallbacks.
-            if let Some(v) = system_property_store().lock().unwrap().get(&key) {
-                return Ok(CfmlValue::string(v.clone()));
-            }
-            let val = match key.to_lowercase().as_str() {
-                "os.name" => std::env::consts::OS.to_string(),
-                "file.separator" => std::path::MAIN_SEPARATOR.to_string(),
-                "path.separator" => {
-                    if cfg!(unix) {
-                        ":".to_string()
-                    } else {
-                        ";".to_string()
-                    }
-                }
-                "line.separator" => "\n".to_string(),
-                "user.dir" => std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                "user.home" => std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .unwrap_or_default(),
-                "java.version" => "rustcfml".to_string(),
+            match system_property(&key) {
+                Some(v) => Ok(CfmlValue::string(v)),
                 // Unset key: the JVM returns null (isNull() true), NOT "" — a
                 // "" flipped portable isNull() save/restore guards (GitHub #249).
                 // A `getProperty(key, default)` 2-arg form returns the default.
-                _ => {
-                    return Ok(reals
-                        .get(1)
-                        .map(|v| CfmlValue::string(v.as_string()))
-                        .unwrap_or(CfmlValue::Null));
-                }
-            };
-            Ok(CfmlValue::string(val))
+                None => Ok(reals
+                    .get(1)
+                    .map(|v| CfmlValue::string(v.as_string()))
+                    .unwrap_or(CfmlValue::Null)),
+            }
+        }
+        // java.lang.System.lineSeparator() — the same value as the
+        // `line.separator` property. Surfaced the moment unhandled shim methods
+        // stopped returning a silent null (GH #412).
+        "lineseparator" => Ok(CfmlValue::string(
+            system_property("line.separator").unwrap_or_else(|| "\n".to_string()),
+        )),
+        "getproperties" => {
+            // `System.getProperties()` returns a `java.util.Properties`, which
+            // IS a Map — so this must be a java.util map shim, not a plain
+            // struct, or member calls on the result (`.getProperty(k)`,
+            // `.containsKey`, `.keySet`) would not dispatch. Exactly the same
+            // reasoning as the no-arg `getenv()` below.
+            //
+            // Without this arm the method fell to `shim_unhandled`, and the
+            // resulting fall-through dispatch produced a SILENT null: `var
+            // osInfo = System.getProperties()` left `osInfo` undefined with
+            // nothing thrown, and every later read of it failed far from the
+            // cause with "Variable 'osInfo' is undefined" (GH #412). That is
+            // what breaks CommandBox's `preside start`.
+            let mut props = ValueMap::default();
+            props.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.util.properties".to_string()),
+            );
+            props.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            for (k, v) in system_property_defaults() {
+                props.insert(k, CfmlValue::string(v));
+            }
+            // Runtime `setProperty` values win over the defaults, and add keys
+            // the engine has no default for.
+            for (k, v) in system_property_store().lock().unwrap().iter() {
+                props.insert(k.clone(), CfmlValue::string(v.clone()));
+            }
+            Ok(CfmlValue::strukt(props))
         }
         "getenv" => {
             // Single-arg form returns the value for that key. No-arg form returns

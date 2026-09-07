@@ -253,6 +253,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_duplicate_deepcopy_flag.cfm">
 <cf_runtest file="stdlib/test_math_functions.cfm">
 <cf_runtest file="stdlib/test_date_functions.cfm">
+<cf_runtest file="stdlib/test_dotted_dates.cfm">
 <cf_runtest file="stdlib/test_timezone.cfm">
 <cf_runtest file="stdlib/test_list_functions.cfm">
 <cf_runtest file="stdlib/test_list_rest_literal_remainder.cfm">
@@ -970,6 +971,7 @@ include "harness.cfm";
 <!--- setting as an empty value and the ORM introspected the wrong (default --->
 <!--- in-memory) database. --->
 <cf_runtest file="core/test_named_args_array_view.cfm">
+<cf_runtest file="core/test_named_arg_required.cfm">
 <!--- - param_dotted_lhs: the cfscript `param` shorthand must accept a dotted / --->
 <!--- scoped lvalue (`param arguments.obj.key = default`), not just a bare --->
 <!--- identifier. Surfaced while booting WireBox (Injector.cfc uses --->
