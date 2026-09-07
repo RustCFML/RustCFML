@@ -2255,3 +2255,55 @@ Wheels-style workloads (CPU, not memory).
 graph: every member of the WireBox injector reaches the whole 29.7 MiB, so each
 reports the total. Use one shared walk with a shape classifier, or a dominator
 tree.
+
+## 84. Generational mid-request sweep: survivors are promoted, not re-walked (v0.653.10) 📌
+
+**Before.** Every mid-request sweep re-ran trial deletion over the whole log —
+new entries AND every survivor of the previous sweep, carried forward. The
+doubling budget kept that amortised-linear, but on the Wheels suite it meant
+~100 sweeps re-walking a ~300k-node live set to find cycles among the new
+entries: ~12 s of a 54 s run (§81).
+
+**Now.** The log has two generations. A **minor** sweep runs trial deletion over
+the YOUNG entries only (allocated since the last sweep); a node still owned from
+outside that set — including from an old node — reads as external and is kept,
+so a minor is conservative in exactly the way a partial log is (§81). Its
+survivors are **promoted** to the old generation, which is re-walked only by a
+**major** sweep (young + old) once its LIVE size has doubled since the last major,
+or by `collect()` at request end, which always takes both generations. Two
+details that mattered as much as the split:
+
+- **Old-generation membership set.** The relog hook re-enters displaced old
+  nodes into the young log every interval, and each minor re-promoted them, so
+  the old generation held ~2× duplicates and majors fired on count: 14 majors
+  per run over 8.6M entries reclaiming 250k nodes. With a pointer set on the
+  old generation (and dead entries pruned before a major is called): 6 majors
+  over 1.7M entries.
+- **Young budget 25k → 100k.** The 25k knee was measured when survivors were
+  re-walked; with minors linear in allocations it only sets how much young
+  garbage accumulates between sweeps. Measured 25k / 50k / 100k: sweeps 5.8 /
+  6.1 / 4.1 s, wall 49 / 46 / 45 s, peak 760 / 757 / 764 M. Peak did not move.
+
+Pointer-keyed sets and maps in the collector use `FxHash` (keys are `Arc`
+addresses); measured within noise on its own, kept because it is free.
+
+**Measured, Wheels suite (`?db=sqlite&reload=true`, 2,737 specs, identical
+results):**
+
+| | v0.653.9 | this build |
+|---|---|---|
+| wall time | 53.8–54.0 s | 45–49 s |
+| mid-request sweep time per run | ~12 s (~590 sweeps) | ~4.5 s (119 minors + 3 majors) |
+| peak footprint | 860–920 M | 760–770 M |
+
+Preside: interleaved warm-render A/B and reinit footprint still to be taken — the first attempt ran with MySQL down (every request re-booted the application: 264 "Application starting up" lines, footprint 1.0 → 3.9 G on BOTH arms). Always check `%{http_code}` before reading a render or footprint number (§80).
+
+**What a minor cannot see.** An old node whose last external reference is dropped
+by a frame exit (no mutation hook fires) stays until the next major or request
+end. That is the same retention the doubling rule always had; majors now fire
+on live growth, so mid-request retention of old cyclic garbage is bounded by
+2× the live old set, as before.
+
+Tests: `crates/cfml-common` `incremental_tests` (minor reclaims young cycles,
+promoted survivor reclaimed by a forced major, major budget backs off, duplicates
+carried once, compaction, relog de-dup).

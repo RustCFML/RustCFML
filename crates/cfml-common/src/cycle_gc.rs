@@ -52,6 +52,12 @@ use crate::component::Instance;
 use parking_lot::RwLock as PlRwLock;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+/// Pointer-keyed set/map used throughout the collector. The keys are `Arc`
+/// addresses (already well distributed), so `FxHash` beats SipHash here and the
+/// collector is hash-bound: several lookups per node and per edge in a pass.
+type PtrSet = rustc_hash::FxHashSet<usize>;
+type PtrMap<V> = rustc_hash::FxHashMap<usize, V>;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
@@ -124,6 +130,29 @@ thread_local! {
     /// never logged and never accumulate). Taking the log out (`collect`) also
     /// leaves it `None`, so the collector's own allocations are never logged.
     static ALLOC_LOG: RefCell<Option<Vec<TrackedAlloc>>> = const { RefCell::new(None) };
+    /// The OLD generation: survivors promoted by a minor sweep. Only re-walked by
+    /// a MAJOR sweep (when it has doubled since the last one) or at request end.
+    /// See `collect_incremental`.
+    static OLD_LOG: RefCell<Vec<TrackedAlloc>> = const { RefCell::new(Vec::new()) };
+    /// Backing pointers currently in `OLD_LOG`, so a node re-entered into the
+    /// young log by the relog hook and re-promoted is not pushed twice.
+    static OLD_SET: RefCell<PtrSet> = RefCell::new(PtrSet::default());
+    /// Old-generation size at which the next sweep is a major one.
+    static NEXT_MAJOR: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Drain BOTH generations of this thread's log into one vector (young first),
+/// leaving the thread not logging. `None` when the thread was not logging.
+fn take_full_log() -> Option<Vec<TrackedAlloc>> {
+    let young = ALLOC_LOG.with(|c| c.borrow_mut().take())?;
+    let mut old = OLD_LOG.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    OLD_SET.with(|c| c.borrow_mut().clear());
+    if old.is_empty() {
+        return Some(young);
+    }
+    old.reserve(young.len());
+    old.extend(young);
+    Some(old)
 }
 
 /// Soft cap on the per-request allocation log, as a pure MEMORY safety valve —
@@ -166,7 +195,10 @@ fn log_cap() -> usize {
 /// request execution (serve mode only).
 pub fn enable() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    OLD_LOG.with(|c| c.borrow_mut().clear());
+    OLD_SET.with(|c| c.borrow_mut().clear());
     NEXT_SWEEP.with(|c| c.set(incremental_threshold()));
+    NEXT_MAJOR.with(|c| c.set(incremental_threshold()));
     LOG_PAUSED.with(|c| c.set(false));
     RELOG_SEEN.with(|c| c.borrow_mut().clear());
 }
@@ -179,7 +211,7 @@ thread_local! {
     static LOG_PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Nodes the relog hook has already entered into the log during the current
     /// sweep interval — see [`relog_first_sight`].
-    static RELOG_SEEN: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static RELOG_SEEN: RefCell<PtrSet> = RefCell::new(PtrSet::default());
 }
 
 /// Whether `ptr` has NOT yet been re-logged during the current sweep interval,
@@ -200,12 +232,15 @@ pub fn relog_first_sight(ptr: usize) -> bool {
 /// Stop logging and drop the log without collecting.
 pub fn disable_and_clear() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = None);
+    OLD_LOG.with(|c| c.borrow_mut().clear());
+    OLD_SET.with(|c| c.borrow_mut().clear());
 }
 
 /// Current length of this thread's allocation log (`None` if not logging). For
 /// diagnostics only.
 pub fn log_len() -> Option<usize> {
     ALLOC_LOG.with(|c| c.borrow().as_ref().map(|v| v.len()))
+        .map(|n| n + OLD_LOG.with(|c| c.borrow().len()))
 }
 
 /// Composition of this thread's allocation log by container type
@@ -215,8 +250,9 @@ pub fn log_type_breakdown() -> (usize, usize, usize, usize) {
     ALLOC_LOG.with(|c| {
         let b = c.borrow();
         let mut t = (0usize, 0usize, 0usize, 0usize);
+        let old = OLD_LOG.with(|o| o.borrow().clone());
         if let Some(v) = b.as_ref() {
-            for a in v {
+            for a in v.iter().chain(old.iter()) {
                 match a {
                     TrackedAlloc::Struct(_) => t.0 += 1,
                     TrackedAlloc::Array(_) => t.1 += 1,
@@ -275,7 +311,7 @@ pub fn deferred_pending() -> usize {
 /// log is empty/absent there is nothing to track — the join handles are simply
 /// dropped (detaching the threads, which keep running as before).
 pub fn defer_current_log(joins: Vec<std::thread::JoinHandle<()>>) {
-    let log = ALLOC_LOG.with(|c| c.borrow_mut().take());
+    let log = take_full_log();
     match log {
         Some(log) if !log.is_empty() && !joins.is_empty() => {
             DEFERRED.lock().push(DeferredEntry { log, joins });
@@ -385,7 +421,7 @@ fn log_push(t: TrackedAlloc) {
 /// Drop dead entries and duplicate entries from a log in place, keeping the
 /// first entry for each distinct live node. Order is preserved.
 fn compact_log(v: &mut Vec<TrackedAlloc>) {
-    let mut seen: HashSet<usize> = HashSet::with_capacity(v.len() / 8);
+    let mut seen: PtrSet = PtrSet::with_capacity_and_hasher(v.len() / 8, Default::default());
     v.retain(|t| t.is_alive() && seen.insert(t.ptr()));
     v.shrink_to_fit();
 }
@@ -592,7 +628,7 @@ impl NodeHandle {
     /// `Instance` arm is the one place a handle is cloned — the two UNTRACKED
     /// data maps, whose refcounts the collector never inspects — so the
     /// "refcounts undisturbed" guarantee still holds for every tracked node.)
-    fn for_each_child_node(&self, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
+    fn for_each_child_node(&self, in_set: &PtrSet, emit: &mut impl FnMut(usize)) {
         match self {
             NodeHandle::Struct(a) => {
                 let g = a.read();
@@ -800,7 +836,7 @@ fn describe_value(v: &CfmlValue) -> String {
 /// root whose whole transitive closure is then marked live. Walked from
 /// [`classify`] so the count phase and the mark phase descend identically (the
 /// invariant that keeps over-counting `internal_in` safe).
-fn classify_body(body: &CfmlClosureBody, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
+fn classify_body(body: &CfmlClosureBody, in_set: &PtrSet, emit: &mut impl FnMut(usize)) {
     match body {
         CfmlClosureBody::Expression(v) => classify(v, in_set, emit),
         CfmlClosureBody::Statements(sts) => {
@@ -820,7 +856,7 @@ fn classify_body(body: &CfmlClosureBody, in_set: &HashSet<usize>, emit: &mut imp
 /// Emit the edges a `CfmlFunction` carries: its captured scope, its DEFAULT
 /// PARAMETER VALUES (`CfmlParam::default` is a `CfmlValue` like any other) and
 /// its body. All three were previously invisible except the scope.
-fn classify_function(f: &CfmlFunction, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
+fn classify_function(f: &CfmlFunction, in_set: &PtrSet, emit: &mut impl FnMut(usize)) {
     if let Some(sc) = &f.captured_scope {
         let p = Arc::as_ptr(sc) as *const () as usize;
         if in_set.contains(&p) {
@@ -835,7 +871,7 @@ fn classify_function(f: &CfmlFunction, in_set: &HashSet<usize>, emit: &mut impl 
     classify_body(&f.body, in_set, emit);
 }
 
-fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)) {
+fn classify(v: &CfmlValue, in_set: &PtrSet, emit: &mut impl FnMut(usize)) {
     match v {
         CfmlValue::Struct(s) => {
             let p = s.backing_ptr();
@@ -960,7 +996,7 @@ fn blueprint_values(bp: &crate::component::ClassBlueprint, mut f: impl FnMut(&Cf
 ///  3. Transient roots (page `variables`, request scope, thread scope) cleared
 ///     — in practice satisfied by dropping the VM before calling this.
 pub fn collect() -> usize {
-    let Some(log) = ALLOC_LOG.with(|c| c.borrow_mut().take()) else {
+    let Some(log) = take_full_log() else {
         return 0;
     };
     // Survivors are carried into the cross-request set rather than abandoned —
@@ -999,10 +1035,19 @@ pub fn collect() -> usize {
 /// | 25,000 | **113 M / 13.1 s**   | **218 M / 3.5 s**   |
 /// | 50,000 | 177 M / 11.1 s       | 221 M / 3.5 s       |
 ///
-/// 25,000 is the knee: ~32x less memory on churn and ~5x on a large live set,
+/// 25,000 was the knee: ~32x less memory on churn and ~5x on a large live set,
 /// with CPU at or below the sweeping-off arm on BOTH. 10,000 buys a little more
 /// memory back but starts paying for the extra passes on the live workload.
-const INCREMENTAL_DEFAULT: usize = 25_000;
+///
+/// That table was measured when every sweep re-walked every survivor, so the
+/// budget also had to bound the re-walk. With the generational sweep (young
+/// entries only; survivors promoted and re-walked only by a major) the young
+/// budget sets only how much young garbage may accumulate between minors, so a
+/// larger one trades a little transient memory for fewer passes. Wheels suite
+/// (2,737 specs), one run each: 25k → 590 minors, 5.8 s of sweeps, wall 49 s,
+/// peak 760 M; 50k → 256 / 6.1 s / 46 s / 757 M; 100k → 119 / 4.1 s / 45 s /
+/// 764 M. Peak did not move; 100k it is.
+const INCREMENTAL_DEFAULT: usize = 100_000;
 
 fn incremental_threshold() -> usize {
     use std::sync::OnceLock;
@@ -1078,51 +1123,100 @@ pub fn collect_incremental() -> usize {
     }
     let budget = NEXT_SWEEP.with(|c| c.get());
     let budget = if budget == usize::MAX { base } else { budget };
-    let log = ALLOC_LOG.with(|c| {
+    let young = ALLOC_LOG.with(|c| {
         let mut b = c.borrow_mut();
         match b.as_mut() {
             Some(v) if v.len() >= budget => Some(std::mem::take(v)),
             _ => None,
         }
     });
-    let Some(log) = log else { return 0 };
-    let taken = log.len();
+    let Some(young) = young else { return 0 };
     let t0 = std::time::Instant::now();
-    // The survivors come back from the pass DE-DUPLICATED by backing pointer —
-    // one entry per distinct live node. They must not be re-entered from the
-    // raw log: that carried every duplicate entry forward and counted each as
-    // "live", so the relog hook's repeats inflated `live` to 15.8M for ~260k
-    // real nodes, the doubled budget landed above the log cap, no further sweep
-    // ever ran, and logging paused for the rest of the request (the Wheels
-    // suite retained 3.3 GB of untracked cycles per run that way).
+    // GENERATIONAL. A minor sweep runs trial deletion over the YOUNG entries
+    // only (allocated since the last sweep); a node still owned from outside
+    // that set — including from an old-generation node — reads as external and
+    // is kept, so a minor sweep is conservative in exactly the way a partial
+    // log is. Survivors are PROMOTED to the old generation, which is re-walked
+    // only by a MAJOR sweep (young + old together) once it has doubled since
+    // the last major, or by `collect()` at request end. Before this, every
+    // sweep re-walked every survivor: on the Wheels suite that was ~100 sweeps
+    // over a ~300k-node live set, ~12 s of a 65 s run, to reclaim young cycles
+    // that a walk of the young entries alone finds just as well.
+    let next_major = NEXT_MAJOR.with(|c| c.get());
+    let next_major = if next_major == usize::MAX { base } else { next_major };
+    // Promoted survivors are mostly acyclic request-lifetime data that refcounting
+    // frees soon after; their entries stay in the old generation as dead weight
+    // and would trigger a major on COUNT alone. When the count reaches the
+    // budget, first drop the dead entries (a `strong_count` read each, no graph
+    // walk) and only call a major if the LIVE old set really has doubled.
+    // Measured on the Wheels suite before this: 15 majors per run re-walking
+    // ~19M entries to reclaim 490k nodes — half of all sweep time.
+    let old_len = OLD_LOG.with(|c| {
+        let mut o = c.borrow_mut();
+        if o.len() >= next_major {
+            o.retain(|t| t.is_alive());
+            OLD_SET.with(|s| {
+                let mut s = s.borrow_mut();
+                s.clear();
+                s.extend(o.iter().map(|t| t.ptr()));
+            });
+        }
+        o.len()
+    });
+    let major = old_len >= next_major;
+    let (log, kind) = if major {
+        let mut log = OLD_LOG.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        OLD_SET.with(|c| c.borrow_mut().clear());
+        log.reserve(young.len());
+        log.extend(young);
+        (log, "major")
+    } else {
+        (young, "minor")
+    };
+    let taken = log.len();
+    // The survivors come back DE-DUPLICATED by backing pointer — one entry per
+    // distinct live node — and must not be re-entered from the raw log: doing
+    // so once inflated `live` to 15.8M for ~260k nodes and stopped all sweeps
+    // for the rest of a request (known-issues §81).
     let mut survivors: Vec<(usize, TrackedAlloc)> = Vec::new();
     let reclaimed = collect_from_log_carrying(log, Some(&mut survivors));
-    let live = survivors.len();
-    ALLOC_LOG.with(|c| {
-        if let Some(v) = c.borrow_mut().as_mut() {
-            v.reserve(live);
-            v.extend(survivors.into_iter().map(|(_, t)| t));
-        }
+    let promoted = survivors.len();
+    let old_now = OLD_LOG.with(|c| {
+        let mut o = c.borrow_mut();
+        OLD_SET.with(|s| {
+            let mut s = s.borrow_mut();
+            for (p, t) in survivors {
+                if s.insert(p) {
+                    o.push(t);
+                }
+            }
+        });
+        o.len()
     });
+    if major {
+        // Doubling from the live count keeps the amortised cost of majors
+        // linear: a fixed threshold re-walks the same live nodes over and over
+        // (quadratic — and a clamp that put the budget BELOW the live count
+        // once made every frame exit run a 330 ms sweep). Clamped to the log
+        // cap so a sweep still fires when the log fills.
+        let next = std::cmp::max(base, old_now.saturating_mul(2)).min(log_cap());
+        NEXT_MAJOR.with(|c| c.set(next));
+    }
+    // Young budget: a fixed `base` — survivors are no longer re-walked by a
+    // minor, so the cost of minors is linear in allocations regardless of the
+    // live set.
+    NEXT_SWEEP.with(|c| c.set(base));
     // The relog de-dup set describes the log that was just replaced.
     RELOG_SEEN.with(|c| c.borrow_mut().clear());
-    // Doubling from the live count keeps the amortised cost linear: a budget
-    // that does not grow with the live set sweeps the same live nodes over and
-    // over (a fixed threshold is quadratic — and a clamp that put the budget
-    // BELOW the live count made every frame exit run a 330 ms sweep). The budget
-    // must therefore always exceed `live`. It is clamped to the log cap so a
-    // sweep still fires when the log fills; `log_push` compacts at the cap and
-    // pauses logging only for a request that genuinely holds more distinct
-    // containers than the cap allows.
-    let next = std::cmp::max(base, live.saturating_mul(2)).min(log_cap());
-    NEXT_SWEEP.with(|c| c.set(next));
     if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
         eprintln!(
-            "[cycle_gc] incremental sweep over {} reclaimed {} node(s); {} live, next sweep at {} ({} ms)",
+            "[cycle_gc] incremental {} sweep over {} reclaimed {} node(s); {} promoted, old={} next major at {} ({} ms)",
+            kind,
             taken,
             reclaimed,
-            live,
-            next,
+            promoted,
+            old_now,
+            NEXT_MAJOR.with(|c| c.get()),
             t0.elapsed().as_millis()
         );
     }
@@ -1189,7 +1283,7 @@ pub fn incremental_due() -> bool {
 /// is live. Only a genuine cycle with no external owner is ever reclaimed.
 struct PersistentSet {
     entries: Vec<TrackedAlloc>,
-    seen: HashSet<usize>,
+    seen: PtrSet,
     next_sweep: usize,
 }
 
@@ -1288,7 +1382,7 @@ fn carry_survivors(live: Vec<(usize, TrackedAlloc)>) -> usize {
         let mut guard = PERSISTENT.lock();
         let set = guard.get_or_insert_with(|| PersistentSet {
             entries: Vec::new(),
-            seen: HashSet::new(),
+            seen: PtrSet::default(),
             next_sweep: base,
         });
         for (ptr, t) in live {
@@ -1479,7 +1573,7 @@ fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
         let mut guard = PERSISTENT.lock();
         let set = guard.get_or_insert_with(|| PersistentSet {
             entries: Vec::new(),
-            seen: HashSet::new(),
+            seen: PtrSet::default(),
             next_sweep: base,
         });
         for (ptr, t) in still_live {
@@ -1515,7 +1609,7 @@ fn collect_from_log_carrying(
     }
 
     // 1. Upgrade survivors; one strong probe handle per distinct backing.
-    let mut nodes: HashMap<usize, NodeHandle> = HashMap::with_capacity(log.len());
+    let mut nodes: PtrMap<NodeHandle> = PtrMap::with_capacity_and_hasher(log.len(), Default::default());
     for t in log {
         match t {
             TrackedAlloc::Struct(w) => {
@@ -1560,7 +1654,7 @@ fn collect_from_log_carrying(
         return 0;
     }
 
-    let in_set: HashSet<usize> = nodes.keys().copied().collect();
+    let in_set: PtrSet = nodes.keys().copied().collect();
 
     // 1b. The class blueprints held by the surviving instances, DE-DUPLICATED by
     //     Arc identity. A blueprint is a CARRIER, not a node: it participates in
@@ -1573,8 +1667,8 @@ fn collect_from_log_carrying(
     //     `EventHandlerBean`'s `viewDispatch` when the Instance data maps were
     //     double-walked).
     #[cfg(feature = "component-instance")]
-    let blueprints: HashMap<usize, std::sync::Arc<crate::component::ClassBlueprint>> = {
-        let mut bps = HashMap::new();
+    let blueprints: PtrMap<std::sync::Arc<crate::component::ClassBlueprint>> = {
+        let mut bps = PtrMap::default();
         for h in nodes.values() {
             if let NodeHandle::Instance(a) = h {
                 match a.try_read() {
@@ -1598,8 +1692,8 @@ fn collect_from_log_carrying(
     //     NOT walking it leaves those edges uncounted — which reads as external
     //     ownership and pins the graph. De-duplicated by Arc identity, it is
     //     counted exactly once, like `blueprints` above.
-    let method_tables: HashMap<usize, Arc<ValueMap>> = {
-        let mut t = HashMap::new();
+    let method_tables: PtrMap<Arc<ValueMap>> = {
+        let mut t = PtrMap::default();
         for h in nodes.values() {
             match h {
                 NodeHandle::Struct(a) => match a.try_read() {
@@ -1641,7 +1735,7 @@ fn collect_from_log_carrying(
 
     // 2. internal_in[n] = number of references to n from other survivors, plus
     //    the references held by the carrier blueprints (counted once each).
-    let mut internal_in: HashMap<usize, usize> = HashMap::with_capacity(nodes.len());
+    let mut internal_in: PtrMap<usize> = PtrMap::with_capacity_and_hasher(nodes.len(), Default::default());
     for h in nodes.values() {
         h.for_each_child_node(&in_set, &mut |child| {
             *internal_in.entry(child).or_insert(0) += 1;
@@ -1667,7 +1761,7 @@ fn collect_from_log_carrying(
     //     class (internal) and by anything else — a live request's blueprint
     //     cache, an instance outside this set (external). `-1` is our own clone.
     #[cfg(feature = "component-instance")]
-    let mut bp_internal: HashMap<usize, usize> = HashMap::with_capacity(blueprints.len());
+    let mut bp_internal: PtrMap<usize> = PtrMap::with_capacity_and_hasher(blueprints.len(), Default::default());
     #[cfg(feature = "component-instance")]
     for h in nodes.values() {
         if let NodeHandle::Instance(a) = h {
@@ -1683,7 +1777,7 @@ fn collect_from_log_carrying(
     // are chosen rather than after the mark.
     if unreachable_report() && IN_SWEEP.with(|c| c.get()) {
         let probes = PROBE_ROOT.lock().clone();
-        let mut seen: HashSet<usize> = HashSet::new();
+        let mut seen: PtrSet = PtrSet::default();
         let mut stack: Vec<usize> = Vec::new();
         for (_, pr) in probes.iter() {
             classify(pr, &in_set, &mut |c| {
@@ -1737,7 +1831,7 @@ fn collect_from_log_carrying(
 
     // 3. Roots = survivors with an owner OUTSIDE the survivor set.
     //    external(n) = strong_count − 1 (probe handle) − internal_in(n).
-    let mut live: HashSet<usize> = HashSet::with_capacity(nodes.len());
+    let mut live: PtrSet = PtrSet::with_capacity_and_hasher(nodes.len(), Default::default());
     let mut worklist: Vec<usize> = Vec::new();
     // RUSTCFML_GC_ROOTS=N reports the N largest PINNED ROOTS — survivors whose
     // external count is non-zero, i.e. the nodes something outside this
@@ -1754,12 +1848,12 @@ fn collect_from_log_carrying(
     });
     let mut root_report: Vec<(usize, String)> = Vec::new();
     let mut deferred_roots: Vec<usize> = Vec::new();
-    let mut root_ext: HashMap<usize, usize> = HashMap::new();
+    let mut root_ext: PtrMap<usize> = PtrMap::default();
     // Index built once (not per root) so the diagnostic stays linear: a pass with
     // 250k survivors can have tens of thousands of roots.
     #[cfg(feature = "component-instance")]
-    let data_map_owners: HashMap<usize, String> = if root_debug > 0 {
-        let mut m = HashMap::new();
+    let data_map_owners: PtrMap<String> = if root_debug > 0 {
+        let mut m = PtrMap::default();
         for oh in nodes.values() {
             if let NodeHandle::Instance(a) = oh {
                 if let Some(g) = a.try_read() {
@@ -1776,7 +1870,7 @@ fn collect_from_log_carrying(
         }
         m
     } else {
-        HashMap::new()
+        PtrMap::default()
     };
     for (&p, h) in &nodes {
         let internal = *internal_in.get(&p).unwrap_or(&0);
@@ -1822,8 +1916,8 @@ fn collect_from_log_carrying(
     //     carried by the mark instead: it goes live exactly when one of its
     //     instances does (step 4).
     #[cfg(feature = "component-instance")]
-    let mut live_bps: HashSet<usize> = HashSet::new();
-    let mut live_tables: HashSet<usize> = HashSet::new();
+    let mut live_bps: PtrSet = PtrSet::default();
+    let mut live_tables: PtrSet = PtrSet::default();
     #[cfg(feature = "component-instance")]
     for (&p, bp) in &blueprints {
         let internal = *bp_internal.get(&p).unwrap_or(&0);
@@ -1922,7 +2016,7 @@ fn collect_from_log_carrying(
             // gathered for `internal_in`; the two walks must agree or the mark
             // phase under-marks exactly what the count over-charged).
             let mut mark_table = |mt: Arc<ValueMap>,
-                                  live: &mut HashSet<usize>,
+                                  live: &mut PtrSet,
                                   worklist: &mut Vec<usize>| {
                 if live_tables.insert(Arc::as_ptr(&mt) as *const () as usize) {
                     for v in mt.values() {
@@ -1987,7 +2081,7 @@ fn collect_from_log_carrying(
         }
         // Engine-or-application: how much of the surviving graph hangs off the
         // application scope?
-        let mut probe_reachable: HashSet<usize> = HashSet::new();
+        let mut probe_reachable: PtrSet = PtrSet::default();
         {
             let probes = PROBE_ROOT.lock();
             if !probes.is_empty() {
@@ -2073,13 +2167,13 @@ fn collect_from_log_carrying(
         anchors.sort_by(|a, b| b.0.cmp(&a.0));
         anchors.truncate(root_debug);
 
-        let targets: HashSet<usize> = retention
+        let targets: PtrSet = retention
             .iter()
             .take(root_debug)
             .map(|(_, r)| *r)
             .chain(anchors.iter().map(|(_, r)| *r))
             .collect();
-        let mut holders: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut holders: PtrMap<Vec<String>> = PtrMap::default();
         if !targets.is_empty() {
             for (&p, h) in &nodes {
                 h.for_each_child_node(&in_set, &mut |child| {
@@ -2125,7 +2219,7 @@ fn collect_from_log_carrying(
         // shape rather than truncated to a top-N, because the whole question is
         // how many distinct carriers there are and what they look like.
         if !probe_reachable.is_empty() {
-            let mut tracked_holders: HashSet<usize> = HashSet::new();
+            let mut tracked_holders: PtrSet = PtrSet::default();
             for h in nodes.values() {
                 h.for_each_child_node(&in_set, &mut |child| {
                     tracked_holders.insert(child);
@@ -2419,9 +2513,13 @@ mod incremental_tests {
             "a reachable cycle must survive an incremental sweep"
         );
         // Now drop the only external handles; a later sweep must still see it.
+        // The survivor was PROMOTED to the old generation, so the sweep that
+        // finds it is a major one (or request-end `collect()`).
         drop(live_a);
         drop(live_b);
+        let _ = CfmlStruct::new(ValueMap::default());
         NEXT_SWEEP.with(|c| c.set(1));
+        NEXT_MAJOR.with(|c| c.set(1));
         let reclaimed = collect_incremental();
         assert!(
             reclaimed > 0,
@@ -2441,12 +2539,18 @@ mod incremental_tests {
         for _ in 0..40 {
             live.push(make_cycle());
         }
+        // First sweep is a minor: promotes the 80 live nodes to the old
+        // generation. Then force a major and check ITS budget backed off.
         NEXT_SWEEP.with(|c| c.set(1));
         collect_incremental();
-        let after = NEXT_SWEEP.with(|c| c.get());
+        let _ = CfmlStruct::new(ValueMap::default());
+        NEXT_SWEEP.with(|c| c.set(1));
+        NEXT_MAJOR.with(|c| c.set(1));
+        collect_incremental();
+        let after = NEXT_MAJOR.with(|c| c.get());
         assert!(
             after >= 80,
-            "budget must rise to ~2x the live set (>=80 for 40 live cycles), got {after}"
+            "major budget must rise to ~2x the live set (>=80 for 40 live cycles), got {after}"
         );
         drop(live);
         disable_and_clear();
