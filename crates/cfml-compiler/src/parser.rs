@@ -15,6 +15,12 @@ pub struct Parser {
     /// deeply nested expression (e.g. `((((...))))`) returns a parse error
     /// instead of overflowing the stack.
     expr_depth: usize,
+    /// Current statement-recursion depth, bounded by `MAX_STMT_DEPTH`. Nested
+    /// blocks and function declarations (`if(true){if(true){...}}`, and the
+    /// `<cfif>`/`<cfloop>` tags that lower to them) recurse through
+    /// `parse_statement` without ever re-entering `parse_expression`, so the
+    /// expression guard alone does not bound them.
+    stmt_depth: usize,
 }
 
 /// Maximum expression nesting depth. Deeply nested untrusted source would
@@ -23,6 +29,19 @@ pub struct Parser {
 /// well below what a thread stack can hold while remaining far above any
 /// hand-written CFML expression.
 const MAX_EXPR_DEPTH: usize = 64;
+
+/// Maximum statement nesting depth (nested blocks / function declarations).
+///
+/// A `parse_statement` frame is far larger than an expression frame, so this
+/// bound is set from stack capacity rather than taste. On the 8 MiB main
+/// thread a release build overflows at ~3200 levels and a debug build (frames
+/// ~20x larger, nothing inlined) at ~100. Measured against 2985 real files
+/// (Preside + `tests/`) the deepest statement nesting anywhere is 11, so 64
+/// leaves ~6x headroom over real code and ~12x margin on the shipped release
+/// binary. Note a debug build on a *small* stack (libtest's default worker
+/// thread) can still overflow below this limit — the bound is calibrated for
+/// the release binary, which is what runs untrusted templates.
+const MAX_STMT_DEPTH: usize = 64;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -41,6 +60,7 @@ impl Parser {
             current: 0,
             doc_comments,
             expr_depth: 0,
+            stmt_depth: 0,
         }
     }
 
@@ -173,6 +193,22 @@ impl Parser {
     // ---- Statement Parsing ----
 
     fn parse_statement(&mut self) -> Result<CfmlNode, ParseError> {
+        // Bound statement recursion so deeply nested blocks / function
+        // declarations (and the tags that lower to them) return a parse error
+        // instead of overflowing the stack. `parse_statement` is the single
+        // funnel: `parse_block` and `parse_block_or_statement` both come
+        // through here.
+        self.stmt_depth += 1;
+        if self.stmt_depth > MAX_STMT_DEPTH {
+            self.stmt_depth -= 1;
+            return Err(self.parse_error("statement nesting too deep"));
+        }
+        let result = self.parse_statement_body();
+        self.stmt_depth -= 1;
+        result
+    }
+
+    fn parse_statement_body(&mut self) -> Result<CfmlNode, ParseError> {
         let stmt_loc = self.current_location();
 
         // Check for access modifiers before function — but only if followed by
@@ -5771,14 +5807,22 @@ impl Parser {
 
     // ---- Expression Parsing (Pratt-style precedence climbing) ----
 
-    fn parse_expression(&mut self) -> Result<Expression, ParseError> {
-        // Bound expression recursion so deeply nested input (e.g. `((((...))))`)
-        // returns a parse error instead of overflowing the stack.
+    /// Enter one level of expression recursion, erroring rather than recursing
+    /// past `MAX_EXPR_DEPTH`. Every caller must pair a successful call with a
+    /// matching `self.expr_depth -= 1`.
+    fn enter_expr_depth(&mut self) -> Result<(), ParseError> {
         self.expr_depth += 1;
         if self.expr_depth > MAX_EXPR_DEPTH {
             self.expr_depth -= 1;
             return Err(self.parse_error("expression nesting too deep"));
         }
+        Ok(())
+    }
+
+    fn parse_expression(&mut self) -> Result<Expression, ParseError> {
+        // Bound expression recursion so deeply nested input (e.g. `((((...))))`)
+        // returns a parse error instead of overflowing the stack.
+        self.enter_expr_depth()?;
         let result = self.parse_assignment_expr();
         self.expr_depth -= 1;
         result
@@ -6004,7 +6048,11 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expression, ParseError> {
         if self.match_token(&Token::NotKeyword) || self.match_token(&Token::Bang) {
-            let operand = Box::new(self.parse_not()?);
+            // `!!!!...x` self-recurses without re-entering `parse_expression`.
+            self.enter_expr_depth()?;
+            let inner = self.parse_not();
+            self.expr_depth -= 1;
+            let operand = Box::new(inner?);
             return Ok(Expression::UnaryOp(Box::new(UnaryOp {
                 operator: UnaryOpType::Not,
                 operand,
@@ -6318,7 +6366,11 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Result<Expression, ParseError> {
         if self.match_token(&Token::Minus) {
-            let operand = Box::new(self.parse_unary()?);
+            // `----...x` self-recurses without re-entering `parse_expression`.
+            self.enter_expr_depth()?;
+            let inner = self.parse_unary();
+            self.expr_depth -= 1;
+            let operand = Box::new(inner?);
             return Ok(Expression::UnaryOp(Box::new(UnaryOp {
                 operator: UnaryOpType::Minus,
                 operand,
@@ -6330,7 +6382,10 @@ impl Parser {
         // parse and return the operand unchanged. Lucee/ACF accept it; we previously
         // only handled unary `-`, so a leading `+` failed with "Expected RParen".
         if self.match_token(&Token::Plus) {
-            return self.parse_unary();
+            self.enter_expr_depth()?;
+            let inner = self.parse_unary();
+            self.expr_depth -= 1;
+            return inner;
         }
 
         // Prefix ++ / --

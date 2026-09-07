@@ -246,6 +246,33 @@ impl Drop for EncodeForGuard {
     }
 }
 
+/// Maximum body-tag nesting depth handled by the preprocessor.
+///
+/// `tags_to_script_inner` recurses once per nested body tag (`<cfoutput>`,
+/// `<cfif>`, `<cfloop>`, ...) to convert the body, so deeply nested tag source
+/// overflows the stack *before* the parser ever runs — the parser's own depth
+/// guards cannot reach it. On the 8 MiB main thread a release build overflows
+/// at ~1600 levels and a debug build at ~130. Measured against 2985 real files
+/// (Preside + `tests/`) the deepest tag nesting anywhere is 4, so 64 leaves
+/// ample headroom. As with `MAX_STMT_DEPTH`, the bound is calibrated for the
+/// release binary; a debug build on a small stack can still overflow below it.
+const MAX_TAG_NEST_DEPTH: usize = 64;
+
+thread_local! {
+    /// Current `tags_to_script_inner` recursion depth, bounded by
+    /// `MAX_TAG_NEST_DEPTH`.
+    static TAG_NEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard that decrements [`TAG_NEST_DEPTH`] however the frame exits.
+struct TagNestGuard;
+
+impl Drop for TagNestGuard {
+    fn drop(&mut self) {
+        TAG_NEST_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Record the first structural preprocess error of the current pass.
 fn record_preprocess_error(msg: impl Into<String>) {
     PREPROCESS_ERROR.with(|e| {
@@ -283,6 +310,7 @@ pub fn tags_to_script(source: &str) -> String {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut imports = std::collections::HashMap::<String, String>::new();
     PREPROCESS_ERROR.with(|e| *e.borrow_mut() = None);
+    TAG_NEST_DEPTH.with(|d| d.set(0));
     tags_to_script_impl(source, &mut imports)
 }
 
@@ -307,6 +335,20 @@ fn tags_to_script_impl(source: &str, imports: &mut std::collections::HashMap<Str
 /// When `in_cfoutput` is true, text and hash expressions use writeOutput() directly.
 /// When false, they use __writeText() which the VM can suppress.
 fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<String, String>, in_cfoutput: bool) -> String {
+    // Bound body-tag recursion so deeply nested tag source (e.g. thousands of
+    // nested `<cfoutput>`) records a compile error instead of overflowing the
+    // stack and aborting the process.
+    let depth = TAG_NEST_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let _nest_guard = TagNestGuard;
+    if depth > MAX_TAG_NEST_DEPTH {
+        record_preprocess_error("tag nesting too deep");
+        return String::new();
+    }
+
     let mut result = String::new();
     let chars: Vec<char> = source.chars().collect();
     let len = chars.len();
