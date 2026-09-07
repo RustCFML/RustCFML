@@ -2130,6 +2130,28 @@ fn print_ready_banner(what: &str, mode: &str, doc_root: &Path) {
         mode
     );
     println!("Document root: {}", doc_root.display());
+    // `--max-memory` status belongs at EVERY bind site, not just the TCP one.
+    // A socket deployment — the engine behind nginx — is precisely where an
+    // operator has no other way to see whether the limit took effect, and it is
+    // where the "cannot be enforced" warning matters most.
+    if let Some(e) = memory_limit::enforcer() {
+        match memory_limit::footprint_bytes() {
+            Some(fp) => println!(
+                "Memory limit: {} (new requests refused with 503 above {}, largest \
+                 in-flight request aborted above {}; {} now {})",
+                memory_limit::human(e.limit().max),
+                memory_limit::human(e.limit().soft),
+                memory_limit::human(e.limit().hard),
+                memory_limit::footprint_source(),
+                memory_limit::human(fp)
+            ),
+            None => println!(
+                "warning: --max-memory {} cannot be enforced: this build has no \
+                 mimalloc process statistics",
+                memory_limit::human(e.limit().max)
+            ),
+        }
+    }
     println!("Press Ctrl+C to stop\n");
 }
 
@@ -2387,21 +2409,6 @@ async fn async_run_server(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| format!("{host}:{port}"));
             print_ready_banner(&format!("running on http://{bound}"), mode, &banner_root);
-            if let Some(e) = memory_limit::enforcer() {
-                match memory_limit::footprint_bytes() {
-                    Some(fp) => eprintln!(
-                        "Memory limit: {} (new requests refused with 503 above {}; {} now {})",
-                        memory_limit::human(e.limit().max),
-                        memory_limit::human(e.limit().soft),
-                        memory_limit::footprint_source(),
-                        memory_limit::human(fp)
-                    ),
-                    None => eprintln!(
-                        "warning: --max-memory {} cannot be enforced: this build has no mimalloc process statistics",
-                        memory_limit::human(e.limit().max)
-                    ),
-                }
-            }
             // Disable Nagle's algorithm on accepted connections. For a request/response
             // HTTP server, Nagle adds latency by holding small writes, and can stall on
             // the classic Nagle + delayed-ACK interaction. axum::serve does not set this
