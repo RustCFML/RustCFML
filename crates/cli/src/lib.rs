@@ -2349,13 +2349,12 @@ async fn async_run_server(
                         req
                     },
                 ));
-                // Graceful shutdown: on Ctrl+C, stop accepting and then remove the
-                // socket file so the next start binds cleanly.
+                // Graceful shutdown on SIGINT/SIGTERM: stop accepting, let
+                // in-flight requests finish, then remove the socket file so the
+                // next start binds cleanly.
                 let cleanup_path = sock_path.clone();
                 axum::serve(listener, app.into_make_service())
-                    .with_graceful_shutdown(async move {
-                        let _ = tokio::signal::ctrl_c().await;
-                    })
+                    .with_graceful_shutdown(shutdown_signal())
                     .await
                     .unwrap();
                 #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
@@ -2411,19 +2410,61 @@ async fn async_run_server(
             let listener = listener.tap_io(|tcp_stream| {
                 let _ = tcp_stream.set_nodelay(true);
             });
-            // Graceful shutdown on Ctrl+C so `main` returns normally. This lets
-            // a held resource (e.g. the DHAT Profiler under `--features
-            // dhat-heap`) run its Drop and flush its dump instead of being
-            // killed mid-flight by the signal.
+            // Graceful shutdown on SIGINT/SIGTERM so `main` returns normally.
+            // This lets a held resource (e.g. the DHAT Profiler under
+            // `--features dhat-heap`) run its Drop and flush its dump instead of
+            // being killed mid-flight by the signal — and it is what makes
+            // `docker stop` / `kubectl delete pod` exit promptly and cleanly
+            // instead of waiting out the grace period (see `shutdown_signal`).
             axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
+                .with_graceful_shutdown(shutdown_signal())
                 .await
                 .unwrap();
             #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
             otel::shutdown();
         }
+    }
+}
+
+/// Await the first shutdown signal: `SIGINT` (Ctrl+C) or, on unix, `SIGTERM`.
+///
+/// SIGTERM matters more than it looks, and in two different ways.
+///
+/// * **Outside a container** an unhandled SIGTERM takes the default action and
+///   kills the process on the spot: in-flight requests are cut off mid-response,
+///   the Unix socket file is left behind, and anything holding a `Drop` (the
+///   heap-profiler dump, the OTel exporter flush) never runs.
+/// * **As PID 1 in a container** it is worse: the kernel installs no default
+///   dispositions for PID 1, so an unhandled SIGTERM is simply IGNORED. That is
+///   the stop signal `docker stop`, Kubernetes and systemd all send, so every
+///   stop became "wait the full grace period, then SIGKILL" — which is why the
+///   reference image had to set `STOPSIGNAL SIGINT` to work around it.
+///
+/// Handling it turns both cases into the same graceful path Ctrl+C already took:
+/// stop accepting, let in-flight requests finish, then return so cleanup runs.
+#[cfg(not(target_arch = "wasm32"))]
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => eprintln!("\nSIGINT received, shutting down..."),
+                    _ = term.recv() => eprintln!("SIGTERM received, shutting down..."),
+                }
+            }
+            // Registration can only fail in exotic conditions; fall back to
+            // Ctrl+C rather than refusing to serve.
+            Err(e) => {
+                eprintln!("warning: could not listen for SIGTERM ({e}); Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

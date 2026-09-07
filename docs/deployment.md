@@ -80,6 +80,25 @@ it, a 700 M limit is not. There is no per-request abort yet: a single runaway
 request can still take the process to the limit, at which point everything else
 is refused until it finishes.
 
+## Stopping the server (SIGINT / SIGTERM)
+
+`--serve` shuts down gracefully on **SIGINT** (Ctrl+C) and **SIGTERM**: it stops
+accepting new connections, lets in-flight requests finish and send their
+responses, then exits. `docker stop`, `kubectl delete pod` and `systemctl stop`
+all send SIGTERM, so a rolling deploy loses no requests and the process exits as
+soon as the last one drains rather than waiting out the grace period.
+
+Set the grace period longer than your slowest request so the platform never has
+to SIGKILL a draining server (`docker stop -t 30`, or `terminationGracePeriod
+Seconds: 30` in Kubernetes).
+
+> Handled since v0.653.14. Before that only SIGINT was handled, which went wrong
+> in two ways: outside a container the default action killed the process on the
+> spot, cutting off in-flight requests; and as PID 1 in a container the kernel
+> installs no default disposition, so SIGTERM was ignored entirely and every stop
+> took the full grace period followed by SIGKILL. Images built for an older
+> engine work around it with `STOPSIGNAL SIGINT`, which is harmless to keep.
+
 ## Behind a reverse proxy (nginx + Unix socket)
 
 In production you typically run RustCFML behind a reverse proxy (nginx, Caddy, HAProxy) that terminates TLS, serves static assets, and load-balances. When the proxy and RustCFML run on the **same host** — the common single-box and containerised setup — **a Unix domain socket is the recommended way to connect them**, in preference to a loopback TCP port.

@@ -2367,3 +2367,40 @@ a request that did not build the heap is not aborted; the soft tier's 503 and
 reopen. Unit tests in `crates/cfml-common/src/mem_guard.rs` cover victim
 selection, the floor, one-victim-at-a-time, and that an abort is visible only to
 the request it was armed on.
+
+## 86. `--serve` ignored SIGTERM, so every containerised stop waited out the grace period (fixed v0.653.14) 📌
+
+Only `tokio::signal::ctrl_c()` (SIGINT) was awaited for graceful shutdown. That
+is wrong in two different ways depending on where the process runs:
+
+* **Outside a container** an unhandled SIGTERM takes the DEFAULT action and kills
+  the process immediately. In-flight requests are cut off mid-response, the Unix
+  socket file is left behind, and every `Drop` is skipped (the heap-profiler dump,
+  the OTel flush). Measured: a 3s request signalled at t=1s returned a truncated
+  read to the client.
+* **As PID 1 in a container** it is worse. The kernel installs no default signal
+  dispositions for PID 1, so an unhandled SIGTERM is simply IGNORED. SIGTERM is
+  what `docker stop`, Kubernetes and systemd send, so every stop became "wait the
+  full grace period, then SIGKILL". The reference image
+  (`RustCFML-Docker`) carried `STOPSIGNAL SIGINT` purely to work around this.
+
+**Fix.** A `shutdown_signal()` future that selects over SIGINT and (on unix)
+SIGTERM, used by both the TCP and Unix-socket serve paths. `tokio`'s `signal`
+feature was already enabled, so this is a handler, not a dependency. Registration
+failure falls back to Ctrl+C rather than refusing to serve, and each signal logs
+which one it was.
+
+**Measured.** Idle server: graceful exit 118ms after SIGTERM. In-flight 3s
+request signalled at t=1s: response delivered in full, server exited 2.0s later,
+i.e. as soon as the request drained.
+
+Tests: `crates/cli/tests/graceful_shutdown.rs`. Note which test does the work —
+the idle-shutdown test passes with OR without the handler when run outside a
+container (the default action kills the process anyway), so it pins the contract,
+not the regression. The in-flight test is the real detector: with the handler
+listening on a different signal it fails, the client getting a truncated read
+(verified).
+
+**For image authors.** `STOPSIGNAL SIGINT` is no longer needed from v0.653.14 and
+is harmless to keep. Set the platform's grace period above your slowest request
+so a draining server is never SIGKILLed.
