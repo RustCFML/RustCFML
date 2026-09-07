@@ -36,6 +36,13 @@ The fastest way to start is with a prebuilt binary — no toolchain required.
    sudo mv rustcfml-macos-aarch64 /usr/local/bin/rustcfml
    ```
 
+> **Which build?** That link gives you the **stable** channel. Every version tag
+> also publishes an **edge** build as a prerelease — the full test gate has run,
+> but it has not yet been used in anger. Browse
+> [all releases](https://github.com/RustCFML/RustCFML/releases) for those, and see
+> [docs/releasing.md](docs/releasing.md) for how a build becomes stable.
+
+
 2. **Run a web application** — the most common way to get going. Point RustCFML at a directory of `.cfm` files:
 
    ```bash

@@ -152,8 +152,23 @@ jobs:
       - name: Attach license notices
         run: cp LICENSE THIRD-PARTY.txt release/
 
-      - name: Create GitHub Release
+      # Every tag publishes to the EDGE channel as a prerelease. GitHub's
+      # /releases/latest excludes prereleases, so the download links in the
+      # README keep pointing at the last STABLE build until a version is
+      # promoted — see .github/workflows/promote.yml and docs/releasing.md.
+      - name: Create GitHub Release (edge / prerelease)
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          prerelease: true
+          make_latest: false
+          body: |
+            **Edge build.** Every push of a version tag publishes here after the
+            full gate (workspace + engine test suites, the CFML suite on the CLI
+            and served in both modes, wasm). It has not yet been run in anger.
+
+            For the vetted build, take the
+            [latest stable release](https://github.com/RustCFML/RustCFML/releases/latest).
+            An edge build becomes stable by promotion — the same artifacts, no
+            rebuild.
           files: release/*

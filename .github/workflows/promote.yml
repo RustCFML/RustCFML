@@ -1,0 +1,54 @@
+name: Promote Release to Stable
+
+# Promote an existing EDGE build (published as a prerelease by release.yml) to
+# the STABLE channel. Nothing is rebuilt: the artifacts that were tested are the
+# artifacts that ship, byte for byte. Promotion only flips the release's flags,
+# so GitHub's /releases/latest — which excludes prereleases, and is what the
+# README and docs link to — starts pointing at it.
+#
+# Run it from the Actions tab, or:
+#   gh workflow run promote.yml -f tag=v0.653.14
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to promote, e.g. v0.653.14"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promote the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::No release for tag '$TAG'. Tags pushed more than three at a time trigger no workflow run, so the binaries may never have been built — push the tag again on its own."
+            exit 1
+          fi
+
+          # A release whose build failed has no binaries. Promoting one would
+          # point every download link at nothing, so require the full set.
+          assets=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          missing=0
+          for want in rustcfml-linux-x86_64 rustcfml-linux-aarch64 rustcfml-macos-aarch64 rustcfml-windows-x86_64.exe THIRD-PARTY.txt; do
+            if ! grep -qx "$want" <<<"$assets"; then
+              echo "::error::'$TAG' is missing asset '$want' — its build did not complete, so it cannot be promoted."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          gh release edit "$TAG" --repo "$REPO" --prerelease=false --latest
+          echo "Promoted $TAG to stable; /releases/latest now resolves to it."
+          echo "### Promoted \`$TAG\` to stable" >> "$GITHUB_STEP_SUMMARY"
