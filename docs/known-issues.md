@@ -2296,7 +2296,7 @@ results):**
 | mid-request sweep time per run | ~12 s (~590 sweeps) | ~4.5 s (119 minors + 3 majors) |
 | peak footprint | 860–920 M | 760–770 M |
 
-Preside: interleaved warm-render A/B and reinit footprint still to be taken — the first attempt ran with MySQL down (every request re-booted the application: 264 "Application starting up" lines, footprint 1.0 → 3.9 G on BOTH arms). Always check `%{http_code}` before reading a render or footprint number (§80).
+Preside (interleaved, both servers alive, six rounds of 40, all 200s): v0.653.9 p50 6.59–8.08 ms, this build 6.61–8.29 ms, rounds split three and three — no change. Reinit footprint over three reloads: 700/776/782 M vs 513/750/823 M — the same fragmentation plateau (§83). A first attempt ran with MySQL down and read footprint 1.0 → 3.9 G on BOTH arms because every request re-booted the application; always check `%{http_code}` before reading a render or footprint number (§80).
 
 **What a minor cannot see.** An old node whose last external reference is dropped
 by a frame exit (no mutation hook fires) stays until the next major or request
