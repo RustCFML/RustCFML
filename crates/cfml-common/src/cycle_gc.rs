@@ -161,9 +161,15 @@ fn take_full_log() -> Option<Vec<TrackedAlloc>> {
 /// every such request to "overflow and skip collection", which is exactly the
 /// runaway serve-mode leak this collector exists to prevent. The cap is now set
 /// far above real request sizes, and — critically — overflowing it no longer
-/// abandons collection: logging simply STOPS (bounding the log's own memory to
-/// ~`LOG_CAP * sizeof(Weak)` ≈ 16 bytes each) while `collect()` still reclaims
-/// every cycle among the allocations logged BEFORE the cap was reached.
+/// abandons collection: the log is first COMPACTED (dead and duplicate entries
+/// dropped, see `log_push`), and only if it is still nearly full does logging
+/// stop (bounding the log's own memory to ~`LOG_CAP * sizeof(Weak)` ≈ 16 bytes
+/// each) while `collect()` still reclaims every cycle among the allocations
+/// logged BEFORE the cap was reached.
+///
+/// 4M entries (~64 MB of bookkeeping). It was 16M while the log could fill with
+/// duplicates (§81); with de-duplication the largest request measured (the
+/// Wheels suite, 2,737 specs) peaks at ~1.2M distinct entries between sweeps.
 ///
 /// Collecting a partial log is provably conservative: any allocation that was
 /// never logged is absent from the survivor set, so edges to it are counted as
@@ -174,7 +180,7 @@ fn take_full_log() -> Option<Vec<TrackedAlloc>> {
 /// retained memory on a pathological alloc-churning request for a hard bound on
 /// the collector's transient bookkeeping — it never silently disables the
 /// collector the way the old threshold did.
-const LOG_CAP_DEFAULT: usize = 16_000_000;
+const LOG_CAP_DEFAULT: usize = 4_000_000;
 
 /// Effective per-request log cap. Overridable via `RUSTCFML_GC_LOG_CAP` (read
 /// once) so the bound can be tuned/experimented with at runtime without a

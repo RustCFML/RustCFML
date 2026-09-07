@@ -33,10 +33,12 @@ Admission reopens once the footprint is back under. It measures real physical
 footprint: cgroup `memory.current` inside a container, the process's resident
 footprint otherwise.
 
-**Sizing.** Leave headroom for an application reload: for ~15 s after
-`?fwreinit=true`-style reloads two application generations are legitimately
-resident, so size for roughly twice the steady state. A Preside site idling at
-~600 M peaks near 950 M on reload; `auto` in a 2 G container (1.5 G) is right for
+**Sizing.** Size for roughly **twice the steady-state footprint**. Two things
+need the headroom: for ~15 s after a `?fwreinit=true`-style reload two
+application generations are legitimately resident, and after the old one is
+freed the allocator keeps a plateau of about 1.6× the live data (see *Memory
+tuning* at the end of this page). A Preside site idling at ~450 M sits at
+750–850 M after a few reloads; `auto` in a 2 G container (1.5 G) is right for
 it, a 700 M limit is not. There is no per-request abort yet: a single runaway
 request can still take the process to the limit, at which point everything else
 is refused until it finishes.
@@ -208,7 +210,80 @@ Passing `--production` (or setting `RUSTCFML_PRODUCTION=1`) enables three in-mem
 
 Net effect: requests pay zero filesystem IO once the cache is warm — typically a 3–4× throughput gain on an app with `Application.cfc` + cfincludes. Files added or modified on disk are not picked up until the server is restarted. See **[Performance](performance.md)** for measured numbers.
 
-## Memory footprint (allocator tuning)
+## Sandbox / virtual filesystem (web and CLI)
+
+Self-contained binaries can run in **sandbox mode**, which completely isolates the application from the host filesystem. Sandbox mode also enables production caching automatically, since the embedded VFS is immutable at runtime.
+
+```bash
+./myserver --sandbox                # No host filesystem access
+./myserver --sandbox --port 3000    # Sandbox + custom port
+```
+
+In sandbox mode:
+
+- **Embedded files are readable** — `fileRead()`, `fileExists()`, `directoryList()`, `expandPath()`, and `include` all work against the embedded virtual filesystem. Your application can read its own bundled config files, templates, and assets normally.
+- **Host filesystem is invisible** — `fileExists("/etc/passwd")` returns `false`; `fileRead()` on any host path returns "file not found". The application cannot discover or read files outside the embedded archive.
+- **All writes are blocked** — `fileWrite()`, `fileAppend()`, `fileDelete()`, `directoryCreate()`, and other write operations throw *"filesystem writes are disabled in sandbox mode"*.
+
+Even if application code is compromised (e.g. via a code-injection vulnerability), the attacker cannot read sensitive host files, write persistent backdoors/web shells, or modify host files. The embedded virtual filesystem is **read-only and non-persistent** — any state the application needs to persist should use external services (databases, APIs).
+
+## Memory tuning (advanced)
+
+Most deployments need nothing from this section: set `--max-memory` and stop.
+It exists for the two questions that come up when a footprint graph looks
+wrong — *is this a leak?* and *can I make it smaller?* — and for the knobs that
+answer them.
+
+### How memory behaves
+
+- **Acyclic data is freed the moment its last owner drops it.** Values are
+  reference-counted, so a request's arrays, structs and strings go back to the
+  allocator as frames return; there is no pause and nothing to tune.
+- **Only cycles need the collector.** A CFC instance is inherently cyclic
+  (`this → variables → this`), so the cycle collector runs a trial-deletion
+  sweep over the containers a request allocated: incrementally during a long
+  request, always at request end, and across requests for anything (an
+  application-scope graph, say) that became garbage after the request that made
+  it. A framework reload drops a whole generation of singletons at once; the
+  collector notices the displacement and sweeps within ~15–30 s.
+- **Footprint sits above live data.** After a reload the freed generation leaves
+  the allocator's segments partially used, so the resident footprint plateaus
+  at roughly 1.6× the live heap and stays there. That plateau is not a leak:
+  the live heap, measured with the profiler below, moves by a few MB per reload.
+  A leak is a footprint that keeps climbing reload after reload with no plateau.
+
+### Collector tunables
+
+Defaults were chosen by measurement on real applications and should not
+normally be changed. They are environment variables, read once at startup.
+
+| variable | default | what it controls |
+|---|---|---|
+| `RUSTCFML_GC_INCREMENTAL` | `100000` | Young-generation budget: how many new containers a request may allocate before a mid-request (minor) sweep. Lower = less transient garbage held, more sweeps. `0` disables mid-request sweeping (request-end only). Measured on a 2,737-spec test suite: 25k / 50k / 100k gave 5.8 / 6.1 / 4.1 s of sweeps with the same peak memory. |
+| `RUSTCFML_GC_PERSISTENT` | `50000` | Base budget for the cross-request sweep over survivors carried between requests; the sweep runs when that set has doubled. `0` disables carrying survivors (not recommended: anything that becomes garbage after its request then leaks). |
+| `RUSTCFML_GC_DISPLACE_SWEEP_MIN` | `1000` | Minimum size of a displaced graph (a key overwritten or deleted that held that many containers) for the request end to trigger a sweep immediately rather than wait for the budget. `0` disables the trigger. |
+| `RUSTCFML_RELOG_BUDGET` | `20000` | Most containers a single overwrite or delete may re-enter into the collector's log. Bounds the cost of the mutation hook. |
+| `RUSTCFML_GC_LOG_CAP` | `4000000` | Hard cap on the per-request log (~16 bytes an entry, so ~64 MB). At the cap the log is compacted; only a request holding more distinct containers than that pauses logging for its remainder. |
+| `RUSTCFML_MAX_MEMORY` | unset | Same as `--max-memory` (see above). |
+
+### Diagnostics
+
+Each of these prints to stderr at request end and is off unless set. They cost a
+pass over the data they report on, so use them on a test instance, not in
+production.
+
+| variable | prints |
+|---|---|
+| `RUSTCFML_GC_DEBUG=1` | Every sweep: entries examined, nodes reclaimed, live count, timing; request-end log size by container type; displacement and cross-request sweep decisions. The first place to look when a footprint climbs. |
+| `RUSTCFML_CACHE_CENSUS=1` | Sizes of the process-wide caches (bytecode, component paths, canonicalised paths, interned names), live component blueprints per class, and each application scope's approximate size with a breakdown by shape (component instances, metadata structs, functions, strings). Answers *what is holding the heap*. |
+| `RUSTCFML_GC_ROOTS=N` | For the cross-request sweep, the N largest survivors with the reference that pins each (which scope or key holds it). Answers *why is this generation still alive*. |
+| `--memprofile` | A sampling heap profiler (release binary built with `--features memprofile`): `kill -USR2 <pid>` dumps live and total allocations by call stack as `.folded` files for a flame graph. Answers *which code allocated what is live*. |
+
+A useful habit: read `RUSTCFML_GC_DEBUG` first. If tracked nodes return to the
+same count after each reload while footprint climbs, it is allocator retention
+(below), not the engine; if the count climbs, `RUSTCFML_GC_ROOTS` names the holder.
+
+### Allocator retention
 
 Since v0.590.0 the release binary uses **mimalloc** as its global allocator, which
 is worth roughly 15% on a warm request. mimalloc retains OS arenas rather than
@@ -250,20 +325,3 @@ So: reach for them when idle RSS is the constraint and the application is
 routing- or IO-bound, and measure your own allocation-heavy endpoints before
 committing. Both are ordinary environment variables, so they can be set per
 deployment without touching the binary.
-
-## Sandbox / virtual filesystem (web and CLI)
-
-Self-contained binaries can run in **sandbox mode**, which completely isolates the application from the host filesystem. Sandbox mode also enables production caching automatically, since the embedded VFS is immutable at runtime.
-
-```bash
-./myserver --sandbox                # No host filesystem access
-./myserver --sandbox --port 3000    # Sandbox + custom port
-```
-
-In sandbox mode:
-
-- **Embedded files are readable** — `fileRead()`, `fileExists()`, `directoryList()`, `expandPath()`, and `include` all work against the embedded virtual filesystem. Your application can read its own bundled config files, templates, and assets normally.
-- **Host filesystem is invisible** — `fileExists("/etc/passwd")` returns `false`; `fileRead()` on any host path returns "file not found". The application cannot discover or read files outside the embedded archive.
-- **All writes are blocked** — `fileWrite()`, `fileAppend()`, `fileDelete()`, `directoryCreate()`, and other write operations throw *"filesystem writes are disabled in sandbox mode"*.
-
-Even if application code is compromised (e.g. via a code-injection vulnerability), the attacker cannot read sensitive host files, write persistent backdoors/web shells, or modify host files. The embedded virtual filesystem is **read-only and non-persistent** — any state the application needs to persist should use external services (databases, APIs).
