@@ -75,6 +75,57 @@ RustCFML supports two pluggable session backends beyond the in-process default, 
 
 Both backends share the same `sessionStorage` / `caches` keys in `.cfconfig.json`, so the configuration shape carries across Lucee and BoxLang. Switching backends is a config-only change — no rebuild needed. See the **[`caches` and `sessionStorage` section of Configuration](configuration.md#caches-and-sessionstorage)** for the full reference, a three-node walkthrough, and a troubleshooting table.
 
+## Streaming responses with `<cfflush>`
+
+By default a request's output is buffered and sent as one response when the page
+finishes, which is what lets `<cfheader>`, `<cfcontent>` and `<cflocation>` be
+decided at any point during the page.
+
+`<cfflush>` opts out of that for a single request. The first flush **commits**
+the response — the status line and headers are sent with that chunk — and
+everything the page produces afterwards is streamed as it is produced, using
+chunked transfer-encoding with no `Content-Length`. Use it for slow reports,
+progress output, or server-sent-event style endpoints:
+
+```cfml
+<cfoutput>Starting…</cfoutput>
+<cfflush>
+
+<cfloop query="bigResult">
+    <cfoutput>#bigResult.name#<br></cfoutput>
+    <cfflush>
+</cfloop>
+```
+
+`<cfflush interval="8192">` sets it and forgets it: output is flushed
+automatically whenever the buffer passes that many bytes, for the rest of the
+request.
+
+Because committing the response is irreversible, once you have flushed:
+
+| after `<cfflush>` | behaviour |
+|---|---|
+| another `<cfflush>`, `<cfabort>` | fine |
+| `<cfcookie>` | accepted but ineffective — the header has already gone |
+| `<cfheader>`, `<cfcontent>`, `<cflocation>`, `<cfhtmlhead>`, `<cfhtmlbody>` | raise an error |
+
+So set your status, headers and cookies *before* the first flush. A page that
+never calls `<cfflush>` is completely unaffected and keeps its `Content-Length`.
+
+`isFlushed()` tells you which side of that line you are on, so shared code can
+branch instead of guessing:
+
+```cfml
+<cfif not isFlushed()>
+    <cfheader statuscode="404" statustext="Not Found">
+</cfif>
+```
+
+Behaviour matches Lucee, including a flush inside `<cfsavecontent>`, which
+pushes the page output written before the capture and leaves the capture itself
+intact. The exact semantics and the two paths where a flush degrades back to
+buffering are in **[known issues §87](known-issues.md)**.
+
 ## URL rewriting
 
 Place a `urlrewrite.xml` file in your document root for Tuckey-compatible URL rewriting. This enables clean URLs and REST-style routing:

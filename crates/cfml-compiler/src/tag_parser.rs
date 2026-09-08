@@ -1609,6 +1609,23 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 )
             }
         }
+        "cfflush" => {
+            // <cfflush>                 → __cfflush({});
+            // <cfflush interval="1024"> → __cfflush({ interval: 1024 });
+            // Attributes are Lucee's: `interval` (auto-flush threshold in bytes)
+            // and `throwonerror` (default true). ACF and BoxLang accept no
+            // attributes at all, so a plain <cfflush> is the portable spelling.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                let raw = v.trim();
+                if raw.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, raw));
+                } else {
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+                }
+            }
+            (format!("__cfflush({{ {} }});\n", parts.join(", ")), tag_end - start)
+        }
         "cfheader" => {
             // <cfheader statuscode="200" statustext="OK">
             // → __cfheader({statuscode: 200, statustext: "OK"});

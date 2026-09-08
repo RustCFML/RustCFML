@@ -2404,3 +2404,80 @@ listening on a different signal it fails, the client getting a truncated read
 **For image authors.** `STOPSIGNAL SIGINT` is no longer needed from v0.653.14 and
 is harmless to keep. Set the platform's grace period above your slowest request
 so a draining server is never SIGKILLed.
+
+## 87. `<cfflush>` streams and commits — what stops working afterwards, and where it degrades to a no-op 🏗 *(GH [#419](https://github.com/RustCFML/RustCFML/issues/419))*
+
+Implemented in the `--serve` response pipeline, not just in the tag parser: the
+first `<cfflush>` **commits** the response (status line + headers go out with
+that chunk) and the rest of the page is delivered as chunked transfer-encoding
+as it is produced. A page that never flushes takes exactly the buffered path it
+always did, `Content-Length` and all — the streaming machinery is inert until a
+flush actually happens.
+
+**Flush targets the ROOT buffer, not the innermost capture — we follow Lucee,
+not BoxLang.** Both engines were read at source:
+
+* Lucee's `tag/Flush.java` calls `getRootOut().flush()`, and `getRootOut()` is
+  `bodyContentStack.getBase()` — the base writer. A flush inside
+  `<cfsavecontent>` therefore ships the page text written *before* the capture
+  began and leaves the capture intact.
+* BoxLang's `components/system/Flush.java` calls `context.flushBuffer(true)`,
+  and its `BaseBoxContext.flushBuffer` drags *every* registered buffer out when
+  `force` is set — so a flush inside a capture leaks the captured text to the
+  client.
+
+We match Lucee (and ACF). Verified live against Lucee 7.1:
+`<cfsavecontent variable="cap">A<cfflush>B</cfsavecontent>` leaves `cap` as `AB`
+on both engines.
+
+**What raises after the response is committed.** This matrix was measured
+against a running Lucee 7.1, not assumed — the servlet spec would suggest
+`cfheader` is silently ignored on a committed response, but Lucee's
+`Header.doStartTag` throws on `isCommitted()`. Our messages match Lucee's
+exactly; only `cfcatch.type` casing differs, which is a pre-existing engine-wide
+convention difference (Lucee lowercases engine-generated types) and is
+immaterial because CFML type matching is case-insensitive.
+
+| after `<cfflush>` | behaviour |
+|---|---|
+| another `<cfflush>` | fine |
+| `<cfabort>` | fine |
+| `<cfcookie>` | fine — silently ineffective, the header has gone |
+| `<cfheader>` | raises `template`: `can't assign value to header, header is already committed` |
+| `<cfcontent>` (**any**, not just `reset`) | raises `application`: `Content was already flushed` |
+| `<cflocation>` | raises: `Response buffer is already flushed` |
+| `<cfhtmlhead>` / `<cfhtmlbody>` | raises: `Page is already flushed` |
+
+`isFlushed()` reports whether the response has been committed — Lucee's
+`IsFlushed` is literally `pc.getHttpServletResponse().isCommitted()`, i.e. the
+same flag the table above is keyed on, so it is the supported way to ask "can I
+still set a header?". BoxLang has no equivalent. It is always `false` under the
+CLI, where nothing is ever committed.
+
+`interval="N"` auto-flushes once the buffer passes N bytes (Lucee's
+`setBufferConfig(N, autoFlush=true)`). A non-numeric interval is a **cast**
+error (`can't cast [abc] string to a number value`) raised regardless of
+`throwonerror`, which covers only the flush itself; a negative or zero interval
+is *not* an error on Lucee — it means "flush on every write" — and is accepted
+here too.
+
+**Where it degrades to buffering.** Two serve-mode paths build one buffered body
+and cannot stream: the `onMissingTemplate` handler and the error-template path.
+A `<cfflush>` reached from those keeps buffering — output still renders
+correctly and in order, it simply arrives in one piece — and, importantly, does
+**not** commit, so nothing that follows starts failing. It must never fall
+through to the CLI's stdout path, which is the server's console, not the client.
+
+In CLI mode the root output *is* stdout, so a flush genuinely prints what has
+accumulated. Nothing is committed there because there are no response headers to
+freeze, which is why `<cflocation>` and friends keep working after a CLI flush.
+
+A flush from inside a `cfthread` body is a no-op: the thread writes to its own
+captured buffer and has no client of its own (Lucee gives the thread a separate
+`PageContext`, so its `getRootOut()` is not the request's either).
+
+Tests: `tests/tags/test_cfflush.cfm` + `tests/tags/flush_target.cfm`. The
+flushing cases run over HTTP against a target page rather than in the runner
+itself, because a flush in the runner would freeze the runner's own headers and
+break every later `cfheader`/`cflocation`/`cfcontent` test. 15/15 green on both
+RustCFML and Lucee 7.1.

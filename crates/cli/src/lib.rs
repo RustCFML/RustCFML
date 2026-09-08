@@ -942,7 +942,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     }
     let cli_vfs: Arc<dyn vfs::Vfs> =
         Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs()));
-    let result = compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false);
+    let result = compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, None);
     // Buffered `<cflog>` lines must reach disk before we return or `exit(1)`
     // — the error path below never unwinds, so no Drop guard would run.
     logging::flush_all();
@@ -1012,8 +1012,9 @@ fn compile_and_run_with_session(
     session_id: Option<String>,
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
+    flush_sink: Option<Box<dyn cfml_vm::flush::FlushSink>>,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true)
+    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true, flush_sink)
 }
 
 /// Run the Application.cfc lifecycle for a requested template that does NOT
@@ -1034,7 +1035,7 @@ fn run_missing_template(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true)
+    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true, None)
 }
 
 /// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
@@ -1157,6 +1158,10 @@ fn compile_and_run(
     sandbox: bool,
     missing_template: Option<String>,
     web_context: bool,
+    // Installed when the embedder can stream: `<cfflush>` then pushes output
+    // to the client mid-request instead of buffering to the end. `None` in CLI
+    // mode, where a flush writes to stdout. See `cfml_vm::flush`.
+    flush_sink: Option<Box<dyn cfml_vm::flush::FlushSink>>,
 ) -> Result<CfmlResponse, CfmlRunError> {
     // Connection-per-request DB isolation. Serve-mode requests run on reused
     // tokio blocking threads, and each request holds one pooled DB connection per
@@ -1274,6 +1279,7 @@ fn compile_and_run(
     vm.sandbox = sandbox;
     vm.base_template_path = source_file.clone();
     vm.source_file = source_file;
+    vm.flush_sink = flush_sink;
 
     // Register builtins, builtin functions, native modules, and the DB
     // transaction/query function pointers. Shared with spawned cfthread child
@@ -1416,6 +1422,16 @@ fn compile_and_run(
     // request's transient roots (page `variables`, request/thread scopes, call
     // frames, the per-request application-scope wrapper) in one go. Persistent
     // state already lives in `ServerState` (Arc-shared), so it survives the drop.
+    // Once a <cfflush> has committed the response, everything produced after the
+    // last flush — including the debug footer and cfhtmlhead/cfhtmlbody content
+    // appended just above — must leave through the same sink. `cfflush` drains
+    // the root buffer, so `output` below is then empty and the embedder streams
+    // nothing further. The error path does the same before the message is
+    // rendered, so a page that failed after flushing still delivers its prefix.
+    if vm.response_flushed {
+        let _ = vm.cfflush();
+    }
+
     let response = match result {
         Ok(_) => Ok(CfmlResponse {
             output: std::mem::take(&mut vm.output_buffer),
@@ -3135,7 +3151,15 @@ async fn handle_request_inner(
                 n.eq_ignore_ascii_case("x-forwarded-proto") && v.eq_ignore_ascii_case("https")
             });
 
-            let result = tokio::task::spawn_blocking(move || {
+            // A <cfflush> anywhere in the page turns this into a streaming
+            // response. Until the first flush arrives nothing is committed, so
+            // a page that never flushes takes exactly the buffered path it
+            // always did — the channel simply closes unused.
+            let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<FlushEvent>(8);
+            let sink: Box<dyn cfml_vm::flush::FlushSink> =
+                Box::new(ChannelFlushSink { tx: flush_tx });
+
+            let handle = tokio::task::spawn_blocking(move || {
                 compile_and_run_with_session(
                     &source,
                     debug,
@@ -3146,13 +3170,36 @@ async fn handle_request_inner(
                     session_id_clone,
                     vfs,
                     sandbox,
+                    Some(sink),
                 )
-            }).await.unwrap();
+            });
 
-            match result {
-                Ok(response) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
-                Err(e) => {
-                    render_error_response(&state, &e)
+            // The request thread owns the only sender, so `None` here means it
+            // finished without ever flushing.
+            match flush_rx.recv().await {
+                None => match handle.await.unwrap() {
+                    Ok(response) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
+                    Err(e) => render_error_response(&state, &e),
+                },
+                Some(FlushEvent::Commit(commit, first_chunk)) => build_streaming_response(
+                    *commit,
+                    first_chunk,
+                    flush_rx,
+                    handle,
+                    existing_sid.as_ref(),
+                    conn_is_secure,
+                ),
+                // The VM always sends the commit snapshot on the first flush.
+                Some(FlushEvent::Chunk(chunk)) => {
+                    debug_assert!(false, "first flush event must carry the commit snapshot");
+                    build_streaming_response(
+                        cfml_vm::flush::FlushCommit::default(),
+                        chunk,
+                        flush_rx,
+                        handle,
+                        existing_sid.as_ref(),
+                        conn_is_secure,
+                    )
                 }
             }
         }
@@ -3300,6 +3347,129 @@ async fn handle_request_inner(
                 .unwrap()
         }
     }
+}
+
+/// One `<cfflush>` crossing from the request's blocking thread to the async
+/// response task. The first event always carries the [`FlushCommit`] snapshot,
+/// because the status line and headers must precede the first body byte.
+enum FlushEvent {
+    Commit(Box<cfml_vm::flush::FlushCommit>, String),
+    Chunk(String),
+}
+
+/// [`FlushSink`](cfml_vm::flush::FlushSink) that hands flushed output to the
+/// async side over a bounded channel.
+///
+/// Bounded on purpose: it applies backpressure, so a page that flushes in a
+/// tight loop is paced by how fast the client reads instead of building an
+/// unbounded queue in memory. `blocking_send` is the correct call here — the
+/// request runs inside `spawn_blocking`, never on a runtime worker.
+struct ChannelFlushSink {
+    tx: tokio::sync::mpsc::Sender<FlushEvent>,
+}
+
+impl cfml_vm::flush::FlushSink for ChannelFlushSink {
+    fn flush(&mut self, commit: Option<cfml_vm::flush::FlushCommit>, chunk: String) -> bool {
+        let event = match commit {
+            Some(c) => FlushEvent::Commit(Box::new(c), chunk),
+            None => FlushEvent::Chunk(chunk),
+        };
+        // Err means the receiver is gone: the client disconnected, so tell the
+        // VM to stop flushing.
+        self.tx.blocking_send(event).is_ok()
+    }
+}
+
+/// Build a chunked, streaming response for a request that called `<cfflush>`.
+///
+/// The status and headers come from `commit` — the snapshot taken at the moment
+/// of the first flush — because by definition they can no longer be revised.
+/// Everything the page produces afterwards, including the trailing flush that
+/// `compile_and_run` performs at the end, arrives on `rx` and is forwarded as
+/// it comes. No `Content-Length` is set, so hyper frames the body with chunked
+/// transfer-encoding.
+fn build_streaming_response(
+    commit: cfml_vm::flush::FlushCommit,
+    first_chunk: String,
+    mut rx: tokio::sync::mpsc::Receiver<FlushEvent>,
+    handle: tokio::task::JoinHandle<Result<CfmlResponse, CfmlRunError>>,
+    existing_sid: Option<&String>,
+    conn_is_secure: bool,
+) -> axum::response::Response<axum::body::Body> {
+    let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
+        commit.content_type.as_deref(),
+        &commit.headers,
+    );
+
+    let status_code = commit.status.as_ref().map(|(c, _)| *c).unwrap_or(200);
+    let mut builder = axum::response::Response::builder()
+        .status(status_code)
+        .header("Content-Type", content_type.as_str());
+    for (name, value) in &emit_headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if let Some(ref sid) = commit.session_id {
+        if commit.session_record_created || Some(sid) != existing_sid {
+            builder = builder.header(
+                "Set-Cookie",
+                commit.session_cookie_policy.render("CFID", sid, conn_is_secure),
+            );
+        }
+    }
+
+    // Forward the remaining chunks, then — once the blocking task has finished —
+    // append the message of an error raised AFTER the commit. There is no way to
+    // turn that into a 500 at this point: the 200 and its headers are already on
+    // the wire, so the truthful thing is to let the partial page carry the error
+    // rather than to end the stream as if the page had completed. (This is what
+    // Lucee does too: an exception after flush is written into the response.)
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+    tokio::spawn(async move {
+        if !first_chunk.is_empty() && out_tx.send(bytes::Bytes::from(first_chunk)).await.is_err() {
+            return;
+        }
+        while let Some(event) = rx.recv().await {
+            let chunk = match event {
+                // Only the first event commits, and the caller consumed it.
+                FlushEvent::Commit(_, c) => c,
+                FlushEvent::Chunk(c) => c,
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            if out_tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+                return;
+            }
+        }
+        // `rx` closed ⇒ the request thread dropped its sender ⇒ it is done.
+        match handle.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let _ = out_tx
+                    .send(bytes::Bytes::from(format!(
+                        "\n<!-- error after cfflush -->\n<pre>{}</pre>\n",
+                        html_escape(&e.message)
+                    )))
+                    .await;
+            }
+            Err(join_err) => {
+                let _ = out_tx
+                    .send(bytes::Bytes::from(format!(
+                        "\n<!-- request failed after cfflush: {} -->\n",
+                        html_escape(&join_err.to_string())
+                    )))
+                    .await;
+            }
+        }
+    });
+
+    let stream = futures_util::stream::unfold(out_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<bytes::Bytes, std::io::Error>(chunk), rx))
+    });
+
+    builder.body(axum::body::Body::from_stream(stream)).unwrap()
 }
 
 /// Build the HTTP response for a successful CFML execution: honour a
@@ -3508,6 +3678,7 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
                 state.sandbox,
                 None,
                 true,
+                None,
             ) {
                 let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
                     resp.response_content_type.as_deref(),
@@ -4529,7 +4700,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute
-    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false) {
+    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false, None) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);

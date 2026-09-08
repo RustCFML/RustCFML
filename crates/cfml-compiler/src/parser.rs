@@ -1062,6 +1062,7 @@ impl Parser {
                     "content" => Some(TagStmt::StructArg("__cfcontent")),
                     "application" => Some(TagStmt::StructArg("__cfapplication")),
                     "header" => Some(TagStmt::StructArg("__cfheader")),
+                    "flush" => Some(TagStmt::StructArg("__cfflush")),
                     "location" => Some(TagStmt::StructArg("__cflocation")),
                     "setting" => Some(TagStmt::StructArg("__cfsetting")),
                     "cookie" => Some(TagStmt::StructArg("__cfcookie")),

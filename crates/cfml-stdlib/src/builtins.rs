@@ -638,6 +638,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("GetContextRoot".to_string(), fn_get_context_root);
     f.insert("getPageContext".to_string(), fn_get_page_context);
     f.insert("isInThread".to_string(), fn_is_in_thread);
+    f.insert("isFlushed".to_string(), fn_is_flushed);
 
     // ---- List functions ----
     f.insert("listNew".to_string(), fn_list_new);
@@ -911,6 +912,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("arrayShift".to_string(), fn_array_shift);
 
     // ---- HTTP/Tag infrastructure (VM-intercepted) ----
+    f.insert("__cfflush".to_string(), fn_cfflush_stub);
     f.insert("__cfheader".to_string(), fn_cfheader_stub);
     f.insert("__cfcontent".to_string(), fn_cfcontent_stub);
     f.insert("__cflocation".to_string(), fn_cflocation_stub);
@@ -5951,6 +5953,13 @@ fn fn_get_base_tag_data_stub(args: Vec<CfmlValue>) -> CfmlResult {
         "can't find base tag with name [{}]",
         name.to_uppercase()
     )))
+}
+
+fn fn_is_flushed(_args: Vec<CfmlValue>) -> CfmlResult {
+    // Fallback only. The real isFlushed() is VM-intercepted in `cfml-vm`
+    // (reads whether a <cfflush> has committed the response). Off-VM there is
+    // no response to commit, so it conservatively reports false.
+    Ok(CfmlValue::Bool(false))
 }
 
 fn fn_is_in_thread(_args: Vec<CfmlValue>) -> CfmlResult {
@@ -15049,6 +15058,10 @@ fn build_mutation_result(affected: i64, last_id: i64, sql: &str) -> CfmlResult {
 
 fn fn_cfdbinfo_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("cfdbinfo requires VM intercept".into()))
+}
+
+fn fn_cfflush_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__cfflush requires VM intercept".into()))
 }
 
 fn fn_cfheader_stub(_args: Vec<CfmlValue>) -> CfmlResult {

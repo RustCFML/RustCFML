@@ -14,7 +14,7 @@ use super::*;
 /// Names this module handles.
 #[inline]
 pub(crate) fn handles(name_lower: &str) -> bool {
-    matches!(name_lower, "writeoutput" | "echo" | "__writetext" | "writedump" | "dump" | "cfdump")
+    matches!(name_lower, "writeoutput" | "echo" | "__writetext" | "writedump" | "dump" | "cfdump" | "__cfflush" | "isflushed")
 }
 
 impl CfmlVirtualMachine {
@@ -35,6 +35,69 @@ impl CfmlVirtualMachine {
                     let s = arg.to_string_strict().map_err(|e| self.wrap_error(e))?;
                     self.output_buffer.push_str(&s);
                 }
+                // <cfflush interval="N"> — ship the buffer once it passes N.
+                self.check_auto_flush().map_err(|e| self.wrap_error(e))?;
+                return Ok(CfmlValue::Null);
+            }
+
+            // isFlushed() — true once a <cfflush> has committed the response.
+            //
+            // Lucee's IsFlushed is `pc.getHttpServletResponse().isCommitted()`,
+            // i.e. exactly the flag that decides whether cfheader/cfcontent/
+            // cflocation still work. (BoxLang has no equivalent.) Outside a
+            // streaming web response nothing is ever committed, so this is
+            // false under the CLI — where those tags do keep working.
+            if name_lower == "isflushed" {
+                return Ok(CfmlValue::Bool(self.response_flushed));
+            }
+
+            // <cfflush> / <cfflush interval="N"> / cfflush(interval=N)
+            //
+            // `interval` configures auto-flushing for the rest of the request
+            // (Lucee: `setBufferConfig(interval, autoFlush=true)`); a bare
+            // cfflush pushes the root buffer once. `throwonerror` (Lucee-only,
+            // default true) decides whether a transport failure surfaces.
+            if name_lower == "__cfflush" {
+                let opts = match args.first() {
+                    Some(CfmlValue::Struct(o)) => Some(o),
+                    _ => None,
+                };
+                let lookup = |key: &str| -> Option<CfmlValue> {
+                    opts.and_then(|o| {
+                        o.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                            .map(|(_, v)| v.clone())
+                    })
+                };
+
+                // Lucee defaults throwonerror to true.
+                let throw_on_error = lookup("throwonerror")
+                    .map(|v| v.is_true())
+                    .unwrap_or(true);
+
+                let outcome = match lookup("interval") {
+                    Some(v) => {
+                        // Lucee casts the attribute to a double before the tag
+                        // body runs, so a non-numeric interval is an
+                        // `expression` CAST error, raised regardless of
+                        // throwonerror (which only covers the flush itself).
+                        // Verified against Lucee 7.1:
+                        //   interval="abc" → "can't cast [abc] string to a number value"
+                        let n = crate::arith_operand(&v).map_err(|e| self.wrap_error(e))?;
+                        // A negative or zero interval is NOT an error on Lucee:
+                        // `setBufferConfig` stores it and `_check()` then sees
+                        // `buffer.length() > interval` as always true, i.e.
+                        // flush on every write. Saturating to 0 reproduces that.
+                        self.cfflush_set_interval(if n < 0.0 { 0 } else { n as usize })
+                    }
+                    None => self.cfflush(),
+                };
+
+                if let Err(e) = outcome {
+                    if throw_on_error {
+                        return Err(self.wrap_error(e));
+                    }
+                }
                 return Ok(CfmlValue::Null);
             }
 
@@ -46,6 +109,7 @@ impl CfmlVirtualMachine {
                         // pushed into the output buffer and dropped.
                         self.output_buffer.push_str(&arg.as_str_cow());
                     }
+                    self.check_auto_flush().map_err(|e| self.wrap_error(e))?;
                 }
                 return Ok(CfmlValue::Null);
             }

@@ -153,6 +153,7 @@ pub mod fuse_counters {
 pub mod socketio_compat;
 pub mod web;
 pub mod websocket;
+pub mod flush;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
@@ -2316,6 +2317,20 @@ pub struct CfmlVirtualMachine {
     pub http_request_data: Option<CfmlValue>,
     /// Stack of saved output buffers for cfsavecontent
     pub saved_output_buffers: Vec<String>,
+    /// Sink that carries `<cfflush>` output to the client while the request is
+    /// still running. Installed by the server; `None` in CLI mode, where a
+    /// flush goes straight to stdout. See [`crate::flush`].
+    pub flush_sink: Option<Box<dyn crate::flush::FlushSink>>,
+    /// True once a `<cfflush>` has committed the response. Status/headers are
+    /// then frozen: `cfheader`/`cfcookie` are silently dropped (servlet parity)
+    /// and `cflocation` / `cfcontent reset` / `cfhtmlhead` raise an error.
+    pub response_flushed: bool,
+    /// `<cfflush interval="N">` — once set, output auto-flushes whenever the
+    /// root buffer exceeds N bytes. Lucee's `setBufferConfig(N, autoFlush=true)`.
+    pub flush_interval: Option<usize>,
+    /// Set when a flush found the peer gone. Later flushes go quiet rather than
+    /// raising the same transport error over and over.
+    pub output_sink_gone: bool,
     /// Nesting depth of cfthread bodies currently executing on this VM. Drives
     /// the `isInThread()` BIF (TestBox's StreamingService auto-queues events
     /// when called from a thread context). Incremented around `run_thread_body`.
@@ -3964,6 +3979,10 @@ impl CfmlVirtualMachine {
             redirect_url: None,
             http_request_data: None,
             saved_output_buffers: Vec::new(),
+            flush_sink: None,
+            response_flushed: false,
+            flush_interval: None,
+            output_sink_gone: false,
             in_thread_body: 0,
             base_template_path: None,
             mappings: Vec::new(),
@@ -9653,6 +9672,7 @@ impl CfmlVirtualMachine {
                     } else if matches!(
                         name_lower,
                         "cfheader"
+                            | "cfflush"
                             | "cfcontent"
                             | "cflocation"
                             | "location"
@@ -17931,6 +17951,11 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cfheader" => {
+                    self.error_if_flushed(
+                        "can't assign value to header, header is already committed",
+                        CfmlErrorType::Template,
+                    )
+                    .map_err(|e| self.wrap_error(e))?;
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         if let Some(code_val) = opts
                             .iter()
@@ -17965,6 +17990,11 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cfcontent" => {
+                    // Lucee's Content.doStartTag guards the WHOLE tag on
+                    // rsp.isCommitted(), not just the reset — any cfcontent
+                    // rewrites the response header.
+                    self.error_if_flushed("Content was already flushed", CfmlErrorType::Application)
+                        .map_err(|e| self.wrap_error(e))?;
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         if let Some(reset_val) = opts
                             .iter()
@@ -18084,6 +18114,11 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cfhtmlhead" | "__cfhtmlbody" => {
+                    // Lucee's writeHTMLHead/writeHTMLBody raise "Page is already
+                    // flushed": once the response is committed the <head>/<body>
+                    // this would inject into has already reached the client.
+                    self.error_if_flushed("Page is already flushed", CfmlErrorType::Application)
+                        .map_err(|e| self.wrap_error(e))?;
                     // Buffer the content; injected into the response <head>/<body>
                     // at output finalization (see finalize_html_injections).
                     // Two shapes reach here: the tag form `<cfhtmlhead text="…">`
@@ -18113,6 +18148,13 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cflocation" => {
+                    // A redirect is a status line + Location header; both left
+                    // with the first flushed chunk.
+                    self.error_if_flushed(
+                        "Response buffer is already flushed",
+                        CfmlErrorType::Application,
+                    )
+                    .map_err(|e| self.wrap_error(e))?;
                     let to_status = |v: &CfmlValue| -> u16 {
                         match v {
                             CfmlValue::Int(n) => *n as u16,
@@ -22802,6 +22844,7 @@ impl CfmlVirtualMachine {
                 // `attributeCollection={…}` single-struct form reached the
                 // intercept. (GitHub issue #141.)
                 | "__cfheader"
+                | "__cfflush"
                 | "__cfcontent"
                 | "__cflocation"
                 | "__cfcookie"
