@@ -312,7 +312,13 @@ async function runHttpFetch(req) {
       init.signal = AbortSignal.timeout(req.timeoutMs);
     }
 
-    const resp = await fetch(req.url, init);
+    // globalThis.fetch, not a bare `fetch`: esbuild bundles this snippet
+    // alongside wasm-bindgen's generated `function fetch(req, env, ctx)`
+    // export wrapper, and a bare reference makes it rename that wrapper to
+    // `fetch2` to avoid the collision. jspi-patch.mjs finds the wrapper by
+    // name, so the rename broke the build with "no wrapper found for
+    // wasm.fetch". Qualifying the global leaves the generated name alone.
+    const resp = await globalThis.fetch(req.url, init);
 
     const headers = {};
     resp.headers.forEach((value, key) => {
