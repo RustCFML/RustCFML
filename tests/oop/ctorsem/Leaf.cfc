@@ -3,4 +3,6 @@ component extends="Mid" {
 	function init() { return this; }
 	function leafMethod() { return "leaf-method"; }
 	function seenFromRoot() { return variables.fromRoot; }
+	function viaSuper() { return super.midMethod() & "+" & super.rootMethod(); }
+	function ownKeys() { return structKeyList( this ); }
 }

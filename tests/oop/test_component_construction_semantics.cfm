@@ -16,7 +16,7 @@ suiteBegin( "Component construction semantics (constructor once per level, live 
 request.ctorsemLog = "";
 leaf = new oop.ctorsem.Leaf();
 assert( "new: every level runs once, root first", request.ctorsemLog, "Root,Mid,Leaf" );
-assert( "inherited methods present after single-run chain", leaf.rootMethod() & "|" & leaf.midMethod() & "|" & leaf.leafMethod(), "root-method|mid-method|leaf-method" );
+assert( "inherited methods present after single-run chain", leaf.rootMethod() & "|" & leaf.midMethod() & "|" & leaf.leafMethod(), "mid-override+root-method|mid-method|leaf-method" );
 assert( "root ctor's variables write visible to the leaf", leaf.seenFromRoot(), "root" );
 
 request.ctorsemLog = "";
@@ -54,6 +54,25 @@ n2 = new oop.ctorsem.NamedCtor();
 assert( "named component: constructor ran for BOTH instantiations", request.ctorsemNamedRuns, 2 );
 assert( "named component: instances do not share this-state", n2.x, 1 );
 assert( "named component: same-named page variable is not clobbered", NamedCtor, "page variable, must survive" );
+
+// --- a replayed construction (2nd+ of a class in the request) is identical ---
+// The engine builds a class's method tables on its first construction and
+// attaches them on every later one; nothing observable may differ between them.
+function fnNames( md ) { local.n = []; for ( local.f in md.functions ) arrayAppend( local.n, local.f.name ); arraySort( local.n, "textnocase" ); return arrayToList( local.n ); }
+first  = new oop.ctorsem.Leaf();
+second = new oop.ctorsem.Leaf();
+third  = createObject( "component", "oop.ctorsem.Leaf" ).init();
+assert( "replay: getMetadata(...).functions identical", fnNames( getMetadata( second ) ), fnNames( getMetadata( first ) ) );
+assert( "replay: leaf metadata lists ONLY own functions", fnNames( getComponentMetaData( "oop.ctorsem.Leaf" ) ), "init,leafMethod,ownKeys,seenFromRoot,viaSuper" );
+assert( "replay: public key list identical", listSort( second.ownKeys(), "textnocase" ), listSort( first.ownKeys(), "textnocase" ) );
+assert( "replay: super dispatch through a 3-level chain", third.viaSuper(), "mid-method+mid-override+root-method" );
+assert( "replay: overridden method resolves to the override, super to the parent", third.rootMethod(), "mid-override+root-method" );
+// NOTE: `isInstanceOf( third, "oop.ctorsem.Root" )` is TRUE on Lucee and FALSE here on
+// every construction (first included): a relative `extends="Mid"` chain is never
+// package-qualified for the path-aware check. Pre-existing, unrelated to construction.
+second.extra = "per-instance";
+assertFalse( "replay: instances do not share public state", structKeyExists( first, "extra" ) );
+assertFalse( "replay: no private-scope method leaks onto the public view", structKeyExists( first, "fromRoot" ) );
 
 // --- an empty component is still a component ---------------------------------
 e = new oop.ctorsem.Empty();

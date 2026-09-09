@@ -2639,3 +2639,61 @@ Tests: `tests/oop/test_component_construction_semantics.cfm` (19 assertions,
 cross-engine, fixtures in `tests/oop/ctorsem/`) — 19/19 on RustCFML and Lucee,
 **11/19 on the v0.657.0 binary** with the doubled constructor logs visible in
 the failure output.
+
+## 90. Component construction no longer scales with method count: a class's method tables are attached, not rebuilt, from its second construction on (v0.659.0) 📌
+
+Follow-on to §89, which left the flat 86-method `new` at 24 µs with ~20 µs of it
+spent materialising the 86 method entries into three per-instance maps (the
+constructor's `variables` seed, the template `this`, the assembled `variables`)
+and then stripping them all into the shared per-class table that already
+existed from the first instance. Subclasses paid the same again in the parent
+hand-off: `all_entries()` on the parent (quadratic in the method count), the
+`super` struct rebuilt from those entries, and the merge's
+`snapshot_with_methods()` of the parent — all class-invariant, all per instance.
+
+**The change ("replay").** A class's first construction in a request is
+unchanged and builds the tables as before. Every later construction of that
+class (`class_method_tables` has its source file) attaches instead of copies:
+the constructor's `variables` seed carries the class's shared `variables` table;
+`DefineComponentMethods` attaches a per-class OWN-methods table to the template
+`this` and writes nothing per method; the parent hand-off reuses a cached
+`__is_super` struct and stages only the parent's data members; the merge copies
+the parent's data and bookkeeping keys and takes the super struct from the
+template. Class-invariant metadata (`__extends_chain`, `__super_map`, …) is now
+shared in every mode, not production only — the cache lives on the per-request
+VM, and a class cannot change within a request.
+
+**Two things the first attempt got wrong, both caught by existing tests.**
+Attaching the class's FINAL table (own + inherited) to the template `this` made
+`getComponentMetaData(child).functions` list the parent's methods, and the leaf
+metadata builder read the template map only, so it then listed nothing. Hence the
+separate own-methods table, and the leaf builder now snapshots with methods.
+Staging the parent's methods onto the child's `this` on a first construction
+(for `structKeyExists(this, "inherited")` parity with Lucee, which answers true)
+polluted the same metadata and was reverted — that read stays `false` on both
+paths, a small pre-existing divergence, recorded in `planning/`.
+
+Same rig as §89, µs per `createObject().init()`, best-of-4 warm on the Lucee arm:
+
+| shape | v0.658.0 | v0.659.0 | Lucee 7.1 |
+|---|---|---|---|
+| 1 method | 4.0 | 3.4 | 0.57 |
+| 86 methods | 23.2 | **4.0** | 5.9 |
+| 200 methods | 51.9 | **4.6** | 15.5 |
+| 1-method child of an 86-method base | 53.6 | **8.3** | 7.35 |
+| 86-method child of an 86-method base | 84.3 | **8.8** | 14.0 |
+| 60,000 live instances, peak RSS | 272 MB | 272 MB | — |
+
+Construction cost is now flat in the method count and at or below Lucee for
+every shape but the trivial 1-method class, whose ~3 µs fixed cost (compile
+lookup, program swap, blueprint lookup, `init()` dispatch, Instance partition)
+is the next target. The replay is per request: a class constructed once per
+request still pays the full first-construction path, so the follow-on for
+Preside-shaped workloads is caching the class-level result across requests,
+keyed to the bytecode-cache entry.
+
+Tests: `tests/oop/test_component_construction_semantics.cfm` grew to 26
+cross-engine assertions, adding a replay block — metadata, public key list,
+3-level `super` dispatch, override resolution and per-instance isolation must be
+identical between a class's first and later constructions. 26/26 on RustCFML,
+Lucee 7.1 and the v0.658.0 binary (the replay must be unobservable).

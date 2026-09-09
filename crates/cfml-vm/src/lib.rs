@@ -2101,6 +2101,18 @@ pub struct CfmlVirtualMachine {
             Arc<cfml_common::dynamic::ValueMap>,
         ),
     >,
+    /// A class's OWN methods (the ones its body declares, none inherited), keyed
+    /// by source file. Built by the first `DefineComponentMethods` a class runs
+    /// and attached to the template `this` on every later construction (see
+    /// `replay_tables`). Deliberately not the merged table: the template's
+    /// `this` is what leaf metadata (`getComponentMetaData(X).functions`) and the
+    /// inheritance merge read, and both must see only the class's own methods.
+    pub class_own_method_tables: HashMap<String, Arc<cfml_common::dynamic::ValueMap>>,
+    /// The `__is_super`-tagged dispatch struct for a parent class (its full
+    /// method set), keyed by the PARENT's source file. Built by the first child
+    /// construction that resolves that parent; a replayed construction reuses it
+    /// instead of folding the parent's method table back into a fresh map.
+    pub class_super_values: HashMap<String, CfmlValue>,
     /// Source file path (for include resolution)
     pub source_file: Option<String>,
     /// Call stack for tracking execution
@@ -3936,6 +3948,8 @@ impl CfmlVirtualMachine {
             user_fn_lc_src_len: 0,
             method_arc_cache: HashMap::new(),
             class_method_tables: HashMap::new(),
+            class_own_method_tables: HashMap::new(),
+            class_super_values: HashMap::new(),
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
@@ -11844,6 +11858,24 @@ impl CfmlVirtualMachine {
                         Some(CfmlValue::Struct(vars)) => Some(vars.clone()),
                         _ => None,
                     };
+                    // Replay (see `replay_tables` in the template resolver): the
+                    // frame's variables scope already carries this class's shared
+                    // method table, so attach the matching `this` table to the
+                    // template and write nothing per method. Guarded on BOTH the
+                    // table existing for the executing file AND the frame scope
+                    // having been set up with one, so a body executed by any other
+                    // path (Application.cfc, a metadata walk) takes the full route.
+                    let replay_own_table = match (&frame_vars, self.source_file.as_deref()) {
+                        (Some(vars), Some(src)) if vars.method_table().is_some() => {
+                            self.class_own_method_tables.get(src).cloned()
+                        }
+                        _ => None,
+                    };
+                    if let Some(own_table) = replay_own_table {
+                        holder.set_method_table(own_table);
+                        continue;
+                    }
+                    let mut own_table = cfml_common::dynamic::ValueMap::default();
                     for gid in &cm.gids {
                         let gid = *gid as i64;
                         let Some(bf) = self.resolve_fn(gid) else {
@@ -11864,7 +11896,14 @@ impl CfmlVirtualMachine {
                                 locals.insert(bf.name.clone(), value.clone());
                             }
                         }
+                        own_table.insert(bf.name.clone(), value.clone());
                         holder.insert(bf.name.clone(), value);
+                    }
+                    if let Some(src) = self.source_file.as_deref() {
+                        if !src.is_empty() && !self.class_own_method_tables.contains_key(src) {
+                            self.class_own_method_tables
+                                .insert(src.to_string(), Arc::new(own_table));
+                        }
                     }
                 }
 
@@ -32344,9 +32383,22 @@ impl CfmlVirtualMachine {
             // values) keeps it reachable only via `super.x()` dispatch, avoiding
             // the unqualified-call recursion the note above warns about.
             let mut super_value: Option<CfmlValue> = None;
-            // Parent's explicit `this.*` data members, staged for the child body
+            // Parent's explicit `this.*` members, staged for the child body
             // (see `pending_pseudo_ctor_parent_this`).
             let mut parent_this_members: Option<ValueMap> = None;
+            // REPLAY: this class has already been fully constructed in this
+            // request, so its shared per-class method tables exist. Every later
+            // construction attaches those tables to the fresh scopes instead of
+            // materialising one map entry per method per scope and stripping
+            // them all again at finalize — the dominant cost of `new` on a
+            // method-heavy class (docs/known-issues.md §89, "where the 23 us go").
+            // Dispatch inside the pseudo-constructor is unchanged: a map miss
+            // falls through to the table. `None` on a class's first construction,
+            // which builds the tables the old way.
+            let replay_tables: Option<(
+                Arc<cfml_common::dynamic::ValueMap>,
+                Arc<cfml_common::dynamic::ValueMap>,
+            )> = self.class_method_tables.get(&*cfc_path).cloned();
             // The parent, fully resolved (its own chain merged, its pseudo-
             // constructor run ONCE). Kept and handed to `resolve_inheritance`
             // via `__resolved_parent` below, so the merge reuses it instead of
@@ -32363,10 +32415,38 @@ impl CfmlVirtualMachine {
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         let mut super_methods = ValueMap::default();
                         let mut this_members = ValueMap::default();
-                        // `all_entries()` includes the parent's shared method
-                        // table (component flyweight) so inherited methods are
-                        // seeded into the child's construction scope.
-                        for (k, v) in ps.all_entries() {
+                        let parent_src: Option<String> = match ps.get("__source_file") {
+                            Some(CfmlValue::String(p)) if !p.is_empty() => Some(p.to_string()),
+                            _ => None,
+                        };
+                        // Replay: the parent's super struct was built by an earlier
+                        // construction; only its DATA members need staging. Walking
+                        // `all_entries()` folded the parent's whole method table
+                        // into two fresh maps per instance (and its own de-dup scan
+                        // is quadratic in the method count).
+                        let cached_super = if replay_tables.is_some() {
+                            parent_src
+                                .as_deref()
+                                .and_then(|p| self.class_super_values.get(p).cloned())
+                        } else {
+                            None
+                        };
+                        let entries: Vec<(String, CfmlValue)> = if cached_super.is_some() {
+                            ps.with_map(|m| {
+                                m.iter()
+                                    .filter(|(k, v)| {
+                                        !k.starts_with("__") && !matches!(v, CfmlValue::Function(_))
+                                    })
+                                    .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+                                    .collect()
+                            })
+                        } else {
+                            // `all_entries()` includes the parent's shared method
+                            // table (component flyweight) so inherited methods are
+                            // seeded into the child's construction scope.
+                            ps.all_entries()
+                        };
+                        for (k, v) in entries {
                             if k.starts_with("__") {
                                 continue;
                             }
@@ -32376,23 +32456,34 @@ impl CfmlVirtualMachine {
                                 // A parent's `this.x = …` data member. Methods are
                                 // reachable via `super`/`__variables`; only data
                                 // members need seeding onto the child body's `this`.
+                                // (Staging the methods too polluted the leaf
+                                // metadata: `getComponentMetaData(child).functions`
+                                // listed the parent's.)
                                 this_members.insert(k.clone(), v.clone());
                             }
                         }
-                        if !super_methods.is_empty() {
+                        if let Some(cs) = cached_super {
+                            super_value = Some(cs);
+                        } else if !super_methods.is_empty() {
                             super_methods
                                 .insert("__is_super".to_string(), CfmlValue::Bool(true));
-                            super_value = Some(CfmlValue::strukt(super_methods));
+                            let sv = CfmlValue::strukt(super_methods);
+                            if let Some(p) = parent_src.as_deref() {
+                                self.class_super_values.insert(p.to_string(), sv.clone());
+                            }
+                            super_value = Some(sv);
                         }
                         if !this_members.is_empty() {
                             parent_this_members = Some(this_members);
                         }
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get(&*cfml_common::key::well_known::VARIABLES) {
-                            // Include the parent's shared method table (component
-                            // flyweight) so inherited methods are present in the
-                            // child body's `variables` during construction (a bare
-                            // inherited call / StructKeyExists(variables, sibling)).
-                            parent_vars.snapshot_with_methods()
+                            if replay_tables.is_some() {
+                                // Data only — the class's shared `variables` table
+                                // (attached below) already holds every method.
+                                parent_vars.snapshot()
+                            } else {
+                                parent_vars.snapshot_with_methods()
+                            }
                         } else {
                             ValueMap::default()
                         }
@@ -32548,69 +32639,39 @@ impl CfmlVirtualMachine {
             // stripped on inherit, so the method table can ONLY reach sub-calls
             // through this struct). It becomes the instance's `variables` scope.
             let body_vars = {
-                // Seed with the parent's resolved variables (inherited methods +
-                // inherited property defaults) — `injected_scope` currently holds
-                // exactly that snapshot — minus per-instance/internal keys.
+                // Seed with the parent's resolved variables (inherited property
+                // defaults, plus inherited methods on a first construction) —
+                // `injected_scope` currently holds exactly that snapshot — minus
+                // per-instance/internal keys.
                 let mut method_table: ValueMap = injected_scope.clone();
                 method_table.shift_remove("this");
                 method_table.shift_remove("super");
                 method_table.shift_remove(ARGUMENTS_SCOPE_KEY);
-                // Own methods from the swapped-in CFC sub-program. Full hoist: a
-                // method defined anywhere in the body is visible from the first
-                // statement (Lucee parity). Built with no captured_scope — CFC
-                // methods resolve via __variables injected at call time.
-                //
-                // The `CfmlFunction` value for a method is class-invariant, so it
-                // is memoised in `method_arc_cache` by the method's process-unique
-                // `global_id` and SHARED across every instance (an `Arc` bump
-                // instead of a fresh alloc + params-`Vec` clone per instance —
-                // previously ~800 B/method/instance, the dominant per-instance
-                // cost). Disjoint field borrows (`&self.program` + `&mut
-                // self.method_arc_cache`) let the cache be filled while iterating
-                // the program's functions.
-                let program = &self.program;
-                let method_arc_cache = &mut self.method_arc_cache;
-                for bf in program.functions.iter() {
-                    if !bf.is_component_method || bf.name.starts_with("__") {
-                        continue;
+                if let Some((_, ref vars_table)) = replay_tables {
+                    // Replay: no per-instance method entries. The shared class
+                    // table answers every method lookup the body makes.
+                    let s = CfmlStruct::new(method_table);
+                    s.set_method_table(vars_table.clone());
+                    s
+                } else {
+                    // First construction of this class in the request: hoist every
+                    // own method into the scope BEFORE the body runs (Lucee assembles
+                    // `variables` first, then runs the pseudo-constructor, so a
+                    // method called mid-body sees the full table). The values are
+                    // the class-invariant cached `Arc`s (`method_arc_for`).
+                    let own: Vec<Arc<BytecodeFunction>> = self
+                        .program
+                        .functions
+                        .iter()
+                        .filter(|bf| bf.is_component_method && !bf.name.starts_with("__"))
+                        .cloned()
+                        .collect();
+                    for bf in own {
+                        let arc = self.method_arc_for(&bf);
+                        method_table.insert(bf.name.clone(), CfmlValue::Function(arc));
                     }
-                    let arc = method_arc_cache
-                        .entry(bf.global_id)
-                        .or_insert_with(|| {
-                            Arc::new(cfml_common::dynamic::CfmlFunction {
-                                name: bf.name.clone(),
-                                params: bf
-                                    .params
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, name)| cfml_common::dynamic::CfmlParam {
-                                        name: name.clone(),
-                                        param_type: bf.param_types.get(i).cloned().flatten(),
-                                        default: None,
-                                        required: bf
-                                            .required_params
-                                            .get(i)
-                                            .copied()
-                                            .unwrap_or(false),
-                                        annotations: bf
-                                            .param_annotations
-                                            .get(i)
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    })
-                                    .collect(),
-                                body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                                    CfmlValue::Int(bf.global_id as i64),
-                                )),
-                                return_type: bf.return_type.clone(),
-                                access: bf.access.clone(),
-                                captured_scope: None,
-                            })
-                        })
-                        .clone();
-                    method_table.insert(bf.name.clone(), CfmlValue::Function(arc));
+                    CfmlStruct::new(method_table)
                 }
-                CfmlStruct::new(method_table)
             };
             // Reachable via __variables (LoadLocal / lookup_name_in_scopes fall
             // through to it) and via the dedicated `static` handle. Inherited
@@ -32642,8 +32703,8 @@ impl CfmlVirtualMachine {
             // Expose `super` to the body so `super.method(...)` calls in the
             // pseudo-constructor resolve to the parent (see pseudo_ctor_super).
             let pushed_super = super_value.is_some();
-            if let Some(sup) = super_value {
-                self.pseudo_ctor_super.push(sup);
+            if let Some(ref sup) = super_value {
+                self.pseudo_ctor_super.push(sup.clone());
             }
             // Expose the real (dotted) class name to a `getMetadata(this).name`
             // read inside the pseudo-constructor body — the `this` struct built
@@ -32829,6 +32890,12 @@ impl CfmlVirtualMachine {
                 // (which removes this key before merging) — see the stash above.
                 if let Some(rp) = resolved_parent_stash.take() {
                     s.insert(Self::RESOLVED_PARENT_KEY.to_string(), rp);
+                    // The merge derives `__super` from the parent's method
+                    // ENTRIES; a replayed parent keeps those in its table, so hand
+                    // the (cached, class-invariant) super struct over directly.
+                    if let Some(ref sv) = super_value {
+                        s.insert("__super".to_string(), sv.clone());
+                    }
                 }
                 // Anonymous `component { ... }` declarations get __name = "Anonymous"
                 // baked in by the parser. Override with the dotted path the caller
@@ -33026,9 +33093,20 @@ impl CfmlVirtualMachine {
             // Inject functions added by cfinclude inside the component body
             // These were registered in user_functions during execution but aren't
             // in the component struct (which was built at compile time)
-            if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
+            // Only when the body actually registered something new: the key-set
+            // build below is O(members) with an allocation per key, and a
+            // pseudo-constructor that cfincludes a function is rare.
+            let body_added_user_fns = self
+                .user_functions
+                .keys()
+                .any(|n| !pre_exec_func_names.contains(n));
+            if let Some(s) = result
+                .as_mut()
+                .filter(|_| body_added_user_fns)
+                .and_then(|v| v.as_cfml_struct())
+            {
                 let existing_keys: std::collections::HashSet<String> =
-                    s.keys().into_iter().map(|k| k.to_lowercase()).collect();
+                    s.all_keys().into_iter().map(|k| k.to_lowercase()).collect();
                 for (func_name, func_def) in &self.user_functions {
                     if !pre_exec_func_names.contains(func_name)
                         && !existing_keys.contains(&func_name.to_lowercase())
@@ -33446,8 +33524,10 @@ impl CfmlVirtualMachine {
         let template = self_.resolve_component_template(name, locals);
         self_.source_file = prev_source;
 
+        // Table-aware: on a replayed construction the template's own methods
+        // live in its shared own-method table, not the map.
         let snap = match template {
-            Some(CfmlValue::Struct(s)) => s.snapshot(),
+            Some(CfmlValue::Struct(s)) => s.snapshot_with_methods(),
             _ => return None,
         };
         // An interface template would have no Function entries — let the
@@ -33950,21 +34030,22 @@ impl CfmlVirtualMachine {
     /// copies. Production mode only — classes are immutable there, so the cache
     /// cannot go stale; in dev we leave the per-instance copies alone.
     fn share_class_invariant_metadata(&mut self, instance: CfmlValue) -> CfmlValue {
-        let production = self
-            .server_state
-            .as_ref()
-            .map_or(false, |s| s.production_mode);
-        if !production {
-            return instance;
-        }
+        // Runs in every mode: the cache lives on the per-request VM and a class
+        // cannot change within one request, so dev is as safe as production. It
+        // was production-only out of caution; a replayed construction (see
+        // `replay_tables`) now DEPENDS on it for `__super`/`__super_map`, which
+        // the merge derives from method entries that a replay no longer has.
         let s = match &instance {
             CfmlValue::Struct(s) => s,
             _ => return instance,
         };
         // Key by physical source file — one class definition per file, so this is
         // a stable per-class key (mirrors `static_stores`).
-        let key = match s.get("__source_file") {
-            Some(CfmlValue::String(f)) => f.to_string(),
+        // Keyed by (source file, dotted name), like `component_blueprints`: the
+        // same file loaded under a different mapping prefix has a different
+        // `__name`, and `__implements_fqns`/`__source_names` embed that package.
+        let key = match (s.get("__source_file"), s.get("__name")) {
+            (Some(CfmlValue::String(f)), Some(n)) => format!("{}\u{0}{}", f, n.as_string()),
             _ => return instance,
         };
         if let Some(cached) = self.class_meta_cache.get(&key).cloned() {
@@ -33974,10 +34055,21 @@ impl CfmlVirtualMachine {
             }
         } else {
             // First instance: cache Arc-shared handles of the invariant keys.
-            let snap: Vec<(String, CfmlValue)> = Self::CLASS_INVARIANT_META_KEYS
+            let mut snap: Vec<(String, CfmlValue)> = Self::CLASS_INVARIANT_META_KEYS
                 .iter()
                 .filter_map(|k| s.get(k).map(|v| (k.to_string(), v)))
                 .collect();
+            // A CFML parent's `__super` (the `__is_super`-tagged method struct) is
+            // class-invariant too. A `rust:` parent's `__super` is a live
+            // per-instance NativeObject and is stamped later by
+            // `attach_native_parent`, so it never appears here.
+            if let Some(v) = s.get("__super") {
+                if let CfmlValue::Struct(ref ss) = v {
+                    if ss.get("__is_super").is_some() {
+                        snap.push(("__super".to_string(), v.clone()));
+                    }
+                }
+            }
             self.class_meta_cache.insert(key, Arc::new(snap));
         }
         instance
@@ -34165,7 +34257,15 @@ impl CfmlVirtualMachine {
         // `snapshot_with_methods()` folds the parent's shared method table
         // (component flyweight) back into a flat map so its methods are merged
         // into the child exactly as when methods lived in the parent's map.
+        // Replay (the child template carries its own-method table): the parent's
+        // methods are in ITS table too and the finished instance gets the class's
+        // final tables from `share_methods_into_table`, so only the parent's DATA
+        // and bookkeeping keys need copying. A first construction still folds the
+        // parent's methods in, because that is what the final tables are built
+        // from.
+        let replaying = child_map.method_table().is_some();
         let mut parent_map: ValueMap = match parent {
+            CfmlValue::Struct(s) if replaying => s.snapshot(),
             CfmlValue::Struct(s) => s.snapshot_with_methods(),
             _ => return Ok(CfmlValue::Struct(child_map)),
         };
@@ -34369,9 +34469,19 @@ impl CfmlVirtualMachine {
         }
 
         // Add __super struct with marker for dispatch detection
-        if !super_methods.is_empty() {
+        // The super struct: built from the parent's method entries, or — on a
+        // replay, where those live in the table — the cached one the resolver
+        // stashed on the child template as `__super`.
+        let super_struct: Option<CfmlValue> = if !super_methods.is_empty() {
             super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
-            let super_struct = CfmlValue::strukt(super_methods);
+            Some(CfmlValue::strukt(super_methods))
+        } else {
+            child_map.get("__super").filter(|v| match v {
+                CfmlValue::Struct(ss) => ss.get("__is_super").is_some(),
+                _ => false,
+            })
+        };
+        if let Some(super_struct) = super_struct {
 
             // Per-class super map: multi-level `super.method()` must resolve to
             // each method's OWN parent, not the leaf instance's. Key by the
@@ -34387,24 +34497,33 @@ impl CfmlVirtualMachine {
             // Defining source of the child class: prefer a child-defined
             // method's BytecodeFunction.source_file (matches dispatch exactly),
             // falling back to the struct's recorded __source_file.
+            // The child's source file: `__source_file` is stamped on every
+            // template by the resolver. The method-scan fallback stays for a
+            // hand-built struct without one — but it must not run first: with
+            // inherited methods staged onto the child's `this`, the first function
+            // found could be the PARENT's, and in a replay the methods are in the
+            // shared table, not the map.
             let child_src = child_map
-                .iter()
-                .find_map(|(k, v)| {
-                    if k.starts_with("__") {
-                        return None;
-                    }
-                    if let CfmlValue::Function(f) = v {
-                        if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) =
-                            f.body
-                        {
-                            if let CfmlValue::Int(idx) = body.as_ref() {
-                                return self.resolve_fn(*idx).and_then(|bf| bf.source_file.clone());
+                .get("__source_file")
+                .map(|v| v.as_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    child_map.iter().find_map(|(k, v)| {
+                        if k.starts_with("__") {
+                            return None;
+                        }
+                        if let CfmlValue::Function(f) = v {
+                            if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) =
+                                f.body
+                            {
+                                if let CfmlValue::Int(idx) = body.as_ref() {
+                                    return self.resolve_fn(*idx).and_then(|bf| bf.source_file.clone());
+                                }
                             }
                         }
-                    }
-                    None
-                })
-                .or_else(|| child_map.get("__source_file").map(|v| v.as_string()));
+                        None
+                    })
+                });
             if let Some(src) = child_src {
                 super_map.insert(src, super_struct.clone());
             }
