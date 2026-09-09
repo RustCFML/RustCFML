@@ -317,6 +317,15 @@ pub(crate) fn run_cfml(
     for (name, func) in get_builtin_functions() {
         vm.builtins.insert(name, func);
     }
+
+    // `<cfhttp>` has no native implementation in this build: cfml-stdlib is
+    // compiled without its `http` feature because ureq/ring have no wasm32
+    // target. Register the fetch-backed one so the VM's cfhttp intercept finds
+    // a provider instead of reporting "HTTP support is not enabled in this
+    // build". Must precede refresh_builtin_index() so the name is indexed.
+    vm.builtins
+        .insert("cfhttp".to_string(), crate::http_provider::cfhttp_worker);
+
     vm.refresh_builtin_index();
 
     // Wire queryExecute to the dynamic-driver-only variant. The worker

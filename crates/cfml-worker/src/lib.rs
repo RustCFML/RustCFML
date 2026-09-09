@@ -18,6 +18,10 @@ pub mod scopes;
 
 #[cfg(target_arch = "wasm32")]
 pub mod hyperdrive_driver;
+
+/// `<cfhttp>` over the Workers `fetch` API. The native ureq client has no
+/// wasm32 target, so the platform fetch is the transport here.
+pub mod http_provider;
 #[cfg(target_arch = "wasm32")]
 pub mod handler;
 #[cfg(target_arch = "wasm32")]

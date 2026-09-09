@@ -9560,11 +9560,25 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                         .map(|(_, v)| v.as_string())
                                         .filter(|s| !s.is_empty())
                                         .unwrap_or_else(|| "application/octet-stream".to_string());
-                                    let file_bytes = match std::fs::read(&file_path) {
-                                        Ok(b) => b,
-                                        Err(e) => return Err(CfmlError::runtime(format!(
-                                            "cfhttp: failed to read file '{}' for multipart upload: {}", file_path, e
-                                        ))),
+                                    // `value=` supplies the content inline; `file=` then names
+                                    // the upload rather than pointing at a path. Without this,
+                                    // a template written for a filesystem-less runtime (a
+                                    // Cloudflare Worker) could not also run on a binary — and
+                                    // the same CFML running in both places is the point.
+                                    let inline = p
+                                        .iter()
+                                        .find(|(k, _)| k.eq_ignore_ascii_case("value"))
+                                        .map(|(_, v)| v)
+                                        .filter(|v| !matches!(v, CfmlValue::Null));
+                                    let file_bytes = match inline {
+                                        Some(CfmlValue::Binary(b)) => b.clone(),
+                                        Some(other) => other.as_string().into_bytes(),
+                                        None => match std::fs::read(&file_path) {
+                                            Ok(b) => b,
+                                            Err(e) => return Err(CfmlError::runtime(format!(
+                                                "cfhttp: failed to read file '{}' for multipart upload: {}", file_path, e
+                                            ))),
+                                        },
                                     };
                                     let filename = std::path::Path::new(&file_path)
                                         .file_name()

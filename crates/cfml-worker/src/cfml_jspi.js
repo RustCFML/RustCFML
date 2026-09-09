@@ -14,6 +14,11 @@
  *   2. Export `cfml_jspi_do_fetch` as a `WebAssembly.Suspending` for
  *      Durable-Object-backed application scope.
  *
+ *   2a. Export `cfml_jspi_http_fetch` as a `WebAssembly.Suspending` so
+ *      `<cfhttp>` can reach the Workers `fetch` API. The engine's native
+ *      HTTP client is ureq, which has no wasm32 target, so on a Worker the
+ *      platform's own fetch is the transport.
+ *
  *   3. Cache the wasm `memory` object once (handed in by the wasm-bindgen
  *      `start` function) so the suspending callbacks can build Uint8Array
  *      views over linear memory.
@@ -266,6 +271,113 @@ export async function __cfml_invoke_run_sync() {
   }
   await fn();
 }
+
+/**
+ * `<cfhttp>` transport. Wire shape in:
+ *
+ *   { url, method, headers?, body?, timeoutMs?, followRedirects?, getAsBinary? }
+ *
+ * and out:
+ *
+ *   { success, status, statusText, headers, body, bodyBase64?, error? }
+ *
+ * A non-2xx is still `success: true` — it is a real HTTP response, and CFML
+ * decides what to do with the status via `throwOnError`. Only a transport
+ * failure (DNS, TLS, abort, timeout) is `success: false`, which mirrors the
+ * native client's split between `Error::Status` and `Error::Transport`.
+ */
+async function runHttpFetch(req) {
+  try {
+    const init = {
+      method: req.method || "GET",
+      headers: req.headers || {},
+      // Workers follows redirects by default; `manual` surfaces the 30x itself
+      // so `redirect="false"` can see it, as the native client does.
+      redirect: req.followRedirects === false ? "manual" : "follow",
+    };
+    // A text body arrives as `body`; anything that is not valid UTF-8 (a
+    // multipart upload carrying binary parts, say) arrives base64-encoded in
+    // `bodyBase64`, because the bridge itself is JSON.
+    if (typeof req.bodyBase64 === "string" && req.bodyBase64.length > 0) {
+      const ascii = atob(req.bodyBase64);
+      const bytes = new Uint8Array(ascii.length);
+      for (let i = 0; i < ascii.length; i++) {
+        bytes[i] = ascii.charCodeAt(i);
+      }
+      init.body = bytes;
+    } else if (typeof req.body === "string" && req.body.length > 0) {
+      init.body = req.body;
+    }
+    if (typeof req.timeoutMs === "number" && req.timeoutMs > 0) {
+      init.signal = AbortSignal.timeout(req.timeoutMs);
+    }
+
+    const resp = await fetch(req.url, init);
+
+    const headers = {};
+    resp.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+
+    let body = "";
+    let bodyBase64 = null;
+    if (req.getAsBinary) {
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      // Chunked: String.fromCharCode(...bytes) overflows the argument limit
+      // on a body of any size, and a per-byte string concat is O(n^2).
+      let ascii = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        ascii += String.fromCharCode.apply(
+          null,
+          bytes.subarray(i, i + CHUNK),
+        );
+      }
+      bodyBase64 = btoa(ascii);
+    } else {
+      body = await resp.text();
+    }
+
+    return {
+      success: true,
+      status: resp.status,
+      statusText: resp.statusText || "",
+      headers,
+      body,
+      bodyBase64,
+    };
+  } catch (e) {
+    // AbortSignal.timeout rejects with a TimeoutError DOMException; give it a
+    // message a CFML author can act on rather than a bare "AbortError".
+    const name = e && e.name ? e.name : "";
+    const msg =
+      name === "TimeoutError" || name === "AbortError"
+        ? `request timed out after ${req.timeoutMs} ms`
+        : String(e?.message ?? e);
+    return { success: false, error: msg };
+  }
+}
+
+export const cfml_jspi_http_fetch = new WebAssembly.Suspending(
+  async (reqPtr, reqLen, respPtr, respCap) => {
+    if (!wasmMemory) {
+      return 0;
+    }
+    let request;
+    try {
+      const bytes = new Uint8Array(wasmMemory.buffer, reqPtr, reqLen);
+      request = JSON.parse(new TextDecoder().decode(bytes));
+    } catch (e) {
+      return writeResponse(
+        { success: false, error: `cfml-jspi: bad request JSON: ${e.message}` },
+        respPtr,
+        respCap,
+      );
+    }
+    const response = await runHttpFetch(request);
+    return writeResponse(response, respPtr, respCap);
+  },
+);
 
 export const cfml_jspi_do_fetch = new WebAssembly.Suspending(
   async (reqPtr, reqLen, respPtr, respCap) => {

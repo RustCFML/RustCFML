@@ -82,6 +82,17 @@ extern "C" {
         resp_cap: u32,
     ) -> i32;
 
+    /// Suspending import for `<cfhttp>`. Same wire convention again: JSON
+    /// request in, JSON response out, through caller-allocated wasm buffers.
+    /// The engine's native HTTP client (ureq) has no wasm32 target, so on a
+    /// Worker the platform's own `fetch` is the transport.
+    fn cfml_jspi_http_fetch(
+        req_ptr: u32,
+        req_len: u32,
+        resp_ptr: u32,
+        resp_cap: u32,
+    ) -> i32;
+
     /// JS-side dispatcher: invokes a `WebAssembly.promising(wasm.cfml_worker_run_sync)`
     /// wrapper installed by the host's post-build patch. From Rust this looks
     /// like a normal async JS call; the work happens in a *separate*
@@ -113,41 +124,47 @@ fn __cfml_worker_jspi_start() {
 /// bytes of JSON) fits in one allocation.
 const INITIAL_RESPONSE_CAP: usize = 64 * 1024;
 
-/// Invoke the suspending import, returning the response JSON. Retries once
-/// with a larger buffer if the first call signals overflow.
-pub(crate) fn hyperdrive_query_sync(request_json: &str) -> Result<String, CfmlError> {
+/// Invoke a suspending import, returning the response JSON. Retries once with
+/// a larger buffer if the first call signals overflow.
+///
+/// All three bridges share this: JSON in, JSON out, `-required` to ask for a
+/// bigger buffer, `0` when the host shim is missing. `what` names the CFML
+/// feature in the error, and `missing_hint` says what the host forgot to wire.
+fn bridge_call(
+    import: fn(u32, u32, u32, u32) -> i32,
+    request_json: &str,
+    what: &str,
+    missing_hint: &str,
+) -> Result<String, CfmlError> {
     let req_bytes = request_json.as_bytes();
     let mut buf: Vec<u8> = vec![0u8; INITIAL_RESPONSE_CAP];
 
-    let written = cfml_jspi_hyperdrive_query(
-        req_bytes.as_ptr() as u32,
-        req_bytes.len() as u32,
-        buf.as_mut_ptr() as u32,
-        buf.len() as u32,
-    );
-
-    if written == 0 {
-        return Err(CfmlError::runtime(
-            "cfquery (Hyperdrive): host JSPI shim returned null — \
-             check that the worker entry point loaded the cfml-worker JSPI snippet"
-                .to_string(),
-        ));
-    }
-
-    let written = if written < 0 {
-        let required = (-written) as usize;
-        buf = vec![0u8; required];
-        let retry = cfml_jspi_hyperdrive_query(
+    let call = |buf: &mut Vec<u8>| {
+        import(
             req_bytes.as_ptr() as u32,
             req_bytes.len() as u32,
             buf.as_mut_ptr() as u32,
             buf.len() as u32,
-        );
+        )
+    };
+
+    let written = call(&mut buf);
+
+    if written == 0 {
+        return Err(CfmlError::runtime(format!(
+            "{}: host JSPI shim returned null — {}",
+            what, missing_hint
+        )));
+    }
+
+    let written = if written < 0 {
+        buf = vec![0u8; (-written) as usize];
+        let retry = call(&mut buf);
         if retry <= 0 {
-            return Err(CfmlError::runtime(
-                "cfquery (Hyperdrive): retry with larger response buffer also failed"
-                    .to_string(),
-            ));
+            return Err(CfmlError::runtime(format!(
+                "{}: retry with larger response buffer also failed",
+                what
+            )));
         }
         retry as usize
     } else {
@@ -157,63 +174,43 @@ pub(crate) fn hyperdrive_query_sync(request_json: &str) -> Result<String, CfmlEr
     buf.truncate(written);
     String::from_utf8(buf).map_err(|e| {
         CfmlError::runtime(format!(
-            "cfquery (Hyperdrive): host JSPI shim returned non-UTF-8 response: {}",
-            e
+            "{}: host JSPI shim returned non-UTF-8 response: {}",
+            what, e
         ))
     })
+}
+
+pub(crate) fn hyperdrive_query_sync(request_json: &str) -> Result<String, CfmlError> {
+    bridge_call(
+        cfml_jspi_hyperdrive_query,
+        request_json,
+        "cfquery (Hyperdrive)",
+        "check that the worker entry point loaded the cfml-worker JSPI snippet",
+    )
 }
 
 /// Sync-from-wasm Durable Object fetch. `request_json` is shaped as
 /// `{binding, instance, path?, method?, body?}`; the returned String is
 /// the JSON the JS shim wrote (`{success, status, body, error?}`).
-///
-/// Not wired up yet: this is the transport for the planned DO-backed
-/// application scope (see do_application_store.rs), kept ahead of that work.
 #[allow(dead_code)]
 pub(crate) fn do_fetch_sync(request_json: &str) -> Result<String, CfmlError> {
-    let req_bytes = request_json.as_bytes();
-    let mut buf: Vec<u8> = vec![0u8; INITIAL_RESPONSE_CAP];
+    bridge_call(
+        cfml_jspi_do_fetch,
+        request_json,
+        "application scope (DO)",
+        "check that the worker entry point imports cfml-jspi-bootstrap",
+    )
+}
 
-    let written = cfml_jspi_do_fetch(
-        req_bytes.as_ptr() as u32,
-        req_bytes.len() as u32,
-        buf.as_mut_ptr() as u32,
-        buf.len() as u32,
-    );
-
-    if written == 0 {
-        return Err(CfmlError::runtime(
-            "application scope (DO): host JSPI shim returned null — \
-             check that the worker entry point imports cfml-jspi-bootstrap"
-                .to_string(),
-        ));
-    }
-
-    let written = if written < 0 {
-        let required = (-written) as usize;
-        buf = vec![0u8; required];
-        let retry = cfml_jspi_do_fetch(
-            req_bytes.as_ptr() as u32,
-            req_bytes.len() as u32,
-            buf.as_mut_ptr() as u32,
-            buf.len() as u32,
-        );
-        if retry <= 0 {
-            return Err(CfmlError::runtime(
-                "application scope (DO): retry with larger response buffer also failed"
-                    .to_string(),
-            ));
-        }
-        retry as usize
-    } else {
-        written as usize
-    };
-
-    buf.truncate(written);
-    String::from_utf8(buf).map_err(|e| {
-        CfmlError::runtime(format!(
-            "application scope (DO): host JSPI shim returned non-UTF-8 response: {}",
-            e
-        ))
-    })
+/// Sync-from-wasm HTTP request for `<cfhttp>`. `request_json` is shaped as
+/// `{url, method, headers, body?, timeoutMs, followRedirects, getAsBinary}`;
+/// the response JSON is `{success, status, statusText, headers, body,
+/// bodyBase64?, error?}`.
+pub(crate) fn http_fetch_sync(request_json: &str) -> Result<String, CfmlError> {
+    bridge_call(
+        cfml_jspi_http_fetch,
+        request_json,
+        "cfhttp",
+        "check that the worker entry point loaded the cfml-worker JSPI snippet",
+    )
 }
