@@ -2562,3 +2562,80 @@ an interleaved A/B over three runs each: pass=3361 fail=5 err=0 skip=23 on BOTH
 binaries, same two spec names failing, six runs identical; wall 33.37 s baseline
 vs 32.95 s fixed — inside the baseline's own 2.4 s spread, i.e. no measurable
 change, which is what the public-first ordering was for.
+
+## 89. Component construction: parent pseudo-constructors ran 2^depth times, constructor values were deep-copied, and every instance carried a self-reference (fixed v0.658.0) 📌
+
+**Four divergences, one construction path, all probed against Lucee 7.1.0.204
+on 2026-09-09 before fixing.** They surfaced while working the CFC-construction
+performance plan, whose flat-class benchmark could not see the first two: the
+plan measured an 86-method class with no parent at ~54 µs per `new`, but a
+**1-method child of that class cost 170 µs and an 86-method child 343 µs** —
+inheritance, the shape every framework object has, was 3–6× worse than the flat
+case the plan was optimising.
+
+1. **A parent's pseudo-constructor ran 2^depth times per instantiation.**
+   `resolve_component_template_impl` resolved (and constructed) the parent once
+   to build the child's injected scope, `resolve_inheritance_chain` then resolved
+   it again for the merge — at every level. With a `writeOutput` in each
+   constructor, `new Leaf()` on a three-level chain logged
+   `Root,Root,Mid,Root,Root,Mid,Leaf,Root,Mid,Root`. Lucee logs `Root,Mid,Leaf`.
+   Any side effect in a parent constructor (a log line, a counter, a
+   registration) repeated on every subclass instantiation. The static-scope
+   block constructed the parent a further time on a class's first sight.
+2. **The finalize deep-copied constructor-assigned values.** A constructor
+   `variables.cfg = request.cfg` handed the instance a private copy, so a later
+   `variables.cfg.x = 2` never reached `request.cfg` (Lucee: it does — CFML
+   structs are references). Same for `this.cfg2 = request.cfg`. The copy existed
+   only to detach the template from an alias it should never have had (below).
+3. **A `component name="X"` file left its template in page globals.** The body's
+   codegen ends with `StoreGlobal(<name>)`; nothing removed it. The resolver's
+   own globals lookup then served that stale template to the next `new X()` —
+   **no constructor run, `this` state shared between instances** — and a page
+   variable called `X` was clobbered. (For the common unnamed `component {}` the
+   key was `Anonymous`, which is why `isDefined("Anonymous")` was true on every
+   page that had constructed one.)
+4. **The body's class-name local leaked into `variables`.** Inside a component,
+   `structKeyList(variables)` listed `Anonymous` — the template struct, i.e. a
+   reference to the instance itself. Lucee has no such key. This is the
+   per-instance reference cycle the collector has been paying for since the
+   flyweight landed.
+
+**The fix.** (1) The resolver keeps the parent it resolved, stashes it on the
+child template under a hidden key, and `resolve_inheritance` merges against it
+(`merge_child_onto_resolved_parent`, split out of the chain walk) instead of
+resolving again; the static block reads the parent's store from `static_stores`
+via that same resolved parent. Every pseudo-constructor now runs exactly once,
+root first. (2)(3) The finalize snapshots the candidate global keys before the
+body, TAKES the template out of globals afterwards (restoring any prior page
+value), and no longer deep-copies either the template or the `variables`
+values — nothing aliases them any more. (4) The class-name local is filtered out
+of the captured body locals. `__variables` is now attached even when empty — it
+was only ever non-empty before because of the leak, and an empty `component {}`
+stopped being recognised as a component without it.
+
+**Performance.** Two further changes rode along because the same profile showed
+them: a new `DefineComponentMethods` op replaces the six-op-per-method sequence
+the constructor body executed to attach each method (`DefineFunction` +
+`StoreLocal`, `LoadLocal` + `DefineFunction` + `SetProperty` + `StoreLocal`), and
+the inheritance merge's linear case-insensitive key scans and per-method
+`remove_ci` (a `shift_remove`) became single hash probes. Same box, same session,
+CLI, N=3000 warm, µs per `createObject().init()`:
+
+| shape | v0.657.0 | v0.658.0 | Lucee 7.1 |
+|---|---|---|---|
+| 1 method | 5.3 | 4.1 | 1.2 |
+| 20 methods | 15.8 | 8.3 | 2.0 |
+| 86 methods | 54 | **24** | 6.1 |
+| 200 methods | 119 | 53 | 18.3 |
+| 1-method child of an 86-method base | 168 | **52** | — |
+| 86-method child of an 86-method base | 343 | **86** | — |
+| 60,000 live instances, peak RSS | 2.11 GB | **272 MB** | — |
+
+The memory figure is the leaked self-reference plus the doubled parent
+constructions plus the deep copies, all of which were retained per instance
+until request end.
+
+Tests: `tests/oop/test_component_construction_semantics.cfm` (19 assertions,
+cross-engine, fixtures in `tests/oop/ctorsem/`) — 19/19 on RustCFML and Lucee,
+**11/19 on the v0.657.0 binary** with the doubled constructor logs visible in
+the failure output.

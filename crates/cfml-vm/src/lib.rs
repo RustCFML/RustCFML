@@ -7453,7 +7453,7 @@ impl CfmlVirtualMachine {
             match op {
                 // A closure/arrow/nested-fn definition captures the frame's
                 // locals (including the arguments Arc) → the struct can escape.
-                BytecodeOp::DefineFunction(_) => return false,
+                BytecodeOp::DefineFunction(_) | BytecodeOp::DefineComponentMethods(_) => return false,
                 // The scope bridges into an included / custom-tag / cfmodule frame.
                 BytecodeOp::Include(_) | BytecodeOp::IncludeDynamic => return false,
                 BytecodeOp::LoadGlobal(s) => {
@@ -11810,6 +11810,61 @@ impl CfmlVirtualMachine {
                         stack.push(final_instance);
                     } else {
                         stack.push(CfmlValue::Null);
+                    }
+                }
+
+                BytecodeOp::DefineComponentMethods(cm) => {
+                    // One op attaches the whole class. Each method value is the
+                    // class-invariant cached `Arc` (`method_arc_for`), written
+                    // onto the template struct in the holder local — exactly what
+                    // `SetProperty(name)` did per method — and defined in the
+                    // constructing frame's scope the way `StoreLocal(name)` did
+                    // (into the shared `__variables` handle when the frame has
+                    // one, else the flat locals). Inside `__cfc_body__` the
+                    // `body_vars` hoist has already seeded every method, so the
+                    // scope write is a contains-probe there.
+                    self.app_fn_table_dirty = true;
+                    let holder = match locals.get(cm.holder.as_str()) {
+                        Some(CfmlValue::Struct(s)) => Some(s.clone()),
+                        _ => match locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                            Some(CfmlValue::Struct(vars)) => match vars.get(cm.holder.as_str()) {
+                                Some(CfmlValue::Struct(s)) => Some(s),
+                                _ => None,
+                            },
+                            _ => None,
+                        },
+                    };
+                    let Some(holder) = holder else {
+                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                            "Internal error: component template [{}] is not in scope",
+                            cm.holder.as_str()
+                        ))));
+                    };
+                    let frame_vars = match locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                        Some(CfmlValue::Struct(vars)) => Some(vars.clone()),
+                        _ => None,
+                    };
+                    for gid in &cm.gids {
+                        let gid = *gid as i64;
+                        let Some(bf) = self.resolve_fn(gid) else {
+                            return Err(self.wrap_error(CfmlError::runtime(format!(
+                                "Internal error: DefineComponentMethods global_id {} is not registered",
+                                gid
+                            ))));
+                        };
+                        let arc = self.method_arc_for(&bf);
+                        let value = CfmlValue::Function(arc);
+                        match &frame_vars {
+                            Some(vars) => {
+                                if !vars.contains_key(&bf.name) {
+                                    vars.insert(bf.name.clone(), value.clone());
+                                }
+                            }
+                            None => {
+                                locals.insert(bf.name.clone(), value.clone());
+                            }
+                        }
+                        holder.insert(bf.name.clone(), value);
                     }
                 }
 
@@ -30318,6 +30373,13 @@ impl CfmlVirtualMachine {
                         if ids.insert(child) {
                             worklist.push(child);
                         }
+                    } else if let BytecodeOp::DefineComponentMethods(cm) = op {
+                        for child in &cm.gids {
+                            let child = *child as i64;
+                            if ids.insert(child) {
+                                worklist.push(child);
+                            }
+                        }
                     }
                 }
             }
@@ -30372,6 +30434,13 @@ impl CfmlVirtualMachine {
                         let child = *child as i64;
                         if ids.insert(child) {
                             worklist.push(child);
+                        }
+                    } else if let BytecodeOp::DefineComponentMethods(cm) = op {
+                        for child in &cm.gids {
+                            let child = *child as i64;
+                            if ids.insert(child) {
+                                worklist.push(child);
+                            }
                         }
                     }
                 }
@@ -31536,6 +31605,46 @@ impl CfmlVirtualMachine {
             .clone()
     }
 
+    /// The class-invariant `CfmlFunction` value for a compiled component method
+    /// (name + params + `global_id` body + access, no captured scope), memoised
+    /// in `method_arc_cache` by the method's process-unique `global_id` so every
+    /// instance of every class shares ONE `Arc` per method. Single builder for
+    /// the `body_vars` hoist and `DefineComponentMethods`.
+    pub(crate) fn method_arc_for(
+        &mut self,
+        bf: &BytecodeFunction,
+    ) -> Arc<cfml_common::dynamic::CfmlFunction> {
+        self.method_arc_cache
+            .entry(bf.global_id)
+            .or_insert_with(|| Arc::new(Self::build_method_value(bf)))
+            .clone()
+    }
+
+    /// Build (never memoise) the `CfmlFunction` value for a compiled method.
+    fn build_method_value(bf: &BytecodeFunction) -> cfml_common::dynamic::CfmlFunction {
+        cfml_common::dynamic::CfmlFunction {
+            name: bf.name.clone(),
+            params: bf
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, name)| cfml_common::dynamic::CfmlParam {
+                    name: name.clone(),
+                    param_type: bf.param_types.get(i).cloned().flatten(),
+                    default: None,
+                    required: bf.required_params.get(i).copied().unwrap_or(false),
+                    annotations: bf.param_annotations.get(i).cloned().unwrap_or_default(),
+                })
+                .collect(),
+            body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::Int(
+                bf.global_id as i64,
+            ))),
+            return_type: bf.return_type.clone(),
+            access: bf.access.clone(),
+            captured_scope: None,
+        }
+    }
+
     /// Dedup a freshly-built instance's method `CfmlFunction` values against the
     /// per-class `method_arc_cache`, so every instance of a class shares ONE `Arc`
     /// per method rather than the fresh copy the component body created during this
@@ -31623,19 +31732,25 @@ impl CfmlVirtualMachine {
         cache: &HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
         sc: &CfmlStruct,
     ) {
-        let mut repl: Vec<(String, Arc<cfml_common::dynamic::CfmlFunction>)> = Vec::new();
-        for (k, v) in sc.iter() {
-            let CfmlValue::Function(f) = &v else { continue };
-            if f.captured_scope.is_some() {
-                continue;
+        // Pure read under the lock (`with_map`), so no per-instance clone of the
+        // whole scope map just to discover — now that methods arrive as the
+        // cached `Arc`s — that there is nothing to replace.
+        let repl: Vec<(String, Arc<cfml_common::dynamic::CfmlFunction>)> = sc.with_map(|m| {
+            let mut repl = Vec::new();
+            for (k, v) in m.iter() {
+                let CfmlValue::Function(f) = v else { continue };
+                if f.captured_scope.is_some() {
+                    continue;
+                }
+                let cfml_common::dynamic::CfmlClosureBody::Expression(b) = &f.body else { continue };
+                let CfmlValue::Int(gid) = **b else { continue };
+                let Some(cached) = cache.get(&(gid as u32)) else { continue };
+                if !Arc::ptr_eq(cached, f) && cached.name == f.name && cached.access == f.access {
+                    repl.push((k.as_str().to_string(), cached.clone()));
+                }
             }
-            let cfml_common::dynamic::CfmlClosureBody::Expression(b) = &f.body else { continue };
-            let CfmlValue::Int(gid) = **b else { continue };
-            let Some(cached) = cache.get(&(gid as u32)) else { continue };
-            if !Arc::ptr_eq(cached, f) && cached.name == f.name && cached.access == f.access {
-                repl.push((k.as_str().to_string(), cached.clone()));
-            }
-        }
+            repl
+        });
         for (k, arc) in repl {
             sc.insert(k, CfmlValue::Function(arc));
         }
@@ -32232,9 +32347,19 @@ impl CfmlVirtualMachine {
             // Parent's explicit `this.*` data members, staged for the child body
             // (see `pending_pseudo_ctor_parent_this`).
             let mut parent_this_members: Option<ValueMap> = None;
+            // The parent, fully resolved (its own chain merged, its pseudo-
+            // constructor run ONCE). Kept and handed to `resolve_inheritance`
+            // via `__resolved_parent` below, so the merge reuses it instead of
+            // resolving — and constructing — the parent a second time. Before
+            // this, every level resolved its parent here AND again in
+            // `resolve_inheritance_chain`, so parent pseudo-constructors ran
+            // 2^depth times per instantiation (a 3-level class ran its root
+            // constructor 5 times; Lucee runs each exactly once, parent first).
+            let mut resolved_parent_stash: Option<CfmlValue> = None;
             let injected_scope: ValueMap = if let Some(ref pname) = parent_name {
                 if let Some(parent_template) = self.resolve_component_template(pname, locals) {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals).ok()?;
+                    resolved_parent_stash = Some(resolved_parent.clone());
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         let mut super_methods = ValueMap::default();
                         let mut this_members = ValueMap::default();
@@ -32300,9 +32425,25 @@ impl CfmlVirtualMachine {
                     let mut inherited = false;
                     let h = CfmlStruct::new(ValueMap::default());
                     if let Some(ref pname) = parent_name {
-                        if let Some(parent_static) =
-                            self.resolve_static_scope_by_name(pname, locals)
-                        {
+                        // The parent was resolved just above (`resolved_parent_stash`)
+                        // and that resolution registered its static store under
+                        // its source file — read it from there. Going through
+                        // `resolve_static_scope_by_name` CONSTRUCTED the parent
+                        // a further time (its pseudo-constructor ran again) on
+                        // every class's first instantiation in a request. The
+                        // by-name path stays as the fallback for a parent with no
+                        // CFML template (a `rust:` class).
+                        let parent_static = resolved_parent_stash
+                            .as_ref()
+                            .and_then(|rp| match rp {
+                                CfmlValue::Struct(ps) => {
+                                    ps.get("__source_file").map(|v| v.as_string())
+                                }
+                                _ => None,
+                            })
+                            .and_then(|src| self.static_stores.get(&src).cloned())
+                            .or_else(|| self.resolve_static_scope_by_name(pname, locals));
+                        if let Some(parent_static) = parent_static {
                             for (k, v) in parent_static.snapshot() {
                                 h.insert(k, v);
                                 inherited = true;
@@ -32527,6 +32668,21 @@ impl CfmlVirtualMachine {
             // component silently acquired the inner one's parent. A missing EC
             // algorithm in a Preside module's `init()` was reported three steps
             // later as "invalid component definition, can't find component [Rsa]".
+            // The body's codegen ends with `StoreGlobal(<component.name>)` — the
+            // declared `name=` or "Anonymous" — which used to LEAVE the template
+            // in page globals: a same-named page variable was clobbered, the
+            // template (methods, ctor `this.*` data) was retained per class for
+            // the request, and for a `component name="X"` file the resolver's
+            // own globals lookup then served that stale template to the next
+            // `new X()` — no constructor run, shared `this` state (Lucee runs it
+            // every time). Remember what the candidate keys held so the finalize
+            // can TAKE the template out and put any prior value back.
+            let short_name = class_name.split('.').last().unwrap_or(class_name);
+            let prev_class_globals: [(&str, Option<CfmlValue>); 3] = [
+                (class_name, self.globals.get(class_name).cloned()),
+                (short_name, self.globals.get(short_name).cloned()),
+                ("Anonymous", self.globals.get("Anonymous").cloned()),
+            ];
             let body_result =
                 self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
             let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
@@ -32554,8 +32710,7 @@ impl CfmlVirtualMachine {
                 self.last_component_compile_error = Some(e);
                 return None;
             }
-            let short_name = class_name.split('.').last().unwrap_or(class_name);
-            // Deep-copy the cached template into an independent instance. Structs
+            // Take the template out of page globals (see `prev_class_globals`). Structs
             // are reference-typed, so a plain handle clone would alias mutable
             // state across instances; the deep copy restores the per-instance
             // independence the old value-type copy-on-write gave implicitly.
@@ -32567,37 +32722,49 @@ impl CfmlVirtualMachine {
             // earlier in `globals` than the just-built component — and short-circuit
             // the `Anonymous` fallback that holds anonymous `component {}` instances.
             let is_struct = |v: &CfmlValue| matches!(v, CfmlValue::Struct(_));
-            let result = self
+            let template_key: Option<String> = if self.globals.get(class_name).is_some_and(is_struct) {
+                Some(class_name.to_string())
+            } else if self.globals.get(short_name).is_some_and(is_struct) {
+                Some(short_name.to_string())
+            } else if let Some(k) = self
                 .globals
-                .get(class_name)
-                .filter(|v| is_struct(v))
-                .cloned()
-                .or_else(|| {
-                    self.globals
-                        .get(short_name)
-                        .filter(|v| is_struct(v))
-                        .cloned()
-                })
-                .or_else(|| {
-                    let lower = class_name.to_lowercase();
-                    self.globals
-                        .iter()
-                        .find(|(k, v)| k.eq_ignore_ascii_case(&lower) && is_struct(v))
-                        .map(|(_, v)| v.clone())
-                })
-                .or_else(|| self.globals.get("Anonymous").cloned());
-            // Deep-copy the `this` scope and the `variables` scope through ONE
-            // shared `seen` map (below), so an object the pseudo-constructor
-            // stored in BOTH (`variables.x = this.x = new Foo()`) stays a single
-            // shared reference in the instance instead of being split into two
-            // independent copies (GitHub #221). The `this` scope is copied here
-            // first to seed the map; `vars_scope` is copied through `dc_seen`.
-            let mut dc_seen: std::collections::HashMap<usize, CfmlValue> =
-                std::collections::HashMap::new();
-            // `is_root = true`: this IS the instance's own backing struct, so copy
-            // it (independent scopes). Nested component references inside it are
-            // shared, not cloned (see `deep_copy_with`).
-            let mut result = result.map(|v| v.deep_copy_with(&mut dc_seen, true));
+                .iter()
+                .find(|(k, v)| k.eq_ignore_ascii_case(class_name) && is_struct(v))
+                .map(|(k, _)| k.as_str().to_string())
+            {
+                Some(k)
+            } else if self.globals.get("Anonymous").is_some_and(is_struct) {
+                Some("Anonymous".to_string())
+            } else {
+                None
+            };
+            let result = template_key.and_then(|k| {
+                let taken = self.globals.shift_remove(&k);
+                // Put back whatever the page had under that name before the body.
+                if let Some((_, Some(prev))) =
+                    prev_class_globals.iter().find(|(pk, _)| pk.eq_ignore_ascii_case(&k))
+                {
+                    self.globals.insert(k, prev.clone());
+                }
+                taken
+            });
+            // The body's own local for the template (`StoreLocal(component.name)`)
+            // is captured with the other body locals below; it must not become a
+            // `variables.<ClassName>` self-reference on the instance (Lucee has
+            // no such key — and it made every instance a reference cycle).
+            let baked_local_name: Option<String> = match &result {
+                Some(CfmlValue::Struct(s)) => s.get("__name").map(|v| v.as_string()),
+                _ => None,
+            };
+            // No deep copy. The template is a fresh struct this construction
+            // built and it was just taken out of globals, so nothing else aliases
+            // it — and copying its VALUES broke reference semantics: a constructor
+            // `variables.cfg = request.cfg` handed the instance a private copy, so
+            // a later `variables.cfg.x = 2` never reached `request.cfg` (Lucee:
+            // it does). GitHub #221's requirement — a value stored in both
+            // `this.x` and `variables.x` stays ONE reference — holds trivially
+            // when neither side is copied.
+            let mut result = result;
             // Merge `this.*` members a `super.method(...)` set during the body (when
             // the body had no materialized `this` — see pseudo_ctor_super_this_writes)
             // onto the instance's `this` scope. Only fill keys the instance lacks, so
@@ -32658,6 +32825,11 @@ impl CfmlVirtualMachine {
                     "__instance_id".to_string(),
                     CfmlValue::Int(Self::next_component_id() as i64),
                 );
+                // Hand the already-resolved parent to `resolve_inheritance`
+                // (which removes this key before merging) — see the stash above.
+                if let Some(rp) = resolved_parent_stash.take() {
+                    s.insert(Self::RESOLVED_PARENT_KEY.to_string(), rp);
+                }
                 // Anonymous `component { ... }` declarations get __name = "Anonymous"
                 // baked in by the parser. Override with the dotted path the caller
                 // used (e.g. "oop.Greeter") so getMetadata(cfc).name matches Lucee/ACF.
@@ -32920,11 +33092,13 @@ impl CfmlVirtualMachine {
                 // resolve via __variables, not closures.
                 let body_scope = body_vars.snapshot();
                 for (k, v) in body_scope.iter().chain(component_variables.iter()) {
-                    let k_lower = k.to_lowercase();
-                    if k_lower == "this"
-                        || k_lower == "arguments"
-                        || k_lower == "super"
+                    if k.eq_ignore_ascii_case("this")
+                        || k.eq_ignore_ascii_case("arguments")
+                        || k.eq_ignore_ascii_case("super")
                         || k.starts_with("__")
+                        || baked_local_name
+                            .as_deref()
+                            .is_some_and(|n| k.eq_ignore_ascii_case(n))
                     {
                         continue;
                     }
@@ -32956,7 +33130,10 @@ impl CfmlVirtualMachine {
                         // (not in `this`) gets a fresh independent copy.
                         // `is_root = false`: these are content values, so a nested
                         // component here (e.g. an injected singleton) is shared.
-                        vars_scope.insert(k.clone(), v.deep_copy_with(&mut dc_seen, false));
+                        // Reference semantics: the instance's `variables` holds
+                        // the very values the constructor stored (see the note
+                        // at the former deep copy above).
+                        vars_scope.insert(k.clone(), v.clone());
                     }
                 }
                 // Backstop: ensure every component method is present in the
@@ -33012,9 +33189,14 @@ impl CfmlVirtualMachine {
                 if let (true, Some(ref h)) = (static_declared, &static_handle) {
                     vars_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
                 }
-                if !vars_scope.is_empty() {
-                    s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
-                }
+                // ALWAYS attach the scope, even empty. A component has a
+                // `variables` scope whether or not anything is in it, and
+                // `is_component_backing` requires the key — an empty
+                // `component {}` (a bare model that has methods grafted on later,
+                // a cycle-test node) was only recognised as a component before
+                // because the leaked class-name self-reference kept this map
+                // non-empty.
+                s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
             }
             // Canonicalise each method's `CfmlFunction` value to the shared,
             // per-class cache (`method_arc_cache`) so every instance points at ONE
@@ -33633,6 +33815,12 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> Result<CfmlValue, CfmlError> {
         if let CfmlValue::Struct(ref s) = instance {
+            // Nothing declared, nothing to validate or qualify: every branch
+            // below keys off `__implements`. Skipping the scope snapshot here
+            // is worth ~5% of a plain component's construction.
+            if s.get("__implements").is_none() {
+                return Ok(instance);
+            }
             // Include the shared method table (component flyweight) so interface
             // method-implementation validation sees the (now class-shared) methods.
             let snap = s.snapshot_with_methods();
@@ -33659,17 +33847,18 @@ impl CfmlVirtualMachine {
                 }
             }
 
-            if !all_ifaces.is_empty() || !fqns.is_empty() {
-                let mut m = snap;
-                if !all_ifaces.is_empty() {
-                    let chain: Vec<CfmlValue> =
-                        all_ifaces.into_iter().map(CfmlValue::string).collect();
-                    m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
-                }
-                if !fqns.is_empty() {
-                    m.insert("__implements_fqns".to_string(), CfmlValue::array(fqns));
-                }
-                return Ok(CfmlValue::strukt(m));
+            // Stamp the results onto the instance IN PLACE. Rebuilding it from
+            // `snap` (as this used to) folded the class's shared method table back
+            // into a per-instance map and dropped the table — so every component
+            // that implemented an interface carried all of its methods per
+            // instance, defeating the flyweight for exactly those classes.
+            if !all_ifaces.is_empty() {
+                let chain: Vec<CfmlValue> =
+                    all_ifaces.into_iter().map(CfmlValue::string).collect();
+                s.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+            }
+            if !fqns.is_empty() {
+                s.insert("__implements_fqns".to_string(), CfmlValue::array(fqns));
             }
         }
         Ok(instance)
@@ -33704,7 +33893,19 @@ impl CfmlVirtualMachine {
             visited.insert(name.to_lowercase());
         }
 
-        let merged = self.resolve_inheritance_chain(template, &extends_name, locals, &mut visited)?;
+        // The parent `resolve_component_template_impl` already resolved (and
+        // ran the pseudo-constructor of) while building this template's
+        // injected scope. Take it off the template — it must never reach the
+        // instance — and merge against it rather than resolving the parent again.
+        let pre_resolved_parent = s.remove(Self::RESOLVED_PARENT_KEY);
+
+        let merged = self.resolve_inheritance_chain(
+            template,
+            &extends_name,
+            locals,
+            &mut visited,
+            pre_resolved_parent,
+        )?;
         // Phase A: class-invariant metadata (the merged `__metadata`/`__properties`/
         // `__super_map`/... just re-derived above) is identical for every instance
         // of this class. Splice one shared Arc-backed copy in so N instances don't
@@ -33718,6 +33919,11 @@ impl CfmlVirtualMachine {
         }
         Ok(merged)
     }
+
+    /// Hidden template key carrying the parent `resolve_component_template_impl`
+    /// already resolved, for `resolve_inheritance` to merge against. Removed
+    /// there; never present on a finished instance.
+    const RESOLVED_PARENT_KEY: &'static str = "__resolved_parent";
 
     /// Class-invariant metadata keys — identical for every instance of a class,
     /// never mutated per-instance after construction (verified: only writers are
@@ -33783,12 +33989,20 @@ impl CfmlVirtualMachine {
         parent_name: &str,
         locals: &ValueMap,
         visited: &mut std::collections::HashSet<String>,
+        pre_resolved_parent: Option<CfmlValue>,
     ) -> CfmlResult {
         // Check circular
         if visited.contains(&parent_name.to_lowercase()) {
             return Ok(child);
         }
         visited.insert(parent_name.to_lowercase());
+
+        // Already resolved by the template resolver (see `__resolved_parent`):
+        // its whole ancestor chain is merged and its constructors have run.
+        // Go straight to the merge — resolving again would re-run them.
+        if let Some(parent) = pre_resolved_parent {
+            return self.merge_child_onto_resolved_parent(child, parent, parent_name);
+        }
 
         // Rust-class parent: no CFML template to merge. Stash the class name
         // for createObject to construct, and record the prefixed name in the
@@ -33868,13 +34082,27 @@ impl CfmlVirtualMachine {
         let parent = if let CfmlValue::Struct(ref ps) = parent {
             if let Some(CfmlValue::String(grandparent)) = ps.get("__extends") {
                 let gp = grandparent.clone();
-                self.resolve_inheritance_chain(parent, &gp, locals, visited)?
+                self.resolve_inheritance_chain(parent, &gp, locals, visited, None)?
             } else {
                 parent
             }
         } else {
             parent
         };
+        self.merge_child_onto_resolved_parent(child, parent, parent_name)
+    }
+
+    /// The merge half of [`Self::resolve_inheritance_chain`]: layer `child`
+    /// (a freshly executed template) onto its FULLY RESOLVED `parent`
+    /// instance. Pure assembly — resolves and constructs nothing — so it is
+    /// safe to reach from either the fresh-resolution path or the
+    /// pre-resolved one.
+    fn merge_child_onto_resolved_parent(
+        &mut self,
+        child: CfmlValue,
+        parent: CfmlValue,
+        parent_name: &str,
+    ) -> CfmlResult {
 
         // Record which members the parent exposes as ONE shared reference in
         // both its `this` scope (a top-level key) and its `variables` scope
@@ -34032,9 +34260,12 @@ impl CfmlVirtualMachine {
                 // version in `variables`, and the per-class method table built from it
                 // resolved the STALE ancestor method (get_ci exact-match-first). Drop
                 // any differently-cased entry first so the child's is the sole winner.
+                // `Key` hashes and compares case-insensitively, so one probe finds
+                // any differently-cased entry; this was a linear scan of every key
+                // per child key (quadratic in the method count).
                 if let Some(stale) = merged_vars
-                    .keys()
-                    .find(|ek| ek.as_str() != k.as_str() && ek.eq_ignore_ascii_case(&k))
+                    .get_key(k.as_str())
+                    .filter(|ek| ek.as_str() != k.as_str())
                     .cloned()
                 {
                     merged_vars.shift_remove(&stale);
@@ -34109,9 +34340,10 @@ impl CfmlVirtualMachine {
             // child onApplicationStart). A plain insert would leave BOTH casings
             // in the map, so drop any differently-cased parent entry first so the
             // child's definition is the sole winner.
+            // One CI probe, not a scan of every parent key (see `merged_vars`).
             if let Some(stale) = parent_map
-                .keys()
-                .find(|ek| ek.as_str() != k.as_str() && ek.eq_ignore_ascii_case(&k))
+                .get_key(k.as_str())
+                .filter(|ek| ek.as_str() != k.as_str())
                 .cloned()
             {
                 parent_map.shift_remove(&stale);
@@ -34121,8 +34353,16 @@ impl CfmlVirtualMachine {
             // unqualified calls within CFC methods resolve to the override
             if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
                 if let Some(vars) = parent_map.get_mut(&*cfml_common::key::well_known::VARIABLES).and_then(|v| v.as_cfml_struct()) {
-                    // remove_ci drops any differently-cased parent entry too
-                    vars.remove_ci(&k);
+                    // A plain insert overwrites a same-cased entry in place. Only
+                    // a DIFFERENTLY-cased ancestor entry needs removing first (so
+                    // the child's casing wins) — `remove_ci` is a `shift_remove`,
+                    // O(n), and doing it for every method made this loop quadratic.
+                    let cased_differently = vars.with_map(|m| {
+                        m.get_key(k.as_str()).is_some_and(|ek| ek.as_str() != k.as_str())
+                    });
+                    if cased_differently {
+                        vars.remove_ci(&k);
+                    }
                     vars.insert(k.clone(), v.clone());
                 }
             }
@@ -39528,6 +39768,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::NewObject(n) | BytecodeOp::NewObjectNamed(_, n) => (1, n + 1), // class + args → instance
         // Function definition: push 1
         BytecodeOp::DefineFunction(_) => (1, 0),
+        BytecodeOp::DefineComponentMethods(_) => (0, 0),
         // Postfix: push 1 (new value)
         BytecodeOp::Increment(_)
         | BytecodeOp::Decrement(_)

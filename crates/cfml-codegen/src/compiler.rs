@@ -365,6 +365,7 @@ impl BytecodeFunction {
                 BytecodeOp::Include(_)
                 | BytecodeOp::IncludeDynamic
                 | BytecodeOp::DefineFunction(_)
+                | BytecodeOp::DefineComponentMethods(_)
                 | BytecodeOp::SetDynamicVar
                 | BytecodeOp::UnsetPath(_)
                 | BytecodeOp::DeleteScopeKey(_)
@@ -456,7 +457,7 @@ impl BytecodeFunction {
                 // the ineligible code is ONLY ineligible because of a closure,
                 // and how much of such a body precedes its first closure (all a
                 // spill-on-DefineFunction design could recover).
-                BytecodeOp::DefineFunction(_) => {
+                BytecodeOp::DefineFunction(_) | BytecodeOp::DefineComponentMethods(_) => {
                     self.count_slot_class(SlotClass::DisqClosure, Some(i));
                     return;
                 }
@@ -863,6 +864,16 @@ pub struct NamedMethodCall {
     pub write_back: Option<Vec<String>>,
 }
 
+/// Out-of-line payload of [`BytecodeOp::DefineComponentMethods`]: the local
+/// holding the component template under construction, and the `global_id` of
+/// every method declared in the class body, in declaration order. Boxed so the
+/// op stays inside the 24-byte budget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentMethods {
+    pub holder: Name,
+    pub gids: Vec<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub enum BytecodeOp {
     // Literals
@@ -1057,6 +1068,16 @@ pub enum BytecodeOp {
 
     // Function definition
     DefineFunction(usize), // BytecodeFunction.global_id (resolved via the VM's fn_registry)
+    /// Attach every method of a component class to the template struct held in
+    /// the named local AND to the constructing frame's variables scope, in one
+    /// op. Replaces the per-method six-op sequence (`DefineFunction` +
+    /// `StoreLocal(name)` from the declaration, then `LoadLocal(holder)`,
+    /// `DefineFunction`, `SetProperty(name)`, `StoreLocal(holder)`) that made
+    /// the pseudo-constructor's cost linear in the method count on EVERY
+    /// instantiation — ~500 dispatched ops and two map inserts per method for an
+    /// 86-method class. The method values themselves are the class-invariant
+    /// `Arc<CfmlFunction>`s from the VM's `method_arc_cache`.
+    DefineComponentMethods(Box<ComponentMethods>),
 
     // Postfix ops
     Increment(Name),  // Increment variable (+1)
@@ -1402,11 +1423,12 @@ impl BytecodeOp {
             Self::CallBuiltin(..) => 121,
             Self::SeedArgumentKey(..) => 122,
             Self::StoreLocalScopeKey(..) => 123,
+            Self::DefineComponentMethods(..) => 124,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 124] = [
+    pub const CENSUS_NAMES: [&'static str; 125] = [
         "Null",
         "True",
         "False",
@@ -1531,6 +1553,7 @@ impl BytecodeOp {
         "CallBuiltin",
         "SeedArgumentKey",
         "StoreLocalScopeKey",
+        "DefineComponentMethods",
     ];
 }
 
@@ -4905,20 +4928,25 @@ impl CfmlCompiler {
         // collisions skips methods (Lucee allows `obj.canonicalize()` etc.).
         let prev_in_method = self.in_component_method;
         self.in_component_method = true;
+        // Compile each method body (registering it in the program), but discard
+        // the `DefineFunction` + `StoreLocal(name)` pair `compile_function_decl`
+        // emits for a page-level declaration: one `DefineComponentMethods` op
+        // below attaches the whole class in a single dispatch (see the variant's
+        // doc). Going through the holder LOCAL — never `LoadLocal(func.name)` —
+        // also keeps a method named after a scope word (`function local(){}`)
+        // from loading the scope instead.
+        let mut gids: Vec<usize> = Vec::with_capacity(component.functions.len());
         for func in &component.functions {
-            let gid = self.compile_function_decl(func, instructions);
-            // SetProperty needs: stack = [object, value]. Load the component
-            // struct, then push a fresh function reference via DefineFunction.
-            // Re-emitting DefineFunction (rather than LoadLocal(func.name))
-            // avoids loading the local *scope* when the method name is a
-            // reserved scope word like `local` (Preside Config.cfc environment
-            // methods: `function local(){}`).
-            instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
-            instructions.push(BytecodeOp::DefineFunction(gid));
-            instructions.push(BytecodeOp::SetProperty(Name::from(&func.name)));
-            instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
+            let mut scratch: Vec<BytecodeOp> = Vec::new();
+            gids.push(self.compile_function_decl(func, &mut scratch));
         }
         self.in_component_method = prev_in_method;
+        if !gids.is_empty() {
+            instructions.push(BytecodeOp::DefineComponentMethods(Box::new(ComponentMethods {
+                holder: Name::from(&component.name),
+                gids,
+            })));
+        }
 
         // Emit per-function metadata as __funcmeta_<name> keys
         for func in &component.functions {
