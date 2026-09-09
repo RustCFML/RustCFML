@@ -21,6 +21,7 @@ pub(crate) fn op_get_property(
     vm: &mut CfmlVirtualMachine,
     stack: &mut Vec<CfmlValue>,
     ip: &mut usize,
+    locals: &ValueMap,
     name: &Name,
     throw_on_miss: bool,
 ) -> Result<(), CfmlError> {
@@ -140,7 +141,11 @@ pub(crate) fn op_get_property(
                     // not a node group keeps returning Null.
                     _ => match crate::xml_group_first(arr) {
                         Some(first) => {
-                            let v = CfmlVirtualMachine::lookup_property(&first, name.as_str());
+                            let v = CfmlVirtualMachine::lookup_property(
+                                &first,
+                                name.as_str(),
+                                Some(locals),
+                            );
                             stack.push(v);
                         }
                         None => stack.push(CfmlValue::Null),
@@ -203,7 +208,16 @@ pub(crate) fn op_get_property(
             // Struct arm). Throwing on a genuine miss matches Lucee.
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
-                let val = match inst.read().get_member(name) {
+                // GH #417/#420 — the full view here was the residual half of
+                // #417: this arm runs whenever the receiver is NOT a bare local
+                // the compiler could fuse into `LoadLocalProperty`, so an
+                // OUTSIDE `arr[ 1 ].secret` / `st.k.secret` still read a
+                // `variables`-only member. Ask by reading frame instead.
+                let val = match CfmlVirtualMachine::instance_member_view(
+                    inst,
+                    name,
+                    Some(locals),
+                ) {
                     Some(v) => {
                         if let CfmlValue::Function(ref f) = v {
                             if f.captured_scope.is_none() {
@@ -258,6 +272,7 @@ pub(crate) fn op_get_index(
     vm: &mut CfmlVirtualMachine,
     stack: &mut Vec<CfmlValue>,
     ip: &mut usize,
+    locals: &ValueMap,
 ) -> Result<(), CfmlError> {
     let index = stack.pop().unwrap_or(CfmlValue::Null);
     let collection = stack.pop().unwrap_or(CfmlValue::Null);
@@ -439,16 +454,23 @@ pub(crate) fn op_get_index(
         // private DATA (tolerant — Null on miss, like struct index).
         #[cfg(feature = "component-instance")]
         CfmlValue::Instance(inst) => {
-            // GH #417 — PUBLIC view. Bracket access is the same external read
-            // as dot access and Lucee gates it identically: `c["secret"]` and
-            // `c["__variables"]` both answer "has no accessible Member".
-            // Gating only the dot paths left this one handing out the private
-            // scope, and with it the write escape in #409 — the nested
-            // assignment `c.__variables.x = v` resolves its intermediate
-            // segment through here.
+            // GH #417 — bracket access is the same read as dot access, so an
+            // EXTERNAL `c["secret"]` / `c["__variables"]` answers "no accessible
+            // member" (Null here) just as `c.secret` does; that also closes the
+            // #409 write escape, since `c.__variables.x = v` resolves its
+            // intermediate segment through here.
+            //
+            // GH #420 — but pinning it to the PUBLIC view denied the INSIDER
+            // too: inside the component `this[ "priv" ]` went Null while
+            // `this.priv` and `variables[ "priv" ]` both resolved, and Lucee
+            // resolves all three. Preside's object merger is exactly that
+            // shape — it re-homes a CFC's methods by `this[ func.name ]` — so
+            // every private method came back Null. The view now follows the
+            // reading frame; see `CfmlVirtualMachine::instance_member_view`.
             let key = index.as_str_cow();
             stack.push(
-                inst.read().get_public_member(&key).unwrap_or(CfmlValue::Null),
+                CfmlVirtualMachine::instance_member_view(inst, &key, Some(locals))
+                    .unwrap_or(CfmlValue::Null),
             );
         }
         // Lucee/ACF/BoxLang: `str[n]` is 1-based CHARACTER access

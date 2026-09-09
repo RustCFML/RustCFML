@@ -2481,3 +2481,84 @@ flushing cases run over HTTP against a target page rather than in the runner
 itself, because a flush in the runner would freeze the runner's own headers and
 break every later `cfheader`/`cflocation`/`cfcontent` test. 15/15 green on both
 RustCFML and Lucee 7.1.
+
+## 88. Component member reads were gated by OPCODE, not by reader — so the same rule denied insiders and served outsiders (fixed v0.657.0) 📌 *(GH [#420](https://github.com/RustCFML/RustCFML/issues/420), residual [#417](https://github.com/RustCFML/RustCFML/issues/417))*
+
+**The reported symptom.** Inside a component, `this[ "priv" ]` returned NULL
+while `this.priv` and `variables[ "priv" ]` both resolved the private method.
+Lucee resolves all three. Same for a function injected onto the instance
+(`obj.fn = udf; obj.fn()`). Outside the component all three were correctly
+unreachable on both engines, so the divergence was dot-vs-bracket *inside*.
+
+Preside's object merger is exactly that shape. `Merger.cfc` merges same-named
+objects from different source folders — a core mechanism, not an edge case — by
+walking `getMetaData( this ).functions` and re-homing each one:
+
+```cfml
+target.$addFunction( func.name, this[ func.name ] );   // NULL for every private method
+```
+
+so `$addFunction( required string name, required function func )` threw
+*"The parameter [func] to function [$addFunction] is required but was not passed
+in"*. `PresideObjectServiceTest` test053/054/055 (`objectsWithMerging`) went
+green → erroring, v0.636.0 → v0.655.0.
+
+**The cause, and why it was two bugs.** #417 gated four read paths onto the
+public view. It gated them **per opcode**, and an opcode does not know who is
+reading — so one rule was wrong in *both* directions:
+
+* `GetIndex` was pinned to the public view and denied the **insider**. That is
+  #420.
+* `op_get_property`'s `Instance` arm was left on the FULL view and still served
+  the **outsider**. `c.secret` looked gated only because the compiler fuses a
+  bare local into `LoadLocalProperty`; a receiver it cannot fuse never reached
+  that path. `arr[ 1 ].secret` and `st.k.secret` both read a `variables`-only
+  member on v0.656.1 — the private-scope leak #417 declared closed was still
+  half open, 20 releases later.
+
+The lesson is the same one #417's own commit message drew and then half-applied:
+these are four paths to one question, and any answer that differs between them
+is a bug in whichever path is asked. The discriminator has to be the *reader*.
+
+**The fix.** `CfmlVirtualMachine::instance_member_view( inst, name, frame )`.
+All four paths (`op_get_index`, `op_get_property`, `lookup_property`,
+`lookup_property_opt`) now thread the reading frame through it: inside the
+receiver's class → full view, outside → public surface. The insider test reuses
+the existing `caller_is_within`, so it is the same rule the method-access gate
+(GH #330) already applies — including that `private` is CLASS-level, so a sibling
+instance and a subclass both qualify, and a closure minted inside a method reads
+as an insider because it captures `this`.
+
+**Why it costs nothing on the hottest op in the engine.** It asks the public view
+FIRST and consults the caller only on a public MISS. That is sound because the
+public view is a strict subset of the full one that agrees with it wherever it
+answers at all (`get_public_member` is `this_members.get_ci` plus a
+declared-private-method gate; `get_member` probes `this_members` first too), so
+asking it first cannot change the answer — only who pays. And it does pay: past
+the `Arc::ptr_eq` fast path, `caller_is_within` clones both class source paths to
+compare them, and *reading another component's public members from inside your
+own* is the commonest shape in any framework. That shape now pays nothing; only
+a private read or a genuine miss (already headed for a native-parent probe or an
+undefined-variable throw) reaches the comparison.
+
+**Still divergent, deliberately.** `isDefined( "this.priv" )` from INSIDE a
+component still walks the public view and answers `false` while the read
+resolves. #417 reasoned about that path explicitly (and its commit corrects a
+contaminated probe that had suggested Lucee answers `true` — measure it on an
+untouched instance) so it is left alone here rather than changed as a side
+effect. Tracked, not forgotten.
+
+Tests: `tests/oop/test_component_member_view_by_reader.cfm` (19 assertions,
+cross-engine) with `MemberViewFixture` / `MemberViewForeign` /
+`MemberViewChild`. It pins both directions, the `getMetaData( this ).functions`
+re-homing walk, the foreign-class negative, inheritance and closures — and it
+FAILS on a pre-fix binary, which is the check that matters for a regression test.
+
+Verified: Preside's real `Merger.cfc`, run against two fixture CFCs, throws the
+reported error pre-fix and merges every method (private included) post-fix. CLI
+8907/8907; serve dev cold+warm and `--production` ×3 at 9035/9035; baseline with
+the change stashed byte-identical at 8888/8888. Wheels core suite on sqlite, as
+an interleaved A/B over three runs each: pass=3361 fail=5 err=0 skip=23 on BOTH
+binaries, same two spec names failing, six runs identical; wall 33.37 s baseline
+vs 32.95 s fixed — inside the baseline's own 2.4 s spread, i.e. no measurable
+change, which is what the public-first ordering was for.

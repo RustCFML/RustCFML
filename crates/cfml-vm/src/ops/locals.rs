@@ -663,7 +663,7 @@ pub(crate) fn op_load_local_property(
             return Ok(());
         }
         None => stack.push(CfmlValue::Null),
-        Some(obj) => match CfmlVirtualMachine::lookup_property_opt(&obj, prop_name) {
+        Some(obj) => match CfmlVirtualMachine::lookup_property_opt(&obj, prop_name, Some(locals)) {
             Some(v) => stack.push(v),
             // A declared-but-unpassed `arguments` param reads as
             // Null (Lucee/ACF), not an undefined-variable throw.

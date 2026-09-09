@@ -6614,7 +6614,14 @@ impl CfmlVirtualMachine {
     /// Extract `obj.name` semantics — identical to the BytecodeOp::GetProperty
     /// logic but operates on a borrowed CfmlValue so the caller avoids a
     /// stack push/pop round-trip. Used by LoadLocalProperty.
-    pub(crate) fn lookup_property(obj: &CfmlValue, name: &str) -> CfmlValue {
+    /// `frame` is the READING frame, threaded through so a component receiver
+    /// resolves against the view its reader is entitled to (GH #420, see
+    /// [`Self::instance_member_view`]); `None` means external.
+    pub(crate) fn lookup_property(
+        obj: &CfmlValue,
+        name: &str,
+        frame: Option<&ValueMap>,
+    ) -> CfmlValue {
         match obj {
             CfmlValue::Struct(s) => {
                 // get_ci does exact-then-CI under one read lock, cloning only the
@@ -6644,7 +6651,7 @@ impl CfmlVirtualMachine {
                     CfmlValue::Int(arr.len() as i64)
                 } else if let Some(first) = xml_group_first(arr) {
                     // XML named-child group: address the first element (GH #343).
-                    Self::lookup_property(&first, name)
+                    Self::lookup_property(&first, name, frame)
                 } else {
                     CfmlValue::Null
                 }
@@ -6692,12 +6699,11 @@ impl CfmlVirtualMachine {
             // `this.value` on a CFC extending a Rust class that exposes `value`).
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
-                let g = inst.read();
-                // GH #417 — PUBLIC view only; the private `variables` scope is
-                // not part of a component's external surface.
-                if let Some(v) = g.get_public_member(name) {
+                // GH #417/#420 — the view the READING FRAME is entitled to:
+                // public surface from outside, full view from inside the class.
+                if let Some(v) = Self::instance_member_view(inst, name, frame) {
                     v
-                } else if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
+                } else if let Some(CfmlValue::NativeObject(parent)) = &inst.read().native_parent {
                     parent
                         .read()
                         .ok()
@@ -6722,14 +6728,16 @@ impl CfmlVirtualMachine {
     fn lookup_property_opt(
         obj: &CfmlValue,
         name: &cfml_common::name::Name,
+        frame: Option<&ValueMap>,
     ) -> Option<CfmlValue> {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = obj {
-            let g = inst.read();
-            // GH #417 — PUBLIC view only (see `get_public_member`).
-            if let Some(v) = g.get_public_member(name) {
+            // GH #417/#420 — the view the READING FRAME is entitled to (see
+            // `instance_member_view`), not a fixed one chosen by opcode.
+            if let Some(v) = Self::instance_member_view(inst, name, frame) {
                 return Some(v);
             }
+            let g = inst.read();
             // Fall through to a `rust:` native parent's `get_property` before
             // signalling a miss.
             if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
@@ -6766,7 +6774,7 @@ impl CfmlVirtualMachine {
             }
             None
         } else {
-            Some(Self::lookup_property(obj, name))
+            Some(Self::lookup_property(obj, name, frame))
         }
     }
 
@@ -11241,7 +11249,7 @@ impl CfmlVirtualMachine {
                 // Collections
                 BytecodeOp::BuildArray(count) => ops::value::op_build_array(&mut stack, *count),
                 BytecodeOp::BuildStruct(count) => ops::value::op_build_struct(&mut stack, *count),
-                BytecodeOp::GetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip)?; }
+                BytecodeOp::GetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip, &locals)?; }
                 BytecodeOp::SetIndex => {
                     if let Err(e) = ops::frame::op_set_index(&mut stack) {
                         ip = self.route_call_error(e, &mut stack)?;
@@ -11477,7 +11485,7 @@ impl CfmlVirtualMachine {
                     }
                 }
                 BytecodeOp::LoadSuper => { ops::locals::op_load_super(self, &mut stack, &mut locals)?; }
-                BytecodeOp::GetProperty(name) | BytecodeOp::TryGetProperty(name) => { ops::access::op_get_property(self, &mut stack, &mut ip, name, matches!(op, BytecodeOp::GetProperty(_)))?; }
+                BytecodeOp::GetProperty(name) | BytecodeOp::TryGetProperty(name) => { ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, matches!(op, BytecodeOp::GetProperty(_)))?; }
                 BytecodeOp::LoadStaticHolder(name) => { ops::frame::op_load_static_holder(self, &mut stack, &locals, name); }
                 BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
                 BytecodeOp::MarkAccessorPrivate(name) => { ops::frame::op_mark_accessor_private(&locals, name); }
@@ -31001,11 +31009,71 @@ impl CfmlVirtualMachine {
         inst.read().has_injected_public_method(method)
     }
 
+    /// GH #420 — read a member through a component RECEIVER with the view the
+    /// READER is entitled to. The gate is the calling frame, not the opcode.
+    ///
+    /// `None` for the frame means "no CFML frame to consult" — external, public
+    /// surface only. `Some(locals)` is the reading frame: if it is executing
+    /// inside the receiver's class (same instance, or another instance of the
+    /// same class — `private` is class-level on Lucee, see
+    /// [`Self::caller_is_within`]) it gets the FULL view, because from in there
+    /// `this.priv`, `this[ "priv" ]` and `variables[ "priv" ]` are the same
+    /// read and Lucee resolves all three.
+    ///
+    /// #417 gated the four external read paths, but it gated them per OPCODE,
+    /// and an opcode does not know who is reading — so the same map was wrong in
+    /// both directions. `GetIndex` denied an INSIDER (`this[ "priv" ]` went Null
+    /// while `this.priv` resolved — #420, which broke Preside's object merger:
+    /// it walks `getMetaData( this ).functions` and re-homes each one by
+    /// `this[ func.name ]`), while `GetProperty`'s `Instance` arm kept the full
+    /// view and so still handed an OUTSIDER the private scope whenever the
+    /// receiver was not a bare local the compiler could fuse — `arr[ 1 ].secret`
+    /// and `st.k.secret` both read a `variables`-only member.
+    #[cfg(feature = "component-instance")]
+    pub(crate) fn instance_member_view(
+        inst: &cfml_common::component::InstanceRef,
+        name: &str,
+        frame: Option<&ValueMap>,
+    ) -> Option<CfmlValue> {
+        // PUBLIC FIRST, and the caller is only consulted on a public MISS.
+        // This is the hottest read in the engine (every `x.y` and `a[k]` with a
+        // component receiver), and the public view is a strict SUBSET of the
+        // full one that agrees with it wherever it answers at all: every name
+        // it resolves, the full view resolves to the same value — `get_public_member` is `this_members.get_ci` plus a gate on
+        // declared-private methods, and `get_member` probes `this_members`
+        // first too. So asking it first cannot change the answer, it only
+        // decides who pays.
+        //
+        // That matters because the insider test is not free once the reader is
+        // a DIFFERENT component: past the `Arc::ptr_eq` fast path,
+        // `caller_is_within` clones both class source paths to compare them,
+        // and reading another component's public members from inside your own
+        // is the single most common shape in any framework. This way that shape
+        // pays nothing, and only a public miss — a private member, or a genuine
+        // miss already headed for a native-parent probe or an
+        // undefined-variable throw — reaches the comparison.
+        if let Some(v) = inst.read().get_public_member(name) {
+            return Some(v);
+        }
+        let caller = match frame {
+            Some(locals) => DispatchCaller::Frame(locals),
+            None => DispatchCaller::Outside,
+        };
+        if !Self::caller_is_within(
+            inst,
+            &cfml_common::dynamic::CfmlAccess::Private,
+            caller,
+        ) {
+            return None;
+        }
+        inst.read().get_member(name)
+    }
+
     /// The caller half of [`instance_method_accessible`]: is the code making this
     /// call inside the receiver's class (for `private`) or its package (for
     /// `package`)?
     #[cfg(feature = "component-instance")]
-    fn caller_is_within(
+    pub(crate) fn caller_is_within(
         inst: &cfml_common::component::InstanceRef,
         access: &cfml_common::dynamic::CfmlAccess,
         caller: DispatchCaller<'_>,

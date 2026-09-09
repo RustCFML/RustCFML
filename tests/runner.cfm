@@ -381,6 +381,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_include_rewrite_freshness.cfm" rustcfmlOnly="true" why="environment-specific: writes and re-reads through a server temp path">
 <cf_runtest file="oop/test_accessor_private_iteration.cfm">
 <cf_runtest file="oop/test_method_access_gate.cfm">
+<cf_runtest file="oop/test_component_member_view_by_reader.cfm">
 <cf_runtest file="oop/test_arg_type_validation.cfm">
 <cf_runtest file="oop/test_new_keyword_path.cfm">
 <!--- - component_internals_serialize_leak: iterating a component (for(k in obj)) --->
