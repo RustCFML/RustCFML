@@ -411,6 +411,8 @@ include "harness.cfm";
 <cf_runtest file="oop/test_inherited_new_mapping_qualified_fqn.cfm">
 <cf_runtest file="oop/test_component_ctor_method_hoist.cfm">
 <cf_runtest file="oop/test_component_construction_semantics.cfm">
+<cf_runtest file="oop/test_static_across_requests.cfm">
+<cf_runtest file="stdlib/test_cache_across_requests.cfm" rustcfmlOnly="true" why="Lucee refuses cachePut without an Administrator-defined default object cache (there is no default object cache defined); RustCFML has a built-in default">
 <cf_runtest file="gc/test_incremental_cycle_sweep.cfm">
 <cf_runtest file="oop/test_runtime_added_method_via_structappend.cfm">
 <cf_runtest file="oop/test_injected_method_instance_isolation.cfm">

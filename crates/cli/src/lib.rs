@@ -1306,6 +1306,8 @@ fn compile_and_run(
         // the Arc; we only need a borrow long enough to copy values across.
         vm.apply_cfconfig(&ss.cfconfig);
         vm.server_state = Some(ss.clone());
+        // Share the server-lifetime object cache (cachePut/cacheGet).
+        vm.cache = ss.object_cache.clone();
     }
 
     // Wire up HTTP request data if provided

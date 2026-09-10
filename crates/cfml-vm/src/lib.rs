@@ -1598,6 +1598,24 @@ fn component_cache_source_dir(source_file: Option<&str>) -> &str {
 }
 
 /// Server-level state, persists across requests in --serve mode.
+/// `cachePut`/`cacheGet` store: key -> (value, optional expiry instant). Shared
+/// across requests in serve mode (see `ServerState::object_cache`).
+pub type ObjectCache =
+    Arc<parking_lot::RwLock<HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>>>;
+
+/// One component class's `static` scope as held across requests (see
+/// `ServerState::static_scopes`).
+#[derive(Clone)]
+pub struct StaticScopeEntry {
+    /// `global_id` of the CFC program's `__main__` at the time the scope was
+    /// initialised; a recompile of the file yields a new id and a fresh scope.
+    pub generation: u32,
+    pub scope: CfmlStruct,
+    /// Whether the type declares or inherits a `static {}` block (the
+    /// `static_ctor_types` membership).
+    pub ctor_declared: bool,
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     pub applications: Arc<dyn ApplicationStore>,
@@ -1712,6 +1730,19 @@ pub struct ServerState {
     /// case and avoids that cross-application bleed. `CfmlStruct` is
     /// `Arc<RwLock<..>>`, so the clone handed to the request shares this state.
     pub pseudo_ctor_app_scopes: Arc<parking_lot::RwLock<HashMap<String, CfmlStruct>>>,
+    /// The `cachePut`/`cacheGet` object cache. Lives here — for the server's
+    /// lifetime — because a request VM is dropped at request end, and the map
+    /// used to live on it: a value `cachePut` in one request was gone in the
+    /// next, which made the cache functions inert in serve mode. A CLI run (no
+    /// server state) keeps a private map on the VM.
+    pub object_cache: ObjectCache,
+    /// Component `static` scopes, keyed by the CFC's source file. A class's
+    /// static scope lives for the application's lifetime on Lucee/ACF; held per
+    /// request VM it was re-initialised on every request (`static { hits = 0 }`
+    /// read 1 forever). The entry records the compile generation (the CFC
+    /// `__main__`'s process-unique `global_id`) so a file edited in dev — a new
+    /// compile, a new id — gets a fresh static scope, as a redeploy would.
+    pub static_scopes: Arc<parking_lot::RwLock<HashMap<String, StaticScopeEntry>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -1776,6 +1807,8 @@ impl ServerState {
             exists_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             dir_fold_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            object_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            static_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -2588,8 +2621,10 @@ pub struct CfmlVirtualMachine {
     /// that defines no function skip the app-scope graph traversal entirely.
     /// Reset at the start of `execute_with_lifecycle`.
     app_fn_table_dirty: bool,
-    /// In-memory cache: key -> (value, optional expiry instant)
-    pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
+    /// The `cachePut`/`cacheGet` store. In serve mode this is the SHARED
+    /// `ServerState::object_cache` handle (attached with the server state), so
+    /// cached values survive the request; a CLI run keeps this private map.
+    pub cache: ObjectCache,
     /// Real runtime stats for the in-memory cache, surfaced by
     /// `cacheGetProperties(name)` (Lucee returns `hit_count`/`miss_count`/
     /// `outOfMemoryHandling` per cache). A `cacheGet`/`cacheKeyExists` that
@@ -4050,7 +4085,7 @@ impl CfmlVirtualMachine {
             pending_app_fns: Vec::new(),
             fn_registry: Vec::new(),
             app_fn_table_dirty: false,
-            cache: HashMap::new(),
+            cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cache_hits: 0,
             cache_misses: 0,
             enable_cfoutput_only: 0,
@@ -5107,6 +5142,9 @@ impl CfmlVirtualMachine {
         }
         self.vfs = seed.vfs;
         self.server_state = seed.server_state;
+        if let Some(ss) = &self.server_state {
+            self.cache = ss.object_cache.clone();
+        }
         self.application_scope = seed.application_scope;
         self.request_scope = seed.request_scope;
         self.session_scope = seed.session_scope;
@@ -20202,15 +20240,15 @@ impl CfmlVirtualMachine {
                             None
                         }
                     });
-                    self.cache.insert(key, (value, expiry));
+                    self.cache.write().insert(key, (value, expiry));
                     return Ok(CfmlValue::Null);
                 }
                 "cacheget" => {
                     let key = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    if let Some((val, expiry)) = self.cache.get(&key).cloned() {
+                    if let Some((val, expiry)) = self.cache.read().get(&key).cloned() {
                         if let Some(exp) = expiry {
                             if cfml_common::clock::Monotonic::now() > exp {
-                                self.cache.remove(&key);
+                                self.cache.write().remove(&key);
                                 self.cache_misses = self.cache_misses.saturating_add(1);
                                 return Ok(CfmlValue::Null);
                             }
@@ -20233,7 +20271,7 @@ impl CfmlVirtualMachine {
                             _ => false,
                         })
                         .unwrap_or(false);
-                    if self.cache.remove(&key).is_none() && throw_on_error {
+                    if self.cache.write().remove(&key).is_none() && throw_on_error {
                         return Err(CfmlError::runtime(format!(
                             "Cache key '{}' does not exist",
                             key
@@ -20244,28 +20282,27 @@ impl CfmlVirtualMachine {
                 "cacheclear" => {
                     let filter = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     if filter.is_empty() {
-                        self.cache.clear();
+                        self.cache.write().clear();
                     } else {
                         // Simple wildcard matching: * matches any sequence
                         let pattern = filter.to_lowercase();
-                        let keys_to_remove: Vec<String> = self
-                            .cache
-                            .keys()
+                        let keys_to_remove: Vec<String> = self.cache.read().keys()
                             .filter(|k| wildcard_match(&pattern, &k.to_lowercase()))
                             .cloned()
                             .collect();
                         for k in keys_to_remove {
-                            self.cache.remove(&k);
+                            self.cache.write().remove(&k);
                         }
                     }
                     return Ok(CfmlValue::Null);
                 }
                 "cachekeyexists" => {
                     let key = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    if let Some((_, expiry)) = self.cache.get(&key) {
+                    let hit = self.cache.read().get(&key).map(|(_, exp)| *exp);
+                    if let Some(expiry) = hit {
                         if let Some(exp) = expiry {
-                            if cfml_common::clock::Monotonic::now() > *exp {
-                                self.cache.remove(&key);
+                            if cfml_common::clock::Monotonic::now() > exp {
+                                self.cache.write().remove(&key);
                                 self.cache_misses = self.cache_misses.saturating_add(1);
                                 return Ok(CfmlValue::Bool(false));
                             }
@@ -20278,9 +20315,7 @@ impl CfmlVirtualMachine {
                 }
                 "cachecount" => {
                     let now = cfml_common::clock::Monotonic::now();
-                    let count = self
-                        .cache
-                        .iter()
+                    let count = self.cache.read().iter()
                         .filter(|(_, (_, exp))| exp.map_or(true, |e| now <= e))
                         .count();
                     return Ok(CfmlValue::Int(count as i64));
@@ -20288,7 +20323,7 @@ impl CfmlVirtualMachine {
                 "cachegetall" => {
                     let now = cfml_common::clock::Monotonic::now();
                     let mut result = ValueMap::default();
-                    for (k, (v, exp)) in &self.cache {
+                    for (k, (v, exp)) in self.cache.read().iter() {
                         if exp.map_or(true, |e| now <= e) {
                             result.insert(k.clone(), v.clone());
                         }
@@ -20297,9 +20332,7 @@ impl CfmlVirtualMachine {
                 }
                 "cachegetallids" => {
                     let now = cfml_common::clock::Monotonic::now();
-                    let ids: Vec<CfmlValue> = self
-                        .cache
-                        .iter()
+                    let ids: Vec<CfmlValue> = self.cache.read().iter()
                         .filter(|(_, (_, exp))| exp.map_or(true, |e| now <= e))
                         .map(|(k, _)| CfmlValue::string(k.clone()))
                         .collect();
@@ -32504,9 +32537,29 @@ impl CfmlVirtualMachine {
             // shared CfmlStruct handle. Done BEFORE the pseudo-constructor so the
             // body can read `static.X`.
             let static_key: &str = &cfc_path;
+            // Compile generation of this CFC: a recompiled file gets a new
+            // `__main__` global_id, so a cross-request static scope built for an
+            // older compile is recognised as stale and rebuilt.
+            let static_generation: u32 = cfc_func.global_id;
+            let shared_static: Option<StaticScopeEntry> = self.server_state.as_ref().and_then(|ss| {
+                ss.static_scopes
+                    .read()
+                    .get(static_key)
+                    .filter(|e| e.generation == static_generation)
+                    .cloned()
+            });
             let static_handle: Option<CfmlStruct> =
                 if let Some(h) = self.static_stores.get(static_key) {
                     Some(h.clone())
+                } else if let Some(entry) = shared_static {
+                    // Initialised by an earlier request: adopt it. The static
+                    // scope lives for the application's lifetime, not the
+                    // request's (Lucee/ACF parity).
+                    self.static_stores.insert(static_key.to_string(), entry.scope.clone());
+                    if entry.ctor_declared {
+                        self.static_ctor_types.insert(static_key.to_string());
+                    }
+                    Some(entry.scope)
                 } else {
                     // Seed a fresh shared handle with the parent's static members
                     // first (child declarations override). Reads of inherited
@@ -32600,6 +32653,20 @@ impl CfmlVirtualMachine {
                         self.static_stores.insert(static_key.to_string(), h.clone());
                         if has_own || inherited {
                             self.static_ctor_types.insert(static_key.to_string());
+                        }
+                        if let Some(ss) = self.server_state.as_ref() {
+                            // Outlives this request: register as a persistent
+                            // scope (like application/server) so the cycle
+                            // collector treats values displaced from it correctly.
+                            h.mark_persistent_scope();
+                            ss.static_scopes.write().insert(
+                                static_key.to_string(),
+                                StaticScopeEntry {
+                                    generation: static_generation,
+                                    scope: h.clone(),
+                                    ctor_declared: has_own || inherited,
+                                },
+                            );
                         }
                         Some(h)
                     }

@@ -2697,3 +2697,30 @@ cross-engine assertions, adding a replay block — metadata, public key list,
 3-level `super` dispatch, override resolution and per-instance isolation must be
 identical between a class's first and later constructions. 26/26 on RustCFML,
 Lucee 7.1 and the v0.658.0 binary (the replay must be unobservable).
+
+## 91. `cachePut`/`cacheGet` and component `static` scopes lived for one request (fixed v0.660.0) 📌
+
+Found by auditing which caches live on the per-request VM (every serve request
+gets a fresh VM) versus the shared server state. Nearly all class-level and
+execution caches are per request — an accepted trade-off — but two things on
+that list are not caches, they are state that must outlive the request:
+
+- **The object cache.** `cachePut("k", v)` in one request; `cacheGet("k")` in
+  the next returned null. The store was a plain map on the VM, so in serve mode
+  the cache functions were inert: anything relying on them for cross-request
+  caching silently recomputed every time. The store is now
+  `ServerState::object_cache`, shared for the server's lifetime; the VM holds
+  the shared handle when serving and a private map under the CLI.
+- **Component `static` scopes.** `static { hits = 0; }` with a method doing
+  `static.hits++` read 1 on every request; Lucee and ACF keep a class's static
+  scope for the application's lifetime. The per-request store stays as the
+  fast path, but it is now seeded from and written through to
+  `ServerState::static_scopes`, keyed by source file. Each entry records the
+  compile generation (the CFC `__main__`'s process-unique `global_id`), so
+  editing the file in dev mode — a new compile, a new id — gives it a fresh
+  static scope, as a redeploy would on the JVM engines.
+
+Tests: `tests/oop/test_static_across_requests.cfm` and
+`tests/stdlib/test_cache_across_requests.cfm`. Both need three separate
+requests to observe, so they drive a target page over HTTP on `cgi.server_port`
+and report a single skip under the CLI runner.
