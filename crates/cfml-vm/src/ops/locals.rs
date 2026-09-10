@@ -103,7 +103,16 @@ pub(crate) fn op_store_global(
     name: &Name,
 ) {
     if let Some(val) = stack.pop() {
-        vm.globals.insert(name, val);
+        // Keep the count of component templates in page globals current (a CFC
+        // body files its template here; the construction finalize takes it out).
+        let is_tpl = CfmlVirtualMachine::is_template_global(Some(&val));
+        let prev = vm.globals.insert(name, val);
+        let was_tpl = CfmlVirtualMachine::is_template_global(prev.as_ref());
+        if is_tpl && !was_tpl {
+            vm.component_template_globals += 1;
+        } else if was_tpl && !is_tpl {
+            vm.component_template_globals = vm.component_template_globals.saturating_sub(1);
+        }
     }
 }
 

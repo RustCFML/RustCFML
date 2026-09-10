@@ -2740,3 +2740,68 @@ copied nothing. A replayed template now carries its `variables` table from the
 finalize, and the merge folds table methods when the child is not itself a
 replay. Test: `tests/oop/test_appcfc_extends_parent_methods.cfm` with its own
 `tests/appcfc_parent/Application.cfc` (serve mode).
+
+## 93. A class's construction tables were rebuilt by every request — the replay path (§90) never fired on a page that constructs each class once (fixed v0.661.0) 📌
+
+§90 made the second and later constructions of a class in a request cheap by
+attaching its shared method tables instead of rebuilding them. Those tables,
+the class's own-method table, its `super` struct and its flyweight blueprint
+all lived on the per-request VM, and serve mode builds a fresh VM per request.
+So a page that constructs most of its classes once — a Preside render, a
+framework boot — paid the full first-construction price for every class on
+every request and never reached the replay path at all. Measured in serve
+mode (`--production`), one construction of each shape per request, median of
+300 requests:
+
+| First construction in a request | v0.660.1 | v0.661.0 |
+|---|---|---|
+| 86-method class | 64 µs | **8 µs** |
+| 200-method class | 125 µs | **9 µs** |
+| 1-method child of an 86-method base | 66 µs | **11 µs** |
+| 86-method child of an 86-method base | 189 µs | **19 µs** |
+| 1-method class, constructed after the others | 6.9 µs | **4.1 µs** |
+
+The tables now live on `ServerState::class_caches`, keyed by source file. A
+request adopts a class's entry into its per-request maps when it resolves the
+class, and publishes what it builds. Each entry carries a **chain generation**:
+the CFC's own compile generation (the `__main__` `global_id`, as the static
+scopes use) folded with its parent's. A child's `variables` table holds the
+parent's methods too, so keying on the child's own compile would have kept
+serving a stale table after a parent edit; with the chain generation an edit
+anywhere in the `extends` chain misses and rebuilds on the next request, in
+dev mode exactly as the bytecode cache does.
+
+Two further per-construction costs fell out of the same profile:
+
+- Every program swap re-registered each of the program's functions into the
+  VM's function registry, on every `new` of the class. A program is registered
+  whole, so its first function's id now marks it registered for the request.
+- Component resolution walked **every** page global (the builtins included)
+  with a case-insensitive comparison, twice per construction, looking for a
+  `component name="X"` template. The finalize now takes the template out under
+  the key the body filed it under — the declared `name=` or "Anonymous", read
+  from the body's bytecode alongside `__extends` — so it never looks. The
+  resolver's entry walk runs only while page globals hold at least one such
+  template (a count `StoreGlobal` and the finalize maintain), which is
+  normally never.
+- The flyweight blueprint lookup formatted a `(source file, name)` string key
+  on every construction; the file's first name is now filed under the bare
+  path and probed without allocating. The template's reserved keys are
+  inserted through the pre-hashed well-known `Key`s.
+
+Trivial 1-method class, CLI loop of 300k, ns per construction: `createObject`
+2,850 → **2,320**, `new` 3,200 → **2,600** (Lucee 570). What remains is spread
+across the marker struct the body builds, the body frame's scope set-up, and the
+instance partition — map inserts and allocations with no line above 1%.
+
+Tests: `crates/cfml-vm/tests/class_cache_across_requests.rs` (adoption is
+observable on the server state, the adopted instance is indistinguishable, and
+a parent-only or child-only edit is visible on the next dev-mode request) and
+`tests/oop/test_class_cache_across_requests.cfm` (serve mode, three requests
+against a 3-level chain). Wheels core and the TestBox suite are identical per
+spec to v0.660.1.
+
+The ~12 µs a request's *first* component resolution pays (the trivial class
+costs 16 µs constructed first and 4 µs constructed last) is spread across
+first-touch growth of per-request maps and registries; no single line
+dominates, and it is not addressed here.

@@ -1616,6 +1616,35 @@ pub struct StaticScopeEntry {
     pub ctor_declared: bool,
 }
 
+/// One component class's construction-invariant tables as held across
+/// requests (see `ServerState::class_caches`). Every field is `Arc`-shared and
+/// never mutated after it is built, so handing the same tables to another
+/// request's instances is exactly what handing them to another instance in the
+/// same request already is.
+#[derive(Clone, Default)]
+pub struct ClassCacheEntry {
+    /// Chain generation (see `CfmlVirtualMachine::class_generation`): the CFC's
+    /// own compile generation folded with its parent's. A recompile anywhere in
+    /// the `extends` chain yields a new value, so a table built for the old
+    /// compile is recognised as stale and rebuilt.
+    pub generation: u64,
+    /// `this`-scope and `variables`-scope method tables (`class_method_tables`).
+    pub method_tables: Option<(
+        Arc<cfml_common::dynamic::ValueMap>,
+        Arc<cfml_common::dynamic::ValueMap>,
+    )>,
+    /// The class's own (declared, not inherited) methods (`class_own_method_tables`).
+    pub own_table: Option<Arc<cfml_common::dynamic::ValueMap>>,
+    /// The `__is_super` dispatch struct a subclass uses for this class as its
+    /// parent (`class_super_values`).
+    pub super_value: Option<CfmlValue>,
+    /// Flyweight blueprints for this file, one per dotted name it was loaded
+    /// under (`component_blueprints`). Building one walks every method of the
+    /// finished first instance — 56% of a first-in-request construction.
+    #[cfg(feature = "component-instance")]
+    pub blueprints: Vec<(String, std::sync::Arc<cfml_common::component::ClassBlueprint>)>,
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     pub applications: Arc<dyn ApplicationStore>,
@@ -1743,6 +1772,15 @@ pub struct ServerState {
     /// `__main__`'s process-unique `global_id`) so a file edited in dev — a new
     /// compile, a new id — gets a fresh static scope, as a redeploy would.
     pub static_scopes: Arc<parking_lot::RwLock<HashMap<String, StaticScopeEntry>>>,
+    /// Per-class construction tables (method tables, own-method table, `super`
+    /// struct), keyed by the CFC's source file, shared across requests. The
+    /// per-request VM builds these on a class's FIRST construction in the
+    /// request and replays them on every later one; without this cache each
+    /// request paid the first-construction price for every class it touched —
+    /// a page that constructs most classes once (the Preside shape) never saw
+    /// the replay path at all. Entries carry the chain generation, so an edited
+    /// file (dev mode recompile, new `global_id`s) misses and rebuilds.
+    pub class_caches: Arc<parking_lot::RwLock<HashMap<String, ClassCacheEntry>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -1809,6 +1847,7 @@ impl ServerState {
             pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             object_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             static_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            class_caches: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -2046,6 +2085,12 @@ pub struct CfmlVirtualMachine {
     pub _live: VmLiveGuard,
     pub program: BytecodeProgram,
     pub globals: ValueMap,
+    /// How many component templates (structs carrying `__name`, filed by a CFC
+    /// body's closing `StoreGlobal`) page globals currently hold. The resolver's
+    /// case-insensitive walk of globals — every builtin included — for a bare
+    /// class name is skipped while this is zero, which is nearly always: the
+    /// construction finalize takes its template straight back out.
+    pub component_template_globals: usize,
     pub builtins: HashMap<String, BuiltinFunction>,
     /// ASCII-lowercased index of `builtins`' keys, for the case-insensitive
     /// "is this name a builtin?" probe on the `LoadLocalKey`/`LoadVariablesKey`
@@ -2146,6 +2191,10 @@ pub struct CfmlVirtualMachine {
     /// construction that resolves that parent; a replayed construction reuses it
     /// instead of folding the parent's method table back into a fresh map.
     pub class_super_values: HashMap<String, CfmlValue>,
+    /// Chain generation of every class resolved in this request, keyed by
+    /// source file — the key under which its tables are published to and
+    /// adopted from `ServerState::class_caches`. See `class_generation`.
+    pub class_generations: HashMap<String, u64>,
     /// Source file path (for include resolution)
     pub source_file: Option<String>,
     /// Call stack for tracking execution
@@ -2608,6 +2657,10 @@ pub struct CfmlVirtualMachine {
     /// to the max `global_id` seen, i.e. the app's distinct-function count (cached
     /// programs reuse ids), not per-request growth.
     fn_registry: Vec<Option<Arc<BytecodeFunction>>>,
+    /// First-function `global_id` of every program `register_program_fns` has
+    /// registered into this VM, so a re-swap of a cached program skips the
+    /// per-function walk (see `register_program_fns`).
+    registered_programs: std::collections::HashSet<u32>,
     /// (The v0.442/Lever-A/Lever-C per-VM memo caches that lived here moved
     /// onto `BytecodeFunction` itself as `OnceLock` fields — computed once per
     /// PROCESS instead of probed via SipHash per call and rebuilt per request.)
@@ -3972,6 +4025,7 @@ impl CfmlVirtualMachine {
             _live: VmLiveGuard::new(),
             program,
             globals: ValueMap::default(),
+            component_template_globals: 0,
             builtins: HashMap::new(),
             builtin_names_lc: HashMap::default(),
             builtin_lc_src_len: usize::MAX, // no index yet — probe takes the slow path
@@ -3985,6 +4039,7 @@ impl CfmlVirtualMachine {
             class_method_tables: HashMap::new(),
             class_own_method_tables: HashMap::new(),
             class_super_values: HashMap::new(),
+            class_generations: HashMap::new(),
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
@@ -4084,6 +4139,7 @@ impl CfmlVirtualMachine {
             app_fn_gids: Vec::new(),
             pending_app_fns: Vec::new(),
             fn_registry: Vec::new(),
+            registered_programs: std::collections::HashSet::new(),
             app_fn_table_dirty: false,
             cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cache_hits: 0,
@@ -4255,6 +4311,14 @@ impl CfmlVirtualMachine {
     /// Grows the registry as needed; ids are dense across a process so the Vec
     /// stays sized to the app's distinct-function count.
     fn register_program_fns(&mut self, prog: &BytecodeProgram) {
+        // A program is registered whole, so its first function's id (ids are
+        // unique per function, never rebound) identifies it: a program this VM
+        // has already registered — every repeat `new` of a class re-swaps its
+        // program in — has nothing to do here.
+        let Some(first) = prog.functions.first() else { return };
+        if !self.registered_programs.insert(first.global_id) {
+            return;
+        }
         for f in &prog.functions {
             self.register_fn_local(f);
         }
@@ -11937,10 +12001,12 @@ impl CfmlVirtualMachine {
                         own_table.insert(bf.name.clone(), value.clone());
                         holder.insert(bf.name.clone(), value);
                     }
-                    if let Some(src) = self.source_file.as_deref() {
-                        if !src.is_empty() && !self.class_own_method_tables.contains_key(src) {
+                    if let Some(src) = self.source_file.clone() {
+                        if !src.is_empty() && !self.class_own_method_tables.contains_key(&src) {
+                            let own_table = Arc::new(own_table);
                             self.class_own_method_tables
-                                .insert(src.to_string(), Arc::new(own_table));
+                                .insert(src.clone(), own_table.clone());
+                            self.publish_class_cache(&src, move |e| e.own_table = Some(own_table));
                         }
                     }
                 }
@@ -31078,12 +31144,40 @@ impl CfmlVirtualMachine {
         let blueprint = if source_file.is_empty() {
             build_bp(self, &s, &source_file)
         } else {
-            let cache_key = format!("{}\u{0}{}", source_file, bp_name);
-            if let Some(bp) = self.component_blueprints.get(&cache_key) {
+            // The file's first name is filed under the bare source path; a second
+            // name for the same file (see above) under a composite key. The bare
+            // probe costs no formatting, and it is the one that hits.
+            let bare_hit = self
+                .component_blueprints
+                .get(&source_file)
+                .filter(|bp| bp.name == bp_name)
+                .cloned();
+            let cache_key = || {
+                if self.component_blueprints.contains_key(&source_file) {
+                    format!("{}\u{0}{}", source_file, bp_name)
+                } else {
+                    source_file.clone()
+                }
+            };
+            if let Some(bp) = bare_hit {
+                bp
+            } else if let Some(bp) = self.component_blueprints.get(&format!("{}\u{0}{}", source_file, bp_name)) {
                 bp.clone()
+            } else if let Some(bp) = self.adopt_blueprint(&source_file, &bp_name) {
+                // Built by an earlier request for this exact compile of the chain.
+                let k = cache_key();
+                self.component_blueprints.insert(k, bp.clone());
+                bp
             } else {
                 let bp = build_bp(self, &s, &source_file);
-                self.component_blueprints.insert(cache_key, bp.clone());
+                let k = cache_key();
+                self.component_blueprints.insert(k, bp.clone());
+                let (n, published) = (bp_name.clone(), bp.clone());
+                self.publish_class_cache(&source_file, move |e| {
+                    if !e.blueprints.iter().any(|(k, _)| *k == n) {
+                        e.blueprints.push((n, published));
+                    }
+                });
                 bp
             }
         };
@@ -31740,6 +31834,97 @@ impl CfmlVirtualMachine {
     /// then for THIS instance strips its own method entries and attaches the
     /// shared tables. Reads/dispatch resolve methods via the table on a map miss;
     /// introspection unions it — so behaviour is identical to methods-in-map.
+    /// Whether a page-global value is a component template (a struct carrying
+    /// the `__name` marker), for the `component_template_globals` count.
+    #[inline]
+    pub(crate) fn is_template_global(v: Option<&CfmlValue>) -> bool {
+        matches!(v, Some(CfmlValue::Struct(s)) if s.get(&*cfml_common::key::well_known::NAME_MARKER).is_some())
+    }
+
+    /// A class's chain generation: its own compile generation (the CFC
+    /// `__main__`'s process-unique `global_id`, as `static_generation` uses)
+    /// folded with its parent's chain generation. Any recompile in the
+    /// `extends` chain changes it — a child's `variables` table holds the
+    /// parent's methods too, so a parent edit must invalidate the child.
+    #[inline]
+    fn class_generation(own: u32, parent: u64) -> u64 {
+        // A cheap non-commutative mix (splitmix64 finaliser over the pair).
+        let mut x = (own as u64) ^ parent.rotate_left(32).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    /// Cross-request class cache, read side: if an earlier request published
+    /// this class's tables for the same chain generation, adopt them into the
+    /// per-request maps so this request's FIRST construction replays. Only an
+    /// entry with the method-table pair enables replay; a partial entry (own
+    /// table only, from a construction that did not finish) is ignored.
+    fn adopt_class_cache(&mut self, src: &str, generation: u64) {
+        if self.class_method_tables.contains_key(src) {
+            return;
+        }
+        let Some(ss) = self.server_state.as_ref() else { return };
+        let entry = ss
+            .class_caches
+            .read()
+            .get(src)
+            .filter(|e| e.generation == generation && e.method_tables.is_some())
+            .cloned();
+        let Some(entry) = entry else { return };
+        if let Some(tables) = entry.method_tables {
+            self.class_method_tables.insert(src.to_string(), tables);
+        }
+        if let Some(own) = entry.own_table {
+            self.class_own_method_tables
+                .entry(src.to_string())
+                .or_insert(own);
+        }
+        if let Some(sv) = entry.super_value {
+            self.class_super_values
+                .entry(src.to_string())
+                .or_insert(sv);
+        }
+    }
+
+    /// Cross-request class cache: the blueprint an earlier request built for
+    /// `(src, name)` at this request's chain generation, if any.
+    #[cfg(feature = "component-instance")]
+    fn adopt_blueprint(
+        &self,
+        src: &str,
+        name: &str,
+    ) -> Option<std::sync::Arc<cfml_common::component::ClassBlueprint>> {
+        let ss = self.server_state.as_ref()?;
+        let generation = *self.class_generations.get(src)?;
+        let r = ss.class_caches.read();
+        let e = r.get(src).filter(|e| e.generation == generation)?;
+        e.blueprints
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, bp)| bp.clone())
+    }
+
+    /// Cross-request class cache, write side: record one of the class's tables
+    /// under its chain generation. An entry from an older generation is
+    /// replaced wholesale. No-op without a server (CLI) or for a source file
+    /// this request has not resolved (no generation known).
+    fn publish_class_cache(&self, src: &str, set: impl FnOnce(&mut ClassCacheEntry)) {
+        let Some(ss) = self.server_state.as_ref() else { return };
+        let Some(&generation) = self.class_generations.get(src) else { return };
+        let mut w = ss.class_caches.write();
+        let e = w.entry(src.to_string()).or_default();
+        if e.generation != generation {
+            *e = ClassCacheEntry {
+                generation,
+                ..ClassCacheEntry::default()
+            };
+        }
+        set(e);
+    }
+
     fn share_methods_into_table(&mut self, s: &CfmlStruct) {
         // Cache key: the CFC's physical source file (stable per class, like
         // `static_stores`). Without one (rare hand-built struct) leave methods
@@ -31763,7 +31948,9 @@ impl CfmlVirtualMachine {
                         .unwrap_or_default(),
                 );
                 let pair = (this_table.clone(), vars_table.clone());
-                self.class_method_tables.insert(src, pair.clone());
+                self.class_method_tables.insert(src.clone(), pair.clone());
+                let published = pair.clone();
+                self.publish_class_cache(&src, move |e| e.method_tables = Some(published));
                 pair
             };
         // Strip this instance's own method entries and delegate to the shared
@@ -32183,15 +32370,23 @@ impl CfmlVirtualMachine {
         // 3. Case-insensitive lookup in globals. Compared straight against
         // `class_name` — an `eq_ignore_ascii_case` against a pre-lowercased copy
         // is the same test, and building that copy cost an allocation on every
-        // single resolution (GH #298).
-        if let Some(val) = self
-            .globals
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(class_name))
-            .map(|(_, v)| v.clone())
-        {
-            if matches!(val, CfmlValue::Struct(_)) {
-                return Some(val);
+        // single resolution (GH #298). Only for a bare name: the templates this
+        // can find are keyed by a `component name="X"` identifier, which a
+        // dotted or slashed path can never equal — and the scan walks EVERY
+        // page global (the builtins included) on every `new`.
+        // And only while page globals hold at least one such template at all
+        // (`component_template_globals`, maintained by `StoreGlobal` and the
+        // finalize that takes a template back out) — normally none do.
+        if self.component_template_globals > 0 && !class_name.contains(['.', '/']) {
+            if let Some(val) = self
+                .globals
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(class_name))
+                .map(|(_, v)| v.clone())
+            {
+                if matches!(val, CfmlValue::Struct(_)) {
+                    return Some(val);
+                }
             }
         }
         // 4. Try loading .cfc file — first relative, then via mappings.
@@ -32397,13 +32592,25 @@ impl CfmlVirtualMachine {
             // in execute_function_with_args (line ~621) strip Function values —
             // injecting parent methods into the child body's initial scope causes
             // recursion through bound this/__variables (see TAFFY_NEXT_STEPS.md).
-            let parent_name: Option<String> =
-                cfc_func.instructions.windows(2).find_map(|w| match w {
-                    [BytecodeOp::String(s1), BytecodeOp::String(s2)] if s1.as_str() == "__extends" => {
-                        Some((**s2).clone())
+            // Same pass: the key the body's closing `StoreGlobal` files the
+            // template under — the declared `name=` or "Anonymous" (codegen
+            // emits `String("__name"); String(<that name>)` first). The finalize
+            // takes the template out of globals by THIS key, so it never has to
+            // scan page globals for it.
+            let mut parent_name: Option<String> = None;
+            let mut template_name: Option<String> = None;
+            for w in cfc_func.instructions.windows(2) {
+                if let [BytecodeOp::String(s1), BytecodeOp::String(s2)] = w {
+                    match s1.as_str() {
+                        "__extends" if parent_name.is_none() => parent_name = Some((**s2).clone()),
+                        "__name" if template_name.is_none() => template_name = Some((**s2).clone()),
+                        _ => {}
                     }
-                    _ => None,
-                });
+                    if parent_name.is_some() && template_name.is_some() {
+                        break;
+                    }
+                }
+            }
             // Also build the `super` object so `super.method(...)` calls inside
             // the pseudo-constructor resolve to the parent's methods. CFML makes
             // `super` available throughout the component body (e.g. Preside's
@@ -32428,10 +32635,6 @@ impl CfmlVirtualMachine {
             // Dispatch inside the pseudo-constructor is unchanged: a map miss
             // falls through to the table. `None` on a class's first construction,
             // which builds the tables the old way.
-            let replay_tables: Option<(
-                Arc<cfml_common::dynamic::ValueMap>,
-                Arc<cfml_common::dynamic::ValueMap>,
-            )> = self.class_method_tables.get(&*cfc_path).cloned();
             // The parent, fully resolved (its own chain merged, its pseudo-
             // constructor run ONCE). Kept and handed to `resolve_inheritance`
             // via `__resolved_parent` below, so the merge reuses it instead of
@@ -32440,12 +32643,38 @@ impl CfmlVirtualMachine {
             // `resolve_inheritance_chain`, so parent pseudo-constructors ran
             // 2^depth times per instantiation (a 3-level class ran its root
             // constructor 5 times; Lucee runs each exactly once, parent first).
+            // Resolved BEFORE the replay decision below: this class's chain
+            // generation folds in the parent's, which the parent's own
+            // resolution records.
             let mut resolved_parent_stash: Option<CfmlValue> = None;
-            let injected_scope: ValueMap = if let Some(ref pname) = parent_name {
+            let mut parent_generation: u64 = 0;
+            if let Some(ref pname) = parent_name {
                 if let Some(parent_template) = self.resolve_component_template(pname, locals) {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals).ok()?;
-                    resolved_parent_stash = Some(resolved_parent.clone());
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
+                        if let Some(CfmlValue::String(psrc)) = ps.get("__source_file") {
+                            parent_generation =
+                                self.class_generations.get(&**psrc).copied().unwrap_or(0);
+                        }
+                    }
+                    resolved_parent_stash = Some(resolved_parent);
+                }
+            }
+            let class_generation = Self::class_generation(cfc_func.global_id, parent_generation);
+            self.class_generations
+                .insert(cfc_path.to_string(), class_generation);
+            // Cross-request: adopt the tables an earlier request built for this
+            // exact compile of the chain, so the first construction in THIS
+            // request replays too.
+            self.adopt_class_cache(&cfc_path, class_generation);
+            let replay_tables: Option<(
+                Arc<cfml_common::dynamic::ValueMap>,
+                Arc<cfml_common::dynamic::ValueMap>,
+            )> = self.class_method_tables.get(&*cfc_path).cloned();
+            let injected_scope: ValueMap =
+                if let Some(CfmlValue::Struct(ref ps)) = resolved_parent_stash {
+                    {
+                        {
                         let mut super_methods = ValueMap::default();
                         let mut this_members = ValueMap::default();
                         let parent_src: Option<String> = match ps.get("__source_file") {
@@ -32503,6 +32732,15 @@ impl CfmlVirtualMachine {
                             let sv = CfmlValue::strukt(super_methods);
                             if let Some(p) = parent_src.as_deref() {
                                 self.class_super_values.insert(p.to_string(), sv.clone());
+                                if let CfmlValue::Struct(ref svs) = sv {
+                                    // Outlives this request once published (like
+                                    // a static scope).
+                                    svs.mark_persistent_scope();
+                                }
+                                let published = sv.clone();
+                                self.publish_class_cache(p, move |e| {
+                                    e.super_value = Some(published)
+                                });
                             }
                             super_value = Some(sv);
                         }
@@ -32520,15 +32758,11 @@ impl CfmlVirtualMachine {
                         } else {
                             ValueMap::default()
                         }
-                    } else {
-                        ValueMap::default()
+                    }
                     }
                 } else {
                     ValueMap::default()
-                }
-            } else {
-                ValueMap::default()
-            };
+                };
 
             // Resolve the shared `static` scope for this component type. Keyed by
             // source path so it is built once and reused across instances. On
@@ -32748,11 +32982,11 @@ impl CfmlVirtualMachine {
             let injected_scope = {
                 let mut s = ValueMap::default();
                 s.insert(
-                    "__variables".to_string(),
+                    &*cfml_common::key::well_known::VARIABLES,
                     CfmlValue::Struct(body_vars.clone()),
                 );
                 if let Some(ref h) = static_handle {
-                    s.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+                    s.insert("__static", CfmlValue::Struct(h.clone()));
                 }
                 s
             };
@@ -32805,12 +33039,8 @@ impl CfmlVirtualMachine {
             // `new X()` — no constructor run, shared `this` state (Lucee runs it
             // every time). Remember what the candidate keys held so the finalize
             // can TAKE the template out and put any prior value back.
-            let short_name = class_name.split('.').last().unwrap_or(class_name);
-            let prev_class_globals: [(&str, Option<CfmlValue>); 3] = [
-                (class_name, self.globals.get(class_name).cloned()),
-                (short_name, self.globals.get(short_name).cloned()),
-                ("Anonymous", self.globals.get("Anonymous").cloned()),
-            ];
+            let template_name: &str = template_name.as_deref().unwrap_or("Anonymous");
+            let prev_class_global: Option<CfmlValue> = self.globals.get(template_name).cloned();
             let body_result =
                 self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
             let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
@@ -32849,33 +33079,27 @@ impl CfmlVirtualMachine {
             // particular would otherwise return the builtin Function — registered
             // earlier in `globals` than the just-built component — and short-circuit
             // the `Anonymous` fallback that holds anonymous `component {}` instances.
+            // The body filed the template under `template_name` (see above);
+            // the key is compile-time, so no lookup by the caller's spelling and
+            // no scan of page globals.
             let is_struct = |v: &CfmlValue| matches!(v, CfmlValue::Struct(_));
-            let template_key: Option<String> = if self.globals.get(class_name).is_some_and(is_struct) {
-                Some(class_name.to_string())
-            } else if self.globals.get(short_name).is_some_and(is_struct) {
-                Some(short_name.to_string())
-            } else if let Some(k) = self
-                .globals
-                .iter()
-                .find(|(k, v)| k.eq_ignore_ascii_case(class_name) && is_struct(v))
-                .map(|(k, _)| k.as_str().to_string())
-            {
-                Some(k)
-            } else if self.globals.get("Anonymous").is_some_and(is_struct) {
-                Some("Anonymous".to_string())
+            let result = if self.globals.get(template_name).is_some_and(is_struct) {
+                let taken = self.globals.shift_remove(template_name);
+                if Self::is_template_global(taken.as_ref()) {
+                    self.component_template_globals =
+                        self.component_template_globals.saturating_sub(1);
+                }
+                // Put back whatever the page had under that name before the body.
+                if let Some(prev) = prev_class_global {
+                    if Self::is_template_global(Some(&prev)) {
+                        self.component_template_globals += 1;
+                    }
+                    self.globals.insert(template_name, prev);
+                }
+                taken
             } else {
                 None
             };
-            let result = template_key.and_then(|k| {
-                let taken = self.globals.shift_remove(&k);
-                // Put back whatever the page had under that name before the body.
-                if let Some((_, Some(prev))) =
-                    prev_class_globals.iter().find(|(pk, _)| pk.eq_ignore_ascii_case(&k))
-                {
-                    self.globals.insert(k, prev.clone());
-                }
-                taken
-            });
             // The body's own local for the template (`StoreLocal(component.name)`)
             // is captured with the other body locals below; it must not become a
             // `variables.<ClassName>` self-reference on the instance (Lucee has
