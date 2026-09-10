@@ -33341,7 +33341,18 @@ impl CfmlVirtualMachine {
                 // a cycle-test node) was only recognised as a component before
                 // because the leaked class-name self-reference kept this map
                 // non-empty.
-                s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
+                let vars_struct = CfmlStruct::new(vars_scope);
+                if let Some((_, ref vars_table)) = replay_tables {
+                    // Replay: the methods this scope would have carried as map
+                    // entries live in the class's shared table. Attach it NOW, on
+                    // the template, not only at `share_methods_into_table` — a
+                    // template can be merged into a subclass as a raw parent
+                    // (the Application.cfc path resolves its parent that way),
+                    // and a `variables` with the methods in neither the map nor a
+                    // table lost every inherited method from the child.
+                    vars_struct.set_method_table(vars_table.clone());
+                }
+                s.insert("__variables".to_string(), CfmlValue::Struct(vars_struct));
             }
             // Canonicalise each method's `CfmlFunction` value to the shared,
             // per-class cache (`method_arc_cache`) so every instance points at ONE
@@ -34406,14 +34417,26 @@ impl CfmlVirtualMachine {
         }
 
         // Merge __variables from parent and child (child overrides parent)
-        let parent_vars: ValueMap = parent_map
-            .get(&*cfml_common::key::well_known::VARIABLES)
-            .and_then(|v| v.as_struct())
-            .unwrap_or_default();
-        let child_vars: ValueMap = child_map
-            .get(&*cfml_common::key::well_known::VARIABLES)
-            .and_then(|v| v.as_struct())
-            .unwrap_or_default();
+        // Not replaying: the merged `variables` map is what this class's shared
+        // tables get BUILT from (`collect_scope_methods` reads the map), so any
+        // methods a scope carries in a TABLE must be folded in here. A parent
+        // resolved a second time in the request (a replay) keeps its methods in
+        // its tables — the Application.cfc path hits exactly that, merging its
+        // template against a replayed parent, and a map-only copy lost every
+        // inherited method from the application component's `variables`.
+        // Replaying: data only; `share_methods_into_table` attaches the final
+        // tables to the merged scopes.
+        let scope_vars = |v: Option<CfmlValue>| -> ValueMap {
+            match v {
+                Some(CfmlValue::Struct(s)) if replaying => s.snapshot(),
+                Some(CfmlValue::Struct(s)) => s.snapshot_with_methods(),
+                _ => ValueMap::default(),
+            }
+        };
+        let parent_vars: ValueMap =
+            scope_vars(parent_map.get(&*cfml_common::key::well_known::VARIABLES).cloned());
+        let child_vars: ValueMap =
+            scope_vars(child_map.get(&*cfml_common::key::well_known::VARIABLES));
         if !parent_vars.is_empty() || !child_vars.is_empty() {
             let mut merged_vars = parent_vars;
             for (k, v) in child_vars {

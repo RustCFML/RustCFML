@@ -2724,3 +2724,19 @@ Tests: `tests/oop/test_static_across_requests.cfm` and
 `tests/stdlib/test_cache_across_requests.cfm`. Both need three separate
 requests to observe, so they drive a target page over HTTP on `cgi.server_port`
 and report a single skip under the CLI runner.
+
+## 92. v0.659.0 regression: an Application.cfc extending a parent lost the parent's methods (fixed v0.660.1) 📌
+
+Preside failed to boot on v0.659.0/v0.660.0: *"Variable '_pingCheck' is
+undefined"* from `Bootstrap.cfc`'s `onRequestStart`, then the same for every
+other Bootstrap helper. The Application.cfc path builds the application
+component itself and merges it against its parent by resolving that parent a
+**second** time in the request — so the parent arrived as a replayed template
+(§90). A replayed template's finalize built a fresh `__variables` struct and
+relied on `share_methods_into_table`, later in `resolve_inheritance`, to attach
+the class table — but a template merged as a raw parent never gets there. Its
+`variables` then held the methods in neither the map nor a table, and the merge
+copied nothing. A replayed template now carries its `variables` table from the
+finalize, and the merge folds table methods when the child is not itself a
+replay. Test: `tests/oop/test_appcfc_extends_parent_methods.cfm` with its own
+`tests/appcfc_parent/Application.cfc` (serve mode).
