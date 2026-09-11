@@ -63,13 +63,24 @@ first  = new oop.ctorsem.Leaf();
 second = new oop.ctorsem.Leaf();
 third  = createObject( "component", "oop.ctorsem.Leaf" ).init();
 assert( "replay: getMetadata(...).functions identical", fnNames( getMetadata( second ) ), fnNames( getMetadata( first ) ) );
-assert( "replay: leaf metadata lists ONLY own functions", fnNames( getComponentMetaData( "oop.ctorsem.Leaf" ) ), "init,leafMethod,ownKeys,seenFromRoot,viaSuper" );
+assert( "replay: leaf metadata lists ONLY own functions", fnNames( getComponentMetaData( "oop.ctorsem.Leaf" ) ), "inheritedOnThis,inheritedRefWorks,init,leafMethod,ownKeys,seenFromRoot,thisKeysInCtor,viaSuper" );
 assert( "replay: public key list identical", listSort( second.ownKeys(), "textnocase" ), listSort( first.ownKeys(), "textnocase" ) );
 assert( "replay: super dispatch through a 3-level chain", third.viaSuper(), "mid-method+mid-override+root-method" );
 assert( "replay: overridden method resolves to the override, super to the parent", third.rootMethod(), "mid-override+root-method" );
-// NOTE: `isInstanceOf( third, "oop.ctorsem.Root" )` is TRUE on Lucee and FALSE here on
-// every construction (first included): a relative `extends="Mid"` chain is never
-// package-qualified for the path-aware check. Pre-existing, unrelated to construction.
+// A chain declared with RELATIVE extends ("Mid", "Root") is package-qualified
+// from the child that declared it, so the path-aware checks match Lucee.
+assertTrue( "relative extends chain: isInstanceOf sees the qualified root", isInstanceOf( third, "oop.ctorsem.Root" ) );
+assertTrue( "relative extends chain: isInstanceOf sees the qualified middle", isInstanceOf( first, "oop.ctorsem.Mid" ) );
+assertFalse( "relative extends chain: a wrong package does not match", isInstanceOf( first, "wrong.ctorsem.Root" ) );
+assert( "relative extends chain: metadata extends.name is qualified", getMetadata( first ).extends.name, "oop.ctorsem.Mid" );
+assert( "relative extends chain: metadata extends.extends.name is qualified", getMetadata( first ).extends.extends.name, "oop.ctorsem.Root" );
+// Inside the subclass pseudo-constructor the parent chain's methods are already
+// on `this` (Lucee runs the parents first on the same `this`) — on the FIRST and
+// on a replayed construction alike; the leaf metadata above still lists only own.
+assert( "pseudo-ctor: inherited methods visible on this (first)", first.inheritedOnThis(), "true/true/true/false/true" );
+assert( "pseudo-ctor: inherited methods visible on this (replay)", third.inheritedOnThis(), "true/true/true/false/true" );
+assert( "pseudo-ctor: structKeyList(this) is the whole class, no engine keys", lCase( first.thisKeysInCtor() ), "inheritedonthis,inheritedrefworks,init,leafmethod,midmethod,ownkeys,rootmethod,seenfromroot,thiskeysinctor,viasuper" );
+assertTrue( "pseudo-ctor: an inherited method reference reads through this", third.inheritedRefWorks() );
 second.extra = "per-instance";
 assertFalse( "replay: instances do not share public state", structKeyExists( first, "extra" ) );
 assertFalse( "replay: no private-scope method leaks onto the public view", structKeyExists( first, "fromRoot" ) );

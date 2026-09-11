@@ -2282,6 +2282,28 @@ pub struct CfmlVirtualMachine {
     /// "Variable is undefined". Merged keys never overwrite ones the child body
     /// already set. `take()`n on first consume so it fires exactly once per body.
     pending_pseudo_ctor_parent_this: Option<ValueMap>,
+    /// The parent chain's full method set, staged for a subclass body on the
+    /// class's FIRST construction. `DefineComponentMethods` attaches it to the
+    /// template `this` (a replayed construction attaches the class's own full
+    /// table instead) so that, inside the pseudo-constructor,
+    /// `structKeyExists(this, "inherited")`, `this.inherited` reads and
+    /// `structKeyList(this)` see inherited methods the way Lucee does — the
+    /// parent has already run on the same `this`. The finalize swaps the table
+    /// back (own table on replay, none on a first construction) before the
+    /// inheritance merge and leaf metadata read the template, both of which
+    /// must see only the class's own methods.
+    pending_pseudo_ctor_inherited_table: Option<Arc<cfml_common::dynamic::ValueMap>>,
+    /// On a replayed construction, the class's FULL `this` table for the body
+    /// (set by the resolver, taken by `DefineComponentMethods`), and the OWN
+    /// table `DefineComponentMethods` leaves for the finalize to restore. Handed
+    /// through here so the per-construction path does no extra path-keyed
+    /// lookups; the resolver saves and restores all three around the body so a
+    /// nested `new` inside a pseudo-constructor sees only its own.
+    pending_pseudo_ctor_body_table: Option<Arc<cfml_common::dynamic::ValueMap>>,
+    pending_pseudo_ctor_own_table: Option<Arc<cfml_common::dynamic::ValueMap>>,
+    /// `(dotted name, source file)` of the child whose `extends=` parent the
+    /// next `resolve_component_template_impl` call resolves; taken at its entry.
+    pending_extends_anchor: Option<(String, String)>,
     /// `this.*` DATA members written by a `super.method(...)` call made during a
     /// component pseudo-constructor whose body had NOT yet materialized a `this`
     /// (e.g. Preside's `Application.cfc` doing only `super.setupApplication(...)`,
@@ -4056,6 +4078,10 @@ impl CfmlVirtualMachine {
             pseudo_ctor_super: Vec::new(),
             constructing_component_names: Vec::new(),
             pending_pseudo_ctor_parent_this: None,
+            pending_pseudo_ctor_inherited_table: None,
+            pending_pseudo_ctor_body_table: None,
+            pending_pseudo_ctor_own_table: None,
+            pending_extends_anchor: None,
             pseudo_ctor_super_this_writes: None,
             method_variables_writeback: None,
             closure_parent_writeback: None,
@@ -11974,7 +12000,17 @@ impl CfmlVirtualMachine {
                         _ => None,
                     };
                     if let Some(own_table) = replay_own_table {
-                        holder.set_method_table(own_table);
+                        // For the body's duration the template `this` answers for
+                        // the WHOLE class (own + inherited), as Lucee's does; the
+                        // resolver's finalize puts the own table back before the
+                        // merge and metadata read it.
+                        let body_table = self
+                            .pending_pseudo_ctor_body_table
+                            .take()
+                            .unwrap_or_else(|| own_table.clone());
+                        holder.set_method_table(body_table);
+                        self.pending_pseudo_ctor_own_table = Some(own_table);
+                        self.pending_pseudo_ctor_inherited_table = None;
                         continue;
                     }
                     let mut own_table = cfml_common::dynamic::ValueMap::default();
@@ -12000,6 +12036,12 @@ impl CfmlVirtualMachine {
                         }
                         own_table.insert(bf.name.clone(), value.clone());
                         holder.insert(bf.name.clone(), value);
+                    }
+                    // First construction of a subclass: the own methods are map
+                    // entries (above); the parent chain's come through the table
+                    // until the finalize clears it.
+                    if let Some(inherited) = self.pending_pseudo_ctor_inherited_table.take() {
+                        holder.set_method_table(inherited);
                     }
                     if let Some(src) = self.source_file.clone() {
                         if !src.is_empty() && !self.class_own_method_tables.contains_key(&src) {
@@ -32326,12 +32368,229 @@ impl CfmlVirtualMachine {
         }
     }
 
+
+    /// The dotted name a freshly resolved template gets as `__name` (Lucee/ACF
+    /// `getMetadata(x).name`): the caller-supplied path normalised, and an
+    /// UNQUALIFIED name qualified with its defining package (issues #229/#237).
+    /// `caller_source` is the file the resolution was made from; `extends_anchor`
+    /// is `(dotted name, source file)` of the CHILD when this template is being
+    /// resolved as its `extends=` parent — a relative `extends="Mid"` declared in
+    /// `pkg/Leaf.cfc` names `pkg.Mid`, and the chain built from it
+    /// (`__extends_chain`, `getMetadata().extends.name`, `isInstanceOf`) carries
+    /// package-qualified names the way Lucee's does. Computed BEFORE the parent
+    /// is resolved so it can anchor the grandparent in turn.
+    fn qualified_template_name(
+        &self,
+        class_name: &str,
+        cfc_path: &str,
+        locals: &ValueMap,
+        caller_source: Option<&str>,
+        extends_anchor: Option<&(String, String)>,
+    ) -> String {
+            // Normalize the caller-supplied path to the dotted component
+            // name Lucee/ACF expose in metadata.name (e.g.
+            // "/app/extensions/x/preside-objects/security_group" ->
+            // "app.extensions.x.preside-objects.security_group"). Preside's
+            // PresideObjectReader.getAutoPivotObjectDefinition derives a
+            // related-object name via ListLast(meta.name, "."), so a
+            // slash-path name yielded the whole path and broke m2m join
+            // relationship validation. Already-dotted names are unchanged
+            // (no slashes to replace). Verified vs Lucee 7.0.4.
+            let mut dotted = Self::dotted_component_name(class_name);
+            // Issue #229/#237: an UNQUALIFIED `new X()` (no dots/slashes)
+            // made from inside a component resolves relative to the
+            // package of the file that LEXICALLY CONTAINS the `new`
+            // expression, so its metadata.name is the fully qualified
+            // "<defining-package>.X" on Lucee/ACF — not the bare "X".
+            //
+            // #229 first qualified using the runtime `this` package, but
+            // for an INHERITED method (`new X()` written in a parent file
+            // but reached via a subclass instance) `this` is the SUBCLASS,
+            // whose package is wrong (#237: `tests.specs.Expectation` vs
+            // the correct `testbox.system.Expectation`). The file itself
+            // was already resolved correctly against the defining source
+            // dir (self.source_file is swapped to the method's defining
+            // component during dispatch), so the RIGHT package is simply
+            // the package of dirname(cfc_path) — where the .cfc was found.
+            //
+            // To turn that directory into a dotted package we need the
+            // webroot. Anchor it to the outermost instance (`this`), whose
+            // dotted __name and __source_file are both known and mutually
+            // consistent: the instance lives at <webroot>/<pkg-path>/<Class>.cfc,
+            // so popping its package-segment count off dirname(__source_file)
+            // yields the webroot. dirname(cfc_path) relative to that
+            // webroot, dotted, is the defining package — correct for both
+            // same-package (#229) and inherited-across-packages (#237).
+            if !class_name.contains(['.', '/', '\\']) {
+                // Resolving a PARENT for `extends=`: the child that declared it is the
+            // anchor — its dotted name and file are known and consistent — not
+            // whatever `this` happens to be in the constructing frame.
+            let anchor = extends_anchor.cloned().or_else(|| locals.get(&*cfml_common::key::well_known::THIS).and_then(|t| match t {
+                    CfmlValue::Struct(cs) => {
+                        let name = cs.get("__name").map(|v| v.as_string())?;
+                        let src = cs.get("__source_file").map(|v| v.as_string())?;
+                        Some((name, src))
+                    }
+                    #[cfg(feature = "component-instance")]
+                    CfmlValue::Instance(inst) => {
+                        let g = inst.read();
+                        Some((g.class.name.clone(), g.class.source_file.clone()))
+                    }
+                    _ => None,
+                }));
+                // Preferred: the DEFINING class's own logical dotted
+                // name, recorded per source file at inheritance-merge
+                // time (__source_names). self.source_file is swapped to
+                // the executing method's defining file, so for an
+                // inherited method this yields the parent class's
+                // mapping-qualified package (testbox.system) rather than
+                // the webroot-relative one (system) the filesystem
+                // derivation below produces — and for a same-class
+                // method it matches the instance's own package. Falls
+                // through to the anchor logic when the map is absent
+                // (e.g. a component with no inheritance).
+                let source_name_pkg: Option<String> = if extends_anchor.is_some() {
+                None
+            } else {
+                caller_source
+                    .and_then(|cur| {
+                        locals
+                            .get(&*cfml_common::key::well_known::THIS)
+                            .and_then(|t| match t {
+                                CfmlValue::Struct(cs) => {
+                                    cs.get("__source_names").and_then(|v| v.as_struct())
+                                }
+                                #[cfg(feature = "component-instance")]
+                                CfmlValue::Instance(inst) => inst
+                                    .read()
+                                    .class
+                                    .source_names
+                                    .as_ref()
+                                    .and_then(|v| v.as_struct()),
+                                _ => None,
+                            })
+                            .and_then(|m| {
+                                m.get(cur)
+                                    .map(|v| v.as_string())
+                                    .or_else(|| {
+                                        m.iter()
+                                            .find(|(k, _)| k.eq_ignore_ascii_case(cur))
+                                            .map(|(_, v)| v.as_string())
+                                    })
+                            })
+                    })
+                    .and_then(|nm| {
+                        nm.rfind('.')
+                            .map(|i| nm[..i].to_string())
+                            .filter(|p| !p.is_empty())
+                    })
+            };
+            let defining_pkg: Option<String> = source_name_pkg.or_else(|| {
+                    anchor.as_ref().and_then(|(name, src)| {
+                        // Common (non-inherited) case: the `new X()` is
+                        // lexically in the instance's OWN component file
+                        // (self.source_file — swapped to the defining
+                        // method's file during dispatch, restored above —
+                        // equals the instance's __source_file). The
+                        // defining package is then simply the instance's
+                        // own dotted-name package, which PRESERVES the
+                        // mapping prefix the instance was loaded under
+                        // (e.g. `preside.system.services.database.adapters`).
+                        // The filesystem derivation below reconstructs the
+                        // package from the on-disk layout under an inferred
+                        // webroot and is WRONG whenever a mapping makes the
+                        // logical name differ from the physical directory
+                        // (mapping `/dotdotprobe` -> dir `oop` yielded
+                        // `oop.pkg.X` instead of `dotdotprobe.pkg.X`).
+                        // Verified vs Lucee 7.0.4.
+                        let defined_in_own_file = if extends_anchor.is_some() {
+                        // The parent file was found beside the child's: it is in
+                        // the child's package. Elsewhere (webroot, a mapping) the
+                        // filesystem derivation below decides.
+                        std::path::Path::new(cfc_path).parent()
+                            == std::path::Path::new(src.as_str()).parent()
+                    } else {
+                        caller_source
+                            .map(|cur| {
+                                std::path::Path::new(cur)
+                                    == std::path::Path::new(src.as_str())
+                            })
+                            .unwrap_or(false)
+                    };
+                        if defined_in_own_file {
+                            if let Some(pkg) = name
+                                .rfind('.')
+                                .map(|i| name[..i].to_string())
+                                .filter(|p| !p.is_empty())
+                            {
+                                return Some(pkg);
+                            }
+                        }
+                        let anchor_dir = std::path::Path::new(src).parent()?;
+                        // Package segments in the instance's own dotted
+                        // name (all but the trailing class segment).
+                        let seg_count = name.matches('.').count();
+                        let mut webroot = anchor_dir;
+                        for _ in 0..seg_count {
+                            webroot = webroot.parent()?;
+                        }
+                        let defining_dir =
+                            std::path::Path::new(cfc_path).parent()?;
+                        let rel = defining_dir.strip_prefix(webroot).ok()?;
+                        let parts: Vec<String> = rel
+                            .components()
+                            .filter_map(|c| match c {
+                                std::path::Component::Normal(seg) => {
+                                    Some(seg.to_string_lossy().to_string())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if parts.is_empty() {
+                            None
+                        } else {
+                            Some(parts.join("."))
+                        }
+                    })
+                });
+                if let Some(pkg) = defining_pkg {
+                    dotted = format!("{}.{}", pkg, dotted);
+                } else if let Some(caller_pkg) =
+                    anchor.as_ref().and_then(|(name, _)| {
+                        name.rfind('.')
+                            .map(|i| name[..i].to_string())
+                            .filter(|p| !p.is_empty())
+                    })
+                {
+                    // Fallback (webroot not derivable, e.g. a mapping-based
+                    // cross-tree resolve where dirname(cfc_path) is not
+                    // under the anchor webroot): keep the pre-#237 behavior
+                    // of qualifying with the instance package, gated on the
+                    // file being found in the defining source's own dir.
+                    let resolved_in_caller_dir = caller_source
+                        .and_then(|src| std::path::Path::new(src).parent())
+                        .map(|d| {
+                            std::path::Path::new(cfc_path).parent() == Some(d)
+                        })
+                        .unwrap_or(false);
+                    if resolved_in_caller_dir {
+                        dotted = format!("{}.{}", caller_pkg, dotted);
+                    }
+                }
+            }
+        dotted
+    }
+
     fn resolve_component_template_impl(
         &mut self,
         class_name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
         cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CALLS);
+        // Set by the child's resolver when THIS resolution is for its `extends=`
+        // parent (see `qualified_template_name`). Taken first so it can never
+        // leak into a `new` made from inside the body below.
+        let extends_anchor: Option<(String, String)> = self.pending_extends_anchor.take();
         // Reset any stashed compile error so a `None` return reflects THIS
         // resolution (a parse error in the target file, or a genuine not-found).
         self.last_component_compile_error = None;
@@ -32626,6 +32885,9 @@ impl CfmlVirtualMachine {
             // Parent's explicit `this.*` members, staged for the child body
             // (see `pending_pseudo_ctor_parent_this`).
             let mut parent_this_members: Option<ValueMap> = None;
+            // The parent chain's methods, for the body's `this` on a first
+            // construction (see `pending_pseudo_ctor_inherited_table`).
+            let mut inherited_table: Option<Arc<cfml_common::dynamic::ValueMap>> = None;
             // REPLAY: this class has already been fully constructed in this
             // request, so its shared per-class method tables exist. Every later
             // construction attaches those tables to the fresh scopes instead of
@@ -32646,10 +32908,23 @@ impl CfmlVirtualMachine {
             // Resolved BEFORE the replay decision below: this class's chain
             // generation folds in the parent's, which the parent's own
             // resolution records.
+            // This class's dotted `__name`, decided now (the body has not run;
+            // nothing it needs depends on it) so the parent resolution below can
+            // anchor the parent's own name on it. Applied at the finalize.
+            let dotted_name: String = self.qualified_template_name(
+                class_name,
+                &cfc_path,
+                locals,
+                old_source_file.as_deref(),
+                extends_anchor.as_ref(),
+            );
             let mut resolved_parent_stash: Option<CfmlValue> = None;
             let mut parent_generation: u64 = 0;
             if let Some(ref pname) = parent_name {
-                if let Some(parent_template) = self.resolve_component_template(pname, locals) {
+                self.pending_extends_anchor = Some((dotted_name.clone(), cfc_path.to_string()));
+                let parent_template = self.resolve_component_template(pname, locals);
+                self.pending_extends_anchor = None;
+                if let Some(parent_template) = parent_template {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals).ok()?;
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         if let Some(CfmlValue::String(psrc)) = ps.get("__source_file") {
@@ -32727,6 +33002,7 @@ impl CfmlVirtualMachine {
                         if let Some(cs) = cached_super {
                             super_value = Some(cs);
                         } else if !super_methods.is_empty() {
+                            inherited_table = Some(Arc::new(super_methods.clone()));
                             super_methods
                                 .insert("__is_super".to_string(), CfmlValue::Bool(true));
                             let sv = CfmlValue::strukt(super_methods);
@@ -33017,6 +33293,14 @@ impl CfmlVirtualMachine {
             // body sees them on `this` (consumed at its first `StoreLocal("this")`
             // — the body's `this`-binding, before any user statement runs).
             self.pending_pseudo_ctor_parent_this = parent_this_members;
+            let saved_pending_tables = (
+                self.pending_pseudo_ctor_inherited_table.take(),
+                self.pending_pseudo_ctor_body_table.take(),
+                self.pending_pseudo_ctor_own_table.take(),
+            );
+            self.pending_pseudo_ctor_inherited_table = inherited_table;
+            self.pending_pseudo_ctor_body_table =
+                replay_tables.as_ref().map(|(this_table, _)| this_table.clone());
             // Isolate this body's `super.method()` this-writes from any outer
             // construction in progress (a nested `new` inside the body restores
             // the outer stash on its own return). See pseudo_ctor_super_this_writes.
@@ -33046,6 +33330,12 @@ impl CfmlVirtualMachine {
             let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
             self.pseudo_ctor_super_this_writes = saved_super_this_writes;
             self.pending_pseudo_ctor_parent_this = None;
+            // The own table `DefineComponentMethods` left for the finalize below;
+            // then the outer construction's pending tables come back.
+            let own_table_for_finalize = self.pending_pseudo_ctor_own_table.take();
+            self.pending_pseudo_ctor_inherited_table = saved_pending_tables.0;
+            self.pending_pseudo_ctor_body_table = saved_pending_tables.1;
+            self.pending_pseudo_ctor_own_table = saved_pending_tables.2;
             self.constructing_component_names.pop();
             if pushed_super {
                 self.pseudo_ctor_super.pop();
@@ -33100,6 +33390,18 @@ impl CfmlVirtualMachine {
             } else {
                 None
             };
+            // The body ran with the class's FULL method set on the template
+            // `this` (see `pending_pseudo_ctor_inherited_table`). From here on the
+            // template must carry only the class's OWN methods: the inheritance
+            // merge detects a replay by the table's presence and copies parent
+            // data accordingly, and `getComponentMetaData(child).functions` reads
+            // the template's methods.
+            if let Some(CfmlValue::Struct(ref t)) = result {
+                match own_table_for_finalize {
+                    Some(own) => t.set_method_table(own),
+                    None => t.clear_method_table(),
+                }
+            }
             // The body's own local for the template (`StoreLocal(component.name)`)
             // is captured with the other body locals below; it must not become a
             // `variables.<ClassName>` self-reference on the instance (Lucee has
@@ -33196,189 +33498,7 @@ impl CfmlVirtualMachine {
                     _ => true,
                 };
                 if needs_override {
-                    // Normalize the caller-supplied path to the dotted component
-                    // name Lucee/ACF expose in metadata.name (e.g.
-                    // "/app/extensions/x/preside-objects/security_group" ->
-                    // "app.extensions.x.preside-objects.security_group"). Preside's
-                    // PresideObjectReader.getAutoPivotObjectDefinition derives a
-                    // related-object name via ListLast(meta.name, "."), so a
-                    // slash-path name yielded the whole path and broke m2m join
-                    // relationship validation. Already-dotted names are unchanged
-                    // (no slashes to replace). Verified vs Lucee 7.0.4.
-                    let mut dotted = Self::dotted_component_name(class_name);
-                    // Issue #229/#237: an UNQUALIFIED `new X()` (no dots/slashes)
-                    // made from inside a component resolves relative to the
-                    // package of the file that LEXICALLY CONTAINS the `new`
-                    // expression, so its metadata.name is the fully qualified
-                    // "<defining-package>.X" on Lucee/ACF — not the bare "X".
-                    //
-                    // #229 first qualified using the runtime `this` package, but
-                    // for an INHERITED method (`new X()` written in a parent file
-                    // but reached via a subclass instance) `this` is the SUBCLASS,
-                    // whose package is wrong (#237: `tests.specs.Expectation` vs
-                    // the correct `testbox.system.Expectation`). The file itself
-                    // was already resolved correctly against the defining source
-                    // dir (self.source_file is swapped to the method's defining
-                    // component during dispatch), so the RIGHT package is simply
-                    // the package of dirname(cfc_path) — where the .cfc was found.
-                    //
-                    // To turn that directory into a dotted package we need the
-                    // webroot. Anchor it to the outermost instance (`this`), whose
-                    // dotted __name and __source_file are both known and mutually
-                    // consistent: the instance lives at <webroot>/<pkg-path>/<Class>.cfc,
-                    // so popping its package-segment count off dirname(__source_file)
-                    // yields the webroot. dirname(cfc_path) relative to that
-                    // webroot, dotted, is the defining package — correct for both
-                    // same-package (#229) and inherited-across-packages (#237).
-                    if !class_name.contains(['.', '/', '\\']) {
-                        let anchor = locals.get(&*cfml_common::key::well_known::THIS).and_then(|t| match t {
-                            CfmlValue::Struct(cs) => {
-                                let name = cs.get("__name").map(|v| v.as_string())?;
-                                let src = cs.get("__source_file").map(|v| v.as_string())?;
-                                Some((name, src))
-                            }
-                            #[cfg(feature = "component-instance")]
-                            CfmlValue::Instance(inst) => {
-                                let g = inst.read();
-                                Some((g.class.name.clone(), g.class.source_file.clone()))
-                            }
-                            _ => None,
-                        });
-                        // Preferred: the DEFINING class's own logical dotted
-                        // name, recorded per source file at inheritance-merge
-                        // time (__source_names). self.source_file is swapped to
-                        // the executing method's defining file, so for an
-                        // inherited method this yields the parent class's
-                        // mapping-qualified package (testbox.system) rather than
-                        // the webroot-relative one (system) the filesystem
-                        // derivation below produces — and for a same-class
-                        // method it matches the instance's own package. Falls
-                        // through to the anchor logic when the map is absent
-                        // (e.g. a component with no inheritance).
-                        let source_name_pkg: Option<String> = self
-                            .source_file
-                            .as_deref()
-                            .and_then(|cur| {
-                                locals
-                                    .get(&*cfml_common::key::well_known::THIS)
-                                    .and_then(|t| match t {
-                                        CfmlValue::Struct(cs) => {
-                                            cs.get("__source_names").and_then(|v| v.as_struct())
-                                        }
-                                        #[cfg(feature = "component-instance")]
-                                        CfmlValue::Instance(inst) => inst
-                                            .read()
-                                            .class
-                                            .source_names
-                                            .as_ref()
-                                            .and_then(|v| v.as_struct()),
-                                        _ => None,
-                                    })
-                                    .and_then(|m| {
-                                        m.get(cur)
-                                            .map(|v| v.as_string())
-                                            .or_else(|| {
-                                                m.iter()
-                                                    .find(|(k, _)| k.eq_ignore_ascii_case(cur))
-                                                    .map(|(_, v)| v.as_string())
-                                            })
-                                    })
-                            })
-                            .and_then(|nm| {
-                                nm.rfind('.')
-                                    .map(|i| nm[..i].to_string())
-                                    .filter(|p| !p.is_empty())
-                            });
-                        let defining_pkg: Option<String> = source_name_pkg.or_else(|| {
-                            anchor.as_ref().and_then(|(name, src)| {
-                                // Common (non-inherited) case: the `new X()` is
-                                // lexically in the instance's OWN component file
-                                // (self.source_file — swapped to the defining
-                                // method's file during dispatch, restored above —
-                                // equals the instance's __source_file). The
-                                // defining package is then simply the instance's
-                                // own dotted-name package, which PRESERVES the
-                                // mapping prefix the instance was loaded under
-                                // (e.g. `preside.system.services.database.adapters`).
-                                // The filesystem derivation below reconstructs the
-                                // package from the on-disk layout under an inferred
-                                // webroot and is WRONG whenever a mapping makes the
-                                // logical name differ from the physical directory
-                                // (mapping `/dotdotprobe` -> dir `oop` yielded
-                                // `oop.pkg.X` instead of `dotdotprobe.pkg.X`).
-                                // Verified vs Lucee 7.0.4.
-                                let defined_in_own_file = self
-                                    .source_file
-                                    .as_deref()
-                                    .map(|cur| {
-                                        std::path::Path::new(cur)
-                                            == std::path::Path::new(src.as_str())
-                                    })
-                                    .unwrap_or(false);
-                                if defined_in_own_file {
-                                    if let Some(pkg) = name
-                                        .rfind('.')
-                                        .map(|i| name[..i].to_string())
-                                        .filter(|p| !p.is_empty())
-                                    {
-                                        return Some(pkg);
-                                    }
-                                }
-                                let anchor_dir = std::path::Path::new(src).parent()?;
-                                // Package segments in the instance's own dotted
-                                // name (all but the trailing class segment).
-                                let seg_count = name.matches('.').count();
-                                let mut webroot = anchor_dir;
-                                for _ in 0..seg_count {
-                                    webroot = webroot.parent()?;
-                                }
-                                let defining_dir =
-                                    std::path::Path::new(&*cfc_path).parent()?;
-                                let rel = defining_dir.strip_prefix(webroot).ok()?;
-                                let parts: Vec<String> = rel
-                                    .components()
-                                    .filter_map(|c| match c {
-                                        std::path::Component::Normal(seg) => {
-                                            Some(seg.to_string_lossy().to_string())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect();
-                                if parts.is_empty() {
-                                    None
-                                } else {
-                                    Some(parts.join("."))
-                                }
-                            })
-                        });
-                        if let Some(pkg) = defining_pkg {
-                            dotted = format!("{}.{}", pkg, dotted);
-                        } else if let Some(caller_pkg) =
-                            anchor.as_ref().and_then(|(name, _)| {
-                                name.rfind('.')
-                                    .map(|i| name[..i].to_string())
-                                    .filter(|p| !p.is_empty())
-                            })
-                        {
-                            // Fallback (webroot not derivable, e.g. a mapping-based
-                            // cross-tree resolve where dirname(cfc_path) is not
-                            // under the anchor webroot): keep the pre-#237 behavior
-                            // of qualifying with the instance package, gated on the
-                            // file being found in the defining source's own dir.
-                            let resolved_in_caller_dir = self
-                                .source_file
-                                .as_deref()
-                                .and_then(|src| std::path::Path::new(src).parent())
-                                .map(|d| {
-                                    std::path::Path::new(&*cfc_path).parent() == Some(d)
-                                })
-                                .unwrap_or(false);
-                            if resolved_in_caller_dir {
-                                dotted = format!("{}.{}", caller_pkg, dotted);
-                            }
-                        }
-                    }
-                    s.insert("__name".to_string(), CfmlValue::string(dotted));
+                    s.insert("__name".to_string(), CfmlValue::string(dotted_name.clone()));
                 }
             }
             // Inject functions added by cfinclude inside the component body
@@ -34566,6 +34686,17 @@ impl CfmlVirtualMachine {
         // parent's methods in, because that is what the final tables are built
         // from.
         let replaying = child_map.method_table().is_some();
+        // The parent's own resolved (package-qualified) name, read before the
+        // child's keys overlay it below — `__extends_chain` is built from it.
+        let parent_resolved_name: Option<String> = match &parent {
+            CfmlValue::Struct(s) => match s.get("__name") {
+                Some(CfmlValue::String(n)) if !n.is_empty() && n.as_str() != "Anonymous" => {
+                    Some(n.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         let mut parent_map: ValueMap = match parent {
             CfmlValue::Struct(s) if replaying => s.snapshot(),
             CfmlValue::Struct(s) => s.snapshot_with_methods(),
@@ -34848,9 +34979,15 @@ impl CfmlVirtualMachine {
             parent_map.insert("__super".to_string(), super_struct);
         }
 
-        // Build __extends_chain for isInstanceOf
+        // Build __extends_chain for isInstanceOf. The parent's resolved
+        // `__name` is package-qualified (`qualified_template_name` anchors a
+        // relative `extends="Mid"` on the child that declared it), so
+        // `isInstanceOf(leaf, "pkg.Root")` holds for a relatively declared chain
+        // as it does on Lucee; the raw `extends=` spelling is the fallback.
         let mut chain = Vec::new();
-        chain.push(CfmlValue::string(parent_name.to_string()));
+        chain.push(CfmlValue::string(
+            parent_resolved_name.unwrap_or_else(|| parent_name.to_string()),
+        ));
         if let Some(CfmlValue::Array(existing)) = parent_map.get("__extends_chain") {
             for item in existing.iter() {
                 chain.push(item.clone());

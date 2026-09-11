@@ -1106,7 +1106,7 @@ impl<'a> CompRef<'a> {
             let g = inst.read();
             let ap = g.accessor_private.read();
             for (k, v) in g.this_members.snapshot() {
-                if ap.contains(&k.to_ascii_lowercase()) {
+                if !ap.is_empty() && ap.contains(&k.to_ascii_lowercase()) {
                     continue; // accessor-private: hidden from for-in / member iteration
                 }
                 out.insert(k, v);
@@ -1120,7 +1120,11 @@ impl<'a> CompRef<'a> {
                     Some(crate::dynamic::CfmlAccess::Public)
                         | Some(crate::dynamic::CfmlAccess::Remote)
                 );
-                if is_public && !out.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+                // `Key` probes case-insensitively; a linear re-scan of `out` per
+                // method made this quadratic in the method count (an 86-method
+                // CFC's `structAppend`/`structKeyList` ran 4x Lucee, a 173-method
+                // subclass 5x — GH #402).
+                if is_public && !out.contains_key(name.as_str()) {
                     out.insert(name.clone(), CfmlValue::Function(f.clone()));
                 }
             }

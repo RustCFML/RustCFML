@@ -2805,3 +2805,81 @@ The ~12 µs a request's *first* component resolution pays (the trivial class
 costs 16 µs constructed first and 4 µs constructed last) is spread across
 first-touch growth of per-request maps and registries; no single line
 dominates, and it is not addressed here.
+
+## 94. Inside a subclass pseudo-constructor `this` did not show inherited methods; a relatively declared `extends` chain was never package-qualified; `structAppend`/`structKeyList` over a component were quadratic; every CLI start re-hashed the installed extensions (fixed v0.662.0) 📌
+
+Four items left open by the construction work (§89–§93), each confirmed
+against Lucee 7.1 before the change.
+
+**Inherited methods on `this` during the body.** Lucee runs the parent chain's
+pseudo-constructors first on the same `this`, so inside a child's body
+`structKeyExists(this, "inheritedMethod")`, `isDefined("this.inheritedMethod")`,
+`isNull(this.inheritedMethod)`, `f = this.inheritedMethod` and
+`structKeyList(this)` all see the parent's methods. Here `this` was the bare
+template — own methods only — on the first construction and on a replay (§90)
+alike, so a body reading an inherited method by reference threw "Variable
+'rootFn' is undefined". §90 had tried staging the parent's methods as entries
+and reverted it because `getComponentMetaData(child).functions` then listed the
+parent's. The template `this` now carries the class's FULL method table for the
+body's duration only (on a replay the class's own shared table; on a first
+construction the parent chain's methods, the same set the `super` struct is
+built from) and the finalize puts it back — own table on a replay, none on a
+first construction — before the inheritance merge and the metadata builders
+read it. Leaf metadata still lists only the class's own functions. The same
+key-list read inside a body also exposed the engine's `__name`/`__extends`
+entries (the filter recognised a component by `__variables`, which a template
+under construction does not have yet); it recognises `__name` now, the test
+`isInstanceOf` already applied.
+
+**Relative `extends` and `isInstanceOf`.** Lucee's `isInstanceOf(x, "pkg.Root")`
+matches every class in the chain by its mapping-qualified full name. A chain
+declared with relative names (`pkg/Leaf.cfc extends="Mid"`, `Mid extends="Root"`)
+stored the raw `extends=` spelling, so `isInstanceOf(leaf, "pkg.Root")` was false
+and `getMetadata(leaf).extends.name` was `Mid` where Lucee gives `pkg.Mid`.
+The name a template gets (#229/#237's qualification) is now decided BEFORE its
+parent is resolved and handed to the parent's resolution as an explicit anchor:
+an unqualified parent found beside the child's file takes the child's package
+(`pkg.Mid`), a parent elsewhere goes through the existing webroot derivation,
+and each level anchors the next, so `pkg.Root` follows. `__extends_chain` is
+built from the parent's resolved name rather than the `extends=` text. Probe on
+both engines, `new pkg.Leaf()` from a page: `isInstanceOf` `pkg.Root`/`pkg.Mid`
+true, `wrong.Root` false, `extends.name` `pkg.Mid`, `extends.extends.name`
+`pkg.Root`.
+
+**`structAppend(plain, cfc)` / `structKeyList(cfc)` were quadratic in the
+method count** (GH #402's actual per-call cost). The flyweight instance's public
+member walk re-scanned the collected keys with `eq_ignore_ascii_case` for every
+class method, and the marker-struct table walks (`all_keys`, `all_entries`) did
+the same — although `Key` already hashes and compares case-insensitively, so the
+map probe alone decides shadowing. The source's pre-hashed keys are also kept
+through the append instead of being re-interned from `String`s. Same box,
+20k iterations, best of 5:
+
+| `structAppend` | v0.661.0 | v0.662.0 | Lucee |
+|---|---|---|---|
+| plain ← 86-method CFC | 12.1 µs | **8.2 µs** | 2.9 µs |
+| plain ← 86-method child of an 86-method base | 30.1 µs | **16.3 µs** | 6.2 µs |
+| plain ← 86-key plain struct | 4.7 µs | **3.0 µs** | 2.1 µs |
+
+What remains is the member walk itself: a snapshot of the instance's data map
+plus a per-method `to_ascii_lowercase` for the access lookup and one `Key` insert.
+
+**Extensions were inflated and SHA-256'd on every start.** `stage_library`
+read the library out of the `.rcx` zip and hashed it to find its
+content-addressed cache directory — even when that directory already held the
+staged library from an earlier start. With the 38 MB browser extension installed
+that was **0.30 s of CPU per CLI run** (`rustcfml trivial.cfm`: user 0.32 s →
+0.00 s), i.e. the whole cost of a small script. The manifest's digest IS the
+cache key, so when `~/.rustcfml/ext-cache/<digest>/<lib>` exists the archive is
+not opened; only a manifest without a digest still takes the full path. An
+archive with no `cfml/` half is remembered with a `.no-cfml` marker so its
+central directory is not walked every start either.
+
+Verification: CLI runner 8946/8946; served dev and `--production`, cold and
+warm, 9088/9088; `cargo test --workspace`; wasm32 and wasm-pack builds; Wheels
+core 2737/3/0/16 and TestBox own suite 415/0/0/22 with zero per-spec status
+changes against v0.661.0. Trivial-class construction loop unchanged
+(2,330 ns both). Tests: `tests/oop/test_component_construction_semantics.cfm`
+(inherited visibility on the first and a replayed construction, qualified
+`isInstanceOf`/metadata names, engine-key-free `structKeyList(this)`), green on
+Lucee 7.1 too.

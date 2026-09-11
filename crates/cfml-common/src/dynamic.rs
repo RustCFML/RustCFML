@@ -1710,8 +1710,13 @@ impl CfmlStruct {
         let g = self.0.read();
         let mut keys: Vec<String> = g.map.keys().map(|k| k.as_str().to_string()).collect();
         if let Some(t) = &g.method_table {
+            // `Key` hashes and compares case-insensitively, so the map probe
+            // alone decides shadowing. (A linear `eq_ignore_ascii_case` re-scan
+            // of the collected keys per table entry made this quadratic in the
+            // method count: `structKeyList` / `structAppend` over an 86-method
+            // CFC ran 4x Lucee, a 173-method subclass 5x — GH #402.)
             for k in t.keys() {
-                if !g.map.contains_key(k) && !keys.iter().any(|e| e.eq_ignore_ascii_case(k)) {
+                if !g.map.contains_key(k) {
                     keys.push(k.as_str().to_string());
                 }
             }
@@ -1767,13 +1772,26 @@ impl CfmlStruct {
     /// Used by component-aware value iteration (e.g. `getMetadata()`'s function
     /// enumeration) so methods that now live once per class still appear.
     pub fn all_entries(&self) -> Vec<(String, CfmlValue)> {
+        self.all_entries_keyed()
+            .into_iter()
+            .map(|(k, v)| (k.as_str().to_string(), v))
+            .collect()
+    }
+
+    /// [`Self::all_entries`] keeping the pre-hashed `Key`s, for a consumer that
+    /// inserts them straight into another struct (`structAppend`) and would
+    /// otherwise re-intern every name. Same order and shadowing rules.
+    pub fn all_entries_keyed(&self) -> Vec<(Key, CfmlValue)> {
         let g = self.0.read();
-        let mut out: Vec<(String, CfmlValue)> =
-            g.map.iter().map(|(k, v)| (k.as_str().to_string(), v.clone())).collect();
+        let mut out: Vec<(Key, CfmlValue)> = Vec::with_capacity(
+            g.map.len() + g.method_table.as_ref().map_or(0, |t| t.len()),
+        );
+        out.extend(g.map.iter().map(|(k, v)| (k.clone(), v.clone())));
         if let Some(t) = &g.method_table {
+            // The CI map probe alone decides shadowing — see `all_keys`.
             for (k, v) in t.iter() {
-                if !g.map.contains_key(k) && !out.iter().any(|(e, _)| e.eq_ignore_ascii_case(k)) {
-                    out.push((k.as_str().to_string(), v.clone()));
+                if !g.map.contains_key(k) {
+                    out.push((k.clone(), v.clone()));
                 }
             }
         }

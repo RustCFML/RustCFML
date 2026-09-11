@@ -3283,10 +3283,14 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
     // `__variables` and recurses without bound (Wheels renderWith(data=model)
     // tripped the depth-256 guard). Mirrors the for-in CFC filter in cfml-vm:
     // drop `__`-prefixed keys + `this`, and keep only public/remote methods.
-    let is_component = keys.iter().any(|k| k.eq_ignore_ascii_case("__variables"))
-        && keys
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case("__name") || k.eq_ignore_ascii_case("this"));
+    // A finished instance carries `__variables`; a template still running its
+    // pseudo-constructor carries `__name` (and `__extends`/`__metadata`) but no
+    // `__variables` yet — `structKeyList(this)` inside the body must hide the
+    // engine keys there too (Lucee lists only the members). `__name` is the
+    // same component test `isInstanceOf`/`isObject` apply.
+    let is_component = keys.iter().any(|k| k.eq_ignore_ascii_case("__name"))
+        || (keys.iter().any(|k| k.eq_ignore_ascii_case("__variables"))
+            && keys.iter().any(|k| k.eq_ignore_ascii_case("this")));
     if is_component {
         // Accessor-private property names (values written by the implicit accessor
         // ctor or a generated setX) — Lucee keeps these in the private `variables`
@@ -3813,20 +3817,23 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
             // `__` marker keys, so detect the table directly. Enumerate map ∪
             // table whenever a table is present.
             let src_has_methods = b.method_table().is_some();
-            let entries: Vec<(String, CfmlValue)> = if src_is_component || src_has_methods {
-                b.all_entries()
-            } else {
-                b.iter().map(|(k, v)| (k.as_str().to_string(), v)).collect()
-            };
+            // Keep the source's pre-hashed `Key`s: the destination insert then
+            // reuses them instead of re-interning every name from a `String`.
+            let entries: Vec<(cfml_common::key::Key, CfmlValue)> =
+                if src_is_component || src_has_methods {
+                    b.all_entries_keyed()
+                } else {
+                    b.iter().collect()
+                };
             for (k, v) in entries {
                 if (src_is_component || src_has_methods)
-                    && (cfml_common::component::is_reserved_component_key(&k)
-                        || k.eq_ignore_ascii_case("this")
-                        || k.eq_ignore_ascii_case("super"))
+                    && (cfml_common::component::is_reserved_component_key(k.as_str())
+                        || k.as_str().eq_ignore_ascii_case("this")
+                        || k.as_str().eq_ignore_ascii_case("super"))
                 {
                     continue;
                 }
-                if overwrite || struct_find_key_ci(a, &k).is_none() {
+                if overwrite || struct_find_key_ci(a, k.as_str()).is_none() {
                     a.insert(k, v);
                 }
             }

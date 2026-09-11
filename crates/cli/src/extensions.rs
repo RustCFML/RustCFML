@@ -250,6 +250,22 @@ fn stage_library(rcx: &Path, manifest: &Manifest) -> Result<(PathBuf, PathBuf), 
         ));
     };
 
+    // Already staged for this exact digest: the manifest's digest IS the cache
+    // key, so the library sitting under it was inflated from the archive and
+    // verified against that digest when it was first extracted. Re-inflating
+    // and re-hashing it on every start cost 0.30 s of CPU per CLI run for one
+    // 38 MB extension — more than the whole run for a small script. Only a
+    // manifest without a digest still takes the full path (the digest is then
+    // computed to name the cache directory).
+    let name = Path::new(inner).file_name().unwrap_or_else(|| std::ffi::OsStr::new("ext"));
+    if !want_sha.is_empty() {
+        let dir = cache_dir().join(want_sha);
+        let out = dir.join(name);
+        if out.is_file() {
+            return Ok((out, dir));
+        }
+    }
+
     let file = fs::File::open(rcx).map_err(|e| format!("{}: {}", rcx.display(), e))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| format!("{}: {}", rcx.display(), e))?;
@@ -272,7 +288,6 @@ fn stage_library(rcx: &Path, manifest: &Manifest) -> Result<(PathBuf, PathBuf), 
     }
 
     let dir = cache_dir().join(&got);
-    let name = Path::new(inner).file_name().unwrap_or_else(|| std::ffi::OsStr::new("ext"));
     let out = dir.join(name);
     if !out.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
@@ -316,6 +331,13 @@ fn stage_cfml(rcx: &Path, into: &Path) -> Option<PathBuf> {
     if dest.is_dir() {
         return Some(dest);
     }
+    // An archive with no `cfml/` half is remembered as such (the cache dir is
+    // keyed by the library digest, so the answer cannot change), instead of
+    // walking the zip's central directory on every start.
+    let none_marker = into.join(".no-cfml");
+    if none_marker.is_file() {
+        return None;
+    }
     let file = fs::File::open(rcx).ok()?;
     let mut zip = zip::ZipArchive::new(file).ok()?;
     let mut wrote = false;
@@ -350,6 +372,7 @@ fn stage_cfml(rcx: &Path, into: &Path) -> Option<PathBuf> {
     if wrote {
         Some(dest)
     } else {
+        let _ = fs::write(&none_marker, b"");
         None
     }
 }

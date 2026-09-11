@@ -21,7 +21,7 @@ if ( serverPort == "" || serverPort == "0" ) {
 	assert( "super dispatch through the chain", parts[ 2 ], "mid-method+mid-override+root-method" );
 	assert( "override wins, super reaches the parent", parts[ 3 ], "mid-override+root-method" );
 	assert( "root constructor's private write visible", parts[ 4 ], "root" );
-	assert( "leaf metadata lists only own functions", parts[ 6 ], "init,leafMethod,ownKeys,seenFromRoot,viaSuper" );
+	assert( "leaf metadata lists only own functions", parts[ 6 ], "inheritedOnThis,inheritedRefWorks,init,leafMethod,ownKeys,seenFromRoot,thisKeysInCtor,viaSuper" );
 	assert( "second request (adopted tables) identical", b, a );
 	assert( "third request identical", c, a );
 }
