@@ -8781,9 +8781,45 @@ impl CfmlVirtualMachine {
                             }
                             CfmlValue::Struct(vars.clone())
                         } else if !is_inside_function {
-                            let mut merged = self.globals.clone();
+                            // Page scope: `variables` is the page's OWN variables. The
+                            // globals map also carries every builtin and engine-
+                            // registered function; those are not members of the
+                            // scope (Lucee: `structCount(variables)` on a page with
+                            // two variables and one UDF is 3, not 754). Leaving them
+                            // in made `structKeyList(variables)` list `arrayLen`, and
+                            // — worse — `variables.x = 1` spliced all ~750 of them
+                            // back into the page frame as ordinary entries, after
+                            // which EVERY call from that page seeded ~750 keys into
+                            // its frame: 800 ns → 59 µs per UDF call.
+                            // Also not members: the other scopes the engine parks in
+                            // globals (`cgi`, `url`, `form`, …), engine `__` keys, and a
+                            // component template awaiting its finalize.
+                            let is_member = |k: &cfml_common::key::Key, v: &CfmlValue| -> bool {
+                                let ks = k.as_str();
+                                if ks.starts_with("__") {
+                                    return false;
+                                }
+                                let lc = ks.to_ascii_lowercase();
+                                if Self::is_web_request_scope(&lc)
+                                    || matches!(lc.as_str(), "cgi" | "request" | "server" | "application" | "session" | "client" | "cookie" | "this" | "super")
+                                {
+                                    return false;
+                                }
+                                if matches!(v, CfmlValue::Function(_)) && self.is_builtin_name_ci(ks, &lc) {
+                                    return false;
+                                }
+                                !Self::is_template_global(Some(v))
+                            };
+                            let mut merged = ValueMap::with_capacity(locals.len() + 8);
+                            for (k, v) in &self.globals {
+                                if is_member(k, v) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
                             for (k, v) in &locals {
-                                merged.insert(k.clone(), v.clone());
+                                if is_member(k, v) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
                             }
                             CfmlValue::strukt(merged)
                         } else {
@@ -9240,9 +9276,19 @@ impl CfmlVirtualMachine {
                                     // CFC method: write back to the __variables scope
                                     locals.insert("__variables".to_string(), CfmlValue::Struct(s));
                                 } else {
-                                    // Non-CFC: merge keys back into locals
+                                    // Non-CFC: merge keys back into locals — only what
+                                    // differs from the page's current value. A
+                                    // `variables.x = 1` round-trips the whole scope view
+                                    // through here, and every unchanged entry re-inserted
+                                    // became a key each later call seeded into its frame.
                                     for (k, v) in s.iter() {
-                                        locals.insert(k.clone(), v.clone());
+                                        let unchanged = locals
+                                            .get(&k)
+                                            .or_else(|| self.globals.get(&k))
+                                            .is_some_and(|cur| Self::values_equal_shallow(cur, &v));
+                                        if !unchanged {
+                                            locals.insert(k.clone(), v.clone());
+                                        }
                                     }
                                     // Forward-sync into the shared closure env, exactly
                                     // like the `local.x = …` branch above and the plain

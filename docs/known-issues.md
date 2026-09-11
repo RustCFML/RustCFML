@@ -3041,3 +3041,36 @@ including `var i = 0; each(function(){ i++ })` with a page `i` present. Test:
 collected keys case-insensitively per class method. It reads under the lock
 and probes the own map (not the class table, which would report every method
 as shadowed) instead. 86-method class: 8.9 → 3.3 µs (Lucee 2.1).
+
+## 99. A page's `variables` scope listed every builtin (754 members on a page with three variables), and one `variables.x = …` made every later call from that page 70x slower (fixed v0.666.0) 📌
+
+Found while sizing call costs against Lucee: a page-level UDF call measured
+800 ns on a clean page and 59 µs after a single explicit `variables.x = 1`
+(or `variables["x"] = 1`), growing with the number of page variables. Two
+defects behind one mechanism:
+
+- The page-scope `variables` view was built as a clone of the VM's globals
+  map plus the frame's locals, and the globals map is also where every
+  builtin and engine-registered function, the other scopes (`cgi`, `url`,
+  `form`) and a component template awaiting its finalize live. So
+  `structCount(variables)` was 754 where Lucee says 3, `structKeyExists(
+  variables, "arrayLen")` and `isDefined("variables.arrayLen")` were true,
+  and `structKeyList(variables)` began with `$sioBroadcast`.
+- A scoped store (`variables.x = …`) compiles to load-the-view, set the
+  member, store-the-view, and the store spliced EVERY entry of the view back
+  into the page frame as an ordinary local. From then on the frame held ~750
+  extra keys, and the fused seed carried all of them into every callee frame
+  (counted: 750 caller keys per call, against 4 before).
+
+The view now includes only members of the scope (no builtin function
+entries, no `__` engine keys, no scopes, no templates), and the store splices
+back only entries whose value differs from the page's current one. Verified
+on Lucee 7.1: `structKeyList(variables)` on a page with `a`, `b` and a UDF
+is exactly those three, four after `variables.c = 3`. Test:
+`tests/core/test_page_variables_scope_members.cfm`, green on both engines.
+
+Still open from the same sizing: a UDF called from a PAGE frame copies the
+page's variables into its frame on every call (the template-caller carry
+filter is "all"), so page-heavy code pays O(page variables) per call where
+Lucee walks a reference chain. That is the next frame lever, together with
+closure calls (10x Lucee) and higher-order functions (7.7x).
