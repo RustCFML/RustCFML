@@ -412,6 +412,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_component_ctor_method_hoist.cfm">
 <cf_runtest file="oop/test_component_construction_semantics.cfm">
 <cf_runtest file="oop/test_injected_method_frame.cfm">
+<cf_runtest file="oop/test_closure_lexical_binding.cfm">
 <cf_runtest file="oop/test_static_across_requests.cfm">
 <cf_runtest file="oop/test_class_cache_across_requests.cfm">
 <cf_runtest file="oop/test_appcfc_extends_parent_methods.cfm">

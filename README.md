@@ -158,11 +158,17 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 
   On the same host as the proxy, bind a **Unix domain socket** with `--socket` instead of a TCP port — it skips loopback TCP and sustains ~40% more throughput than TCP loopback at high concurrency. See **[Deployment → Behind a reverse proxy (nginx + Unix socket)](docs/deployment.md#behind-a-reverse-proxy-nginx--unix-socket)**.
 
-- **Optimised Docker container** — *coming soon*: a minimal image for containerised deployment.
+- **Docker container** — a multi-arch reference image (`linux/amd64`, `linux/arm64`), ~36 MB, non-root, extension-aware, and it stops cleanly on `docker stop`:
+
+  ```bash
+  docker run --rm -p 8500:8500 -v "$PWD/webroot:/app" ghcr.io/rustcfml/rustcfml
+  ```
+
+  Image and Dockerfile: **[RustCFML-Docker](https://github.com/RustCFML/RustCFML-Docker)**. See **[Deployment → Docker](docs/deployment.md#docker)**.
 
 - **CLI tool** — compile a CFML app into a standalone command-line binary. See **[Deployment → CLI tools](docs/deployment.md#cli-tools)**.
 
-- **Cloudflare Workers** — run RustCFML at the edge via WebAssembly. See **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**.
+- **Cloudflare Workers** — run RustCFML at the edge via WebAssembly, deployed with `wrangler deploy` from the worker host. There is no `rustcfml` flag for this target: the host repo carries the build and the bindings (Hyperdrive datasources, KV sessions, a Durable Object application scope). See **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**.
 
 **Production mode** (warm caching) and **sandbox / virtual filesystem** (host isolation, embedded files) apply to both web and CLI deployments — they're documented once in **[Deployment](docs/deployment.md)**.
 

@@ -170,7 +170,37 @@ See **[Performance](performance.md)** for the direct-serve methodology these bui
 
 ## Docker
 
-*Coming soon* — an optimised, minimal container image for running RustCFML web applications. Until then, a standalone web-application binary (below) copied into a `scratch`/`distroless` base works well, since RustCFML has no runtime dependencies.
+The reference image lives in its own repo, **[RustCFML-Docker](https://github.com/RustCFML/RustCFML-Docker)**, and is published to the GitHub container registry:
+
+```
+ghcr.io/rustcfml/rustcfml:<tag>
+```
+
+It is multi-arch (`linux/amd64`, `linux/arm64`), around 36 MB, runs as a non-root user, stops cleanly on `docker stop`, and checks for native extensions (`.rcx`) before the server starts. The base is Chainguard Wolfi, so anything the app needs at the OS level is an `apk add` away.
+
+Mount a webroot at `/app` and run it:
+
+```bash
+docker run --rm -p 8500:8500 -v "$PWD/webroot:/app" ghcr.io/rustcfml/rustcfml
+```
+
+The default mode is `production`, so everything is cached until restart. For local development, where edits should appear without one:
+
+```bash
+docker run --rm -p 8500:8500 -v "$PWD/webroot:/app" -e RUSTCFML_MODE=dev ghcr.io/rustcfml/rustcfml
+```
+
+To bake an application into an image, use it as a base:
+
+```dockerfile
+FROM ghcr.io/rustcfml/rustcfml:v0.653.3
+COPY --chown=nonroot:nonroot webroot/ /app/
+RUN rustcfml-warm-extensions   # only if the app ships .rcx files
+```
+
+`rustcfml-warm-extensions` extracts native extensions at build time, so the first container start does not pay for it and a broken or wrong-platform archive fails the **build** rather than the deploy.
+
+A standalone web-application binary (below) copied into a `scratch`/`distroless` base remains a valid alternative, since RustCFML has no runtime dependencies.
 
 ## CLI tools
 
@@ -248,11 +278,24 @@ Self-contained binaries can include user-authored Rust code that surfaces as fir
 
 ## Cloudflare Workers
 
-Run RustCFML at the edge by compiling to WebAssembly. The Worker integration (Hyperdrive datasources, KV/R2/Durable Objects, session storage) lives in a separate repo:
+Run RustCFML at the edge by compiling to WebAssembly.
+
+> **There is no `rustcfml` flag for this target.** The CLI has no `--wasm` option, and the edge build is not produced by the `rustcfml` binary at all. You deploy from the worker host repo with `wrangler`, which builds the WASM module and carries the bindings.
+
+The Worker integration (Hyperdrive datasources, KV/R2/Durable Objects, session storage) lives in a separate repo:
 
 - **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**
 
-See **[WebAssembly](wasm.md)** for the WASM target generally.
+The short version, once `wrangler` and `worker-build` are installed and `wrangler.toml` carries your binding ids:
+
+```bash
+cargo install worker-build
+npm install                          # postgres / mysql2, for the Hyperdrive path
+wrangler kv namespace create SESSIONS # paste the id into wrangler.toml
+wrangler deploy
+```
+
+Full setup, including Hyperdrive provisioning and the JSPI architecture behind `<cfquery>`, is in that repo's README. See **[WebAssembly](wasm.md)** for the WASM target generally.
 
 ## Production mode (web and CLI)
 

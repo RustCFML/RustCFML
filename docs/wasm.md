@@ -25,6 +25,14 @@ RustCFML runs on Cloudflare Workers at the edge. Database access uses [Hyperdriv
 
 - **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**
 
+You deploy from that repo with `wrangler`, which drives `worker-build` to produce the WASM module:
+
+```bash
+wrangler deploy
+```
+
+The `rustcfml` CLI has **no `--wasm` flag** and takes no part in an edge deploy. See **[Deployment → Cloudflare Workers](deployment.md#cloudflare-workers)** for the surrounding setup.
+
 See **[Database](database.md#postgresql-on-cloudflare-workers)** for how `queryExecute` behaves against Hyperdrive datasources.
 
 ## Notes & limits

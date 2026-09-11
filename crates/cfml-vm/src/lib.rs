@@ -3680,6 +3680,12 @@ fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
 #[derive(Debug)]
 struct FusedParentPlan {
     env: Option<Arc<std::sync::RwLock<ValueMap>>>,
+    /// The callee is a closure / arrow function: lexically bound, so the
+    /// caller's `this`/`variables`/`super` are NOT seeded into its frame — it
+    /// sees only what it captured (Lucee: a page-level closure invoked as
+    /// `cfc.f()` has no `this`; one defined in CFC A and invoked on CFC B sees
+    /// A's scopes).
+    lexical: bool,
     /// `None` = carry everything (closure expression, or the caller is a
     /// template/page frame whose locals ARE the page variables scope).
     filter: Option<std::sync::Arc<InheritedKeys>>,
@@ -8937,7 +8943,11 @@ impl CfmlVirtualMachine {
                                     Some(CfmlValue::Struct(cv)) if cv.contains_key_ci(name)
                                 )
                             };
-                            if (locals.contains_key(&*cfml_common::key::well_known::THIS)
+                            // A closure read by name keeps its lexical binding (see
+                            // `strip_instance_binding`); only a plain UDF value is
+                            // re-bound to this component here.
+                            if !Self::is_closure_value(f)
+                                && (locals.contains_key(&*cfml_common::key::well_known::THIS)
                                 || locals.contains_key(&*cfml_common::key::well_known::VARIABLES))
                                 && !locals.contains_key(name)
                                 && !locals.contains_key(name_lower)
@@ -9768,7 +9778,10 @@ impl CfmlVirtualMachine {
                                 if !f.name.eq_ignore_ascii_case(name.as_str()) {
                                     self.pending_called_name = Some(name.key().as_arc());
                                 }
-                                let foreign_bind = f
+                                // Closures are lexically bound (see
+                                // `strip_instance_binding`): never re-bound here.
+                                let foreign_bind = !Self::is_closure_value(f)
+                                    && f
                                     .captured_scope
                                     .as_ref()
                                     .and_then(|c| c.read().ok().map(|g| {
@@ -22180,6 +22193,7 @@ impl CfmlVirtualMachine {
         FusedParentPlan {
             env: func_ref.captured_scope.clone(),
             filter,
+            lexical: Self::is_closure_value(func_ref),
         }
     }
 
@@ -22277,6 +22291,11 @@ impl CfmlVirtualMachine {
             }
             for (k, v) in caller {
                 if !filter_carry(k, v) {
+                    continue;
+                }
+                if plan.lexical && InheritedKeys::structural_bit(k.as_str()).is_some() {
+                    // Lexical callee: the env loop above already seeded whatever
+                    // structural scopes it captured; the caller's are not its.
                     continue;
                 }
                 if !matches!(v, CfmlValue::Function(_))
@@ -24526,6 +24545,14 @@ impl CfmlVirtualMachine {
         n.replace(['/', '\\'], ".")
     }
 
+    /// A function value that is a closure or arrow expression (as opposed to a
+    /// named UDF read off a component) — the shapes that keep their defining
+    /// component's scopes when dispatched elsewhere.
+    #[inline]
+    fn is_closure_value(f: &cfml_common::dynamic::CfmlFunction) -> bool {
+        f.name.starts_with("__closure_") || f.name.starts_with("__arrow_")
+    }
+
     /// When a bound method value (one whose `captured_scope` pins it to the
     /// component it was *read from* via `this.method` — carrying that component's
     /// `this`/`variables`/`super`) is dispatched AS A METHOD on a different
@@ -24538,6 +24565,15 @@ impl CfmlVirtualMachine {
     /// unbound-method case pays only a couple of reads, no clone).
     fn strip_instance_binding(func: &CfmlValue) -> CfmlValue {
         if let CfmlValue::Function(f) = func {
+            // A closure / arrow function is LEXICALLY bound: on Lucee its
+            // `variables`, `this`, and unscoped reads and writes all resolve to
+            // the component it was DEFINED in, wherever it is stored and however
+            // it is invoked (`t.clo()`, `this.clo()`, a bare `clo()`, through a
+            // struct). Only a plain UDF value re-binds to the receiver. Probed on
+            // Lucee 7.1 across all six shapes (docs/known-issues.md §96).
+            if Self::is_closure_value(f) {
+                return func.clone();
+            }
             if let Some(ref cap) = f.captured_scope {
                 let (cleaned, orig_len): (ValueMap, usize) = {
                     let g = cap.read().unwrap();

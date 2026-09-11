@@ -2961,8 +2961,8 @@ writing the regression test (`tests/oop/test_injected_method_frame.cfm`): an
 injected plain UDF binds to the component it is INVOKED on (its `variables`
 are the target's — both engines agree), and an injected CLOSURE keeps its
 captured locals (both agree) but Lucee ALSO keeps `variables` bound to the
-DEFINING component where we bind it to the target. That closure `variables`
-binding is a pre-existing divergence (identical on v0.661.0), left open here.
+DEFINING component where we bound it to the target. That closure binding
+divergence is fixed in v0.664.0 (§96).
 
 **Tried and dropped:** seeding a bare sibling-method call's frame the same
 owned way. It broke the private-method access gate and custom-tag `thisTag`
@@ -2974,3 +2974,35 @@ Verification: CLI runner 8946/8946; served dev and `--production`, cold and
 warm, 9088/9088; `cargo test --workspace`; wasm32 and wasm-pack builds;
 Wheels core 2737/3/0/16 and TestBox own suite 415/0/0/22 with zero per-spec
 status changes against v0.661.0.
+
+## 96. A closure dispatched on another component was re-bound to it — Lucee keeps a closure lexically bound to the component that defined it (fixed v0.664.0) 📌
+
+Found while writing §95's regression test and probed on Lucee 7.1 across every
+call shape before changing anything. Lucee's rule is total: a closure or arrow
+function keeps the scopes of the component it was DEFINED in — `variables`,
+`this`, unscoped reads AND writes — wherever it is stored and however it is
+invoked: `t.clo()`, `this.clo()` inside a method, a bare `clo()`,
+`variables.clo()`, held in a plain struct and called as `s.f()`, nested
+closures. A closure defined at page level and stored on a component sees the
+page's `variables` and has NO `this` at all. A PLAIN UDF reference behaves the
+opposite way and re-binds to the component it is invoked on (its `variables`
+are the receiver's). A closure never sees its caller's locals or `arguments`,
+and does see its defining frame's later declarations and mutations.
+
+We matched the UDF rule and the `variables.clo()` path, and re-bound closures
+everywhere else: `strip_instance_binding` removed the captured
+`this`/`variables` on instance dispatch (so the receiver's won), the bare-call
+and bare-read paths rebuilt a "foreign-bound" function's env around the
+current component (the guard assumed a "genuine closure" captures no
+`this`/`__variables` — ours capture their defining method frame, which has
+both), and the fused frame seed carried the caller's structural scopes into a
+closure's frame (which is how a page closure acquired a `this`). Each of those
+three now applies only to a plain UDF value (`is_closure_value`: the
+`__closure_`/`__arrow_` expression names), and a lexical callee's frame takes
+its structural scopes from its captured env alone (`FusedParentPlan::lexical`).
+
+Test: `tests/oop/test_closure_lexical_binding.cfm` — 23 assertions covering
+all the shapes above, every expectation read off Lucee first; green on both
+engines. Wheels core and TestBox identical per spec (WireBox's injected
+`buildProviderMixer` provider and Preside's `decorated.onMissingMethod =
+this.onMissingMethod` are plain UDF values and still re-bind).
