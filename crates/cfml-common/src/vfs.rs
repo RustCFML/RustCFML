@@ -217,29 +217,123 @@ pub trait Vfs: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RealFs;
 
+/// Lucee-like case-insensitive path resolution on case-sensitive filesystems.
+///
+/// Walks **every** path segment (not just the last, and not only `.cfc`/`.cfm`):
+/// `storage/testDir/loading.gif` finds on-disk `storage/testdir/loading.gif`.
+/// Exact-case `exists` is the per-segment fast path; a directory listing is
+/// paid only on a miss whose parent exists.
+///
+/// Returns the on-disk spelling when the path exists ignoring case, else `None`.
+pub fn lucee_case_fold_path(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.exists() {
+        return Some(path.to_string());
+    }
+    let mut acc = std::path::PathBuf::new();
+    let comps: Vec<_> = p.components().collect();
+    if comps.is_empty() {
+        return None;
+    }
+    for comp in comps {
+        match comp {
+            std::path::Component::Prefix(pre) => acc.push(pre.as_os_str()),
+            std::path::Component::RootDir => acc.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                acc.push(comp.as_os_str());
+            }
+            std::path::Component::Normal(seg) => {
+                let next = acc.join(seg);
+                if next.exists() {
+                    acc = next;
+                    continue;
+                }
+                if acc.as_os_str().is_empty() || !acc.is_dir() {
+                    return None;
+                }
+                let want = seg.to_str()?;
+                let mut hit: Option<std::ffi::OsString> = None;
+                let entries = std::fs::read_dir(&acc).ok()?;
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name
+                        .to_str()
+                        .map(|n| n.eq_ignore_ascii_case(want))
+                        .unwrap_or(false)
+                    {
+                        hit = Some(name);
+                        break;
+                    }
+                }
+                acc.push(hit?);
+            }
+        }
+    }
+    if acc.exists() {
+        Some(acc.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+fn real_fs_folded(path: &str) -> Option<String> {
+    if Path::new(path).exists() {
+        Some(path.to_string())
+    } else {
+        lucee_case_fold_path(path)
+    }
+}
+
 impl Vfs for RealFs {
     fn read_to_string(&self, path: &str) -> io::Result<String> {
-        std::fs::read_to_string(path)
+        match std::fs::read_to_string(path) {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::read_to_string(folded)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        match std::fs::read(path) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::read(folded)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn exists(&self, path: &str) -> bool {
-        Path::new(path).exists()
+        Path::new(path).exists() || lucee_case_fold_path(path).is_some()
     }
 
     fn is_file(&self, path: &str) -> bool {
         Path::new(path).is_file()
+            || lucee_case_fold_path(path)
+                .map(|p| Path::new(&p).is_file())
+                .unwrap_or(false)
     }
 
     fn is_dir(&self, path: &str) -> bool {
         Path::new(path).is_dir()
+            || lucee_case_fold_path(path)
+                .map(|p| Path::new(&p).is_dir())
+                .unwrap_or(false)
     }
 
     fn read_dir(&self, path: &str) -> io::Result<Vec<VfsDirEntry>> {
-        let entries = std::fs::read_dir(path)?;
+        let resolved = real_fs_folded(path).unwrap_or_else(|| path.to_string());
+        let entries = std::fs::read_dir(&resolved)?;
         let mut result = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
@@ -261,7 +355,17 @@ impl Vfs for RealFs {
     }
 
     fn modified(&self, path: &str) -> io::Result<SystemTime> {
-        std::fs::metadata(path)?.modified()
+        match std::fs::metadata(path) {
+            Ok(md) => md.modified(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::metadata(folded)?.modified()
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Buffered, one chunk resident at a time — this is the whole point of
@@ -286,7 +390,17 @@ impl Vfs for RealFs {
     }
 
     fn canonicalize(&self, path: &str) -> io::Result<String> {
-        std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string())
+        match std::fs::canonicalize(path) {
+            Ok(p) => Ok(p.to_string_lossy().to_string()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::canonicalize(folded).map(|p| p.to_string_lossy().to_string())
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -891,6 +1005,54 @@ mod tests {
         assert!(names.contains(&"application.cfc".to_string()), "{names:?}");
         assert!(names.contains(&"index.cfm".to_string()), "{names:?}");
     }
+
+    /// GH #387: a mid-path directory case mismatch must resolve, not only the
+    /// last segment. Preside FileStorage fixtures live at `storage/testdir/`
+    /// while tests ask for `storage/testDir/loading.gif`.
+    #[test]
+    fn real_fs_folds_every_path_segment() {
+        let dir = TempDir::new("segfold");
+        let on_disk = dir.0.join("storage").join("testdir");
+        std::fs::create_dir_all(&on_disk).expect("mkdir testdir");
+        std::fs::write(on_disk.join("loading.gif"), b"GIF89a").expect("write gif");
+
+        let fs = RealFs;
+        let asked = format!("{}/storage/testDir/loading.gif", dir.str());
+        assert!(fs.exists(&asked), "exists must fold testDir -> testdir");
+        assert!(fs.is_file(&asked), "is_file must fold testDir -> testdir");
+        assert_eq!(fs.read(&asked).expect("read folded gif"), b"GIF89a");
+        assert_eq!(
+            fs.read_to_string(&asked).expect("read_to_string folded gif"),
+            "GIF89a"
+        );
+        let canon = fs.canonicalize(&asked).expect("canonicalize folded gif");
+        assert!(
+            canon.to_lowercase().ends_with("testdir/loading.gif")
+                || canon.to_lowercase().ends_with("testdir\\\\loading.gif"),
+            "canonicalize should land on testdir: {canon}"
+        );
+        let parent_asked = format!("{}/storage/testDir", dir.str());
+        assert!(fs.is_dir(&parent_asked), "directory segment itself folds");
+        // A genuinely missing path stays missing.
+        let missing = format!("{}/storage/testDir/nope.gif", dir.str());
+        assert!(!fs.exists(&missing));
+    }
+
+    #[test]
+    fn lucee_case_fold_path_returns_on_disk_spelling() {
+        let dir = TempDir::new("foldret");
+        let on_disk = dir.0.join("storage").join("testdir");
+        std::fs::create_dir_all(&on_disk).expect("mkdir");
+        std::fs::write(on_disk.join("loading.gif"), b"x").expect("write");
+        let asked = format!("{}/storage/testDir/loading.gif", dir.str());
+        let folded = lucee_case_fold_path(&asked).expect("should fold");
+        assert!(
+            folded.ends_with("testdir/loading.gif") || folded.ends_with("testdir\\\\loading.gif"),
+            "folded={folded}"
+        );
+        assert!(!folded.contains("testDir"), "must not keep requested case: {folded}");
+    }
+
 }
 
 /// The system temp directory WITH a trailing separator, which is what Lucee and
