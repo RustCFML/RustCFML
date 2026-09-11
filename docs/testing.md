@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-RustCFML's test suite is **written in CFML**, not Rust. The runner includes every test file and uses a small harness providing `assert()`, `assertTrue()`, `assertFalse()`, `assertNull()`, `assertThrows()`, `suiteBegin()`, and `suiteEnd()`.
+RustCFML's test suite is **written in CFML**, not Rust. The runner includes every test file and uses a small harness providing `assert()`, `assertTrue()`, `assertFalse()`, `assertNull()`, `assertNotNull()`, `assertThrows()`, `suiteBegin()`, and `suiteEnd()`.
 
 ```bash
 cargo run -- tests/runner.cfm    # Full CFML test suite
@@ -22,11 +22,19 @@ cargo test                       # Rust unit tests (tag parser, pg_sql, etc.)
    suiteEnd();
    ```
 
-3. Register it in `tests/runner.cfm`:
+3. Register it in `tests/runner.cfm` with the `<cf_runtest>` tag, which is what the
+   runner uses for all ~680 files:
 
    ```cfml
-   try { include "category/test_my_feature.cfm"; } catch (any e) { /* ... */ }
+   <cf_runtest file="category/test_my_feature.cfm">
    ```
+
+   `<cf_runtest>` runs the file in the tag's **own** `variables` scope, so a test's
+   unscoped page-level writes cannot leak into the runner and pollute later tests.
+   The pass/fail counters live in the `request` scope, which does cross the tag
+   boundary, so totals still accumulate. It also catches and reports an error in the
+   file as an aborted suite, so a test file needs no `try`/`catch` of its own, and it
+   re-includes `harness.cfm` for you, so your test file must **not** include it.
 
 ## Lucee is the compatibility reference
 
@@ -59,6 +67,14 @@ A file exercising a RustCFML extension, a superset, or syntax Lucee's parser rej
 
 ```cfml
 <cf_runtest file="stdlib/test_xmp.cfm" rustcfmlOnly="true">
+```
+
+Add `why="..."` to say *why* in the `SKIPPED:` block; without it the reason is
+recorded as the generic "RustCFML-only":
+
+```cfml
+<cf_runtest file="core/test_closure_env_leak.cfm" rustcfmlOnly="true"
+            why="chained call mk(5)(3) in an expression; Lucee's parser rejects it">
 ```
 
 It runs normally on RustCFML and is reported as `SKIP` on any other engine, with a `SKIPPED:` block in the summary listing every one. Nothing is ever skipped on RustCFML itself, so this cannot weaken the release gate.

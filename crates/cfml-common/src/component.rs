@@ -1066,13 +1066,14 @@ impl<'a> CompRef<'a> {
         if let CompRef::Instance(inst) = self {
             let g = inst.read();
             let ap = g.accessor_private.read();
-            let mut keys: Vec<String> = g
-                .this_members
-                .snapshot()
-                .into_keys()
-                .filter(|k| !ap.contains(&k.to_ascii_lowercase()))
-                .map(|k| k.as_str().to_string())
-                .collect();
+            // Own public entries: read under the struct lock, no map copy; the
+            // accessor-private lowercase probe only when there is such a set.
+            let mut keys: Vec<String> = g.this_members.with_map(|m| {
+                m.keys()
+                    .filter(|k| ap.is_empty() || !ap.contains(&k.to_ascii_lowercase()))
+                    .map(|k| k.as_str().to_string())
+                    .collect()
+            });
             // Methods enumerate only while the shared table is still attached —
             // `structClear(instance)` drops it (MockBox `clearMethods`), after which
             // the object is method-less until re-mixed.
@@ -1085,7 +1086,18 @@ impl<'a> CompRef<'a> {
                     Some(crate::dynamic::CfmlAccess::Public)
                         | Some(crate::dynamic::CfmlAccess::Remote)
                 );
-                if is_public && !keys.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+                // A class method is shadowed only by an own entry of the same
+                // name; probe the map (case-insensitive `Key`) instead of
+                // re-scanning the collected list per method — that scan made
+                // `structKeyList(cfc)` quadratic in the method count (4x Lucee
+                // on an 86-method class; `structAppend` had the same, GH #402).
+                // Probe the OWN map only — `CfmlStruct::contains_key` falls
+                // through to the class method table, which would report every
+                // class method as "shadowed". An own entry hidden as
+                // accessor-private does not shadow the method either.
+                let shadowed = g.this_members.with_map(|m| m.contains_key(name.as_str()))
+                    && (ap.is_empty() || !ap.contains(&name.to_ascii_lowercase()));
+                if is_public && !shadowed {
                     keys.push(name.clone());
                 }
             }

@@ -10584,7 +10584,7 @@ impl CfmlVirtualMachine {
                                 // Reconcile any nested-closure writeback that reached
                                 // the shared env behind an intermediate frame (see the
                                 // CallMethod arm / reconcile_closure_env_into_locals).
-                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
+                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -11268,7 +11268,7 @@ impl CfmlVirtualMachine {
                                 }
                                 // queryExecute result=/cfquery name= delivery
                                 self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
-                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
+                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -12556,6 +12556,9 @@ impl CfmlVirtualMachine {
                                 Self::reconcile_closure_env_into_locals(
                                     &closure_env,
                                     &mut locals,
+                                    &declared_locals,
+                                    &func.params,
+                                    parent_scope,
                                 );
                                 stack.push(val);
                                 continue;
@@ -13521,7 +13524,7 @@ impl CfmlVirtualMachine {
                     // closure env, not this frame's `closure_parent_writeback`
                     // (which the method frame already consumed). Reconcile the env
                     // so the enclosing var sees the mutation across the CFC boundary.
-                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
+                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
 
                     stack.push(result);
                 }
@@ -13684,7 +13687,7 @@ impl CfmlVirtualMachine {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
-                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
+                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
                     stack.push(result);
                 }
 
@@ -30039,6 +30042,9 @@ impl CfmlVirtualMachine {
     fn reconcile_closure_env_into_locals(
         closure_env: &Option<Arc<std::sync::RwLock<ValueMap>>>,
         locals: &mut ValueMap,
+        declared_locals: &DeclaredLocals,
+        params: &[String],
+        parent_scope: Option<&ValueMap>,
     ) {
         if let Some(env) = closure_env {
             let env = env.read().unwrap();
@@ -30048,6 +30054,27 @@ impl CfmlVirtualMachine {
                 // captured scope and re-break recursion/sibling resolution.
                 if matches!(v, CfmlValue::Function(_)) {
                     continue;
+                }
+                // A `var` local (or parameter) of THIS frame that shadows a key
+                // this frame INHERITED: a slot-backed `var i` declared after the
+                // env was captured is never forward-synced to the env, so the
+                // env still holds the enclosing scope's value. Pulling that over
+                // the local reset a closure's `for (var i…)` counter to a
+                // same-named page variable after every nested closure call
+                // (page `i` = 5000: the loop ran once; 201: it never ended).
+                // "Stale" is decided by value: the env still equals what the
+                // enclosing scope has. A local the closure genuinely mutated
+                // (`var groups` declared BEFORE the closure, set inside it) no
+                // longer matches and is still reconciled.
+                let shadows_local = declared_locals.contains(k.as_str())
+                    || params.iter().any(|p| p.eq_ignore_ascii_case(k.as_str()));
+                if shadows_local {
+                    let stale_inherited = parent_scope
+                        .and_then(|p| p.get(k))
+                        .is_some_and(|pv| Self::values_equal_shallow(v, pv));
+                    if stale_inherited {
+                        continue;
+                    }
                 }
                 match locals.get(k) {
                     Some(lv) if Self::values_equal_shallow(lv, v) => {}

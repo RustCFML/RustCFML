@@ -3006,3 +3006,38 @@ all the shapes above, every expectation read off Lucee first; green on both
 engines. Wheels core and TestBox identical per spec (WireBox's injected
 `buildProviderMixer` provider and Preside's `decorated.onMissingMethod =
 this.onMissingMethod` are plain UDF values and still re-bind).
+
+## 97. Inside a closure, a `var` local sharing its name with a captured variable was overwritten after every nested closure call — a `for (var i…)` loop ran once, or never ended (fixed v0.665.0) 📌
+
+Found by a cross-engine microbench that would not finish: a closure defined
+inside another closure, called in a loop, with a 1,000-element array built
+earlier on the page. The array was a red herring — the loop that built it
+left a page-level `i` behind. After ANY closure call inside a closure the
+frame reconciled its own captured env back into its locals
+(`reconcile_closure_env_into_locals`, there so a closure's write to an
+enclosing variable is visible when it was invoked behind an intermediate CFC
+method frame), and it did so for every env key whose value differed from the
+local — including keys the frame had declared with `var`. A `var i` in a slot
+is never forward-synced to the env, so the env still held the enclosing
+scope's `i`, and the loop counter was reset to it after each nested call: with
+page `i = 5000` the loop ran once; with page `i = 201` it never terminated;
+with page `t = 999999` the closure's running total became 1,000,001. A nested
+UDF call did not trigger it. Identical on v0.661.0, so long-standing, and the
+shape — `describe(function(){ … it(function(){ for (var i…) … }) })`, a
+`for (var i…)` around a callback inside an `arrayEach` — is common.
+
+The fix has to keep the case the reconcile exists for: `var groups` declared
+BEFORE the closure and set inside it must still come back (two existing
+suites cover it). The rule is value-based: a declared local or parameter is
+skipped only when the env's value still equals what the enclosing scope
+holds for that key — i.e. the env never saw this frame's variable and is
+merely stale. A genuinely mutated local no longer matches and is reconciled,
+including `var i = 0; each(function(){ i++ })` with a page `i` present. Test:
+`tests/core/test_closure_var_shadows_captured_after_nested_call.cfm`.
+
+## 98. `structKeyList`/`structKeyArray` over a component were quadratic in the method count, like §94's `structAppend` (fixed v0.665.0)
+
+`instance_public_keys` copied the instance's data map and re-scanned the
+collected keys case-insensitively per class method. It reads under the lock
+and probes the own map (not the class table, which would report every method
+as shadowed) instead. 86-method class: 8.9 → 3.3 µs (Lucee 2.1).
