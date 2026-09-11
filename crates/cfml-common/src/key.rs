@@ -128,6 +128,12 @@ impl Key {
         &self.name
     }
 
+    /// The name as a shared string (an `Arc` clone, no allocation).
+    #[inline]
+    pub fn as_arc(&self) -> Arc<str> {
+        self.name.clone()
+    }
+
     /// The pre-computed folded hash, for callers building their own indexes
     /// keyed the same way.
     #[inline]
@@ -534,6 +540,8 @@ pub mod well_known {
     pub static THIS: LazyLock<Key> = LazyLock::new(|| Key::new("this"));
     /// The parent-component handle.
     pub static SUPER: LazyLock<Key> = LazyLock::new(|| Key::new("super"));
+    /// A CFC method frame's shared per-class `static` scope.
+    pub static STATIC: LazyLock<Key> = LazyLock::new(|| Key::new("__static"));
     /// The reserved slot holding a frame's `arguments` scope (the literal
     /// spelling a user variable could never collide with).
     pub static ARGUMENTS_SCOPE: LazyLock<Key> = LazyLock::new(|| Key::new("__arguments__"));

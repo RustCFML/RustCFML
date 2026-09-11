@@ -611,7 +611,7 @@ fn run_dispatch(
     crate::register_vm_runtime(&mut vm);
     vm.apply_cfconfig(&server_state.cfconfig);
     vm.session_id = session_id;
-    vm.source_file = Some(cfc_path.clone());
+    vm.source_file = Some(std::sync::Arc::from(cfc_path.as_str()));
     let registry = server_state.websocket.clone();
     vm.server_state = Some(server_state);
 

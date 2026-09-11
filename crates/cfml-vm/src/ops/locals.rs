@@ -184,6 +184,8 @@ pub(crate) fn op_validate_param_type(
 pub(crate) fn op_jump_if_arg_present(
     ip: &mut usize,
     locals: &ValueMap,
+    func: &BytecodeFunction,
+    arguments_supplied_bits: u64,
     arguments_supplied: &Option<
         std::collections::HashSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>,
     >,
@@ -204,9 +206,17 @@ pub(crate) fn op_jump_if_arg_present(
     // vars). `contains` uses the pre-lowercased key.
     let supplied = match locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
         Some(CfmlValue::Struct(a)) => a.contains_key_ci(name),
-        _ => arguments_supplied
-            .as_ref()
-            .is_some_and(|s| s.contains(name.key())),
+        _ => {
+            // Bit per declared-param index (see `arguments_supplied_bits` in
+            // the prologue); the set only holds indices 64 and up.
+            let idx = func.param_keys().iter().position(|k| k == name.key());
+            match idx {
+                Some(i) if i < 64 => arguments_supplied_bits & (1u64 << i) != 0,
+                _ => arguments_supplied
+                    .as_ref()
+                    .is_some_and(|s| s.contains(name.key())),
+            }
+        }
     };
     if supplied {
         *ip = target;
@@ -980,7 +990,7 @@ pub(crate) fn op_load_super(
         if let (Some(src), Some(CfmlValue::Struct(map))) =
             (vm.source_file.as_ref(), g.class.super_map.as_ref())
         {
-            if let Some(sup) = map.get(src.as_str()).or_else(|| {
+            if let Some(sup) = map.get(&*src).or_else(|| {
                 map.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case(src))
                     .map(|(_, v)| v.clone())
@@ -1026,7 +1036,7 @@ pub(crate) fn op_load_super(
         if let (Some(src), Some(CfmlValue::Struct(map))) =
             (vm.source_file.as_ref(), s.get_ci("__super_map"))
         {
-            if let Some(sup) = map.get(src.as_str()).or_else(|| {
+            if let Some(sup) = map.get(&*src).or_else(|| {
                 map.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case(src))
                     .map(|(_, v)| v.clone())

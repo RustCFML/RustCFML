@@ -36,7 +36,7 @@ fn compile_page(source: &str) -> BytecodeProgram {
 /// One "request": a fresh VM sharing `ss`, exactly as the serve loop builds one.
 fn run_request(ss: &ServerState, page_path: &str, source: &str) -> String {
     let mut vm = CfmlVirtualMachine::new(compile_page(source));
-    vm.source_file = Some(page_path.to_string());
+    vm.source_file = Some(std::sync::Arc::from(page_path));
     vm.base_template_path = Some(page_path.to_string());
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);

@@ -309,7 +309,7 @@ pub(crate) fn run_cfml(
     let mut vm = CfmlVirtualMachine::new(program);
     vm.vfs = vfs;
     vm.base_template_path = Some(file_path.to_string());
-    vm.source_file = Some(file_path.to_string());
+    vm.source_file = Some(std::sync::Arc::from(file_path));
 
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);

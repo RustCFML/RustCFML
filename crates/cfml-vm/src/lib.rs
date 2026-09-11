@@ -2196,7 +2196,7 @@ pub struct CfmlVirtualMachine {
     /// adopted from `ServerState::class_caches`. See `class_generation`.
     pub class_generations: HashMap<String, u64>,
     /// Source file path (for include resolution)
-    pub source_file: Option<String>,
+    pub source_file: Option<Arc<str>>,
     /// Call stack for tracking execution
     call_stack: Vec<CallFrame>,
     /// Per-frame call context for `build_call_parent_scope`, pushed for EVERY
@@ -2301,6 +2301,12 @@ pub struct CfmlVirtualMachine {
     /// nested `new` inside a pseudo-constructor sees only its own.
     pending_pseudo_ctor_body_table: Option<Arc<cfml_common::dynamic::ValueMap>>,
     pending_pseudo_ctor_own_table: Option<Arc<cfml_common::dynamic::ValueMap>>,
+    /// An instance-method dispatch hands the frame its scope map READY-MADE
+    /// (`this`, `__variables`, `__static`) instead of a parent map the frame
+    /// copies entry by entry into a second one. Taken by the very next
+    /// `execute_function_body`; the dispatch clears it after the call so it
+    /// can never reach another frame.
+    pending_instance_frame: Option<(ValueMap, bool)>,
     /// `(dotted name, source file)` of the child whose `extends=` parent the
     /// next `resolve_component_template_impl` call resolves; taken at its entry.
     pending_extends_anchor: Option<(String, String)>,
@@ -2775,7 +2781,7 @@ pub struct CfmlVirtualMachine {
     /// `getFunctionCalledName()` report the alias a UDF was called by — the
     /// primitive WireBox delegation relies on (one `getByDelegate` UDF injected
     /// under many method names, dispatched by the called name).
-    pending_called_name: Option<String>,
+    pending_called_name: Option<Arc<str>>,
     /// Registry of Rust-backed classes, keyed by lowercased class name.
     /// Populated via `register_native_class`. The function is invoked when
     /// CFML calls `createObject("rust", "Name", ...)` / `new rust:Name(...)`
@@ -3699,6 +3705,21 @@ struct FusedParentPlan {
 struct InheritedKeys {
     /// Bitmask over STRUCTURAL_NAMES (this/__variables/super/variables).
     structural: u8,
+    /// The first few non-structural keys, held inline. A frame's parameters
+    /// land here (one per declared param, tracked so a `local`-mode write of
+    /// a param name is not mistaken for a write-through), so without this
+    /// every call of ANY function with parameters allocated and grew a hash
+    /// table: measured at ~5% of a 1-param CFC method call. Keys beyond the
+    /// inline capacity spill to `other`; `contains`/`remove` consult both.
+    inline_len: u8,
+    inline: [Option<cfml_common::key::Key>; Self::INLINE_CAP],
+    /// The frame's declared parameters, tracked as a bit per parameter index
+    /// over the function's shared `param_keys` instead of one table entry per
+    /// parameter per call: binding a 35-parameter method spent a quarter of
+    /// the call inserting and re-hashing those names. Index 64+ falls back to
+    /// the inline/table path.
+    param_keys: Option<Arc<[cfml_common::key::Key]>>,
+    param_bits: u64,
     /// Non-structural inherited keys (page vars, helpers, params where the
     /// caller tracks them here). Empty — and unallocated, `HashTable::new()`
     /// being a non-allocating `const fn` — for the common structural-only
@@ -3739,7 +3760,68 @@ struct InheritedKeys {
 }
 
 impl InheritedKeys {
-    const STRUCTURAL_NAMES: [&'static str; 4] = ["this", "__variables", "super", "variables"];
+    const STRUCTURAL_NAMES: [&'static str; 5] =
+        ["this", "__variables", "super", "variables", "__static"];
+    const INLINE_CAP: usize = 4;
+
+    /// Track declared parameter `i` of the function whose keys are `keys`.
+    #[inline]
+    fn track_param(&mut self, keys: &Arc<[cfml_common::key::Key]>, i: usize) {
+        if i < 64 {
+            if self.param_keys.is_none() {
+                self.param_keys = Some(keys.clone());
+            }
+            self.param_bits |= 1u64 << i;
+        } else {
+            self.insert_key(&keys[i]);
+        }
+    }
+
+    /// Index of the tracked parameter named `k` (case-insensitive), if any.
+    #[inline]
+    fn param_find(&self, hash: u64, k: &str) -> Option<usize> {
+        if self.param_bits == 0 {
+            return None;
+        }
+        let keys = self.param_keys.as_ref()?;
+        let mut bits = self.param_bits;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if let Some(pk) = keys.get(i) {
+                if pk.hash_value() == hash && pk.as_str().eq_ignore_ascii_case(k) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn inline_find(&self, hash: u64, k: &str) -> Option<usize> {
+        self.inline[..self.inline_len as usize]
+            .iter()
+            .position(|e| {
+                e.as_ref()
+                    .is_some_and(|e| e.hash_value() == hash && e.as_str().eq_ignore_ascii_case(k))
+            })
+    }
+
+    /// True if the key is already tracked inline, or was placed there now.
+    /// False when the inline store is full (caller spills to the table).
+    #[inline]
+    fn inline_insert(&mut self, hash: u64, k: &str, make: impl FnOnce() -> cfml_common::key::Key) -> bool {
+        if self.inline_find(hash, k).is_some() {
+            return true;
+        }
+        let n = self.inline_len as usize;
+        if n < Self::INLINE_CAP {
+            self.inline[n] = Some(make());
+            self.inline_len += 1;
+            return true;
+        }
+        false
+    }
 
     #[inline]
     fn structural_bit(k: &str) -> Option<u8> {
@@ -3748,6 +3830,11 @@ impl InheritedKeys {
             "__variables" => Some(2),
             "super" => Some(4),
             "variables" => Some(8),
+            // A method frame's shared class `static` scope: structural so a
+            // method frame's inherited set stays bits-only (`has_data_keys`
+            // false), which is what lets a bare sibling-method call take the
+            // owned-frame fast path.
+            "__static" => Some(16),
             _ => None,
         }
     }
@@ -3780,6 +3867,9 @@ impl InheritedKeys {
                     pc::bump(&pc::IK_SET_CREATED);
                 }
             }
+            if self.inline_insert(k.hash_value(), k.as_str(), || k.clone()) {
+                return;
+            }
             self.other
                 .entry(k.hash_value(), |e| e == k, Self::key_hash)
                 .or_insert_with(|| k.clone());
@@ -3804,13 +3894,30 @@ impl InheritedKeys {
                     pc::bump(&pc::IK_SET_CREATED);
                 }
             }
+            let hash = cfml_common::key::fold_hash(k);
+            if self.inline_insert(hash, k, || cfml_common::key::Key::new(k)) {
+                return;
+            }
             self.other
-                .entry(
-                    cfml_common::key::fold_hash(k),
-                    |e| e.as_str().eq_ignore_ascii_case(k),
-                    Self::key_hash,
-                )
+                .entry(hash, |e| e.as_str().eq_ignore_ascii_case(k), Self::key_hash)
                 .or_insert_with(|| cfml_common::key::Key::new(k));
+        }
+    }
+
+    /// `contains` for a caller that already holds the interned key: no
+    /// re-hash of the name (a `&str` probe folds and hashes it every time,
+    /// which a frame with parameters now pays on every bare-name read).
+    #[inline]
+    fn contains_key(&self, k: &cfml_common::key::Key) -> bool {
+        if let Some(bit) = Self::structural_bit(k.as_str()) {
+            self.structural & bit != 0
+        } else if self.param_bits == 0 && self.inline_len == 0 && self.other.is_empty() {
+            false
+        } else {
+            let hash = k.hash_value();
+            self.param_find(hash, k.as_str()).is_some()
+                || self.inline_find(hash, k.as_str()).is_some()
+                || (!self.other.is_empty() && self.other.find(hash, |e| e == k).is_some())
         }
     }
 
@@ -3818,17 +3925,20 @@ impl InheritedKeys {
     fn contains(&self, k: &str) -> bool {
         if let Some(bit) = Self::structural_bit(k) {
             self.structural & bit != 0
-        } else if self.other.is_empty() {
+        } else if self.param_bits == 0 && self.inline_len == 0 && self.other.is_empty() {
             // The overwhelmingly common shape. Checked before hashing so an
             // empty set costs a load and a branch, as it did when this field
             // was an `Option`.
             false
         } else {
-            self.other
-                .find(cfml_common::key::fold_hash(k), |e| {
-                    e.as_str().eq_ignore_ascii_case(k)
-                })
-                .is_some()
+            let hash = cfml_common::key::fold_hash(k);
+            self.param_find(hash, k).is_some()
+                || self.inline_find(hash, k).is_some()
+                || (!self.other.is_empty()
+                    && self
+                        .other
+                        .find(hash, |e| e.as_str().eq_ignore_ascii_case(k))
+                        .is_some())
         }
     }
 
@@ -3838,12 +3948,28 @@ impl InheritedKeys {
     /// `HashSet<String>` original cleared both halves unconditionally.
     #[inline]
     fn remove_data(&mut self, k: &str) {
+        if self.param_bits == 0 && self.inline_len == 0 && self.other.is_empty() {
+            return;
+        }
+        let hash = cfml_common::key::fold_hash(k);
+        if let Some(i) = self.param_find(hash, k) {
+            self.param_bits &= !(1u64 << i);
+            return;
+        }
+        if let Some(i) = self.inline_find(hash, k) {
+            let last = self.inline_len as usize - 1;
+            self.inline.swap(i, last);
+            self.inline[last] = None;
+            self.inline_len -= 1;
+            return;
+        }
         if self.other.is_empty() {
             return;
         }
-        if let Ok(entry) = self.other.find_entry(cfml_common::key::fold_hash(k), |e| {
-            e.as_str().eq_ignore_ascii_case(k)
-        }) {
+        if let Ok(entry) = self
+            .other
+            .find_entry(hash, |e| e.as_str().eq_ignore_ascii_case(k))
+        {
             entry.remove();
         }
     }
@@ -3874,14 +4000,14 @@ impl InheritedKeys {
 
     #[inline]
     fn has_data_keys(&self) -> bool {
-        !self.other.is_empty()
+        self.param_bits != 0 || self.inline_len != 0 || !self.other.is_empty()
     }
 
     /// Arc this set for `frame_ctx`. Structural-only shapes (the overwhelmingly
     /// common case) return one of 16 process-shared singletons — zero allocation.
     fn into_shared(self) -> Arc<InheritedKeys> {
         use std::sync::OnceLock;
-        static SHARED: OnceLock<[Arc<InheritedKeys>; 16]> = OnceLock::new();
+        static SHARED: OnceLock<[Arc<InheritedKeys>; 32]> = OnceLock::new();
         if self.has_data_keys() {
             return Arc::new(self);
         }
@@ -3889,11 +4015,15 @@ impl InheritedKeys {
             std::array::from_fn(|i| {
                 Arc::new(InheritedKeys {
                     structural: i as u8,
+                    inline_len: 0,
+                    inline: Default::default(),
+                    param_keys: None,
+                    param_bits: 0,
                     other: hashbrown::HashTable::new(),
                 })
             })
         });
-        shared[(self.structural & 15) as usize].clone()
+        shared[(self.structural & 31) as usize].clone()
     }
 }
 
@@ -3958,14 +4088,14 @@ impl DeclaredLocals {
 
 #[derive(Debug, Clone)]
 struct CallFrame {
-    function_name: String,
+    function_name: Arc<str>,
     /// The name this function was actually invoked under at the call site —
     /// for member calls this is the method name used (which can differ from
     /// `function_name` when one UDF is injected under several aliases, as
     /// WireBox does for delegated methods). Exposed by `getFunctionCalledName()`.
     /// Defaults to `function_name` for plain named calls.
-    called_name: String,
-    template: String,
+    called_name: Arc<str>,
+    template: Arc<str>,
     /// Current line within this function (updated by LineInfo)
     line: usize,
     /// Line in the caller where this function was invoked
@@ -4081,6 +4211,7 @@ impl CfmlVirtualMachine {
             pending_pseudo_ctor_inherited_table: None,
             pending_pseudo_ctor_body_table: None,
             pending_pseudo_ctor_own_table: None,
+            pending_instance_frame: None,
             pending_extends_anchor: None,
             pseudo_ctor_super_this_writes: None,
             method_variables_writeback: None,
@@ -4794,7 +4925,7 @@ impl CfmlVirtualMachine {
             .and_then(|c| c.get_ci("script_name"))
             .map(|v| v.as_string())
             .filter(|s| !s.is_empty())
-            .or_else(|| self.source_file.clone())
+            .or_else(|| self.source_file.as_deref().map(str::to_string))
             .unwrap_or_default();
         self.profile = Some(hub.register(route));
     }
@@ -4818,8 +4949,8 @@ impl CfmlVirtualMachine {
             Vec::with_capacity(self.call_stack.len() + 1);
         for f in &self.call_stack {
             frames.push(profiler::SampleFrame {
-                function: f.function_name.clone(),
-                template: f.template.clone(),
+                function: f.function_name.to_string(),
+                template: f.template.to_string(),
                 line: f.line,
             });
         }
@@ -4827,7 +4958,7 @@ impl CfmlVirtualMachine {
             // Top-level page code between/before any function call.
             frames.push(profiler::SampleFrame {
                 function: "(template)".to_string(),
-                template: self.source_file.clone().unwrap_or_default(),
+                template: self.source_file.as_deref().unwrap_or_default().to_string(),
                 line: self.current_line,
             });
         }
@@ -5190,7 +5321,7 @@ impl CfmlVirtualMachine {
             session_id: self.session_id.clone(),
             current_application_name: self.current_application_name.clone(),
             base_template_path: self.base_template_path.clone(),
-            source_file: self.source_file.clone(),
+            source_file: self.source_file.as_deref().map(str::to_string),
             mappings: self.mappings.clone(),
             custom_tag_paths: self.custom_tag_paths.clone(),
             custom_tag_deep_search: self.custom_tag_deep_search,
@@ -5241,7 +5372,7 @@ impl CfmlVirtualMachine {
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
         self.base_template_path = seed.base_template_path;
-        self.source_file = seed.source_file;
+        self.source_file = seed.source_file.map(Arc::from);
         self.mappings = seed.mappings;
         self.apply_extension_mappings();
         self.refresh_mappings_fingerprint();
@@ -6280,7 +6411,7 @@ impl CfmlVirtualMachine {
     pub(crate) fn build_stack_trace(&self) -> Vec<cfml_common::vm::StackFrame> {
         use cfml_common::vm::StackFrame;
         let mut frames = Vec::new();
-        let template = self.source_file.clone().unwrap_or_default();
+        let template = self.source_file.as_deref().unwrap_or_default().to_string();
 
         if self.call_stack.is_empty() {
             // Error in __main__ — single frame
@@ -6292,15 +6423,15 @@ impl CfmlVirtualMachine {
         } else {
             // Innermost frame: the function currently executing, at the current line
             frames.push(StackFrame {
-                function: self.call_stack.last().unwrap().function_name.clone(),
+                function: self.call_stack.last().unwrap().function_name.to_string(),
                 template: template.clone(),
                 line: self.current_line,
             });
             // Intermediate frames in reverse (skip the last/current)
             for frame in self.call_stack.iter().rev().skip(1) {
                 frames.push(StackFrame {
-                    function: frame.function_name.clone(),
-                    template: frame.template.clone(),
+                    function: frame.function_name.to_string(),
+                    template: frame.template.to_string(),
                     line: frame.line,
                 });
             }
@@ -6646,8 +6777,8 @@ impl CfmlVirtualMachine {
     fn request_timeout_error(&self, elapsed_ms: i64) -> CfmlError {
         let template = self
             .source_file
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+            .as_deref()
+            .unwrap_or("unknown").to_string();
         let mut err = CfmlError::new(
             format!(
                 "Request [{}] has run into a timeout (timeout: {} seconds) and has been \
@@ -6708,7 +6839,7 @@ impl CfmlVirtualMachine {
                  limit (--max-memory) and this request was the largest allocator \
                  ({} tracked containers, {} request(s) in flight). Other requests were \
                  left running.",
-                self.source_file.clone().unwrap_or_else(|| "unknown".to_string()),
+                self.source_file.as_deref().unwrap_or("unknown").to_string(),
                 largest,
                 in_flight
             ),
@@ -7038,7 +7169,7 @@ impl CfmlVirtualMachine {
         > = std::sync::OnceLock::new();
         let cache = EXPR_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
-        let key = (self.source_file.clone(), expr.to_string());
+        let key = (self.source_file.as_deref().map(str::to_string), expr.to_string());
         if let Some(hit) = cache.read().unwrap().get(&key) {
             return Ok(hit.clone());
         }
@@ -7053,7 +7184,7 @@ impl CfmlVirtualMachine {
                 ))
             })?;
         let program = cfml_codegen::compiler::CfmlCompiler::new()
-            .with_source_file(self.source_file.clone())
+            .with_source_file(self.source_file.as_deref().map(str::to_string))
             .compile(ast);
 
         let mut w = cache.write().unwrap();
@@ -7659,6 +7790,21 @@ impl CfmlVirtualMachine {
     /// — template frames hand `locals` to `captured_locals`). Clears it first so
     /// no `CfmlValue` is retained between calls. The cap bounds pool memory under
     /// deep recursion; excess maps are simply dropped.
+    /// A scope map for a frame seeded by its caller (see
+    /// `pending_instance_frame`): from the pool when there is one, so the
+    /// hand-off costs no allocation on either side.
+    #[inline]
+    fn seed_locals_map(&mut self, cap: usize) -> ValueMap {
+        #[cfg(feature = "scope-pool")]
+        {
+            self.take_locals_map(cap)
+        }
+        #[cfg(not(feature = "scope-pool"))]
+        {
+            ValueMap::with_capacity_and_hasher(cap, Default::default())
+        }
+    }
+
     #[cfg(feature = "scope-pool")]
     #[inline]
     fn recycle_locals_map(&mut self, mut m: ValueMap) {
@@ -7702,6 +7848,10 @@ impl CfmlVirtualMachine {
             _cp_t = _cp0;
         }
         let fused_plan = self.pending_fused_parent.take();
+        let (owned_parent, skip_method_writeback) = match self.pending_instance_frame.take() {
+            Some((m, skip)) => (Some(m), skip),
+            None => (None, false),
+        };
         if fuse_counters::enabled() {
             fuse_counters::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -7737,7 +7887,7 @@ impl CfmlVirtualMachine {
             let window = 32.min(depth);
             let recent: Vec<&str> = self.call_stack[depth - window..]
                 .iter()
-                .map(|f| f.function_name.as_str())
+                .map(|f| &*f.function_name)
                 .collect();
             'cycle: for cycle_len in 1..=4 {
                 if window < cycle_len * 4 {
@@ -7777,11 +7927,15 @@ impl CfmlVirtualMachine {
         // Lever D1 (scope-pool): reuse a per-call `locals` backing from the
         // free-list; recycled at the non-escaping success exits below. Flag-off
         // path is the original per-call allocation, byte-identical.
-        #[cfg(feature = "scope-pool")]
-        let mut locals: ValueMap = self.take_locals_map(seed_cap + 1);
-        #[cfg(not(feature = "scope-pool"))]
-        let mut locals: ValueMap =
-            ValueMap::with_capacity_and_hasher(seed_cap + 1, Default::default());
+        // Instance-method frame: the dispatch's map IS this frame's scope.
+        let instance_frame = owned_parent.is_some();
+        let mut locals: ValueMap = match owned_parent {
+            Some(mut owned) => {
+                owned.reserve(func.params.len());
+                owned
+            }
+            None => self.seed_locals_map(seed_cap + 1),
+        };
         let mut stack: Vec<CfmlValue> = Vec::new();
         // Slot-resolved locals (perf plan T3.1 stage 1): direct-indexed storage
         // for the `var`-declared names in `func.slot_names`. `None` = not (yet)
@@ -7868,6 +8022,13 @@ impl CfmlVirtualMachine {
         // pushed to frame_ctx so a bare call from this frame knows which
         // of its keys are lexical/page scope (propagate) vs its own locals.
         let mut inherited_from_parent = InheritedKeys::default();
+        if instance_frame {
+            // What the fused merge below would have recorded for these keys.
+            for k in locals.keys() {
+                inherited_or_param_keys.insert_key(k);
+                inherited_from_parent.insert_key(k);
+            }
+        }
         // For a function-scoped `<cfinclude>`, the caller passes down exactly its
         // genuine `local`-scope keys here. Those keys are seeded into this frame's
         // locals like any other parent var, but must remain part of the frame's
@@ -7894,7 +8055,10 @@ impl CfmlVirtualMachine {
             _cp_t = _n;
         }
         let _seed_t0 = ablate::wb_counters().then(std::time::Instant::now);
-        if let Some(plan) = fused_plan {
+        if instance_frame {
+            // Scope already seeded by the dispatch (see `pending_instance_frame`).
+            let _ = fused_plan;
+        } else if let Some(plan) = fused_plan {
             // Fused path (perf plan 3.2 stage 1): `parent_scope` is the RAW
             // caller locals; merge (captured env ∪ filtered caller) straight
             // into `locals`. Decision table identical to
@@ -8106,16 +8270,13 @@ impl CfmlVirtualMachine {
         // insertion is a refcount bump instead of a `to_lowercase()` allocation
         // per parameter per lazy call, and `Key`'s own equality already folds
         // case, so the lowercasing this set existed to pre-compute is gone.
+        // Lazy `arguments` scope: which declared params the caller supplied,
+        // as a bit per index (the set version allocated a hash set per frame
+        // for every call with parameters). Index 64+ spills to the set.
+        let mut arguments_supplied_bits: u64 = 0;
         let mut arguments_supplied: Option<
             std::collections::HashSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>,
-        > = if build_arguments_eager {
-            None
-        } else {
-            Some(std::collections::HashSet::with_capacity_and_hasher(
-                func.params.len(),
-                Default::default(),
-            ))
-        };
+        > = None;
         #[cfg(feature = "call-phases")]
         let mut _p4_t = {
             // phase 29: eagerness decision (memo probes) + containers alloc
@@ -8134,27 +8295,44 @@ impl CfmlVirtualMachine {
         // v0.599 — bind through the interned parameter keys: the probe does no
         // hashing and the insert clones a key instead of allocating a `String`
         // per parameter per call (the phase-4b cost).
-        let param_keys = func.param_keys();
+        let param_keys_arc = func.param_keys_arc();
+        let param_keys: &[cfml_common::key::Key] = param_keys_arc;
         // Read by BOTH the `call-phases` phase-30 record and the always-compiled
         // param-binding census below, so these are unconditional: two u64 adds in
         // a loop that already inserts into a map and may validate a declared type.
         let (mut _p4_supplied, mut _p4_typechecks) = (0u64, 0u64);
+        // Which params the caller supplied (non-null), recorded here because
+        // the values are MOVED out of `args` below and the required-param
+        // check after the loop must not re-probe them.
+        let mut supplied_bits: u64 = 0;
+        let mut supplied_over64: Vec<usize> = Vec::new();
+        let mut args = args;
         for (i, param_name) in func.params.iter().enumerate() {
             // `param_keys` is the function's interned parameter names, built
             // once per function — so this marks the param inherited without
             // allocating a `Key` from `param_name`'s `String`.
-            match param_keys.get(i) {
-                Some(pk) => inherited_or_param_keys.insert_key(pk),
-                None => inherited_or_param_keys.insert(param_name),
+            if i < param_keys.len() {
+                inherited_or_param_keys.track_param(param_keys_arc, i);
+            } else {
+                inherited_or_param_keys.insert(param_name);
             }
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
             // A Null arg value counts as "not supplied": CFML has no way to pass
             // an explicit null, and the named-argument rebinder pads omitted
             // slots with Null to keep later named args at the right index.
-            let supplied = match args.get(i) {
-                Some(v) if !matches!(v, CfmlValue::Null) => Some(v.clone()),
+            // Move the value out (the args Vec is this frame's own); cloning
+            // it cost an Arc increment per param for every string/struct.
+            let supplied = match args.get_mut(i) {
+                Some(v) if !matches!(v, CfmlValue::Null) => Some(std::mem::take(v)),
                 _ => None,
             };
+            if supplied.is_some() {
+                if i < 64 {
+                    supplied_bits |= 1u64 << i;
+                } else {
+                    supplied_over64.push(i);
+                }
+            }
             match supplied {
                 Some(value) => {
                     if fuse_counters::enabled() {
@@ -8175,11 +8353,18 @@ impl CfmlVirtualMachine {
                         }
                     }
                     _p4_supplied += 1;
-                    locals.insert(param_keys[i].clone(), value.clone());
                     if build_arguments_eager {
+                        locals.insert(param_keys[i].clone(), value.clone());
                         arguments_map.insert(param_keys[i].clone(), value);
                     } else {
-                        arguments_supplied.as_mut().unwrap().insert(param_keys[i].clone());
+                        locals.insert(param_keys[i].clone(), value);
+                        if i < 64 {
+                            arguments_supplied_bits |= 1u64 << i;
+                        } else {
+                            arguments_supplied
+                                .get_or_insert_with(Default::default)
+                                .insert(param_keys[i].clone());
+                        }
                     }
                 }
                 None => {
@@ -8212,7 +8397,11 @@ impl CfmlVirtualMachine {
         // in `arguments` as an extra key. The MISSING REQUIRED PARAM is.
         for (i, param_name) in func.params.iter().enumerate() {
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
-            let supplied = matches!(args.get(i), Some(v) if !matches!(v, CfmlValue::Null));
+            let supplied = if i < 64 {
+                supplied_bits & (1u64 << i) != 0
+            } else {
+                supplied_over64.contains(&i)
+            };
             if func.required_params.get(i).copied().unwrap_or(false)
                 && !supplied
                 && !has_default
@@ -8369,18 +8558,17 @@ impl CfmlVirtualMachine {
         let called_name = self
             .pending_called_name
             .take()
-            .unwrap_or_else(|| func.name.clone());
+            .unwrap_or_else(|| func.name_arc());
 
         // Push call frame for stack trace tracking (skip __main__ — it's the root)
         if func.name != "__main__" {
             self.call_stack.push(CallFrame {
-                function_name: func.name.clone(),
+                function_name: func.name_arc(),
                 called_name,
                 template: func
-                    .source_file
-                    .clone()
-                    .or_else(|| self.source_file.clone())
-                    .unwrap_or_default(),
+                    .source_file_arc()
+                    .or_else(|| self.source_file.as_deref().map(Arc::from))
+                    .unwrap_or_else(|| Arc::from("")),
                 line: 0,
                 caller_line: self.current_line,
             });
@@ -9485,7 +9673,7 @@ impl CfmlVirtualMachine {
                             let is_own_param =
                                 func.params.iter().any(|p| p.eq_ignore_ascii_case(k));
                             let inherited_data =
-                                inherited_or_param_keys.contains(k.as_str()) && !is_own_param;
+                                inherited_or_param_keys.contains_key(k) && !is_own_param;
                             !inherited_data && !is_builtin_name
                         }
                     };
@@ -9540,7 +9728,7 @@ impl CfmlVirtualMachine {
                                 && !f.name.starts_with("__closure_")
                                 && !f.name.starts_with("__arrow_")
                             {
-                                self.pending_called_name = Some(name.to_string());
+                                self.pending_called_name = Some(name.key().as_arc());
                                 let mut bf = (**f).clone();
                                 bf.name = name.to_string();
                                 v = CfmlValue::Function(Arc::new(bf));
@@ -9578,7 +9766,7 @@ impl CfmlVirtualMachine {
                                 // an injected provider whose source method is named
                                 // "buildProviderMixer". Drained by the next call.
                                 if !f.name.eq_ignore_ascii_case(name.as_str()) {
-                                    self.pending_called_name = Some(name.to_string());
+                                    self.pending_called_name = Some(name.key().as_arc());
                                 }
                                 let foreign_bind = f
                                     .captured_scope
@@ -11100,7 +11288,10 @@ impl CfmlVirtualMachine {
                     cfml_common::perf_counters::call_phases::bump_ret(
                         locals.get(&*cfml_common::key::well_known::THIS).is_some());
                     // Save modified 'this' for component method write-back
-                    if let Some(this_val) = locals.get(&*cfml_common::key::well_known::THIS) {
+                    if skip_method_writeback {
+                        // Nothing to write back: the dispatch drops both
+                        // fields, the instance's scopes are live references.
+                    } else if let Some(this_val) = locals.get(&*cfml_common::key::well_known::THIS) {
                         self.method_this_writeback = Some(this_val.clone());
                         // If the return value on top of the stack IS the component's
                         // `this` (the common `return this;` pattern from chained-setter
@@ -12044,10 +12235,10 @@ impl CfmlVirtualMachine {
                         holder.set_method_table(inherited);
                     }
                     if let Some(src) = self.source_file.clone() {
-                        if !src.is_empty() && !self.class_own_method_tables.contains_key(&src) {
+                        if !src.is_empty() && !self.class_own_method_tables.contains_key(&*src) {
                             let own_table = Arc::new(own_table);
                             self.class_own_method_tables
-                                .insert(src.clone(), own_table.clone());
+                                .insert(src.to_string(), own_table.clone());
                             self.publish_class_cache(&src, move |e| e.own_table = Some(own_table));
                         }
                     }
@@ -12305,6 +12496,9 @@ impl CfmlVirtualMachine {
                         let inst = inst.clone();
                         self.method_this_writeback = None;
                         self.method_variables_writeback = None;
+                        // The invoked name for the frame's stack record, as the
+                        // bytecode's shared string (no per-call allocation).
+                        self.pending_called_name = Some(method_name.key().as_arc());
                         let saved_try = std::mem::take(&mut self.try_stack);
                         // Reject mixing positional + named args (Lucee parity) — the
                         // marker CallMethod path validates here too; the Instance arm
@@ -12612,7 +12806,7 @@ impl CfmlVirtualMachine {
                                     // level deeper (LoadSuper keys on source_file).
                                     let saved_super_source = parent_func
                                         .as_ref()
-                                        .and_then(|pf| pf.source_file.clone())
+                                        .and_then(|pf| pf.source_file_arc())
                                         .map(|src| {
                                             let prev = self.source_file.clone();
                                             self.source_file = Some(src);
@@ -13492,7 +13686,7 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::JumpIfNotNull(target) => { ops::effect::op_jump_if_not_null(&stack, &mut ip, *target); }
 
-                BytecodeOp::JumpIfArgPresent(name, target) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, &arguments_supplied, name, *target); }
+                BytecodeOp::JumpIfArgPresent(name, target) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, func, arguments_supplied_bits, &arguments_supplied, name, *target); }
                 BytecodeOp::SeedArgumentKey(name) => { ops::locals::op_seed_argument_key(&mut stack, &mut locals, name); }
                 BytecodeOp::StoreLocalScopeKey(prop_name) => { ops::locals::op_store_local_scope_key(self, &mut stack, &mut locals, &mut declared_locals, &mut inherited_or_param_keys, frame_has_local_scope, prop_name); }
 
@@ -13517,7 +13711,7 @@ impl CfmlVirtualMachine {
                     // leading-slash CFML include initially resolves to an OS-root
                     // path here. The mapping/webroot fallback below catches that.
                     let resolved = if let Some(ref source) = self.source_file {
-                        let source_dir = std::path::Path::new(source)
+                        let source_dir = std::path::Path::new(&**source)
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new("."));
                         normalize_path(&source_dir.join(&path).to_string_lossy())
@@ -13546,7 +13740,7 @@ impl CfmlVirtualMachine {
                         Ok(sub_program) => {
                             let old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
-                            self.source_file = Some(resolved.clone());
+                            self.source_file = Some(Arc::from(resolved.as_str()));
                             let main_idx = self
                                 .program
                                 .functions
@@ -13726,7 +13920,7 @@ impl CfmlVirtualMachine {
                     };
 
                     let resolved = if let Some(ref source) = self.source_file {
-                        let source_dir = std::path::Path::new(source)
+                        let source_dir = std::path::Path::new(&**source)
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new("."));
                         normalize_path(&source_dir.join(&path).to_string_lossy())
@@ -13749,7 +13943,7 @@ impl CfmlVirtualMachine {
                         Ok(sub_program) => {
                             let old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
-                            self.source_file = Some(resolved.clone());
+                            self.source_file = Some(Arc::from(resolved.as_str()));
                             let main_idx = self
                                 .program
                                 .functions
@@ -13926,7 +14120,9 @@ impl CfmlVirtualMachine {
         self.unwind_abandoned_tag_pairs(entry_tag_depth, entry_buffers_depth);
 
         // Save modified 'this' and variables scope for component method write-back
-        if let Some(this_val) = locals.get(&*cfml_common::key::well_known::THIS) {
+        if skip_method_writeback {
+            // See the `Return` arm: an instance frame writes nothing back.
+        } else if let Some(this_val) = locals.get(&*cfml_common::key::well_known::THIS) {
             self.method_this_writeback = Some(this_val.clone());
             // Save variables scope mutations for component write-back
             if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
@@ -14250,7 +14446,7 @@ impl CfmlVirtualMachine {
             path.to_string()
         };
         let resolved = if let Some(ref source) = self.source_file {
-            let dir = std::path::Path::new(source)
+            let dir = std::path::Path::new(&**source)
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
             normalize_path(&dir.join(&path).to_string_lossy())
@@ -14269,7 +14465,7 @@ impl CfmlVirtualMachine {
         let sub_program = self.compile_file_cached_req(&resolved)?;
         let old_program = self.push_program_swap(sub_program);
         let old_source = self.source_file.clone();
-        self.source_file = Some(resolved.clone());
+        self.source_file = Some(Arc::from(resolved.as_str()));
         let main_idx = self
             .program
             .functions
@@ -14674,10 +14870,10 @@ impl CfmlVirtualMachine {
                         // migration up() -> inherited createTable() ->
                         // createObject("TableDefinition").)
                         let saved_source_file = if user_func.source_file.is_some()
-                            && user_func.source_file != self.source_file
+                            && user_func.source_file.as_deref() != self.source_file.as_deref()
                         {
                             let prev = self.source_file.clone();
-                            self.source_file = user_func.source_file.clone();
+                            self.source_file = user_func.source_file_arc();
                             Some(prev)
                         } else {
                             None
@@ -14700,7 +14896,7 @@ impl CfmlVirtualMachine {
                         if self.pending_called_name.is_none()
                             && !func.name.eq_ignore_ascii_case(&user_func.name)
                         {
-                            self.pending_called_name = Some(func.name.clone());
+                            self.pending_called_name = Some(Arc::from(func.name.as_str()));
                         }
                         self.pending_fused_parent = Some(fused_parent_plan);
                         #[cfg(feature = "call-phases")]
@@ -16581,7 +16777,7 @@ impl CfmlVirtualMachine {
                         if let Ok(abs) = self.canonicalize_cached(source) {
                             return Ok(CfmlValue::string(abs));
                         }
-                        return Ok(CfmlValue::string(source.clone()));
+                        return Ok(CfmlValue::string(source.to_string()));
                     }
                     // Fallback to CWD
                     if let Ok(cwd) = std::env::current_dir() {
@@ -16601,7 +16797,7 @@ impl CfmlVirtualMachine {
                         if let Ok(abs) = self.canonicalize_cached(source) {
                             return Ok(CfmlValue::string(abs));
                         }
-                        return Ok(CfmlValue::string(source.clone()));
+                        return Ok(CfmlValue::string(source.to_string()));
                     }
                     return Ok(CfmlValue::string(String::new()));
                 }
@@ -16631,8 +16827,8 @@ impl CfmlVirtualMachine {
                     // serve/CLI request context).
                     let base_dir = self
                         .base_template_path
-                        .as_ref()
-                        .or(self.source_file.as_ref())
+                        .as_deref()
+                        .or(self.source_file.as_deref())
                         .and_then(|s| std::path::Path::new(s).parent())
                         .unwrap_or_else(|| std::path::Path::new("."));
 
@@ -20992,7 +21188,7 @@ impl CfmlVirtualMachine {
                         .last()
                         .map(|f| f.called_name.clone())
                         .unwrap_or_default();
-                    return Ok(CfmlValue::string(name));
+                    return Ok(CfmlValue::string(name.to_string()));
                 }
 
                 "callstackget" => {
@@ -22018,13 +22214,18 @@ impl CfmlVirtualMachine {
         inherited_from_parent: &mut InheritedKeys,
         share_local_keys: Option<&std::collections::HashSet<String>>,
     ) {
-        let filter_carry = |k: &str, v: &CfmlValue| -> bool {
+        // Cheapest test first: the structural names and a plain function value
+        // are carried unconditionally; only then is the caller's inherited set
+        // probed (by the pre-hashed key, and only if it tracks any data key —
+        // a method frame's set is structural bits only).
+        let filter_has_data = plan.filter.as_ref().is_some_and(|inh| inh.has_data_keys());
+        let filter_carry = |k: &cfml_common::key::Key, v: &CfmlValue| -> bool {
             match &plan.filter {
                 None => true,
                 Some(inh) => {
-                    inh.contains(k)
+                    InheritedKeys::structural_bit(k.as_str()).is_some()
                         || matches!(v, CfmlValue::Function(f) if f.captured_scope.is_none())
-                        || matches!(k, "this" | "__variables" | "variables" | "super")
+                        || (filter_has_data && inh.contains_key(k))
                 }
             }
         };
@@ -23838,66 +24039,52 @@ impl CfmlVirtualMachine {
         arg_names: Option<&[String]>,
         arg_values: Vec<CfmlValue>,
     ) -> (Vec<CfmlValue>, Vec<(usize, String)>) {
+        use cfml_common::key::{fold_hash, Key};
         let Some(arg_names) = arg_names else {
             return (arg_values, Vec::new());
         };
         let CfmlValue::Function(func) = func_ref else {
             return (arg_values, Vec::new());
         };
-
-        // Expand argumentCollection structs into individual arguments. A struct
-        // key that is a positive integer is a POSITIONAL argument (Lucee/ACF/
-        // BoxLang: `argumentCollection={1:a,2:b}` is the same as calling with
-        // `(a, b)` positionally) — emit it with an EMPTY name so the binding
-        // loop below places it into the right param slot (and thus binds the
-        // param LOCAL, not just an arguments-scope key). A paramless caller
-        // forwarding `argumentCollection=arguments` (numeric keys) through
-        // `super.init(...)` relies on this. Non-numeric keys stay named.
-        let mut expanded_names: Vec<String> = Vec::with_capacity(arg_names.len());
-        let mut expanded_values = Vec::with_capacity(arg_names.len());
-        // Positional args expanded from a numeric-keyed argumentCollection are
-        // placed by their 1-based key rather than appended in iteration order.
-        let mut numeric_positional: Vec<(usize, CfmlValue)> = Vec::new();
-        // Explicit named args win over argumentCollection keys regardless of
-        // call-site order (Lucee/ACF/BoxLang). Drop colliding argumentCollection
-        // keys so a spread can't clobber an explicit arg via the last-wins
-        // binding below — see the CallNamed handler for the rationale (Wheels
-        // recursive `resource(name=…, argumentCollection=arguments)`).
-        let explicit_named: std::collections::HashSet<String> = arg_names
+        // Per-call cost used to be one lowercase `String` per collection key,
+        // one `String` clone per expanded name, a `HashSet<String>` of the
+        // explicit names, and a quadratic case-insensitive string scan to map
+        // each name to its parameter (35 params: ~600 compares). Names now
+        // travel as pre-hashed `Key`s, parameters are matched by folded hash
+        // with a "next parameter in order" guess first (a collection built
+        // from an `arguments` scope is in declaration order), and the explicit
+        // names — usually none — are a short slice compared directly.
+        let explicit_named: Vec<&str> = arg_names
             .iter()
             .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("argumentcollection"))
-            .map(|n| n.to_lowercase())
+            .map(String::as_str)
             .collect();
+        let is_explicit = |k: &str| explicit_named.iter().any(|n| n.eq_ignore_ascii_case(k));
+        // `None` name = positional (an unnamed argument in a mixed call).
+        let mut expanded: Vec<(Option<Key>, CfmlValue)> = Vec::with_capacity(arg_names.len());
+        let mut numeric_positional: Vec<(usize, CfmlValue)> = Vec::new();
+        let mut arg_values = arg_values;
         for (i, name) in arg_names.iter().enumerate() {
-            let value = arg_values.get(i).cloned().unwrap_or(CfmlValue::Null);
+            let value = arg_values.get_mut(i).map(std::mem::take).unwrap_or(CfmlValue::Null);
             if name.eq_ignore_ascii_case("argumentcollection") {
                 if let CfmlValue::Struct(s) = &value {
-                    // Lock-held read: the body only parses/compares keys and clones
-                    // out, so it can't re-enter `s`. `iter()` here cloned the whole
-                    // argumentCollection map on every spread — hot in Preside/
-                    // ColdBox/Wheels, which forward `argumentCollection=arguments`
-                    // constantly. See `CfmlStruct::with_map`'s re-entrancy caveat.
                     s.with_map(|m| {
+                        expanded.reserve(m.len());
                         for (k, v) in m.iter() {
-                            if let Ok(pos) = k.parse::<usize>() {
+                            if let Ok(pos) = k.as_str().parse::<usize>() {
                                 if pos >= 1 {
                                     numeric_positional.push((pos - 1, v.clone()));
                                     continue;
                                 }
                             }
-                            if explicit_named.contains(&k.to_lowercase()) {
+                            if !explicit_named.is_empty() && is_explicit(k.as_str()) {
                                 continue; // explicit named arg wins
                             }
-                            expanded_names.push(k.as_str().to_string());
-                            expanded_values.push(v.clone());
+                            expanded.push((Some(k.clone()), v.clone()));
                         }
                     });
                     continue;
                 }
-                // An ARRAY argumentCollection spreads as POSITIONAL args by index
-                // (Lucee/ACF/BoxLang: `argumentCollection=[a,b]` == calling
-                // `(a, b)`). MockBox's `$results( argumentCollection=arr )` relies
-                // on this to register one sequential result per element.
                 if let CfmlValue::Array(items) = &value {
                     for (idx, v) in items.iter().enumerate() {
                         numeric_positional.push((idx, v));
@@ -23905,18 +24092,11 @@ impl CfmlVirtualMachine {
                     continue;
                 }
             }
-            expanded_names.push(name.clone());
-            expanded_values.push(value);
+            let key = if name.is_empty() { None } else { Some(Key::new(name)) };
+            expanded.push((key, value));
         }
-
-        // Size to the declared params only; positional overflow and unmatched
-        // named args are appended below. Padding to expanded_names.len() created
-        // spurious empty slots that leaked into the arguments scope as numeric
-        // keys when a paramless function was called purely by name.
         let mut positional = vec![CfmlValue::Null; func.params.len()];
         let mut extras: Vec<(usize, String)> = Vec::new();
-        // Place positional args expanded from a numeric-keyed argumentCollection
-        // at their declared slot (growing past the declared params if needed).
         for (idx, value) in numeric_positional {
             if idx < positional.len() {
                 positional[idx] = value;
@@ -23927,31 +24107,40 @@ impl CfmlVirtualMachine {
                 positional.push(value);
             }
         }
-        for (i, name) in expanded_names.iter().enumerate() {
-            let value = expanded_values.get(i).cloned().unwrap_or(CfmlValue::Null);
-            if name.is_empty() {
-                // Positional arg: fill its slot, or append when it overflows the
-                // declared params.
+        // Folded hashes of the declared parameter names, computed once per
+        // call; a hit is confirmed with a case-insensitive compare.
+        let param_hashes: Vec<u64> = func.params.iter().map(|p| fold_hash(&p.name)).collect();
+        let find_param = |key: &Key, guess: usize| -> Option<usize> {
+            let h = key.hash_value();
+            let matches = |i: usize| {
+                param_hashes[i] == h && func.params[i].name.eq_ignore_ascii_case(key.as_str())
+            };
+            if guess < param_hashes.len() && matches(guess) {
+                return Some(guess);
+            }
+            (0..param_hashes.len()).find(|&i| matches(i))
+        };
+        let mut next_guess = 0usize;
+        for (i, (name, value)) in expanded.into_iter().enumerate() {
+            let Some(name) = name else {
                 if i < positional.len() {
                     positional[i] = value;
                 } else {
                     positional.push(value);
                 }
                 continue;
-            }
-            match func
-                .params
-                .iter()
-                .position(|param| param.name.eq_ignore_ascii_case(name))
-            {
-                Some(param_index) if param_index < positional.len() => {
-                    positional[param_index] = value;
+            };
+            match find_param(&name, next_guess) {
+                Some(param_index) => {
+                    next_guess = param_index + 1;
+                    if param_index < positional.len() {
+                        positional[param_index] = value;
+                    }
                 }
-                Some(_) => {}
                 None => {
                     let idx = positional.len();
                     positional.push(value);
-                    extras.push((idx, name.clone()));
+                    extras.push((idx, name.as_str().to_string()));
                 }
             }
         }
@@ -28014,11 +28203,11 @@ impl CfmlVirtualMachine {
             // sibling-parent swap; without the defining-source preference,
             // `InhChild` (oop/inhsub/) inheriting `InhParent.viaCreate()`
             // (oop/inh/) wrongly searched oop/inhsub/ for the bare sibling.
-            let defining_source: Option<String> =
+            let defining_source: Option<Arc<str>> =
                 if let CfmlValue::Function(ref f) = prop {
                     if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body {
                         if let CfmlValue::Int(idx) = body.as_ref() {
-                            self.resolve_fn(*idx).and_then(|bf| bf.source_file.clone())
+                            self.resolve_fn(*idx).and_then(|bf| bf.source_file_arc())
                         } else {
                             None
                         }
@@ -28028,10 +28217,10 @@ impl CfmlVirtualMachine {
                 } else {
                     None
                 };
-            let swap_source: Option<String> = defining_source.or_else(|| {
+            let swap_source: Option<Arc<str>> = defining_source.or_else(|| {
                 if let CfmlValue::Struct(ref s) = object {
                     if let Some(CfmlValue::String(src)) = s.get("__source_file") {
-                        Some(src.to_string())
+                        Some(Arc::from(src.as_str()))
                     } else {
                         None
                     }
@@ -28039,7 +28228,7 @@ impl CfmlVirtualMachine {
                     None
                 }
             });
-            let saved_source_file_method: Option<Option<String>> = if receiver_is_cfc
+            let saved_source_file_method: Option<Option<Arc<str>>> = if receiver_is_cfc
                 || receiver_is_flat_scope
             {
                 if let Some(src) = swap_source {
@@ -28130,7 +28319,15 @@ impl CfmlVirtualMachine {
             // Record the name this method was invoked under so the callee's
             // getFunctionCalledName() reports the alias (WireBox delegation
             // injects one UDF under many method names and dispatches by it).
-            self.pending_called_name = Some(method.to_string());
+            // The CallMethod op stages the invoked name as a shared string; only
+            // a dispatch that did not come through it (invoke(), a bare call)
+            // allocates one here.
+            let called: Arc<str> = self
+                .pending_called_name
+                .take()
+                .filter(|n| n.eq_ignore_ascii_case(method))
+                .unwrap_or_else(|| Arc::from(method));
+            self.pending_called_name = Some(called);
             let result = self.call_function(&func_ref, args, &method_locals);
             // Restore the caller's source_file before propagating any error or
             // result, so relative resolution outside the method is unaffected.
@@ -29542,7 +29739,13 @@ impl CfmlVirtualMachine {
         func: &BytecodeFunction,
         locals: &ValueMap,
     ) {
-        if func.params.is_empty() {
+        // The only value this scan can find is a `CfmlValue::Component`, and
+        // nothing in the engine constructs that variant any more (components
+        // are `Struct` markers or flyweight `Instance`s), so the per-return
+        // probe of every declared parameter — 8% of a 35-param method call —
+        // can never fire. Kept as a fast reset until the variant is removed.
+        const COMPONENT_VARIANT_IS_CONSTRUCTED: bool = false;
+        if func.params.is_empty() || !COMPONENT_VARIANT_IS_CONSTRUCTED {
             self.arg_ref_writeback = None;
             return;
         }
@@ -30152,7 +30355,7 @@ impl CfmlVirtualMachine {
 
             // 1) Look in calling template directory
             if let Some(ref source) = self.source_file {
-                let source_dir = std::path::Path::new(source)
+                let source_dir = std::path::Path::new(&**source)
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."));
                 let candidate = source_dir.join(&filename).to_string_lossy().to_string();
@@ -30251,7 +30454,7 @@ impl CfmlVirtualMachine {
         } else {
             // Plain path: resolve relative to source_file
             let resolved = if let Some(ref source) = self.source_file {
-                let source_dir = std::path::Path::new(source)
+                let source_dir = std::path::Path::new(&**source)
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."));
                 source_dir.join(path_spec).to_string_lossy().to_string()
@@ -30306,7 +30509,7 @@ impl CfmlVirtualMachine {
 
         let old_program = self.push_program_swap(sub_program);
         let old_source = self.source_file.clone();
-        self.source_file = Some(template_path.to_string());
+        self.source_file = Some(Arc::from(template_path));
 
         let main_idx = self
             .program
@@ -31468,16 +31671,20 @@ impl CfmlVirtualMachine {
         // dispatches back onto this same instance would otherwise deadlock. The
         // CfmlStruct clones are shared Arc handles (cheap), so mutations through
         // them still land on the live instance.
-        let (func, variables_scope, this_members, variables_members, defines_on_missing) = {
+        let (func, variables_scope, this_members, variables_members, static_scope) = {
             let g = inst.read();
             (
                 g.lookup_method(method),
                 CfmlValue::Struct(g.private_map_handle()),
                 g.public_map_handle(),
                 g.private_map_handle(),
-                g.has_public_member("onmissingmethod"),
+                g.class.static_scope.clone(),
             )
         };
+        // Only the fallback paths below (no resolvable method) need to know
+        // whether the class defines onMissingMethod; a direct dispatch — the
+        // common case — must not pay a case-insensitive probe for it.
+        let defines_on_missing = || inst.read().has_public_member("onmissingmethod");
 
         // Access gate (GH #330): a `private`/`package` method is invisible to an
         // external caller. Resolved-but-denied is NOT the same as unresolved — it
@@ -31504,47 +31711,64 @@ impl CfmlVirtualMachine {
             let func_ref = self
                 .heal_stale_component_method(&object, method, &func_ref)
                 .unwrap_or(func_ref);
-            let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
+            // Take the caller's buffer as-is; `drain().collect()` allocated a
+            // second Vec per call.
+            let raw_args: Vec<CfmlValue> = std::mem::take(extra_args);
             let (args, extras) =
                 Self::reorder_named_args_with_extras(&func_ref, arg_names, raw_args);
             self.pending_extra_named_args =
                 if extras.is_empty() { None } else { Some(extras) };
-            // Relative component resolution inside the method uses the method's
-            // DEFINING source directory (per-method, correct for inherited methods).
-            let defining_source: Option<String> = if let CfmlValue::Function(ref f) = func_ref {
-                if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body {
-                    if let CfmlValue::Int(idx) = body.as_ref() {
-                        self.resolve_fn(*idx).and_then(|bf| bf.source_file.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+            // (`call_function` swaps `source_file` to the method's defining file
+            // itself — doing it here as well was a second swap per call.)
+            //
+            // The frame's scope map, handed over ready-made (see
+            // `pending_instance_frame`): the frame used to copy these entries
+            // out of a parent map into a second one, and this map was built
+            // from `String` keys — together ~20% of a trivial method call.
+            let n_params = match &func_ref {
+                CfmlValue::Function(f) => f.params.len(),
+                _ => 0,
             };
-            let saved_source = defining_source.map(|src| {
-                let prev = self.source_file.clone();
-                self.source_file = Some(src);
-                prev
-            });
-            let mut method_locals = ValueMap::default();
-            method_locals.insert("__variables".to_string(), variables_scope);
-            method_locals.insert("this".to_string(), object.clone());
+            let mut method_locals = self.seed_locals_map(3 + n_params);
+            method_locals.insert(
+                cfml_common::key::well_known::VARIABLES.clone(),
+                variables_scope,
+            );
+            method_locals.insert(cfml_common::key::well_known::THIS.clone(), object.clone());
             // Shared per-class `static` scope (dropped from the data maps as a
             // reserved key) — inject it so static reads/writes inside the method
             // resolve and persist across instances (Slice 5).
-            if let Some(stat) = { inst.read().class.static_scope.clone() } {
-                method_locals.insert("__static".to_string(), stat);
+            if let Some(stat) = static_scope {
+                method_locals.insert(cfml_common::key::well_known::STATIC.clone(), stat);
             }
             self.closure_parent_writeback = None;
             self.closure_parent_deletes = None;
-            self.pending_called_name = Some(method.to_string());
-            let result = self.call_function(&func_ref, args, &method_locals);
-            if let Some(prev) = saved_source {
-                self.source_file = prev;
-            }
+            // The CallMethod op stages the invoked name as a shared string; only
+            // a dispatch that did not come through it (invoke(), a bare call)
+            // allocates one here.
+            let called: Arc<str> = self
+                .pending_called_name
+                .take()
+                .filter(|n| n.eq_ignore_ascii_case(method))
+                .unwrap_or_else(|| Arc::from(method));
+            self.pending_called_name = Some(called);
+            // Only a PLAIN class method takes the ready-made frame. An injected
+            // method (a TestBox custom matcher, a Wheels controller mixin) is a
+            // UDF defined in another CFC and carries that CFC's captured scope,
+            // which the general seed merges into the frame; it goes the
+            // general way with the same map as its parent.
+            let plain_method = matches!(&func_ref,
+                CfmlValue::Function(f) if f.captured_scope.is_none());
+            let result = if plain_method {
+                self.pending_instance_frame = Some((method_locals, true));
+                let r = self.call_function(&func_ref, args, &ValueMap::default());
+                // Not consumed only if `call_function` refused the call before
+                // a frame was entered; it must not reach the next frame.
+                self.pending_instance_frame = None;
+                r
+            } else {
+                self.call_function(&func_ref, args, &method_locals)
+            };
             self.method_this_writeback = None;
             self.method_variables_writeback = None;
             self.closure_parent_writeback = None;
@@ -31570,12 +31794,12 @@ impl CfmlVirtualMachine {
         // accessors="true" for data CFCs; a component defining onMissingMethod
         // routes there instead, Lucee parity).
         let ml = method.to_lowercase();
-        if !denied && !defines_on_missing && ml.len() > 3 && ml.starts_with("get") {
+        if !denied && ml.len() > 3 && ml.starts_with("get") && !defines_on_missing() {
             if let Some(v) = data_get(&method[3..]) {
                 return Ok(v);
             }
         }
-        if !denied && !defines_on_missing && ml.len() > 3 && ml.starts_with("set") {
+        if !denied && ml.len() > 3 && ml.starts_with("set") && !defines_on_missing() {
             if let Some(value) = extra_args.first().cloned() {
                 this_members.insert(method[3..].to_string(), value);
                 return Ok(object.clone()); // setX returns `this` (fluent — Lucee)
@@ -31597,7 +31821,7 @@ impl CfmlVirtualMachine {
         }
 
         // 3. onMissingMethod.
-        if defines_on_missing {
+        if defines_on_missing() {
             if let Some(handler) = { inst.read().lookup_method("onmissingmethod") } {
                 let handler = Self::strip_instance_binding(&handler);
                 let args_array: Vec<CfmlValue> = extra_args.drain(..).collect();
@@ -32287,7 +32511,7 @@ impl CfmlVirtualMachine {
                 real
             } else if let Some(ref source) = self.source_file {
                 // Try relative to source file
-                let source_dir = std::path::Path::new(source)
+                let source_dir = std::path::Path::new(&**source)
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."));
                 let joined = source_dir.join(&p).to_string_lossy().to_string();
@@ -32298,7 +32522,7 @@ impl CfmlVirtualMachine {
         } else {
             // Dot-path: convert dots to path separators
             let relative_path = if let Some(ref source) = self.source_file {
-                let source_dir = std::path::Path::new(source)
+                let source_dir = std::path::Path::new(&**source)
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."));
                 let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
@@ -32830,7 +33054,7 @@ impl CfmlVirtualMachine {
             let old_program = self.push_program_swap(sub_program);
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
-            self.source_file = Some(cfc_path.to_string());
+            self.source_file = Some(Arc::from(&*cfc_path));
             let main_idx = self
                 .program
                 .functions
@@ -33913,7 +34137,7 @@ impl CfmlVirtualMachine {
         } else {
             let ctx = source_context
                 .clone()
-                .or_else(|| self.source_file.clone())
+                .or_else(|| self.source_file.as_deref().map(str::to_string))
                 .unwrap_or_default();
             Some(self.meta_memo_key(name, ctx))
         };
@@ -33941,7 +34165,7 @@ impl CfmlVirtualMachine {
         // context so a sibling parent (`extends="Parent"`) resolves.
         let prev_source = self_.source_file.clone();
         if let Some(src) = source_context {
-            self_.source_file = Some(src);
+            self_.source_file = Some(Arc::from(src));
         }
         let template = self_.resolve_component_template(name, locals);
         self_.source_file = prev_source;
@@ -34049,7 +34273,7 @@ impl CfmlVirtualMachine {
         if locals.get(comp_name).is_some() {
             return None;
         }
-        Some(self.meta_memo_key(comp_name, self.source_file.clone().unwrap_or_default()))
+        Some(self.meta_memo_key(comp_name, self.source_file.as_deref().unwrap_or_default().to_string()))
     }
 
     /// Record a path-string `getComponentMetaData()` result under `key` (a deep
@@ -34258,7 +34482,7 @@ impl CfmlVirtualMachine {
                     _ => None,
                 })
                 .or_else(|| base_source.clone());
-            self.source_file = decl_src.or_else(|| prev_source_file.clone());
+            self.source_file = decl_src.map(Arc::from).or_else(|| prev_source_file.clone());
 
             // Collect all transitive interface names
             let mut visited_ifaces = std::collections::HashSet::new();
@@ -34546,7 +34770,7 @@ impl CfmlVirtualMachine {
         let old_source_file = if let CfmlValue::Struct(ref cs) = child {
             if let Some(CfmlValue::String(src)) = cs.get("__source_file") {
                 let prev = self.source_file.clone();
-                self.source_file = Some(src.to_string());
+                self.source_file = Some(Arc::from(src.as_str()));
                 Some(prev)
             } else {
                 None
@@ -35164,8 +35388,8 @@ impl CfmlVirtualMachine {
         // from a CFC in a subdirectory reads the *webroot* sibling when one exists).
         let base_resolved = match self
             .base_template_path
-            .as_ref()
-            .or(self.source_file.as_ref())
+            .as_deref()
+            .or(self.source_file.as_deref())
             .and_then(|s| std::path::Path::new(s).parent())
             .filter(|d| !d.as_os_str().is_empty())
         {
@@ -35183,7 +35407,7 @@ impl CfmlVirtualMachine {
             if let Some(cur_dir) = self
                 .call_stack
                 .last()
-                .map(|f| f.template.as_str())
+                .map(|f| &*f.template)
                 .filter(|t| !t.is_empty())
                 .and_then(|t| std::path::Path::new(t).parent())
                 .filter(|d| !d.as_os_str().is_empty())
@@ -37119,8 +37343,8 @@ impl CfmlVirtualMachine {
             .and_then(|ss| ss.webroot.clone())
             .or_else(|| {
                 self.base_template_path
-                    .as_ref()
-                    .or(self.source_file.as_ref())
+                    .as_deref()
+                    .or(self.source_file.as_deref())
                     .and_then(|s| std::path::Path::new(s).parent())
                     .map(|p| p.to_path_buf())
             })
@@ -37378,7 +37602,7 @@ impl CfmlVirtualMachine {
         // reach `<webroot>/../config`, regardless of which deep page (e.g.
         // `/tests/runner.cfm`) triggered the request. Without this, the include
         // resolves against the target page's dir and escapes to the wrong place.
-        let saved_source_file = self.source_file.replace(path.to_string());
+        let saved_source_file = self.source_file.replace(Arc::from(path));
         // Isolate this Application.cfc body's `super.setupApplication()` this-writes
         // (see pseudo_ctor_super_this_writes) from any outer construction.
         let saved_super_this_writes = self.pseudo_ctor_super_this_writes.take();
@@ -38664,7 +38888,7 @@ impl CfmlVirtualMachine {
     /// component resolution, but CFML engines pass web-root-relative paths
     /// such as `/_moopa.cfm` to onRequestStart/onRequest/onRequestEnd.
     fn lifecycle_target_page(&self) -> String {
-        let source = self.source_file.clone().unwrap_or_default();
+        let source = self.source_file.as_deref().unwrap_or_default().to_string();
         let canonical_source = self.canonicalize_cached(&source).unwrap_or(source.clone());
         let source_path = std::path::Path::new(&canonical_source);
 
@@ -39002,7 +39226,7 @@ impl CfmlVirtualMachine {
         // Add default "/" mapping if not already present
         if !mappings.iter().any(|m| m.name == "/") {
             let root_dir = if let Some(ref source) = self.source_file {
-                std::path::Path::new(source)
+                std::path::Path::new(&**source)
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_string_lossy()

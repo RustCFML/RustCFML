@@ -82,7 +82,7 @@ component {
 
     let mut vm = CfmlVirtualMachine::new(program);
     vm.vfs = vfs;
-    vm.source_file = Some(source_file.into());
+    vm.source_file = Some(std::sync::Arc::from(source_file.into().as_str()));
     vm.base_template_path = Some(page_path);
     vm.server_state = Some(server_state);
 

@@ -178,8 +178,36 @@ impl BytecodeFunction {
     /// `params` — anywhere a parameter name is used to probe or seed a scope.
     #[inline]
     pub fn param_keys(&self) -> &[cfml_common::key::Key] {
-        self.param_keys
-            .get_or_init(|| self.params.iter().map(cfml_common::key::Key::new).collect())
+        self.param_keys_arc()
+    }
+
+    /// The function's name as a shared string (see `name_shared`).
+    #[inline]
+    pub fn name_arc(&self) -> std::sync::Arc<str> {
+        self.name_shared
+            .get_or_init(|| std::sync::Arc::from(self.name.as_str()))
+            .clone()
+    }
+
+    /// The defining source file as a shared string (see `source_file_shared`).
+    #[inline]
+    pub fn source_file_arc(&self) -> Option<std::sync::Arc<str>> {
+        self.source_file_shared
+            .get_or_init(|| self.source_file.as_deref().map(std::sync::Arc::from))
+            .clone()
+    }
+
+    /// The same keys as a shared handle, for a per-frame structure that must
+    /// outlive the borrow of `self` (the frame's inherited-key tracker).
+    #[inline]
+    pub fn param_keys_arc(&self) -> &std::sync::Arc<[cfml_common::key::Key]> {
+        self.param_keys.get_or_init(|| {
+            self.params
+                .iter()
+                .map(cfml_common::key::Key::new)
+                .collect::<Vec<_>>()
+                .into()
+        })
     }
 }
 
@@ -197,7 +225,12 @@ pub struct BytecodeFunction {
     /// return-time write-back scan both probe `locals` once per parameter per
     /// call; going through these means neither hashes, and binding inserts by
     /// cloning a key instead of allocating a `String`.
-    pub param_keys: std::sync::OnceLock<Vec<cfml_common::key::Key>>,
+    pub param_keys: std::sync::OnceLock<std::sync::Arc<[cfml_common::key::Key]>>,
+    /// `name` / `source_file` as shared strings, built once: every call frame
+    /// records both for stack traces, and cloning them as `String`s was three
+    /// allocations per call.
+    pub name_shared: std::sync::OnceLock<std::sync::Arc<str>>,
+    pub source_file_shared: std::sync::OnceLock<Option<std::sync::Arc<str>>>,
     /// Whether the body can observe the `arguments` scope (bare load, string
     /// form, include, custom tag) — decides the eager-vs-lazy arguments build.
     /// Computed ONCE per process from the bytecode (the analysis lives in the
@@ -1614,6 +1647,8 @@ impl CfmlCompiler {
                     name: "__main__".to_string(),
                     params: Vec::new(),
                     param_keys: Default::default(),
+                    name_shared: Default::default(),
+                    source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
@@ -4499,6 +4534,8 @@ impl CfmlCompiler {
             name: func.name.clone(),
             params: func.params.iter().map(|p| p.name.clone()).collect(),
             param_keys: Default::default(),
+            name_shared: Default::default(),
+            source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
@@ -4782,6 +4819,8 @@ impl CfmlCompiler {
                     name: getter_name.clone(),
                     params: Vec::new(),
                     param_keys: Default::default(),
+                    name_shared: Default::default(),
+                    source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
@@ -4878,6 +4917,8 @@ impl CfmlCompiler {
                     name: setter_name.clone(),
                     params: vec![prop.name.clone()],
                     param_keys: Default::default(),
+                    name_shared: Default::default(),
+                    source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
@@ -5069,6 +5110,8 @@ impl CfmlCompiler {
                 name: "__cfc_static_init__".to_string(),
                 params: Vec::new(),
                 param_keys: Default::default(),
+                name_shared: Default::default(),
+                source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
@@ -6108,6 +6151,8 @@ impl CfmlCompiler {
                     name: func_name.clone(),
                     params: closure.params.iter().map(|p| p.name.clone()).collect(),
                     param_keys: Default::default(),
+                    name_shared: Default::default(),
+                    source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
@@ -6205,6 +6250,8 @@ impl CfmlCompiler {
                     name: func_name.clone(),
                     params: arrow.params.iter().map(|p| p.name.clone()).collect(),
                     param_keys: Default::default(),
+                    name_shared: Default::default(),
+                    source_file_shared: Default::default(),
                     args_needed: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),

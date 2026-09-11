@@ -51,7 +51,7 @@ fn run_request(ss: &ServerState, source: &str) -> String {
         std::fs::write(&p, b"").ok();
         p.display().to_string()
     };
-    vm.source_file = Some(page.clone());
+    vm.source_file = Some(std::sync::Arc::from(page.as_str()));
     vm.base_template_path = Some(page);
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);

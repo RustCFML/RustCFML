@@ -30,7 +30,7 @@ fn run_page(files: HashMap<String, Vec<u8>>) -> String {
 
     let mut vm = CfmlVirtualMachine::new(program);
     vm.vfs = vfs;
-    vm.source_file = Some(page_path.clone());
+    vm.source_file = Some(std::sync::Arc::from(page_path.as_str()));
     vm.base_template_path = Some(page_path);
     vm.custom_tag_paths = vec![format!("{}/tags", VROOT)];
     for (name, value) in get_builtins() {

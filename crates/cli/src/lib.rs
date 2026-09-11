@@ -1278,7 +1278,7 @@ fn compile_and_run(
     vm.vfs = vfs;
     vm.sandbox = sandbox;
     vm.base_template_path = source_file.clone();
-    vm.source_file = source_file;
+    vm.source_file = source_file.map(std::sync::Arc::from);
     vm.flush_sink = flush_sink;
 
     // Register builtins, builtin functions, native modules, and the DB
@@ -1349,7 +1349,7 @@ fn compile_and_run(
     // largest if the process reaches its ceiling. RAII — deregisters on every
     // path out of this function, including a panic. No-op without a limit.
     let _mem_slot = cfml_common::mem_guard::register(
-        vm.source_file.clone().unwrap_or_else(|| "unknown".to_string()),
+        vm.source_file.as_deref().unwrap_or("unknown").to_string(),
     );
 
     // Perf-plan 3.2 stage-2 sizing: per-request delta of the call-parent

@@ -49,7 +49,7 @@ fn run_request_with_expected_output(
 
     let mut vm = CfmlVirtualMachine::new(program);
     vm.vfs = vfs;
-    vm.source_file = Some(page_path.clone());
+    vm.source_file = Some(std::sync::Arc::from(page_path.as_str()));
     vm.base_template_path = Some(page_path);
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);

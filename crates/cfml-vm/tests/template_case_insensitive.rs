@@ -145,7 +145,7 @@ fn run_vm(page_path: &str, source: &str, mappings: Vec<CfmlMapping>, sandbox: bo
     let mut vm = CfmlVirtualMachine::new(compile_page(source));
     vm.vfs = Arc::new(CaseSensitiveFs(RealFs));
     vm.sandbox = sandbox;
-    vm.source_file = Some(page_path.to_string());
+    vm.source_file = Some(std::sync::Arc::from(page_path));
     vm.base_template_path = Some(page_path.to_string());
     vm.mappings = mappings;
     vm.refresh_mappings_fingerprint();

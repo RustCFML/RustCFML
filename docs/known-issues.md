@@ -2883,3 +2883,94 @@ changes against v0.661.0. Trivial-class construction loop unchanged
 (inherited visibility on the first and a replayed construction, qualified
 `isInstanceOf`/metadata names, engine-key-free `structKeyList(this)`), green on
 Lucee 7.1 too.
+
+## 95. A CFC method call cost 3-4x Lucee's and grew ~50 ns per declared parameter — the frame's bookkeeping, not its body (v0.663.0) 📌
+
+With construction at or near Lucee (§89–§94), the method CALL is where CFC
+time goes: frames were 71% of a Preside request's CPU. A `call-phases` split
+of `o.m1(1)` said the prologue phases were small and everything sat in the
+"body" of a `return 1;` method, i.e. in the dispatch and return machinery the
+marks did not cover. Line-level sampling (samply, `line-tables-only`) on the
+instance-method dispatch and the frame prologue found the cost was almost
+entirely allocation and re-hashing that Lucee never does:
+
+- **Dispatch (`call_instance_method_impl`)** built its 3-entry parent map from
+  `String` keys (two interns + a grow per call), read the instance lock twice,
+  probed for `onMissingMethod` on every direct dispatch, swapped `source_file`
+  with two `String` clones — which `call_function` then did AGAIN — and copied
+  the argument `Vec` once more with `drain().collect()`.
+- **Frame prologue.** Every declared parameter was inserted into a per-frame
+  hash table of "inherited or param" names and, on the lazy `arguments` path,
+  into a second `HashSet<Key>`; both allocated and re-hashed on growth every
+  call, and each supplied value was cloned instead of moved. A 35-parameter
+  method spent a quarter of its call there. The frame then copied the
+  dispatch's parent map entry by entry into its own scope map through the
+  carry filter.
+- **Stack record.** `function_name`, `called_name` and `template` were three
+  `String` clones per frame, plus `method.to_string()` at the dispatch.
+- **Return.** Every method return scanned all declared params for a
+  `CfmlValue::Component` by-reference write-back — a variant nothing in the
+  engine constructs any more.
+- **Named arguments** (`argumentCollection`) lower-cased every collection key,
+  cloned every name, built a `HashSet<String>` of the explicit names and
+  matched names to parameters with a quadratic case-insensitive string scan
+  (35 params: ~600 compares).
+
+**What changed.** The dispatch snapshots the instance once, tests
+`onMissingMethod` only on the fallback paths, and hands the frame its scope
+map READY-MADE from the pool (`pending_instance_frame`): the frame adopts it
+instead of seeding a second one, and — since the flyweight instance's scopes
+are live references — skips the `this`/`variables` return write-backs the
+dispatch was discarding. Declared parameters are tracked as a bit per index
+over the function's shared `param_keys` (`InheritedKeys::track_param`), the
+first few non-structural inherited keys live inline, and the lazy supplied
+set is a `u64`; argument values are moved out of the call's `Vec`. Call frames
+record `Arc<str>`s (`BytecodeFunction::name_arc`/`source_file_arc`, the
+`CallMethod` op's own key for the called name) and the VM's `source_file` is
+an `Arc<str>`. Named-argument reordering keeps the collection's pre-hashed
+keys, matches parameters by folded hash with a next-in-order guess, and
+compares the (usually empty) explicit-name list directly. `__static` is a
+structural inherited key, which keeps a method frame's inherited set
+bits-only. The dead `Component`-variant scan returns early.
+
+Same box, ns per call, CFC method `function mN(p0..pN) { return 1; }` called
+300k times; Lucee 7.1 warm, best of 4:
+
+| shape | v0.662.0 | v0.663.0 | Lucee |
+|---|---|---|---|
+| `o.m1(1)` | 534 | **323** | 126 |
+| `o.m8(…)` | 899 | **488** | 199 |
+| `o.m35(…)` positional | 2,209 | **1,069** | 518 |
+| `o.m35(argumentCollection=ac)` | 3,914 | **1,473** | 1,421 |
+| bare `leaf(i)` from a sibling method | 419 | **347** | 136 |
+| `this.leaf(i)` | 563 | **335** | 133 |
+| `variables.dep.m1(i)` | 585 | **363** | 155 |
+
+Per declared parameter: ~50 ns → ~22 ns positional. Construction loops are
+unchanged. What remains is the frame itself (operand stack, slot vector,
+scope map insert per param, `frame_ctx`/call-stack pushes, pooled map
+recycle) and the two hash probes of the bare-name lookup — no single line
+above 3%.
+
+**Only a PLAIN class method takes the ready-made frame.** A method injected
+from another CFC — a TestBox custom matcher, a Wheels controller mixin — is a
+UDF value carrying its defining CFC's captured scope, which the general seed
+merges into the frame; the first cut skipped that and turned 6 TestBox and 3
+Wheels specs red. Those dispatch the general way. Probed on Lucee 7.1 while
+writing the regression test (`tests/oop/test_injected_method_frame.cfm`): an
+injected plain UDF binds to the component it is INVOKED on (its `variables`
+are the target's — both engines agree), and an injected CLOSURE keeps its
+captured locals (both agree) but Lucee ALSO keeps `variables` bound to the
+DEFINING component where we bind it to the target. That closure `variables`
+binding is a pre-existing divergence (identical on v0.661.0), left open here.
+
+**Tried and dropped:** seeding a bare sibling-method call's frame the same
+owned way. It broke the private-method access gate and custom-tag `thisTag`
+inheritance (the general carry filter does more than copy structure there)
+and measured no faster; the structural `__static` alone gave the bare path its
+gain.
+
+Verification: CLI runner 8946/8946; served dev and `--production`, cold and
+warm, 9088/9088; `cargo test --workspace`; wasm32 and wasm-pack builds;
+Wheels core 2737/3/0/16 and TestBox own suite 415/0/0/22 with zero per-spec
+status changes against v0.661.0.
