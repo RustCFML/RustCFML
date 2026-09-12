@@ -243,19 +243,93 @@ pub(crate) fn op_jump_if_arg_present(
 /// frame reaching here without a scope has no way to read what we would write.
 /// The key is never sought in the CALLER's scope — a frame's `arguments` is its
 /// own, and the lazy path drops any inherited handle at frame setup.
+///
+/// On a lazy frame the value still has to be RECORDED as supplied: `LoadArgKey`
+/// gates its read of the parameter's local on the supplied bits (so an omitted
+/// parameter reads Null rather than a same-named enclosing variable, GH #240),
+/// and an applied default must read back as present — `function f(a, b="DEF")`
+/// called as `f(1)` returns "DEF" for `arguments.b` on Lucee 7.1 and here.
+/// Returns the declared-parameter index to mark supplied, if this is one.
 #[inline]
 pub(crate) fn op_seed_argument_key(
     stack: &mut Vec<CfmlValue>,
     locals: &mut ValueMap,
+    func: &BytecodeFunction,
     name: &Name,
-) {
+) -> Option<usize> {
     let value = stack.pop().unwrap_or(CfmlValue::Null);
     if let Some(args) = locals
         .get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
         .and_then(|v| v.as_cfml_struct())
     {
         args.insert(name, value);
+        return None;
     }
+    func.param_keys().iter().position(|k| k == name.key())
+}
+
+/// `LoadArgKey` / `TryLoadArgKey` — read `arguments.<name>` without naming the
+/// `arguments` scope. See the op's docs in `cfml-codegen` for why it exists.
+///
+/// Eager frame: the struct is the authority, exactly as `GetProperty` on it was.
+/// Lazy frame: a declared parameter's value lives in `locals` under its own
+/// name, but ONLY the supplied/defaulted bits may authorize reading it — an
+/// omitted parameter must read Null even when the frame inherited a same-named
+/// enclosing variable (verified against Lucee 7.1). A name that is not a
+/// declared parameter cannot exist on a lazy frame (extra named/positional args
+/// force the eager path at bind time), so it throws as the struct read did.
+///
+/// Returns `false` when the key is a genuine miss, which the caller turns into
+/// `raise_undefined_member` — the SAME routing (and the same `expression` error
+/// type) that `GetProperty` on the arguments struct used before this op existed.
+/// Returning a plain runtime error here instead re-typed the exception to
+/// `Runtime` and broke a Wheels `contentSpec` expectation.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn op_load_arg_key(
+    stack: &mut Vec<CfmlValue>,
+    locals: &ValueMap,
+    func: &BytecodeFunction,
+    arguments_supplied_bits: u64,
+    arguments_supplied: &Option<
+        std::collections::HashSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>,
+    >,
+    tolerant: bool,
+    name: &Name,
+) -> bool {
+    if let Some(CfmlValue::Struct(args)) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+    {
+        match args.get(name) {
+            Some(v) => stack.push(v),
+            None if tolerant => stack.push(CfmlValue::Null),
+            None => {
+                // A DECLARED parameter the caller omitted reads as Null on both
+                // engines; only an undeclared key is an error.
+                if func.param_keys().iter().any(|k| k == name.key()) {
+                    stack.push(CfmlValue::Null);
+                } else {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    let idx = func.param_keys().iter().position(|k| k == name.key());
+    let supplied = match idx {
+        Some(i) if i < 64 => arguments_supplied_bits & (1u64 << i) != 0,
+        Some(_) => arguments_supplied
+            .as_ref()
+            .is_some_and(|s| s.contains(name.key())),
+        None => false,
+    };
+    if supplied {
+        stack.push(locals.get(name.key()).cloned().unwrap_or(CfmlValue::Null));
+    } else if tolerant || idx.is_some() {
+        stack.push(CfmlValue::Null);
+    } else {
+        return false;
+    }
+    true
 }
 
 /// `Increment`

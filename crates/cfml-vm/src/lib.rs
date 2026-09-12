@@ -7865,7 +7865,25 @@ impl CfmlVirtualMachine {
     ///    "__cfcustomtag_start"|"__cfmodule")`): the tag frame bridges the
     ///    caller's `arguments` in (ColdBox RendererEncapsulator).
     fn function_needs_arguments_scope(instructions: &[BytecodeOp]) -> bool {
+        // `local.X` / `var X` and `arguments.X` are SEPARATE scopes inside one
+        // frame: writing the local must NOT change what an explicit
+        // `arguments.X` read returns (Lucee 7.1; `tests/core/
+        // test_local_shadows_arguments.cfm`). `LoadArgKey`'s lazy path reads the
+        // parameter out of the frame's `locals`, which is the very slot such a
+        // write overwrites — so a function that declares a local named like one
+        // of its `arguments.X` reads keeps the eager struct, where the two views
+        // are genuinely separate storage. Statically decidable, and rare: it
+        // costs the optimisation only for the colliding function.
+        let declares_local_named = |name: &cfml_common::name::Name| {
+            instructions.iter().any(|op| match op {
+                BytecodeOp::DeclareLocal(n)
+                | BytecodeOp::DeclareSlot(_, n)
+                | BytecodeOp::StoreLocalScopeKey(n) => n.lower() == name.lower(),
+                _ => false,
+            })
+        };
         instructions.iter().any(|op| match op {
+            BytecodeOp::LoadArgKey(n) | BytecodeOp::TryLoadArgKey(n) => declares_local_named(n),
             BytecodeOp::LoadLocal(s) | BytecodeOp::TryLoadLocal(s) => {
                 s.eq_ignore_ascii_case("arguments")
             }
@@ -7898,6 +7916,54 @@ impl CfmlVirtualMachine {
             }
             _ => false,
         })
+    }
+
+    /// Does the body REBIND one of its own declared parameters by bare name?
+    ///
+    /// Only meaningful under `localmode="modern"`, where Lucee 7.1 treats such a
+    /// write as a LOCAL-scope write that leaves the argument alone — verified on
+    /// Lucee 7.1 for a plain assign, a self-referencing assign (`a = a & "X"`),
+    /// `+=`, `++`, and assignments inside branches and loops; in `classic` mode
+    /// the same write DOES update the argument on both engines, which is why this
+    /// is gated on the mode and not applied wholesale.
+    ///
+    /// We bind a parameter into the frame's `locals` under its own name, so bare
+    /// `a` and `arguments.a` share one slot; the eager `arguments` struct is the
+    /// only place the ORIGINAL argument still exists after such a write. A frame
+    /// in modern mode that rebinds a parameter therefore keeps the struct.
+    #[inline(never)]
+    fn function_rebinds_param(func: &BytecodeFunction) -> bool {
+        if func.params.is_empty() {
+            return false;
+        }
+        let is_param = |n: &cfml_common::name::Name| {
+            func.params.iter().any(|p| p.eq_ignore_ascii_case(n.lower()))
+        };
+        func.instructions.iter().any(|op| match op {
+            BytecodeOp::StoreLocal(n)
+            | BytecodeOp::StoreSlot(_, n)
+            | BytecodeOp::Increment(n)
+            | BytecodeOp::IncrementSlot(_, n)
+            | BytecodeOp::Decrement(n)
+            | BytecodeOp::DecrementSlot(_, n)
+            | BytecodeOp::AddLocalConst(n, _)
+            | BytecodeOp::AddSlotConst(_, n, _)
+            | BytecodeOp::MulLocalConst(n, _)
+            | BytecodeOp::MulSlotConst(_, n, _)
+            | BytecodeOp::ArrayAppendLocal(n)
+            | BytecodeOp::ArrayAppendSlot(_, n) => is_param(n),
+            BytecodeOp::ForLoopStep(n, ..) | BytecodeOp::ForSlotStep(_, n, ..) => is_param(n),
+            _ => false,
+        })
+    }
+
+    /// Memoized [`Self::function_rebinds_param`] — once per process, then an
+    /// atomic load (same pattern as [`Self::arguments_scope_needed`]).
+    #[inline(never)]
+    fn rebinds_param(func: &BytecodeFunction) -> bool {
+        *func
+            .rebinds_param
+            .get_or_init(|| Self::function_rebinds_param(func))
     }
 
     /// Memoized wrapper over [`function_needs_arguments_scope`], keyed by the
@@ -8482,8 +8548,13 @@ impl CfmlVirtualMachine {
                 .is_some_and(|e| !e.is_empty());
         #[cfg(feature = "call-phases")]
         let _p4_needed_probe = !is_template_frame && !has_overflow_args;
-        let build_arguments_eager =
-            is_template_frame || has_overflow_args || self.arguments_scope_needed(func);
+        let build_arguments_eager = is_template_frame
+            || has_overflow_args
+            || self.arguments_scope_needed(func)
+            // Last, and behind the mode flag: in `classic` (the default on every
+            // frame in Preside/ColdBox/Wheels) this is one already-loaded bool and
+            // the memoized scan behind it is never reached.
+            || (effective_local_mode_modern && Self::rebinds_param(func));
         if cfml_common::perf_counters::enabled() {
             use cfml_common::perf_counters as pc;
             if build_arguments_eager {
@@ -10020,7 +10091,16 @@ impl CfmlVirtualMachine {
                             // PR #96: NOT for `var X` / `local.X` declarations — those
                             // create a separate local-scope slot; `arguments.X` must keep
                             // resolving to the passed value / declared default.
+                            // NOT in `localmode="modern"`: there a bare assignment
+                            // is a LOCAL-scope write, and Lucee 7.1 leaves the
+                            // argument at its passed value (`function f(a)
+                            // localmode="modern" { a = "MOD"; return arguments.a; }`
+                            // returns "orig"). In `classic` the two stay aliased on
+                            // both engines. The frame kept its eager `arguments`
+                            // struct for exactly this (see `rebinds_param`), so the
+                            // original is still there to read.
                             if is_inside_function
+                                && !effective_local_mode_modern
                                 && !declared_locals.contains(name.as_str())
                                 && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                             {
@@ -14225,7 +14305,36 @@ impl CfmlVirtualMachine {
                 BytecodeOp::JumpIfNotNull(target) => { ops::effect::op_jump_if_not_null(&stack, &mut ip, *target); }
 
                 BytecodeOp::JumpIfArgPresent(name, target) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, func, arguments_supplied_bits, &arguments_supplied, name, *target); }
-                BytecodeOp::SeedArgumentKey(name) => { ops::locals::op_seed_argument_key(&mut stack, &mut locals, name); }
+                BytecodeOp::SeedArgumentKey(name) => {
+                    // On a lazy frame the applied default must be recorded as
+                    // supplied so `LoadArgKey` can read it back (see that op).
+                    if let Some(i) = ops::locals::op_seed_argument_key(&mut stack, &mut locals, func, name) {
+                        if i < 64 {
+                            arguments_supplied_bits |= 1u64 << i;
+                        } else {
+                            arguments_supplied
+                                .get_or_insert_with(Default::default)
+                                .insert(name.key().clone());
+                        }
+                    }
+                }
+                BytecodeOp::LoadArgKey(name) | BytecodeOp::TryLoadArgKey(name) => {
+                    if !ops::locals::op_load_arg_key(
+                        &mut stack,
+                        &locals,
+                        func,
+                        arguments_supplied_bits,
+                        &arguments_supplied,
+                        matches!(op, BytecodeOp::TryLoadArgKey(_)),
+                        name,
+                    ) {
+                        // Same routing as a `GetProperty` miss on the arguments
+                        // struct: a catchable `expression` error, unwound into an
+                        // active try handler.
+                        ip = self.raise_undefined_member(name.as_str(), &mut stack)?;
+                        continue;
+                    }
+                }
                 BytecodeOp::StoreLocalScopeKey(prop_name) => { ops::locals::op_store_local_scope_key(self, &mut stack, &mut locals, &mut declared_locals, &mut inherited_or_param_keys, frame_has_local_scope, prop_name); }
 
                 BytecodeOp::ValidateParamType(index) => { ops::locals::op_validate_param_type(self, func, &locals, *index)?; }
@@ -41306,6 +41415,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::JumpIfNotNull(_) => (1, 1), // pops, pushes back if not null
         BytecodeOp::JumpIfArgPresent(_, _) => (0, 0), // pure control flow, no stack traffic
         BytecodeOp::SeedArgumentKey(_) => (1, 0), // pops the applied default value
+        BytecodeOp::LoadArgKey(_) | BytecodeOp::TryLoadArgKey(_) => (1, 0), // pushes value, reads nothing
         BytecodeOp::StoreLocalScopeKey(_) => (0, 1), // pops the value, pushes nothing
         BytecodeOp::ValidateParamType(_) => (0, 0),   // reads a local, throws or nothing
         // Output

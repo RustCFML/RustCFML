@@ -3258,3 +3258,87 @@ parameter binding, the `arguments` struct, teardown; the profile is flat),
 `variables.x` at 153 vs 60 (each op still locks the handle), struct key
 read/write at 211/243 vs 149/140 (the key string is built and hashed per
 access on both engines; ours also allocates the `Key`).
+
+## 102. `arguments.x` — the commonest idiom in framework code — forced the eager `arguments` struct onto 35% of all frames; in `localmode="modern"` a bare parameter rebind wrote through to the argument (fixed v0.669.0) 📌
+
+Follow-up to §101's "still open" list, which named the generic frame cost
+(UDF-to-UDF 306 vs Lucee 155) as the next target. The profile there is flat —
+no item over 10% — and the instrumented `call-phases` build agreed. The item
+worth having was one level out, and it was not on the list at all.
+
+Warm ns, same box, Lucee 7.1 alongside:
+
+| shape | v0.668.0 | v0.669.0 | Lucee |
+|---|---|---|---|
+| `arguments.a` vs bare `a`, 1 declared parameter | +103 | **-7** | ~0 |
+| `arguments.a`+`.b`+`.c` vs bare, 3 declared parameters | +174 | **-13** | ~0 |
+| frames taking the eager path, `tests/runner.cfm` | 57.6% | **22.4%** | — |
+
+**Naming the scope was the whole cost.** `arguments.foo` lowered to
+`LoadLocal("arguments")` + `GetProperty`, and that load is exactly what
+`function_needs_arguments_scope` scans for — so a single `arguments.foo`
+anywhere in a body put *every* call of that function on the eager path, which
+allocates a `CfmlStruct` (an `Arc<RwLock<..>>` plus a cycle-GC log entry) and
+copies every bound argument into it a second time. 43,211 of the 122,463 frames
+in our own suite were eager for that reason alone. The precedent was already
+here: `SeedArgumentKey` (§ the default-parameter preamble) exists because one
+defaulted parameter used to force the same thing.
+
+`LoadArgKey` / `TryLoadArgKey` read one parameter without naming the scope.
+On a frame that is eager anyway — a template frame, overflow arguments, or a
+body that genuinely observes the whole scope — they read the struct, exactly as
+`GetProperty` did. Otherwise they read the parameter where it already lives, in
+the frame's `locals` under its own name, gated on the supplied/defaulted bits so
+an omitted parameter reads Null and never a same-named enclosing variable
+(§ GH #240's hazard). Reading `arguments.a` is now marginally *cheaper* than
+reading bare `a`, because it resolves one key instead of walking the scope chain.
+
+This moves the two engines closer together rather than apart. Lucee's
+`UndefinedImpl.get()` resolves a bare name as `local` first, then
+`argument.getFunctionArgument(key)`: a parameter has **one** storage and
+`arguments.x` is a view onto it. We keep two copies, which is also why
+`structDelete(arguments,"a")` still leaves bare `a` readable here and nulls it
+there (below).
+
+**Three things keep the semantics, and each was caught by a gate rather than by
+review.** `local.X` / `var X` and `arguments.X` are separate scopes inside one
+frame (`tests/core/test_local_shadows_arguments.cfm`), so a function that
+declares a local named like one of its `arguments.X` reads keeps the eager
+struct — statically decided, and it costs the optimisation only for that
+function. A miss must route through `raise_undefined_member`, which raises the
+catchable `expression` error `GetProperty` raised; returning a plain runtime
+error re-typed it to `Runtime` and only Wheels' `contentSpec` noticed. And the
+default preamble's `SeedArgumentKey` now marks the parameter supplied on the
+lazy path, or an applied default would read as absent.
+
+**`localmode="modern"`: a bare rebind of a parameter is a local write.**
+Verified against Lucee 7.1 across plain assignment, a self-referencing
+assignment (`a = a & "X"`), `+=`, `++`, and assignments inside branches and
+loops: all of them create or update the frame's `local` and leave the argument
+at its passed value, where we wrote through to both. In `classic` — the default
+on every frame in Preside, ColdBox and Wheels — the write *does* update the
+argument on both engines, so this is gated on the mode. A modern-mode frame that
+rebinds a parameter keeps its eager struct, that being the only place the
+original argument still exists after the write.
+
+One divergence is left here, and it is Lucee disagreeing with itself: `a &= "X"`
+writes through to `arguments` there, while `a += 1` and `a++` do not. We give
+the self-consistent answer. `&=` has no distinct opcode in our codegen — it
+lowers exactly like `a = a & "X"`, which Lucee itself treats as local-only — so
+matching it would mean inventing an opcode to reproduce the inconsistency.
+
+⚠️ **Where a clause sits in the frame prologue is worth 2%.** The modern-mode
+test, added to the eager-arguments decision, made CFC method calls 2.0-2.4%
+slower — outside the A-to-A spread, on frames where the flag is false and the
+clause is a single already-loaded bool. Moving it behind the memoized
+`arguments_scope_needed` returned it to baseline. `execute_function_body` is
+large and its prologue is layout-sensitive; a three-arm interleaved run
+(baseline / this change alone / both) is what attributed it, a two-arm A/B
+blamed the wrong half.
+
+Still open: the generic frame cost itself (UDF-to-UDF 306 vs Lucee 155),
+`variables.x` at 153 vs 60, struct key read/write at 211/243 vs 149/140, and two
+`arguments`-scope divergences this work surfaced but did not address —
+`structCount`/`structKeyList` over `arguments` omit declared-but-omitted
+parameters where Lucee lists them, and `structDelete(arguments, "a")` does not
+clear the bare name.

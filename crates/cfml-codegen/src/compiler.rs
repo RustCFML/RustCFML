@@ -243,6 +243,16 @@ pub struct BytecodeFunction {
     /// the frame (⇒ allocated untracked, skipping cycle-GC logging). Same
     /// once-per-process pattern as `args_needed`, for the same reason.
     pub args_never_escapes: std::sync::OnceLock<bool>,
+    /// Whether the body REBINDS one of its own declared parameters by bare name
+    /// (`a = …`, `a += 1`, `a++`, a bare loop variable …). Only consulted in
+    /// `localmode="modern"`, where Lucee 7.1 makes such a write a LOCAL-scope
+    /// write that leaves the argument untouched: `function f(a) localmode=
+    /// "modern" { a = "MOD"; return arguments.a; }` returns the PASSED value.
+    /// Our parameter binding puts the value in the frame's `locals` under the
+    /// parameter name, so the two views are only separable while the eager
+    /// `arguments` struct exists — hence such a frame opts out of the lazy path.
+    /// Same once-per-process pattern as `args_needed`.
+    pub rebinds_param: std::sync::OnceLock<bool>,
     /// The `__arguments_params` positional-marker array (declared param names
     /// as a CfmlArray), built once per process on first eager call. Previously
     /// a per-VM `HashMap<global_id, CfmlValue>` — one more SipHash probe per
@@ -1053,6 +1063,33 @@ pub enum BytecodeOp {
     /// receiver variable OR a missing member reads as Null instead of throwing.
     TryLoadLocalProperty(Name, Name),
     TryLoadLocalKey(Name),
+    /// Fused read of `arguments.<member>` that does NOT name the `arguments`
+    /// scope. The generic lowering is `LoadLocal("arguments")` + `GetProperty`,
+    /// and that load is what `function_needs_arguments_scope` keys on — so the
+    /// single most common idiom in framework code (`arguments.foo`) forced every
+    /// call of the function onto the eager `arguments` path, paying a `CfmlStruct`
+    /// (`Arc<RwLock<..>>` + cycle-GC log) plus a second copy of every bound
+    /// argument. Measured at +103 ns on a 1-param frame and +174 ns on a 3-param
+    /// one, on 35% of all frames in our own suite.
+    ///
+    /// Reading one parameter never needs the struct: a bound parameter's value
+    /// already lives in the frame's `locals` under its own name. This op reads it
+    /// there when the frame took the lazy path, and from the real `arguments`
+    /// struct when the frame is eager anyway (a template frame, overflow args, or
+    /// a body that genuinely observes the whole scope). Lucee resolves a bare name
+    /// as `local` then `argument.getFunctionArgument(key)` — one storage per
+    /// parameter, no copy — so this moves the two engines closer, not apart.
+    ///
+    /// Semantics, verified against Lucee 7.1 on both paths: a declared parameter
+    /// the caller omitted reads as Null (NOT as a same-named enclosing variable —
+    /// hence the supplied-bit gate, GH #240's hazard); a defaulted parameter reads
+    /// its applied default; a bare store to the parameter is visible here (one
+    /// storage); a name that is not a declared parameter throws exactly as the
+    /// struct read did.
+    LoadArgKey(Name),
+    /// Null-tolerant twin of [`Self::LoadArgKey`] (`arguments.x?.y`, and every
+    /// site that reads through `compile_member_read_tolerant`).
+    TryLoadArgKey(Name),
     /// `local.X = v` compiled at TEMPLATE level (GH #351).
     ///
     /// Whether the frame owns a function `local` scope cannot be decided at
@@ -1474,11 +1511,13 @@ impl BytecodeOp {
             Self::DefineComponentMethods(..) => 124,
             Self::StoreVariablesKey(..) => 125,
             Self::BuildStructStatic(..) => 126,
+            Self::LoadArgKey(..) => 127,
+            Self::TryLoadArgKey(..) => 128,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 127] = [
+    pub const CENSUS_NAMES: [&'static str; 129] = [
         "Null",
         "True",
         "False",
@@ -1606,6 +1645,8 @@ impl BytecodeOp {
         "DefineComponentMethods",
         "StoreVariablesKey",
         "BuildStructStatic",
+        "LoadArgKey",
+        "TryLoadArgKey",
     ];
 }
 
@@ -1669,6 +1710,7 @@ impl CfmlCompiler {
                     name_shared: Default::default(),
                     source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
@@ -2414,6 +2456,10 @@ impl CfmlCompiler {
                     // scope while a true page reads the ordinary `local` variable.
                     if ident.name.eq_ignore_ascii_case("local") {
                         instructions.push(BytecodeOp::TryLoadLocalKey(Name::from(&access.member)));
+                        return;
+                    }
+                    if ident.name.eq_ignore_ascii_case("arguments") {
+                        instructions.push(BytecodeOp::TryLoadArgKey(Name::from(&access.member)));
                         return;
                     }
                     if !is_reserved_scope_name(&ident.name) {
@@ -4583,6 +4629,7 @@ impl CfmlCompiler {
             name_shared: Default::default(),
             source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
@@ -4868,6 +4915,7 @@ impl CfmlCompiler {
                     name_shared: Default::default(),
                     source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
@@ -4966,6 +5014,7 @@ impl CfmlCompiler {
                     name_shared: Default::default(),
                     source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
@@ -5159,6 +5208,7 @@ impl CfmlCompiler {
                 name_shared: Default::default(),
                 source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
@@ -5699,6 +5749,16 @@ impl CfmlCompiler {
                                 .push(BytecodeOp::LoadLocalKey(Name::from(&access.member)));
                             return;
                         }
+                        // `arguments.foo` read: fuse into LoadArgKey so the op
+                        // never names the `arguments` scope. Naming it is what
+                        // puts the whole function on the eager path (see
+                        // LoadArgKey's docs); reading one parameter does not
+                        // need the struct at all.
+                        if ident.name.eq_ignore_ascii_case("arguments") {
+                            instructions
+                                .push(BytecodeOp::LoadArgKey(Name::from(&access.member)));
+                            return;
+                        }
                         if !is_reserved_scope_name(&ident.name) {
                             instructions.push(BytecodeOp::LoadLocalProperty(Name::from(&ident.name),Name::from(&access.member),
                             ));
@@ -6228,6 +6288,7 @@ impl CfmlCompiler {
                     name_shared: Default::default(),
                     source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
@@ -6327,6 +6388,7 @@ impl CfmlCompiler {
                     name_shared: Default::default(),
                     source_file_shared: Default::default(),
                     args_needed: Default::default(),
+                    rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
