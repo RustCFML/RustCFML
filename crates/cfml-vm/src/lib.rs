@@ -7864,6 +7864,20 @@ impl CfmlVirtualMachine {
     ///  - invokes a custom tag / `cfmodule` (`LoadGlobal("__cfcustomtag"|
     ///    "__cfcustomtag_start"|"__cfmodule")`): the tag frame bridges the
     ///    caller's `arguments` in (ColdBox RendererEncapsulator).
+    /// Does this string, used as a variable/scope path, reach the `arguments`
+    /// scope by name? Shared by the two scanners that decide whether a frame
+    /// needs the eager `arguments` struct — and applied to
+    /// [`BytecodeOp::SetScopePath`]'s path as well as to a literal
+    /// [`BytecodeOp::String`], because the pre-split op carries its path INSIDE
+    /// the operand where a `String` scan cannot see it. (Missing that is exactly
+    /// how `param default="" name="arguments.rc.status"` silently stopped
+    /// writing through to the caller's struct: the lazy frame rebuilt an empty
+    /// `arguments` and the walk vivified a fresh `rc`.)
+    fn path_names_arguments_scope(s: &str) -> bool {
+        let l = s.to_ascii_lowercase();
+        l == "arguments" || l.contains("arguments.") || l.contains("arguments[")
+    }
+
     fn function_needs_arguments_scope(instructions: &[BytecodeOp]) -> bool {
         // `local.X` / `var X` and `arguments.X` are SEPARATE scopes inside one
         // frame: writing the local must NOT change what an explicit
@@ -7911,9 +7925,11 @@ impl CfmlVirtualMachine {
                 // `arguments` case) as well as dynamic isDefined/evaluate/
                 // structKeyExists paths. Conservative: any string containing the
                 // literal `arguments.`/`arguments[` forces the eager path.
-                let l = s.to_ascii_lowercase();
-                l == "arguments" || l.contains("arguments.") || l.contains("arguments[")
+                Self::path_names_arguments_scope(s)
             }
+            // Same rule for the pre-split path operand — it reaches the scope by
+            // name exactly as the `String` form it replaced.
+            BytecodeOp::SetScopePath(sp) => Self::path_names_arguments_scope(&sp.path),
             _ => false,
         })
     }
@@ -8029,8 +8045,14 @@ impl CfmlVirtualMachine {
                 // String-form access to the scope by name (isDefined/evaluate/QoQ)
                 // — reaches the struct outside this op-adjacency model.
                 BytecodeOp::String(s) => {
-                    let l = s.to_ascii_lowercase();
-                    if l == "arguments" || l.contains("arguments.") || l.contains("arguments[") {
+                    if Self::path_names_arguments_scope(s) {
+                        return false;
+                    }
+                }
+                // See `function_needs_arguments_scope`: the pre-split path
+                // operand names the scope where a `String` scan cannot see it.
+                BytecodeOp::SetScopePath(sp) => {
+                    if Self::path_names_arguments_scope(&sp.path) {
                         return false;
                     }
                 }
@@ -8711,13 +8733,31 @@ impl CfmlVirtualMachine {
                     }
                 }
                 None => {
-                    // Omitted. Do NOT pre-seed the local: the default preamble
-                    // detects omission via JumpIfArgPresent (the `arguments`
-                    // scope lacks this key) and then fills the real default into
-                    // both the local and the arguments key. Pre-seeding a Null
-                    // here used to clobber an inherited same-named enclosing
-                    // variable, so a `function f(x = x)` default read its own
-                    // empty slot as Null instead of the outer `x` (GitHub #240).
+                    // Omitted. Do NOT pre-seed the LOCAL: the default preamble
+                    // detects omission via JumpIfArgPresent and then fills the
+                    // real default into both the local and the arguments key.
+                    // Pre-seeding a Null here used to clobber an inherited
+                    // same-named enclosing variable, so a `function f(x = x)`
+                    // default read its own empty slot as Null instead of the
+                    // outer `x` (GitHub #240).
+                    //
+                    // The arguments SCOPE is different. Lucee 7.1 gives the
+                    // scope one entry per DECLARED parameter, in declaration
+                    // order, holding null when the caller omitted it:
+                    // `function f(a,b,c)` called `f(1)` reports
+                    // `structCount` 3, `structKeyList` "a,b,c", for-in a,b,c and
+                    // `serializeJSON` `{"a":1,"b":null,"c":null}` — while
+                    // `structKeyExists(arguments,"b")` and
+                    // `isDefined("arguments.b")` both stay FALSE. We reported
+                    // count 1 / keys "a". Verified against Lucee 7.1; see
+                    // `tests/core/test_arguments_scope_shape.cfm`.
+                    //
+                    // Omission is therefore no longer "the key is absent" but
+                    // "the key is absent OR null" — see `op_jump_if_arg_present`
+                    // and `arguments_key_is_supplied`, which must agree.
+                    if build_arguments_eager {
+                        arguments_map.insert(param_keys[i].clone(), CfmlValue::Null);
+                    }
                     let _ = has_default;
                 }
             }
@@ -9916,6 +9956,18 @@ impl CfmlVirtualMachine {
                                     {
                                         continue;
                                     }
+                                    // A NULL entry is a declared-but-omitted parameter
+                                    // (§105 — the scope holds one per declared param,
+                                    // Lucee shape). There is nothing to alias: mirroring
+                                    // it would create a null bare local that SHADOWS the
+                                    // rest of the resolution chain, so after any
+                                    // `arguments.x = v` in the body a bare read of an
+                                    // omitted param stopped reaching `variables.<name>`
+                                    // (Preside HandlerService.getHandlerListing: "cannot
+                                    // call method [isIgnored] on a null value").
+                                    if matches!(v, CfmlValue::Null) {
+                                        continue;
+                                    }
                                     // Sync the param value back to its named local so
                                     // `arguments.p` and bare `p` stay aliased (CFML
                                     // scope semantics). Previously only complex types
@@ -10149,6 +10201,25 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
+                    }
+                }
+                // Compile-time-known nested scope/bare path (`variables.a.b = v`).
+                // The same store as `SetDynamicVar`, minus the string operand,
+                // the runtime re-split, and the value clone + push-back that
+                // existed only to feed the `Pop` the old sequence ended with.
+                // Errors route through `route_call_error` for the same reason:
+                // a bare `Err` here would skip an enclosing `try {}` in this
+                // frame.
+                BytecodeOp::SetScopePath(sp) => {
+                    let value = stack.pop().unwrap_or(CfmlValue::Null);
+                    if let Err(e) = self.store_runtime_path_parts(
+                        &sp.path,
+                        &sp.parts,
+                        value,
+                        &mut locals,
+                        effective_local_mode_modern,
+                    ) {
+                        ip = self.route_call_error(e, &mut stack)?;
                     }
                 }
                 BytecodeOp::SetDynamicVar => {
@@ -14692,6 +14763,15 @@ impl CfmlVirtualMachine {
                                     err_struct
                                         .insert("tagcontext".to_string(), self.build_tag_context());
                                     let error_val = CfmlValue::strukt(err_struct);
+                                    // The catch block this jumps into may `rethrow` —
+                                    // codegen synthesises one for the cleanup arm of
+                                    // `lock {}` / `try {} finally {}` — and `rethrow`
+                                    // re-raises whatever is in this register. Every
+                                    // other catch-entry path sets it; this one did not,
+                                    // so an error escaping a DYNAMIC include inside a
+                                    // `lock {}` surfaced as "No exception to rethrow"
+                                    // with the real message lost (Wheels' onRequest).
+                                    self.last_exception = Some(error_val.clone());
                                     stack.push(error_val);
                                     ip = handler.catch_ip;
                                 } else {
@@ -23135,13 +23215,22 @@ impl CfmlVirtualMachine {
         // arguments scope correctly outranks the variables scope.
         if name_lower != "arguments" {
             if let Some(CfmlValue::Struct(args)) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
-                if let Some(v) = args.get(name) {
+                // A NULL entry is a declared-but-omitted parameter (§105: the
+                // scope holds one per declared param, Lucee shape). It must not
+                // shadow the rest of the chain: Lucee's `UndefinedImpl.get()`
+                // walks local -> arguments -> variables and treats a null
+                // argument as "not here". Preside's HandlerService declares
+                // `any ignoreFileService` and, when the caller omits it, expects
+                // the bare name to reach `variables.ignoreFileService`; returning
+                // the null here broke every Preside boot with "cannot call
+                // method [isIgnored] on a null value".
+                if let Some(v) = args.get(name).filter(|v| !matches!(v, CfmlValue::Null)) {
                     if depth_census {
                         cfml_common::perf_counters::bump(
                             &cfml_common::perf_counters::SCOPE_HIT_ARGUMENTS,
                         );
                     }
-                    return Some(v.clone());
+                    return Some(v);
                 }
                 // No case-insensitive scan after the probe: the arguments scope
                 // is keyed by `Key`, whose equality folds case, so the exact
@@ -23510,20 +23599,26 @@ impl CfmlVirtualMachine {
     /// auto-vivify as plain structs (matching dotted-assignment semantics).
     /// `keys` is the path relative to `root` (at least one segment).
     #[cfg(feature = "component-instance")]
-    fn store_member_path_in_place(root: &CfmlValue, keys: &[&str], value: CfmlValue) {
+    fn store_member_path_in_place<S: AsRef<str>>(
+        root: &CfmlValue,
+        keys: &[S],
+        value: CfmlValue,
+    ) {
         let (leaf, mids) = match keys.split_last() {
             Some(x) => x,
             None => return,
         };
+        let leaf = leaf.as_ref();
         let mut cur = root.clone();
         for k in mids {
+            let k = k.as_ref();
             let next = match &cur {
                 CfmlValue::Struct(s) => match s.get_ci(k) {
                     Some(v @ CfmlValue::Struct(_)) => v,
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {
                         let ns = CfmlValue::strukt(ValueMap::default());
-                        s.insert(*k, ns.clone());
+                        s.insert(k, ns.clone());
                         ns
                     }
                 },
@@ -23536,7 +23631,7 @@ impl CfmlVirtualMachine {
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {
                         let ns = CfmlValue::strukt(ValueMap::default());
-                        inst.read().set_public_member((*k).to_string(), ns.clone());
+                        inst.read().set_public_member(k.to_string(), ns.clone());
                         ns
                     }
                 },
@@ -23548,18 +23643,39 @@ impl CfmlVirtualMachine {
             CfmlValue::Struct(s) => {
                 // `&str`, not `to_string()`: the insert probes with a borrowed
                 // key and only allocates when the key is genuinely new (§103).
-                s.insert(*leaf, value);
+                s.insert(leaf, value);
             }
             CfmlValue::Instance(inst) => {
-                inst.read().set_public_member((*leaf).to_string(), value);
+                inst.read().set_public_member(leaf.to_string(), value);
             }
             _ => {}
         }
     }
 
+    /// Store through a dotted path whose text is only known at runtime. Splits,
+    /// then defers to [`Self::store_runtime_path_parts`].
     fn store_runtime_path(
         &mut self,
         path: &str,
+        value: CfmlValue,
+        locals: &mut ValueMap,
+        local_mode_modern: bool,
+    ) -> Result<(), CfmlError> {
+        let parts: Vec<&str> = path.split('.').collect();
+        self.store_runtime_path_parts(path, &parts, value, locals, local_mode_modern)
+    }
+
+    /// Store through an ALREADY-SPLIT path. `path` is the joined form, needed
+    /// only by the null-assignment branch (which routes through the string-based
+    /// delete) and must agree with `parts`.
+    ///
+    /// Generic over the segment type so `BytecodeOp::SetScopePath` can hand over
+    /// its compile-time `Vec<String>` directly — the split and its `Vec` used to
+    /// run on every execution of the statement.
+    fn store_runtime_path_parts<S: AsRef<str>>(
+        &mut self,
+        path: &str,
+        parts: &[S],
         value: CfmlValue,
         locals: &mut ValueMap,
         local_mode_modern: bool,
@@ -23572,9 +23688,8 @@ impl CfmlVirtualMachine {
             self.delete_scope_path(path, locals, local_mode_modern)?;
             return Ok(());
         }
-        let parts: Vec<&str> = path.split('.').collect();
         if parts.len() >= 2 {
-            let scope = parts[0];
+            let scope = parts[0].as_ref();
             let root = self
                 .scope_aware_load(scope, locals)
                 .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()));
@@ -23585,7 +23700,7 @@ impl CfmlVirtualMachine {
             // lazily — otherwise every scope-path write allocates and upper-cases
             // a string for a message that is essentially never emitted (§103).
             if root.is_read_only_struct() {
-                root.check_struct_writable(&parts[1].to_uppercase())?;
+                root.check_struct_writable(&parts[1].as_ref().to_uppercase())?;
             }
             // A Rust-backed object root (e.g. the live `socket` handle): descend
             // through its `CfmlNative` accessors instead of rebuilding the path
@@ -23594,7 +23709,7 @@ impl CfmlVirtualMachine {
             // property the getter returns (`socket.data`) is reference-typed, so
             // mutating it in place persists for the connection.
             if let CfmlValue::NativeObject(obj) = &root {
-                let seg = parts[1];
+                let seg = parts[1].as_ref();
                 if parts.len() == 2 {
                     if let Ok(mut g) = obj.write() {
                         let _ = g.set_property(seg, value);
@@ -23605,9 +23720,9 @@ impl CfmlVirtualMachine {
                 if let Some(CfmlValue::Struct(s)) = prop {
                     let mut cur = s;
                     for key in &parts[2..parts.len() - 1] {
-                        cur = cur.get_or_insert_struct(key);
+                        cur = cur.get_or_insert_struct(key.as_ref());
                     }
-                    cur.insert(parts[parts.len() - 1].to_string(), value);
+                    cur.insert(parts[parts.len() - 1].as_ref(), value);
                 }
                 return Ok(());
             }
@@ -23644,9 +23759,9 @@ impl CfmlVirtualMachine {
                 // Walk/auto-vivify intermediate structs, set the leaf.
                 let mut cur = s.clone();
                 for key in &parts[1..parts.len() - 1] {
-                    cur = cur.get_or_insert_struct(key);
+                    cur = cur.get_or_insert_struct(key.as_ref());
                 }
-                cur.insert(parts[parts.len() - 1].to_string(), value);
+                cur.insert(parts[parts.len() - 1].as_ref(), value);
             }
             // Write the (possibly copied) scope container back. For
             // reference-typed scopes (a CFC's __variables) the leaf is
@@ -29830,10 +29945,18 @@ impl CfmlVirtualMachine {
                     // method — including an include-attached lifecycle handler —
                     // now lives in the shared method table, not the instance map,
                     // so a map-only scan would miss `isDefined("variables.onXxx")`.
-                    if let Some(v) = s.get_ci(&seg_lower) {
-                        current = v;
-                    } else {
-                        return false;
+                    //
+                    // A NULL-valued key is not defined. The arguments scope
+                    // carries one null entry per declared-but-omitted parameter
+                    // (Lucee 7.1 shape), and Lucee reports
+                    // `isDefined("arguments.b")` false for exactly those while
+                    // still listing `b` in `structKeyList` — the same answer
+                    // `structKeyExists` already gives. Elsewhere a struct cannot
+                    // normally hold Null (null assignment deletes the key), so
+                    // this only ever fires for that scope.
+                    match s.get_ci(&seg_lower) {
+                        Some(CfmlValue::Null) | None => return false,
+                        Some(v) => current = v,
                     }
                 }
                 // isDefined("q.col") — a query column counts as defined (Lucee).
@@ -41416,6 +41539,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
         BytecodeOp::MarkAccessorPrivate(_) => (0, 0), // no stack effect
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
+        BytecodeOp::SetScopePath(_) => (0, 1), // value → (stored through the path)
         BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
         BytecodeOp::GetKeys => (1, 1),

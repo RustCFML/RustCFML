@@ -3445,3 +3445,160 @@ taking apart. Per write that path did:
 The string path itself is still built and re-split at runtime; pre-splitting it
 at codegen (the segments are known there) is the obvious next step and is not
 done here.
+
+---
+
+## 104. A nested scope assignment re-split at runtime a path the compiler had just taken apart — fixed, but the split was NOT where the time went (v0.671.0) 📌
+
+Following §103: any assignment two or more levels below a scope or a bare root
+(`variables.a.b = v`, `request.a.b = v`, `o.a.b = v`) compiled to a dotted STRING
+plus `SetDynamicVar` plus `Pop`, and `store_runtime_path` split that string again
+on every execution. The segments are known at codegen. `BytecodeOp::SetScopePath`
+now carries them pre-split, and `store_runtime_path_parts` is generic over the
+segment type so the compiler's `Vec<String>` is used directly.
+
+Removed per execution: the `String` operand push, the `Swap`, the `as_string()`
+deep copy of the literal's `Arc<String>`, the `split('.')` `Vec`, the clone of
+the stored value, and the `Pop` — four ops become one.
+
+### It measured 2-3%, not the 30% the allocation count suggested
+
+| shape | v0.670.0 | after | Δ |
+|---|---|---|---|
+| `request.zz.y = i` | 157.2 | 153.0 | −2.7% |
+| `variables.st.w7 = i` | 188.8 | 185.3 | −1.9% |
+| `variables.st.deep.k = i` | 211.7 | 208.1 | −1.7% |
+| `o.a.b = i` (bare root) | 188.5 | 187.6 | −0.5% |
+| every shape NOT using the op | — | — | inside the spread |
+
+(ns per iteration; two independent 6-round interleaved ABBA batches, medians;
+consistent in sign and magnitude across both, with the control rows at zero.)
+
+**So the path handling was never the cost of a nested scope write.** What is
+left — roughly 110 ns for `variables.st.w7 = i` after §103 — is
+`scope_aware_load` resolving the root, the in-place walk through the
+intermediates, and `scope_aware_store` putting the root back. That is where the
+next attempt should go; do not rebuild this one expecting more.
+
+### ⚠️ The trap: an operand inside a struct is invisible to op-level scans
+
+Two scanners decide whether a frame needs the EAGER `arguments` struct
+(`function_needs_arguments_scope`, `args_never_escapes`), and both do it by
+looking for a `BytecodeOp::String` whose text names the scope — that is how
+`isDefined("arguments.rc.status")` and `evaluate()` are caught. Moving the path
+from a `String` operand into `SetScopePath`'s struct made it invisible to both,
+so a frame containing `param default="" name="arguments.rc.status"` silently took
+the LAZY path: `scope_aware_load("arguments", …)` rebuilt an empty scope, the
+walk vivified a fresh `rc`, and the write never reached the caller's struct.
+Masa and Mura `param` dozens of these per request.
+
+`Self::path_names_arguments_scope` is now shared by both scanners and applied to
+`SetScopePath`'s path as well as to `String`. The general rule: **when a new
+opcode absorbs an operand that a static scan used to read off the stack, every
+scan that read it has to learn the new shape.** Caught by
+`tests/core/test_param_attr_order.cfm` and the nested-`arguments` `isDefined`
+suite — nothing else, and no review would have found it.
+
+---
+
+## 105. The `arguments` scope omitted declared-but-unpassed parameters; `structAppend(…, false)` skipped a null-valued key; an error escaping a dynamic include inside `lock {}` surfaced as "No exception to rethrow" (fixed v0.671.0) 📌
+
+Three Lucee divergences, found and fixed together because the first exposed the
+other two. All verified against Lucee 7.1 with probes run on both engines.
+
+### 1. The scope holds one entry per DECLARED parameter
+
+`function f( a, b, c )` called as `f( 1 )`:
+
+| | Lucee 7.1 | before | now |
+|---|---|---|---|
+| `structCount( arguments )` | 3 | 1 | **3** |
+| `structKeyList` / `structKeyArray` / for-in | `a,b,c` | `a` | **`a,b,c`** |
+| `arguments.len()` | 3 | 1 | **3** |
+| `serializeJSON( arguments )` | `{"a":1,"b":null,"c":null}` | `{"a":1}` | **matches** |
+| `structCopy` / `duplicate` / `structAppend` out | 3 keys | 1 | **3** |
+| `structKeyExists( arguments, "b" )` | false | false | false |
+| `isDefined( "arguments.b" )` | false | **true** (after the change, until fixed) | **false** |
+| reading `arguments.b` | null — concatenates as `""`, `len()` 0 | null | null |
+
+An omitted parameter is a key holding null, in declaration order; defaulted
+parameters count too. The existence checks still say "absent". Two interlocks
+moved with it: omission detection (`JumpIfArgPresent`) is now "absent **or
+null**", or no default would ever apply; and `isDefined` treats a null-valued
+key as undefined, which is also what `structKeyExists` already did.
+
+**A probe artefact worth recording.** The first probe funnelled every read
+through a helper — `out( label, arguments.b )` — and Lucee threw, so the read
+was briefly changed to throw. That broke `test_preside_boot_lang_fixes.cfm`,
+which asserts the opposite with a real Preside path behind it. Re-probing the
+exact shape settled it: Lucee does **not** throw on the read; it throws when
+that null is *passed as an argument* to another function, which is argument
+binding, not the read. Reverted; the test file was right.
+
+### 2. `structAppend( target, defaults, false )` must fill a null-valued key
+
+Lucee counts a key holding null as *lacking* for `overwrite=false`, so the
+Wheels idiom `$args( name, args=arguments )` → `structAppend( arguments,
+defaults, false )` fills an omitted parameter's default. We tested presence
+only, so the null rode through `save()` → `invokeWithTransaction` → `$invoke`
+into `$save( required parameterize )` and every model save in the Wheels suite
+died with "The parameter [parameterize] to function [$save] is required but was
+not passed in". Reverse direction unchanged: `structAppend( d, arguments, true )`
+copies the nulls through, as Lucee does.
+
+### 3. A dynamic include's error path never set the exception register
+
+Codegen synthesises a `Rethrow` for the cleanup arm of `lock {}` and `try {}
+finally {}`. When an error escaped a **dynamic** include (`include "#path#"`),
+the handler jumped into that arm without setting `last_exception`, so the
+synthesised rethrow raised "No exception to rethrow" and the real message was
+lost. Every other catch-entry path set the register; this one now does too.
+This is what turned the Wheels failure above into an unreadable one — the
+suite runs under `lock { include "#arguments.targetPage#"; }` in `onRequest`.
+
+### 4. …and the real-app check found a fourth: a null entry must not SHADOW the chain
+
+The suite gates were green and Preside would not boot: "cannot call method
+[isIgnored] on a null value" at `HandlerService.getHandlerListing`, which
+declares `any ignoreFileService`, is usually called without it, and expects the
+bare name to reach `variables.ignoreFileService`. Lucee's `UndefinedImpl.get()`
+walks local → arguments → variables and treats a null argument as "not here";
+two of our paths did not:
+
+* the bare-name chain (`lookup_name_in_scopes`) returned the null entry from
+  the arguments scope instead of continuing to `variables`;
+* the `arguments.x = v` write-back re-mirrors every arguments key into the
+  frame's locals, so the null entry became a null bare *local* — which then
+  shadowed everything for the rest of the body. That is the one that bit
+  Preside (`arguments.directory = replace( … )` two lines above the read).
+
+Both now skip null entries. Probed on Lucee 7.1 across page and CFC frames,
+lazy and eager, with and without the write-back, from the pseudo-constructor
+and after it: identical on every row. Pinned by four more assertions in
+`test_arguments_scope_shape.cfm` (28 total). **A parity change to a scope's
+shape has to be checked against every consumer of that shape, and the real
+app found the one the suites did not.**
+
+### How it was found
+
+Bisected with an env gate on the one seeding line (off: Wheels 2737/3/0; on:
+suite dead). Then eliminated in turn: the `isDefined` half, the rethrow
+machinery, the catch-variable lookup (zero misses), a new exception (both
+catch branches instrumented: 16 events off, **one** on — the rethrow itself),
+for-in iteration (hidden, still dead), and five argument-forwarding shapes
+(byte-identical). Tagging every one of the 23 jump-to-catch sites named the
+dynamic-include path in one run; setting the register there produced the
+real message; the message named `$args`; a five-row `structAppend` probe on
+both engines showed row A.
+
+Pinned by `tests/core/test_arguments_scope_shape.cfm` (28),
+`test_struct_append_null_keys.cfm` (8) and
+`test_rethrow_across_dynamic_include.cfm` (2). Gates: CLI 9077/9077 · serve
+dev+prod cold+warm 9209/9209 ×4 · `cargo test --workspace` 714/0/5 · wasm32 +
+wasm-pack · TestBox 415/0/0 +22 · Wheels 2737/3/0 +16.
+
+Still open from the same list: `structDelete( arguments, "a" )` does not clear
+the bare name (Lucee does, and a later bare write does not resurrect the key);
+error-message wording; `a &= "X"` write-through under `localmode="modern"`; and
+the bracket read `st["missing"]`, which throws on Lucee and returns quietly
+here.

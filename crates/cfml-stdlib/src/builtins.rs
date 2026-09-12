@@ -3842,7 +3842,16 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
                 {
                     continue;
                 }
-                if overwrite || struct_find_key_ci(a, k.as_str()).is_none() {
+                // `overwrite=false` fills a key the target LACKS — and Lucee 7.1
+                // counts a key holding NULL as lacking: `structAppend( arguments,
+                // defaults, false )` fills a declared-but-omitted parameter (the
+                // scope holds a null entry for it) exactly as it fills a missing
+                // key. Wheels' `$args` → `structAppendDefaults` relies on this for
+                // every model call; with "present" alone the null rode through to
+                // a `required` parameter and every `save()` failed.
+                if overwrite
+                    || matches!(a.get_ci(k.as_str()), None | Some(CfmlValue::Null))
+                {
                     a.insert(k, v);
                 }
             }

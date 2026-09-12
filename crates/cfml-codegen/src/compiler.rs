@@ -410,6 +410,7 @@ impl BytecodeFunction {
                 | BytecodeOp::DefineFunction(_)
                 | BytecodeOp::DefineComponentMethods(_)
                 | BytecodeOp::SetDynamicVar
+                | BytecodeOp::SetScopePath(_)
                 | BytecodeOp::UnsetPath(_)
                 | BytecodeOp::DeleteScopeKey(_)
                 | BytecodeOp::ArrayAppendLocal(_)
@@ -529,6 +530,23 @@ impl BytecodeFunction {
                 // which is exactly the by-name channel slots cannot survive.
                 // A genuinely runtime-computed path (`"#scope#.#prop#" = v`)
                 // also stays wholesale — the name isn't knowable here.
+                // Pre-split literal path (the common nested-write shape). The
+                // root is right here, so the narrowing below needs no peephole
+                // over the two preceding ops.
+                BytecodeOp::SetScopePath(sp) => {
+                    let root = sp
+                        .parts
+                        .first()
+                        .map(|r| r.to_lowercase())
+                        .unwrap_or_default();
+                    if !slot_dynvar_narrowing_enabled() || root.is_empty() || root == "local" {
+                        self.count_slot_class(SlotClass::DisqOther(DisqReason::DynVar), Some(i));
+                        return;
+                    }
+                    if !SCOPE_NAMES.contains(&root.as_str()) {
+                        excluded.insert(root);
+                    }
+                }
                 BytecodeOp::SetDynamicVar => {
                     let literal_root = (i >= 2)
                         .then(|| (&self.instructions[i - 2], &self.instructions[i - 1]))
@@ -919,6 +937,32 @@ pub struct ComponentMethods {
     pub gids: Vec<usize>,
 }
 
+/// A compile-time-known scope/variable assignment path, pre-split into its
+/// segments. Carried by [`BytecodeOp::SetScopePath`].
+///
+/// `store_runtime_path` walks a path segment by segment; the compiler already
+/// has those segments when it builds the target, so joining them into a dotted
+/// string for the runtime to split again was pure waste — a `Vec` allocation and
+/// a scan on every execution of the statement. `path` is kept because the
+/// null-assignment branch still routes through the string-based
+/// `check_scope_path_writable` / `delete_scope_path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopePath {
+    /// The full dotted path, exactly as the old `String` operand spelled it.
+    pub path: String,
+    /// `path` split on `.`, in source casing. Never empty; always >= 2 segments
+    /// (a single-segment target never reaches this op).
+    pub parts: Vec<String>,
+}
+
+impl ScopePath {
+    /// Split `path` on `.` and keep both forms.
+    pub fn new(path: String) -> Self {
+        let parts = path.split('.').map(|s| s.to_string()).collect();
+        ScopePath { path, parts }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum BytecodeOp {
     // Literals
@@ -1126,6 +1170,23 @@ pub enum BytecodeOp {
     /// the assigned value on the stack. Lucee/ACF semantics; WireBox's
     /// MixerUtil.injectPropertyMixin relies on this.
     SetDynamicVar,
+    /// Fused `String(path); Swap; SetDynamicVar; Pop` for the case the compiler
+    /// can see statically: a nested assignment two or more levels below a scope
+    /// or a bare root (`variables.a.b = v`, `request.a.b = v`, `o.a.b = v`),
+    /// whose path is a compile-time literal. Stack: [value] -> [] (the value is
+    /// consumed; the old sequence pushed it back only for the `Pop` that
+    /// followed).
+    ///
+    /// The segments are split HERE, once, instead of being joined into a dotted
+    /// string that `store_runtime_path` re-split on every execution — which also
+    /// cost a `Vec`, an `as_string()` deep copy of the literal's `Arc<String>`,
+    /// and a clone of the stored value for the push-back. `SetDynamicVar` stays
+    /// for genuinely runtime-computed paths (`"##scope##.##prop##" = v`).
+    ///
+    /// Carries the joined path too: the Null branch (CFML null-assignment
+    /// deletes rather than stores) still reaches the string-based
+    /// `check_scope_path_writable` / `delete_scope_path`.
+    SetScopePath(std::sync::Arc<ScopePath>),
     /// Delete a variable / scope path (CFML null-assignment semantics). Assigning
     /// the result of a function that returns null/void (`x = voidFn()`) must NOT
     /// create the target key, and must DELETE a pre-existing one — the assigned
@@ -1513,11 +1574,12 @@ impl BytecodeOp {
             Self::BuildStructStatic(..) => 126,
             Self::LoadArgKey(..) => 127,
             Self::TryLoadArgKey(..) => 128,
+            Self::SetScopePath(..) => 129,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 129] = [
+    pub const CENSUS_NAMES: [&'static str; 130] = [
         "Null",
         "True",
         "False",
@@ -1647,6 +1709,7 @@ impl BytecodeOp {
         "BuildStructStatic",
         "LoadArgKey",
         "TryLoadArgKey",
+        "SetScopePath",
     ];
 }
 
@@ -2974,22 +3037,23 @@ impl CfmlCompiler {
                         // elsewhere. Stack on entry is [value]; SetDynamicVar wants
                         // [path, value], so push the path and Swap.
                         if let Some(path) = Self::scope_rooted_nested_path(obj, member) {
-                            instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
-                            instructions.push(BytecodeOp::Swap);
-                            instructions.push(BytecodeOp::SetDynamicVar);
-                            // SetDynamicVar pushes the value back; this is a
-                            // statement, so discard it.
-                            instructions.push(BytecodeOp::Pop);
+                            // The path is a compile-time literal, so split it
+                            // here rather than emitting a string for
+                            // `store_runtime_path` to split on every execution —
+                            // see `SetScopePath`, which also consumes the value
+                            // instead of pushing it back for a `Pop`.
+                            instructions.push(BytecodeOp::SetScopePath(
+                                std::sync::Arc::new(ScopePath::new(path)),
+                            ));
                         } else if let Some(path) = Self::bare_rooted_nested_path(obj, member) {
                             // Undeclared bare root ≥2 levels deep
                             // (`copies.request.cgi = v`): same auto-vivifying
                             // runtime store as the scope-rooted case, so the
                             // missing `copies` container is created instead of
                             // throwing "Variable 'copies' is undefined".
-                            instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
-                            instructions.push(BytecodeOp::Swap);
-                            instructions.push(BytecodeOp::SetDynamicVar);
-                            instructions.push(BytecodeOp::Pop);
+                            instructions.push(BytecodeOp::SetScopePath(
+                                std::sync::Arc::new(ScopePath::new(path)),
+                            ));
                         } else if let Expression::Identifier(ref ident) = **obj {
                             if !is_reserved_scope_name(&ident.name) {
                                 instructions.push(BytecodeOp::StoreLocalProperty(Name::from(&ident.name),Name::from(&member),

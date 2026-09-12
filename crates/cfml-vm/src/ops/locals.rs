@@ -205,7 +205,11 @@ pub(crate) fn op_jump_if_arg_present(
     // only the params the caller passed, never carried enclosing
     // vars). `contains` uses the pre-lowercased key.
     let supplied = match locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
-        Some(CfmlValue::Struct(a)) => a.contains_key_ci(name),
+        // PRESENT-AND-NOT-NULL, not merely present: the eager scope now carries a
+        // null entry for every declared-but-omitted parameter (Lucee 7.1 shape —
+        // see the binding loop's `None` arm), so a bare `contains_key` would
+        // report every omitted param as supplied and no default would ever apply.
+        Some(CfmlValue::Struct(a)) => !matches!(a.get_ci(name.as_str()), None | Some(CfmlValue::Null)),
         _ => {
             // Bit per declared-param index (see `arguments_supplied_bits` in
             // the prologue); the set only holds indices 64 and up.
@@ -303,8 +307,17 @@ pub(crate) fn op_load_arg_key(
             Some(v) => stack.push(v),
             None if tolerant => stack.push(CfmlValue::Null),
             None => {
-                // A DECLARED parameter the caller omitted reads as Null on both
-                // engines; only an undeclared key is an error.
+                // A DECLARED parameter the caller omitted reads as NULL on both
+                // engines — it concatenates as "", `len()` is 0, and a plain
+                // assignment yields null (verified against Lucee 7.1; Preside's
+                // FeatureService.isFeatureEnabled recurses on exactly this). Only
+                // an UNDECLARED key is an error.
+                //
+                // Lucee throws only when such a null is PASSED AS AN ARGUMENT to
+                // another function, which is a property of argument binding, not
+                // of this read. Do not "fix" the read: a probe that funnels the
+                // value through a helper call sees that throw and looks like the
+                // read threw. It doesn't.
                 if func.param_keys().iter().any(|k| k == name.key()) {
                     stack.push(CfmlValue::Null);
                 } else {
