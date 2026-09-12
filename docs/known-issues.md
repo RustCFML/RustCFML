@@ -1,6 +1,6 @@
 # Known Issues & Unsupported Behaviour
 
-What RustCFML **does not fully do**, as of **v0.610.0**.
+What RustCFML **does not fully do**, as of **v0.672.0**.
 
 Sections are grouped by *what it means for you*, not by when they were found. Section
 numbers (`§1`, `§27`, …) are permanent IDs — they are cited from commits and issues, so
@@ -40,6 +40,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [7](#7) | Partially-ignored function/tag parameters | 🔇 open |
 | [27](#27) | Tag attributes dropped at lowering (`cfqueryparam`, `cfstoredproc`) | 🔇 open |
 | [30](#30) | Java shims — remaining gaps | 🔇/🛑 open |
+| [107](#107) | `st["missing"]` / `arr[9]` out-of-range bracket reads return quietly (Lucee throws) | 🔇 open |
 
 **Part B — Unsupported, fails loudly (open) 🛑**
 
@@ -57,6 +58,9 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
 | [39](#39) | `.cfconfig.json` placeholders expand single-pass (GH #306) | 🌟 won't-fix |
+| [108](#108) | Undefined-variable / missing-key / no-such-function error wording differs from Lucee | 🌟 to fix |
+| [109](#109) | `a &= "X"` on a parameter under `localmode="modern"` does not write through to `arguments` | 🌟 to fix |
+| [110](#110) | Bare write to a DELETED parameter stays frame-local (Lucee: `variables`) | 🌟 deferred |
 
 **Part D — Implemented, with documented edges 🏗**
 
@@ -261,6 +265,16 @@ which classes and methods exist at all — see `docs/java-shims.md`.
 
 ---
 
+<a id="107"></a>
+## 107. `st["missing"]` and out-of-range `arr[9]` bracket reads return quietly — Lucee throws 🔇
+
+Reading a missing key with bracket syntax (`st["missing"]`) or an array index past
+the end (`arr[9]` on a two-element array) yields an empty/null value here. Lucee 7.1
+throws `key [missing] doesn't exist` and `Array index [9] out of range, array size is
+[2]`. The dot form (`st.missing`) already throws on both. Silent because code that
+mistypes a bracket key looks like it works. Found 2026-09-12 while probing §105; on
+the fix list with §108 (its message wording).
+
 # Part B — Unsupported, fails loudly (open) 🛑
 
 Genuinely not implemented, but it throws a clear message. Safe to ship against — you
@@ -453,6 +467,38 @@ not to add a second pass. Pinned by `env_value_with_dollar_brace_is_not_recursed
 `crates/cfml-config/src/env.rs`. See also `docs/configuration.md`.
 
 ---
+
+<a id="108"></a>
+## 108. Error-message wording for undefined variables, missing keys and unknown functions differs from Lucee 🌟 *(to fix)*
+
+Lucee 7.1: `variable [X] doesn't exist`, `key [X] doesn't exist`, the arguments
+and request scope variants (`key [X] doesn't exist in arguments scope` /
+`… in request scope`), and `No matching function [F] found`. Identifier keys are
+upper-cased in the message, bracket literals keep their casing. We say
+`Variable 'x' is undefined` and similar. 76 engine sites emit these; 3 test
+assertions pin the current text. Application code that matches on
+`cfcatch.message` (Preside/ColdBox do in places) sees a different string.
+
+<a id="109"></a>
+## 109. `a &= "X"` on a parameter under `localmode="modern"` does not write through to `arguments` 🌟 *(to fix)*
+
+Probed on Lucee 7.1: in modern localmode a bare `a = …`, `a += 1` and `a++` on a
+parameter are LOCAL writes that leave `arguments.a` alone (we match, §102), but
+`a &= "X"` DOES update `arguments.a`. We lower `&=` exactly like `a = a & "X"`,
+so the argument stays at its passed value. Matching needs `&=` to stop lowering
+as a plain reassign (its own op or a marker) — decided 2026-09-12: match Lucee,
+inconsistency included.
+
+<a id="110"></a>
+## 110. A bare write to a DELETED parameter stays frame-local; Lucee sends it to `variables` 🌟 *(deferred)*
+
+After `structDelete( arguments, "a" )` (§106) a later bare `a = "x"` is no longer
+a parameter write on either engine. In classic localmode Lucee therefore stores
+it in the `variables` scope; we keep it in the frame's locals. Observable only as
+`variables.a` after the call. Closing it means the classic-mode store routing
+(eight `func.params` checks in the frame prologue) consulting a per-frame
+"detached parameter" set — a hot-path change that needs its own A/B (see §102's
+2% note), so parked.
 
 # Part D — Implemented, with documented edges 🏗
 
@@ -3321,11 +3367,10 @@ argument on both engines, so this is gated on the mode. A modern-mode frame that
 rebinds a parameter keeps its eager struct, that being the only place the
 original argument still exists after the write.
 
-One divergence is left here, and it is Lucee disagreeing with itself: `a &= "X"`
-writes through to `arguments` there, while `a += 1` and `a++` do not. We give
-the self-consistent answer. `&=` has no distinct opcode in our codegen — it
-lowers exactly like `a = a & "X"`, which Lucee itself treats as local-only — so
-matching it would mean inventing an opcode to reproduce the inconsistency.
+One divergence is left here: `a &= "X"` writes through to `arguments` on Lucee,
+while `a += 1` and `a++` do not. `&=` has no distinct opcode in our codegen — it
+lowers exactly like `a = a & "X"`, which Lucee treats as local-only. Tracked as
+§109; the decision (2026-09-12) is to match Lucee.
 
 ⚠️ **Where a clause sits in the frame prologue is worth 2%.** The modern-mode
 test, added to the eager-arguments decision, made CFC method calls 2.0-2.4%
