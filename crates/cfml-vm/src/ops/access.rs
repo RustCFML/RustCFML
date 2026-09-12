@@ -535,7 +535,9 @@ pub(crate) fn op_set_property(
             // GitHub #372: refuse a write into a read-only scope struct (`cgi`).
             // The mark rides on the struct, so this catches the scope reached
             // under any name and at any depth of the receiver chain.
-            obj.check_struct_writable(&name.to_uppercase())?;
+            if obj.is_read_only_struct() {
+                obj.check_struct_writable(&name.to_uppercase())?;
+            }
             // Phase C.3 — Slice 3: `instance.x = v` writes the public
             // DATA map in place (shared Arc → persists on the instance).
             // A CFC with a `rust:` native parent routes writes the
@@ -616,12 +618,26 @@ pub(crate) fn op_set_property(
                         if let Some(CfmlValue::Struct(vars)) =
                             s.get(&*cfml_common::key::well_known::VARIABLES)
                         {
-                            vars.insert(name, value.clone());
+                            vars.insert(name.key(), value.clone());
                         }
                     }
                 }
             }
-            obj.set(name.to_string(), value);
+            // `st.foo = v` is the commonest struct write in CFML, and
+            // `CfmlValue::set` takes an owned `String`: `name.to_string()`
+            // allocated and copied the identifier, then `Key::from_string`
+            // copied it AGAIN into the key's `Arc<str>`, only for the insert to
+            // drop that key because the entry already existed. The compiled
+            // `Name` already carries the interned `Key` (`Name::key`), so the
+            // struct case clones it — no allocation, no hashing. Arrays and
+            // query columns still need the string form (numeric parse /
+            // `set_column`), and they are not the hot path.
+            match &obj {
+                CfmlValue::Struct(s) => {
+                    s.insert(name.key(), value);
+                }
+                _ => obj.set(name.to_string(), value),
+            }
             stack.push(obj);
         }
     }

@@ -12192,7 +12192,9 @@ impl CfmlVirtualMachine {
                                 continue;
                             }
                             if let Some(s) = entry.as_cfml_struct() {
-                                s.insert(prop_name.to_string(), value);
+                                // `Name::key` — the interned key, so no string is
+                                // allocated and nothing is hashed (see op_set_property).
+                                s.insert(prop_name.key(), value);
                             }
                             continue;
                         }
@@ -12263,12 +12265,16 @@ impl CfmlVirtualMachine {
                             // through ANY name — the scope itself, or a local
                             // holding it (`local.c = cgi; local.c.x = 1`), which is
                             // why the mark is on the struct and not on the name.
-                            if let Err(e) = obj.check_struct_writable(&prop_name.to_uppercase()) {
+                            if let Err(e) = if obj.is_read_only_struct() {
+                                obj.check_struct_writable(&prop_name.to_uppercase())
+                            } else {
+                                Ok(())
+                            } {
                                 ip = self.route_call_error(e, &mut stack)?;
                                 continue;
                             }
                             if let Some(s) = obj.as_cfml_struct() {
-                                s.insert(prop_name.to_string(), value);
+                                s.insert(prop_name.key(), value);
                             } else {
                                 return Err(CfmlError::runtime(format!(
                                     "Cannot set property '{}' on non-struct in local '{}'",
@@ -12339,17 +12345,26 @@ impl CfmlVirtualMachine {
                                 // (struct backing or the instance's public data map),
                                 // so this write is visible through `variables.<name>`.
                                 // `set` handles both Struct and flyweight Instance.
-                                if let Err(e) = existing.check_struct_writable(&prop_name.to_uppercase()) {
+                                if let Err(e) = if existing.is_read_only_struct() {
+                                    existing.check_struct_writable(&prop_name.to_uppercase())
+                                } else {
+                                    Ok(())
+                                } {
                                 ip = self.route_call_error(e, &mut stack)?;
                                 continue;
                             }
-                                existing.set(prop_name.to_string(), value);
+                                match &existing {
+                                    CfmlValue::Struct(st) => {
+                                        st.insert(prop_name.key(), value);
+                                    }
+                                    _ => existing.set(prop_name.to_string(), value),
+                                }
                             } else {
                                 // Auto-vivification: assigning to a member path of a
                                 // variable that does not yet exist creates that variable
                                 // as a struct, matching Lucee/ACF/BoxLang.
                                 let mut s = ValueMap::default();
-                                s.insert(prop_name.to_string(), value);
+                                s.insert(prop_name.key(), value);
                                 // Inside a CFC method under classic localmode, an
                                 // unscoped write belongs to the component (variables)
                                 // scope — so sibling methods AND super/override
@@ -12370,13 +12385,13 @@ impl CfmlVirtualMachine {
                                         .and_then(|v| v.as_cfml_struct())
                                         .map(|vars| {
                                             vars.insert(
-                                                local_name.to_string(),
+                                                local_name.key(),
                                                 CfmlValue::strukt(s.clone()),
                                             );
                                         })
                                         .is_some();
                                 if !vivd_into_variables {
-                                    locals.insert(local_name.to_string(), CfmlValue::strukt(s));
+                                    locals.insert(local_name.key(), CfmlValue::strukt(s));
                                 }
                             }
                         }
@@ -23294,10 +23309,12 @@ impl CfmlVirtualMachine {
         locals: &mut ValueMap,
         modern: bool,
     ) {
-        let name_lower = name.to_lowercase();
+        // `eq_ignore_ascii_case`, not `to_lowercase()`: a scope name is a short
+        // ASCII identifier and this runs on every scope-path store.
+        let name_is = |s: &str| name.eq_ignore_ascii_case(s);
         // GH #351: see `scope_aware_load` — at page level `local` is a plain
         // variable, so the whole-scope merge below must not fire there.
-        if name_lower == "local" && self.current_frame_has_local_scope() {
+        if name_is("local") && self.current_frame_has_local_scope() {
             // `local` is always the function-local scope — merge into locals, NOT __variables.
             if let CfmlValue::Struct(s) = val {
                 let saved_vars = locals.get(&*cfml_common::key::well_known::VARIABLES).cloned();
@@ -23308,17 +23325,30 @@ impl CfmlVirtualMachine {
                     locals.insert("__variables".to_string(), v);
                 }
             }
-        } else if name_lower == "variables" {
+        } else if name_is("variables") {
             if let CfmlValue::Struct(s) = val {
-                if locals.contains_key(&*cfml_common::key::well_known::VARIABLES) {
-                    locals.insert("__variables".to_string(), CfmlValue::Struct(s));
+                if let Some(CfmlValue::Struct(cur)) =
+                    locals.get(&*cfml_common::key::well_known::VARIABLES)
+                {
+                    // A nested scope-path write (`variables.a.b = v`) walks the
+                    // scope struct IN PLACE, so the value arriving here is the
+                    // handle already stored. Re-inserting it allocated a key,
+                    // and — worse — bumped `locals.version()`, invalidating the
+                    // FrameScopeCache so the frame's very next `variables.x`
+                    // read had to rebuild it. Skip the store when nothing moved.
+                    if cur.backing_ptr() != s.backing_ptr() {
+                        locals.insert(
+                            cfml_common::key::well_known::VARIABLES.clone(),
+                            CfmlValue::Struct(s),
+                        );
+                    }
                 } else {
                     for (k, v) in s.iter() {
                         locals.insert(k.clone(), v.clone());
                     }
                 }
             }
-        } else if name_lower == "application" {
+        } else if name_is("application") {
             if let CfmlValue::Struct(s) = &val {
                 if let Some(ref app_scope) = self.application_scope {
                     // Self-alias guard (see StoreLocal application): skip storing
@@ -23329,7 +23359,7 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
-        } else if name_lower == "request" {
+        } else if name_is("request") {
             if let CfmlValue::Struct(s) = &val {
                 // Self-alias guard (see application above): `request` is now a live
                 // handle (StoreLocal/LoadLocal return request_scope.clone()), so a
@@ -23341,7 +23371,7 @@ impl CfmlVirtualMachine {
                     self.request_scope.with_write(|m| *m = snap);
                 }
             }
-        } else if name_lower == "server" {
+        } else if name_is("server") {
             // `server` is a live handle (see live_server_scope): SetProperty/
             // SetIndex already mutated the persistent backing in place, so a
             // matching-backing writeback is a self-alias no-op (copying it onto
@@ -23358,7 +23388,7 @@ impl CfmlVirtualMachine {
                     });
                 }
             }
-        } else if name_lower == "thread" {
+        } else if name_is("thread") {
             // `thread.x = y` writeback. A real local var or the cfthread scope
             // (globals["thread"]) wins; otherwise commit to the page-level soft
             // scope field. Keeps cfthread's transient globals["thread"] separate.
@@ -23376,7 +23406,7 @@ impl CfmlVirtualMachine {
                     self.page_thread_scope.with_write(|m| *m = snap);
                 }
             }
-        } else if name_lower == "session" {
+        } else if name_is("session") {
             // Commit the (whole) session scope back so nested writes routed
             // through store_runtime_path persist into the SessionData. `val`
             // is the full session struct loaded via get_session_scope above,
@@ -23384,7 +23414,7 @@ impl CfmlVirtualMachine {
             if let CfmlValue::Struct(s) = &val {
                 let _ = self.set_session_scope(s.snapshot());
             }
-        } else if name_lower == "static" {
+        } else if name_is("static") {
             if let CfmlValue::Struct(s) = val {
                 if let Some(h) = self.find_static_scope(locals) {
                     // Shared handle present: commit back unless `s` IS the handle
@@ -23405,7 +23435,7 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
-        } else if name_lower == "arguments" && locals.contains_key(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+        } else if name_is("arguments") && locals.contains_key(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
             // Write back the arguments scope under its reserved key (so an
             // `arguments.x = …` round-trip doesn't fork a literal "arguments"
             // key, which belongs to a user `local.arguments` var).
@@ -23417,7 +23447,7 @@ impl CfmlVirtualMachine {
             // that declared `var rscheck` created a stray `rsCheck` while the
             // `var rscheck` stayed empty (Mura/Masa dbUtility.version()).
             locals.insert(existing, val);
-        } else if Self::is_web_request_scope(&name_lower) {
+        } else if Self::is_web_request_scope(name) {
             // Request-global web scopes commit to `self.globals`, never a
             // component `variables` scope (see is_web_request_scope). Without
             // this a `url.path = x` writeback inside a classic-localmode CFC
@@ -23428,7 +23458,9 @@ impl CfmlVirtualMachine {
             // Captured name in a lexical closure frame: updated where it lives.
         } else if !modern
             && locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
-            && !matches!(name_lower.as_str(), "cfcatch" | "cookie" | "server" | "attributes")
+            && !["cfcatch", "cookie", "server", "attributes"]
+                .iter()
+                .any(|s| name.eq_ignore_ascii_case(s))
         {
             // Classic-localmode CFC method frame: an unscoped bare name that is
             // NOT a frame-local belongs to the component (`variables`) scope —
@@ -23491,7 +23523,7 @@ impl CfmlVirtualMachine {
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {
                         let ns = CfmlValue::strukt(ValueMap::default());
-                        s.insert((*k).to_string(), ns.clone());
+                        s.insert(*k, ns.clone());
                         ns
                     }
                 },
@@ -23514,7 +23546,9 @@ impl CfmlVirtualMachine {
         }
         match &cur {
             CfmlValue::Struct(s) => {
-                s.insert((*leaf).to_string(), value);
+                // `&str`, not `to_string()`: the insert probes with a borrowed
+                // key and only allocates when the key is genuinely new (§103).
+                s.insert(*leaf, value);
             }
             CfmlValue::Instance(inst) => {
                 inst.read().set_public_member((*leaf).to_string(), value);
@@ -23547,7 +23581,12 @@ impl CfmlVirtualMachine {
             // GitHub #372: refuse a write into a read-only scope (`cgi`) before
             // any of the walks below mutate it. Checked on the RESOLVED root, so
             // it also catches the path reaching the scope under another name.
-            root.check_struct_writable(&parts[1].to_uppercase())?;
+            // The key is only needed to NAME the key in the error, so build it
+            // lazily — otherwise every scope-path write allocates and upper-cases
+            // a string for a message that is essentially never emitted (§103).
+            if root.is_read_only_struct() {
+                root.check_struct_writable(&parts[1].to_uppercase())?;
+            }
             // A Rust-backed object root (e.g. the live `socket` handle): descend
             // through its `CfmlNative` accessors instead of rebuilding the path
             // as a plain struct — otherwise `socket.data.x = v` would replace the
@@ -23619,12 +23658,14 @@ impl CfmlVirtualMachine {
             // sibling methods/closures see it — exactly like StoreLocal's
             // unscoped-write rule. Otherwise (reserved scope, already-present
             // root, or modern localmode) defer to scope_aware_store.
-            let scope_lc = scope.to_lowercase();
-            let is_reserved_store_scope = matches!(
-                scope_lc.as_str(),
-                "local" | "variables" | "application" | "request"
-                    | "thread" | "session" | "static" | "arguments"
-            );
+            // `eq_ignore_ascii_case`, not `to_lowercase()`: this runs on every
+            // scope-path write and the allocation bought nothing.
+            let is_reserved_store_scope = [
+                "local", "variables", "application", "request",
+                "thread", "session", "static", "arguments",
+            ]
+            .iter()
+            .any(|s| scope.eq_ignore_ascii_case(s));
             // Undeclared named argument (ColdBox `preHandler` prc/rc): the modified
             // root belongs in the arguments scope, mirroring the read cascade + the
             // StoreLocal / StoreLocalProperty rules. scope_aware_load returned the

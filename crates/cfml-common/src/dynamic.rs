@@ -39,8 +39,35 @@ pub struct ValueMap(RawValueMap, u32);
 
 /// Types that can be turned into an owned [`Key`] for insertion. Passing a
 /// `Key` moves it (no hash, no allocation); passing a string builds one.
+///
+/// # Why there is a second method
+///
+/// Building a `Key` from a string ALLOCATES: `Arc<str>` cannot adopt a
+/// `String`'s buffer (it needs the refcount header inline), so `Key::new` /
+/// `Key::from_string` is one malloc plus a copy, and — when the key turns out
+/// to be already present — one free straight afterwards, because
+/// `IndexMap::insert` keeps the key it already stores and drops the new one.
+/// Overwriting an existing key is the COMMON case for a CFML struct
+/// (`st[k] = v` in a loop, a scope key rewritten each request), so
+/// [`IntoKey::insert_into`] probes with a non-allocating [`KeyRef`] first and
+/// only builds the owned key on a genuine miss.
+///
+/// The default body is the old behaviour, and it is what the `Key`/`&Key`
+/// impls keep: cloning an existing `Key` is an atomic increment, so
+/// probe-then-insert would only add a second lookup on the miss path.
 pub trait IntoKey {
     fn into_key(self) -> Key;
+
+    /// Insert `value` under this key, replacing any existing entry's value and
+    /// keeping the stored key (CFML's first-written-casing rule). Semantically
+    /// identical to `map.insert(self.into_key(), value)`.
+    #[inline]
+    fn insert_into(self, map: &mut RawValueMap, value: CfmlValue) -> Option<CfmlValue>
+    where
+        Self: Sized,
+    {
+        map.insert(self.into_key(), value)
+    }
 }
 
 impl IntoKey for Key {
@@ -62,6 +89,17 @@ impl IntoKey for String {
     fn into_key(self) -> Key {
         Key::from_string(self)
     }
+
+    #[inline]
+    fn insert_into(self, map: &mut RawValueMap, value: CfmlValue) -> Option<CfmlValue> {
+        {
+            let probe = KeyRef::new(self.as_str());
+            if let Some(slot) = map.get_mut(&probe) {
+                return Some(std::mem::replace(slot, value));
+            }
+        }
+        map.insert(Key::from_string(self), value)
+    }
 }
 
 impl IntoKey for &str {
@@ -69,12 +107,27 @@ impl IntoKey for &str {
     fn into_key(self) -> Key {
         Key::new(self)
     }
+
+    #[inline]
+    fn insert_into(self, map: &mut RawValueMap, value: CfmlValue) -> Option<CfmlValue> {
+        let probe = KeyRef::new(self);
+        if let Some(slot) = map.get_mut(&probe) {
+            return Some(std::mem::replace(slot, value));
+        }
+        // The probe already folded and hashed the name — reuse it.
+        map.insert(probe.to_key(), value)
+    }
 }
 
 impl IntoKey for &String {
     #[inline]
     fn into_key(self) -> Key {
         Key::new(self.as_str())
+    }
+
+    #[inline]
+    fn insert_into(self, map: &mut RawValueMap, value: CfmlValue) -> Option<CfmlValue> {
+        self.as_str().insert_into(map, value)
     }
 }
 
@@ -208,7 +261,7 @@ impl ValueMap {
     #[inline]
     pub fn insert(&mut self, key: impl IntoKey, value: CfmlValue) -> Option<CfmlValue> {
         self.1 = self.1.wrapping_add(1);
-        self.0.insert(key.into_key(), value)
+        key.insert_into(&mut self.0, value)
     }
 
     #[inline]
@@ -2767,6 +2820,20 @@ impl CfmlValue {
     /// verbatim — Lucee echoes a string-literal key as written (`cgi["b"]` →
     /// `[b]`) and an identifier key upper-cased (`cgi.b` → `[B]`), because its
     /// compiler upper-cases member names, so the CASING IS THE CALLER'S JOB.
+    /// Cheap precondition for [`Self::check_struct_writable`]: is this a struct
+    /// marked read-only?
+    ///
+    /// The check itself needs the key only to NAME it in the error, so every
+    /// caller used to materialise the key string (`index.as_string()`,
+    /// `name.to_uppercase()`) on every write to produce a message that is
+    /// almost never emitted — one malloc, one copy and one free per struct
+    /// write. Guard the call with this and build the string only when it is
+    /// actually about to be reported.
+    #[inline]
+    pub fn is_read_only_struct(&self) -> bool {
+        matches!(self, CfmlValue::Struct(s) if s.is_read_only())
+    }
+
     pub fn check_struct_writable(&self, key: &str) -> Result<(), crate::vm::CfmlError> {
         match self {
             CfmlValue::Struct(s) if s.is_read_only() => Err(crate::vm::CfmlError::expression(

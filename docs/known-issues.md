@@ -3342,3 +3342,106 @@ Still open: the generic frame cost itself (UDF-to-UDF 306 vs Lucee 155),
 `structCount`/`structKeyList` over `arguments` omit declared-but-omitted
 parameters where Lucee lists them, and `structDelete(arguments, "a")` does not
 clear the bare name.
+
+---
+
+## 103. Every struct write allocated the key twice and then threw both away; a nested dot write also re-stored the scope handle over itself, invalidating the frame scope cache (fixed v0.670.0) 📌
+
+A CFML struct write does not need to build a key at all when the key is already
+there, which is the common case: `st.foo = v` in a loop, a scope key rewritten
+each request, a result struct assembled field by field. We built one anyway, and
+usually built it twice.
+
+| shape | before | after | Δ |
+|---|---|---|---|
+| `s.w7 = i` (local struct, dot form) | 38.6 | 9.3 | **−76%** |
+| `s["w7"] = i` (local struct, literal key) | 78.1 | 25.4 | **−67%** |
+| `request.zz.y = i` (scope path, 2 levels) | 117.3 | 83.4 | **−29%** |
+| `variables.st["w7"] = i` | 134.1 | 91.2 | **−32%** |
+| `o.a.b = i` (bare root, 2 levels) | 150.9 | 115.7 | **−23%** |
+| `variables.st.w7 = i` (scope path) | 169.8 | 115.6 | **−32%** |
+| `variables.st.deep.k = i` (scope path, 3 levels) | 191.8 | 137.8 | **−28%** |
+| `st["w" & (i % 100)] = i` (computed key) | 200.1 | 181.5 | −9% |
+
+(ns per iteration, net of the same loop with a slot-local target; medians of a
+6-round interleaved ABBA, A-to-A spread 1.4-14.3 ns. Reads, `structKeyExists`,
+scoped-variable loops and every frame shape in `shapes.cfm` stayed inside the
+spread.)
+
+### The three costs
+
+**1. The key string was materialised eagerly.** `CfmlValue::String` is an
+`Arc<String>`, and `op_set_index` called `index.into_string()` — a deep copy
+whenever the value is shared, which it always is for a bytecode literal. The
+dot-form paths were worse: `op_set_property` and the fused
+`StoreLocalProperty`/`StoreSlotProperty` arms called `name.to_string()` on an
+identifier whose interned `Key` was already sitting on the `Name`
+(`Name::key()`, whose own doc comment says to use it for exactly this).
+
+**2. `Key::from_string` copied it again.** `Arc<str>` cannot adopt a `String`'s
+buffer — it needs the refcount header inline — so building the owned key is a
+second malloc and a second copy.
+
+**3. `IndexMap::insert` then dropped that key.** An insert over an existing
+entry keeps the key already stored (that is what preserves CFML's
+first-written-casing rule) and drops the one passed in. So both allocations were
+freed immediately, having done nothing.
+
+`IntoKey::insert_into` now probes with a borrowed, non-allocating `KeyRef`
+first and replaces the value in place on a hit, building the owned `Key` only on
+a genuine miss — and reusing the probe's already-computed fold hash when it
+does. `Key`/`&Key` callers keep the old body: cloning an existing key is an
+atomic increment, so probe-then-insert would only add a lookup on the miss path.
+Frame seeding passes `Key`s and is unaffected (verified: every row of
+`shapes.cfm` inside the A-to-A spread).
+
+Behaviour is unchanged by construction — `get_mut` + replace and
+`IndexMap::insert` agree on the stored key, the value and the insertion order.
+
+### Also here: the read-only check stopped allocating an error it never raised
+
+`check_struct_writable` needs the key only to NAME it in the message, so every
+caller built the string — `index.as_string()`, `name.to_uppercase()` — on every
+write to produce an error that is essentially never emitted (only `cgi` and
+explicitly read-only structs are marked; GH #372). The hot sites now test
+`CfmlValue::is_read_only_struct()` first and materialise the string only when
+the error is actually about to be reported.
+
+### What is still slower than Lucee here
+
+The write path is now 90 ns for a scoped struct against a ~47 ns read, and the
+gap is lock traffic, not allocation: a bracket write takes a read lock for the
+read-only mark, another for the CFC declared-property propagation probe
+(`__variables` + `properties`), and then the write lock for the insert itself.
+Folding the first two into the insert's own guard is the next step and needs a
+`CfmlStruct` API change, so it is not done here.
+
+### The nested dot form was a different code path entirely
+
+`variables.st.w7 = i` was 40% slower than the bracket form for a reason that had
+nothing to do with `SetProperty`: **any assignment two or more levels below a
+scope or a bare root compiles to a dotted STRING plus `SetDynamicVar`**
+(`scope_rooted_nested_path` / `bare_rooted_nested_path` in the codegen), so
+`variables.a.b = v`, `request.a.b = v` and `o.a.b = v` all go through
+`store_runtime_path` — a runtime walk of a path the compiler had just finished
+taking apart. Per write that path did:
+
+* `path.split('.').collect::<Vec<_>>()` — a `Vec` allocation;
+* `parts[1].to_uppercase()` — a `String` for the read-only error, again never
+  emitted (now gated on `is_read_only_struct`);
+* `scope.to_lowercase()` and, inside `scope_aware_store`, `name.to_lowercase()` —
+  two more `String`s per write to compare a scope name against a fixed list, now
+  `eq_ignore_ascii_case`;
+* `(*leaf).to_string()` and `(*k).to_string()` for the in-place walk — the same
+  double key allocation as above, now borrowed;
+* and, worst of all, **`scope_aware_store("variables", …)` re-inserted the scope
+  handle over itself.** The walk mutates the scope struct in place, so the value
+  arriving there is the handle already stored — but the insert still bumped
+  `locals.version()`, which invalidates the `FrameScopeCache`, so the frame's
+  very next `variables.x` read had to rebuild it. That store is now skipped when
+  `backing_ptr()` shows nothing moved (the same guard `StoreVariablesKey`
+  already had).
+
+The string path itself is still built and re-split at runtime; pre-splitting it
+at codegen (the segments are known there) is the obvious next step and is not
+done here.

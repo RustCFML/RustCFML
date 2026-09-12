@@ -135,7 +135,9 @@ pub(crate) fn op_set_index(
     let value = stack.pop().unwrap_or(CfmlValue::Null);
     // GitHub #372: `cgi["x"] = v` is the same write as `cgi.x = v` and gets the
     // same refusal — read-only is a property of the struct, not of the syntax.
-    collection.check_struct_writable(&index.as_string())?;
+    if collection.is_read_only_struct() {
+        collection.check_struct_writable(&index.as_string())?;
+    }
     match &mut collection {
         CfmlValue::Array(arr) => {
             // 1-based index; accept Int or numeric Double/String.
@@ -154,10 +156,16 @@ pub(crate) fn op_set_index(
             }
         }
         CfmlValue::Struct(s) => {
-            // §3.5: the key is inserted (owned is genuinely needed),
-            // but `index` was just popped off the stack, so move the
-            // backing String out rather than copying its contents.
-            let key = index.into_string();
+            // The key is only BORROWED here. `CfmlValue::String` is an
+            // `Arc<String>`, so `into_string()` deep-copied the text whenever
+            // the value was shared — which it always is for a bytecode literal
+            // (`st["w7"] = v`) — and `Key::from_string` then copied it a second
+            // time into the `Arc<str>`, only for `IndexMap::insert` to drop
+            // that key again because the entry already existed. Probing with a
+            // borrowed `&str` (see `IntoKey::insert_into`) makes the common
+            // overwrite allocation-free and leaves the miss path at one copy.
+            let key = index.as_str_cow();
+            let key = key.as_ref();
             // Propagate to __variables for declared CFC properties
             if s.contains_key(&*cfml_common::key::well_known::VARIABLES) && s.contains_key(&*cfml_common::key::well_known::PROPERTIES) {
                 let key_lower = key.to_lowercase();
@@ -178,7 +186,7 @@ pub(crate) fn op_set_index(
                     };
                 if is_declared {
                     if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                        vars.insert(key.clone(), value.clone());
+                        vars.insert(key, value.clone());
                     }
                 }
             }
@@ -201,7 +209,7 @@ pub(crate) fn op_set_index(
                 collection = CfmlValue::Array(arr);
             } else {
                 let mut s = ValueMap::default();
-                s.insert(index.as_string(), value);
+                s.insert(index.as_str_cow().as_ref(), value);
                 collection = CfmlValue::strukt(s);
             }
         }
