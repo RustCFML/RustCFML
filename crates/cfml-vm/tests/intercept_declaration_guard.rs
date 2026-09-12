@@ -45,8 +45,17 @@ fn scan_intercept_literals(src: &str) -> BTreeSet<String> {
         }
     };
 
+    // Window ends are clamped to a char boundary: the source carries non-ASCII
+    // punctuation in comments, and a byte-index slice landing inside one panics.
+    let clamp = |mut end: usize| {
+        end = end.min(src.len());
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    };
     for (i, _) in src.match_indices("name_lower") {
-        let win = &src[i..(i + 600).min(src.len())];
+        let win = &src[i..clamp(i + 600)];
         let after_marker = &win["name_lower".len()..];
         let is_match_stmt = after_marker.trim_start().starts_with(".as_str() {")
             || after_marker.trim_start().starts_with('{');
@@ -61,7 +70,7 @@ fn scan_intercept_literals(src: &str) -> BTreeSet<String> {
             // names, so it silently truncated away `fileread`, `fileexists`,
             // `directorydelete` and friends — and those are exactly the sandbox-relevant
             // ones. Truncation here is a security hole, so err large.
-            let win = &src[i..(i + 8000).min(src.len())];
+            let win = &src[i..clamp(i + 8000)];
             let open = win.find('{').unwrap_or(0);
             let mut depth = 0i32;
             let mut end = win.len();

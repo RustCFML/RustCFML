@@ -4215,6 +4215,98 @@ fn same_reference(a: &CfmlValue, b: &CfmlValue) -> bool {
     }
 }
 
+/// The frame's scope handles for the direct-resolution fast paths, fetched off
+/// `locals` once per change of the locals map (its `version()` bumps on every
+/// insert/remove, so a replaced `__variables` or `arguments` invalidates the
+/// cache) and reused by every plain-variable load, store and fused loop op in
+/// between.
+///
+/// A plain name that misses `locals` resolves, in CFML order, through the
+/// arguments scope's EXTRA keys, a lexical closure's env chain, and then the
+/// `variables` scope. The fast path goes straight to `variables` only when the
+/// first two cannot answer: the frame holds no closure-env carrier and its
+/// arguments scope holds no key beyond the declared parameters (which are in
+/// `locals` already). A later mutation of the arguments scope shows as a
+/// length change and drops the frame back to the generic path.
+///
+/// Before this, a bare page loop paid two map probes per access just to find
+/// the handle, and a classic CFC method reading an unscoped component
+/// variable paid five probes and two lock acquisitions.
+#[derive(Default)]
+struct FrameScopeCache {
+    valid: bool,
+    version: u32,
+    vars: Option<CfmlStruct>,
+    args: Option<CfmlStruct>,
+    args_len: usize,
+    /// A closure-env carrier or an arguments extra is present: generic path.
+    blocked: bool,
+}
+
+impl FrameScopeCache {
+    fn refresh(&mut self, locals: &ValueMap, params: &[String]) {
+        self.valid = true;
+        self.version = locals.version();
+        self.vars = locals
+            .get(&*cfml_common::key::well_known::VARIABLES)
+            .and_then(|x| x.as_cfml_struct())
+            .cloned();
+        self.args = locals
+            .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+            .and_then(|x| x.as_cfml_struct())
+            .cloned();
+        let has_marker = locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV);
+        let (args_len, extras) = match &self.args {
+            Some(a) => a.with_map(|m| {
+                let extras = m.keys().any(|k| {
+                    !k.starts_with("__") && !params.iter().any(|p| p.eq_ignore_ascii_case(k.as_str()))
+                });
+                (m.len(), extras)
+            }),
+            None => (0, false),
+        };
+        self.args_len = args_len;
+        self.blocked = has_marker || extras;
+    }
+
+    /// The `variables` handle a plain name may be resolved or stored through
+    /// directly; `None` when this frame's shape needs the generic path.
+    #[inline]
+    fn direct_vars(&mut self, locals: &ValueMap, params: &[String]) -> Option<&CfmlStruct> {
+        if !self.valid || self.version != locals.version() {
+            self.refresh(locals, params);
+        }
+        if self.blocked {
+            return None;
+        }
+        if let Some(a) = &self.args {
+            if a.len() != self.args_len {
+                return None;
+            }
+        }
+        self.vars.as_ref()
+    }
+}
+
+/// Fast path for `x++` / `x--` / `x += k` / `x *= k` on a plain variable
+/// resolved through the frame's `variables` handle: one write lock, the value
+/// updated in place. `false` = the name is
+/// not in the page scope (the generic op then routes it).
+#[inline]
+fn page_numeric_delta(
+    vars: &CfmlStruct,
+    name: &cfml_common::name::Name,
+    op: impl Fn(&CfmlValue) -> CfmlValue,
+) -> bool {
+    vars.with_write(|m| match m.get_mut(name) {
+        Some(v) => {
+            *v = op(v);
+            true
+        }
+        None => false,
+    })
+}
+
 #[inline]
 fn is_reference_value(v: &CfmlValue) -> bool {
     matches!(v, CfmlValue::Struct(_) | CfmlValue::Array(_) | CfmlValue::Query(_))
@@ -8318,6 +8410,20 @@ impl CfmlVirtualMachine {
             );
         }
         let effective_local_mode_modern = effective_local_mode_modern && !page_main_frame;
+        // The frame's scope handles, cached for the fast paths below and
+        // validated by `locals.version()`: any insert into (or removal from)
+        // `locals` — including a replacement of `__variables` — bumps the
+        // version, so a stale handle can never be used. See FrameScopeCache.
+        let mut scope_cache = FrameScopeCache::default();
+        // Direct-resolution fast paths apply to a page frame and to any frame
+        // with a `variables` handle (CFC methods, UDFs called from a page) —
+        // see FrameScopeCache. Writes additionally need classic localmode.
+        // A lexical closure frame (it carries its env) always resolves through
+        // the chain, so it is excluded up front rather than discovering that
+        // in a cache refresh on every call.
+        let direct_frame = (page_main_frame
+            || locals.contains_key(&*cfml_common::key::well_known::VARIABLES))
+            && !locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV);
         #[cfg(feature = "call-phases")]
         {
             // phase 2: parent-scope seed copy
@@ -8831,19 +8937,28 @@ impl CfmlVirtualMachine {
                             continue;
                         }
                     }
-                    // Page-scope fast path: a plain variable read on a page
-                    // frame resolves straight off the page's `variables`
+                    // Direct fast path: a plain variable read on a page frame or a
+                    // component frame resolves straight off the `variables`
                     // handle — one pre-hashed probe instead of the scope-name
                     // comparison chain and the local → arguments → web-scope →
                     // variables cascade. A miss (a `var`-declared page local,
                     // an inherited copy in `locals`, an undefined name) takes
                     // the generic path, which is where the same name would
                     // have resolved anyway.
-                    if page_main_frame && !name.is_reserved_word() && !locals.contains_key(name) {
-                        if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                    if direct_frame
+                        && !name.is_reserved_word()
+                        && (locals.len() <= 1 || !locals.contains_key(name))
+                    {
+                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                            // A FUNCTION value (a method referenced by bare name
+                            // as a callback: `items.each( record )`) takes the
+                            // generic path, which binds the receiver at the load
+                            // site — Lucee/ACF semantics the raw table entry lacks.
                             if let Some(v) = vars.get(name) {
-                                stack.push(v);
-                                continue;
+                                if !matches!(v, CfmlValue::Function(_)) {
+                                    stack.push(v);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -8887,7 +9002,10 @@ impl CfmlVirtualMachine {
                     let scope_name_shadow_attempt = (is_inside_function
                         && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
                         || declared_locals.contains(name.as_str());
-                    let val = if name_lower == "local" && frame_has_local_scope {
+                    // One precomputed bool (see Name::is_reserved_word) stands in for the
+                    // chain of scope-name comparisons below: a plain variable skips them all.
+                    let reserved = name.is_reserved_word();
+                    let val = if reserved && name_lower == "local" && frame_has_local_scope {
                         // `local` is strictly per-call (PR #93): only keys
                         // established in THIS frame are visible — inherited
                         // parent vars (page `variables`, CFC bridge keys) and
@@ -8909,7 +9027,7 @@ impl CfmlVirtualMachine {
                             &func.slot_names,
                             &slots,
                         ))
-                    } else if name_lower == "variables"
+                    } else if reserved && name_lower == "variables"
                     {
                         // Return a struct representing the variables scope.
                         // A `__variables` key means we're running in a component
@@ -9001,9 +9119,9 @@ impl CfmlVirtualMachine {
                         } else {
                             CfmlValue::strukt(locals.clone())
                         }
-                    } else if name_lower == "request" {
+                    } else if reserved && name_lower == "request" {
                         CfmlValue::Struct(self.request_scope.clone())
-                    } else if name_lower == "static" {
+                    } else if reserved && name_lower == "static" {
                         // The shared per-type static scope (see find_static_scope).
                         // Falls back to an empty struct when no static block exists,
                         // so a stray `static.x` read yields null rather than erroring.
@@ -9016,7 +9134,7 @@ impl CfmlVirtualMachine {
                             });
                             CfmlValue::strukt(scope)
                         }
-                    } else if name_lower == "thread" {
+                    } else if reserved && name_lower == "thread" {
                         // `thread` is a SOFT scope (verified on Lucee 7): writable
                         // and readable even outside a cfthread. Resolution order:
                         //   1. a real local/variable named `thread` (e.g.
@@ -9055,7 +9173,7 @@ impl CfmlVirtualMachine {
                             // scope-aware path) read back through the same backing.
                             CfmlValue::Struct(self.page_thread_scope.clone())
                         }
-                    } else if name_lower == "attributes"
+                    } else if reserved && name_lower == "attributes"
                         && self.globals.contains_key("attributes")
                         && self.base_tag_stack.len() <= self.thread_attrs_tag_depth
                         && !(locals.contains_key("attributes")
@@ -9077,7 +9195,7 @@ impl CfmlVirtualMachine {
                         // call, and background tasks always carry thread attributes,
                         // so every such render lost its `rendererVariables`).
                         self.globals.get("attributes").cloned().unwrap()
-                    } else if name_lower == "application" {
+                    } else if reserved && name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             // Live handle clone, not a snapshot, so `var p =
                             // application; p.x = 1` writes through (Lucee semantics).
@@ -9085,7 +9203,7 @@ impl CfmlVirtualMachine {
                         } else {
                             CfmlValue::strukt(ValueMap::default())
                         }
-                    } else if name_lower == "session" {
+                    } else if reserved && name_lower == "session" {
                         // Attach the live session scope before returning it, so a
                         // bare `session` READ hands back the same Arc-backed
                         // handle on every read (Lucee scope-reference semantics).
@@ -9094,12 +9212,12 @@ impl CfmlVirtualMachine {
                         // the read-first scope-pointer caching pattern.
                         self.attach_session_scope();
                         self.get_session_scope()
-                    } else if name_lower == "cookie" {
+                    } else if reserved && name_lower == "cookie" {
                         self.globals
                             .get("cookie")
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(ValueMap::default()))
-                    } else if name_lower == "server" {
+                    } else if reserved && name_lower == "server" {
                         CfmlValue::Struct(self.live_server_scope())
                     } else if scope_name_shadow_attempt
                         && matches!(name_lower, "url" | "form" | "cgi" | "client")
@@ -9312,6 +9430,62 @@ impl CfmlVirtualMachine {
                 BytecodeOp::TryLoadLocal(name) | BytecodeOp::TryLoadSlot(_, name) => { ops::locals::op_try_load_local(self, &mut stack, func, &locals, &slots, &inherited_or_param_keys, op, name)?; }
                 BytecodeOp::DeclareLocal(name) | BytecodeOp::DeclareSlot(_, name) => { ops::locals::op_declare_local(&mut declared_locals, &mut inherited_or_param_keys, name); }
                 BytecodeOp::StoreLocal(name) | BytecodeOp::StoreSlot(_, name) => {
+                    // A member write (`st.x = v`, `arr[i] = v`, `q.col[r] = v`)
+                    // mutates the shared handle and then stores that handle back
+                    // to its variable. When the variable — wherever it lives —
+                    // already holds this very handle, the store is a no-op:
+                    // answer it with read probes only, before any of the routing
+                    // below (a closure frame's chain walk, the scope-name chain,
+                    // the `__variables` branch) runs. Reference values only.
+                    if let Some(top) = stack.last() {
+                        // Only where the store would land: a frame-local wins when
+                        // it exists; the scope handle / closure chain are consulted
+                        // only for a name this frame would route there — not one it
+                        // has `var`-declared (`local.routes = this.getRoutes()`
+                        // hands back the very array `variables.routes` holds, and
+                        // the local must still be created), nor a parameter, nor a
+                        // modern-localmode bare write.
+                        if is_reference_value(top)
+                            && (!effective_local_mode_modern
+                                || !inherited_or_param_keys.contains(name.as_str()))
+                        {
+                            let held = match op {
+                                BytecodeOp::StoreSlot(i, _) => slots[*i as usize].as_ref(),
+                                _ => None,
+                            }
+                            .or_else(|| locals.get(name));
+                            let routes_to_scope = !effective_local_mode_modern
+                                && !declared_locals.contains(name.as_str())
+                                && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name));
+                            let same = match held {
+                                Some(cur) => same_reference(cur, top),
+                                None if !routes_to_scope => false,
+                                None => {
+                                    let via_vars = if direct_frame && !name.is_reserved_word() {
+                                        scope_cache
+                                            .direct_vars(&locals, &func.params)
+                                            .and_then(|vars| vars.get(name))
+                                            .is_some_and(|cur| same_reference(&cur, top))
+                                    } else {
+                                        false
+                                    };
+                                    via_vars
+                                        || Self::closure_chain_get(&locals, name)
+                                            .is_some_and(|cur| same_reference(&cur, top))
+                                        || (!direct_frame
+                                            && locals
+                                                .get(&*cfml_common::key::well_known::VARIABLES)
+                                                .and_then(|v| v.as_cfml_struct())
+                                                .and_then(|vars| vars.get(name))
+                                                .is_some_and(|cur| same_reference(&cur, top)))
+                                }
+                            };
+                            if same {
+                                stack.pop();
+                                continue;
+                            }
+                        }
+                    }
                     // Slot store (T3.1). An active slot is overwritten in place.
                     // An inactive one ACTIVATES here iff the name has been
                     // declared (`var` executed on this path) AND no CI-cased
@@ -9344,23 +9518,22 @@ impl CfmlVirtualMachine {
                             slot_blocked |= 1u64 << idx;
                         }
                     }
-                    // Page-scope fast path (the twin of LoadLocal's): a plain
-                    // variable written on a page frame goes straight into the
-                    // page's `variables` handle with a pre-hashed key. Exactly
+                    // Direct fast path (the twin of LoadLocal's): a plain variable
+                    // written on a page or component frame goes straight into
+                    // the `variables` handle with a pre-hashed key. Exactly
                     // the `__variables` routing branch below minus the tests
                     // that cannot apply to a page frame (no parameters, no
                     // `local` scope, modern mode forced off); a name already
                     // present in `locals` (a `var`-declared page local, an
                     // inherited copy) keeps today's in-place update there.
-                    if page_main_frame
+                    if direct_frame
+                        && !effective_local_mode_modern
                         && !name.is_reserved_word()
                         && !declared_locals.contains(name.as_str())
-                        && !locals.contains_key(name)
+                        && (locals.len() <= 1 || !locals.contains_key(name))
+                        && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                     {
-                        if let Some(vars) = locals
-                            .get(&*cfml_common::key::well_known::VARIABLES)
-                            .and_then(|v| v.as_cfml_struct())
-                        {
+                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             if let Some(val) = stack.pop() {
                                 // A named declaration is stored unbound — see
                                 // the matching rule on the generic branch.
@@ -9388,6 +9561,8 @@ impl CfmlVirtualMachine {
                     if let Some(val) = stack.pop() {
                         // Same zero-alloc lowercase guard as LoadLocal.
                         let name_lower: &str = name.lower();
+                        // See LoadLocal: one bool gates the whole scope-name chain.
+                        let reserved = name.is_reserved_word();
                         // Subclass pseudo-constructor: the body's `this`-binding
                         // (LoadLocal(name) → StoreLocal("this"), emitted before any
                         // body statement). Merge the parent's explicit `this.*` data
@@ -9395,7 +9570,7 @@ impl CfmlVirtualMachine {
                         // the parent pseudo-ctor first on the same `this`. Only fills
                         // keys the just-built struct lacks (child overrides stay
                         // authoritative); `take()` so it fires exactly once per body.
-                        if name_lower == "this" {
+                        if reserved && name_lower == "this" {
                             if let Some(parent_members) =
                                 self.pending_pseudo_ctor_parent_this.take()
                             {
@@ -9408,7 +9583,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
-                        if name_lower == "local" && frame_has_local_scope {
+                        if reserved && name_lower == "local" && frame_has_local_scope {
                             // `local.X = Y` — write back into the function's locals,
                             // NOT __variables (which is the component scope in CFC methods).
                             //
@@ -9467,7 +9642,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                        } else if name_lower == "variables"
+                        } else if reserved && name_lower == "variables"
                             && !declared_locals.contains(name.as_str())
                             // A declared param named after a scope is inherently
                             // local (see the twin guards in the __variables and
@@ -9559,7 +9734,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                        } else if name_lower == "request"
+                        } else if reserved && name_lower == "request"
                             && !declared_locals.contains(name.as_str())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
@@ -9575,7 +9750,7 @@ impl CfmlVirtualMachine {
                                     self.request_scope.with_write(|m| *m = snap);
                                 }
                             }
-                        } else if name_lower == "application"
+                        } else if reserved && name_lower == "application"
                             && !declared_locals.contains(name.as_str())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
@@ -9588,16 +9763,16 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                        } else if name_lower == "session"
+                        } else if reserved && name_lower == "session"
                             && !declared_locals.contains(name.as_str())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
                                 self.set_session_scope(s.snapshot())?;
                             }
-                        } else if name_lower == "thread" && self.globals.contains_key("thread") {
+                        } else if reserved && name_lower == "thread" && self.globals.contains_key("thread") {
                             self.globals.insert("thread".to_string(), val);
-                        } else if name_lower == "thread"
+                        } else if reserved && name_lower == "thread"
                             && !declared_locals.contains("thread")
                             && matches!(&val, CfmlValue::Struct(s) if self.page_thread_scope.ptr_eq(s))
                         {
@@ -9616,7 +9791,7 @@ impl CfmlVirtualMachine {
                             // the write target (page_thread_scope) diverge from the read
                             // target (a same-named plain var), so `thread = javaObj`
                             // after a stray `thread = "s"` was silently dropped.
-                        } else if name_lower == "arguments"
+                        } else if reserved && name_lower == "arguments"
                             && is_inside_function
                             && !declared_locals.contains(name.as_str())
                         {
@@ -9685,7 +9860,7 @@ impl CfmlVirtualMachine {
                             // The arguments scope lives under the reserved key, not
                             // the literal "arguments" (which is a user local var).
                             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
-                        } else if Self::is_web_request_scope(&name_lower)
+                        } else if reserved && Self::is_web_request_scope(&name_lower)
                             && !declared_locals.contains(name.as_str())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                             // Only a SCOPE round-trip commits here. A whole-value
@@ -9915,10 +10090,12 @@ impl CfmlVirtualMachine {
                 BytecodeOp::ArrayAppendLocal(name) | BytecodeOp::ArrayAppendSlot(_, name) => { ops::locals::op_array_append_local(self, &mut stack, func, &mut locals, &mut slots, &closure_env, &declared_locals, effective_local_mode_modern, is_inside_function, op, name)?; }
                 BytecodeOp::StoreVariablesKey(name) => {
                     if let Some(val) = stack.pop() {
-                        match locals
-                            .get(&*cfml_common::key::well_known::VARIABLES)
-                            .and_then(|v| v.as_cfml_struct())
-                        {
+                        // The handle comes from the frame scope cache (validated
+                        // by locals.version()) rather than a map probe per write.
+                        if !scope_cache.valid || scope_cache.version != locals.version() {
+                            scope_cache.refresh(&locals, &func.params);
+                        }
+                        match scope_cache.vars.as_ref() {
                             Some(vars) => {
                                 if !(is_reference_value(&val)
                                     && vars.get(name).is_some_and(|cur| same_reference(&cur, &val)))
@@ -9953,11 +10130,11 @@ impl CfmlVirtualMachine {
                     // A frame with no handle falls through to the page-globals
                     // resolution below, unchanged.
                     if matches!(op, BytecodeOp::LoadVariablesKey(_)) {
+                        if !scope_cache.valid || scope_cache.version != locals.version() {
+                            scope_cache.refresh(&locals, &func.params);
+                        }
                         let probe: Option<Option<CfmlValue>> =
-                            match locals.get(&*cfml_common::key::well_known::VARIABLES) {
-                                Some(CfmlValue::Struct(vars)) => Some(vars.get(name)),
-                                _ => None,
-                            };
+                            scope_cache.vars.as_ref().map(|vars| vars.get(name));
                         match probe {
                             Some(Some(v)) => {
                                 stack.push(v);
@@ -11872,6 +12049,16 @@ impl CfmlVirtualMachine {
                 // Collections
                 BytecodeOp::BuildArray(count) => ops::value::op_build_array(&mut stack, *count),
                 BytecodeOp::BuildStruct(count) => ops::value::op_build_struct(&mut stack, *count),
+                BytecodeOp::BuildStructStatic(keys) => {
+                    // Values are on the stack in key order; keys are pre-interned.
+                    let n = keys.len();
+                    let base = stack.len().saturating_sub(n);
+                    let mut map = ValueMap::with_capacity(n);
+                    for (k, v) in keys.iter().zip(stack.drain(base..)) {
+                        map.insert(k.key().clone(), v);
+                    }
+                    stack.push(CfmlValue::strukt(map));
+                }
                 BytecodeOp::GetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip, &locals)?; }
                 BytecodeOp::SetIndex => {
                     if let Err(e) = ops::frame::op_set_index(&mut stack) {
@@ -12747,10 +12934,59 @@ impl CfmlVirtualMachine {
                     })));
                 }
 
-                BytecodeOp::Increment(name) | BytecodeOp::IncrementSlot(_, name) => { ops::locals::op_increment(&mut locals, &mut slots, &closure_env, op, name)?; }
-                BytecodeOp::AddLocalConst(name, k) | BytecodeOp::AddSlotConst(_, name, k) => { ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?; }
-                BytecodeOp::MulLocalConst(name, k) | BytecodeOp::MulSlotConst(_, name, k) => { ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?; }
-                BytecodeOp::Decrement(name) | BytecodeOp::DecrementSlot(_, name) => { ops::locals::op_decrement(&mut locals, &mut slots, &closure_env, op, name)?; }
+                BytecodeOp::Increment(name) | BytecodeOp::IncrementSlot(_, name) => {
+                    // Direct fast path (see FrameScopeCache): a plain variable behind
+                    // the frame's `variables` handle is bumped in place under one
+                    // lock instead of probe-miss → closure chain → get + insert.
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                            if page_numeric_delta(vars, name, |v| match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(i + 1),
+                                CfmlValue::Double(d) => CfmlValue::Double(d + 1.0),
+                                _ => CfmlValue::Int(1),
+                            }) { continue; }
+                        }
+                    }
+                    ops::locals::op_increment(&mut locals, &mut slots, &closure_env, op, name)?;
+                }
+                BytecodeOp::AddLocalConst(name, k) | BytecodeOp::AddSlotConst(_, name, k) => {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                            let k = *k;
+                            if page_numeric_delta(vars, name, |v| match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(i + k),
+                                CfmlValue::Double(d) => CfmlValue::Double(d + k as f64),
+                                _ => CfmlValue::Int(k),
+                            }) { continue; }
+                        }
+                    }
+                    ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?;
+                }
+                BytecodeOp::MulLocalConst(name, k) | BytecodeOp::MulSlotConst(_, name, k) => {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                            let k = *k;
+                            if page_numeric_delta(vars, name, |v| match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(i * k),
+                                CfmlValue::Double(d) => CfmlValue::Double(d * k as f64),
+                                _ => CfmlValue::Int(k),
+                            }) { continue; }
+                        }
+                    }
+                    ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?;
+                }
+                BytecodeOp::Decrement(name) | BytecodeOp::DecrementSlot(_, name) => {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                            if page_numeric_delta(vars, name, |v| match v {
+                                CfmlValue::Int(i) => CfmlValue::Int(i - 1),
+                                CfmlValue::Double(d) => CfmlValue::Double(d - 1.0),
+                                _ => CfmlValue::Int(-1),
+                            }) { continue; }
+                        }
+                    }
+                    ops::locals::op_decrement(&mut locals, &mut slots, &closure_env, op, name)?;
+                }
 
                 // Exception handling
                 BytecodeOp::TryStart(catch_ip) => { ops::locals::op_try_start(self, &mut stack, *catch_ip); }
@@ -17002,16 +17238,24 @@ impl CfmlVirtualMachine {
                     // (O(1) per row — this is what makes building an N-row query
                     // O(n) instead of O(n²)). The caller's query sees the rows
                     // through the shared Arc, so no writeback is needed.
-                    if let Some(CfmlValue::Query(q)) = args.first() {
+                    if let Some(CfmlValue::Query(q)) = args.first().cloned() {
                         if args.len() >= 2 {
-                            match &args[1] {
+                            // Taken by value: a struct literal built for this call
+                            // is uniquely owned, so its map moves into the row
+                            // instead of being cloned.
+                            let second = std::mem::replace(&mut args[1], CfmlValue::Null);
+                            match second {
                                 CfmlValue::Int(n) => {
-                                    for _ in 0..*n {
+                                    for _ in 0..n {
                                         q.add_row(ValueMap::default());
                                     }
                                 }
                                 CfmlValue::Struct(data) => {
-                                    q.add_row(data.snapshot());
+                                    let row = match data.try_into_map() {
+                                        Ok(m) => m,
+                                        Err(shared) => shared.snapshot(),
+                                    };
+                                    q.add_row(row);
                                 }
                                 CfmlValue::Array(items) => {
                                     // Lucee semantics: array-of-arrays → one
@@ -22574,11 +22818,25 @@ impl CfmlVirtualMachine {
                     inherited_or_param_keys.insert_key(k);
                     inherited_from_parent.insert_key(k);
                 }
-                if let Some(env_arc) = plan.env.as_ref() {
-                    locals.insert(
-                        cfml_common::key::well_known::CLOSURE_FRAME_ENV.clone(),
-                        Self::closure_env_marker(env_arc),
-                    );
+                // The carrier is installed only when the chain can answer a
+                // name this frame cannot on its own: the env holds a data key
+                // (a captured local, a parameter, a stripped helper) or a link
+                // to a parent env. A page-level closure's env is typically just
+                // `__variables`, and a frame WITHOUT a carrier takes the direct
+                // fast paths (see FrameScopeCache) instead of walking a chain
+                // that has nothing to find.
+                let env_can_answer = env.iter().any(|(k, _)| {
+                    InheritedKeys::structural_bit(k.as_str()).is_none()
+                        && k != &*cfml_common::key::well_known::ARGUMENTS_SCOPE
+                        && k != &*cfml_common::key::well_known::CLOSURE_OWN_KEYS
+                });
+                if env_can_answer {
+                    if let Some(env_arc) = plan.env.as_ref() {
+                        locals.insert(
+                            cfml_common::key::well_known::CLOSURE_FRAME_ENV.clone(),
+                            Self::closure_env_marker(env_arc),
+                        );
+                    }
                 }
             } else {
             for (k, v) in env.iter() {
@@ -22752,22 +23010,11 @@ impl CfmlVirtualMachine {
                     }
                     return Some(v.clone());
                 }
-                // Pure key comparison + one value clone — no need to copy the
-                // whole arguments scope just to find a case-insensitive match.
-                if let Some(v) = args.with_map(|m| {
-                    m.iter()
-                        .find(|(k, _)| {
-                            !k.starts_with("__arguments_") && k.eq_ignore_ascii_case(name_lower)
-                        })
-                        .map(|(_, v)| v.clone())
-                }) {
-                    if depth_census {
-                        cfml_common::perf_counters::bump(
-                            &cfml_common::perf_counters::SCOPE_HIT_ARGUMENTS,
-                        );
-                    }
-                    return Some(v);
-                }
+                // No case-insensitive scan after the probe: the arguments scope
+                // is keyed by `Key`, whose equality folds case, so the exact
+                // probe above already answers every casing. The scan it replaces
+                // walked the whole scope on EVERY miss — i.e. on every read of a
+                // variables-scope or page variable from a frame with arguments.
             }
         }
         // Web request scopes (url/form/cgi/cookie) are always request-global:
@@ -40995,6 +41242,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         // Collections
         BytecodeOp::BuildArray(n) => (1, *n),
         BytecodeOp::BuildStruct(n) => (1, n * 2),
+        BytecodeOp::BuildStructStatic(keys) => (1, keys.len()),
         BytecodeOp::GetIndex => (1, 2),       // obj + key → value
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value

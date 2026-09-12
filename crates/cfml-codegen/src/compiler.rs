@@ -945,6 +945,11 @@ pub enum BytecodeOp {
     /// string on every write — ~550 ns per `variables.x += variables.y` in a
     /// method body against Lucee's ~60.
     StoreVariablesKey(Name),
+    /// A struct literal whose keys are all static (`{ id: i, name: n }`): the
+    /// values are on the stack, the keys are pre-interned here. `BuildStruct`
+    /// popped each key as a runtime String and allocated a `Key` from it on
+    /// every evaluation — two allocations per key per literal.
+    BuildStructStatic(std::sync::Arc<[Name]>),
     StoreGlobal(Name),
 
     // Stack
@@ -1468,11 +1473,12 @@ impl BytecodeOp {
             Self::StoreLocalScopeKey(..) => 123,
             Self::DefineComponentMethods(..) => 124,
             Self::StoreVariablesKey(..) => 125,
+            Self::BuildStructStatic(..) => 126,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 126] = [
+    pub const CENSUS_NAMES: [&'static str; 127] = [
         "Null",
         "True",
         "False",
@@ -1599,6 +1605,7 @@ impl BytecodeOp {
         "StoreLocalScopeKey",
         "DefineComponentMethods",
         "StoreVariablesKey",
+        "BuildStructStatic",
     ];
 }
 
@@ -2089,17 +2096,32 @@ impl CfmlCompiler {
         children: &[(StructKey, StructKeyNode)],
         instructions: &mut Vec<BytecodeOp>,
     ) {
+        let all_static = children.iter().all(|(k, _)| matches!(k, StructKey::Static(_)));
         for (key, node) in children {
-            match key {
-                StructKey::Static(s) => instructions.push(BytecodeOp::String(std::sync::Arc::new(s.clone()))),
-                StructKey::Computed(expr) => self.compile_expression(expr, instructions),
+            if !all_static {
+                match key {
+                    StructKey::Static(s) => instructions.push(BytecodeOp::String(std::sync::Arc::new(s.clone()))),
+                    StructKey::Computed(expr) => self.compile_expression(expr, instructions),
+                }
             }
             match node {
                 StructKeyNode::Leaf(value) => self.compile_expression(value, instructions),
                 StructKeyNode::Branch(c) => self.emit_struct_tree(c, instructions),
             }
         }
-        instructions.push(BytecodeOp::BuildStruct(children.len()));
+        if all_static {
+            // Keys interned once at compile time (see BuildStructStatic).
+            let keys: Vec<Name> = children
+                .iter()
+                .map(|(k, _)| match k {
+                    StructKey::Static(s) => Name::from(s),
+                    StructKey::Computed(_) => unreachable!(),
+                })
+                .collect();
+            instructions.push(BytecodeOp::BuildStructStatic(std::sync::Arc::from(keys)));
+        } else {
+            instructions.push(BytecodeOp::BuildStruct(children.len()));
+        }
     }
 
     /// Scope roots whose nested member writes are routed through the runtime
@@ -6045,18 +6067,40 @@ impl CfmlCompiler {
                         }
                         self.emit_struct_tree(&root, instructions);
                     } else {
-                        for (key, value) in &st.pairs {
-                            match key {
-                                Expression::Identifier(ident) => {
-                                    instructions.push(BytecodeOp::String(std::sync::Arc::new(ident.name.clone())));
+                        // Every key a bare identifier or a string literal: intern
+                        // the keys once here and push only the values (see
+                        // BuildStructStatic). Any computed key keeps the generic
+                        // key/value pair form.
+                        let static_keys: Option<Vec<Name>> = st
+                            .pairs
+                            .iter()
+                            .map(|(k, _)| match k {
+                                Expression::Identifier(ident) => Some(Name::from(&ident.name)),
+                                Expression::Literal(Literal { value: LiteralValue::String(sk), .. }) => {
+                                    Some(Name::from(sk))
                                 }
-                                _ => {
-                                    self.compile_expression(key, instructions);
-                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(keys) = static_keys {
+                            for (_, value) in &st.pairs {
+                                self.compile_expression(value, instructions);
                             }
-                            self.compile_expression(value, instructions);
+                            instructions.push(BytecodeOp::BuildStructStatic(std::sync::Arc::from(keys)));
+                        } else {
+                            for (key, value) in &st.pairs {
+                                match key {
+                                    Expression::Identifier(ident) => {
+                                        instructions.push(BytecodeOp::String(std::sync::Arc::new(ident.name.clone())));
+                                    }
+                                    _ => {
+                                        self.compile_expression(key, instructions);
+                                    }
+                                }
+                                self.compile_expression(value, instructions);
+                            }
+                            instructions.push(BytecodeOp::BuildStruct(st.pairs.len()));
                         }
-                        instructions.push(BytecodeOp::BuildStruct(st.pairs.len()));
                     }
                 }
             }

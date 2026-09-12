@@ -3174,3 +3174,76 @@ Lucee's 155; profiles are flat — dispatch, param binding, the `arguments`
 struct, frame teardown), `queryAddRow` at 450 vs 232, struct key read/write at
 248/330 vs 149/140 (the key string is built per access on both engines; ours
 still allocates it twice), and the page bare-loop regression above.
+
+## 101. The page bare loop got slower in v0.667.0; a classic method reading an unscoped component variable cost 2.2x Lucee; struct literals allocated every key twice; `queryAddRow` was 1.9x (fixed v0.668.0)
+
+Follow-up to §100, taking its "still open" list in the order "where we got
+slower first". Warm ns per operation; Lucee 7.1 on the same box (the box
+carried ~12% external load during the v0.668.0 runs, so its absolute numbers
+are slightly pessimistic — the unchanged `var`-local loop moved 57 → 64):
+
+| shape | v0.667.0 | v0.668.0 | Lucee |
+|---|---|---|---|
+| page bare loop (`t += i`, no calls), per iteration | 180 | 105-111 | 60-77 |
+| classic method, unscoped `t`/`i` routed to `variables`, per iteration | 229 | 111 | 104 |
+| `variables.t += variables.i` in a method, per iteration | 193 | 153 | 60 |
+| page UDF call, 50 page variables | 456 | ~400 | 196 |
+| struct key write (`st["w" & k] = i`) | 331 | 243 | 140 |
+| struct key read | 248 | 211 | 149 |
+| `queryAddRow(q, {id: i, name: "n" & i})` | 450 | 345 | 232 |
+
+**One frame scope cache.** Every plain-variable load, store and fused loop
+op on a page frame or a component frame (a CFC method, a UDF called from a
+page) goes straight to the frame's `variables` handle, fetched once per
+change of the locals map: `FrameScopeCache` is validated by the map's
+`version()`, which bumps on every insert and removal, so a replaced
+`__variables` or `arguments` can never leave a stale handle in use. The fast
+path takes the CFML resolution order into account rather than shortcutting
+it: it is skipped when the frame carries a closure-env carrier (captured
+names come first) or when the arguments scope holds a key beyond the declared
+parameters (extras come first), and a later mutation of the arguments scope
+shows up as a length change. A method referenced by bare name as a callback
+(`items.each( record )`) still takes the generic path, which binds the
+receiver at the load site. Before: the page frame's loop paid two probes per
+access to find the handle it had just used; a method's unscoped read walked
+locals → arguments (with a redundant case-insensitive scan of the whole
+arguments scope on every miss — the keys already fold case) → the closure
+chain → four web-scope compares → `__variables`.
+
+**Fewer wasted probes.** The scope-name comparison chains in LoadLocal and
+StoreLocal are gated on the per-`Name` reserved-word flag; the fused
+`JumpIfLocalCmpConstFalse` resolves a counter that lives behind the handle
+once and takes its numeric arms instead of the generic CFML comparison; a
+member write's handle store-back (`st[k] = v` → `StoreLocal st`) is answered
+with read probes at the top of StoreLocal when the variable already holds the
+handle; a lexical closure whose env holds no data key and no parent link
+(a page-level closure: env = `__variables`) gets no carrier, so its frame
+takes the direct paths too.
+
+**Struct literals.** `{ id: i, name: n }` compiles to `BuildStructStatic`
+with its keys interned at compile time; `BuildStruct` popped each key as a
+runtime String and built a `Key` from it — two allocations per key per
+evaluation. Computed keys keep the pair form. `queryAddRow(q, struct)` moves
+a uniquely owned literal's map into the row instead of cloning it, the row
+insert probes each column once (the row's keys fold case), and the deferred-
+intercept name check is a binary search instead of a scan of ~150 names on
+every intercepted BIF call.
+
+Gates: CLI runner 9,041/9,041, serve dev+prod cold+warm 9,183/9,183,
+`cargo test --workspace` 714 passed, wasm32 + wasm-pack, TestBox 415/0/0 and
+Wheels 2,737/3/0 unchanged. Two regressions were caught on the way, one by
+each side of the gate. The runner: the direct read path handed a raw
+method-table entry to a callback (`this` undefined inside `record`) — Function
+values now fall through to the binding path. Wheels (mapperModernSpec, 9
+specs): the write-back shortcut treated "some scope holds this handle" as
+"the target variable holds it", so `local.routes = this.getRoutes()` — the
+very array `variables.routes` holds — never created the local. The shortcut
+now consults the scope handle and closure chain only for a name the store
+would route there (classic localmode, not `var`-declared, not a parameter);
+`tests/oop/test_local_alias_of_variables_member.cfm` pins the shape.
+
+Still open: the generic frame cost (UDF-to-UDF 306 vs Lucee 155 — dispatch,
+parameter binding, the `arguments` struct, teardown; the profile is flat),
+`variables.x` at 153 vs 60 (each op still locks the handle), struct key
+read/write at 211/243 vs 149/140 (the key string is built and hashed per
+access on both engines; ours also allocates the `Key`).

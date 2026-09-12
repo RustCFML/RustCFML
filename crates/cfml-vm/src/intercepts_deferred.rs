@@ -58,5 +58,12 @@ pub(crate) const DEFERRED_TO_VM: &[&str] = &[
 /// the original arm's grouping, which is the useful order for a reader.
 #[inline]
 pub(crate) fn is_deferred(name_lower: &str) -> bool {
-    DEFERRED_TO_VM.contains(&name_lower)
+    // A sorted copy, built once: the linear scan over ~150 names ran on every
+    // intercepted BIF call (measured at ~5% of a queryAddRow call).
+    static SORTED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let mut v: Vec<&'static str> = DEFERRED_TO_VM.to_vec();
+        v.sort_unstable();
+        v
+    });
+    SORTED.binary_search(&name_lower).is_ok()
 }

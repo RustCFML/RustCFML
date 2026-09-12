@@ -402,7 +402,20 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
         }
         _ => None,
     };
-    let matched = match slot_val.or_else(|| locals.get(name)) {
+    // A counter that lives outside this frame's map (a page variable behind
+    // the page scope handle, a captured closure variable, a component
+    // variable) is fetched ONCE here and then takes the same numeric arms as a
+    // local one, instead of falling to the generic CFML comparison.
+    let resolved: Option<CfmlValue> = match slot_val.or_else(|| locals.get(name)) {
+        Some(_) => None,
+        None => CfmlVirtualMachine::closure_chain_get(locals, name).or_else(|| {
+            locals
+                .get(&*cfml_common::key::well_known::VARIABLES)
+                .and_then(|v| v.as_cfml_struct())
+                .and_then(|s| s.get(name))
+        }),
+    };
+    let matched = match slot_val.or_else(|| locals.get(name)).or(resolved.as_ref()) {
         Some(CfmlValue::Int(i)) => {
             let c = c;
             let i = *i;
@@ -443,14 +456,7 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
             // plain-local case pays nothing.
             let left = match other {
                 Some(v) => v.clone(),
-                None => CfmlVirtualMachine::closure_chain_get(locals, name)
-                    .or_else(|| {
-                        locals
-                            .get(&*cfml_common::key::well_known::VARIABLES)
-                            .and_then(|v| v.as_cfml_struct())
-                            .and_then(|s| s.get(name))
-                    })
-                    .unwrap_or(CfmlValue::Null),
+                None => CfmlValue::Null,
             };
             let right = CfmlValue::Int(c);
             match cmp {

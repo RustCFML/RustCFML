@@ -1728,6 +1728,16 @@ impl CfmlStruct {
     /// loop body may call back into code that touches the same struct — it
     /// releases the lock so re-entrancy can't deadlock.
     #[inline]
+    /// Take the map out of a struct nobody else holds (a just-built literal
+    /// handed to a BIF), or give the struct back when it is shared. Lets a
+    /// consumer that needs an owned map (`queryAddRow(q, {…})`) skip a clone.
+    pub fn try_into_map(self) -> Result<ValueMap, CfmlStruct> {
+        match Arc::try_unwrap(self.0) {
+            Ok(lock) => Ok(lock.into_inner().map),
+            Err(arc) => Err(CfmlStruct(arc)),
+        }
+    }
+
     pub fn snapshot(&self) -> ValueMap {
         self.0.read().map.clone()
     }
@@ -3483,11 +3493,9 @@ impl CfmlQueryData {
         // match against canonical columns).
         for ci in 0..self.columns.len() {
             let col_name = self.columns[ci].as_str();
-            let val = row
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
-                .map(|(_, v)| v.clone())
-                .unwrap_or(CfmlValue::Null);
+            // One probe per column: the row map's keys fold case, so the linear
+            // case-insensitive scan this replaces was redundant.
+            let val = row.get(col_name).cloned().unwrap_or(CfmlValue::Null);
             Arc::make_mut(&mut self.data[ci]).push(val);
         }
     }
