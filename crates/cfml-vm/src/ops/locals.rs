@@ -443,10 +443,13 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
             // plain-local case pays nothing.
             let left = match other {
                 Some(v) => v.clone(),
-                None => locals
-                    .get(&*cfml_common::key::well_known::VARIABLES)
-                    .and_then(|v| v.as_cfml_struct())
-                    .and_then(|s| s.get_ci(name.as_str()))
+                None => CfmlVirtualMachine::closure_chain_get(locals, name)
+                    .or_else(|| {
+                        locals
+                            .get(&*cfml_common::key::well_known::VARIABLES)
+                            .and_then(|v| v.as_cfml_struct())
+                            .and_then(|s| s.get(name))
+                    })
                     .unwrap_or(CfmlValue::Null),
             };
             let right = CfmlValue::Int(c);

@@ -3381,19 +3381,27 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
         }
         match &args[0] {
             CfmlValue::Struct(s) => {
-                let found = struct_find_key_ci(s, &key).is_some();
+                // ONE probe: `get` folds case, consults the shared method table
+                // and resolves the live `this` alias. This used to be a
+                // case-insensitive key scan (allocating the found key), a second
+                // probe for the Null check and three string-keyed marker probes.
                 // Lucee parity: "a NULL value is the same as not existing in CFML" — a key
                 // that is present but holds null reports as absent. Verified on Lucee 7:
                 // `s.foo = nullValue(); structKeyExists(s,"foo")` → false. Without this,
                 // Preside's `if ( StructKeyExists( page, prop ) ) { value = page[prop]; ... }`
                 // enters the block for a null property then throws reading the null `value`.
-                if found && matches!(s.get_ci(&key), Some(CfmlValue::Null)) {
+                let found = match s.get(&key) {
+                    None => false,
+                    Some(CfmlValue::Null) => return Ok(CfmlValue::Bool(false)),
+                    Some(_) => true,
+                };
+                if !found {
                     return Ok(CfmlValue::Bool(false));
                 }
                 // Hide the private arguments-scope markers from introspection.
-                if found
-                    && s.contains_key("__arguments_scope")
+                if key.starts_with("__")
                     && (key == "__arguments_scope" || key == "__arguments_params")
+                    && s.contains_key(&*cfml_common::key::well_known::ARGUMENTS_MARKER)
                 {
                     return Ok(CfmlValue::Bool(false));
                 }
@@ -3412,8 +3420,9 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
                     // so probe them with the O(1) exact `contains_key` rather
                     // than a ci lookup (issue #262). ("this" can be user-cased,
                     // but the live-alias check needs contains_key_ci anyway.)
-                    let is_component = s.contains_key("__variables")
-                        && (s.contains_key("__name") || s.contains_key_ci("this"));
+                    let is_component = s.contains_key(&*cfml_common::key::well_known::VARIABLES)
+                        && (s.contains_key(&*cfml_common::key::well_known::NAME_MARKER)
+                            || s.contains_key_ci("this"));
                     if is_component
                         && !visible_struct_keys(s)
                             .iter()

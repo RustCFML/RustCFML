@@ -40,7 +40,25 @@ struct NameInner {
     /// `None` when `orig` is already all-lowercase (the common case for CFML
     /// code in practice) — `lower()` then borrows `orig` directly.
     lower: Option<Box<str>>,
+    /// The identifier names a scope, an engine-managed frame key, or is an
+    /// engine `__` key — anything the frame ops route somewhere other than
+    /// the plain variable store. Computed once here so a hot store/load can
+    /// skip the whole chain of scope-name comparisons with one bool test.
+    reserved: bool,
+    /// The identifier is a compiled-in builtin function name (`BUILTIN_NAMES`),
+    /// answered at intern time so the bare-call resolver need not hash the
+    /// lowercase spelling into the builtin index on every call.
+    builtin: bool,
+    /// The compiled-in builtin this name dispatches to, resolved by the VM on
+    /// the first call and reused by every later call of the same spelling —
+    /// the per-call hash of the name into the builtin index was ~10% of a
+    /// small string BIF. Only ever set for a `builtin` name whose VM has no
+    /// native override for it (the VM checks that before consulting this).
+    builtin_fn: std::sync::OnceLock<BuiltinFnPtr>,
 }
+
+/// A compiled-in builtin's entry point, as cached on a [`Name`].
+pub type BuiltinFnPtr = fn(Vec<crate::dynamic::CfmlValue>) -> crate::vm::CfmlResult;
 
 /// An interned, case-aware identifier. Cheap to clone (`Arc`), derefs to the
 /// original spelling, and exposes the precomputed lowercase via [`Name::lower`].
@@ -48,6 +66,15 @@ struct NameInner {
 pub struct Name(Arc<NameInner>);
 
 static INTERNER: RwLock<Option<HashMap<Box<str>, Name>>> = RwLock::new(None);
+
+/// Identifiers a frame's load/store ops give special routing (scope names,
+/// the reserved `arguments`/`cfcatch` frame keys, custom-tag bridge keys). See
+/// [`Name::is_reserved_word`].
+const RESERVED_WORDS: &[&str] = &[
+    "local", "variables", "arguments", "this", "super", "static", "request",
+    "application", "session", "server", "client", "thread", "url", "form", "cgi",
+    "cookie", "cfcatch", "cfthread", "attributes", "caller", "thistag",
+];
 
 impl Name {
     /// Intern `s`, returning the shared `Name` for this exact spelling.
@@ -98,10 +125,19 @@ impl Name {
         } else {
             None
         };
+        let reserved = s.starts_with("__")
+            || RESERVED_WORDS.iter().any(|w| s.eq_ignore_ascii_case(w));
+        let builtin = {
+            let l: &str = lower.as_deref().unwrap_or(s);
+            crate::builtins_meta::BUILTIN_NAMES.binary_search(&l).is_ok()
+        };
         Name(Arc::new(NameInner {
             key: crate::key::Key::new(s),
             orig: Box::from(s),
             lower,
+            reserved,
+            builtin,
+            builtin_fn: std::sync::OnceLock::new(),
         }))
     }
 
@@ -134,6 +170,30 @@ impl Name {
     #[inline]
     pub fn eq_ci(&self, other: &str) -> bool {
         self.lower().eq_ignore_ascii_case(other)
+    }
+
+    /// Does this identifier need special routing in a frame's load/store ops
+    /// (a scope name, a reserved frame key, or an engine `__` key)? Free —
+    /// computed at intern time. A `false` answer means the name is a plain
+    /// variable the fast paths may store straight into the frame's scope.
+    #[inline]
+    pub fn is_reserved_word(&self) -> bool {
+        self.0.reserved
+    }
+
+    /// Is this a compiled-in builtin function name? Free — computed at intern
+    /// time against `BUILTIN_NAMES`. Extension-provided and natively
+    /// registered builtins are NOT covered; callers that must see those fall
+    /// back to the VM's dynamic index when this answers `false`.
+    #[inline]
+    pub fn is_builtin_static(&self) -> bool {
+        self.0.builtin
+    }
+
+    /// The cached builtin entry point for this name (see `NameInner::builtin_fn`).
+    #[inline]
+    pub fn builtin_fn_cache(&self) -> &std::sync::OnceLock<BuiltinFnPtr> {
+        &self.0.builtin_fn
     }
 
     /// This identifier as a struct/scope [`Key`] — free, precomputed at intern

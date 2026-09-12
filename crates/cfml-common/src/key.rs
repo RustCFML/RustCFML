@@ -557,6 +557,17 @@ pub mod well_known {
     pub static PROPERTIES: LazyLock<Key> = LazyLock::new(|| Key::new("__properties"));
     /// A component's class name marker.
     pub static NAME_MARKER: LazyLock<Key> = LazyLock::new(|| Key::new("__name"));
+    /// The env a LEXICAL closure frame resolves its captured names through —
+    /// a `Function` carrier holding the `Arc<RwLock<ValueMap>>`, see
+    /// `CfmlVirtualMachine::FRAME_CLOSURE_ENV_KEY`.
+    pub static CLOSURE_FRAME_ENV: LazyLock<Key> =
+        LazyLock::new(|| Key::new("__closure_frame_env__"));
+    /// A closure env's link to its lexical parent env (`CfmlVirtualMachine::CLOSURE_PARENT_KEY`).
+    pub static CLOSURE_PARENT: LazyLock<Key> =
+        LazyLock::new(|| Key::new("__closure_parent_env__"));
+    /// A closure env's own-key list (`CfmlVirtualMachine::CLOSURE_OWN_KEYS`).
+    pub static CLOSURE_OWN_KEYS: LazyLock<Key> =
+        LazyLock::new(|| Key::new("__closure_own_keys__"));
     /// Sentinel marking a struct AS the `arguments` scope.
     pub static ARGUMENTS_MARKER: LazyLock<Key> = LazyLock::new(|| Key::new("__arguments_scope"));
     /// Declared parameter names carried on the `arguments` scope, so

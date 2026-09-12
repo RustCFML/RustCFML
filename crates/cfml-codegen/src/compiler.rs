@@ -403,7 +403,8 @@ impl BytecodeFunction {
                 | BytecodeOp::UnsetPath(_)
                 | BytecodeOp::DeleteScopeKey(_)
                 | BytecodeOp::ArrayAppendLocal(_)
-                | BytecodeOp::LoadVariablesKey(_) => return 0,
+                | BytecodeOp::LoadVariablesKey(_)
+                | BytecodeOp::StoreVariablesKey(_) => return 0,
                 BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n) => {
                     if matches!(
                         n.lower(),
@@ -559,7 +560,8 @@ impl BytecodeFunction {
                 | BytecodeOp::SetLastExceptionFromLocal(n)
                 | BytecodeOp::JumpIfArgPresent(n, _)
                 | BytecodeOp::SeedArgumentKey(n)
-                | BytecodeOp::LoadVariablesKey(n) => {
+                | BytecodeOp::LoadVariablesKey(n)
+                | BytecodeOp::StoreVariablesKey(n) => {
                     excluded.insert(n.lower().to_string());
                 }
                 BytecodeOp::IsDefined(n) => {
@@ -935,6 +937,14 @@ pub enum BytecodeOp {
     /// resolution (PR #97) — semantics that would corrupt reads of
     /// variables named like builtins (`variables.log`, `variables.len`).
     LoadVariablesKey(Name),
+    /// `variables.<key> = value` at any depth: one pre-hashed insert into the
+    /// frame's `__variables` handle (a component's scope, a page's scope). This
+    /// used to compile to LoadLocal("variables") + SetProperty + StoreLocal(
+    /// "variables"): a handle clone with a `this`-alias stamp, a writability
+    /// check, and a round-trip store that allocated a fresh `__variables` key
+    /// string on every write — ~550 ns per `variables.x += variables.y` in a
+    /// method body against Lucee's ~60.
+    StoreVariablesKey(Name),
     StoreGlobal(Name),
 
     // Stack
@@ -1457,11 +1467,12 @@ impl BytecodeOp {
             Self::SeedArgumentKey(..) => 122,
             Self::StoreLocalScopeKey(..) => 123,
             Self::DefineComponentMethods(..) => 124,
+            Self::StoreVariablesKey(..) => 125,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 125] = [
+    pub const CENSUS_NAMES: [&'static str; 126] = [
         "Null",
         "True",
         "False",
@@ -1587,6 +1598,7 @@ impl BytecodeOp {
         "SeedArgumentKey",
         "StoreLocalScopeKey",
         "DefineComponentMethods",
+        "StoreVariablesKey",
     ];
 }
 
@@ -2459,6 +2471,14 @@ impl CfmlCompiler {
                 }
                 // Stack has modified child value. Load the parent, swap, set property.
                 // Then recurse to write back the parent.
+                if let Expression::Identifier(ref ident) = *access.object {
+                    if ident.name.eq_ignore_ascii_case("variables") && !access.null_safe {
+                        // `variables.x++` / `variables.x += v`: the read half
+                        // is LoadVariablesKey, the write half is this.
+                        instructions.push(BytecodeOp::StoreVariablesKey(Name::from(&access.member)));
+                        return;
+                    }
+                }
                 self.emit_load_for_writeback(&access.object, instructions);
                 instructions.push(BytecodeOp::Swap);
                 instructions.push(BytecodeOp::SetProperty(Name::from(&access.member)));
@@ -2921,6 +2941,10 @@ impl CfmlCompiler {
                                 // hand the decision to StoreLocalScopeKey rather
                                 // than guessing here.
                                 instructions.push(BytecodeOp::StoreLocalScopeKey(Name::from(&member)));
+                            } else if ident.name.eq_ignore_ascii_case("variables") {
+                                // `variables.x = v`: a direct insert into the
+                                // frame's scope handle (see StoreVariablesKey).
+                                instructions.push(BytecodeOp::StoreVariablesKey(Name::from(&member)));
                             } else {
                                 self.compile_expression(obj, instructions);
                                 instructions.push(BytecodeOp::Swap);
@@ -5614,7 +5638,13 @@ impl CfmlCompiler {
                 // Unsafe inside function bodies: `variables` there means the locals
                 // merge or a CFC's `__variables` struct — LoadGlobal would hit page
                 // globals instead. Also unsafe for null-safe `variables?.foo`.
-                if !access.null_safe && self.function_depth == 0 {
+                // Emitted at EVERY depth now: the VM arm resolves the key off the
+                // frame's `__variables` handle first (a component's scope, or a
+                // page's — pages carry one too), so a function body's
+                // `variables.foo` is one pre-hashed probe instead of a handle
+                // clone + `this`-alias stamp + GetProperty. Frames without a
+                // handle keep the page-globals resolution the peephole always had.
+                if !access.null_safe {
                     if let Expression::Identifier(ref ident) = *access.object {
                         if ident.name.eq_ignore_ascii_case("variables") {
                             instructions

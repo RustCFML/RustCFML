@@ -89,27 +89,49 @@ pub(crate) fn op_concat(
         // densely shared object graph it expanded to an O(2^depth)
         // string and hung the process (ColdBox boot). Left operand
         // is checked first, matching CFML left-to-right evaluation.
-        let sa = match a.to_string_strict() {
-            Ok(s) => s,
-            Err(e) => match vm.raise_catchable(stack, &e.message, "expression") {
-                Ok(catch_ip) => {
-                    *ip = catch_ip;
-                    return Ok(());
+        // ONE allocation for the result. This used to coerce both operands to
+        // fresh `String`s (cloning a String operand's text) and then `format!`
+        // a third — three allocations and the formatting machinery per `&`.
+        // A uniquely-owned left String is appended to in place; an Int right
+        // operand is written straight into the buffer.
+        let mut out: String = match a {
+            CfmlValue::String(arc) => match std::sync::Arc::try_unwrap(arc) {
+                Ok(s) => s,
+                Err(arc) => {
+                    let mut s = String::with_capacity(arc.len() + 16);
+                    s.push_str(&arc);
+                    s
                 }
-                Err(e) => return Err(e),
+            },
+            other => match other.to_string_strict() {
+                Ok(s) => s,
+                Err(e) => match vm.raise_catchable(stack, &e.message, "expression") {
+                    Ok(catch_ip) => {
+                        *ip = catch_ip;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                },
             },
         };
-        let sb = match b.to_string_strict() {
-            Ok(s) => s,
-            Err(e) => match vm.raise_catchable(stack, &e.message, "expression") {
-                Ok(catch_ip) => {
-                    *ip = catch_ip;
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
+        match &b {
+            CfmlValue::String(sb) => out.push_str(sb),
+            CfmlValue::Int(i) => {
+                use std::fmt::Write;
+                let _ = write!(out, "{}", i);
+            }
+            other => match other.to_string_strict() {
+                Ok(s) => out.push_str(&s),
+                Err(e) => match vm.raise_catchable(stack, &e.message, "expression") {
+                    Ok(catch_ip) => {
+                        *ip = catch_ip;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                },
             },
-        };
-        stack.push(CfmlValue::string(format!("{}{}", sa, sb)));
+        }
+        stack.push(CfmlValue::String(std::sync::Arc::new(out)));
     }
     Ok(())
 }

@@ -2129,6 +2129,9 @@ pub struct CfmlVirtualMachine {
         cfml_common::dynamic::ValueBuildHasher,
     >,
     builtin_lc_src_len: usize,
+    /// A native module re-registered a compiled-in builtin's name (see
+    /// `register_native_fn`): disables the per-`Name` entry-point cache.
+    native_overrides_builtin: bool,
     /// Memoized `isValid` builtin, for the §29 declared-type checks (which need
     /// the format predicates but must not pay a case-insensitive scan of the
     /// whole builtin table on every typed call). `Some(None)` = looked up and
@@ -3689,6 +3692,16 @@ struct FusedParentPlan {
     /// `None` = carry everything (closure expression, or the caller is a
     /// template/page frame whose locals ARE the page variables scope).
     filter: Option<std::sync::Arc<InheritedKeys>>,
+    /// The callee has a captured env and the caller is NOT a component
+    /// context (no `this` in its frame): every key the env holds wins over the
+    /// caller's, whatever its type, and the caller only fills the gaps. In a
+    /// component context a caller FUNCTION overrides a same-named env entry
+    /// (unless the env's is a stripped self-reference) and caller data fills
+    /// gaps. These are the two compositions the `Call`/`CallNamed` arms used
+    /// to materialize as a merged copy of env ∪ locals BEFORE the frame seed
+    /// copied it all again — the merge is now done once, here, from the raw
+    /// caller locals.
+    env_first: bool,
 }
 
 /// The set of keys a frame inherited from its parent scope, split by kind
@@ -4173,6 +4186,40 @@ struct CustomTagState {
 /// param set are built at execution time). A CFML identifier cannot collide:
 /// the `__cf` prefix is reserved for the engine. See GH #362.
 #[inline]
+/// The `arguments` key for positional argument `n` (1-based), pre-interned for
+/// the small indexes so a call with EXTRA positional arguments — every
+/// higher-order callback, which receives (value, index, collection) but
+/// usually declares one parameter — allocates no key string per element.
+fn positional_arg_key(n: usize) -> cfml_common::key::Key {
+    static KEYS: std::sync::LazyLock<Vec<cfml_common::key::Key>> = std::sync::LazyLock::new(|| {
+        (0..=32).map(|i| cfml_common::key::Key::new(i.to_string())).collect()
+    });
+    match KEYS.get(n) {
+        Some(k) => k.clone(),
+        None => cfml_common::key::Key::new(n.to_string()),
+    }
+}
+
+/// Do `a` and `b` denote the SAME by-reference value (one shared backing)?
+/// A member write (`st.x = 1`, `arr[i] = v`) compiles to a mutation of the
+/// handle followed by a store of that handle back to its variable; when the
+/// variable already holds this very handle, the store is a no-op and is skipped
+/// — saving a map insert, a version bump and a closure-env sync per write.
+#[inline]
+fn same_reference(a: &CfmlValue, b: &CfmlValue) -> bool {
+    match (a, b) {
+        (CfmlValue::Struct(x), CfmlValue::Struct(y)) => x.ptr_eq(y),
+        (CfmlValue::Array(x), CfmlValue::Array(y)) => x.ptr_eq(y),
+        (CfmlValue::Query(x), CfmlValue::Query(y)) => x.ptr_eq(y),
+        _ => false,
+    }
+}
+
+#[inline]
+fn is_reference_value(v: &CfmlValue) -> bool {
+    matches!(v, CfmlValue::Struct(_) | CfmlValue::Array(_) | CfmlValue::Query(_))
+}
+
 fn is_engine_frame_local(name: &str) -> bool {
     name.eq_ignore_ascii_case("__cfquery_params") || name.eq_ignore_ascii_case("__cfhttp_params")
 }
@@ -4186,6 +4233,7 @@ impl CfmlVirtualMachine {
             component_template_globals: 0,
             builtins: HashMap::new(),
             builtin_names_lc: HashMap::default(),
+            native_overrides_builtin: false,
             builtin_lc_src_len: usize::MAX, // no index yet — probe takes the slow path
             type_check_is_valid: None,
             output_buffer: String::new(),
@@ -5291,10 +5339,21 @@ impl CfmlVirtualMachine {
                     // wholesale — v0.630.0 (GH #360) correctly stopped
                     // publishing them and took the thread body's last remaining
                     // source of its own siblings with it.
+                    // The component scope crosses into the thread as a per-thread
+                    // SNAPSHOT struct under the same structural key, not as loose
+                    // env entries. The body frame then reads `variables.helper()`
+                    // and bare sibling methods through `__variables` exactly as the
+                    // method that spawned it does, and a sibling method the body
+                    // calls is bound to that same scope, so ITS sibling calls
+                    // resolve too. Loose entries only worked while a closure frame
+                    // copied its whole env into `locals`; a lexical closure now
+                    // references it (see `frame_closure_env`). Still a copy per
+                    // thread — the GH #234 isolation argument above stands.
                     let vars = vars.snapshot_with_methods();
-                    for (k, v) in &vars {
-                        snap.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
+                    snap.insert(
+                        "__variables".to_string(),
+                        CfmlValue::Struct(CfmlStruct::new(vars.clone())),
+                    );
                     component_vars = Some(vars);
                 }
                 Arc::make_mut(f).captured_scope = Some(cfml_common::cycle_gc::tracked_scope(snap));
@@ -5806,6 +5865,14 @@ impl CfmlVirtualMachine {
                     captured_scope: None,
                 })),
             );
+            // An extension taking over a compiled-in name must win over the
+            // per-Name entry-point cache (see op_call_builtin).
+            if cfml_common::builtins_meta::BUILTIN_NAMES
+                .binary_search(&key.to_lowercase().as_str())
+                .is_ok()
+            {
+                self.native_overrides_builtin = true;
+            }
             self.foreign_builtins.insert(key, bif.clone());
         }
         for (name, class) in &module.classes {
@@ -5874,6 +5941,23 @@ impl CfmlVirtualMachine {
         }
         self.builtin_names_lc = idx;
         self.builtin_lc_src_len = self.builtins.len();
+    }
+
+    /// `is_builtin_name_ci` for a bytecode operand: the compiled-in answer was
+    /// computed when the `Name` was interned, so the common case costs no hash.
+    /// Only when the answer is `false` AND something beyond the compiled-in set
+    /// is registered (an extension, a native module) is the dynamic index asked.
+    #[inline]
+    fn is_builtin_name_fast(&self, name: &cfml_common::name::Name) -> bool {
+        if name.is_builtin_static() {
+            return true;
+        }
+        if self.foreign_builtins.is_empty()
+            && self.builtins.len() == cfml_common::builtins_meta::BUILTIN_NAMES.len()
+        {
+            return false;
+        }
+        self.is_builtin_name_ci(name.as_str(), name.lower())
     }
 
     /// Case-insensitive "is `name` a builtin?" — equivalent to
@@ -5989,6 +6073,23 @@ impl CfmlVirtualMachine {
             args.push(stack.pop().unwrap_or(CfmlValue::Null));
         }
         args.reverse();
+        // A compiled-in builtin resolves once per NAME, not once per call: the
+        // entry point is cached on the interned operand. Guarded so a native
+        // module or an extension that took over a compiled-in name still wins
+        // (rare; `native_overrides_builtin` is set by `register_native_fn` and
+        // by extension loading) — which is what lets the cache sit BEFORE the
+        // extension table below: that table is a SipHash map probed by string,
+        // and with any extension installed it cost every BIF call.
+        let cacheable = name.is_builtin_static() && !self.native_overrides_builtin;
+        if cacheable {
+            if let Some(f) = name.builtin_fn_cache().get() {
+                #[cfg(feature = "bif-census")]
+                cfml_common::perf_counters::bif_census::record(name.as_str(), &args);
+                let out = f(args)?;
+                stack.push(out);
+                return Ok(());
+            }
+        }
         // An extension's BIF is compile-time bound too (codegen's
         // `is_direct_builtin` consults the loaded set), so check the foreign
         // registry first — it is empty for everyone who has not installed one,
@@ -6015,6 +6116,9 @@ impl CfmlVirtualMachine {
         };
         match resolved {
             Some(f) => {
+                if cacheable {
+                    let _ = name.builtin_fn_cache().set(f);
+                }
                 #[cfg(feature = "bif-census")]
                 cfml_common::perf_counters::bif_census::record(name.as_str(), &args);
                 // NB: the error is returned, NOT `?`-propagated — the caller routes it
@@ -6168,7 +6272,15 @@ impl CfmlVirtualMachine {
     }
 
     pub fn register_native_fn(&mut self, name: &str, f: BuiltinFunction) {
-        self.builtins.insert(name.to_string(), f);
+        if self.builtins.insert(name.to_string(), f).is_some()
+            || cfml_common::builtins_meta::BUILTIN_NAMES
+                .binary_search(&name.to_lowercase().as_str())
+                .is_ok()
+        {
+            // A compiled-in name now dispatches elsewhere: the per-Name entry
+            // point cache (see op_call_builtin) must not be consulted.
+            self.native_overrides_builtin = true;
+        }
         // Keep the hot-path index in step with the map it indexes.
         self.refresh_builtin_index();
         self.globals.insert(
@@ -7451,7 +7563,7 @@ impl CfmlVirtualMachine {
     fn apply_numeric_delta(
         locals: &mut ValueMap,
         closure_env: Option<&Arc<std::sync::RwLock<ValueMap>>>,
-        name: &str,
+        name: &cfml_common::name::Name,
         op: impl Fn(&CfmlValue) -> CfmlValue,
     ) {
         if let Some(val) = locals.get(name) {
@@ -7467,12 +7579,24 @@ impl CfmlVirtualMachine {
             }
             return;
         }
+        // A captured name in a lexical closure frame: update it where it lives.
+        if let Some(owner) = Self::closure_chain_owner(locals, name) {
+            if let Ok(mut g) = owner.write() {
+                if let Some(cur) = g.get(name).cloned() {
+                    g.insert(name, op(&cur));
+                }
+            }
+            return;
+        }
         // Fallback: unscoped var in the CFC component scope (`__variables`).
         // CfmlStruct mutates through `&self` (interior RwLock), so an immutable
         // borrow of `locals` suffices. get_ci keeps CFML's case-insensitivity.
         if let Some(vars) = locals.get(&*cfml_common::key::well_known::VARIABLES).and_then(|v| v.as_cfml_struct()) {
-            if let Some(cur) = vars.get_ci(name) {
-                vars.insert(name, op(&cur));
+            // Pre-hashed probes: the key is a bytecode operand, so neither the
+            // read nor the write hashes or allocates (a page loop counter lives
+            // here — see `page_main_frame`).
+            if let Some(cur) = vars.get(name) {
+                vars.insert(name.key().clone(), op(&cur));
             }
         }
     }
@@ -7984,6 +8108,9 @@ impl CfmlVirtualMachine {
         // Shared closure environment: all closures defined within this function
         // invocation share one Rc<RefCell<HashMap>>. Lazily created on first DefineFunction.
         let mut closure_env: Option<Arc<RwLock<ValueMap>>> = None;
+        // `ValueMap::version()` of `closure_env` at the last reconcile — see
+        // `reconcile_closure_env_into_locals`. `u32::MAX` = never reconciled.
+        let mut env_reconciled_version: u32 = u32::MAX;
         // If THIS frame is a lexical-closure invocation, `call_function` stashed the
         // closure's live captured (defining) env in `pending_closure_env`. We do NOT
         // adopt it as our own env — each invocation must own its scope so closure
@@ -8158,6 +8285,39 @@ impl CfmlVirtualMachine {
             pc::bump(&pc::SEED_FRAMES);
         }
         let inherited_from_parent = inherited_from_parent.into_shared();
+        // A page's `variables` scope is a SHARED STRUCT, not the frame's own
+        // locals map. A top-level `__main__` (a template frame with no function
+        // `local` scope) that inherited no `__variables` from its launcher gets
+        // a fresh one here; an `include`d template, a custom tag body, an
+        // `evaluate()` frame or a REPL line arrives with one already seeded
+        // (the includer's / the tag's / the previous line's) and shares it.
+        //
+        // Before this the page frame's locals WERE the page scope, so every
+        // call out of the page copied every page variable into the callee's
+        // frame and diffed it back on return: a UDF call cost 1.4 us with 5
+        // page variables, 5.3 us with 50, 21 us with 200 and 461 us with 1000
+        // (Lucee: ~160 ns, flat — its frames walk a reference chain). With the
+        // scope behind a handle a callee is seeded with ONE structural key and
+        // resolves page variables through it exactly as a CFC method resolves
+        // its component's `variables`; closures defined on the page capture the
+        // same live handle instead of a snapshot that had to be kept in sync.
+        //
+        // The page frame itself reads and writes its variables through the
+        // handle (the `__variables` routing every component-scope frame already
+        // uses). `localMode="modern"` has no meaning for a frame without a
+        // `local` scope — an unscoped page write is a `variables` write on
+        // every engine — so the flag is forced off for these frames, otherwise
+        // the modern-mode guards would park page variables in the empty locals
+        // map where the handle cannot see them.
+        let page_main_frame =
+            is_template_frame && !frame_has_local_scope && func.name == "__main__";
+        if page_main_frame && !locals.contains_key(&*cfml_common::key::well_known::VARIABLES) {
+            locals.insert(
+                "__variables".to_string(),
+                CfmlValue::Struct(CfmlStruct::empty()),
+            );
+        }
+        let effective_local_mode_modern = effective_local_mode_modern && !page_main_frame;
         #[cfg(feature = "call-phases")]
         {
             // phase 2: parent-scope seed copy
@@ -8454,7 +8614,7 @@ impl CfmlVirtualMachine {
                 if let Some((_, name)) = extras.iter().find(|(idx, _)| *idx == i) {
                     arguments_map.insert(name.clone(), value);
                 } else {
-                    arguments_map.insert((i + 1).to_string(), value);
+                    arguments_map.insert(positional_arg_key(i + 1), value);
                 }
             }
             // Tag this struct as the arguments scope. `__arguments_scope` is the
@@ -8669,6 +8829,22 @@ impl CfmlVirtualMachine {
                         if let Some(v) = slots[*i as usize].as_ref() {
                             stack.push(v.clone());
                             continue;
+                        }
+                    }
+                    // Page-scope fast path: a plain variable read on a page
+                    // frame resolves straight off the page's `variables`
+                    // handle — one pre-hashed probe instead of the scope-name
+                    // comparison chain and the local → arguments → web-scope →
+                    // variables cascade. A miss (a `var`-declared page local,
+                    // an inherited copy in `locals`, an undefined name) takes
+                    // the generic path, which is where the same name would
+                    // have resolved anyway.
+                    if page_main_frame && !name.is_reserved_word() && !locals.contains_key(name) {
+                        if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                            if let Some(v) = vars.get(name) {
+                                stack.push(v);
+                                continue;
+                            }
                         }
                     }
                     // Handle CFML scope references
@@ -9168,6 +9344,47 @@ impl CfmlVirtualMachine {
                             slot_blocked |= 1u64 << idx;
                         }
                     }
+                    // Page-scope fast path (the twin of LoadLocal's): a plain
+                    // variable written on a page frame goes straight into the
+                    // page's `variables` handle with a pre-hashed key. Exactly
+                    // the `__variables` routing branch below minus the tests
+                    // that cannot apply to a page frame (no parameters, no
+                    // `local` scope, modern mode forced off); a name already
+                    // present in `locals` (a `var`-declared page local, an
+                    // inherited copy) keeps today's in-place update there.
+                    if page_main_frame
+                        && !name.is_reserved_word()
+                        && !declared_locals.contains(name.as_str())
+                        && !locals.contains_key(name)
+                    {
+                        if let Some(vars) = locals
+                            .get(&*cfml_common::key::well_known::VARIABLES)
+                            .and_then(|v| v.as_cfml_struct())
+                        {
+                            if let Some(val) = stack.pop() {
+                                // A named declaration is stored unbound — see
+                                // the matching rule on the generic branch.
+                                let val = match &val {
+                                    CfmlValue::Function(f)
+                                        if f.captured_scope.is_some()
+                                            && f.name.eq_ignore_ascii_case(name.as_str()) =>
+                                    {
+                                        let mut nf = (**f).clone();
+                                        nf.captured_scope = None;
+                                        CfmlValue::Function(Arc::new(nf))
+                                    }
+                                    _ => val,
+                                };
+                                if is_reference_value(&val)
+                                    && vars.get(name).is_some_and(|cur| same_reference(&cur, &val))
+                                {
+                                    continue; // member-write round-trip of the same handle
+                                }
+                                vars.insert(name.key().clone(), val);
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(val) = stack.pop() {
                         // Same zero-alloc lowercase guard as LoadLocal.
                         let name_lower: &str = name.lower();
@@ -9500,6 +9717,16 @@ impl CfmlVirtualMachine {
                             // contentServer.parseURLRoot accumulates url.path). A
                             // genuine `var url` frame-local is guarded out above.
                             self.globals.insert(name_lower.to_string(), val);
+                        } else if !effective_local_mode_modern
+                            && !declared_locals.contains(name.as_str())
+                            && !locals.contains_key(name)
+                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                            && Self::closure_chain_store(&locals, name, &val)
+                        {
+                            // Lexical closure, classic localmode: a write to a
+                            // captured name updates the env level that owns it —
+                            // the enclosing function's variable — Lucee's closure
+                            // scope chain (see `frame_closure_env`). Done.
                         } else if !declared_locals.contains(name.as_str())
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
@@ -9589,10 +9816,19 @@ impl CfmlVirtualMachine {
                                     }
                                     _ => val,
                                 };
+                                if is_reference_value(&val)
+                                    && vars.get(name).is_some_and(|cur| same_reference(&cur, &val))
+                                {
+                                    continue; // member-write round-trip of the same handle
+                                }
                                 vars.insert(name, val);
                             }
                         } else {
-                            scope_insert_ci(&mut locals, name, val.clone());
+                            if !(is_reference_value(&val)
+                                && locals.get(name).is_some_and(|cur| same_reference(cur, &val)))
+                            {
+                                scope_insert_ci(&mut locals, name, val.clone());
+                            }
                             // PR #93: in modern localmode, a bare assignment IS a
                             // local-scope assignment — it claims the key for this
                             // frame's `local` view, shadowing any inherited
@@ -9677,7 +9913,75 @@ impl CfmlVirtualMachine {
                     }
                 }
                 BytecodeOp::ArrayAppendLocal(name) | BytecodeOp::ArrayAppendSlot(_, name) => { ops::locals::op_array_append_local(self, &mut stack, func, &mut locals, &mut slots, &closure_env, &declared_locals, effective_local_mode_modern, is_inside_function, op, name)?; }
+                BytecodeOp::StoreVariablesKey(name) => {
+                    if let Some(val) = stack.pop() {
+                        match locals
+                            .get(&*cfml_common::key::well_known::VARIABLES)
+                            .and_then(|v| v.as_cfml_struct())
+                        {
+                            Some(vars) => {
+                                if !(is_reference_value(&val)
+                                    && vars.get(name).is_some_and(|cur| same_reference(&cur, &val)))
+                                {
+                                    vars.insert(name.key().clone(), val);
+                                }
+                            }
+                            None => {
+                                // No scope handle: `variables` IS this frame's own
+                                // locals (a function frame reached outside any page or
+                                // component). The generic path built a struct view of
+                                // them, set the member and merged it back — the net
+                                // effect for one key, plus the closure-env forward sync
+                                // every plain store does (GH #316).
+                                scope_insert_ci(&mut locals, name.as_str(), val.clone());
+                                if let Some(ref env) = closure_env {
+                                    let mut m = env.write().unwrap();
+                                    if m.contains_key(name) {
+                                        m.insert(name, val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 BytecodeOp::LoadGlobal(name) | BytecodeOp::LoadVariablesKey(name) => {
+                    // `variables.<key>` READ against the frame's scope handle (a
+                    // component's `variables`, a page's). One pre-hashed probe on a
+                    // hit. A miss behaves exactly as LoadLocal("variables") +
+                    // GetProperty did — `variables.this` alias resolution and the
+                    // "is undefined" error included — so nothing observable moved.
+                    // A frame with no handle falls through to the page-globals
+                    // resolution below, unchanged.
+                    if matches!(op, BytecodeOp::LoadVariablesKey(_)) {
+                        let probe: Option<Option<CfmlValue>> =
+                            match locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                                Some(CfmlValue::Struct(vars)) => Some(vars.get(name)),
+                                _ => None,
+                            };
+                        match probe {
+                            Some(Some(v)) => {
+                                stack.push(v);
+                                continue;
+                            }
+                            Some(None) => {
+                                let vars = match locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                                    Some(CfmlValue::Struct(vars)) => vars.clone(),
+                                    _ => unreachable!(),
+                                };
+                                if let Some(CfmlValue::Struct(this_s)) = locals.get(&*cfml_common::key::well_known::THIS) {
+                                    vars.set_this_alias_if_changed(this_s);
+                                }
+                                #[cfg(feature = "component-instance")]
+                                if let Some(CfmlValue::Instance(inst)) = locals.get(&*cfml_common::key::well_known::THIS) {
+                                    vars.set_this_instance_alias(inst);
+                                }
+                                stack.push(CfmlValue::Struct(vars));
+                                ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, true)?;
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
                     // Avoid allocating a lowercase String when the identifier is
                     // already all-lowercase ASCII (the common case for the most
                     // frequent read op). Unicode/mixed-case idents still get full
@@ -9698,7 +10002,7 @@ impl CfmlVirtualMachine {
                     // visible (`variables.log` must return the variable, not the
                     // log() builtin).
                     let is_read_position = matches!(op, BytecodeOp::LoadVariablesKey(_));
-                    let is_builtin_name = self.is_builtin_name_ci(name.as_str(), &name_lower);
+                    let is_builtin_name = self.is_builtin_name_fast(name);
                     // Resolve from this frame's locals (exact, then CI), keeping the
                     // matched key so we can ask whether it was inherited. For a bare
                     // read of a BUILTIN name, a CI data hit is provably discarded
@@ -9792,6 +10096,23 @@ impl CfmlVirtualMachine {
                         }
                         stack.push(v);
                     // 1b. Check __variables scope for CFC methods
+                    } else if let Some(CfmlValue::Function(cf)) = Self::closure_chain_get(&locals, name) {
+                        // A captured FUNCTION value (a var-scoped helper, a
+                        // closure passed as a parameter) called by bare name from
+                        // a lexical closure. A captured DATA hit is not a call
+                        // target and falls through (PR #97).
+                        let v = if !cf.name.eq_ignore_ascii_case(name.as_str())
+                            && !cf.name.starts_with("__closure_")
+                            && !cf.name.starts_with("__arrow_")
+                        {
+                            self.pending_called_name = Some(name.key().as_arc());
+                            let mut bf = (*cf).clone();
+                            bf.name = name.to_string();
+                            CfmlValue::Function(Arc::new(bf))
+                        } else {
+                            CfmlValue::Function(cf)
+                        };
+                        stack.push(v);
                     } else if let Some(val) = locals.get(&*cfml_common::key::well_known::VARIABLES).filter(|_| !skip_variables_method).and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
                             // get_ci does exact-then-CI under one read lock and
@@ -10465,7 +10786,6 @@ impl CfmlVirtualMachine {
                         // For closures with captured scope, merge defining scope + caller locals.
                         // For CFC method calls (this in locals), caller locals take priority.
                         // For plain UDF calls, pass caller locals by reference (no clone).
-                        let merged_scope;
                         // T3.1: callees that resolve the CALLER's variables by
                         // name at runtime (QoQ table sources via queryExecute /
                         // cfquery, custom-tag `caller` bridging) can't see slot
@@ -10493,60 +10813,11 @@ impl CfmlVirtualMachine {
                             }
                             std::time::Instant::now()
                         };
-                        let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
-                            if let Some(ref shared_env) = f.captured_scope {
-                                #[cfg(feature = "call-phases")]
-                                cfml_common::perf_counters::call_phases::bump_env_clone(
-                                    shared_env.read().map(|e| e.len() as u64).unwrap_or(0)
-                                        + locals.len() as u64,
-                                );
-                                let is_cfc_context = locals.contains_key(&*cfml_common::key::well_known::THIS);
-                                merged_scope = if is_cfc_context {
-                                    // CFC methods: start with captured scope (has runtime data),
-                                    // then overlay functions from caller locals (correct method overrides),
-                                    // then add remaining caller locals (like `this`).
-                                    // __variables and this ALWAYS come from caller (current state).
-                                    let mut m = shared_env.read().unwrap().clone();
-                                    for (k, v) in &locals {
-                                        // Preserve a closure self-reference / captured
-                                        // helper: a var-fn the defining frame stored into
-                                        // this env with captured_scope stripped to None.
-                                        // The caller's same-named Some-env copy must NOT
-                                        // clobber it, or a recursive var-scoped function
-                                        // expression inside a CFC method loses its own name.
-                                        if matches!(m.get(k), Some(CfmlValue::Function(f)) if f.captured_scope.is_none())
-                                        {
-                                            continue;
-                                        }
-                                        if matches!(v, CfmlValue::Function(_))
-                                            || !m.contains_key(k)
-                                            || k == "__variables"
-                                            || k == "this"
-                                        {
-                                            m.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                    m
-                                } else {
-                                    let mut m = shared_env.read().unwrap().clone();
-                                    for (k, v) in &locals {
-                                        if !m.contains_key(k) {
-                                            m.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                    m
-                                };
-                                &merged_scope
-                            } else {
-                                #[cfg(feature = "call-phases")]
-                                cfml_common::perf_counters::call_phases::bump_env_passthrough();
-                                &locals
-                            }
-                        } else {
-                            #[cfg(feature = "call-phases")]
-                            cfml_common::perf_counters::call_phases::bump_env_passthrough();
-                            &locals
-                        };
+                        // The callee's captured env is composed with these locals ONCE, at
+                        // frame entry (`fused_parent_merge`, `FusedParentPlan::env_first`).
+                        // This used to build a merged copy of env ∪ locals here first, which
+                        // the frame seed then copied AGAIN: ~20% of a closure call.
+                        let effective_locals = &locals;
                         #[cfg(feature = "call-phases")]
                         let _cp_call = {
                             let _n = std::time::Instant::now();
@@ -10630,7 +10901,7 @@ impl CfmlVirtualMachine {
                                 // Reconcile any nested-closure writeback that reached
                                 // the shared env behind an intermediate frame (see the
                                 // CallMethod arm / reconcile_closure_env_into_locals).
-                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
+                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope, &mut env_reconciled_version);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -11184,7 +11455,6 @@ impl CfmlVirtualMachine {
                         self.closure_parent_deletes = None;
                         self.arg_ref_writeback = None;
                         self.pending_result_writeback = None;
-                        let merged_scope;
                         // T3.1: callees that resolve the CALLER's variables by
                         // name at runtime (QoQ table sources via queryExecute /
                         // cfquery, custom-tag `caller` bridging) can't see slot
@@ -11200,50 +11470,11 @@ impl CfmlVirtualMachine {
                                 &mut slot_blocked,
                             );
                         }
-                        let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
-                            if let Some(ref shared_env) = f.captured_scope {
-                                #[cfg(feature = "call-phases")]
-                                cfml_common::perf_counters::call_phases::bump_env_clone(
-                                    shared_env.read().map(|e| e.len() as u64).unwrap_or(0)
-                                        + locals.len() as u64,
-                                );
-                                let is_cfc_context = locals.contains_key(&*cfml_common::key::well_known::THIS);
-                                merged_scope = if is_cfc_context {
-                                    let mut m = shared_env.read().unwrap().clone();
-                                    for (k, v) in &locals {
-                                        // Preserve a closure self-reference / captured helper
-                                        // (stored with captured_scope=None) — see the matching
-                                        // guard on the positional-call merge path above.
-                                        if matches!(m.get(k), Some(CfmlValue::Function(f)) if f.captured_scope.is_none())
-                                        {
-                                            continue;
-                                        }
-                                        if matches!(v, CfmlValue::Function(_)) || !m.contains_key(k)
-                                        {
-                                            m.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                    m
-                                } else {
-                                    let mut m = shared_env.read().unwrap().clone();
-                                    for (k, v) in &locals {
-                                        if !m.contains_key(k) {
-                                            m.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                    m
-                                };
-                                &merged_scope
-                            } else {
-                                #[cfg(feature = "call-phases")]
-                                cfml_common::perf_counters::call_phases::bump_env_passthrough();
-                                &locals
-                            }
-                        } else {
-                            #[cfg(feature = "call-phases")]
-                            cfml_common::perf_counters::call_phases::bump_env_passthrough();
-                            &locals
-                        };
+                        // The callee's captured env is composed with these locals ONCE, at
+                        // frame entry (`fused_parent_merge`, `FusedParentPlan::env_first`).
+                        // This used to build a merged copy of env ∪ locals here first, which
+                        // the frame seed then copied AGAIN: ~20% of a closure call.
+                        let effective_locals = &locals;
                         let saved_try_stack = if self.try_stack.is_empty() {
                             None
                         } else {
@@ -11314,7 +11545,7 @@ impl CfmlVirtualMachine {
                                 }
                                 // queryExecute result=/cfquery name= delivery
                                 self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
-                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
+                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope, &mut env_reconciled_version);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -11818,7 +12049,15 @@ impl CfmlVirtualMachine {
                             } else {
                                 None
                             };
-                            let existing_var = if existing_arg.is_some() {
+                            // A captured struct/object in a lexical closure frame
+                            // (`captured.x = v`): its live handle, mutated in place.
+                            let existing_env = if existing_arg.is_some() {
+                                None
+                            } else {
+                                Self::closure_chain_get(&locals, local_name)
+                                    .filter(|v| is_compound_receiver(v))
+                            };
+                            let existing_var = if existing_arg.is_some() || existing_env.is_some() {
                                 None
                             } else if let Some(CfmlValue::Struct(vars)) =
                                 locals.get(&*cfml_common::key::well_known::VARIABLES)
@@ -11828,7 +12067,7 @@ impl CfmlVirtualMachine {
                             } else {
                                 None
                             };
-                            if let Some(mut existing) = existing_arg.or(existing_var) {
+                            if let Some(mut existing) = existing_arg.or(existing_env).or(existing_var) {
                                 // `existing` is a clone sharing the Arc-backed store
                                 // (struct backing or the instance's public data map),
                                 // so this write is visible through `variables.<name>`.
@@ -12605,6 +12844,7 @@ impl CfmlVirtualMachine {
                                     &declared_locals,
                                     &func.params,
                                     parent_scope,
+                                    &mut env_reconciled_version,
                                 );
                                 stack.push(val);
                                 continue;
@@ -13570,7 +13810,7 @@ impl CfmlVirtualMachine {
                     // closure env, not this frame's `closure_parent_writeback`
                     // (which the method frame already consumed). Reconcile the env
                     // so the enclosing var sees the mutation across the CFC boundary.
-                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
+                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope, &mut env_reconciled_version);
 
                     stack.push(result);
                 }
@@ -13733,7 +13973,7 @@ impl CfmlVirtualMachine {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
-                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope);
+                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals, &declared_locals, &func.params, parent_scope, &mut env_reconciled_version);
                     stack.push(result);
                 }
 
@@ -14904,9 +15144,6 @@ impl CfmlVirtualMachine {
                             // ancestors so an outer var reassigned by a sibling
                             // (e.g. a TestBox `beforeEach`) is seen by this deferred
                             // `it`, which was seeded with a now-stale copy.
-                            if let Some(ref env) = func.captured_scope {
-                                Self::refresh_env_from_parent_chain(env);
-                            }
                             // (2) Hand our captured (defining) env down so any env
                             // this invocation mints links back to it as its parent —
                             // building the chain (1) walks. Each invocation still owns
@@ -14914,7 +15151,7 @@ impl CfmlVirtualMachine {
                             // adopting the parent env outright.
                             self.pending_closure_env = func.captured_scope.clone();
                         }
-                        let fused_parent_plan = self.fused_call_parent_plan(func);
+                        let fused_parent_plan = self.fused_call_parent_plan(func, parent_locals);
                         // Lexical relative-component resolution: while a user
                         // function runs, a bare createObject("component","X")/
                         // `new X()` inside it must resolve X relative to the
@@ -15340,7 +15577,7 @@ impl CfmlVirtualMachine {
             // merge it with parent_locals so the function retains access to its
             // defining scope's variables when called from a different context.
             if let Some(user_func) = self.user_functions.get(&func.name).cloned() {
-                self.pending_fused_parent = Some(self.fused_call_parent_plan(func));
+                self.pending_fused_parent = Some(self.fused_call_parent_plan(func, parent_locals));
                 return self.execute_function_with_args(&user_func, args, Some(parent_locals));
             }
 
@@ -15349,7 +15586,7 @@ impl CfmlVirtualMachine {
             let user_match = self.user_fn_lookup_ci(&name_lower).map(|(_, v)| v.clone());
 
             if let Some(user_func) = user_match {
-                self.pending_fused_parent = Some(self.fused_call_parent_plan(func));
+                self.pending_fused_parent = Some(self.fused_call_parent_plan(func, parent_locals));
                 return self.execute_function_with_args(&user_func, args, Some(parent_locals));
             }
 
@@ -17134,19 +17371,13 @@ impl CfmlVirtualMachine {
                             }
                             "request" => ensure_nested(&self.request_scope, &segs, default_val),
                             "variables" => {
-                                // `globals` is a flat ValueMap; ensure the first
-                                // segment is a struct, then descend into it.
-                                let first = segs[0];
-                                let root = match self.globals.get(first) {
-                                    Some(CfmlValue::Struct(s)) => s.clone(),
-                                    _ => {
-                                        let s = CfmlStruct::empty();
-                                        self.globals
-                                            .insert(first.to_string(), CfmlValue::Struct(s.clone()));
-                                        s
-                                    }
-                                };
-                                ensure_nested(&root, &segs[1..], default_val);
+                                // Auto-vivified in the CALLER's frame through the
+                                // runtime scope-path store (caller-frame delivery,
+                                // see setVariable): it lands on the page/component
+                                // `variables` handle, not in `self.globals`.
+                                self.pending_result_writeback
+                                    .get_or_insert_with(Vec::new)
+                                    .push((format!("variables.{}", key), default_val));
                             }
                             // Session storage is indirected through
                             // set_session_variable; nested session params are
@@ -17162,7 +17393,11 @@ impl CfmlVirtualMachine {
                     }
                     match scope {
                         "variables" => {
-                            self.globals.insert(key.to_string(), default_val);
+                            // Caller-frame delivery (see setVariable): the default
+                            // lands on the page/component `variables` handle.
+                            self.pending_result_writeback
+                                .get_or_insert_with(Vec::new)
+                                .push((format!("variables.{}", key), default_val));
                         }
                         "request" => {
                             self.request_scope.insert(key.to_string(), default_val);
@@ -20431,8 +20666,10 @@ impl CfmlVirtualMachine {
                     // Handle dotted scope names
                     let var_lower = var_name.to_lowercase();
                     if var_lower.starts_with("variables.") {
-                        let key = var_name[10..].to_string();
-                        self.globals.insert(key, value.clone());
+                        // See the bare-name arm below: caller-frame delivery.
+                        self.pending_result_writeback
+                            .get_or_insert_with(Vec::new)
+                            .push((var_name.clone(), value.clone()));
                     } else if var_lower.starts_with("request.") {
                         let key = var_name[8..].to_string();
                         self.request_scope.insert(key, value.clone());
@@ -20445,8 +20682,14 @@ impl CfmlVirtualMachine {
                             app_scope.insert(key, value.clone());
                         }
                     } else {
-                        // Default: set in variables (globals) scope
-                        self.globals.insert(var_name, value.clone());
+                        // Bare name: delivered into the CALLER's frame by the same
+                        // channel a `queryExecute(result=)` uses, so it lands where
+                        // an assignment would — the page/component `variables`
+                        // handle. This used to write `self.globals`, which the page
+                        // `variables` scope no longer includes.
+                        self.pending_result_writeback
+                            .get_or_insert_with(Vec::new)
+                            .push((var_name.clone(), value.clone()));
                     }
                     return Ok(value);
                 }
@@ -22227,6 +22470,7 @@ impl CfmlVirtualMachine {
     fn fused_call_parent_plan(
         &self,
         func_ref: &cfml_common::dynamic::CfmlFunction,
+        parent_locals: &ValueMap,
     ) -> FusedParentPlan {
         let is_closure_expr =
             func_ref.name.starts_with("__closure_") || func_ref.name.starts_with("__arrow_");
@@ -22243,6 +22487,8 @@ impl CfmlVirtualMachine {
             env: func_ref.captured_scope.clone(),
             filter,
             lexical: Self::is_closure_value(func_ref),
+            env_first: func_ref.captured_scope.is_some()
+                && !parent_locals.contains_key(&*cfml_common::key::well_known::THIS),
         }
     }
 
@@ -22309,10 +22555,46 @@ impl CfmlVirtualMachine {
         // Pass 1: env entries — skipping any key a filter-carried caller
         // FUNCTION will override.
         if let Some(env) = env_guard.as_deref() {
-            for (k, v) in env.iter() {
-                if let Some(cv) = caller.and_then(|c| c.get(k)) {
-                    if matches!(cv, CfmlValue::Function(_)) && filter_carry(k, cv) {
+            if plan.lexical {
+                // A lexical closure REFERENCES its env (see
+                // `frame_closure_env`); only the structural scope keys —
+                // this / __variables / super / __static — are materialized in
+                // the frame, because the routing code reads those off `locals`
+                // directly. Everything else resolves through the live chain.
+                for (k, v) in env.iter() {
+                    if InheritedKeys::structural_bit(k.as_str()).is_none() {
                         continue;
+                    }
+                    if counting {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        fuse_counters::ENV_KEYS.fetch_add(1, Relaxed);
+                        fuse_counters::STRUCT_KEYS.fetch_add(1, Relaxed);
+                    }
+                    locals.insert(k.clone(), v.clone());
+                    inherited_or_param_keys.insert_key(k);
+                    inherited_from_parent.insert_key(k);
+                }
+                if let Some(env_arc) = plan.env.as_ref() {
+                    locals.insert(
+                        cfml_common::key::well_known::CLOSURE_FRAME_ENV.clone(),
+                        Self::closure_env_marker(env_arc),
+                    );
+                }
+            } else {
+            for (k, v) in env.iter() {
+                // Component-context composition only (see `env_first`): a
+                // filter-carried caller FUNCTION overrides this env entry —
+                // except a stripped self-reference / captured helper, which
+                // keeps its own name (the recursive var-scoped function
+                // expression inside a CFC method).
+                if !plan.env_first {
+                    if let Some(cv) = caller.and_then(|c| c.get(k)) {
+                        if matches!(cv, CfmlValue::Function(_))
+                            && filter_carry(k, cv)
+                            && !matches!(v, CfmlValue::Function(f) if f.captured_scope.is_none())
+                        {
+                            continue;
+                        }
                     }
                 }
                 if seed_carry(self, k, v) {
@@ -22331,6 +22613,7 @@ impl CfmlVirtualMachine {
                     inherited_from_parent.insert_key(k);
                 }
             }
+            }
         }
         // Pass 2: caller locals.
         if let Some(caller) = caller {
@@ -22339,6 +22622,22 @@ impl CfmlVirtualMachine {
                 fuse_counters::CALLER_SCANNED.fetch_add(caller.len() as u64, Relaxed);
             }
             for (k, v) in caller {
+                // The CALLER's closure-env carrier is the caller's, never the
+                // callee's: carried, it would either clobber the callee's own
+                // (a closure invoked from inside another closure resolved its
+                // captured names through the WRONG env) or hand a plain UDF a
+                // dynamic view of its caller's captured scope.
+                if k == &*cfml_common::key::well_known::CLOSURE_FRAME_ENV {
+                    // One exception: a lexical callee with NO env of its own is a
+                    // STRIPPED copy — a var-scoped function expression stored
+                    // into an env (a recursive `var fact = function(n){ …
+                    // fact(n-1) }`, a captured helper). Its lexical scope IS the
+                    // chain it was fetched from, so it adopts the caller's.
+                    if plan.lexical && plan.env.is_none() {
+                        locals.insert(k.clone(), v.clone());
+                    }
+                    continue;
+                }
                 if !filter_carry(k, v) {
                     continue;
                 }
@@ -22347,13 +22646,22 @@ impl CfmlVirtualMachine {
                     // structural scopes it captured; the caller's are not its.
                     continue;
                 }
-                if !matches!(v, CfmlValue::Function(_))
-                    && env_guard.as_deref().is_some_and(|e| e.contains_key(k))
-                {
-                    // Data only fills gaps the env left (or_insert semantics) —
-                    // including keys whose env value was later dropped by the
-                    // seed-carry rule (the composed value was still the env's).
-                    continue;
+                if let Some(env) = env_guard.as_deref() {
+                    if env.contains_key(k) {
+                        // The env holds this key. Outside a component context
+                        // the env wins outright; inside one, caller DATA only
+                        // fills gaps (or_insert semantics — including keys whose
+                        // env value the seed-carry rule then dropped, because
+                        // the composed value was still the env's), and a caller
+                        // FUNCTION overrides unless the env's is a stripped
+                        // self-reference (already seeded above).
+                        if plan.env_first
+                            || !matches!(v, CfmlValue::Function(_))
+                            || matches!(env.get(k), Some(CfmlValue::Function(f)) if f.captured_scope.is_none())
+                        {
+                            continue;
+                        }
+                    }
                 }
                 if seed_carry(self, k, v) {
                     if counting {
@@ -22469,6 +22777,13 @@ impl CfmlVirtualMachine {
         // __variables, so an application-scoped singleton reads the LIVE
         // per-request scope instead of a `url` key that leaked onto its
         // `variables` scope (Masa front-controller infinite redirect loop).
+        // A lexical closure frame: captured names resolve through the live
+        // env chain (`frame_closure_env`) — after this frame's own locals
+        // and arguments, before its `variables` scope. One pre-hashed probe on
+        // a non-closure frame.
+        if let Some(v) = Self::closure_chain_get(locals, name) {
+            return Some(v);
+        }
         if Self::is_web_request_scope(name_lower) {
             if let Some(v) = self.globals.get(name) {
                 if depth_census {
@@ -22744,6 +23059,8 @@ impl CfmlVirtualMachine {
             // method fell into the `__variables` branch below and, for an
             // application-scoped singleton, leaked across requests.
             self.globals.insert(name, val);
+        } else if !modern && Self::closure_chain_store(locals, name, &val) {
+            // Captured name in a lexical closure frame: updated where it lives.
         } else if !modern
             && locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
             && !matches!(name_lower.as_str(), "cfcatch" | "cookie" | "server" | "attributes")
@@ -29037,6 +29354,9 @@ impl CfmlVirtualMachine {
                         .find(|(k, _)| k.eq_ignore_ascii_case(&root))
                         .map(|(_, v)| v.clone())
                 })
+                // A lexical closure frame: its captured names (the same chain
+                // the variable READ path walks, see `frame_closure_env`).
+                .or_else(|| Self::closure_chain_get(locals, parts[0]))
                 // Check the component `variables` scope. An unscoped var assigned
                 // inside a CFC method (or a closure defined in one) lands in
                 // `__variables`, not the function-local frame — so without this
@@ -29931,6 +30251,98 @@ impl CfmlVirtualMachine {
     /// existing env guard (closure_env_capture_value, write_back_to_captured_scope,
     /// reconcile_closure_env_into_locals, scope views) already skips it.
     const CLOSURE_PARENT_KEY: &'static str = "__closure_parent_env__";
+    /// Reserved frame key under which a LEXICAL closure invocation holds its
+    /// captured (defining) env — the same throwaway-`Function` carrier as
+    /// `CLOSURE_PARENT_KEY`. The closure's frame does NOT copy the env's data
+    /// keys into `locals`: a bare name that misses `locals`/`arguments` is
+    /// resolved by walking this env and its parent links LIVE, and a classic-
+    /// mode write to a captured name lands in the env level that owns it. That
+    /// is Lucee's closure scope chain, and it retires three per-call costs at
+    /// once — the copy of every captured key into the frame, the refresh of the
+    /// env from its ancestors before each call, and the return-time diff that
+    /// wrote captured-variable mutations back. Measured: a closure defined
+    /// inside a closure cost 1,050 ns per call against Lucee's 175 with the
+    /// copy model. `__`-prefixed and Function-typed, so every scope view and
+    /// env guard already skips it.
+    /// (The key itself is `well_known::CLOSURE_FRAME_ENV`.)
+    #[inline]
+    fn frame_closure_env(locals: &ValueMap) -> Option<Arc<RwLock<ValueMap>>> {
+        match locals.get(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV) {
+            Some(CfmlValue::Function(f)) => f.captured_scope.clone(),
+            _ => None,
+        }
+    }
+
+    /// The carrier value stored under [`Self::frame_closure_env`].
+    fn closure_env_marker(env: &Arc<RwLock<ValueMap>>) -> CfmlValue {
+        CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+            name: String::new(),
+            params: Vec::new(),
+            body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
+            return_type: None,
+            access: cfml_common::dynamic::CfmlAccess::Public,
+            captured_scope: Some(Arc::clone(env)),
+        }))
+    }
+
+    /// Resolve `key` through the frame's closure env chain (see
+    /// [`Self::frame_closure_env`]): the closure's own env first, then its
+    /// lexical parents. `None` for a non-closure frame or a miss.
+    pub(crate) fn closure_chain_get<K>(locals: &ValueMap, key: K) -> Option<CfmlValue>
+    where
+        K: cfml_common::dynamic::ProbeKey + Copy,
+    {
+        let mut cur = Self::frame_closure_env(locals)?;
+        for _ in 0..64 {
+            let next = {
+                let g = cur.read().ok()?;
+                if let Some(v) = g.get(key) {
+                    return Some(v.clone());
+                }
+                Self::closure_parent_link(&g)
+            };
+            cur = next?;
+        }
+        None
+    }
+
+    /// The env level of the frame's closure chain that holds `key` — where a
+    /// classic-mode write to a captured name must land.
+    fn closure_chain_owner<K>(locals: &ValueMap, key: K) -> Option<Arc<RwLock<ValueMap>>>
+    where
+        K: cfml_common::dynamic::ProbeKey + Copy,
+    {
+        let mut cur = Self::frame_closure_env(locals)?;
+        for _ in 0..64 {
+            let next = {
+                let g = cur.read().ok()?;
+                if g.contains_key(key) {
+                    drop(g);
+                    return Some(cur);
+                }
+                Self::closure_parent_link(&g)
+            };
+            cur = next?;
+        }
+        None
+    }
+
+    /// Write `val` to the env level that owns `key`; `false` when no level does
+    /// (the caller then routes the write as for any new name).
+    fn closure_chain_store<K>(locals: &ValueMap, key: K, val: &CfmlValue) -> bool
+    where
+        K: cfml_common::dynamic::ProbeKey + cfml_common::dynamic::IntoKey + Copy,
+    {
+        match Self::closure_chain_owner(locals, key) {
+            Some(owner) => {
+                if let Ok(mut g) = owner.write() {
+                    g.insert(key, val.clone());
+                }
+                true
+            }
+            None => false,
+        }
+    }
     /// Reserved key holding an `Array` of THIS env's OWN key names — the frame's
     /// params and `var`-declared locals. `refresh_env_from_parent_chain` never
     /// overwrites an own key from an ancestor, so a closure factory's captured
@@ -29946,7 +30358,7 @@ impl CfmlVirtualMachine {
         own_keys: Vec<CfmlValue>,
     ) {
         map.insert(
-            Self::CLOSURE_PARENT_KEY.to_string(),
+            cfml_common::key::well_known::CLOSURE_PARENT.clone(),
             CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                 name: String::new(),
                 params: Vec::new(),
@@ -29961,96 +30373,18 @@ impl CfmlVirtualMachine {
                 }),
             })),
         );
-        map.insert(Self::CLOSURE_OWN_KEYS.to_string(), CfmlValue::array(own_keys));
+        map.insert(cfml_common::key::well_known::CLOSURE_OWN_KEYS.clone(), CfmlValue::array(own_keys));
     }
 
     /// Read `map`'s lexical-parent env link, if any.
     fn closure_parent_link(map: &ValueMap) -> Option<Arc<RwLock<ValueMap>>> {
-        match map.get(Self::CLOSURE_PARENT_KEY) {
+        // Pre-hashed: this probe runs once per level on every chain walk.
+        match map.get(&*cfml_common::key::well_known::CLOSURE_PARENT) {
             Some(CfmlValue::Function(f)) => f.captured_scope.clone(),
             _ => None,
         }
     }
 
-    /// Refresh `env`'s inherited data keys from its lexical parent chain so a
-    /// deferred closure sees the CURRENT value of an outer variable that a sibling
-    /// closure reassigned after `env` was seeded (the TestBox
-    /// `describe(fn(){ beforeEach(...); describe(fn(){ it(...) }) })` shape).
-    ///
-    /// For each non-reserved, non-Function key already present in `env`, take the
-    /// value from the FARTHEST ancestor that also holds it — i.e. the scope that
-    /// actually OWNS the variable (where `beforeEach`'s write-back lands), not an
-    /// intermediate frame's stale copy. A key that no ancestor holds (a param /
-    /// `var`-local, e.g. a closure factory's captured argument) is left untouched,
-    /// preserving per-invocation independence.
-    fn refresh_env_from_parent_chain(env: &Arc<RwLock<ValueMap>>) {
-        // Collect the ancestor chain (nearest → farthest), guarding against a
-        // pathological cycle with a depth cap.
-        let mut chain: Vec<Arc<RwLock<ValueMap>>> = Vec::new();
-        {
-            let mut cur = Self::closure_parent_link(&env.read().unwrap());
-            let mut depth = 0;
-            while let Some(p) = cur {
-                if chain.iter().any(|c| Arc::ptr_eq(c, &p)) || depth > 64 {
-                    break;
-                }
-                let next = Self::closure_parent_link(&p.read().unwrap());
-                chain.push(p);
-                cur = next;
-                depth += 1;
-            }
-        }
-        if chain.is_empty() {
-            return;
-        }
-        // Keys to refresh: this env's inherited data keys — everything except the
-        // reserved links, Function values, and the frame's OWN params/var-locals
-        // (those are frozen per-invocation; see CLOSURE_OWN_KEYS).
-        let keys: Vec<String> = {
-            let e = env.read().unwrap();
-            // CASE-INSENSITIVE, like the `DeclaredLocals` this list is built
-            // from: `e`'s keys carry whatever casing they were seeded with, so a
-            // case-sensitive probe here would refresh a param or `var`-local
-            // whose casing merely differs — exactly the miss that let
-            // `var fileName` escape the write-back filter.
-            let mut own = DeclaredLocals::default();
-            if let Some(CfmlValue::Array(a)) = e.get(Self::CLOSURE_OWN_KEYS) {
-                for v in a.snapshot().iter() {
-                    own.insert(&v.as_string());
-                }
-            }
-            e.keys()
-                .filter(|k| {
-                    k.as_str() != Self::CLOSURE_PARENT_KEY && k.as_str() != Self::CLOSURE_OWN_KEYS
-                })
-                .filter(|k| !own.contains(k.as_str()))
-                .filter(|k| !matches!(e.get(k.as_str()), Some(CfmlValue::Function(_))))
-                .cloned()
-                .map(|k| k.as_str().to_string()).collect()
-        };
-        let mut updates: Vec<(String, CfmlValue)> = Vec::new();
-        for k in keys {
-            // Farthest ancestor that owns the key = authoritative home.
-            for anc in chain.iter().rev() {
-                let a = anc.read().unwrap();
-                if let Some(v) = a.get(k.as_str()) {
-                    if !matches!(v, CfmlValue::Function(_)) {
-                        updates.push((k.clone(), v.clone()));
-                    }
-                    break;
-                }
-            }
-        }
-        if !updates.is_empty() {
-            let mut e = env.write().unwrap();
-            for (k, v) in updates {
-                e.insert(k, v);
-            }
-        }
-    }
-
-    /// Write back mutations into a closure's shared Arc<RwLock> environment.
-    /// Only updates variables that already exist in the captured scope (prevents pollution).
     fn write_back_to_captured_scope(func_ref: &CfmlValue, writeback: &ValueMap) {
         if let CfmlValue::Function(ref f) = func_ref {
             if let Some(ref shared_env) = f.captured_scope {
@@ -30091,9 +30425,20 @@ impl CfmlVirtualMachine {
         declared_locals: &DeclaredLocals,
         params: &[String],
         parent_scope: Option<&ValueMap>,
+        reconciled_version: &mut u32,
     ) {
         if let Some(env) = closure_env {
             let env = env.read().unwrap();
+            // Nothing has written to the env since the last reconcile (the
+            // closure just called did not touch a captured variable, and this
+            // frame did not forward-sync one) — there is nothing to bring back.
+            // Without this every call from a closure-defining frame walked the
+            // whole env, hashing each key twice: the largest single cost left in
+            // a closure-in-closure call.
+            if env.version() == *reconciled_version {
+                return;
+            }
+            *reconciled_version = env.version();
             for (k, v) in env.iter() {
                 // Never pull a (stripped, captured_scope=None) Function copy back
                 // over the live closure value in locals — that would drop its
@@ -40599,6 +40944,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         | BytecodeOp::LoadSlot(..)
         | BytecodeOp::TryLoadSlot(..) => (1, 0),
         // Variable stores: push 0, pop 1
+        BytecodeOp::StoreVariablesKey(_) => (0, 1),
         BytecodeOp::StoreLocal(_) | BytecodeOp::StoreGlobal(_) | BytecodeOp::StoreSlot(..) => {
             (0, 1)
         }

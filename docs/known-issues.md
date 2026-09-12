@@ -3074,3 +3074,103 @@ page's variables into its frame on every call (the template-caller carry
 filter is "all"), so page-heavy code pays O(page variables) per call where
 Lucee walks a reference chain. That is the next frame lever, together with
 closure calls (10x Lucee) and higher-order functions (7.7x).
+
+## 100. A call from a page copied every page variable into the callee and diffed it back; a closure call copied its whole captured env in and out; `variables.x` in a method cost 9x Lucee (fixed v0.667.0) 📌
+
+The three frame levers left open by §99, sized against Lucee 7.1 on the same
+box (warm, ns per call):
+
+| shape | v0.666.0 | v0.667.0 | Lucee |
+|---|---|---|---|
+| page UDF call, 5 page variables | 1,406 | 456 | 196 |
+| page UDF call, 50 page variables | 5,311 | 456 | 196 |
+| page UDF call, 200 page variables | 21,494 | 456 | — |
+| page UDF call, 1,000 page variables | 461,057 | 456 | — |
+| page closure call | 1,419 | 451 | 146 |
+| closure defined inside a closure | 1,053 | 547 | 175 |
+| `arrayMap` per element | 728 | 315 | 153 |
+| `variables.t += variables.i` in a method (per iteration) | 553 | 193 | 60 |
+| `s &= "x"` (100k, per append) | 2,681 | 1,020 | 1,382 |
+| `structKeyExists` | 173 | 154 | 105 |
+| string BIF trio (`len(ucase(replace(…)))`) | 288 | 226 | 151 |
+
+Three structural changes, each verified against Lucee before it was kept:
+
+**The page `variables` scope is one shared struct.** A `__main__` frame that
+inherited no `__variables` handle from its launcher gets a fresh one at entry,
+and the frame reads and writes its variables through it — the routing every
+component-scope frame already used. Before, the page frame's locals map WAS
+the scope, so the call-parent seed carried every page variable into each
+callee (the template-caller filter is "all") and the return path diffed them
+back: O(page variables) per call, and worse than linear at 1,000. A callee is
+now seeded with the one structural key and resolves page variables through it
+exactly as a CFC method resolves its component's `variables`; an `include`d
+template, a custom tag body, an `evaluate()` frame and a REPL line arrive with
+a handle already seeded and share it. `localMode="modern"` is forced off for
+a page frame (there is no `local` scope for a bare write to land in). Two
+things that only worked because the page scope used to be a copy of the
+globals map were fixed along the way: `setVariable("variables.x", …)` /
+`setVariable("x", …)` and `<cfparam name="…">` with a variables-scoped or
+runtime name wrote `self.globals` — they are delivered into the caller's frame
+through the `queryExecute(result=)` channel and land on the handle. The page
+frame's own loads and stores take a fast path (one pre-hashed probe on the
+handle) keyed off a per-`Name` reserved-word flag computed at intern time; a
+bare page loop is 180 ns per iteration against 113 before and Lucee's 60-77,
+the one regression, taken for the flat call cost.
+
+**A lexical closure references its env; it does not copy it.** The frame
+holds the captured (defining) env under a reserved `__closure_frame_env__`
+carrier; a bare name that misses `locals`/`arguments` walks that env and its
+parent links LIVE, and a classic-mode write to a captured name updates the env
+level that owns it — Lucee's closure scope chain. Retired per call: the copy
+of every captured key into the frame, `refresh_env_from_parent_chain` (which
+re-copied the ancestors' values into the env before every call, allocating a
+`String` per key), and the return-time diff that wrote mutations back. The
+defining frame still reconciles its env into its locals after a call, but
+only when the env's version changed. The caller's carrier is never carried
+into a callee — that clobbered a nested closure's own env, so it resolved its
+captured names through the wrong scope — except into a STRIPPED closure (a
+var-scoped function expression fetched from an env: the recursive `var fact =
+function(n){ … fact(n-1) }`), whose lexical scope IS the caller's chain.
+Semantics probed on Lucee 7.1 and matched on nine shapes (new-name writes go
+to the defining scope's `variables`, not the closure's `local` nor the
+enclosing function's; a captured var-local is updated in place; a deferred
+closure sees the variable's last value; a parameter shadows a same-named
+page variable; the definer's local beats the caller's; `arrayEach` callbacks
+mutate the enclosing function's local): `tests/core/test_closure_scope_chain.cfm`.
+A cfthread body written in a CFC method used to receive the component's
+methods flattened into its env as loose entries; it now gets the scope as a
+per-thread snapshot struct under `__variables`, so `variables.helper()` and a
+sibling's sibling call resolve as they do in the method.
+
+**`variables.x` reads and writes are one op at any depth.** `LoadVariablesKey`
+(previously a page-only peephole) is emitted inside function bodies too and
+resolves off the frame's `__variables` handle first; a new `StoreVariablesKey`
+replaces load-handle + `SetProperty` + store-handle for `variables.x = …`,
+`variables.x += …` and `variables.x++`. The old sequence allocated a fresh
+`"__variables"` key string per write and stamped the `this` alias per read.
+
+Smaller levers found in the same profiles: the env ∪ locals composition the
+`Call`/`CallNamed` arms materialized as a merged copy before the frame seed
+copied it again (~20% of a closure call) is folded into the seed; a
+compiled-in builtin's entry point is cached on its interned `Name` after the
+first call (the per-call hash into the builtin index — and, with any `.rcx`
+extension installed, a SipHash probe of the extension table — was ~10% of a
+small string BIF); `&` builds its result with one allocation instead of three
+plus `format!`; `structKeyExists` is one probe instead of a case-insensitive
+scan plus four; a callee's positional-overflow `arguments` keys (`"1"`, `"2"`
+— every higher-order callback) come from a pre-interned table; a member write
+that stores the very handle a variable already holds is skipped.
+
+Gates: CLI runner 9,036/9,036 (41 new assertions in
+`tests/core/test_page_scope_shared_struct.cfm` and
+`tests/core/test_closure_scope_chain.cfm`), TestBox 415/0/0 (+22 skipped) and
+Wheels core 2,737/3/0 unchanged at every step. The CFML runner caught three
+closure regressions the two framework suites did not (the carrier clobber,
+the stripped-closure chain, the cfthread flattening) — keep it in the gate.
+
+Still open: the generic frame cost (a UDF-to-UDF call is 306 ns against
+Lucee's 155; profiles are flat — dispatch, param binding, the `arguments`
+struct, frame teardown), `queryAddRow` at 450 vs 232, struct key read/write at
+248/330 vs 149/140 (the key string is built per access on both engines; ours
+still allocates it twice), and the page bare-loop regression above.
