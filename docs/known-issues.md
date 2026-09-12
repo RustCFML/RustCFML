@@ -3701,7 +3701,12 @@ before, throwing `Array index [4] out of range` now. Preside's
 inside `for ( mField in fields )`) and every page 500'd. Lucee reads the size
 LIVE each step: a delete skips the next element and ends early (`1,2,4` over
 `[1,2,3,4]`), an append is iterated. New one-op `IterLen` in the loop condition
-(same rules as `len()`); the hoisted temp is gone. **A lenient read that
+(same rules as `len()`); the hoisted temp is gone (GH #368). `<cfloop array=>`
+and `cfloop( array= )` differ from script for-in on Lucee: their bound is
+min(length at entry, live length), so a delete still ends early but an appended
+element is NOT iterated. Both lowerings now go through a `__cfloop_array_iter`
+codegen marker that adds the entry-length test; the item+index form gets the
+same cap in its counted loop. **A lenient read that
 becomes strict turns every consumer that leaned on the leniency into a
 failure — the framework suites were all green; only the real app found it.**
 
@@ -3711,8 +3716,8 @@ Lucee's `Available functions are [...]` suffix; `"abc".foo` reads Null (Lucee:
 element 1 (Lucee: `cannot cast [x] string to a number value`); a missing method
 on a component keeps our wording.
 
-Pinned by `tests/core/test_error_wording_lucee.cfm` (43, identical on
-Lucee 7.1). Gates: CLI 9142/9142 · serve dev+prod cold+warm 9286/9286 ×4 ·
+Pinned by `tests/core/test_error_wording_lucee.cfm` (46, identical on
+Lucee 7.1). Gates: CLI 9147/9147 · serve dev+prod cold+warm 9289/9289 ×4 ·
 `cargo test --workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 ·
 Wheels 2737/3/0 +16 · Preside boot + 16 admin pages clean.
 

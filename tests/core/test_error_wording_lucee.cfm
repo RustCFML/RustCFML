@@ -79,6 +79,20 @@ ewApp = [ 1, 2 ];
 ewSeen = [];
 for ( ewX in ewApp ) { arrayAppend( ewSeen, ewX ); if ( arrayLen( ewApp ) < 4 ) arrayAppend( ewApp, arrayLen( ewApp ) + 1 ); }
 assert("append during for-in is iterated", arrayToList( ewSeen ), "1,2,3,4");
+// cfloop array= (tag and script) is bounded by min(entry length, live length):
+// a delete ends it early, an appended element is NOT iterated (Lucee).
+ewApp = [ 1, 2 ];
+ewSeen = [];
+cfloop( array = ewApp, item = "ewX" ) { arrayAppend( ewSeen, ewX ); if ( arrayLen( ewApp ) < 4 ) arrayAppend( ewApp, arrayLen( ewApp ) + 1 ); }
+assert("cfloop array: append is not iterated", arrayToList( ewSeen ), "1,2");
+ewApp = [ 1, 2 ];
+ewSeen = [];
+cfloop( array = ewApp, item = "ewX", index = "ewI" ) { arrayAppend( ewSeen, ewI & ":" & ewX ); if ( arrayLen( ewApp ) < 4 ) arrayAppend( ewApp, arrayLen( ewApp ) + 1 ); }
+assert("cfloop array item+index: append is not iterated", arrayToList( ewSeen ), "1:1,2:2");
+ewDel = [ 1, 2, 3, 4 ];
+ewSeen = [];
+cfloop( array = ewDel, item = "ewX" ) { arrayAppend( ewSeen, ewX ); if ( ewX == 2 ) arrayDeleteAt( ewDel, 2 ); }
+assert("cfloop array: delete skips and ends early", arrayToList( ewSeen ), "1,2,4");
 
 suiteEnd();
 </cfscript>

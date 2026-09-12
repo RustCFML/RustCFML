@@ -4117,8 +4117,27 @@ impl CfmlCompiler {
             }
         }
 
+        // `<cfloop array=>` / `cfloop( array= )` arrive as
+        // `for (x in __cfloop_array_iter(arr))` (both lowerings). Lucee bounds
+        // that loop by min(length at entry, live length): a delete ends it early
+        // exactly like script for-in, but an element appended during the loop
+        // is NOT iterated — script for-in DOES iterate it. `capped` adds the
+        // entry-length test in front of the live one.
+        let mut capped = false;
+        let iterable: &Expression = match &for_in.iterable {
+            Expression::FunctionCall(call)
+                if call.arguments.len() == 1
+                    && matches!(&*call.name, Expression::Identifier(n)
+                        if n.name.eq_ignore_ascii_case("__cfloop_array_iter")) =>
+            {
+                capped = true;
+                &call.arguments[0]
+            }
+            other => other,
+        };
+
         // Compile iterable
-        self.compile_expression(&for_in.iterable, instructions);
+        self.compile_expression(iterable, instructions);
 
         // GetKeys: if struct, convert to array of keys; arrays pass through unchanged
         instructions.push(BytecodeOp::GetKeys);
@@ -4126,17 +4145,36 @@ impl CfmlCompiler {
         // Unique per-loop temp names (so nested for-in don't collide).
         let iter_var = format!("__iter_{}", instructions.len());
         let idx_var = format!("__idx_{}", instructions.len());
+        let cap_var = format!("__cap_{}", instructions.len());
         // Declare as function-locals so StoreLocal writes to locals (not __variables
         // in a CFC method context) — otherwise the loop counter never increments.
         instructions.push(BytecodeOp::DeclareLocal(Name::from(&iter_var)));
         instructions.push(BytecodeOp::DeclareLocal(Name::from(&idx_var)));
         instructions.push(BytecodeOp::StoreLocal(Name::from(&iter_var)));
+        if capped {
+            instructions.push(BytecodeOp::DeclareLocal(Name::from(&cap_var)));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
+            instructions.push(BytecodeOp::IterLen);
+            instructions.push(BytecodeOp::StoreLocal(Name::from(&cap_var)));
+        }
 
         // CFML arrays are 1-based, so start index at 1.
         instructions.push(BytecodeOp::Integer(1));
         instructions.push(BytecodeOp::StoreLocal(Name::from(&idx_var)));
 
         let loop_start = instructions.len();
+
+        // cfloop-array only: idx <= length-at-entry, patched to loop_end below.
+        let cap_jump_idx = if capped {
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
+            instructions.push(BytecodeOp::LoadLocal(Name::from(&cap_var)));
+            instructions.push(BytecodeOp::Lte);
+            let j = instructions.len();
+            instructions.push(BytecodeOp::JumpIfFalse(0));
+            Some(j)
+        } else {
+            None
+        };
 
         // Condition: idx <= len(iterable), with the length read LIVE each
         // iteration (`IterLen`, one op — no builtin call). A hoisted length let
@@ -4255,6 +4293,9 @@ impl CfmlCompiler {
 
         let loop_end = instructions.len();
         instructions[jump_false_idx] = BytecodeOp::JumpIfFalse(loop_end);
+        if let Some(j) = cap_jump_idx {
+            instructions[j] = BytecodeOp::JumpIfFalse(loop_end);
+        }
 
         let (break_indices, continue_indices, _, _, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {

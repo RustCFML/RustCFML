@@ -3850,25 +3850,22 @@ fn parse_cfloop_tag(
             let index_var = format!("__cfloop_index_{}", uniq);
             (
                 format!(
-                    "var {} = {};\nfor (var {} = 1; {} <= arrayLen({}); {} = {} + 1) {{\n{} = {};\n{} = {}[{}];\n",
-                    array_var,
-                    array,
-                    index_var,
-                    index_var,
-                    array_var,
-                    index_var,
-                    index_var,
-                    index,
-                    index_var,
-                    item,
-                    array_var,
-                    index_var
+                    "var {av} = {arr};\nvar {av}_cap = arrayLen({av});\nfor (var {iv} = 1; {iv} <= {av}_cap && {iv} <= arrayLen({av}); {iv} = {iv} + 1) {{\n{index} = {iv};\n{item} = {av}[{iv}];\n",
+                    av = array_var,
+                    arr = array,
+                    iv = index_var,
+                    index = index,
+                    item = item
                 ),
                 consumed,
             )
         } else if let Some(item) = attrs.get("item").or_else(|| attrs.get("index")) {
             let item = strip_hashes(item);
-            (format!("for (var {} in {}) {{\n", item, array), consumed)
+            // `__cfloop_array_iter` is a codegen marker (no such function can be
+            // written by user source): Lucee's cfloop-array bound is min(length
+            // at entry, live length) — a delete ends the loop early like script
+            // for-in, but an element appended during the loop is NOT iterated.
+            (format!("for (var {} in __cfloop_array_iter({})) {{\n", item, array), consumed)
         } else {
             (
                 "throw(\"cfloop array requires an item or index attribute.\");\n".to_string(),

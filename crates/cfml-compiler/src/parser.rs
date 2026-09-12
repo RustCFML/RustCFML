@@ -2521,11 +2521,21 @@ impl Parser {
                 })))];
                 for_body.extend(body);
                 let init = Statement::Var(Var { name: idx_n.clone(), value: Some(int(1)), location: loc });
-                let cond = bin(ident(&idx_n), BinaryOpType::LessEqual, call("arrayLen", vec![ident(&arr_tmp)]));
+                // Lucee bound: min(length at entry, live length) — see the
+                // `__cfloop_array_iter` marker for the item-only form.
+                let cap_tmp = format!("{}_cap", arr_tmp);
+                let cond = bin(
+                    bin(ident(&idx_n), BinaryOpType::LessEqual, ident(&cap_tmp)),
+                    BinaryOpType::And,
+                    bin(ident(&idx_n), BinaryOpType::LessEqual, call("arrayLen", vec![ident(&arr_tmp)])),
+                );
                 let increment = bin(ident(&idx_n), BinaryOpType::Assign, bin(ident(&idx_n), BinaryOpType::Add, int(1)));
                 // Hoist the array into a temp so it is evaluated once.
                 return Ok(self.wrap_with_preamble(
-                    vec![assign(arr_tmp.clone(), array)],
+                    vec![
+                        assign(arr_tmp.clone(), array),
+                        assign(cap_tmp.clone(), call("arrayLen", vec![ident(&arr_tmp)])),
+                    ],
                     Statement::For(For {
                         init: Some(Box::new(init)),
                         condition: Some(cond),
@@ -2541,7 +2551,8 @@ impl Parser {
                 let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
                     variable: name,
-                    iterable: array,
+                    // Codegen marker: cfloop-array bound is min(entry, live) on Lucee.
+                    iterable: call("__cfloop_array_iter", vec![array]),
                     body,
                     location: loc,
                 })));
