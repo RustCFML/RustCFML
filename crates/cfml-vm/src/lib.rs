@@ -8013,6 +8013,26 @@ impl CfmlVirtualMachine {
         })
     }
 
+    /// §110: is `name` a parameter that is still the frame's parameter — i.e.
+    /// declared by the function AND either still tracked as a param key or still
+    /// present in the `arguments` scope? After `structDelete( arguments, "a" )`
+    /// both are false and a classic-localmode bare `a = …` is an ordinary
+    /// variable write (Lucee stores it in `variables`), not a parameter write.
+    #[inline]
+    fn is_live_param(
+        func: &BytecodeFunction,
+        inherited_or_param_keys: &InheritedKeys,
+        locals: &ValueMap,
+        name: &str,
+    ) -> bool {
+        func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+            && (inherited_or_param_keys.contains(name)
+                || locals
+                    .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                    .and_then(|v| v.as_cfml_struct())
+                    .is_some_and(|a| a.get_ci(name).is_some()))
+    }
+
     /// Does the body REBIND one of its own declared parameters by bare name?
     ///
     /// Only meaningful under `localmode="modern"`, where Lucee 7.1 treats such a
@@ -8365,6 +8385,9 @@ impl CfmlVirtualMachine {
         let mut ip = 0;
         // Track variables declared with `var` (function-local, not written back to parent)
         let mut declared_locals = DeclaredLocals::default();
+        // §109: set by ArgConcatWriteThrough for the StoreLocal that follows it,
+        // which must then NOT reclassify the parameter as a local.
+        let mut arg_concat_write_through = false;
         // Shared closure environment: all closures defined within this function
         // invocation share one Rc<RefCell<HashMap>>. Lazily created on first DefineFunction.
         let mut closure_env: Option<Arc<RwLock<ValueMap>>> = None;
@@ -9646,7 +9669,7 @@ impl CfmlVirtualMachine {
                             .or_else(|| locals.get(name));
                             let routes_to_scope = !effective_local_mode_modern
                                 && !declared_locals.contains(name.as_str())
-                                && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name));
+                                && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name);
                             let same = match held {
                                 Some(cur) => same_reference(cur, top),
                                 None if !routes_to_scope => false,
@@ -9721,7 +9744,7 @@ impl CfmlVirtualMachine {
                         && !name.is_reserved_word()
                         && !declared_locals.contains(name.as_str())
                         && (locals.len() <= 1 || !locals.contains_key(name))
-                        && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                        && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
                     {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             if let Some(val) = stack.pop() {
@@ -10097,7 +10120,7 @@ impl CfmlVirtualMachine {
                         } else if !effective_local_mode_modern
                             && !declared_locals.contains(name.as_str())
                             && !locals.contains_key(name)
-                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                            && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
                             && Self::closure_chain_store(&locals, name, &val)
                         {
                             // Lexical closure, classic localmode: a write to a
@@ -10107,7 +10130,7 @@ impl CfmlVirtualMachine {
                         } else if !declared_locals.contains(name.as_str())
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
-                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                            && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
                             && locals
                                 .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
                                 .and_then(|v| v.as_cfml_struct())
@@ -10210,7 +10233,9 @@ impl CfmlVirtualMachine {
                             // local-scope assignment — it claims the key for this
                             // frame's `local` view, shadowing any inherited
                             // same-named key from the caller / closure parent.
-                            if effective_local_mode_modern {
+                            if effective_local_mode_modern
+                                && !std::mem::take(&mut arg_concat_write_through)
+                            {
                                 inherited_or_param_keys.remove(name.as_str());
                             }
                             // Bidirectional sync: when a function param is stored by
@@ -13160,10 +13185,17 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Increment(name) | BytecodeOp::IncrementSlot(_, name) => {
+                    // §109/§102: in modern localmode a bare compound write claims
+                    // the name for this frame's `local` view, exactly like the
+                    // StoreLocal it fuses (Lucee: `a += 1` on a param creates
+                    // local.a and leaves arguments.a alone).
+                    if effective_local_mode_modern && is_inside_function {
+                        inherited_or_param_keys.remove(name.as_str());
+                    }
                     // Direct fast path (see FrameScopeCache): a plain variable behind
                     // the frame's `variables` handle is bumped in place under one
                     // lock instead of probe-miss → closure chain → get + insert.
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             if page_numeric_delta(vars, name, |v| match v {
                                 CfmlValue::Int(i) => CfmlValue::Int(i + 1),
@@ -13175,7 +13207,14 @@ impl CfmlVirtualMachine {
                     ops::locals::op_increment(&mut locals, &mut slots, &closure_env, op, name)?;
                 }
                 BytecodeOp::AddLocalConst(name, k) | BytecodeOp::AddSlotConst(_, name, k) => {
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    // §109/§102: in modern localmode a bare compound write claims
+                    // the name for this frame's `local` view, exactly like the
+                    // StoreLocal it fuses (Lucee: `a += 1` on a param creates
+                    // local.a and leaves arguments.a alone).
+                    if effective_local_mode_modern && is_inside_function {
+                        inherited_or_param_keys.remove(name.as_str());
+                    }
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             let k = *k;
                             if page_numeric_delta(vars, name, |v| match v {
@@ -13188,7 +13227,14 @@ impl CfmlVirtualMachine {
                     ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?;
                 }
                 BytecodeOp::MulLocalConst(name, k) | BytecodeOp::MulSlotConst(_, name, k) => {
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    // §109/§102: in modern localmode a bare compound write claims
+                    // the name for this frame's `local` view, exactly like the
+                    // StoreLocal it fuses (Lucee: `a += 1` on a param creates
+                    // local.a and leaves arguments.a alone).
+                    if effective_local_mode_modern && is_inside_function {
+                        inherited_or_param_keys.remove(name.as_str());
+                    }
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             let k = *k;
                             if page_numeric_delta(vars, name, |v| match v {
@@ -13201,7 +13247,14 @@ impl CfmlVirtualMachine {
                     ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?;
                 }
                 BytecodeOp::Decrement(name) | BytecodeOp::DecrementSlot(_, name) => {
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    // §109/§102: in modern localmode a bare compound write claims
+                    // the name for this frame's `local` view, exactly like the
+                    // StoreLocal it fuses (Lucee: `a += 1` on a param creates
+                    // local.a and leaves arguments.a alone).
+                    if effective_local_mode_modern && is_inside_function {
+                        inherited_or_param_keys.remove(name.as_str());
+                    }
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             if page_numeric_delta(vars, name, |v| match v {
                                 CfmlValue::Int(i) => CfmlValue::Int(i - 1),
@@ -14440,6 +14493,27 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::GetKeys => { ops::access::op_get_keys(&mut stack); }
                 BytecodeOp::IterLen => { ops::access::op_iter_len(&mut stack); }
+                BytecodeOp::ArgConcatWriteThrough(name) => {
+                    // See the op's doc. Pops the duplicated result; the following
+                    // StoreLocal stores the original.
+                    let val = stack.pop().unwrap_or(CfmlValue::Null);
+                    if effective_local_mode_modern
+                        && is_inside_function
+                        && !declared_locals.contains(name.as_str())
+                        && inherited_or_param_keys.contains(name.as_str())
+                        && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                    {
+                        if let Some(args) = locals
+                            .get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                            .and_then(|v| v.as_cfml_struct())
+                        {
+                            if args.get_ci(name.as_str()).is_some() {
+                                args.insert(name, val);
+                                arg_concat_write_through = true;
+                            }
+                        }
+                    }
+                }
 
                 BytecodeOp::CallBuiltin(name, argc) => {
                     if let Err(e) = self.op_call_builtin(&mut stack, name, *argc) {
@@ -41614,6 +41688,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
         BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::IterLen => (1, 1),
+        BytecodeOp::ArgConcatWriteThrough(_) => (0, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object
         BytecodeOp::NewObject(n) | BytecodeOp::NewObjectNamed(_, n) => (1, n + 1), // class + args → instance

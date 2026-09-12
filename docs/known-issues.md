@@ -57,8 +57,6 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
 | [39](#39) | `.cfconfig.json` placeholders expand single-pass (GH #306) | 🌟 won't-fix |
-| [109](#109) | `a &= "X"` on a parameter under `localmode="modern"` does not write through to `arguments` | 🌟 to fix |
-| [110](#110) | Bare write to a DELETED parameter stays frame-local (Lucee: `variables`) | 🌟 deferred |
 
 **Part D — Implemented, with documented edges 🏗**
 
@@ -455,27 +453,6 @@ not to add a second pass. Pinned by `env_value_with_dollar_brace_is_not_recursed
 `crates/cfml-config/src/env.rs`. See also `docs/configuration.md`.
 
 ---
-
-<a id="109"></a>
-## 109. `a &= "X"` on a parameter under `localmode="modern"` does not write through to `arguments` 🌟 *(to fix)*
-
-Probed on Lucee 7.1: in modern localmode a bare `a = …`, `a += 1` and `a++` on a
-parameter are LOCAL writes that leave `arguments.a` alone (we match, §102), but
-`a &= "X"` DOES update `arguments.a`. We lower `&=` exactly like `a = a & "X"`,
-so the argument stays at its passed value. Matching needs `&=` to stop lowering
-as a plain reassign (its own op or a marker) — decided 2026-09-12: match Lucee,
-inconsistency included.
-
-<a id="110"></a>
-## 110. A bare write to a DELETED parameter stays frame-local; Lucee sends it to `variables` 🌟 *(deferred)*
-
-After `structDelete( arguments, "a" )` (§106) a later bare `a = "x"` is no longer
-a parameter write on either engine. In classic localmode Lucee therefore stores
-it in the `variables` scope; we keep it in the frame's locals. Observable only as
-`variables.a` after the call. Closing it means the classic-mode store routing
-(eight `func.params` checks in the frame prologue) consulting a per-frame
-"detached parameter" set — a hot-path change that needs its own A/B (see §102's
-2% note), so parked.
 
 # Part D — Implemented, with documented edges 🏗
 
@@ -3347,7 +3324,7 @@ original argument still exists after the write.
 One divergence is left here: `a &= "X"` writes through to `arguments` on Lucee,
 while `a += 1` and `a++` do not. `&=` has no distinct opcode in our codegen — it
 lowers exactly like `a = a & "X"`, which Lucee treats as local-only. Tracked as
-§109; the decision (2026-09-12) is to match Lucee.
+§109+110 (fixed v0.674.0).
 
 ⚠️ **Where a clause sits in the frame prologue is worth 2%.** The modern-mode
 test, added to the eager-arguments decision, made CFC method calls 2.0-2.4%
@@ -3720,4 +3697,50 @@ Pinned by `tests/core/test_error_wording_lucee.cfm` (46, identical on
 Lucee 7.1). Gates: CLI 9147/9147 · serve dev+prod cold+warm 9289/9289 ×4 ·
 `cargo test --workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 ·
 Wheels 2737/3/0 +16 · Preside boot + 16 admin pages clean.
+
+## 109 + 110. `a &= "X"` on a modern-localmode parameter did not write through to `arguments`; a bare write to a DELETED parameter stayed frame-local (fixed v0.674.0) 📌
+
+Both probed on Lucee 7.1 through a CFC with mixed `localmode` methods
+(`tests/core/ParamWriteModes.cfc`):
+
+| localmode="modern" | Lucee (now ours) |
+|---|---|
+| `a &= "X"` | `arguments.a` = AX, bare `a` = AX, **no `local.a`** |
+| `a += 1`, `a++`, `a = a & "X"` | local write: `local.a` created, `arguments.a` untouched (§102) |
+| `a &= "X"; a &= "Y"` | `arguments.a` = AXY |
+| `a &= "X"; a = "Z"` | `arguments.a` = AX, bare `a` = Z |
+| `a = "Z"; a &= "X"` | name is already local: `local.a` = ZX, `arguments.a` untouched |
+| `var a = "V"; a &= "X"` | local |
+| `b &= "X"` on a non-parameter | local |
+
+| after `structDelete( arguments, "a" )` | Lucee (now ours) |
+|---|---|
+| classic: `a = "W"` | `variables.a` = W (no local, no argument) |
+| classic: `a = "W"; a &= "V"` | `variables.a` = WV |
+| modern: `a = "W"` | `local.a` = W |
+
+`&=` is the ONE compound operator Lucee resolves against the scope that holds
+the name (the argument) instead of defaulting to `local`. Codegen emits
+`Dup; ArgConcatWriteThrough(name)` in front of the `StoreLocal` for a
+`&=` whose target is a plain variable; the op writes the result into the
+`arguments` entry when the frame is modern, the name is a declared parameter
+still classed as one (not rebound, not `var`-declared) and the key is present,
+and flags the following `StoreLocal` so it does not reclassify the name as a
+local. The fused numeric ops (`Increment`/`Decrement`/`AddLocalConst`/
+`MulLocalConst`) now reclassify in modern mode exactly as the `StoreLocal`
+they replace did — `a += 1` had been leaving no `local.a` behind.
+
+§110: the classic-mode store routing asked the STATIC parameter list
+"is this a parameter?" at six sites; it now asks `is_live_param` — declared
+AND (still tracked as a parameter key OR still present in the `arguments`
+scope). `structDelete( arguments, "a" )` clears both, so the later bare write
+takes the ordinary variables route. `a = nullValue()` on a parameter leaves the
+scope entry and stays a parameter write. Interleaved A/B against v0.673.0 on a
+3-param classic method call and a `+=` loop, 16 runs per arm on a quiet box:
+method 606.4 → 606.3 ns median, loop 64.0 → 63.0 ns — flat.
+
+Pinned by `tests/core/test_param_write_modes.cfm` (12, identical on Lucee
+7.1). Gates: CLI 9159/9159 · serve dev+prod cold+warm 9301/9301 · `cargo test
+--workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 · Wheels
+2737/3/0 +16 · Preside boot + 16 admin pages clean.
 

@@ -1075,6 +1075,14 @@ pub enum BytecodeOp {
     /// (Lucee: delete skips the next element and ends early; append is
     /// iterated). Replaces the hoisted `len()` call (§107).
     IterLen,
+    /// `a &= expr` on a PARAMETER under `localmode="modern"` (§109). Emitted
+    /// right before the StoreLocal, with the result duplicated on the stack: if
+    /// the frame is modern, `a` is a declared param not yet rebound as a local
+    /// and not `var`-declared, the value is also written into the `arguments`
+    /// scope and the param keeps its non-local status (Lucee 7.1: `a &= "X"`
+    /// updates `arguments.a` and creates no `local.a`, while `a += 1` and
+    /// `a = …` are local writes). A no-op everywhere else.
+    ArgConcatWriteThrough(Name),
     SetIndex,            // Set array[index] = value or struct[key] = value
     GetProperty(Name), // Get object.property — THROWS "Variable '<name>' is undefined" on a genuine miss (Lucee/ACF parity)
     /// Null-tolerant twin of GetProperty: a missing struct/component member reads
@@ -1587,11 +1595,12 @@ impl BytecodeOp {
             Self::SetScopePath(..) => 129,
             Self::TryGetIndex => 130,
             Self::IterLen => 131,
+            Self::ArgConcatWriteThrough(..) => 132,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 132] = [
+    pub const CENSUS_NAMES: [&'static str; 133] = [
         "Null",
         "True",
         "False",
@@ -1724,6 +1733,7 @@ impl BytecodeOp {
         "SetScopePath",
         "TryGetIndex",
         "IterLen",
+        "ArgConcatWriteThrough",
     ];
 }
 
@@ -3058,6 +3068,14 @@ impl CfmlCompiler {
 
                 match &assign.target {
                     AssignTarget::Variable(name) => {
+                        // §109: `&=` is the one compound op Lucee writes through
+                        // to a modern-localmode parameter.
+                        if matches!(assign.operator, AssignOp::ConcatEqual)
+                            && !Self::is_reserved_scope_name(name)
+                        {
+                            instructions.push(BytecodeOp::Dup);
+                            instructions.push(BytecodeOp::ArgConcatWriteThrough(Name::from(&name)));
+                        }
                         instructions.push(BytecodeOp::StoreLocal(Name::from(&name)));
                     }
                     AssignTarget::ArrayAccess(arr, idx) => {
