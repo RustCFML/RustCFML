@@ -22609,6 +22609,15 @@ impl CfmlVirtualMachine {
         // resolve straight from `self.globals`, never a component's stale
         // `__variables` shadow (see is_web_request_scope). A genuine frame-local
         // `var url` above still wins.
+        // A lexical closure frame's captured names (the same chain the bare
+        // READ path walks). Without this a runtime load inside a closure — the
+        // guard that checks what a variable held before a mutating member
+        // call writes its result back — saw nothing, and the write-back of
+        // `captured.method().append(x)` replaced the captured component with
+        // the array in the shared env (Preside ModuleService, boot failure).
+        if let Some(v) = Self::closure_chain_get(locals, name) {
+            return Some(v);
+        }
         if Self::is_web_request_scope(&name_lower) {
             if let Some(v) = self.globals.get(name).or_else(|| self.globals.get(&name_lower)) {
                 return Some(v.clone());

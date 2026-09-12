@@ -3241,6 +3241,17 @@ very array `variables.routes` holds — never created the local. The shortcut
 now consults the scope handle and closure chain only for a name the store
 would route there (classic localmode, not `var`-declared, not a parameter);
 `tests/oop/test_local_alias_of_variables_member.cfm` pins the shape.
+A third was caught by booting Preside (the ModuleService `each()` callback
+that does `appRouter.getModuleRoutes( moduleName ).append( item )`): the
+guard that checks what a variable held before a mutating member call writes
+its result back used a runtime load that did not know the closure chain, saw
+nothing for the captured `appRouter`, and let the array be written over the
+captured component in the shared env — "The function [getModuleRoutes] does
+not exist in the Array" on the second route. `scope_aware_load` now resolves
+captured names through the chain; `tests/oop/test_closure_mutating_chain_root.cfm`
+pins it. The framework suites did not see it either: with page and closure
+scopes now shared by reference, a wrong write is visible to every later
+reader, so "boot the real app" stays in the gate.
 
 Still open: the generic frame cost (UDF-to-UDF 306 vs Lucee 155 — dispatch,
 parameter binding, the `arguments` struct, teardown; the profile is flat),
