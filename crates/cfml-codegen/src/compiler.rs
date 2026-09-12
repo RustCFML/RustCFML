@@ -1065,6 +1065,16 @@ pub enum BytecodeOp {
     BuildArray(usize),   // Build array from top N stack items
     BuildStruct(usize),  // Build struct from top N key-value pairs
     GetIndex,            // Get array[index] or struct[key]
+    /// Null-tolerant twin of `GetIndex` (§107): a missing key / out-of-range index
+    /// reads as Null instead of throwing. Emitted for the elvis/isNull operand
+    /// path, compound-assign reads and nested write-back loads.
+    TryGetIndex,
+    /// Live length of a for-in iterable (same rules as `len()`): Array/Struct
+    /// entry count, String character count, 0 otherwise. Re-read every
+    /// iteration so a body that deletes from or appends to the array is seen
+    /// (Lucee: delete skips the next element and ends early; append is
+    /// iterated). Replaces the hoisted `len()` call (§107).
+    IterLen,
     SetIndex,            // Set array[index] = value or struct[key] = value
     GetProperty(Name), // Get object.property — THROWS "Variable '<name>' is undefined" on a genuine miss (Lucee/ACF parity)
     /// Null-tolerant twin of GetProperty: a missing struct/component member reads
@@ -1575,11 +1585,13 @@ impl BytecodeOp {
             Self::LoadArgKey(..) => 127,
             Self::TryLoadArgKey(..) => 128,
             Self::SetScopePath(..) => 129,
+            Self::TryGetIndex => 130,
+            Self::IterLen => 131,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 130] = [
+    pub const CENSUS_NAMES: [&'static str; 132] = [
         "Null",
         "True",
         "False",
@@ -1710,6 +1722,8 @@ impl BytecodeOp {
         "LoadArgKey",
         "TryLoadArgKey",
         "SetScopePath",
+        "TryGetIndex",
+        "IterLen",
     ];
 }
 
@@ -2439,7 +2453,7 @@ impl CfmlCompiler {
             Expression::ArrayAccess(access) => {
                 self.compile_index_assign_base(&access.array, instructions);
                 self.compile_expression(&access.index, instructions);
-                instructions.push(BytecodeOp::GetIndex);
+                instructions.push(BytecodeOp::TryGetIndex);
             }
             Expression::MemberAccess(access) => {
                 self.compile_index_assign_base(&access.object, instructions);
@@ -2483,7 +2497,7 @@ impl CfmlCompiler {
             AssignTarget::ArrayAccess(arr, idx) => {
                 self.compile_expression(arr, instructions);
                 self.compile_expression(idx, instructions);
-                instructions.push(BytecodeOp::GetIndex);
+                instructions.push(BytecodeOp::TryGetIndex);
             }
         }
     }
@@ -2549,10 +2563,11 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::TryGetProperty(Name::from(&access.member)));
             }
             Expression::ArrayAccess(access) => {
-                // GetIndex already reads a missing key / Null receiver as Null.
+                // §107: the strict GetIndex throws on a missing key / out-of-range
+                // index (Lucee); the operand of `?:` / isNull needs the twin.
                 self.compile_member_read_tolerant(&access.array, instructions);
                 self.compile_expression(&access.index, instructions);
-                instructions.push(BytecodeOp::GetIndex);
+                instructions.push(BytecodeOp::TryGetIndex);
             }
             // Reserved scopes (variables/local/this/…) always resolve to a live
             // scope struct; null-safe accesses and everything else keep their
@@ -2700,7 +2715,7 @@ impl CfmlCompiler {
                 // back to a Null and read the wrong cell.
                 self.emit_load_for_writeback(&access.array, instructions);
                 self.compile_expression(&access.index, instructions);
-                instructions.push(BytecodeOp::GetIndex);
+                instructions.push(BytecodeOp::TryGetIndex);
             }
             _ => {
                 // Can't load this expression for writeback
@@ -4111,21 +4126,11 @@ impl CfmlCompiler {
         // Unique per-loop temp names (so nested for-in don't collide).
         let iter_var = format!("__iter_{}", instructions.len());
         let idx_var = format!("__idx_{}", instructions.len());
-        let limit_var = format!("__limit_{}", instructions.len());
         // Declare as function-locals so StoreLocal writes to locals (not __variables
         // in a CFC method context) — otherwise the loop counter never increments.
         instructions.push(BytecodeOp::DeclareLocal(Name::from(&iter_var)));
         instructions.push(BytecodeOp::DeclareLocal(Name::from(&idx_var)));
-        instructions.push(BytecodeOp::DeclareLocal(Name::from(&limit_var)));
         instructions.push(BytecodeOp::StoreLocal(Name::from(&iter_var)));
-
-        // Hoist len(iterable) out of the loop. The old codegen looked up the
-        // `len` builtin and invoked it every iteration — a HashMap probe plus
-        // full function-call trampoline per element. Compute once, reuse.
-        instructions.push(BytecodeOp::LoadGlobal(Name::intern("len")));
-        instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
-        instructions.push(BytecodeOp::Call(1));
-        instructions.push(BytecodeOp::StoreLocal(Name::from(&limit_var)));
 
         // CFML arrays are 1-based, so start index at 1.
         instructions.push(BytecodeOp::Integer(1));
@@ -4133,9 +4138,15 @@ impl CfmlCompiler {
 
         let loop_start = instructions.len();
 
-        // Condition: idx <= limit  (both locals; no builtin call per iter).
+        // Condition: idx <= len(iterable), with the length read LIVE each
+        // iteration (`IterLen`, one op — no builtin call). A hoisted length let
+        // a body that deleted from the array walk past its end (Preside
+        // FormsService deletes fieldset entries inside `for (mField in
+        // fields)`), which read Null while GetIndex was lenient and throws now
+        // that it matches Lucee (§107). Lucee re-checks the size each step.
         instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
-        instructions.push(BytecodeOp::LoadLocal(Name::from(&limit_var)));
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
+        instructions.push(BytecodeOp::IterLen);
         instructions.push(BytecodeOp::Lte);
 
         let jump_false_idx = instructions.len();

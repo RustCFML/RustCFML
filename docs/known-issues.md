@@ -40,7 +40,6 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [7](#7) | Partially-ignored function/tag parameters | 🔇 open |
 | [27](#27) | Tag attributes dropped at lowering (`cfqueryparam`, `cfstoredproc`) | 🔇 open |
 | [30](#30) | Java shims — remaining gaps | 🔇/🛑 open |
-| [107](#107) | `st["missing"]` / `arr[9]` out-of-range bracket reads return quietly (Lucee throws) | 🔇 open |
 
 **Part B — Unsupported, fails loudly (open) 🛑**
 
@@ -58,7 +57,6 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
 | [39](#39) | `.cfconfig.json` placeholders expand single-pass (GH #306) | 🌟 won't-fix |
-| [108](#108) | Undefined-variable / missing-key / no-such-function error wording differs from Lucee | 🌟 to fix |
 | [109](#109) | `a &= "X"` on a parameter under `localmode="modern"` does not write through to `arguments` | 🌟 to fix |
 | [110](#110) | Bare write to a DELETED parameter stays frame-local (Lucee: `variables`) | 🌟 deferred |
 
@@ -265,16 +263,6 @@ which classes and methods exist at all — see `docs/java-shims.md`.
 
 ---
 
-<a id="107"></a>
-## 107. `st["missing"]` and out-of-range `arr[9]` bracket reads return quietly — Lucee throws 🔇
-
-Reading a missing key with bracket syntax (`st["missing"]`) or an array index past
-the end (`arr[9]` on a two-element array) yields an empty/null value here. Lucee 7.1
-throws `key [missing] doesn't exist` and `Array index [9] out of range, array size is
-[2]`. The dot form (`st.missing`) already throws on both. Silent because code that
-mistypes a bracket key looks like it works. Found 2026-09-12 while probing §105; on
-the fix list with §108 (its message wording).
-
 # Part B — Unsupported, fails loudly (open) 🛑
 
 Genuinely not implemented, but it throws a clear message. Safe to ship against — you
@@ -467,17 +455,6 @@ not to add a second pass. Pinned by `env_value_with_dollar_brace_is_not_recursed
 `crates/cfml-config/src/env.rs`. See also `docs/configuration.md`.
 
 ---
-
-<a id="108"></a>
-## 108. Error-message wording for undefined variables, missing keys and unknown functions differs from Lucee 🌟 *(to fix)*
-
-Lucee 7.1: `variable [X] doesn't exist`, `key [X] doesn't exist`, the arguments
-and request scope variants (`key [X] doesn't exist in arguments scope` /
-`… in request scope`), and `No matching function [F] found`. Identifier keys are
-upper-cased in the message, bracket literals keep their casing. We say
-`Variable 'x' is undefined` and similar. 76 engine sites emit these; 3 test
-assertions pin the current text. Application code that matches on
-`cfcatch.message` (Preside/ColdBox do in places) sees a different string.
 
 <a id="109"></a>
 ## 109. `a &= "X"` on a parameter under `localmode="modern"` does not write through to `arguments` 🌟 *(to fix)*
@@ -3688,4 +3665,54 @@ Pinned by `tests/core/test_structdelete_arguments.cfm` (20, identical on
 Lucee 7.1). Gates: CLI 9101/9101 · serve dev+prod cold+warm 9243/9243 ×4 ·
 `cargo test --workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 ·
 Wheels 2737/3/0 +16 · Preside boot + admin tour clean.
+
+## 107 + 108. Bracket reads of a missing key / out-of-range index returned quietly; every "undefined" message used our own wording (fixed v0.673.0) 📌
+
+Lucee 7.1 throws on `st["missing"]`, `st[k]`, `arr[9]`, `arr[0]`, `[][1]`,
+`q["nocol"]` and `q.nocol`; we read Null/"" and carried on. The dot forms
+already threw, but with `Variable 'x' is undefined` where Lucee says:
+
+| Shape | Lucee wording (now ours) |
+|---|---|
+| bare `noSuchVar` | `variable [NOSUCHVAR] doesn't exist` |
+| `st.missing`, `variables.x`, `local.x`, `url/form/application/server.x` | `key [MISSING] doesn't exist` (identifier upper-cased) |
+| `st["MissingKey"]`, `st[k]`, `local["x"]` | `key [MissingKey] doesn't exist` (literal keeps its casing) |
+| `request.x` / `request["x"]` | `key [X] doesn't exist in the request scope` |
+| `arguments.x` / `arguments["x"]` / `arguments[5]` | `The key [X] doesn't exist in the arguments scope. The existing keys are [alpha, beta]` (all DECLARED params, §105) |
+| `arr[9]`, `arr[0]` | `Array index [9] out of range, array size is [2]` (negative index still reads Null, as on Lucee) |
+| `noSuchFn()` | `No matching function [NOSUCHFN] found` |
+| `q.nocol` / `q["nocol"]` | `Column [NOCOL] not found in query`, type `database` |
+| `st.noSuchMethod()` | `The function [noSuchMethod] does not exist in the Struct.` |
+
+All `expression`-typed and catchable in-frame (`raise_expression_message`) or
+across frames. Message builders live next to it (`msg_variable_missing`,
+`msg_key_missing`, `msg_function_missing`, `msg_array_index_out_of_range`).
+
+`GetIndex` now throws; its Null-tolerant twin `TryGetIndex` serves the `?:` /
+`isNull()` operand path, compound-assign reads (`st["n"] += 1`) and nested
+write-back loads (`st["a"]["b"] = v` auto-vivifies as before). The fused
+`obj.prop` read (`lookup_property_opt`) treats a missing query column as a miss
+instead of Null.
+
+**What the throw exposed:** `for ( x in arr )` hoisted `len(arr)` once, so a
+body that deleted from the array walked past its end — silently reading Null
+before, throwing `Array index [4] out of range` now. Preside's
+`FormsService` merges fieldsets exactly that way (`ArrayDelete( fields, mField )`
+inside `for ( mField in fields )`) and every page 500'd. Lucee reads the size
+LIVE each step: a delete skips the next element and ends early (`1,2,4` over
+`[1,2,3,4]`), an append is iterated. New one-op `IterLen` in the loop condition
+(same rules as `len()`); the hoisted temp is gone. **A lenient read that
+becomes strict turns every consumer that leaned on the leniency into a
+failure — the framework suites were all green; only the real app found it.**
+
+Left as they were (not silent, or cosmetic): the struct-method message omits
+Lucee's `Available functions are [...]` suffix; `"abc".foo` reads Null (Lucee:
+`there is no property with name [FOO]  found in [string]`); `arr["x"]` reads
+element 1 (Lucee: `cannot cast [x] string to a number value`); a missing method
+on a component keeps our wording.
+
+Pinned by `tests/core/test_error_wording_lucee.cfm` (43, identical on
+Lucee 7.1). Gates: CLI 9142/9142 · serve dev+prod cold+warm 9286/9286 ×4 ·
+`cargo test --workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 ·
+Wheels 2737/3/0 +16 · Preside boot + 16 admin pages clean.
 

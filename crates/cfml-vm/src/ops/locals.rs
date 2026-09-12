@@ -670,7 +670,7 @@ pub(crate) fn op_load_local_key(
                 BytecodeOp::LoadLocalKey(_) | BytecodeOp::LoadSlotKey(..)
             ) =>
             {
-                let cip = vm.raise_undefined_member(prop_name, stack)?;
+                let cip = vm.raise_undefined_member(prop_name, None, stack)?;
                 *ip = cip;
             }
             None => stack.push(CfmlValue::Null),
@@ -714,7 +714,7 @@ pub(crate) fn op_load_local_key(
         {
             // `local.foo` read where foo isn't in this frame's local
             // scope → throw (Lucee/ACF parity).
-            let cip = vm.raise_undefined_member(prop_name, stack)?;
+            let cip = vm.raise_undefined_member(prop_name, None, stack)?;
             *ip = cip;
             return Ok(());
         }
@@ -773,7 +773,7 @@ pub(crate) fn op_load_local_property(
         // Undefined receiver variable: same as the unfused
         // `LoadLocal(root)` — throw on the root name.
         None if throw_on_miss => {
-            let cip = vm.raise_undefined_member(local_name, stack)?;
+            let cip = vm.raise_undefined_variable(local_name, stack)?;
             *ip = cip;
             return Ok(());
         }
@@ -785,7 +785,7 @@ pub(crate) fn op_load_local_property(
             None if throw_on_miss
                 && !CfmlVirtualMachine::is_declared_arg_param(&obj, prop_name) =>
             {
-                let cip = vm.raise_undefined_member(prop_name, stack)?;
+                let cip = vm.raise_undefined_member(prop_name, Some(&obj), stack)?;
                 *ip = cip;
                 return Ok(());
             }

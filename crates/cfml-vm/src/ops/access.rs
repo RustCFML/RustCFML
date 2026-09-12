@@ -120,7 +120,7 @@ pub(crate) fn op_get_property(
                             // A declared-but-unpassed `arguments` param
                             // is exempt — it reads as Null (Lucee/ACF).
                             let cip =
-                                vm.raise_undefined_member(name, stack)?;
+                                vm.raise_undefined_member(name, Some(&obj), stack)?;
                             *ip = cip;
                             return Ok(());
                         } else {
@@ -180,6 +180,12 @@ pub(crate) fn op_get_property(
                         // but stringifies to the query's current row (Lucee parity).
                         if let Some(col_data) = q.column_values_ci(name) {
                             stack.push(CfmlValue::QueryColumn(col_data, q.current_row().saturating_sub(1)));
+                        } else if throw_on_miss {
+                            // §107: Lucee `Column [NOCOL] not found in query`
+                            // (type `database`; identifier upper-cased).
+                            let msg = format!("Column [{}] not found in query", name.to_uppercase());
+                            *ip = vm.raise_catchable(stack, &msg, "database")?;
+                            return Ok(());
                         } else {
                             stack.push(CfmlValue::Null);
                         }
@@ -247,7 +253,7 @@ pub(crate) fn op_get_property(
                     None => {
                         if throw_on_miss {
                             let cip =
-                                vm.raise_undefined_member(name, stack)?;
+                                vm.raise_undefined_member(name, Some(&obj), stack)?;
                             *ip = cip;
                             return Ok(());
                         } else {
@@ -273,9 +279,13 @@ pub(crate) fn op_get_index(
     stack: &mut Vec<CfmlValue>,
     ip: &mut usize,
     locals: &ValueMap,
+    throw_on_miss: bool,
 ) -> Result<(), CfmlError> {
     let index = stack.pop().unwrap_or(CfmlValue::Null);
     let collection = stack.pop().unwrap_or(CfmlValue::Null);
+    // §107: `st["missing"]` / `arr[9]` throw on Lucee. The strict `GetIndex`
+    // does too; the `TryGetIndex` twin (elvis / isNull operands, compound-assign
+    // reads, nested write-back loads) keeps the Null read.
     let one_based_to_zero = |index: &CfmlValue| -> usize {
         let idx = match index {
             CfmlValue::Int(i) => *i as usize,
@@ -288,7 +298,22 @@ pub(crate) fn op_get_index(
     match &collection {
         CfmlValue::Array(arr) => {
             let idx = one_based_to_zero(&index);
-            stack.push(arr.get(idx).unwrap_or(CfmlValue::Null));
+            let n: Option<i64> = match &index {
+                CfmlValue::Int(i) => Some(*i),
+                CfmlValue::Double(d) => Some(*d as i64),
+                CfmlValue::String(s) => s.trim().parse::<i64>().ok(),
+                _ => None,
+            };
+            match n {
+                // `arr[0]` and `arr[len+1..]` are out of range on Lucee (a
+                // negative index reads Null there — kept).
+                Some(n) if throw_on_miss && (n == 0 || (n > 0 && (n as usize) > arr.len())) => {
+                    let msg = CfmlVirtualMachine::msg_array_index_out_of_range(n, arr.len());
+                    *ip = vm.raise_catchable(stack, &msg, "expression")?;
+                    return Ok(());
+                }
+                _ => stack.push(arr.get(idx).unwrap_or(CfmlValue::Null)),
+            }
         }
         // GH #340: a binary IS a Java `byte[]` on Lucee, so `b[1]` reads byte 1
         // as a SIGNED value (`0xFF` → `-1`). Out of range throws there rather
@@ -337,6 +362,11 @@ pub(crate) fn op_get_index(
                         stack.push(CfmlValue::Int(q.current_row() as i64));
                     } else if let Ok(n) = name.trim().parse::<i64>() {
                         stack.push(row_at_oneless(n));
+                    } else if throw_on_miss {
+                        // Lucee: `Column [x] not found in query`, type `database`.
+                        let msg = format!("Column [{}] not found in query", name);
+                        *ip = vm.raise_catchable(stack, &msg, "database")?;
+                        return Ok(());
                     } else {
                         stack.push(CfmlValue::Null);
                     }
@@ -380,6 +410,7 @@ pub(crate) fn op_get_index(
             // param name at position N-1. A value bound to
             // a declared param lives under its name, not
             // under the numeric alias.
+            let mut missed = false;
             let val = if direct.is_none()
                 && s.contains_key("__arguments_scope")
             {
@@ -418,13 +449,18 @@ pub(crate) fn op_get_index(
                                     })
                                     .nth(idx)
                                     .map(|(_, v)| v.clone())
-                                    .unwrap_or(CfmlValue::Null)
+                                    .unwrap_or_else(|| {
+                                        missed = true;
+                                        CfmlValue::Null
+                                    })
                             })
                         })
                     } else {
+                        missed = true;
                         CfmlValue::Null
                     }
                 } else {
+                    missed = true;
                     CfmlValue::Null
                 }
             } else if direct.is_none()
@@ -435,8 +471,20 @@ pub(crate) fn op_get_index(
                 // Magic scope (cgi): unset key reads as "".
                 CfmlValue::string(String::new())
             } else {
-                direct.unwrap_or(CfmlValue::Null)
+                match direct {
+                    Some(v) => v,
+                    None => {
+                        missed = true;
+                        CfmlValue::Null
+                    }
+                }
             };
+            if missed && throw_on_miss {
+                // Bracket literal keeps its casing in the message (Lucee).
+                let msg = vm.msg_key_missing(&key, Some(&collection), true);
+                *ip = vm.raise_catchable(stack, &msg, "expression")?;
+                return Ok(());
+            }
             // `this[ name ]` extracts a component method as a bare
             // VALUE — it is NOT bound to `s` here. Binding is a
             // call-site decision: an immediate `obj[name]()` goes
@@ -645,6 +693,26 @@ pub(crate) fn op_set_property(
 }
 
 #[inline]
+/// `IterLen` — the for-in loop bound, re-read every iteration. Same rules as
+/// the `len()` builtin so the loop count is unchanged for every iterable type
+/// the old hoisted `len()` call accepted.
+#[inline]
+pub(crate) fn op_iter_len(stack: &mut Vec<CfmlValue>) {
+    let v = stack.pop().unwrap_or(CfmlValue::Null);
+    let n: i64 = match &v {
+        CfmlValue::Array(a) => a.len() as i64,
+        CfmlValue::Struct(s) => s.len() as i64,
+        CfmlValue::String(s) => s.chars().count() as i64,
+        CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) => {
+            v.as_string().chars().count() as i64
+        }
+        CfmlValue::Binary(b) => b.len() as i64,
+        CfmlValue::QueryColumn(..) => v.as_string().chars().count() as i64,
+        _ => 0,
+    };
+    stack.push(CfmlValue::Int(n));
+}
+
 pub(crate) fn op_get_keys(
     stack: &mut Vec<CfmlValue>,
 ) {

@@ -7256,6 +7256,18 @@ impl CfmlVirtualMachine {
                 return Some(CfmlValue::string(String::new()));
             }
             None
+        } else if let CfmlValue::Query(q) = obj {
+            // §107: a missing column is a genuine miss (Lucee: `Column [X] not
+            // found in query`), not a Null read. The pseudo-columns keep their
+            // generic resolution.
+            match name.lower() {
+                "recordcount" | "columnlist" | "currentrow" => {
+                    Some(Self::lookup_property(obj, name, frame))
+                }
+                _ => q
+                    .column_values_ci(name)
+                    .map(|c| CfmlValue::QueryColumn(c, q.current_row().saturating_sub(1))),
+            }
         } else {
             Some(Self::lookup_property(obj, name, frame))
         }
@@ -7552,30 +7564,100 @@ impl CfmlVirtualMachine {
         false
     }
 
-    /// Raise a catchable "Variable '<name>' is undefined" for a genuine member/key
-    /// miss on a struct-or-scope read (`GetProperty`/`LoadLocalProperty`/
-    /// `LoadLocalKey`). If a `try` handler is active, unwind the stack into it and
+    /// Lucee wording for an undefined bare variable (§108): `variable [X] doesn't
+    /// exist`, identifier upper-cased.
+    pub(crate) fn msg_variable_missing(name: &str) -> String {
+        format!("variable [{}] doesn't exist", name.to_uppercase())
+    }
+
+    /// Lucee wording for a missing struct/scope key (§108). An identifier key
+    /// (`st.x`) is upper-cased; a bracket literal (`st["x"]`) keeps its casing
+    /// (`literal`). The arguments scope names itself and lists its keys; the
+    /// request scope names itself.
+    pub(crate) fn msg_key_missing(&self, key: &str, obj: Option<&CfmlValue>, literal: bool) -> String {
+        let shown: std::borrow::Cow<str> = if literal { key.into() } else { key.to_uppercase().into() };
+        if let Some(CfmlValue::Query(_)) = obj {
+            return format!("Column [{}] not found in query", shown);
+        }
+        if let Some(CfmlValue::Struct(s)) = obj {
+            if s.get("__arguments_scope").is_some() {
+                let keys = s.with_map(|m| {
+                    m.keys()
+                        .filter(|k| !k.starts_with("__"))
+                        .map(|k| k.as_str().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+                return Self::msg_arguments_key_missing(&shown, &keys);
+            }
+            if s.backing_ptr() == self.request_scope.backing_ptr() {
+                return format!("key [{}] doesn't exist in the request scope", shown);
+            }
+        }
+        format!("key [{}] doesn't exist", shown)
+    }
+
+    pub(crate) fn msg_arguments_key_missing(shown: &str, existing_keys: &str) -> String {
+        format!(
+            "The key [{}] doesn't exist in the arguments scope. The existing keys are [{}]",
+            shown, existing_keys
+        )
+    }
+
+    /// Lucee wording for a call to an undefined function (§108).
+    pub(crate) fn msg_function_missing(name: &str) -> String {
+        format!("No matching function [{}] found", name.to_uppercase())
+    }
+
+    /// Lucee wording for an out-of-range array read (§107).
+    pub(crate) fn msg_array_index_out_of_range(index: i64, len: usize) -> String {
+        format!("Array index [{}] out of range, array size is [{}]", index, len)
+    }
+
+    /// Raise a catchable `key [X] doesn't exist` for a genuine member/key miss on
+    /// a struct-or-scope DOT read (`GetProperty`/`LoadLocalProperty`/`LoadLocalKey`);
+    /// `obj` (the receiver, when the caller has it) selects the arguments/request
+    /// scope variants. If a `try` handler is active, unwind the stack into it and
     /// return `Ok(catch_ip)` (caller sets `ip` and `continue`s); otherwise return
-    /// the error to abort the request. Mirrors the undefined-name routing used by
-    /// bare-identifier reads so the standard CFML lazy-init `try/catch` idiom works.
+    /// the error to abort the request.
     fn raise_undefined_member(
+        &mut self,
+        name: &str,
+        obj: Option<&CfmlValue>,
+        stack: &mut Vec<CfmlValue>,
+    ) -> Result<usize, CfmlError> {
+        let msg = self.msg_key_missing(name, obj, false);
+        if matches!(obj, Some(CfmlValue::Query(_))) {
+            // Lucee types a missing query column as `database`.
+            return self.raise_catchable(stack, &msg, "database");
+        }
+        self.raise_expression_message(msg, stack)
+    }
+
+    /// Raise a catchable `variable [X] doesn't exist` for an undefined bare name.
+    fn raise_undefined_variable(
         &mut self,
         name: &str,
         stack: &mut Vec<CfmlValue>,
     ) -> Result<usize, CfmlError> {
+        self.raise_expression_message(Self::msg_variable_missing(name), stack)
+    }
+
+    /// Route a pre-worded `expression` error into the active try handler (or
+    /// propagate it). Mirrors the undefined-name routing used by bare-identifier
+    /// reads so the standard CFML lazy-init `try/catch` idiom works.
+    pub(crate) fn raise_expression_message(
+        &mut self,
+        msg: String,
+        stack: &mut Vec<CfmlValue>,
+    ) -> Result<usize, CfmlError> {
         if let Some(handler) = self.try_stack.pop() {
             let mut exception = ValueMap::default();
-            exception.insert(
-                "message".to_string(),
-                CfmlValue::string(format!("Variable '{}' is undefined", name)),
-            );
+            exception.insert("message".to_string(), CfmlValue::string(msg.clone()));
             exception.insert("type".to_string(), CfmlValue::string("expression".to_string()));
             exception.insert("detail".to_string(), CfmlValue::string(String::new()));
             let tc = self.build_tag_context();
-            exception.insert(
-                "stackTrace".to_string(),
-                CfmlValue::string(format!("Variable '{}' is undefined", name)),
-            );
+            exception.insert("stackTrace".to_string(), CfmlValue::string(msg));
             exception.insert("tagcontext".to_string(), tc);
             stack.truncate(handler.stack_depth);
             self.restore_capture_state(&handler);
@@ -7589,13 +7671,8 @@ impl CfmlVirtualMachine {
             // frame's try/catch can still catch it. Use `expression` (NOT
             // `runtime`) so a cross-frame `catch( expression e )` matches and
             // `e.type` reports the CFML-standard type — matching Lucee/ACF and
-            // the in-handler branch above. Without this, an undefined read
-            // inside a component method/UDF surfaced as `runtime` while the
-            // page-scope read was `expression` (GH #282).
-            Err(self.wrap_error(CfmlError::expression(format!(
-                "Variable '{}' is undefined",
-                name
-            ))))
+            // the in-handler branch above (GH #282).
+            Err(self.wrap_error(CfmlError::expression(msg)))
         }
     }
 
@@ -9509,7 +9586,7 @@ impl CfmlVirtualMachine {
                             let mut exception = ValueMap::default();
                             exception.insert(
                                 "message".to_string(),
-                                CfmlValue::string(format!("Variable '{}' is undefined", name)),
+                                CfmlValue::string(Self::msg_variable_missing(name)),
                             );
                             exception.insert(
                                 "type".to_string(),
@@ -9534,10 +9611,9 @@ impl CfmlVirtualMachine {
                         // matches — matching Lucee/ACF and the in-handler branch
                         // above. Undefined reads inside a UDF/method used to
                         // surface as `runtime` here (GH #282).
-                        return Err(self.wrap_error(CfmlError::expression(format!(
-                            "Variable '{}' is undefined",
-                            name
-                        ))));
+                        return Err(self.wrap_error(CfmlError::expression(
+                            Self::msg_variable_missing(name),
+                        )));
                     };
                     stack.push(val);
                 }
@@ -10795,39 +10871,11 @@ impl CfmlVirtualMachine {
                         // the active try handler if there is one: calling an
                         // undefined function must be catchable (the standard
                         // CFML feature-detection idiom relies on it).
-                        if let Some(handler) = self.try_stack.pop() {
-                            let mut exception = ValueMap::default();
-                            exception.insert(
-                                "message".to_string(),
-                                CfmlValue::string(format!("Variable '{}' is undefined", name)),
-                            );
-                            exception.insert(
-                                "type".to_string(),
-                                CfmlValue::string("expression".to_string()),
-                            );
-                            exception
-                                .insert("detail".to_string(), CfmlValue::string(String::new()));
-                            exception.insert("tagcontext".to_string(), self.build_tag_context());
-                            stack.truncate(handler.stack_depth);
-                            self.restore_capture_state(&handler);
-                            Self::add_root_cause(&mut exception);
-                            let exc = CfmlValue::strukt(exception);
-                            self.last_exception = Some(exc.clone());
-                            stack.push(exc);
-                            ip = handler.catch_ip;
-                            continue;
-                        }
-                        // No handler in this frame: propagate as `expression`
-                        // (not `runtime`) so a cross-frame `catch( expression e )`
-                        // matches and `e.type` reports the CFML-standard type —
-                        // matching Lucee/ACF and the in-handler branch above. An
-                        // undefined bare read inside a UDF/method used to surface
-                        // as `runtime` while the page-scope read was `expression`
-                        // (GH #282).
-                        return Err(self.wrap_error(CfmlError::expression(format!(
-                            "Variable '{}' is undefined",
-                            name
-                        ))));
+                        // §108: Lucee's `No matching function [F] found`, routed
+                        // through the shared expression-error path (catchable in
+                        // this frame, `expression`-typed across frames — GH #282).
+                        ip = self.raise_expression_message(Self::msg_function_missing(name), &mut stack)?;
+                        continue;
                     }
                 }
                 BytecodeOp::StoreGlobal(name) => { ops::locals::op_store_global(self, &mut stack, name); }
@@ -12221,7 +12269,7 @@ impl CfmlVirtualMachine {
                     }
                     stack.push(CfmlValue::strukt(map));
                 }
-                BytecodeOp::GetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip, &locals)?; }
+                BytecodeOp::GetIndex | BytecodeOp::TryGetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip, &locals, matches!(op, BytecodeOp::GetIndex))?; }
                 BytecodeOp::SetIndex => {
                     if let Err(e) = ops::frame::op_set_index(&mut stack) {
                         ip = self.route_call_error(e, &mut stack)?;
@@ -14391,6 +14439,7 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::GetKeys => { ops::access::op_get_keys(&mut stack); }
+                BytecodeOp::IterLen => { ops::access::op_iter_len(&mut stack); }
 
                 BytecodeOp::CallBuiltin(name, argc) => {
                     if let Err(e) = self.op_call_builtin(&mut stack, name, *argc) {
@@ -14428,7 +14477,16 @@ impl CfmlVirtualMachine {
                         // Same routing as a `GetProperty` miss on the arguments
                         // struct: a catchable `expression` error, unwound into an
                         // active try handler.
-                        ip = self.raise_undefined_member(name.as_str(), &mut stack)?;
+                        let msg = match locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+                            Some(args) => self.msg_key_missing(name.as_str(), Some(args), false),
+                            None => {
+                                // Lazy frame: the scope holds one entry per DECLARED
+                                // param (§105), so that is the list Lucee prints.
+                                let keys = func.params.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ");
+                                Self::msg_arguments_key_missing(&name.to_uppercase(), &keys)
+                            }
+                        };
+                        ip = self.raise_expression_message(msg, &mut stack)?;
                         continue;
                     }
                 }
@@ -29734,7 +29792,7 @@ impl CfmlVirtualMachine {
                 && s.method_table().is_none();
             if is_plain {
                 let mut err = CfmlError::new(
-                    format!("Variable '{}' is undefined", method),
+                    format!("The function [{}] does not exist in the Struct.", method),
                     CfmlErrorType::Expression,
                 );
                 err.stack_trace = self.build_stack_trace();
@@ -41537,6 +41595,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::BuildStruct(n) => (1, n * 2),
         BytecodeOp::BuildStructStatic(keys) => (1, keys.len()),
         BytecodeOp::GetIndex => (1, 2),       // obj + key → value
+        BytecodeOp::TryGetIndex => (1, 2),    // Null-tolerant twin
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value
         BytecodeOp::TryGetProperty(_) => (1, 1), // obj → value (Null-tolerant twin)
@@ -41554,6 +41613,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
         BytecodeOp::GetKeys => (1, 1),
+        BytecodeOp::IterLen => (1, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object
         BytecodeOp::NewObject(n) | BytecodeOp::NewObjectNamed(_, n) => (1, n + 1), // class + args → instance
