@@ -1884,7 +1884,7 @@ carried live on as `crates/cfml-vm/tests/numeric_semantics.rs`.
 
 **What replaces it:** nothing, and deliberately. The measured cost centre is
 frames and member access, not arithmetic — see
-`docs/inline-caches-plan.md` for the one idea worth taking from the JIT
+the inline-cache section of the performance roadmap (planning/PERFORMANCE_ROADMAP.md §2.2, a working doc) for the one idea worth taking from the JIT
 (inline caches for member reads), sized against the interpreter instead.
 
 ## 78. Allocations made on a `cfthread` were invisible to the cycle collector (fixed v0.653.3) 📌
