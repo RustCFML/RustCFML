@@ -6,7 +6,8 @@
 //!
 //! Bodies moved verbatim (roadmap P3 slice 4); see `super` for the rules.
 
-use crate::CfmlVirtualMachine;
+use crate::{CfmlVirtualMachine, DeclaredLocals, InheritedKeys};
+use cfml_codegen::BytecodeFunction;
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::name::Name;
 use std::sync::Arc;
@@ -62,7 +63,10 @@ pub(crate) fn op_set_last_exception_from_local(
 pub(crate) fn op_delete_scope_key(
     vm: &mut CfmlVirtualMachine,
     stack: &mut Vec<CfmlValue>,
+    func: &BytecodeFunction,
     locals: &mut ValueMap,
+    declared_locals: &DeclaredLocals,
+    inherited_or_param_keys: &mut InheritedKeys,
     effective_local_mode_modern: bool,
     scope: &Name,
 ) -> Result<(), cfml_common::vm::CfmlError> {
@@ -71,6 +75,40 @@ pub(crate) fn op_delete_scope_key(
     // snapshotted when passed as a builtin arg, so an in-place
     // struct mutation wouldn't reach them).
     let key = stack.pop().unwrap_or(CfmlValue::Null).as_string();
+    if scope.lower() == "arguments" {
+        // §106: on Lucee the arguments scope IS the storage for a parameter, so
+        // deleting `arguments.a` makes bare `a` fall through the resolution
+        // chain (throws / `isDefined("a")` false). We bind each parameter into
+        // the frame's locals under its own name as well, so the mirror has to
+        // go with the key. A `var a` / `local.a` is a SEPARATE slot on both
+        // engines and stays (`declared_locals`). Codegen emits the empty key
+        // for `structClear(arguments)`: every parameter mirror goes.
+        let args = locals
+            .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+            .and_then(|v| v.as_cfml_struct());
+        if key.is_empty() {
+            if let Some(a) = &args {
+                a.clear();
+            }
+            for p in func.params.iter() {
+                if !declared_locals.contains(p.as_str()) {
+                    crate::imap_remove_ci(locals, p.as_str());
+                    inherited_or_param_keys.remove_ci(p.as_str());
+                }
+            }
+            return Ok(());
+        }
+        if let Some(a) = &args {
+            a.remove_ci(&key);
+        }
+        if func.params.iter().any(|p| p.eq_ignore_ascii_case(&key))
+            && !declared_locals.contains(&key)
+        {
+            crate::imap_remove_ci(locals, &key);
+            inherited_or_param_keys.remove_ci(&key);
+        }
+        return Ok(());
+    }
     let path = format!("{}.{}", scope, key);
     vm.delete_scope_path(&path, locals, effective_local_mode_modern)?;
     Ok(())

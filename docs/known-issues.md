@@ -3597,8 +3597,50 @@ Pinned by `tests/core/test_arguments_scope_shape.cfm` (28),
 dev+prod cold+warm 9209/9209 ×4 · `cargo test --workspace` 714/0/5 · wasm32 +
 wasm-pack · TestBox 415/0/0 +22 · Wheels 2737/3/0 +16.
 
-Still open from the same list: `structDelete( arguments, "a" )` does not clear
-the bare name (Lucee does, and a later bare write does not resurrect the key);
-error-message wording; `a &= "X"` write-through under `localmode="modern"`; and
-the bracket read `st["missing"]`, which throws on Lucee and returns quietly
-here.
+Still open from the same list: error-message wording; `a &= "X"` write-through
+under `localmode="modern"`; and the bracket read `st["missing"]`, which throws
+on Lucee and returns quietly here. (`structDelete( arguments, "a" )` is §106.)
+
+## 106. `structDelete( arguments, "a" )` / `structClear( arguments )` left the bare parameter name readable (fixed v0.672.0) 📌
+
+On Lucee the `arguments` scope IS a parameter's storage: after
+`structDelete( arguments, "a" )` a bare `a` throws (`variable [A] doesn't
+exist`), `isDefined( "a" )` is false, the count drops, and a later bare
+`a = "x"` is an ordinary variable write that does **not** put the key back
+(`arguments.a = "x"` restores both views). `structClear( arguments )` does the
+same for every parameter. We bind each parameter into the frame's locals under
+its own name as well as into the scope struct, so the delete removed the scope
+entry and left the mirror: bare `a` still read `1`, `isDefined` said true, and
+the later bare write re-inserted the key (the classic-mode param store syncs
+into the scope unconditionally).
+
+Fix: `DeleteScopeKey("arguments")` (`op_delete_scope_key`) removes the scope
+entry AND the parameter's local mirror (also dropping it from the frame's
+inherited/param key set), unless the name was explicitly declared local
+(`var a` / `local.a` are a separate slot on both engines and survive). Codegen
+emits the same op with an empty key after a statement-level
+`structClear( arguments )`, which clears every parameter mirror. The
+param-name store syncs into the scope only while the key is still present —
+a declared-but-omitted parameter has a Null entry and takes the write (Lucee
+too: `b = 5` → `arguments.b = 5`), a deleted one does not. Both eager-arguments
+scanners now treat the op as naming the scope. (Frames that call
+`structDelete`/`structClear` are already excluded from local slots, so no slot
+state is involved.)
+
+**Residual, deliberately left:** on Lucee in classic localmode the bare write
+AFTER the delete lands in the `variables` scope (it is no longer a parameter);
+here it stays frame-local. Making it leak would need the classic-mode store
+routing (eight `func.params` checks) to consult a per-frame "detached" set — a
+hot-prologue change that needs its own A/B for an edge of an edge. Observable
+only as `variables.a` after the call.
+
+Probe trap re-learned twice: the bare write after the delete leaked into
+Lucee's page `variables`, so the NEXT probe function's bare read of the same
+name found it — use distinct parameter names per probe function, and never a
+name another suite in the runner assigns at page scope (`c1` was).
+
+Pinned by `tests/core/test_structdelete_arguments.cfm` (20, identical on
+Lucee 7.1). Gates: CLI 9101/9101 · serve dev+prod cold+warm 9243/9243 ×4 ·
+`cargo test --workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 ·
+Wheels 2737/3/0 +16 · Preside boot + admin tour clean.
+

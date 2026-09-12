@@ -7930,6 +7930,8 @@ impl CfmlVirtualMachine {
             // Same rule for the pre-split path operand — it reaches the scope by
             // name exactly as the `String` form it replaced.
             BytecodeOp::SetScopePath(sp) => Self::path_names_arguments_scope(&sp.path),
+            // `structDelete(arguments, k)` / `structClear(arguments)` (§106).
+            BytecodeOp::DeleteScopeKey(n) => n.lower() == "arguments",
             _ => false,
         })
     }
@@ -8056,6 +8058,7 @@ impl CfmlVirtualMachine {
                         return false;
                     }
                 }
+                BytecodeOp::DeleteScopeKey(n) if n.lower() == "arguments" => return false,
                 // A load of the whole arguments struct. Safe ONLY when the very
                 // next op consumes it into a member value.
                 BytecodeOp::LoadLocal(s) | BytecodeOp::TryLoadLocal(s)
@@ -10159,7 +10162,15 @@ impl CfmlVirtualMachine {
                                 if let Some(args) =
                                     locals.get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE).and_then(|v| v.as_cfml_struct())
                                 {
-                                    args.insert(name, val.clone());
+                                    // §106: only while the key is still IN the scope. A
+                                    // declared-but-omitted param has a Null entry and
+                                    // takes the write (Lucee: `b = 5` → arguments.b = 5),
+                                    // but after `structDelete(arguments, "a")` the bare
+                                    // write is an ordinary variable and must not
+                                    // resurrect the key.
+                                    if args.get_ci(name.as_str()).is_some() {
+                                        args.insert(name, val.clone());
+                                    }
                                 }
                             }
                             // Sync to shared closure env so closures see updated value
@@ -10234,7 +10245,7 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::DeleteScopeKey(scope) => {
-                    if let Err(e) = ops::frame::op_delete_scope_key(self, &mut stack, &mut locals, effective_local_mode_modern, scope) {
+                    if let Err(e) = ops::frame::op_delete_scope_key(self, &mut stack, func, &mut locals, &declared_locals, &mut inherited_or_param_keys, effective_local_mode_modern, scope) {
                         ip = self.route_call_error(e, &mut stack)?;
                     }
                 }
@@ -40992,7 +41003,7 @@ fn imap_key_ci(m: &ValueMap, key: &str) -> Option<String> {
     m.keys().find(|k| k.eq_ignore_ascii_case(key)).map(|k| k.as_str().to_string())
 }
 
-fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
+pub(crate) fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
     if m.shift_remove(key).is_some() {
         return true;
     }

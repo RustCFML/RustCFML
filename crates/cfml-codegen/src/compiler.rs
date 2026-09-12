@@ -2075,6 +2075,20 @@ impl CfmlCompiler {
         None
     }
 
+    /// True when `expr` is exactly `structClear(arguments)`.
+    fn is_structclear_arguments(expr: &Expression) -> bool {
+        if let Expression::FunctionCall(call) = expr {
+            if let Expression::Identifier(ident) = &*call.name {
+                if ident.name.eq_ignore_ascii_case("structclear") && call.arguments.len() == 1 {
+                    if let Expression::Identifier(scope) = &call.arguments[0] {
+                        return scope.name.eq_ignore_ascii_case("arguments");
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// True when `expr` is exactly `arrayAppend(<ident>, value)` — a two-arg
     /// append whose first argument is the given simple identifier and which is
     /// not a reserved scope name. These compile to the fused `ArrayAppendLocal`
@@ -2828,6 +2842,17 @@ impl CfmlCompiler {
                 {
                     self.compile_expression(key_expr, instructions);
                     instructions.push(BytecodeOp::DeleteScopeKey(Name::from(scope)));
+                }
+                // `structClear(arguments)` — the scope IS a parameter's storage
+                // on Lucee, so clearing it also clears every bare parameter name.
+                // The generic in-place clear runs first (the struct is a shared
+                // handle); the empty-key DeleteScopeKey then drops the frame's
+                // parameter mirrors (see `op_delete_scope_key`).
+                else if Self::is_structclear_arguments(&expr_stmt.expr) {
+                    self.compile_expression(&expr_stmt.expr, instructions);
+                    instructions.push(BytecodeOp::Pop);
+                    instructions.push(BytecodeOp::String(std::sync::Arc::new(String::new())));
+                    instructions.push(BytecodeOp::DeleteScopeKey(Name::from("arguments")));
                 }
                 // Check for mutating function calls: structAppend(a, b), structInsert(a, k, v), etc.
                 // These return the modified struct; store it back to the first arg's location.
