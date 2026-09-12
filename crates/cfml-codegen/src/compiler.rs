@@ -191,6 +191,13 @@ impl BytecodeFunction {
 
     /// The defining source file as a shared string (see `source_file_shared`).
     #[inline]
+    /// Borrow of the shared defining-file handle (no refcount traffic).
+    pub fn source_file_arc_ref(&self) -> Option<&std::sync::Arc<str>> {
+        self.source_file_shared
+            .get_or_init(|| self.source_file.as_deref().map(std::sync::Arc::from))
+            .as_ref()
+    }
+
     pub fn source_file_arc(&self) -> Option<std::sync::Arc<str>> {
         self.source_file_shared
             .get_or_init(|| self.source_file.as_deref().map(std::sync::Arc::from))

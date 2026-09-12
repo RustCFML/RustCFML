@@ -2234,6 +2234,10 @@ pub struct CfmlVirtualMachine {
     /// thread, so no synchronization is needed.
     #[cfg(feature = "scope-pool")]
     locals_pool: Vec<ValueMap>,
+    /// §2.1: per-call operand stacks, recycled like `locals_pool`. A fresh
+    /// `Vec::new()` per frame paid one malloc (96 B on first push) and one free
+    /// per call — the only per-frame heap traffic besides the args `Vec`.
+    stack_pool: Vec<Vec<CfmlValue>>,
     /// Try-catch handler stack
     pub(crate) try_stack: Vec<TryHandler>,
     /// Current exception (if any)
@@ -2795,7 +2799,10 @@ pub struct CfmlVirtualMachine {
     /// These cannot live in `builtins`: that map holds bare
     /// `fn(Vec<CfmlValue>) -> CfmlResult` pointers, which cannot carry "which
     /// module, which entry point" and cannot be handed a `ctx`.
-    pub foreign_builtins: HashMap<String, foreign::ForeignBuiltin>,
+    /// §2.1: Fx-hashed. With any extension loaded this map is probed on every
+    /// bare-name resolution (`is_builtin_name_ci`), and the default SipHash
+    /// probe was ~4% of a UDF→UDF frame.
+    pub foreign_builtins: HashMap<String, foreign::ForeignBuiltin, cfml_common::dynamic::ValueBuildHasher>,
     /// Classes provided by loaded `.rcx` extensions, keyed lowercase.
     pub foreign_classes: HashMap<String, foreign::ForeignClass>,
 
@@ -4344,6 +4351,7 @@ impl CfmlVirtualMachine {
             frame_has_local_scope: false,
             #[cfg(feature = "scope-pool")]
             locals_pool: Vec::new(),
+            stack_pool: Vec::new(),
             try_stack: Vec::new(),
             current_exception: None,
             last_exception: None,
@@ -4461,7 +4469,7 @@ impl CfmlVirtualMachine {
             pending_fused_parent: None,
             pending_called_name: None,
             native_classes: HashMap::new(),
-            foreign_builtins: HashMap::new(),
+            foreign_builtins: HashMap::default(),
             foreign_classes: HashMap::new(),
             qoq_registry: QoQFunctionRegistry::new(),
             // Compiled-in runtime defaults. `apply_cfconfig` overlays the
@@ -8188,7 +8196,12 @@ impl CfmlVirtualMachine {
     fn take_locals_map(&mut self, cap: usize) -> ValueMap {
         match self.locals_pool.pop() {
             Some(mut m) => {
-                m.reserve(cap);
+                // §2.1: a pooled map is cleared, not shrunk — `reserve` on one
+                // that already holds the capacity was 5% of a 1-param frame.
+                if m.capacity() < cap {
+                    let need = cap.saturating_sub(m.len());
+                    m.reserve(need);
+                }
                 m
             }
             None => ValueMap::with_capacity_and_hasher(cap, Default::default()),
@@ -8212,6 +8225,15 @@ impl CfmlVirtualMachine {
         #[cfg(not(feature = "scope-pool"))]
         {
             ValueMap::with_capacity_and_hasher(cap, Default::default())
+        }
+    }
+
+    /// §2.1: return a frame's operand stack to the pool (cleared; bounded).
+    #[inline]
+    fn recycle_stack(&mut self, mut st: Vec<CfmlValue>) {
+        if st.capacity() > 0 && self.stack_pool.len() < 128 {
+            st.clear();
+            self.stack_pool.push(st);
         }
     }
 
@@ -8346,7 +8368,7 @@ impl CfmlVirtualMachine {
             }
             None => self.seed_locals_map(seed_cap + 1),
         };
-        let mut stack: Vec<CfmlValue> = Vec::new();
+        let mut stack: Vec<CfmlValue> = self.stack_pool.pop().unwrap_or_default();
         // Slot-resolved locals (perf plan T3.1 stage 1): direct-indexed storage
         // for the `var`-declared names in `func.slot_names`. `None` = not (yet)
         // declared on this control path, or deleted via UnsetPath — the slot
@@ -10453,18 +10475,13 @@ impl CfmlVirtualMachine {
                     // `writeOutput("…")`, whose exact probe always misses: the
                     // unrestricted version linear-scanned the whole page scope per
                     // chunk.
-                    let local_hit_ref = locals.get_key_value(name).or_else(|| {
-                        if is_builtin_name && !is_read_position {
-                            locals.iter().find(|(k, v)| {
-                                matches!(v, CfmlValue::Function(_))
-                                    && k.eq_ignore_ascii_case(name_lower)
-                            })
-                        } else {
-                            locals
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(name_lower))
-                        }
-                    });
+                    // §2.1: one probe. `Key` equality is already case-insensitive
+                    // (folded hash + `eq_ignore_ascii_case`), so the linear
+                    // `locals.iter().find(eq_ignore_ascii_case)` fallback that ran
+                    // here on every miss could never find what the probe did not —
+                    // it walked every local on every bare call to a page/sibling
+                    // function (the v0.613 CI-scan deletion missed this site).
+                    let local_hit_ref = locals.get_key_value(name);
                     let local_hit_visible = match &local_hit_ref {
                         None => false,
                         _ if is_read_position => true,
@@ -10555,12 +10572,11 @@ impl CfmlVirtualMachine {
                         stack.push(v);
                     } else if let Some(val) = locals.get(&*cfml_common::key::well_known::VARIABLES).filter(|_| !skip_variables_method).and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
-                            // get_ci does exact-then-CI under one read lock and
-                            // clones only the matched value — never snapshots the
-                            // whole __variables map (the old `vars.iter()` path
-                            // cloned the entire IndexMap on every CI-fallback read,
-                            // the single hottest clone site on the Wheels /posts path).
-                            vars.get_ci(name.as_str())
+                            // One probe by the interned key (pre-folded hash, CI
+                            // equality) under one read lock, cloning only the
+                            // matched value. `get_ci(&str)` re-hashed the name's
+                            // bytes on every bare call to a page function (§2.1).
+                            vars.get(name.key())
                         } else {
                             None
                         }
@@ -10587,6 +10603,9 @@ impl CfmlVirtualMachine {
                                 }
                                 // Closures are lexically bound (see
                                 // `strip_instance_binding`): never re-bound here.
+                                // (§2.1: testing the frame's own THIS/__variables keys
+                                // BEFORE this lock read measured +8 ns on a UDF→UDF
+                                // frame — layout, not work — so the order stays.)
                                 let foreign_bind = !Self::is_closure_value(f)
                                     && f
                                     .captured_scope
@@ -12278,7 +12297,9 @@ impl CfmlVirtualMachine {
                         cfml_common::perf_counters::call_phases::add(
                             20, _n.duration_since(_cp_ret).as_nanos() as u64);
                     }
-                    return Ok(stack.pop().unwrap_or(CfmlValue::Null));
+                    let ret = stack.pop().unwrap_or(CfmlValue::Null);
+                    self.recycle_stack(std::mem::take(&mut stack));
+                    return Ok(ret);
                 }
 
                 // Collections
@@ -15177,7 +15198,9 @@ impl CfmlVirtualMachine {
             cfml_common::perf_counters::call_phases::add(
                 7, _n.duration_since(_cp_t).as_nanos() as u64);
         }
-        Ok(stack.pop().unwrap_or(CfmlValue::Null))
+        let ret = stack.pop().unwrap_or(CfmlValue::Null);
+        self.recycle_stack(std::mem::take(&mut stack));
+        Ok(ret)
     }
 
     /// Resolve a `<cflock>` / `lock {}` attribute set into the key, mode, deadline and
@@ -15751,14 +15774,23 @@ impl CfmlVirtualMachine {
                         // cheap comparison, no clone. (Wheels migrator shape:
                         // migration up() -> inherited createTable() ->
                         // createObject("TableDefinition").)
-                        let saved_source_file = if user_func.source_file.is_some()
-                            && user_func.source_file.as_deref() != self.source_file.as_deref()
-                        {
-                            let prev = self.source_file.clone();
-                            self.source_file = user_func.source_file_arc();
-                            Some(prev)
-                        } else {
-                            None
+                        // §2.1: a pointer test first. The byte compare of two
+                        // equal ~60-char paths ran on EVERY same-file call (3.6% of
+                        // a UDF→UDF frame); when the paths match but the handles
+                        // differ, adopt the callee's shared handle so the next
+                        // call from this file is a pointer test.
+                        let saved_source_file = match (user_func.source_file_arc_ref(), self.source_file.as_ref()) {
+                            (None, _) => None,
+                            (Some(f), Some(cur)) if Arc::ptr_eq(f, cur) => None,
+                            (Some(f), Some(cur)) if **f == **cur => {
+                                self.source_file = Some(f.clone());
+                                None
+                            }
+                            (Some(f), _) => {
+                                let prev = self.source_file.clone();
+                                self.source_file = Some(f.clone());
+                                Some(prev)
+                            }
                         };
                         // Alias attribution for getFunctionCalledName(). The frame's
                         // called_name falls back to the RESOLVED function's declared
