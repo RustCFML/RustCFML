@@ -529,10 +529,21 @@ fn component_leaf_metadata(s: &ValueMap, fallback_name: &str) -> ValueMap {
                 .map(|p| {
                     let mut pm = ValueMap::default();
                     pm.insert("name".to_string(), CfmlValue::string(p.name.clone()));
-                    if let Some(ref t) = p.param_type {
-                        pm.insert("type".to_string(), CfmlValue::string(t.clone()));
-                    }
+                    // Lucee always reports a `type`, defaulting to "any" for an
+                    // undeclared parameter — reflection consumers read the key
+                    // unconditionally (GH #399).
+                    pm.insert(
+                        "type".to_string(),
+                        CfmlValue::string(
+                            p.param_type.clone().unwrap_or_else(|| "any".to_string()),
+                        ),
+                    );
                     pm.insert("required".to_string(), CfmlValue::Bool(p.required));
+                    // `default` is present ONLY when the parameter declares one,
+                    // and carries the declared literal's own type (GH #399).
+                    if let Some(ref d) = p.default {
+                        pm.insert("default".to_string(), d.clone());
+                    }
                     for (ak, av) in &p.annotations {
                         pm.insert(ak.clone(), CfmlValue::string(av.clone()));
                     }
@@ -4888,7 +4899,7 @@ impl CfmlVirtualMachine {
         }
         if !r.timezone.is_empty() {
             self.timezone = r.timezone.clone();
-            cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
+            cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
         }
         self.whitespace_compression = r.whitespace_compression_enabled;
         if let Some(secs) = cfml_config::RuntimeCfg::parse_timeout_seconds(&r.session_timeout) {
@@ -5688,7 +5699,7 @@ impl CfmlVirtualMachine {
         // `setLocale()` in one request would still be in force for the next.
         cfml_common::locale::set_current_locale(&self.locale);
         self.timezone = seed.timezone;
-        cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
+        cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
         self.whitespace_compression = seed.whitespace_compression;
         self.session_timeout_secs = seed.session_timeout_secs;
         self.application_timeout_secs = seed.application_timeout_secs;
@@ -9781,7 +9792,7 @@ impl CfmlVirtualMachine {
                                 .map(|(i, pname)| cfml_common::dynamic::CfmlParam {
                                     name: pname.clone(),
                                     param_type: bc_func.param_types.get(i).cloned().flatten(),
-                                    default: None,
+                                    default: bc_func.param_defaults.get(i).cloned().flatten(),
                                     required: bc_func
                                         .required_params
                                         .get(i)
@@ -10915,7 +10926,7 @@ impl CfmlVirtualMachine {
                                 .map(|(i, p)| cfml_common::dynamic::CfmlParam {
                                     name: p.clone(),
                                     param_type: uf.param_types.get(i).cloned().flatten(),
-                                    default: None,
+                                    default: uf.param_defaults.get(i).cloned().flatten(),
                                     required: uf
                                         .required_params
                                         .get(i)
@@ -10987,7 +10998,7 @@ impl CfmlVirtualMachine {
                                 .map(|(i, p)| cfml_common::dynamic::CfmlParam {
                                     name: p.clone(),
                                     param_type: uf.param_types.get(i).cloned().flatten(),
-                                    default: None,
+                                    default: uf.param_defaults.get(i).cloned().flatten(),
                                     required: uf
                                         .required_params
                                         .get(i)
@@ -13378,7 +13389,7 @@ impl CfmlVirtualMachine {
                             .map(|(i, name)| cfml_common::dynamic::CfmlParam {
                                 name: name.clone(),
                                 param_type: bc_func_ref.param_types.get(i).cloned().flatten(),
-                                default: None,
+                                default: bc_func_ref.param_defaults.get(i).cloned().flatten(),
                                 required: bc_func_ref
                                     .required_params
                                     .get(i)
@@ -18034,7 +18045,11 @@ impl CfmlVirtualMachine {
                         && !result.ends_with('/')
                         && !result.ends_with('\\')
                     {
-                        result.push('/');
+                        // Use the PLATFORM separator, not a hardcoded '/'. On
+                        // Windows the rest of the path is backslash-separated, so
+                        // appending '/' produced the mixed `D:\Projects\app/` of
+                        // GH #422; Lucee returns `D:\Projects\app\`.
+                        result.push(std::path::MAIN_SEPARATOR);
                     }
                     return Ok(CfmlValue::string(result));
                 }
@@ -18362,7 +18377,7 @@ impl CfmlVirtualMachine {
                     match tz::resolve_tz(&id) {
                         Some(t) => {
                             self.timezone = tz::canonical_name(&t);
-                            cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
+                            cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
                             return Ok(CfmlValue::Null);
                         }
                         None => {
@@ -33495,7 +33510,7 @@ impl CfmlVirtualMachine {
                 .map(|(i, name)| cfml_common::dynamic::CfmlParam {
                     name: name.clone(),
                     param_type: bf.param_types.get(i).cloned().flatten(),
-                    default: None,
+                    default: bf.param_defaults.get(i).cloned().flatten(),
                     required: bf.required_params.get(i).copied().unwrap_or(false),
                     annotations: bf.param_annotations.get(i).cloned().unwrap_or_default(),
                 })
@@ -35195,7 +35210,7 @@ impl CfmlVirtualMachine {
                                     .map(|(i, name)| cfml_common::dynamic::CfmlParam {
                                         name: name.clone(),
                                         param_type: func_def.param_types.get(i).cloned().flatten(),
-                                        default: None,
+                                        default: func_def.param_defaults.get(i).cloned().flatten(),
                                         required: func_def
                                             .required_params
                                             .get(i)
@@ -39051,7 +39066,7 @@ impl CfmlVirtualMachine {
                         .map(|(i, name)| cfml_common::dynamic::CfmlParam {
                             name: name.clone(),
                             param_type: bf.param_types.get(i).cloned().flatten(),
-                            default: None,
+                            default: bf.param_defaults.get(i).cloned().flatten(),
                             required: bf.required_params.get(i).copied().unwrap_or(false),
                             annotations: bf
                                 .param_annotations
@@ -39228,7 +39243,7 @@ impl CfmlVirtualMachine {
                         .map(|(i, pname)| cfml_common::dynamic::CfmlParam {
                             name: pname.clone(),
                             param_type: bf.param_types.get(i).cloned().flatten(),
-                            default: None,
+                            default: bf.param_defaults.get(i).cloned().flatten(),
                             required: bf.required_params.get(i).copied().unwrap_or(false),
                             annotations: bf
                                 .param_annotations
@@ -40654,7 +40669,7 @@ impl CfmlVirtualMachine {
         {
             if let Some(zone) = tz::resolve_tz(tz_id.trim()) {
                 self.timezone = tz::canonical_name(&zone);
-                cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
+                cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
             }
         }
         if let Some(loc) = config
@@ -41547,7 +41562,7 @@ pub(crate) fn to_number(val: &CfmlValue) -> Option<f64> {
         // participates in all arithmetic/comparison exactly like a Double.
         CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Some(*d),
         CfmlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        CfmlValue::String(s) => s.trim().parse::<f64>().ok(),
+        CfmlValue::String(s) => cfml_common::numeric::numeric_string_value(s),
         _ => None,
     }
 }
@@ -41735,6 +41750,20 @@ pub(crate) fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
                     return a == b;
                 }
             }
+            // Numeric-aware equality: when BOTH sides are numeric strings, CFML
+            // compares them as NUMBERS, not as text — so `"000" eq "000000"`,
+            // `"01" eq "1"`, `"1.0" eq "1"` and `"1e2" eq "100"` are all true on
+            // Lucee and ACF (GH #398). We compared them textually, which made
+            // every zero-padded id, version or colour code diverge; TestBox's
+            // `Assertion.equalize()` routes numeric comparisons through exactly
+            // this operator. `<`/`>` were already numeric-aware here — only
+            // equality was not.
+            if let (Some(na), Some(nb)) = (
+                cfml_common::numeric::numeric_string_value(x),
+                cfml_common::numeric::numeric_string_value(y),
+            ) {
+                return na == nb;
+            }
             // Date-aware equality: two date VALUES are equal when they name the
             // same instant, even if their textual forms differ (a plain
             // `1990-01-01 00:00:00` DB column vs the `{ts '...'}` ODBC literal
@@ -41917,8 +41946,13 @@ pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
             x.partial_cmp(&(*y as f64)).map_or(0, |o| o as i32)
         }
         (CfmlValue::String(x), CfmlValue::String(y)) => {
-            // Try numeric comparison first
-            if let (Ok(a), Ok(b)) = (x.parse::<f64>(), y.parse::<f64>()) {
+            // Try numeric comparison first, by the same rule equality uses:
+            // surrounding whitespace is trimmed and the IEEE spellings
+            // (`inf`, `NaN`) are NOT numeric to CFML.
+            if let (Some(a), Some(b)) = (
+                cfml_common::numeric::numeric_string_value(x),
+                cfml_common::numeric::numeric_string_value(y),
+            ) {
                 return a.partial_cmp(&b).map_or(0, |o| o as i32);
             }
             // Date-aware: Lucee compares two date VALUES as dates even when their
@@ -41942,7 +41976,7 @@ pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
                     CfmlValue::Int(i) => Some(*i as f64),
                     CfmlValue::Double(d) => Some(*d),
                     CfmlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-                    CfmlValue::String(s) => s.trim().parse::<f64>().ok(),
+                    CfmlValue::String(s) => cfml_common::numeric::numeric_string_value(s),
                     _ => None,
                 }
             };
@@ -42318,7 +42352,7 @@ fn query_sort_numeric(v: &CfmlValue) -> Option<f64> {
         CfmlValue::Int(i) => Some(*i as f64),
         CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Some(*d),
         CfmlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        CfmlValue::String(s) => s.trim().parse::<f64>().ok(),
+        CfmlValue::String(s) => cfml_common::numeric::numeric_string_value(s),
         _ => None,
     }
 }

@@ -1321,40 +1321,16 @@ thread_local! {
     static PRNG_SEEDED: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
-thread_local! {
-    /// The request's timezone (`setTimeZone`, or `this.timezone`), as an IANA
-    /// id. `None` = no request zone set, so the system zone applies.
-    ///
-    /// Date PARSING needs this and cannot reach the VM. An offset-bearing
-    /// string names an absolute instant, and CFML reports instants in the
-    /// REQUEST zone — `dateConvert` already did, via the VM intercept, but the
-    /// parser resolved `+0000` against chrono's `Local` (the SYSTEM zone).
-    /// With `setTimeZone("Asia/Kolkata")` on a UTC box, Lucee 7.1 parses
-    /// "August, 25 2026 09:00:14 +0000" as 14:30:14 and we returned 09:00:14,
-    /// so `dateDiff(dateConvert("utc2Local", d), thatString)` was out by the
-    /// whole zone offset (GH #415's CI failure; measured on Lucee).
-    ///
-    /// It hid locally because the suite leaves a request zone set and most
-    /// developer machines run that same zone as their system zone — the two
-    /// only diverge on a UTC CI box, or under an explicit setTimeZone.
-    static REQUEST_TZ: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Publish the request timezone to the date parser. Called by the VM wherever
-/// its own `timezone` field is assigned; `None` restores the system zone.
-pub fn set_request_timezone(id: Option<String>) {
-    REQUEST_TZ.with(|t| *t.borrow_mut() = id.filter(|s| !s.is_empty()));
-}
+/// Publish the request timezone to the date parser. Re-exported from
+/// `cfml-common` so existing callers keep working; the thread-local lives there
+/// because the VM (its only writer) cannot depend on `cfml-stdlib` on wasm32.
+pub use cfml_common::clock::set_request_timezone;
 
 /// The zone an instant should be reported in: the request zone when one is set,
 /// otherwise the system zone.
 fn reporting_zone() -> Option<chrono_tz::Tz> {
-    REQUEST_TZ.with(|t| {
-        t.borrow()
-            .as_deref()
-            .and_then(|id| id.parse::<chrono_tz::Tz>().ok())
-    })
+    cfml_common::clock::request_timezone()
+        .and_then(|id| id.parse::<chrono_tz::Tz>().ok())
 }
 
 fn xorshift64(state: u64) -> u64 {
@@ -1750,6 +1726,14 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     // on non-ASCII input (GitHub #248).
     let start_char = if args.len() >= 3 { (get_int(&args, 2).max(1) as usize).saturating_sub(1) } else { 0 };
     let return_sub = if args.len() >= 4 { args[3].is_true() } else { false };
+    // 5th argument: scope. "all" returns EVERY match rather than the first
+    // (Lucee/ACF 2016+). We dropped it silently, so a caller asking for all
+    // matches got the single-match result and iterating it found nothing —
+    // Preside's `_getObfuscationsInSql` never entered its loop (GH #393).
+    let scope_all = args
+        .get(4)
+        .map(|v| v.as_string())
+        .is_some_and(|s| s.eq_ignore_ascii_case("all"));
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
     let re = match cached_regex(&pat) {
@@ -1767,33 +1751,84 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     // Clamp to len so an out-of-range start can't panic.
     let start = char_index_to_byte(&string, start_char).min(string.len());
 
-    if return_sub {
-        if let Some(caps) = re.captures_at_start(&string, start) {
-            let mut pos_arr = Vec::new();
-            let mut match_arr = Vec::new();
-            let mut len_arr = Vec::new();
-            for cap in &caps {
-                if let Some((m_start, m_str)) = cap {
-                    pos_arr.push(CfmlValue::Int((byte_to_char_index(&string, *m_start) + 1) as i64));
-                    len_arr.push(CfmlValue::Int(m_str.chars().count() as i64));
-                    match_arr.push(CfmlValue::string(m_str.clone()));
-                } else {
-                    pos_arr.push(CfmlValue::Int(0));
-                    match_arr.push(CfmlValue::string(String::new()));
-                    len_arr.push(CfmlValue::Int(0));
-                }
+    // One match's {pos, len, match} struct, in the key order Lucee reports.
+    let caps_to_struct = |caps: &CapList| -> CfmlValue {
+        let mut pos_arr = Vec::new();
+        let mut match_arr = Vec::new();
+        let mut len_arr = Vec::new();
+        for cap in caps {
+            if let Some((m_start, m_str)) = cap {
+                pos_arr.push(CfmlValue::Int((byte_to_char_index(&string, *m_start) + 1) as i64));
+                len_arr.push(CfmlValue::Int(m_str.chars().count() as i64));
+                match_arr.push(CfmlValue::string(m_str.clone()));
+            } else {
+                pos_arr.push(CfmlValue::Int(0));
+                match_arr.push(CfmlValue::string(String::new()));
+                len_arr.push(CfmlValue::Int(0));
             }
-            let mut result = ValueMap::default();
-            result.insert("POS".to_string(), CfmlValue::array(pos_arr));
-            result.insert("MATCH".to_string(), CfmlValue::array(match_arr));
-            result.insert("LEN".to_string(), CfmlValue::array(len_arr));
-            Ok(CfmlValue::strukt(result))
-        } else {
-            let mut result = ValueMap::default();
-            result.insert("POS".to_string(), CfmlValue::array(vec![CfmlValue::Int(0)]));
-            result.insert("MATCH".to_string(), CfmlValue::array(vec![CfmlValue::string(String::new())]));
-            result.insert("LEN".to_string(), CfmlValue::array(vec![CfmlValue::Int(0)]));
-            Ok(CfmlValue::strukt(result))
+        }
+        let mut result = ValueMap::default();
+        result.insert("POS".to_string(), CfmlValue::array(pos_arr));
+        result.insert("MATCH".to_string(), CfmlValue::array(match_arr));
+        result.insert("LEN".to_string(), CfmlValue::array(len_arr));
+        CfmlValue::strukt(result)
+    };
+    let empty_match_struct = || -> CfmlValue {
+        let mut result = ValueMap::default();
+        result.insert("POS".to_string(), CfmlValue::array(vec![CfmlValue::Int(0)]));
+        result.insert("MATCH".to_string(), CfmlValue::array(vec![CfmlValue::string(String::new())]));
+        result.insert("LEN".to_string(), CfmlValue::array(vec![CfmlValue::Int(0)]));
+        CfmlValue::strukt(result)
+    };
+
+    if scope_all {
+        // Walk every non-overlapping match from `start`. A zero-width match
+        // (e.g. `x*` against "abcabd") must still advance, by one CHARACTER —
+        // Lucee reports one hit at every position including one past the end.
+        let mut out: Vec<CfmlValue> = Vec::new();
+        let mut at = start;
+        loop {
+            let Some(caps) = re.captures_at_start(&string, at) else { break };
+            let Some((m_start, m_str)) = caps.first().and_then(|c| c.clone()) else { break };
+            if return_sub {
+                out.push(caps_to_struct(&caps));
+            } else {
+                out.push(CfmlValue::Int(
+                    (byte_to_char_index(&string, m_start) + 1) as i64,
+                ));
+            }
+            let next = if m_str.is_empty() {
+                // Step to the next char boundary; stop once past the end.
+                match string[m_start..].chars().next() {
+                    Some(c) => m_start + c.len_utf8(),
+                    None => break,
+                }
+            } else {
+                m_start + m_str.len()
+            };
+            if next > string.len() {
+                break;
+            }
+            at = next;
+        }
+        if out.is_empty() {
+            // Lucee's no-match answers are asymmetric, and both are load-bearing
+            // for callers that check the result before iterating: WITH
+            // sub-expressions it is an array holding the single zero-struct;
+            // WITHOUT, it is the plain scalar 0, not an empty array.
+            return Ok(if return_sub {
+                CfmlValue::array(vec![empty_match_struct()])
+            } else {
+                CfmlValue::Int(0)
+            });
+        }
+        return Ok(CfmlValue::array(out));
+    }
+
+    if return_sub {
+        match re.captures_at_start(&string, start) {
+            Some(caps) => Ok(caps_to_struct(&caps)),
+            None => Ok(empty_match_struct()),
         }
     } else {
         match re.find_at_start(&string, start) {
@@ -2468,7 +2503,9 @@ fn fn_format_base_n(args: Vec<CfmlValue>) -> CfmlResult {
     let is_negative = n < 0;
     let abs_n = if is_negative { (n as i64).unsigned_abs() } else { n as u64 };
     if abs_n == 0 { return Ok(CfmlValue::string("0".to_string())); }
-    let digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // LOWERCASE digits: `formatBaseN(255, 16)` is `ff` on Lucee (and Java's
+    // `Long.toString(v, radix)`, which it wraps), not `FF` (GH #398).
+    let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
     let mut result = String::new();
     let mut val = abs_n;
     while val > 0 {
@@ -4144,7 +4181,11 @@ fn fn_is_numeric(args: Vec<CfmlValue>) -> CfmlResult {
     // value in numeric type tests — mirrors to_number/cfml_equal/cfml_compare.
     match args.first().map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(CfmlValue::Bool(true)),
-        Some(CfmlValue::String(s)) => Ok(CfmlValue::Bool(s.trim().parse::<f64>().is_ok())),
+        // `inf`/`Infinity`/`NaN` parse as f64 in Rust but are NOT numeric to
+        // CFML — `isNumeric("INF")` is false on Lucee (GH #398 neighbourhood).
+        Some(CfmlValue::String(s)) => Ok(CfmlValue::Bool(
+            cfml_common::numeric::is_numeric_string(s),
+        )),
         // A CFML boolean is NOT numeric — isNumeric(true)/isNumeric(false) are
         // false on Lucee, Adobe CF and BoxLang. (Wheels guards its finder
         // `parameterize` flag with isNumeric(), which defaults to boolean true.)
@@ -9629,8 +9670,6 @@ static HTTP_AGENT_NO_REDIRECT: Lazy<ureq::Agent> = Lazy::new(|| {
         .build()
 });
 
-/// Read a response body either as decoded text or as raw bytes. Decoding bytes
-/// through `into_string()` would corrupt non-UTF-8 payloads (images, etc.).
 #[cfg(feature = "http")]
 /// Collect a cfhttp response's headers.
 ///
@@ -9672,6 +9711,9 @@ fn cfhttp_collect_headers(
     (headers, raw)
 }
 
+/// Read a response body either as decoded text or as raw bytes. Decoding bytes
+/// through `into_string()` would corrupt non-UTF-8 payloads (images, etc.).
+#[cfg(feature = "http")]
 fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> CfmlValue {
     if !get_as_binary {
         return CfmlValue::string(resp.into_string().unwrap_or_default());
@@ -18289,7 +18331,12 @@ fn fn_get_file_from_path(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_get_canonical_path(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
     match std::fs::canonicalize(&path) {
-        Ok(p) => Ok(CfmlValue::string(p.to_string_lossy().to_string())),
+        // Shed Windows' `\\?\` extended-length prefix: `canonicalize` returns
+        // it, and it is not a path the caller can feed back to the file BIFs
+        // (GH #422, the same defect expandPath had).
+        Ok(p) => Ok(CfmlValue::string(cfml_common::vfs::strip_verbatim_prefix(
+            &p.to_string_lossy(),
+        ))),
         Err(_) => Ok(CfmlValue::string(path)),
     }
 }

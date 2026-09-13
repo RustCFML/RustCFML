@@ -17,6 +17,7 @@ pub mod locale;
 pub mod mem_guard;
 pub mod logging;
 pub mod name;
+pub mod numeric;
 pub mod perf_counters;
 pub mod position;
 pub mod session_cookie;

@@ -286,8 +286,52 @@ impl Vfs for RealFs {
     }
 
     fn canonicalize(&self, path: &str) -> io::Result<String> {
-        std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string())
+        std::fs::canonicalize(path).map(|p| strip_verbatim_prefix(&p.to_string_lossy()))
     }
+}
+
+/// Strip Windows' `\\?\` "verbatim" (extended-length) path prefix.
+///
+/// `std::fs::canonicalize` on Windows returns `\\?\D:\Projects\app`, not
+/// `D:\Projects\app`. That form is accepted by the Win32 API but is NOT a path
+/// most software — or most CFML — will accept: it disables all path parsing, so
+/// `/` is no longer a separator and relative components are not resolved. GH
+/// \#422: `expandPath("/")` returned `\\?\D:\Projects\lucee7/`, which then
+/// failed in `directoryList` and friends, where Lucee returns
+/// `D:\Projects\lucee7\`.
+///
+/// A UNC canonicalization comes back as `\\?\UNC\server\share`, whose
+/// non-verbatim spelling is `\\server\share`.
+///
+/// On every other platform this is the identity: the prefix cannot occur, and a
+/// path that literally begins with those characters is a real (if strange)
+/// POSIX filename we must not rewrite.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if !cfg!(windows) {
+        return path.to_string();
+    }
+    strip_verbatim_prefix_any_platform(path)
+}
+
+/// The body of [`strip_verbatim_prefix`] with the platform guard removed, so the
+/// rewrite can be unit-tested from a POSIX CI box — where the guard returns
+/// early and a test would otherwise assert nothing.
+pub fn strip_verbatim_prefix_any_platform(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("\\\\?\\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return format!(r"\\{}", unc);
+        }
+        // Only shed the prefix for a real drive path (`D:\...`). Anything else
+        // (a device path such as `\\?\Volume{...}`) has no non-verbatim
+        // spelling, so leaving it alone is the only correct answer.
+        let mut chars = rest.chars();
+        if matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+            && chars.next() == Some(':')
+        {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -912,4 +956,36 @@ pub fn temp_dir_with_separator() -> String {
         dir.push(std::path::MAIN_SEPARATOR);
     }
     dir
+}
+
+#[cfg(test)]
+mod verbatim_prefix_tests {
+    use super::strip_verbatim_prefix_any_platform as strip;
+
+    #[test]
+    fn sheds_the_prefix_from_a_drive_path() {
+        // GH #422: this is exactly what `canonicalize` hands back on Windows,
+        // and what `expandPath("/")` was returning to CFML.
+        assert_eq!(strip(r"\\?\D:\Projects\lucee7"), r"D:\Projects\lucee7");
+        assert_eq!(strip(r"\\?\C:\"), r"C:\");
+    }
+
+    #[test]
+    fn rewrites_a_verbatim_unc_path_to_its_normal_spelling() {
+        assert_eq!(strip(r"\\?\UNC\server\share\file"), r"\\server\share\file");
+    }
+
+    #[test]
+    fn leaves_alone_what_has_no_plain_spelling() {
+        // A device path has no non-verbatim form, so rewriting it would break it.
+        let device = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\x";
+        assert_eq!(strip(device), device);
+    }
+
+    #[test]
+    fn is_the_identity_for_ordinary_paths() {
+        for p in [r"D:\Projects\app", "/usr/local/bin", r"\\server\share", "relative/path"] {
+            assert_eq!(strip(p), p);
+        }
+    }
 }

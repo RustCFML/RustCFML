@@ -43,7 +43,12 @@ for ( i = 1; i <= 500; i++ ) {
     id = createUUID();
     if ( mid( id, 15, 1 ) != "4" ) { badVersion++; }
     if ( !listFindNoCase( "8,9,A,B", mid( id, 20, 1 ) ) ) { badVariant++; }
-    if ( left( id, 8 ) == "00000000" ) { zeroPrefix++; }
+    // `compare()`, NOT `==`: CFML's equality operator compares two NUMERIC
+    // strings numerically, and a hex block such as "0E576548" IS numeric —
+    // zero times ten to the 576548 — so `== "00000000"` is true for roughly one
+    // UUID in 5,000 on Lucee and here alike. This assertion flaked on exactly
+    // that (GH #398 made our operator match Lucee's).
+    if ( compare( left( id, 8 ), "00000000" ) eq 0 ) { zeroPrefix++; }
     seen[ id ] = 1;
 }
 assert( "every uuid is version 4",   badVersion,           0 );

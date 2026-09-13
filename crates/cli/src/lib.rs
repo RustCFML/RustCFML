@@ -2200,9 +2200,17 @@ async fn async_run_server(
 ) {
     let mut server_state = ServerState::with_config(production, cfconfig.clone());
     server_state.sessions = build_session_store(&cfconfig, &server_state.websocket).await;
-    server_state.webroot = Some(
-        fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
-    );
+    // `strip_verbatim_prefix`: on Windows `canonicalize` yields the `\\?\D:\...`
+    // extended-length form, and the webroot is the ROOT of every path expandPath
+    // and the file BIFs build (GH #422 — `expandPath("/")` handed back a path
+    // `directoryList` could not use).
+    server_state.webroot = Some(std::path::PathBuf::from(
+        cfml_common::vfs::strip_verbatim_prefix(
+            &fs::canonicalize(doc_root)
+                .unwrap_or_else(|_| doc_root.to_path_buf())
+                .to_string_lossy(),
+        ),
+    ));
 
     // Sampling profiler (Phase 2 of the observability plan). When
     // `observability.profiler.enabled`, build the shared registry and spawn a

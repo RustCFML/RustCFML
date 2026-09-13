@@ -214,3 +214,45 @@ fn js_perf_now_ms() -> f64 {
         // Fall back to Date.now() if performance.now() isn't available.
         .unwrap_or_else(js_date_now_ms)
 }
+
+// ─────────────────────────────────────────────
+// Request timezone
+// ─────────────────────────────────────────────
+
+thread_local! {
+    /// The request's timezone (`setTimeZone`, or `this.timezone`), as an IANA
+    /// id. `None` = no request zone set, so the system zone applies.
+    ///
+    /// Date PARSING needs this and cannot reach the VM. An offset-bearing
+    /// string names an absolute instant, and CFML reports instants in the
+    /// REQUEST zone — `dateConvert` already did, via the VM intercept, but the
+    /// parser resolved `+0000` against chrono's `Local` (the SYSTEM zone).
+    /// With `setTimeZone("Asia/Kolkata")` on a UTC box, Lucee 7.1 parses
+    /// "August, 25 2026 09:00:14 +0000" as 14:30:14 and we returned 09:00:14,
+    /// so `dateDiff(dateConvert("utc2Local", d), thatString)` was out by the
+    /// whole zone offset (GH #415's CI failure; measured on Lucee).
+    ///
+    /// It hid locally because the suite leaves a request zone set and most
+    /// developer machines run that same zone as their system zone — the two
+    /// only diverge on a UTC CI box, or under an explicit setTimeZone.
+    ///
+    /// It lives HERE, in the crate both sides already depend on, rather than in
+    /// `cfml-stdlib`: the VM is the writer and the stdlib date parser the
+    /// reader, but `cfml-stdlib` is an OPTIONAL dependency of `cfml-vm` (the
+    /// wasm32 worker builds without it), so a direct `cfml_stdlib::` call from
+    /// the VM broke the `wasm32-unknown-unknown` build — which a plain
+    /// `cargo build` never compiles.
+    static REQUEST_TZ: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the request timezone to the date parser. Called by the VM wherever
+/// its own `timezone` field is assigned; `None` restores the system zone.
+pub fn set_request_timezone(id: Option<String>) {
+    REQUEST_TZ.with(|t| *t.borrow_mut() = id.filter(|s| !s.is_empty()));
+}
+
+/// The request timezone's IANA id, if one is set.
+pub fn request_timezone() -> Option<String> {
+    REQUEST_TZ.with(|t| t.borrow().clone())
+}

@@ -84,6 +84,34 @@ pub struct Param {
     pub annotations: Vec<(String, String)>,
 }
 
+impl Param {
+    /// The value `getMetaData()` reports for this parameter's `default` key, or
+    /// `None` when the parameter has no default (the key is then absent, as it
+    /// is on Lucee).
+    ///
+    /// A LITERAL default is reported as its value, preserving the declared type
+    /// — `someParam="test"` reports the string `test`, `anotherParam=false` the
+    /// boolean `false`, `b=7` the number `7`. Anything the engine must evaluate
+    /// at call time (`a=now()`, `b=[1,2]`, `c={x:1}`) has no value to report at
+    /// reflection time, and Lucee reports the fixed marker string
+    /// `[runtime expression]` rather than the source text. Verified against
+    /// Lucee 7.1.0.204 (GH #399).
+    pub fn metadata_default(&self) -> Option<cfml_common::dynamic::CfmlValue> {
+        use cfml_common::dynamic::CfmlValue;
+        let expr = self.default.as_ref()?;
+        Some(match expr {
+            Expression::Literal(lit) => match &lit.value {
+                LiteralValue::Null => CfmlValue::Null,
+                LiteralValue::Bool(b) => CfmlValue::Bool(*b),
+                LiteralValue::Int(i) => CfmlValue::Int(*i),
+                LiteralValue::Double(d) => CfmlValue::Double(*d),
+                LiteralValue::String(s) => CfmlValue::string(s.clone()),
+            },
+            _ => CfmlValue::string("[runtime expression]".to_string()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessModifier {
     Public,

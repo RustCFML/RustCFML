@@ -16,6 +16,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_numeric_string_equality.cfm">
 <cf_runtest file="core/test_closure_var_shadows_captured_after_nested_call.cfm">
 <cf_runtest file="core/test_page_variables_scope_members.cfm">
 <cf_runtest file="core/test_page_scope_shared_struct.cfm">
@@ -334,6 +335,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_date_functions_extra.cfm">
 <cf_runtest file="stdlib/test_lucee_json_date_form.cfm">
 <cf_runtest file="stdlib/test_parse_offset_uses_request_timezone.cfm">
+<cf_runtest file="stdlib/test_refind_scope_all.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
@@ -378,6 +380,7 @@ include "harness.cfm";
 
 <!--- --- OOP --- --->
 <cf_runtest file="oop/test_components.cfm">
+<cf_runtest file="oop/test_getmetadata_parameter_defaults.cfm">
 <cf_runtest file="oop/test_relative_component_metadata.cfm">
 <cf_runtest file="oop/test_pseudo_constructor_errors.cfm">
 <cf_runtest file="oop/test_flyweight_instance.cfm">

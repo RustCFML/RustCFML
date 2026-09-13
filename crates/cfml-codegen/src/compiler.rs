@@ -316,6 +316,14 @@ pub struct BytecodeFunction {
     /// WireBox `@arg.inject coldbox:setting:features`. Surfaced as `param.inject`
     /// etc. in getMetadata()/getComponentMetadata() for DI frameworks.
     pub param_annotations: Vec<Vec<(String, String)>>,
+    /// Declared parameter DEFAULTS as reflection sees them (parallel to
+    /// `params`; `None` when the parameter has no default). A literal default
+    /// carries its value; anything evaluated at call time carries the marker
+    /// string `[runtime expression]`. The default is otherwise compiled into
+    /// the frame prologue, which reflection has no way to read back — so
+    /// `getMetaData(cfc).functions[n].parameters[m].default` was simply absent
+    /// (GH #399). See [`cfml_compiler::ast::Param::metadata_default`].
+    pub param_defaults: Vec<Option<cfml_common::dynamic::CfmlValue>>,
     /// True when this function is a component method (declared inside a CFC
     /// body). Lucee/ACF allow component methods to shadow built-in function
     /// names — `obj.canonicalize()` dispatches to the method, not the BIF —
@@ -1826,6 +1834,7 @@ impl CfmlCompiler {
                     param_types: Vec::new(),
                     return_type: None,
                     param_annotations: Vec::new(),
+                    param_defaults: Vec::new(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
@@ -4842,6 +4851,7 @@ impl CfmlCompiler {
                     .map(|(_, v)| v.clone())
             }),
             param_annotations: func.params.iter().map(|p| p.annotations.clone()).collect(),
+            param_defaults: func.params.iter().map(|p| p.metadata_default()).collect(),
             is_component_method: self.in_component_method,
             access: match func.access {
                 AccessModifier::Private => cfml_common::dynamic::CfmlAccess::Private,
@@ -5120,6 +5130,7 @@ impl CfmlCompiler {
                     param_types: Vec::new(),
                     return_type: prop.prop_type.clone(),
                     param_annotations: Vec::new(),
+                    param_defaults: Vec::new(),
                     is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
@@ -5215,6 +5226,7 @@ impl CfmlCompiler {
                     param_types: vec![None],
                     return_type: Some(component.name.clone()),
                     param_annotations: vec![Vec::new()],
+                    param_defaults: vec![None],
                     is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
@@ -5409,6 +5421,7 @@ impl CfmlCompiler {
                 param_types: Vec::new(),
                 return_type: None,
                 param_annotations: Vec::new(),
+                param_defaults: Vec::new(),
                 is_component_method: true,
                 access: cfml_common::dynamic::CfmlAccess::Public,
                 metadata: Vec::new(),
@@ -6497,6 +6510,7 @@ impl CfmlCompiler {
                         .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
                         .map(|(_, v)| v.clone()),
                     param_annotations: closure.params.iter().map(|p| p.annotations.clone()).collect(),
+                    param_defaults: closure.params.iter().map(|p| p.metadata_default()).collect(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
@@ -6589,6 +6603,7 @@ impl CfmlCompiler {
                     param_types: arrow.params.iter().map(|p| p.param_type.clone()).collect(),
                     return_type: None,
                     param_annotations: arrow.params.iter().map(|p| p.annotations.clone()).collect(),
+                    param_defaults: arrow.params.iter().map(|p| p.metadata_default()).collect(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
                     metadata: Vec::new(),
