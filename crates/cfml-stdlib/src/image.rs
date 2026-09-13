@@ -1384,20 +1384,55 @@ impl CfmlImage {
         None
     }
 
-    /// getEXIFMetadata() — struct of EXIF tag→value pairs (empty if none).
+    /// getEXIFMetadata() — the image's EXIF tags MERGED with its baseline image
+    /// info, which is the shape Lucee returns (GH #389).
+    ///
+    /// Lucee's implementation does not hand back the raw IFD alone: it merges
+    /// the same baseline keys `imageInfo()` reports — `width`, `height`,
+    /// `source`, `colormodel`, `jpeg_color_type`, `metadata` — into the result,
+    /// whichever way the image was read. We returned only the raw tags, so
+    /// `meta.width` was absent even though `imageInfo()` on the same image
+    /// reported it, and Preside's DocumentMetadataService (which appends this
+    /// struct and expects width/height for every uploaded image) saw nothing.
+    ///
+    /// Tag VALUES are the raw ones, not display strings: Lucee reports
+    /// `XResolution` as `72` and `ResolutionUnit` as `2`, where we reported
+    /// "72 pixels per inch" and "inch" — a numeric tag that is not numeric.
+    ///
+    /// One deliberate superset: on a base64-read image Lucee drops the EXIF
+    /// tags entirely (it has no file for its metadata reader to re-open) and
+    /// returns the six baseline keys alone. We keep the tags on both paths —
+    /// strictly more information, and the same keys where Lucee has them.
     fn exif_metadata(&self) -> CfmlResult {
         let mut out = ValueMap::default();
+        let mut exif_tags = ValueMap::default();
+        let mut gps_tags = ValueMap::default();
         if let Some(bytes) = self.container_bytes() {
             let reader = exif::Reader::new();
             if let Ok(exif) = reader.read_from_container(&mut Cursor::new(&bytes)) {
                 for f in exif.fields() {
-                    out.insert(
-                        f.tag.to_string(),
-                        CfmlValue::string(f.display_value().with_unit(&exif).to_string()),
-                    );
+                    let name = f.tag.to_string();
+                    let value = CfmlValue::string(exif_raw_value(f));
+                    if matches!(f.tag.0, exif::Context::Gps) {
+                        gps_tags.insert(name.clone(), value.clone());
+                    } else {
+                        exif_tags.insert(name.clone(), value.clone());
+                    }
+                    out.insert(name, value);
                 }
             }
         }
+        // The baseline info keys, exactly as `imageInfo()` reports them.
+        if let CfmlValue::Struct(info) = self.info_struct() {
+            info.with_map(|m| {
+                for (k, v) in m.iter() {
+                    out.insert(k.to_string(), v.clone());
+                }
+            });
+        }
+        // `exif` / `gps` sub-structs: Lucee carries these on the file-read path.
+        out.insert("exif", CfmlValue::strukt(exif_tags));
+        out.insert("gps", CfmlValue::strukt(gps_tags));
         Ok(CfmlValue::strukt(out))
     }
 
@@ -1408,9 +1443,10 @@ impl CfmlImage {
             if let Ok(exif) = reader.read_from_container(&mut Cursor::new(&bytes)) {
                 for f in exif.fields() {
                     if f.tag.to_string().eq_ignore_ascii_case(name) {
-                        return Ok(CfmlValue::string(
-                            f.display_value().with_unit(&exif).to_string(),
-                        ));
+                        // The same RAW value the struct reports, so
+                        // `imageGetEXIFTag(img, "XResolution")` and
+                        // `imageGetEXIFMetadata(img).XResolution` agree.
+                        return Ok(CfmlValue::string(exif_raw_value(f)));
                     }
                 }
             }
@@ -1540,13 +1576,147 @@ impl CfmlImage {
         info.insert("height", CfmlValue::Int(h as i64));
         info.insert("source", CfmlValue::string(self.source.clone()));
         info.insert("colormodel", color_model_struct(color));
+        // `jpeg_color_type` and `metadata` are part of the baseline set Lucee
+        // reports (GH #389) and are what `imageGetEXIFMetadata` merges in.
+        info.insert(
+            "jpeg_color_type",
+            CfmlValue::string(jpeg_color_type_name(color)),
+        );
+        info.insert("metadata", image_metadata_struct(self.format, color));
         CfmlValue::strukt(info)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXIF tag values — the RAW form, matching Lucee.
+// ---------------------------------------------------------------------------
+
+/// Render one EXIF field the way Lucee's `exif` struct does: the stored value,
+/// with no unit suffix and no quoting.
+///
+/// `Field::display_value()` is a HUMAN rendering — "72 pixels per inch",
+/// "inch", "centered", and an ASCII string wrapped in quotes. Lucee reports
+/// `72`, `2`, `1` and `Test Copyright`, so a caller doing arithmetic on a
+/// numeric tag, or comparing a string one, got the wrong thing from us.
+fn exif_raw_value(f: &exif::Field) -> String {
+    use exif::Value;
+    fn join<T: std::fmt::Display>(v: &[T]) -> String {
+        v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+    }
+    /// A rational prints as a plain integer when it divides exactly (72/1 → 72)
+    /// and as `num/den` otherwise, which is what metadata-extractor does.
+    fn rational(num: u32, den: u32) -> String {
+        if den != 0 && num % den == 0 {
+            (num / den).to_string()
+        } else {
+            format!("{}/{}", num, den)
+        }
+    }
+    fn srational(num: i32, den: i32) -> String {
+        if den != 0 && num % den == 0 {
+            (num / den).to_string()
+        } else {
+            format!("{}/{}", num, den)
+        }
+    }
+    match f.value {
+        // Trailing NULs are already stripped by the parser; join multi-part
+        // ASCII values the way a single string would read.
+        Value::Ascii(ref parts) => parts
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Byte(ref v) => join(v),
+        Value::Short(ref v) => join(v),
+        Value::Long(ref v) => join(v),
+        Value::SByte(ref v) => join(v),
+        Value::SShort(ref v) => join(v),
+        Value::SLong(ref v) => join(v),
+        Value::Float(ref v) => join(v),
+        Value::Double(ref v) => join(v),
+        Value::Rational(ref v) => v
+            .iter()
+            .map(|r| rational(r.num, r.denom))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::SRational(ref v) => v
+            .iter()
+            .map(|r| srational(r.num, r.denom))
+            .collect::<Vec<_>>()
+            .join(", "),
+        // Undefined payloads (MakerNote, UserComment, the thumbnail) have no
+        // meaningful raw text; the human rendering is the best available.
+        _ => f.display_value().to_string(),
     }
 }
 
 // ---------------------------------------------------------------------------
 // imageInfo colormodel — matches Lucee key names / value strings.
 // ---------------------------------------------------------------------------
+
+/// Lucee's `jpeg_color_type` — the colour interpretation of the decoded image
+/// ("RGB", "Grayscale"). Named for JPEG because that is where Java's ImageIO
+/// surfaces it, but Lucee reports it for every format it can decode.
+fn jpeg_color_type_name(color: image::ColorType) -> &'static str {
+    use image::ColorType::*;
+    match color {
+        L8 | La8 | L16 | La16 => "Grayscale",
+        _ => "RGB",
+    }
+}
+
+/// Lucee's `metadata` key.
+///
+/// On Lucee this is Java ImageIO's NATIVE metadata tree — for a JPEG, the full
+/// marker sequence (`app0JFIF`, `dht`, `dqt`, `sof`, `sos`), Huffman and
+/// quantisation table ids included. That tree is a property of ImageIO's own
+/// decoders and we do not reproduce it: we report the subset we can derive
+/// truthfully from the decoded image, and nothing we cannot.
+///
+/// The key is therefore always PRESENT (callers test for it) and always
+/// honest, but it is NOT key-for-key Lucee. See docs/known-issues.md §111.
+fn image_metadata_struct(format: ImageFormat, color: image::ColorType) -> CfmlValue {
+    use image::ColorType::*;
+    let mut chroma = ValueMap::default();
+    let channels = match color {
+        L8 | L16 => 1,
+        La8 | La16 => 2,
+        Rgba8 | Rgba16 | Rgba32F => 4,
+        _ => 3,
+    };
+    chroma.insert("NumChannels", CfmlValue::string(channels.to_string()));
+    let mut cs = ValueMap::default();
+    cs.insert(
+        "name",
+        CfmlValue::string(match color {
+            L8 | La8 | L16 | La16 => "GRAY",
+            _ if matches!(format, ImageFormat::Jpeg) => "YCbCr",
+            _ => "RGB",
+        }),
+    );
+    chroma.insert("ColorSpaceType", CfmlValue::strukt(cs));
+
+    let mut compression = ValueMap::default();
+    let (lossless, name) = match format {
+        ImageFormat::Jpeg => (false, "JPEG"),
+        ImageFormat::Png => (true, "PNG"),
+        ImageFormat::Gif => (true, "LZW"),
+        ImageFormat::Bmp => (true, "BI_RGB"),
+        ImageFormat::WebP => (false, "WebP"),
+        _ => (true, "none"),
+    };
+    compression.insert(
+        "Lossless",
+        CfmlValue::string(if lossless { "TRUE" } else { "FALSE" }),
+    );
+    compression.insert("CompressionTypeName", CfmlValue::string(name));
+
+    let mut out = ValueMap::default();
+    out.insert("Chroma", CfmlValue::strukt(chroma));
+    out.insert("Compression", CfmlValue::strukt(compression));
+    CfmlValue::strukt(out)
+}
 
 fn color_model_struct(color: image::ColorType) -> CfmlValue {
     use image::ColorType::*;

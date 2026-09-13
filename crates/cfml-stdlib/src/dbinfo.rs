@@ -164,6 +164,22 @@ fn cell_int(row: &ValueMap, name: &str) -> i64 {
     }
 }
 
+/// `cell_int`, but distinguishing "absent or not a number" from a real 0.
+///
+/// Our MySQL driver surfaces a SQL NULL in an information_schema numeric column
+/// as an EMPTY STRING, so `cell_int`'s `unwrap_or(0)` silently turned every
+/// missing NUMERIC_PRECISION / NUMERIC_SCALE into a legitimate-looking zero —
+/// which is why COLUMN_SIZE was 0 for every numeric and temporal column.
+fn cell_opt_int(row: &ValueMap, name: &str) -> Option<i64> {
+    match cell(row, name) {
+        Some(CfmlValue::Int(i)) => Some(*i),
+        Some(CfmlValue::Double(d)) => Some(*d as i64),
+        Some(CfmlValue::Bool(b)) => Some(*b as i64),
+        Some(CfmlValue::Null) | None => None,
+        Some(v) => v.as_string().trim().parse::<i64>().ok(),
+    }
+}
+
 fn s(v: &str) -> CfmlValue {
     CfmlValue::string(v.to_string())
 }
@@ -367,6 +383,77 @@ const COLUMNS_ENRICHMENT: &[&str] = &[
 ];
 
 /// One source column, driver-neutral, before shaping into the Lucee result.
+/// Whether a MySQL `COLUMN_TYPE` is the one Connector/J presents as JDBC BIT.
+///
+/// Its `tinyInt1isBit` connection property defaults to TRUE, so a SIGNED
+/// `TINYINT(1)` — which is also how MySQL and MariaDB store `BOOLEAN` — reads
+/// back as BIT. The boundary was measured on Lucee 7.1.0.204, not assumed:
+/// `TINYINT(1) UNSIGNED` stays TINYINT, and so does `TINYINT(4)`.
+fn mysql_tinyint1_is_bit(column_type: &str) -> bool {
+    let lower = column_type.to_lowercase();
+    lower.replace(' ', "").starts_with("tinyint(1)") && !lower.contains("unsigned")
+}
+
+/// The string length a MySQL temporal column reports as COLUMN_SIZE.
+///
+/// These are not in `CHARACTER_MAXIMUM_LENGTH` (not character types) nor in
+/// `NUMERIC_PRECISION` (not numeric), but JDBC reports the width of the
+/// column's textual form. Measured against Lucee 7.1.0.204 on MariaDB 12.1.
+fn mysql_temporal_display_size(type_name: &str) -> Option<i64> {
+    Some(match type_name.to_ascii_uppercase().as_str() {
+        "DATE" => 10,
+        "TIME" => 8,
+        "YEAR" => 4,
+        "DATETIME" | "TIMESTAMP" => 19,
+        _ => return None,
+    })
+}
+
+/// The `java.sql.Types` constant for a SQL type name — `cfdbinfo`'s DATA_TYPE.
+///
+/// We reported 0 for every column on every driver. Lucee reports the JDBC code,
+/// which is what portable schema code switches on. The MySQL/MariaDB rows were
+/// measured against Lucee 7.1.0.204 + Connector/J; the rest are the ANSI names'
+/// standard `java.sql.Types` values, which are fixed by the JDBC specification
+/// and identical across drivers.
+fn jdbc_type_code(type_name: &str) -> i64 {
+    // An UNSIGNED variant carries the same JDBC code as its signed form
+    // (`INT UNSIGNED` is 4, exactly like `INT`), so match on the base word.
+    let upper = type_name.to_ascii_uppercase();
+    let base = upper.split_whitespace().next().unwrap_or("");
+    match base {
+        "BIT" => -7,
+        "BOOL" | "BOOLEAN" => 16,
+        "TINYINT" => -6,
+        "SMALLINT" => 5,
+        // MySQL's MEDIUMINT has no JDBC code of its own; the driver reports it
+        // as INTEGER.
+        "INT" | "INTEGER" | "MEDIUMINT" => 4,
+        "BIGINT" => -5,
+        "DECIMAL" | "DEC" | "FIXED" => 3,
+        "NUMERIC" => 2,
+        "FLOAT" => 7,
+        "REAL" => 7,
+        "DOUBLE" => 8,
+        // ENUM and SET are presented as CHAR by Connector/J.
+        "CHAR" | "ENUM" | "SET" | "NCHAR" | "BPCHAR" => 1,
+        "VARCHAR" | "NVARCHAR" | "VARCHAR2" | "CHARACTER" => 12,
+        "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "LONGVARCHAR" | "NTEXT" => -1,
+        "DATE" => 91,
+        "TIME" => 92,
+        "DATETIME" | "TIMESTAMP" | "DATETIME2" | "SMALLDATETIME" => 93,
+        "BINARY" => -2,
+        "VARBINARY" => -3,
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "LONGVARBINARY" | "IMAGE" | "BYTEA" => -4,
+        "CLOB" => 2005,
+        "UUID" | "UNIQUEIDENTIFIER" => 1111,
+        "JSON" | "JSONB" | "XML" => -1,
+        // 0 is java.sql.Types.NULL — the value we used to report for
+        // everything. It stays the answer only for a type we do not know.
+        _ => 0,
+    }
+}
+
 struct ColInfo {
     table_cat: String,
     table_schem: String,
@@ -374,7 +461,11 @@ struct ColInfo {
     column_name: String,
     type_name: String,
     column_size: i64,
-    decimal_digits: i64,
+    /// `Option`, not a bare number: JDBC reports DECIMAL_DIGITS as SQL NULL for
+    /// a non-numeric column, and Lucee passes that through as an empty cell. We
+    /// reported 0, which reads as "zero decimal places" — a real scale — on
+    /// every VARCHAR and DATE column.
+    decimal_digits: Option<i64>,
     nullable: bool,
     default_value: Option<String>,
     ordinal: i64,
@@ -432,7 +523,7 @@ fn type_columns(
                     column_name: cell_str(&row, "name"),
                     type_name,
                     column_size: size,
-                    decimal_digits: 0,
+                    decimal_digits: None,
                     nullable: cell_int(&row, "notnull") == 0,
                     default_value: dflt,
                     ordinal: cell_int(&row, "cid") + 1,
@@ -493,13 +584,56 @@ fn type_columns(
                     }
                 }
                 let type_name = type_name.split_whitespace().collect::<Vec<_>>().join(" ");
-                let size = match cell(&row, "CHARACTER_MAXIMUM_LENGTH") {
-                    Some(CfmlValue::Null) | None => cell_int(&row, "NUMERIC_PRECISION"),
-                    Some(v) => v.as_string().parse::<i64>().unwrap_or(0),
+                // Connector/J's `tinyInt1isBit=true` (its DEFAULT) presents a
+                // SIGNED `TINYINT(1)` — which is also how MySQL/MariaDB store
+                // `BOOLEAN` — as JDBC BIT, and Lucee inherits that. We reported
+                // "tinyint", so Preside's schema sync saw a type change on
+                // every boolean column and tried to alter it on every dbSync
+                // (GH #390 create path, #391 alter path).
+                //
+                // Measured boundary, NOT assumed: `TINYINT(1) UNSIGNED` stays
+                // TINYINT on Lucee — the driver quirk applies to the signed
+                // form only — and `TINYINT(4)` stays TINYINT.
+                let is_bool_tinyint = mysql_tinyint1_is_bit(&column_type);
+                let type_name = if is_bool_tinyint {
+                    "BIT".to_string()
+                } else {
+                    type_name.to_uppercase()
+                };
+                // CHARACTER_MAXIMUM_LENGTH comes back as an EMPTY STRING (not a
+                // typed NULL) for a non-character column, so this fallback never
+                // ran and every numeric/temporal column reported COLUMN_SIZE 0.
+                let char_len = match cell(&row, "CHARACTER_MAXIMUM_LENGTH") {
+                    Some(CfmlValue::Null) | None => None,
+                    Some(v) => v.as_string().trim().parse::<i64>().ok(),
+                };
+                let size = if is_bool_tinyint {
+                    1
+                } else {
+                    match char_len {
+                        // Connector/J clamps a length to Integer.MAX_VALUE, so
+                        // LONGTEXT reports 2147483647, not MySQL's 4294967295.
+                        Some(n) => n.min(i32::MAX as i64),
+                        None => match mysql_temporal_display_size(&type_name) {
+                            Some(n) => n,
+                            None => cell_int(&row, "NUMERIC_PRECISION"),
+                        },
+                    }
                 };
                 let dflt = match cell(&row, "COLUMN_DEFAULT") {
                     Some(CfmlValue::Null) | None => None,
                     Some(v) => Some(v.as_string()),
+                };
+                // JDBC's DECIMAL_DIGITS is "not applicable" — SQL NULL — for
+                // an EXACT integer type, and 0 for an approximate one, which is
+                // the INVERSE of what information_schema stores (NUMERIC_SCALE
+                // is 0 for INT and NULL for DOUBLE). Lucee reports the JDBC
+                // reading, so map it rather than passing the catalogue value
+                // straight through.
+                let decimal_digits = match type_name.as_str() {
+                    "DECIMAL" | "NUMERIC" | "DEC" | "FIXED" => cell_opt_int(&row, "NUMERIC_SCALE"),
+                    "FLOAT" | "DOUBLE" | "REAL" => Some(0),
+                    _ => None,
                 };
                 cols.push(ColInfo {
                     table_cat: cell_str(&row, "TABLE_SCHEMA"),
@@ -508,7 +642,7 @@ fn type_columns(
                     column_name: cell_str(&row, "COLUMN_NAME"),
                     type_name,
                     column_size: size,
-                    decimal_digits: cell_int(&row, "NUMERIC_SCALE"),
+                    decimal_digits,
                     nullable: cell_str(&row, "IS_NULLABLE").eq_ignore_ascii_case("YES"),
                     default_value: dflt,
                     ordinal: cell_int(&row, "ORDINAL_POSITION"),
@@ -588,7 +722,7 @@ fn type_columns(
                     column_name: name,
                     type_name: cell_str(&row, "udt_name"),
                     column_size: size,
-                    decimal_digits: cell_int(&row, "numeric_scale"),
+                    decimal_digits: cell_opt_int(&row, "numeric_scale"),
                     nullable: cell_str(&row, "is_nullable").eq_ignore_ascii_case("YES"),
                     // Postgres serial/bigserial columns default to nextval(seq);
                     // that (or an IDENTITY default) is the auto-increment marker.
@@ -677,7 +811,7 @@ fn type_columns(
                     column_name: name,
                     type_name: cell_str(&row, "DATA_TYPE"),
                     column_size: size,
-                    decimal_digits: cell_int(&row, "NUMERIC_SCALE"),
+                    decimal_digits: cell_opt_int(&row, "NUMERIC_SCALE"),
                     nullable: cell_str(&row, "IS_NULLABLE").eq_ignore_ascii_case("YES"),
                     default_value: dflt,
                     ordinal: cell_int(&row, "ORDINAL_POSITION"),
@@ -734,13 +868,19 @@ fn type_columns(
         row.insert("TABLE_SCHEM".to_string(), s(&c.table_schem));
         row.insert("TABLE_NAME".to_string(), s(&c.table_name));
         row.insert("COLUMN_NAME".to_string(), s(&c.column_name));
-        row.insert("DATA_TYPE".to_string(), CfmlValue::Int(0));
+        row.insert(
+            "DATA_TYPE".to_string(),
+            CfmlValue::Int(jdbc_type_code(&c.type_name)),
+        );
         row.insert("TYPE_NAME".to_string(), s(&c.type_name));
         row.insert("COLUMN_SIZE".to_string(), CfmlValue::Int(c.column_size));
         row.insert("BUFFER_LENGTH".to_string(), CfmlValue::Int(0));
         row.insert(
             "DECIMAL_DIGITS".to_string(),
-            CfmlValue::Int(c.decimal_digits),
+            match c.decimal_digits {
+                Some(d) => CfmlValue::Int(d),
+                None => CfmlValue::Null,
+            },
         );
         row.insert("NUM_PREC_RADIX".to_string(), CfmlValue::Int(10));
         row.insert(
@@ -1565,4 +1705,78 @@ fn type_terms(driver: &DbDriver) -> CfmlValue {
     m.insert("catalog".to_string(), s(cat_term));
     m.insert("schema".to_string(), s(schema_term));
     CfmlValue::strukt(m)
+}
+
+#[cfg(test)]
+mod type_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn tinyint1_is_bit_only_when_signed() {
+        // The rows measured against Lucee 7.1.0.204 + Connector/J on MariaDB.
+        assert!(mysql_tinyint1_is_bit("tinyint(1)"));
+        assert!(mysql_tinyint1_is_bit("TINYINT(1)"));
+        // `boolean` is stored as tinyint(1), so it arrives here spelled that way.
+        assert!(mysql_tinyint1_is_bit("tinyint( 1 )"));
+        // The boundary: unsigned keeps its own type, and so does any other width.
+        assert!(!mysql_tinyint1_is_bit("tinyint(1) unsigned"));
+        assert!(!mysql_tinyint1_is_bit("tinyint(4)"));
+        assert!(!mysql_tinyint1_is_bit("tinyint"));
+        assert!(!mysql_tinyint1_is_bit("bit(1)"));
+        assert!(!mysql_tinyint1_is_bit("int(11)"));
+    }
+
+    #[test]
+    fn jdbc_codes_match_lucee() {
+        // Every pair here was read off Lucee 7.1.0.204 for a real column.
+        for (name, code) in [
+            ("BIT", -7),
+            ("TINYINT", -6),
+            ("SMALLINT", 5),
+            ("MEDIUMINT", 4),
+            ("INT", 4),
+            ("BIGINT", -5),
+            ("DECIMAL", 3),
+            ("FLOAT", 7),
+            ("DOUBLE", 8),
+            ("CHAR", 1),
+            ("ENUM", 1),
+            ("VARCHAR", 12),
+            ("TEXT", -1),
+            ("LONGTEXT", -1),
+            ("DATE", 91),
+            ("TIME", 92),
+            ("DATETIME", 93),
+            ("TIMESTAMP", 93),
+            ("BINARY", -2),
+            ("VARBINARY", -3),
+            ("BLOB", -4),
+        ] {
+            assert_eq!(jdbc_type_code(name), code, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_unsigned_variant_keeps_its_base_code() {
+        assert_eq!(jdbc_type_code("INT UNSIGNED"), jdbc_type_code("INT"));
+        assert_eq!(jdbc_type_code("TINYINT UNSIGNED"), jdbc_type_code("TINYINT"));
+        assert_eq!(jdbc_type_code("BIGINT UNSIGNED"), jdbc_type_code("BIGINT"));
+    }
+
+    #[test]
+    fn an_unknown_type_still_reports_types_null() {
+        // 0 is java.sql.Types.NULL — what we used to report for EVERY column.
+        assert_eq!(jdbc_type_code("SOME_VENDOR_TYPE"), 0);
+    }
+
+    #[test]
+    fn temporal_display_sizes_match_lucee() {
+        assert_eq!(mysql_temporal_display_size("DATE"), Some(10));
+        assert_eq!(mysql_temporal_display_size("TIME"), Some(8));
+        assert_eq!(mysql_temporal_display_size("DATETIME"), Some(19));
+        assert_eq!(mysql_temporal_display_size("TIMESTAMP"), Some(19));
+        assert_eq!(mysql_temporal_display_size("YEAR"), Some(4));
+        // A non-temporal type falls through to NUMERIC_PRECISION instead.
+        assert_eq!(mysql_temporal_display_size("INT"), None);
+    }
 }

@@ -3744,3 +3744,95 @@ Pinned by `tests/core/test_param_write_modes.cfm` (12, identical on Lucee
 --workspace` 714/0/5 · wasm32 + wasm-pack · TestBox 415/0/0 +22 · Wheels
 2737/3/0 +16 · Preside boot + 16 admin pages clean.
 
+
+## 111. `imageGetEXIFMetadata()` merges the baseline info keys, but `metadata` is not ImageIO's native tree (GH #389, v0.683.0) 📌
+
+`ImageGetEXIFMetadata()` returned only the raw EXIF IFD tags. Lucee merges the
+image's baseline info keys — `width`, `height`, `source`, `colormodel`,
+`jpeg_color_type`, `metadata` — into the same struct however the image was read,
+so `meta.width` was absent here while `imageInfo()` on the same image reported
+it. Preside's `DocumentMetadataService._parse()` appends this struct and expects
+width/height for every uploaded image. Fixed: the baseline set is merged, and
+tag VALUES are now the RAW ones (`XResolution` = `72`, not "72 pixels per inch";
+`ResolutionUnit` = `2`, not "inch"; an ASCII tag unquoted), which is what Lucee
+reports and what any caller doing arithmetic on a numeric tag needs.
+
+**What is NOT reproduced.** On Lucee the `metadata` key is Java ImageIO's
+NATIVE metadata tree — for a JPEG, the whole marker sequence (`app0JFIF`, `dht`,
+`dqt`, `sof`, `sos`) down to Huffman and quantisation table ids. That tree is a
+property of ImageIO's own decoders. We report the subset we can derive
+truthfully from the decoded image (`Chroma`, `Compression`) and nothing we
+cannot, so the key is always present and always honest but is not key-for-key
+Lucee. Equally not reproduced: the Drew-Noakes-style NAMED tags Lucee's
+file-read path adds (`Image Width`, `Compression Type`, `Number of Tables`, the
+IPTC names), which come from metadata-extractor.
+
+Two deliberate supersets, both strictly more information than Lucee returns:
+
+* On a **base64-read** image Lucee drops the EXIF tags entirely (it has no file
+  for its metadata reader to re-open) and returns the six baseline keys alone.
+  We keep the tags on both paths.
+* Lucee's split of `exif`/`gps` (file-read) versus `metadata` (base64-read) is
+  an artefact of which reader it could run. We emit all three on both paths.
+
+Pinned by `tests/stdlib/test_image_exif_baseline_keys.cfm` (27, identical on
+Lucee 7.1.0.204 — the cross-engine-untestable superset above is called out in
+the file rather than asserted).
+
+## 112. `cfdbinfo type="columns"` on MySQL/MariaDB: `tinyint(1)` is BIT, plus DATA_TYPE and COLUMN_SIZE were never populated (GH #390, #391, v0.683.0) 📌
+
+MySQL Connector/J's `tinyInt1isBit` defaults to TRUE, so a **signed** `TINYINT(1)`
+— which is also how MySQL and MariaDB store `BOOLEAN` — presents as JDBC BIT,
+and Lucee inherits that. We reported `type_name = "tinyint"`, so Preside's
+`PresideObjectService.dbSync()` saw a type change on every boolean column and
+tried to alter it on every sync (#390 is the create path, #391 the alter path;
+specs `test003_dbSync_shouldCreateVariousKindsOfColumnsAndWorkWithInheritance`
+and `test004_dbSync_shouldModifyTables_whenComponentFieldsChange`).
+
+The BOUNDARY was measured, not assumed — this is the half that is easy to get
+wrong. `TINYINT(1) UNSIGNED` stays `TINYINT UNSIGNED` on Lucee (the driver quirk
+is signed-only) and `TINYINT(4)` stays `TINYINT`. Widening the rule to all
+`TINYINT` would turn every small integer column into a boolean.
+
+Two further defects found while measuring, both affecting EVERY MySQL column:
+
+* **`DATA_TYPE` was hardcoded 0** — `java.sql.Types.NULL` — where Lucee reports
+  the JDBC type code. Now mapped: BIT −7, TINYINT −6, SMALLINT 5,
+  INT/MEDIUMINT 4, BIGINT −5, DECIMAL 3, FLOAT 7, DOUBLE 8, CHAR/ENUM 1,
+  VARCHAR 12, TEXT/LONGTEXT/JSON −1, DATE 91, TIME 92, DATETIME/TIMESTAMP 93,
+  BINARY −2, VARBINARY −3, BLOB −4. An `UNSIGNED` variant carries its base
+  type's code.
+* **`COLUMN_SIZE` was 0 for every numeric and temporal column.** Our MySQL
+  driver surfaces a SQL NULL in an information_schema numeric column as an
+  EMPTY STRING, not a typed NULL, so `CHARACTER_MAXIMUM_LENGTH`'s
+  `.parse().unwrap_or(0)` produced a legitimate-looking zero and the
+  `NUMERIC_PRECISION` fallback never ran. The same bug made `DECIMAL_DIGITS` 0
+  on every column; it is now `Option`, since JDBC reports it as NULL where it
+  does not apply.
+
+`DECIMAL_DIGITS` is also the INVERSE of the catalogue: JDBC reports NULL for an
+exact integer type and 0 for an approximate one, where `information_schema`
+stores 0 for INT and NULL for DOUBLE. Lucee reports the JDBC reading.
+
+`type_name` is now UPPERCASE for MySQL, matching Lucee (and the sqlite path,
+which already was). Preside compares case-insensitively.
+
+**Still divergent, not addressed here:** Lucee's `columns` query carries the
+extra JDBC columns `SCOPE_CATALOG`, `SCOPE_SCHEMA`, `SCOPE_TABLE`,
+`SOURCE_DATA_TYPE` and `IS_GENERATEDCOLUMN`, which we do not emit; and
+`<cfdbinfo datasource="#aStructLiteral#">` (an inline datasource definition
+rather than a name) works on Lucee and errors here.
+
+The mapping rules are unit-tested in Rust (`crates/cfml-stdlib/src/dbinfo.rs`,
+`mod type_mapping_tests`), which runs everywhere. The live-driver check is
+`tests/tags/test_dbinfo_mysql_column_types.cfm` (20), gated on
+`RUSTCFML_TEST_MYSQL_DS` like the other MySQL suites; measured against Lucee
+7.1.0.204 + Connector/J on MariaDB 12.1.
+
+While running that suite against a live server, a pre-existing assertion in
+`tests/tags/test_mysql_dml_returning.cfm` failed: it demanded that a plain
+`queryExecute` INSERT return a STRUCT with `recordCount`. No engine does —
+Lucee returns an empty QUERY, and the mutation counters live on `cfquery`'s
+`result` attribute. Since that suite is skipped unless the env var is set,
+nothing had ever run the assertion. Corrected to what it was actually guarding:
+a non-RETURNING statement must not be routed to the row-returning path.

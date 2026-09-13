@@ -77,8 +77,17 @@ if (NOT myskip AND mariadb) {
             [4, "delta"],
             { datasource: mydsn }
         );
-        assertTrue("queryExecute plain INSERT stays on mutation path",
-            isStruct(plain) AND structKeyExists(plain, "recordCount"));
+        // Measured on Lucee 7.1.0.204: a plain INSERT through queryExecute
+        // returns an EMPTY QUERY, not a struct — the mutation counters live on
+        // cfquery's `result` attribute, not on the return value. This assertion
+        // used to demand a struct with `recordCount`, which no engine returns;
+        // it failed whenever RUSTCFML_TEST_MYSQL_DS was set, and since the
+        // suite is skipped without one, nothing ever ran it. What it is
+        // actually guarding is that a non-RETURNING statement does NOT get
+        // routed to the row-returning path, so assert exactly that.
+        assertTrue("queryExecute plain INSERT stays on the mutation path",
+            isQuery(plain));
+        assert("returning no rows", plain.recordCount, 0);
     } catch (any e) {
         assertTrue("MariaDB queryExecute DML RETURNING failed: " & e.message, false);
     }

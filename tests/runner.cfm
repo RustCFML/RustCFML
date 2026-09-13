@@ -336,6 +336,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_lucee_json_date_form.cfm">
 <cf_runtest file="stdlib/test_parse_offset_uses_request_timezone.cfm">
 <cf_runtest file="stdlib/test_refind_scope_all.cfm">
+<cf_runtest file="stdlib/test_image_exif_baseline_keys.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
@@ -601,6 +602,7 @@ include "harness.cfm";
 <!--- that returns rows must use the query path, else the rows are silently lost. --->
 <cf_runtest file="tags/test_mssql_dml_output.cfm">
 <cf_runtest file="tags/test_mysql_dml_returning.cfm">
+<cf_runtest file="tags/test_dbinfo_mysql_column_types.cfm">
 <cf_runtest file="tags/test_db_null_column_empty_string.cfm">
 <cf_runtest file="tags/test_pg_extended_param_binds.cfm">
 <cf_runtest file="tags/test_pg_pool_checkout_validation.cfm">
