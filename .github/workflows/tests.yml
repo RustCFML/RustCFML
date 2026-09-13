@@ -1,0 +1,87 @@
+name: Tests
+
+# CI ran NO tests of any kind until this existed (GH #415): the workflows were
+# deploy-demo, licenses, promote and release, none of which invoke `cargo test`
+# or `tests/runner.cfm`. Everything below is a gate that has caught a real
+# regression at least once, and the ordering of the jobs is deliberate — the
+# cheap ones fail fast.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # NOT redundant with the line above. The wasm members depend on cfml-vm
+      # with default features stripped, and feature unification then strips them
+      # for the whole workspace run — which silently skipped cfml-vm's own
+      # suites. Run that crate on its own defaults too.
+      - name: cargo test -p cfml-vm
+        run: cargo test -p cfml-vm
+
+  cfml:
+    name: CFML suite (CLI + serve)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      # The harness throws on failure, so a non-zero exit is the gate.
+      - name: CLI
+        run: ./target/release/rustcfml tests/runner.cfm
+
+      # Serve mode is a separate gate from the CLI, and production is a separate
+      # gate from dev: the bytecode, freshness and component-path caches all
+      # behave differently there. Each invocation makes TWO consecutive requests
+      # to the SAME process — see the script for why.
+      - name: Serve (dev)
+        run: ./scripts/serve-gate.sh ./target/release/rustcfml 8610
+
+      - name: Serve (production)
+        run: ./scripts/serve-gate.sh ./target/release/rustcfml 8611 --production
+
+  wasm:
+    name: wasm targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # A plain `cargo build` does not compile these — they are wasm32-only, so
+      # host builds skip them and a broken Cloudflare-worker build reaches
+      # downstream consumers with every other gate green (v0.33.0/v0.34.0).
+      - name: cargo build --target wasm32-unknown-unknown
+        run: cargo build -p cfml-worker -p rustcfml-wasm --target wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+
+      # The demo-deploy path. `cargo build --target wasm32` does NOT run
+      # wasm-pack/wasm-bindgen, so it cannot catch a broken demo deploy — which
+      # is exactly how the v0.240.0 wasm-opt SIGSEGV reached the Action.
+      - name: wasm-pack build
+        run: wasm-pack build crates/wasm --target web
