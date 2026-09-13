@@ -3977,7 +3977,12 @@ impl InheritedKeys {
         if self.param_bits == 0 && self.inline_len == 0 && self.other.is_empty() {
             return;
         }
-        let hash = cfml_common::key::fold_hash(k);
+        self.remove_data_hashed(cfml_common::key::fold_hash(k), k);
+    }
+
+    /// `remove_data` with the folded hash already known (an interned key's).
+    #[inline]
+    fn remove_data_hashed(&mut self, hash: u64, k: &str) {
         if let Some(i) = self.param_find(hash, k) {
             self.param_bits &= !(1u64 << i);
             return;
@@ -4022,6 +4027,21 @@ impl InheritedKeys {
             }
         }
         self.remove_data(name);
+    }
+
+    /// [`Self::remove_ci`] from an interned key — same semantics, no hashing.
+    #[inline]
+    fn remove_ci_key(&mut self, k: &cfml_common::key::Key) {
+        let name = k.as_str();
+        for s in Self::STRUCTURAL_NAMES {
+            if s.eq_ignore_ascii_case(name) {
+                self.structural &= !Self::structural_bit(s).unwrap();
+            }
+        }
+        if self.param_bits == 0 && self.inline_len == 0 && self.other.is_empty() {
+            return;
+        }
+        self.remove_data_hashed(k.hash_value(), name);
     }
 
     #[inline]
@@ -4091,6 +4111,16 @@ impl DeclaredLocals {
             .or_insert_with(|| cfml_common::key::Key::new(name));
     }
 
+    /// Insert from an interned key: no `fold_hash` and no `Key::new` allocation
+    /// — the entry is an `Arc` bump of the operand's key. `var x` ran the
+    /// `&str` form (hash + alloc) on every declaration of every frame.
+    #[inline]
+    fn insert_key(&mut self, k: &cfml_common::key::Key) {
+        self.set
+            .entry(k.hash_value(), |e| e == k, cfml_common::key::Key::hash_value)
+            .or_insert_with(|| k.clone());
+    }
+
     #[inline]
     fn contains(&self, name: &str) -> bool {
         if self.set.is_empty() {
@@ -4102,6 +4132,17 @@ impl DeclaredLocals {
                 e.as_str().eq_ignore_ascii_case(name)
             })
             .is_some()
+    }
+
+    /// Probe by an interned key: the hash is already on the `Key`, so this is
+    /// one table probe and no `fold_hash` — the `&str` form copied the name
+    /// into the fold buffer on every `StoreLocal`/`LoadLocal` that reached it.
+    #[inline]
+    fn contains_key(&self, k: &cfml_common::key::Key) -> bool {
+        if self.set.is_empty() {
+            return false;
+        }
+        self.set.find(k.hash_value(), |e| e == k).is_some()
     }
 
     /// Declared names in their original casing. Iteration order is unspecified —
@@ -8041,14 +8082,16 @@ impl CfmlVirtualMachine {
         func: &BytecodeFunction,
         inherited_or_param_keys: &InheritedKeys,
         locals: &ValueMap,
-        name: &str,
+        name: &cfml_common::name::Name,
     ) -> bool {
-        func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
-            && (inherited_or_param_keys.contains(name)
+        // Every probe here is by the interned key: the param test is a hash
+        // compare per parameter and the set/struct probes do no hashing.
+        func.has_param_key(name.key())
+            && (inherited_or_param_keys.contains_key(name.key())
                 || locals
                     .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
                     .and_then(|v| v.as_cfml_struct())
-                    .is_some_and(|a| a.get_ci(name).is_some()))
+                    .is_some_and(|a| a.get(name.key()).is_some()))
     }
 
     /// Does the body REBIND one of its own declared parameters by bare name?
@@ -9295,7 +9338,7 @@ impl CfmlVirtualMachine {
                     let scope_name_shadow_attempt = reserved
                         && ((is_inside_function
                             && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
-                            || declared_locals.contains(name.as_str()));
+                            || declared_locals.contains_key(name.key()));
                     let val = if reserved && name_lower == "local" && frame_has_local_scope {
                         // `local` is strictly per-call (PR #93): only keys
                         // established in THIS frame are visible — inherited
@@ -9737,7 +9780,7 @@ impl CfmlVirtualMachine {
                         // modern-localmode bare write.
                         if is_reference_value(top)
                             && (!effective_local_mode_modern
-                                || !inherited_or_param_keys.contains(name.as_str()))
+                                || !inherited_or_param_keys.contains_key(name.key()))
                         {
                             let held = match op {
                                 BytecodeOp::StoreSlot(i, _) => slots[*i as usize].as_ref(),
@@ -9745,7 +9788,7 @@ impl CfmlVirtualMachine {
                             }
                             .or_else(|| locals.get(name));
                             let routes_to_scope = !effective_local_mode_modern
-                                && !declared_locals.contains(name.as_str())
+                                && !declared_locals.contains_key(name.key())
                                 && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name);
                             let same = match held {
                                 Some(cur) => same_reference(cur, top),
@@ -9793,7 +9836,7 @@ impl CfmlVirtualMachine {
                             continue;
                         }
                         if slot_blocked & (1u64 << idx) == 0
-                            && declared_locals.contains(name.as_str())
+                            && declared_locals.contains_key(name.key())
                         {
                             if !locals.contains_key(name)
                                 && !locals
@@ -9819,7 +9862,7 @@ impl CfmlVirtualMachine {
                     if direct_frame
                         && !effective_local_mode_modern
                         && !name.is_reserved_word()
-                        && !declared_locals.contains(name.as_str())
+                        && !declared_locals.contains_key(name.key())
                         && (locals.len() <= 1 || !locals.contains_key(name))
                         && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
                     {
@@ -9933,7 +9976,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         } else if reserved && name_lower == "variables"
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             // A declared param named after a scope is inherently
                             // local (see the twin guards in the __variables and
                             // LoadLocal arms) — its default-value store must NOT
@@ -10025,7 +10068,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         } else if reserved && name_lower == "request"
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             // Same declared-local guard as `variables`: a user
@@ -10041,7 +10084,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         } else if reserved && name_lower == "application"
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
@@ -10054,7 +10097,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         } else if reserved && name_lower == "session"
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                         {
                             if let CfmlValue::Struct(s) = &val {
@@ -10083,7 +10126,7 @@ impl CfmlVirtualMachine {
                             // after a stray `thread = "s"` was silently dropped.
                         } else if reserved && name_lower == "arguments"
                             && is_inside_function
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                         {
                             // Storing the `arguments` SCOPE (bare `arguments = …`
                             // or an `arguments.x = …` round-trip). A user
@@ -10163,7 +10206,7 @@ impl CfmlVirtualMachine {
                             // the literal "arguments" (which is a user local var).
                             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
                         } else if reserved && Self::is_web_request_scope(&name_lower)
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
                             // Only a SCOPE round-trip commits here. A whole-value
                             // store of something that isn't a struct is not the
@@ -10195,7 +10238,7 @@ impl CfmlVirtualMachine {
                             // genuine `var url` frame-local is guarded out above.
                             self.globals.insert(name_lower.to_string(), val);
                         } else if !effective_local_mode_modern
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             && !locals.contains_key(name)
                             && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
                             && Self::closure_chain_store(&locals, name, &val)
@@ -10204,7 +10247,7 @@ impl CfmlVirtualMachine {
                             // captured name updates the env level that owns it —
                             // the enclosing function's variable — Lucee's closure
                             // scope chain (see `frame_closure_env`). Done.
-                        } else if !declared_locals.contains(name.as_str())
+                        } else if !declared_locals.contains_key(name.key())
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
                             && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
@@ -10234,7 +10277,7 @@ impl CfmlVirtualMachine {
                                 args.insert(name, val);
                             }
                         } else if locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
-                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains_key(name.key())
                             // The engine's own `<cfquery>`/`<cfhttp>` bind-param
                             // accumulator must stay pinned to the frame building
                             // the statement. Its init is an UNSCOPED assignment
@@ -10261,7 +10304,7 @@ impl CfmlVirtualMachine {
                             // That broke every bare `p()` call program-wide once such a
                             // method ran (surfaced as the Wheels `$args` POST-redirect
                             // 500s / the bare-call caller-stack leak suite).
-                            && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                            && !func.has_param_key(name.key())
                         {
                             // CFC method, classic localmode (default): unscoped,
                             // non-local variables go to __variables (the component scope).
@@ -10334,8 +10377,8 @@ impl CfmlVirtualMachine {
                             // original is still there to read.
                             if is_inside_function
                                 && !effective_local_mode_modern
-                                && !declared_locals.contains(name.as_str())
-                                && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                                && !declared_locals.contains_key(name.key())
+                                && func.has_param_key(name.key())
                             {
                                 if let Some(args) =
                                     locals.get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE).and_then(|v| v.as_cfml_struct())
@@ -10372,7 +10415,7 @@ impl CfmlVirtualMachine {
                                 // NOT in declared_locals — force-stripping its captured_scope
                                 // into the env would break its `variables`-scope capture when
                                 // read back (regressed test_include_scope_capture).
-                                let is_own_closure = declared_locals.contains(name.as_str())
+                                let is_own_closure = declared_locals.contains_key(name.key())
                                     && matches!(
                                         &val,
                                         CfmlValue::Function(f)
@@ -13281,7 +13324,7 @@ impl CfmlVirtualMachine {
                     // Direct fast path (see FrameScopeCache): a plain variable behind
                     // the frame's `variables` handle is bumped in place under one
                     // lock instead of probe-miss → closure chain → get + insert.
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             if page_numeric_delta(vars, name, |v| match v {
                                 CfmlValue::Int(i) => CfmlValue::Int(i + 1),
@@ -13300,7 +13343,7 @@ impl CfmlVirtualMachine {
                     if effective_local_mode_modern && is_inside_function {
                         inherited_or_param_keys.remove(name.as_str());
                     }
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             let k = *k;
                             if page_numeric_delta(vars, name, |v| match v {
@@ -13320,7 +13363,7 @@ impl CfmlVirtualMachine {
                     if effective_local_mode_modern && is_inside_function {
                         inherited_or_param_keys.remove(name.as_str());
                     }
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             let k = *k;
                             if page_numeric_delta(vars, name, |v| match v {
@@ -13340,7 +13383,7 @@ impl CfmlVirtualMachine {
                     if effective_local_mode_modern && is_inside_function {
                         inherited_or_param_keys.remove(name.as_str());
                     }
-                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains(name.as_str()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
+                    if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             if page_numeric_delta(vars, name, |v| match v {
                                 CfmlValue::Int(i) => CfmlValue::Int(i - 1),
@@ -14585,9 +14628,9 @@ impl CfmlVirtualMachine {
                     let val = stack.pop().unwrap_or(CfmlValue::Null);
                     if effective_local_mode_modern
                         && is_inside_function
-                        && !declared_locals.contains(name.as_str())
-                        && inherited_or_param_keys.contains(name.as_str())
-                        && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                        && !declared_locals.contains_key(name.key())
+                        && inherited_or_param_keys.contains_key(name.key())
+                        && func.has_param_key(name.key())
                     {
                         if let Some(args) = locals
                             .get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
@@ -24890,7 +24933,14 @@ impl CfmlVirtualMachine {
         declared: &str,
         value: &CfmlValue,
     ) -> Result<(), CfmlError> {
-        if matches!(value, CfmlValue::Null) || type_check::is_unchecked(declared) {
+        if matches!(value, CfmlValue::Null) {
+            return Ok(());
+        }
+        // Resolve the declared type ONCE: `is_unchecked` + `satisfies` each
+        // re-parsed it (two trims and keyword matches per check, ~12.6k checks
+        // on a Preside admin render).
+        let target = type_check::resolve(declared);
+        if matches!(target, type_check::Target::Any) {
             return Ok(());
         }
         let constructing = self.constructing_type_names();
@@ -24898,7 +24948,7 @@ impl CfmlVirtualMachine {
             Self::value_satisfies_component_type_in_ctor(v, t, &constructing)
         };
         let env = Self::type_check_env(self.is_valid_builtin(), &satisfies);
-        if type_check::satisfies(value, declared, &env) {
+        if type_check::satisfies_target(value, target, declared, &env) {
             return Ok(());
         }
         Err(self.wrap_error(CfmlError::expression(format!(
@@ -24964,7 +25014,11 @@ impl CfmlVirtualMachine {
         if func.is_generated_accessor {
             return Ok(value);
         }
-        if matches!(value, CfmlValue::Null) || type_check::is_unchecked(declared) {
+        if matches!(value, CfmlValue::Null) {
+            return Ok(value);
+        }
+        let target = type_check::resolve(declared);
+        if matches!(target, type_check::Target::Any) {
             return Ok(value);
         }
         let constructing = self.constructing_type_names();
@@ -24972,7 +25026,7 @@ impl CfmlVirtualMachine {
             Self::value_satisfies_component_type_in_ctor(v, t, &constructing)
         };
         let env = Self::type_check_env(self.is_valid_builtin(), &satisfies);
-        if type_check::satisfies(&value, declared, &env) {
+        if type_check::satisfies_target(&value, target, declared, &env) {
             return Ok(value);
         }
         let cast = format!(
@@ -25484,7 +25538,7 @@ impl CfmlVirtualMachine {
     ) -> ValueMap {
         let mut out = ValueMap::default();
         for (k, v) in locals {
-            if inherited_or_param_keys.contains(k) {
+            if inherited_or_param_keys.contains_key(k) {
                 continue;
             }
             // `this`/`super`/the `arguments` scope (ARGUMENTS_SCOPE_KEY) and
@@ -32855,10 +32909,10 @@ impl CfmlVirtualMachine {
     /// NB (Slice 3 scope): `super.` dispatch, strict external access gating, and
     /// stale-gid healing for cross-request-cached instances are Slice 5.
     #[cfg(feature = "component-instance")]
-    fn call_instance_method(
+    fn call_instance_method<K: cfml_common::dynamic::ProbeKey + ?Sized>(
         &mut self,
         inst: &cfml_common::component::InstanceRef,
-        method: &str,
+        method: &K,
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
         caller: DispatchCaller<'_>,
@@ -32887,7 +32941,7 @@ impl CfmlVirtualMachine {
                     self.template_frame_begin();
                     let r = self
                         .call_instance_method_impl(inst, method, extra_args, arg_names, caller);
-                    self.template_frame_end(&src, Some(method), start.elapsed().as_micros() as i64);
+                    self.template_frame_end(&src, Some(method.probe().text()), start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
@@ -32896,14 +32950,19 @@ impl CfmlVirtualMachine {
     }
 
     #[cfg(feature = "component-instance")]
-    fn call_instance_method_impl(
+    fn call_instance_method_impl<K: cfml_common::dynamic::ProbeKey + ?Sized>(
         &mut self,
         inst: &cfml_common::component::InstanceRef,
-        method: &str,
+        method: &K,
         extra_args: &mut Vec<CfmlValue>,
         arg_names: Option<&[String]>,
         caller: DispatchCaller<'_>,
     ) -> CfmlResult {
+        // The probe form of the name for the table lookups (hash-free when the
+        // caller passed the bytecode's interned `Name`), and its text for
+        // everything else.
+        let method_key = method.probe();
+        let method: &str = method_key.text();
         let object = CfmlValue::Instance(inst.clone());
 
         // Snapshot the handles we need, then DROP the read lock before any
@@ -32914,7 +32973,7 @@ impl CfmlVirtualMachine {
         let (func, variables_scope, this_members, variables_members, static_scope) = {
             let g = inst.read();
             (
-                g.lookup_method(method),
+                g.lookup_method(method_key),
                 CfmlValue::Struct(g.private_map_handle()),
                 g.public_map_handle(),
                 g.private_map_handle(),

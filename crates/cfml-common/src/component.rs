@@ -735,13 +735,18 @@ impl Instance {
     /// Resolve a callable method: an injected/mixin data-member function (public
     /// then private) shadows the shared blueprint table, exactly as `get_ci`'s
     /// map-before-table order gives us for free.
-    pub fn lookup_method(&self, name: &str) -> Option<CfmlValue> {
+    ///
+    /// Takes any probe key: the hot dispatch site passes the bytecode's interned
+    /// `Name`, so neither probe hashes; a `&str` caller folds the name ONCE for
+    /// both probes (it used to fold per probe).
+    pub fn lookup_method(&self, name: impl crate::dynamic::ProbeKey) -> Option<CfmlValue> {
+        let k = name.probe();
         self.this_members
-            .get_ci(name)
+            .get_ci(k)
             .filter(|v| matches!(v, CfmlValue::Function(_)))
             .or_else(|| {
                 self.variables_members
-                    .get_ci(name)
+                    .get_ci(k)
                     .filter(|v| matches!(v, CfmlValue::Function(_)))
             })
     }

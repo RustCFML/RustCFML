@@ -135,7 +135,7 @@ pub(crate) fn op_declare_local(
     // the casing the CALLER seeded the key under. That third casing is the one
     // the old two-entry `HashSet<String>` could not cover, and is why
     // `var fileName` used to overwrite a caller's `filename`.
-    declared_locals.insert(name.as_str());
+    declared_locals.insert_key(name.key());
     // PR #93: a `var x` / `local.x` declaration RECLAIMS the
     // name into THIS frame's `local` scope, shadowing any
     // same-named key inherited from the caller. Removing it
@@ -152,7 +152,7 @@ pub(crate) fn op_declare_local(
     // filtered the write straight back out — the local assignment
     // was silently lost. Drop every CI-matching entry.
     // remove_ci covers the exact match and every CI casing (GH #243).
-    inherited_or_param_keys.remove_ci(name.as_str());
+    inherited_or_param_keys.remove_ci_key(name.key());
 }
 
 /// `ValidateParamType`
@@ -173,8 +173,7 @@ pub(crate) fn op_validate_param_type(
         (func.params.get(index), func.param_types.get(index))
     {
         let value = locals.get(name).cloned().unwrap_or(CfmlValue::Null);
-        let ptype = ptype.clone();
-        vm.check_declared_param_type(func, index, name, &ptype, &value)?;
+        vm.check_declared_param_type(func, index, name, ptype, &value)?;
     }
     Ok(())
 }
@@ -209,7 +208,7 @@ pub(crate) fn op_jump_if_arg_present(
         // null entry for every declared-but-omitted parameter (Lucee 7.1 shape —
         // see the binding loop's `None` arm), so a bare `contains_key` would
         // report every omitted param as supplied and no default would ever apply.
-        Some(CfmlValue::Struct(a)) => !matches!(a.get_ci(name.as_str()), None | Some(CfmlValue::Null)),
+        Some(CfmlValue::Struct(a)) => !matches!(a.get_ci(name.key()), None | Some(CfmlValue::Null)),
         _ => {
             // Bit per declared-param index (see `arguments_supplied_bits` in
             // the prologue); the set only holds indices 64 and up.
@@ -685,8 +684,8 @@ pub(crate) fn op_load_local_key(
     // it was established in THIS frame — inherited/param keys,
     // `this`/`super`, and `__`-prefixed bridge keys are invisible.
     // A miss yields Null, matching GetProperty on the view struct.
-    let is_visible = |k: &str| {
-        !inherited_or_param_keys.contains(k)
+    let is_visible = |k: &cfml_common::key::Key| {
+        !inherited_or_param_keys.contains_key(k)
             && k != "this"
             && k != "super"
             && !k.starts_with("__")
@@ -858,12 +857,12 @@ pub(crate) fn op_array_append_local(
     // StoreLocal routes a plain identifier.
     let val = CfmlValue::array(vec![value]);
     if locals.contains_key(&*cfml_common::key::well_known::VARIABLES)
-        && !declared_locals.contains(name.as_str())
+        && !declared_locals.contains_key(name.key())
         && !locals.contains_key(name)
         && !effective_local_mode_modern
         // A declared parameter is local, never the component scope —
         // see the matching guard in StoreLocal above.
-        && !func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+        && !func.has_param_key(name.key())
     {
         // CFC method, classic localmode: component (variables) scope.
         if let Some(vars) =
@@ -874,8 +873,8 @@ pub(crate) fn op_array_append_local(
     } else {
         locals.insert(name, val.clone());
         if is_inside_function
-            && !declared_locals.contains(name.as_str())
-            && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+            && !declared_locals.contains_key(name.key())
+            && func.has_param_key(name.key())
         {
             if let Some(args) =
                 locals.get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE).and_then(|v| v.as_cfml_struct())

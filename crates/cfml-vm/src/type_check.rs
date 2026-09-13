@@ -34,7 +34,7 @@
 use cfml_common::dynamic::CfmlValue;
 
 /// A declared type resolved to the cast target Lucee would use.
-enum Target<'a> {
+pub enum Target<'a> {
     /// `any` / undeclared — never checked.
     Any,
     Str,
@@ -62,7 +62,7 @@ enum Target<'a> {
     ComponentPath,
 }
 
-fn resolve<'a>(declared: &'a str) -> Target<'a> {
+pub fn resolve<'a>(declared: &'a str) -> Target<'a> {
     let t = declared.trim();
     if let Some(inner) = t.strip_suffix("[]") {
         return Target::TypedArray(inner);
@@ -294,6 +294,12 @@ impl Env<'_> {
 /// filters those out before asking (an omitted argument, or a function that
 /// falls off its end without returning).
 pub fn satisfies(value: &CfmlValue, declared: &str, env: &Env<'_>) -> bool {
+    satisfies_target(value, resolve(declared), declared, env)
+}
+
+/// [`satisfies`] with the declared type already resolved by the caller (the
+/// call path resolves once and tests `Target::Any` itself).
+pub fn satisfies_target(value: &CfmlValue, target: Target<'_>, declared: &str, env: &Env<'_>) -> bool {
     // `q.col` is a `QueryColumn` — a PROXY that stands in for its current row's
     // value, not a collection. Lucee agrees: `isArray(q.col)` is false, and
     // every scalar context here (comparison, coercion, `Len`) already treats it
@@ -304,7 +310,6 @@ pub fn satisfies(value: &CfmlValue, declared: &str, env: &Env<'_>) -> bool {
     //
     // Resolved for every target EXCEPT `array`, which keeps accepting the raw
     // QueryColumn as it always did, so nothing that passed before now fails.
-    let target = resolve(declared);
     let value = match &target {
         Target::Array => value,
         _ => value.query_column_scalar(),

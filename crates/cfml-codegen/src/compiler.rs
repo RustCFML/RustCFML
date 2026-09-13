@@ -181,6 +181,15 @@ impl BytecodeFunction {
         self.param_keys_arc()
     }
 
+    /// Is `k` one of this function's declared parameters? Compares through the
+    /// interned keys — a u64 hash test per parameter, no case folding of the
+    /// probe — where `params.iter().any(eq_ignore_ascii_case)` folded the name
+    /// against every parameter on every call.
+    #[inline]
+    pub fn has_param_key(&self, k: &cfml_common::key::Key) -> bool {
+        self.param_keys().iter().any(|p| p == k)
+    }
+
     /// The function's name as a shared string (see `name_shared`).
     #[inline]
     pub fn name_arc(&self) -> std::sync::Arc<str> {

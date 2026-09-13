@@ -6402,10 +6402,57 @@ fn json_escape_str(s: &str) -> String {
 }
 
 fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) -> String {
+    let mut out = String::new();
+    write_json_value(val, &mut out, visited, by_columns);
+    out
+}
+
+/// Append `s` to `out` as a JSON string literal — the same escaping as
+/// [`json_escape_str`], written straight into the output buffer.
+fn write_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    // Fast path: nothing to escape, one memcpy.
+    if !s.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+        out.push_str(s);
+    } else {
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0C}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+    }
+    out.push('"');
+}
+
+/// Serialize a value to JSON into `out`. One growing buffer for the whole
+/// document: the previous shape built a `String` per scalar and per key
+/// (`format!("\"{}\":{}", …)`), collected them into a `Vec<String>` per
+/// container and `join`ed — several allocations per member, which on a
+/// Preside admin render (serializeJSON is on the request path) was ~2.3% of
+/// CPU, almost all of it in the allocator's fresh-page path.
+///
+/// `visited` tracks the backing-Arc pointers of the containers on the recursion
+/// path: reference-typed arrays/structs (and components) can alias and form
+/// cycles — e.g. a TestBox mock holds `this.mockBox`, whose generator holds the
+/// mock back. Without the guard such a cycle recurses until the native stack
+/// overflows and aborts the process. On revisiting a container we emit `null`.
+fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>, by_columns: bool) {
+    use std::fmt::Write as _;
     // Phase C.3 — Slice 4: a flyweight instance serializes its public DATA members
     // directly (no methods, no `__` filter — the data map is already clean, so
     // user `__`/`___` keys serialize like any other). `is_instance_backed()` is
-    // const `false` in a default build, leaving the marker path (serialize_struct)
+    // const `false` in a default build, leaving the marker path (write_json_struct)
     // untouched.
     if let Some(comp) = val.as_component() {
         if comp.is_instance_backed() {
@@ -6418,55 +6465,75 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
             let id = comp.instance_identity_ptr();
             if let Some(p) = id {
                 if visited.contains(&p) {
-                    return "null".to_string();
+                    out.push_str("null");
+                    return;
                 }
                 visited.push(p);
             }
             let data = comp.instance_serialize_data();
-            let items: Vec<String> = data
-                .iter()
-                .filter(|(_, v)| !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_)))
-                .map(|(k, v)| {
-                    format!(
-                        "\"{}\":{}",
-                        json_escape_str(k),
-                        serialize_value(v, visited, by_columns)
-                    )
-                })
-                .collect();
+            out.push('{');
+            let mut first = true;
+            for (k, v) in data.iter() {
+                if matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_)) {
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                write_json_str(out, k);
+                out.push(':');
+                write_json_value(v, out, visited, by_columns);
+            }
+            out.push('}');
             if id.is_some() {
                 visited.pop();
             }
-            return format!("{{{}}}", items.join(","));
+            return;
         }
     }
     match val {
-        CfmlValue::Null => "null".to_string(),
-        CfmlValue::Bool(b) => b.to_string(),
-        CfmlValue::Int(i) => i.to_string(),
-        CfmlValue::Double(d) => d.to_string(),
+        CfmlValue::Null => out.push_str("null"),
+        CfmlValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        CfmlValue::Int(i) => {
+            let _ = write!(out, "{}", i);
+        }
+        CfmlValue::Double(d) => {
+            let _ = write!(out, "{}", d);
+        }
         // A timespan serializes as its numeric (fractional-day) value, like Lucee.
-        CfmlValue::TimeSpan(d) => d.to_string(),
-        CfmlValue::String(s) => format!("\"{}\"", json_escape_str(s)),
+        CfmlValue::TimeSpan(d) => {
+            let _ = write!(out, "{}", d);
+        }
+        CfmlValue::String(s) => write_json_str(out, s),
         CfmlValue::Array(arr) => {
             let ptr = arr.backing_ptr();
             if visited.contains(&ptr) {
-                return "null".to_string();
+                out.push_str("null");
+                return;
             }
             visited.push(ptr);
-            let items: Vec<String> = arr.iter().map(|v| serialize_value(&v, visited, by_columns)).collect();
+            out.push('[');
+            let mut first = true;
+            for v in arr.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                write_json_value(&v, out, visited, by_columns);
+            }
+            out.push(']');
             visited.pop();
-            format!("[{}]", items.join(","))
         }
         CfmlValue::Struct(s) => {
             let ptr = s.backing_ptr();
             if visited.contains(&ptr) {
-                return "null".to_string();
+                out.push_str("null");
+                return;
             }
             visited.push(ptr);
-            let out = serialize_struct(s, visited, by_columns);
+            write_json_struct(s, out, visited, by_columns);
             visited.pop();
-            out
         }
         CfmlValue::Query(q) => {
             // Lucee/ACF serialize a query to a {COLUMNS, DATA} envelope (NOT an
@@ -6478,37 +6545,53 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
             // Lucee 6. See GH #231's sibling, GH #232.
             q.with_read(|d| {
                 let row_count = d.row_count();
-                let columns: Vec<String> = d
-                    .columns
-                    .iter()
-                    .map(|c| format!("\"{}\"", json_escape_str(c)))
-                    .collect();
-                let columns_json = format!("[{}]", columns.join(","));
+                let write_columns = |out: &mut String| {
+                    out.push('[');
+                    for (i, c) in d.columns.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        write_json_str(out, c);
+                    }
+                    out.push(']');
+                };
                 if by_columns {
-                    let cols: Vec<String> = d.columns.iter().enumerate().map(|(ci, col)| {
-                        let vals: Vec<String> = (0..row_count)
-                            .map(|r| serialize_value(&d.data[ci][r], visited, by_columns))
-                            .collect();
-                        format!("\"{}\":[{}]", json_escape_str(&col.to_uppercase()), vals.join(","))
-                    }).collect();
-                    format!(
-                        "{{\"ROWCOUNT\":{},\"COLUMNS\":{},\"DATA\":{{{}}}}}",
-                        row_count,
-                        columns_json,
-                        cols.join(",")
-                    )
+                    let _ = write!(out, "{{\"ROWCOUNT\":{},\"COLUMNS\":", row_count);
+                    write_columns(out);
+                    out.push_str(",\"DATA\":{");
+                    for (ci, col) in d.columns.iter().enumerate() {
+                        if ci > 0 {
+                            out.push(',');
+                        }
+                        write_json_str(out, &col.to_uppercase());
+                        out.push_str(":[");
+                        for r in 0..row_count {
+                            if r > 0 {
+                                out.push(',');
+                            }
+                            write_json_value(&d.data[ci][r], out, visited, by_columns);
+                        }
+                        out.push(']');
+                    }
+                    out.push_str("}}");
                 } else {
-                    let rows: Vec<String> = (0..row_count).map(|r| {
-                        let fields: Vec<String> = d.columns.iter().enumerate()
-                            .map(|(ci, _)| serialize_value(&d.data[ci][r], visited, by_columns))
-                            .collect();
-                        format!("[{}]", fields.join(","))
-                    }).collect();
-                    format!(
-                        "{{\"COLUMNS\":{},\"DATA\":[{}]}}",
-                        columns_json,
-                        rows.join(",")
-                    )
+                    out.push_str("{\"COLUMNS\":");
+                    write_columns(out);
+                    out.push_str(",\"DATA\":[");
+                    for r in 0..row_count {
+                        if r > 0 {
+                            out.push(',');
+                        }
+                        out.push('[');
+                        for ci in 0..d.columns.len() {
+                            if ci > 0 {
+                                out.push(',');
+                            }
+                            write_json_value(&d.data[ci][r], out, visited, by_columns);
+                        }
+                        out.push(']');
+                    }
+                    out.push_str("]}");
                 }
             })
         }
@@ -6519,14 +6602,14 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
             // expose a Serializable method on their CfmlNative implementation.
             let name = obj.read().map(|g| g.class_name().to_string())
                 .unwrap_or_else(|_| "poisoned".to_string());
-            format!("\"<NativeObject:{}>\"", json_escape_str(&name))
+            write_json_str(out, &format!("<NativeObject:{}>", name));
         }
         CfmlValue::QueryColumn(..) => {
             // A bare query-column access (q.col) is a proxy standing in for its
             // first-row scalar in scalar contexts. Serializing a struct/array
             // holding a query cell must emit the value, not drop it to null
             // (Lucee/ACF/BoxLang treat a query cell as a simple value).
-            serialize_value(val.query_column_scalar(), visited, by_columns)
+            write_json_value(val.query_column_scalar(), out, visited, by_columns)
         }
         // Binary serializes to its base64 text, like Lucee (GH #359). This used
         // to fall into the `null` arm below, so a struct carrying binary lost
@@ -6534,12 +6617,16 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) 
         // thrown — a silent data loss through a cache write or an API response.
         // base64 is also the shape that recovers:
         // `binaryDecode( deserializeJSON( json ), "base64" )` returns the bytes.
-        CfmlValue::Binary(b) => format!("\"{}\"", base64_encode_bytes(b)),
-        _ => "null".to_string(),
+        CfmlValue::Binary(b) => {
+            out.push('"');
+            out.push_str(&base64_encode_bytes(b));
+            out.push('"');
+        }
+        _ => out.push_str("null"),
     }
 }
 
-fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) -> String {
+fn write_json_struct(s: &CfmlStruct, out: &mut String, visited: &mut Vec<usize>, by_columns: bool) {
     // A struct carrying CFC instance markers (`__variables` plus a
     // `this`/`__name` marker) is a component instance — this engine
     // materialises CFCs as marker-bearing structs. Lucee/ACF serialize
@@ -6553,29 +6640,35 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) 
     // must too, or a struct built via structAppend(s, arguments) leaks
     // them into the JSON (Lucee has no such keys).
     let is_args = s.contains_key("__arguments_scope");
-    let mut items: Vec<String> = s
-        .iter()
-        .filter(|(k, _)| k.as_str() != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER)
-        .filter(|(k, _)| {
-            !is_args
-                || (k.as_str() != "__arguments_scope"
-                    && k.as_str() != "__arguments_params")
-        })
-        .filter(|(k, v)| {
-            if !is_cfc {
-                return true;
-            }
+    out.push('{');
+    let mut first = true;
+    for (k, v) in s.iter() {
+        if k.as_str() == cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER {
+            continue;
+        }
+        if is_args
+            && (k.as_str() == "__arguments_scope" || k.as_str() == "__arguments_params")
+        {
+            continue;
+        }
+        if is_cfc {
             // Only EXACT engine-reserved keys are hidden; user/framework `__`/`___`
             // public data (FW/1 AOP `___orig`) is real data Lucee serializes.
-            if cfml_common::component::is_reserved_component_key(k)
+            if cfml_common::component::is_reserved_component_key(&k)
                 || k.eq_ignore_ascii_case("this")
+                || matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
             {
-                return false;
+                continue;
             }
-            !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
-        })
-        .map(|(k, v)| format!("\"{}\":{}", json_escape_str(&k), serialize_value(&v, visited, by_columns)))
-        .collect();
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write_json_str(out, &k);
+        out.push(':');
+        write_json_value(&v, out, visited, by_columns);
+    }
 
     // For a CFC, accessor-`property` values that were never written to the
     // top-level `this` scope live only in the private `variables` backing — this
@@ -6604,16 +6697,18 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>, by_columns: bool) 
                     if matches!(pv, CfmlValue::Function(_) | CfmlValue::Closure(_)) {
                         continue;
                     }
-                    items.push(format!(
-                        "\"{}\":{}",
-                        json_escape_str(&pname),
-                        serialize_value(&pv, visited, by_columns)
-                    ));
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    write_json_str(out, &pname);
+                    out.push(':');
+                    write_json_value(&pv, out, visited, by_columns);
                 }
             }
         }
     }
-    format!("{{{}}}", items.join(","))
+    out.push('}');
 }
 
 /// `Serialize(value)` — Lucee/ACF CFML-literal serialisation. Produces a string

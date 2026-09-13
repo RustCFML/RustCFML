@@ -145,6 +145,38 @@ thread_local! {
     static OLD_SET: RefCell<PtrSet> = RefCell::new(PtrSet::default());
     /// Old-generation size at which the next sweep is a major one.
     static NEXT_MAJOR: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// A drained log's buffer, kept for the next log on this thread. Every
+    /// request began with `Some(Vec::new())` and every minor sweep left a
+    /// zero-capacity `Vec` behind, so the log regrew by doubling through its
+    /// ~8k pushes on every Preside render — the largest steady-state source of
+    /// fresh mimalloc pages in the warm profile (~2.7%), for a buffer whose
+    /// size is the same request after request. Bounded by `SPARE_CAP`.
+    static SPARE_LOG: RefCell<Vec<TrackedAlloc>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Largest buffer `SPARE_LOG` keeps between requests (entries, 16 bytes each):
+/// a pathological request must not pin its log's memory on the worker forever.
+const SPARE_CAP: usize = 1 << 20;
+
+/// A cleared buffer for a new log: the thread's spare if it has one, else empty.
+#[inline]
+fn fresh_log() -> Vec<TrackedAlloc> {
+    SPARE_LOG.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Return a drained log's buffer for reuse (the larger of it and the current spare).
+#[inline]
+fn recycle_log(mut v: Vec<TrackedAlloc>) {
+    v.clear();
+    if v.capacity() == 0 || v.capacity() > SPARE_CAP {
+        return;
+    }
+    SPARE_LOG.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.capacity() < v.capacity() {
+            *s = v;
+        }
+    });
 }
 
 /// Drain BOTH generations of this thread's log into one vector (young first),
@@ -206,7 +238,7 @@ fn log_cap() -> usize {
 /// Begin logging allocations for a request. Call at the very top of a top-level
 /// request execution (serve mode only).
 pub fn enable() {
-    ALLOC_LOG.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    ALLOC_LOG.with(|c| *c.borrow_mut() = Some(fresh_log()));
     ALLOC_TOTAL.with(|n| n.set(0));
     OLD_LOG.with(|c| c.borrow_mut().clear());
     OLD_SET.with(|c| c.borrow_mut().clear());
@@ -1147,7 +1179,7 @@ pub fn collect_incremental() -> usize {
     let young = ALLOC_LOG.with(|c| {
         let mut b = c.borrow_mut();
         match b.as_mut() {
-            Some(v) if v.len() >= budget => Some(std::mem::take(v)),
+            Some(v) if v.len() >= budget => Some(std::mem::replace(v, fresh_log())),
             _ => None,
         }
     });
@@ -1627,16 +1659,17 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
 }
 
 fn collect_from_log_carrying(
-    log: Vec<TrackedAlloc>,
+    mut log: Vec<TrackedAlloc>,
     carry: Option<&mut Vec<(usize, TrackedAlloc)>>,
 ) -> usize {
     if log.is_empty() {
+        recycle_log(log);
         return 0;
     }
 
     // 1. Upgrade survivors; one strong probe handle per distinct backing.
     let mut nodes: PtrMap<NodeHandle> = PtrMap::with_capacity_and_hasher(log.len(), Default::default());
-    for t in log {
+    for t in log.drain(..) {
         match t {
             TrackedAlloc::Struct(w) => {
                 if let Some(a) = w.upgrade() {
@@ -1676,6 +1709,7 @@ fn collect_from_log_carrying(
             }
         }
     }
+    recycle_log(log);
     if nodes.is_empty() {
         return 0;
     }
