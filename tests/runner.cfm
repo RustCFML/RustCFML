@@ -526,6 +526,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_control.cfm">
 <cf_runtest file="tags/test_tags_include.cfm">
 <cf_runtest file="tags/test_cookie_scope_write_sets_header.cfm">
+<cf_runtest file="tags/test_cfhttp_repeated_response_headers.cfm">
 <cf_runtest file="tags/test_cfinclude_css.cfm">
 <cf_runtest file="tags/test_tags_cffunction_hoisting.cfm">
 <cf_runtest file="tags/test_tags_cfargument_namespaced_attr.cfm">

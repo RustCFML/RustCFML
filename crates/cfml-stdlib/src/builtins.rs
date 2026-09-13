@@ -9632,6 +9632,46 @@ static HTTP_AGENT_NO_REDIRECT: Lazy<ureq::Agent> = Lazy::new(|| {
 /// Read a response body either as decoded text or as raw bytes. Decoding bytes
 /// through `into_string()` would corrupt non-UTF-8 payloads (images, etc.).
 #[cfg(feature = "http")]
+/// Collect a cfhttp response's headers.
+///
+/// Returns the `responseHeader` struct plus the raw status+header lines.
+///
+/// A header name may legitimately repeat — `Set-Cookie`, `Link`, `Vary`,
+/// `WWW-Authenticate`. `ureq`'s `header()` yields only the FIRST value, so a
+/// page setting two cookies showed the caller one and silently dropped the
+/// other (GH #424). Lucee surfaces repeats as an ARRAY under the single key and
+/// keeps a scalar when there is only one — measured on 7.1.0.204: two `X-Multi`
+/// headers give an array of 2, one `X-Single` gives a scalar — which is what
+/// this reproduces. Shared by the success and error-status branches so the two
+/// cannot drift.
+fn cfhttp_collect_headers(
+    resp: &ureq::Response,
+    http_version: &str,
+    status: u16,
+    status_text: &str,
+) -> (ValueMap, Vec<String>) {
+    let mut headers: ValueMap = ValueMap::default();
+    let mut raw = vec![format!("HTTP/{} {} {}", http_version, status, status_text)];
+    for name in resp.headers_names() {
+        let all = resp.all(&name);
+        for v in &all {
+            raw.push(format!("{}: {}", name, v));
+        }
+        match all.len() {
+            0 => {}
+            1 => {
+                headers.insert(name, CfmlValue::string(all[0].to_string()));
+            }
+            _ => {
+                let vals: Vec<CfmlValue> =
+                    all.iter().map(|v| CfmlValue::string(v.to_string())).collect();
+                headers.insert(name, CfmlValue::array(vals));
+            }
+        }
+    }
+    (headers, raw)
+}
+
 fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> CfmlValue {
     if !get_as_binary {
         return CfmlValue::string(resp.into_string().unwrap_or_default());
@@ -10036,12 +10076,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let http_version = resp.http_version().to_string();
             let content_type = resp.content_type().to_string();
 
-            let mut resp_headers: ValueMap = ValueMap::default();
-            for name in resp.headers_names() {
-                if let Some(val) = resp.header(&name) {
-                    resp_headers.insert(name, CfmlValue::string(val.to_string()));
-                }
-            }
+            let (mut resp_headers, raw_header_lines) =
+                cfhttp_collect_headers(&resp, &http_version, status, &status_text);
             // ACF/Lucee inject the status into responseHeader itself (numeric
             // status_code + explanation), alongside the real HTTP headers. Lots
             // of CFML reads result.responseHeader.status_code (e.g. Preside's
@@ -10073,6 +10109,13 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             result_struct.insert("mimeType".to_string(), CfmlValue::string(mime));
             result_struct.insert("charset".to_string(), CfmlValue::string(charset));
             result_struct.insert("responseHeader".to_string(), CfmlValue::strukt(resp_headers));
+            // The raw status line plus every header line, repeats included.
+            // Lucee provides this and callers reach for it precisely when a
+            // header repeats; we had no `header` key at all (GH #424).
+            result_struct.insert(
+                "header".to_string(),
+                CfmlValue::string(raw_header_lines.join("\r\n")),
+            );
             result_struct.insert("errorDetail".to_string(), CfmlValue::string(String::new()));
             result_struct.insert("HTTP_Version".to_string(), CfmlValue::string(http_version));
         }
@@ -10089,12 +10132,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let http_version = resp.http_version().to_string();
             let content_type = resp.content_type().to_string();
 
-            let mut resp_headers: ValueMap = ValueMap::default();
-            for name in resp.headers_names() {
-                if let Some(val) = resp.header(&name) {
-                    resp_headers.insert(name, CfmlValue::string(val.to_string()));
-                }
-            }
+            let (mut resp_headers, raw_header_lines) =
+                cfhttp_collect_headers(&resp, &http_version, code, &status_text);
             // Match ACF/Lucee: status also lives inside responseHeader (see the
             // success branch above).
             resp_headers.insert("status_code".to_string(), CfmlValue::Int(code as i64));
@@ -10111,6 +10150,13 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             result_struct.insert("mimeType".to_string(), CfmlValue::string(mime));
             result_struct.insert("charset".to_string(), CfmlValue::string(charset));
             result_struct.insert("responseHeader".to_string(), CfmlValue::strukt(resp_headers));
+            // The raw status line plus every header line, repeats included.
+            // Lucee provides this and callers reach for it precisely when a
+            // header repeats; we had no `header` key at all (GH #424).
+            result_struct.insert(
+                "header".to_string(),
+                CfmlValue::string(raw_header_lines.join("\r\n")),
+            );
             result_struct.insert("errorDetail".to_string(), CfmlValue::string(String::new()));
             result_struct.insert("HTTP_Version".to_string(), CfmlValue::string(http_version));
         }

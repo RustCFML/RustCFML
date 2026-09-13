@@ -21,13 +21,15 @@ assertTrue("struct write is present in the scope", structKeyExists(cookie, "stru
 port = structKeyExists(cgi, "server_port") ? cgi.server_port : "";
 if (len(port) && port != "0") {
 	http result="r" url="http://127.0.0.1:#port#/tests/tags/cookie_scope_target.cfm" method="get";
-	// `responseHeader` keeps only ONE entry per header name, so repeated
-	// Set-Cookie values collapse and only the first is visible there. The raw
-	// `header` string carries every line, which is what these assertions need.
+	// Repeated Set-Cookie headers come back as an array under the one key, and
+	// the raw `header` string carries every line (GH #424) — so both cookies
+	// this target sets are visible here.
 	headerText = (structKeyExists(r, "header") ? r.header : "")
 		& (isStruct(r.responseHeader) ? serializeJSON(r.responseHeader) : "");
 
-	assertTrue("a cookie-scope write emits Set-Cookie",
+	assertTrue("a scalar cookie-scope write emits Set-Cookie",
+		findNoCase("scopescalar", headerText) GT 0);
+	assertTrue("a struct cookie-scope write emits Set-Cookie",
 		findNoCase("scopestruct", headerText) GT 0);
 	// expires="never" must produce an Expires attribute — without it the cookie
 	// dies with the browser session, which is the visible half of the bug.
