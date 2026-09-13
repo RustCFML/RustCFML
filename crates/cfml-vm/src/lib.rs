@@ -4276,6 +4276,16 @@ impl FrameScopeCache {
         self.blocked = has_marker || extras;
     }
 
+    /// The frame's `variables` handle whatever its shape (a blocked frame
+    /// included) — what `locals.get(__variables)` answers, off the cache.
+    #[inline]
+    fn vars_handle(&mut self, locals: &ValueMap, params: &[String]) -> Option<&CfmlStruct> {
+        if !self.valid || self.version != locals.version() {
+            self.refresh(locals, params);
+        }
+        self.vars.as_ref()
+    }
+
     /// The `variables` handle a plain name may be resolved or stored through
     /// directly; `None` when this frame's shape needs the generic path.
     #[inline]
@@ -8460,11 +8470,16 @@ impl CfmlVirtualMachine {
         // pushed to frame_ctx so a bare call from this frame knows which
         // of its keys are lexical/page scope (propagate) vs its own locals.
         let mut inherited_from_parent = InheritedKeys::default();
+        // Whether the seed installed a closure-env carrier (see `direct_frame`):
+        // answered by the seed loops themselves, not by probing `locals` for it
+        // afterwards. The carrier is only ever inserted at seed time.
+        let mut seeded_env_marker = false;
         if instance_frame {
             // What the fused merge below would have recorded for these keys.
             for k in locals.keys() {
                 inherited_or_param_keys.insert_key(k);
                 inherited_from_parent.insert_key(k);
+                seeded_env_marker |= k == &*cfml_common::key::well_known::CLOSURE_FRAME_ENV;
             }
         }
         // For a function-scoped `<cfinclude>`, the caller passes down exactly its
@@ -8507,7 +8522,7 @@ impl CfmlVirtualMachine {
                 use std::sync::atomic::Ordering::Relaxed;
                 fuse_counters::ENV_KEYS.load(Relaxed) + fuse_counters::CALLER_KEYS.load(Relaxed)
             });
-            self.fused_parent_merge(
+            seeded_env_marker = self.fused_parent_merge(
                 plan,
                 parent_scope,
                 &mut locals,
@@ -8530,6 +8545,13 @@ impl CfmlVirtualMachine {
                 fuse_counters::CALLER_SCANNED.fetch_add(parent.len() as u64, Relaxed);
             }
             for (k, v) in parent {
+                // The caller's `arguments` scope is never this frame's: an eager
+                // frame builds its own under this key and a lazy frame removed
+                // the carried handle again — a probe, an insert and a data key
+                // in the inherited set (an `Arc` per frame) for nothing. §2.1.
+                if k == &*cfml_common::key::well_known::ARGUMENTS_SCOPE {
+                    continue;
+                }
                 // Function values are normally skipped here: a named function /
                 // sibling closure is already reachable via user_functions or the
                 // captured-scope merge, and cloning its (large) captured scope on
@@ -8571,6 +8593,7 @@ impl CfmlVirtualMachine {
                             fuse_counters::STRUCT_KEYS.fetch_add(1, Relaxed);
                         }
                     }
+                    seeded_env_marker |= k == &*cfml_common::key::well_known::CLOSURE_FRAME_ENV;
                     locals.insert(k.clone(), v.clone());
                     // A shared `local` key from a function-scoped cfinclude stays
                     // in this frame's `local` view — do NOT mark it inherited.
@@ -8589,6 +8612,15 @@ impl CfmlVirtualMachine {
             pc::add(&pc::SEED_NANOS, t0.elapsed().as_nanos() as u64);
             pc::bump(&pc::SEED_FRAMES);
         }
+        // The seed marked every key it carried; a `variables` handle is one of
+        // the structural bits, so this is a mask test where two map probes
+        // (`__variables`, then the env carrier) used to run on every frame.
+        let seeded_variables =
+            inherited_from_parent.contains_key(&*cfml_common::key::well_known::VARIABLES);
+        // `this` can only be in `locals` at exit if the seed carried it or the
+        // body wrote it (a version bump) — the return-path probe is skipped
+        // for the plain UDF frame that did neither. §2.1 round 2.
+        let seeded_this = inherited_from_parent.contains_key(&*cfml_common::key::well_known::THIS);
         let inherited_from_parent = inherited_from_parent.into_shared();
         // A page's `variables` scope is a SHARED STRUCT, not the frame's own
         // locals map. A top-level `__main__` (a template frame with no function
@@ -8634,9 +8666,13 @@ impl CfmlVirtualMachine {
         // A lexical closure frame (it carries its env) always resolves through
         // the chain, so it is excluded up front rather than discovering that
         // in a cache refresh on every call.
-        let direct_frame = (page_main_frame
-            || locals.contains_key(&*cfml_common::key::well_known::VARIABLES))
-            && !locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV);
+        let direct_frame = (page_main_frame || seeded_variables) && !seeded_env_marker;
+        debug_assert_eq!(
+            direct_frame,
+            (page_main_frame || locals.contains_key(&*cfml_common::key::well_known::VARIABLES))
+                && !locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV),
+            "direct_frame derived from the seed disagrees with the map"
+        );
         #[cfg(feature = "call-phases")]
         {
             // phase 2: parent-scope seed copy
@@ -9034,18 +9070,22 @@ impl CfmlVirtualMachine {
             self.pending_extra_named_args.take();
             // INVARIANT: `locals[__arguments_scope]` is always THIS frame's own
             // scope, never the caller's. The eager branch above guarantees that
-            // by construction; on this lazy path the parent copy-in may have
-            // carried the CALLER's arguments struct in as an ordinary data key,
-            // and a `CfmlStruct` is an Arc handle — so every downstream site
-            // that treats the key as "my arguments" was reading, and worse
-            // WRITING, the caller's scope. `function f( numeric n ){ n = 7; }`
-            // called with no argument took StoreLocal's param→arguments sync
-            // straight into the caller's struct, leaving `n` readable in the
-            // caller and inherited by the next callee — Lucee 7.0.5 throws
-            // `variable [N] doesn't exist` there. Drop the inherited handle so
-            // the lazy frame is honestly argument-scope-less; `arguments_supplied`
-            // is the authority for presence on this path.
-            locals.shift_remove(&*cfml_common::key::well_known::ARGUMENTS_SCOPE);
+            // by construction. On this lazy path the key must be ABSENT: a
+            // `CfmlStruct` is an Arc handle, and a carried caller scope under
+            // this key made every downstream site that treats the key as "my
+            // arguments" read — and WRITE — the caller's scope
+            // (`function f( numeric n ){ n = 7; }` called with no argument took
+            // StoreLocal's param→arguments sync straight into the caller's
+            // struct; Lucee 7.0.5 throws `variable [N] doesn't exist` there).
+            // The seed loops (classic, fused env, fused caller) skip the key, and
+            // the instance-frame dispatch never inserts it, so the removal that
+            // used to enforce this here — one probe on EVERY lazy frame — is a
+            // debug assertion now. `arguments_supplied` is the authority for
+            // presence on this path.
+            debug_assert!(
+                !locals.contains_key(&*cfml_common::key::well_known::ARGUMENTS_SCOPE),
+                "lazy frame seeded with a caller's arguments scope"
+            );
         }
 
         #[cfg(feature = "call-phases")]
@@ -9181,19 +9221,31 @@ impl CfmlVirtualMachine {
                     // an inherited copy in `locals`, an undefined name) takes
                     // the generic path, which is where the same name would
                     // have resolved anyway.
-                    if direct_frame
-                        && !name.is_reserved_word()
-                        && (locals.len() <= 1 || !locals.contains_key(name))
-                    {
-                        if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
-                            // A FUNCTION value (a method referenced by bare name
-                            // as a callback: `items.each( record )`) takes the
-                            // generic path, which binds the receiver at the load
-                            // site — Lucee/ACF semantics the raw table entry lacks.
-                            if let Some(v) = vars.get(name) {
-                                if !matches!(v, CfmlValue::Function(_)) {
-                                    stack.push(v);
-                                    continue;
+                    //
+                    // §2.1 round 2: the frame's own map is probed ONCE, first. A
+                    // hit (a parameter, a local) is exactly what the generic path
+                    // returns for a non-reserved name — `lookup_name_in_scopes`
+                    // starts with this very probe and the load-site rebinding
+                    // below only applies to a name NOT held in `locals` — so it
+                    // is pushed here; the generic path used to re-probe it after
+                    // a `contains_key` and a parameter scan. A miss then takes the
+                    // direct `variables` path with no second probe of `locals`.
+                    if !name.is_reserved_word() {
+                        if let Some(v) = locals.get(name) {
+                            stack.push(v.clone());
+                            continue;
+                        }
+                        if direct_frame {
+                            if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                                // A FUNCTION value (a method referenced by bare name
+                                // as a callback: `items.each( record )`) takes the
+                                // generic path, which binds the receiver at the load
+                                // site — Lucee/ACF semantics the raw table entry lacks.
+                                if let Some(v) = vars.get(name) {
+                                    if !matches!(v, CfmlValue::Function(_)) {
+                                        stack.push(v);
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -9235,12 +9287,15 @@ impl CfmlVirtualMachine {
                     // below: they are redirected to the scope ONLY when something
                     // would otherwise shadow them, leaving the unshadowed path
                     // byte-for-byte unchanged.
-                    let scope_name_shadow_attempt = (is_inside_function
-                        && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
-                        || declared_locals.contains(name.as_str());
                     // One precomputed bool (see Name::is_reserved_word) stands in for the
                     // chain of scope-name comparisons below: a plain variable skips them all.
                     let reserved = name.is_reserved_word();
+                    // Only consulted for the four host scopes below, all reserved
+                    // words — so the parameter scan is not paid by a plain name.
+                    let scope_name_shadow_attempt = reserved
+                        && ((is_inside_function
+                            && func.params.iter().any(|p| p.eq_ignore_ascii_case(name_lower)))
+                            || declared_locals.contains(name.as_str()));
                     let val = if reserved && name_lower == "local" && frame_has_local_scope {
                         // `local` is strictly per-call (PR #93): only keys
                         // established in THIS frame are visible — inherited
@@ -10553,7 +10608,12 @@ impl CfmlVirtualMachine {
                         }
                         stack.push(v);
                     // 1b. Check __variables scope for CFC methods
-                    } else if let Some(CfmlValue::Function(cf)) = Self::closure_chain_get(&locals, name) {
+                    } else if let Some(CfmlValue::Function(cf)) =
+                        // A direct frame has no env carrier (decided at seed time,
+                        // and the carrier is only ever inserted there): the chain
+                        // walk would start with a miss on `locals`. §2.1 round 2.
+                        (!direct_frame).then(|| Self::closure_chain_get(&locals, name)).flatten()
+                    {
                         // A captured FUNCTION value (a var-scoped helper, a
                         // closure passed as a parameter) called by bare name from
                         // a lexical closure. A captured DATA hit is not a call
@@ -10570,17 +10630,18 @@ impl CfmlVirtualMachine {
                             CfmlValue::Function(cf)
                         };
                         stack.push(v);
-                    } else if let Some(val) = locals.get(&*cfml_common::key::well_known::VARIABLES).filter(|_| !skip_variables_method).and_then(|v| {
-                        if let CfmlValue::Struct(vars) = v {
-                            // One probe by the interned key (pre-folded hash, CI
-                            // equality) under one read lock, cloning only the
-                            // matched value. `get_ci(&str)` re-hashed the name's
-                            // bytes on every bare call to a page function (§2.1).
-                            vars.get(name.key())
-                        } else {
-                            None
-                        }
-                    }) {
+                    } else if let Some(val) = (!skip_variables_method)
+                        // The frame's `variables` handle comes from the
+                        // version-validated cache — a probe of `locals` per bare
+                        // call before (§2.1 round 2). Then one probe by the
+                        // interned key (pre-folded hash, CI equality) under one
+                        // read lock, cloning only the matched value. `get_ci(&str)`
+                        // re-hashed the name's bytes on every bare call to a page
+                        // function (§2.1).
+                        .then(|| scope_cache.vars_handle(&locals, &func.params))
+                        .flatten()
+                        .and_then(|vars| vars.get(name.key()))
+                    {
                         // A component method resolved from `__variables` for a bare
                         // call. If it carries a FOREIGN component binding in its
                         // captured_scope (an INJECTED method member-extracted from
@@ -12012,7 +12073,11 @@ impl CfmlVirtualMachine {
                     if skip_method_writeback {
                         // Nothing to write back: the dispatch drops both
                         // fields, the instance's scopes are live references.
-                    } else if let Some(this_val) = locals.get(&*cfml_common::key::well_known::THIS) {
+                    } else if let Some(this_val) = (seeded_this
+                        || locals.version() != locals_version_at_entry)
+                        .then(|| locals.get(&*cfml_common::key::well_known::THIS))
+                        .flatten()
+                    {
                         self.method_this_writeback = Some(this_val.clone());
                         // If the return value on top of the stack IS the component's
                         // `this` (the common `return this;` pattern from chained-setter
@@ -15028,7 +15093,11 @@ impl CfmlVirtualMachine {
         // Save modified 'this' and variables scope for component method write-back
         if skip_method_writeback {
             // See the `Return` arm: an instance frame writes nothing back.
-        } else if let Some(this_val) = locals.get(&*cfml_common::key::well_known::THIS) {
+        } else if let Some(this_val) = (seeded_this
+            || locals.version() != locals_version_at_entry)
+            .then(|| locals.get(&*cfml_common::key::well_known::THIS))
+            .flatten()
+        {
             self.method_this_writeback = Some(this_val.clone());
             // Save variables scope mutations for component write-back
             if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
@@ -23154,7 +23223,9 @@ impl CfmlVirtualMachine {
         inherited_or_param_keys: &mut InheritedKeys,
         inherited_from_parent: &mut InheritedKeys,
         share_local_keys: Option<&std::collections::HashSet<String>>,
-    ) {
+    ) -> bool {
+        // Returned: whether a closure-env carrier was installed in `locals`.
+        let mut env_marker = false;
         // Cheapest test first: the structural names and a plain function value
         // are carried unconditionally; only then is the caller's inherited set
         // probed (by the pre-hashed key, and only if it tracks any data key —
@@ -23224,10 +23295,15 @@ impl CfmlVirtualMachine {
                             cfml_common::key::well_known::CLOSURE_FRAME_ENV.clone(),
                             Self::closure_env_marker(env_arc),
                         );
+                        env_marker = true;
                     }
                 }
             } else {
             for (k, v) in env.iter() {
+                // Never the env's `arguments` scope (see the classic seed loop).
+                if k == &*cfml_common::key::well_known::ARGUMENTS_SCOPE {
+                    continue;
+                }
                 // Component-context composition only (see `env_first`): a
                 // filter-carried caller FUNCTION overrides this env entry —
                 // except a stripped self-reference / captured helper, which
@@ -23268,6 +23344,10 @@ impl CfmlVirtualMachine {
                 fuse_counters::CALLER_SCANNED.fetch_add(caller.len() as u64, Relaxed);
             }
             for (k, v) in caller {
+                // Never the caller's `arguments` scope (see the classic seed loop).
+                if k == &*cfml_common::key::well_known::ARGUMENTS_SCOPE {
+                    continue;
+                }
                 // The CALLER's closure-env carrier is the caller's, never the
                 // callee's: carried, it would either clobber the callee's own
                 // (a closure invoked from inside another closure resolved its
@@ -23281,6 +23361,7 @@ impl CfmlVirtualMachine {
                     // chain it was fetched from, so it adopts the caller's.
                     if plan.lexical && plan.env.is_none() {
                         locals.insert(k.clone(), v.clone());
+                        env_marker = true;
                     }
                     continue;
                 }
@@ -23326,6 +23407,7 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        env_marker
     }
 
 
