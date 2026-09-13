@@ -8640,13 +8640,15 @@ impl CfmlVirtualMachine {
                     locals.insert(k.clone(), v.clone());
                     // A shared `local` key from a function-scoped cfinclude stays
                     // in this frame's `local` view — do NOT mark it inherited.
+                    // A shared `local` key is this frame's OWN local scope, so it is
+                    // neither inherited nor something a bare callee may see.
                     if share_local_keys
                         .as_ref()
                         .is_none_or(|s| !s.contains(k.as_str()))
                     {
                         inherited_or_param_keys.insert_key(k);
+                        inherited_from_parent.insert_key(k);
                     }
-                    inherited_from_parent.insert_key(k);
                 }
             }
         }
@@ -8730,8 +8732,18 @@ impl CfmlVirtualMachine {
         // call resolves its inherited-key filter against its true immediate
         // caller. Balanced by the truncate-to-entry-depth in
         // `execute_function_with_args` (robust to `__main__`'s early pop). GH #259.
+        // A template frame carries EVERYTHING into a bare callee only when it is
+        // a page (its locals ARE the page's variables). A template included from
+        // inside a function runs in that function's `local` scope — its locals
+        // are the caller's `var`s, the include's own writes and the compiler's
+        // loop temporaries — and Lucee shows a callee NONE of those (a UDF sees
+        // local → arguments → the component's variables, never its caller's
+        // locals). So it filters like a function frame. Measured on a Preside
+        // admin render: 6.9k of 34k frames carried a caller local (`viewpath`,
+        // `__iter_N`…), each paying an `Arc` for its inherited set plus the
+        // copies. Probed on Lucee 7.1 (tests/tags/test_include_udf_no_caller_locals.cfm).
         self.frame_ctx
-            .push((inherited_from_parent.clone(), is_template_frame));
+            .push((inherited_from_parent.clone(), is_template_frame && !frame_has_local_scope));
         // NB `self.frame_has_local_scope` — the same value, published for the
         // helpers that resolve `local` outside this function — is set by
         // `execute_function_with_args` BEFORE this body runs, so that the early
@@ -23374,8 +23386,8 @@ impl CfmlVirtualMachine {
                     locals.insert(k.clone(), v.clone());
                     if share_local_keys.is_none_or(|s| !s.contains(k.as_str())) {
                         inherited_or_param_keys.insert_key(k);
+                        inherited_from_parent.insert_key(k);
                     }
-                    inherited_from_parent.insert_key(k);
                 }
             }
             }
@@ -23445,8 +23457,8 @@ impl CfmlVirtualMachine {
                     locals.insert(k.clone(), v.clone());
                     if share_local_keys.is_none_or(|s| !s.contains(k.as_str())) {
                         inherited_or_param_keys.insert_key(k);
+                        inherited_from_parent.insert_key(k);
                     }
-                    inherited_from_parent.insert_key(k);
                 }
             }
         }

@@ -2199,6 +2199,7 @@ impl Parser {
                     self.consume(&Token::RParen)?;
                     let body = self.parse_block_or_statement()?;
                     return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                        var_declared: has_var,
                         variable: name,
                         iterable,
                         body,
@@ -2550,6 +2551,7 @@ impl Parser {
             if let Some(binding) = item.clone().or(index.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    var_declared: false,
                     variable: name,
                     // Codegen marker: cfloop-array bound is min(entry, live) on Lucee.
                     iterable: call("__cfloop_array_iter", vec![array]),
@@ -2597,6 +2599,7 @@ impl Parser {
             if let Some(binding) = index.clone().or(item.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    var_declared: false,
                     variable: name,
                     iterable: call("listToArray", vec![list, delims_expr()]),
                     body,
@@ -2622,6 +2625,7 @@ impl Parser {
                 return Ok(self.wrap_with_preamble(
                     vec![assign(coll_tmp.clone(), collection.clone())],
                     Statement::ForIn(ForIn {
+                        var_declared: false,
                         variable: key_n,
                         iterable: call("structKeyArray", vec![ident(&coll_tmp)]),
                         body: for_body,
@@ -2631,6 +2635,7 @@ impl Parser {
                 ));
             }
             return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                var_declared: false,
                 variable: item_n,
                 iterable: collection,
                 body,
@@ -2644,6 +2649,7 @@ impl Parser {
             if let Some(binding) = index.clone().or(item.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "row".to_string());
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    var_declared: false,
                     variable: name,
                     iterable: query,
                     body,
@@ -2737,6 +2743,7 @@ impl Parser {
                 let characters = get("characters").unwrap_or_else(null_lit);
                 let charset = get("charset").unwrap_or_else(null_lit);
                 return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    var_declared: false,
                     variable: name,
                     iterable: call(
                         "__cfloop_file_lines",

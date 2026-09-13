@@ -139,6 +139,7 @@ include "harness.cfm";
 <!--- but conflating the local and arguments views of a single frame. --->
 <!--- Runtime-level (wrong values, no parse error), so registration is safe. --->
 <cf_runtest file="core/test_local_shadows_arguments.cfm">
+<cf_runtest file="core/test_forin_loop_variable_scope.cfm">
 <cf_runtest file="core/test_arguments_scope_shape.cfm">
 <cf_runtest file="core/test_structdelete_arguments.cfm">
 <cf_runtest file="core/test_error_wording_lucee.cfm">
@@ -518,6 +519,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tag_preprocessor_masa_fixes.cfm">
 <cf_runtest file="tags/test_cfmodule_script_form.cfm">
 <cf_runtest file="tags/test_seethrough_udf_variables.cfm">
+<cf_runtest file="tags/test_include_udf_no_caller_locals.cfm">
 <cf_runtest file="tags/test_tags_basic.cfm">
 <cf_runtest file="tags/test_tags_control.cfm">
 <cf_runtest file="tags/test_tags_include.cfm">

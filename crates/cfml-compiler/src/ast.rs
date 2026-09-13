@@ -198,6 +198,10 @@ pub struct For {
 #[derive(Debug, Clone)]
 pub struct ForIn {
     pub variable: String,
+    /// `for (var x in …)`: the loop variable is declared function-local.
+    /// Without it the variable is an ordinary unscoped write (routed like
+    /// `x = …`: `variables` in a classic method, the page scope at page level).
+    pub var_declared: bool,
     pub iterable: Expression,
     pub body: Vec<Statement>,
     pub location: SourceLocation,

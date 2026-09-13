@@ -4303,7 +4303,20 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::StoreLocal(Name::from(root)));
             }
         } else {
-            instructions.push(BytecodeOp::DeclareLocal(Name::from(&loop_var_name)));
+            // The loop variable is an ordinary unscoped assignment, routed by
+            // `StoreLocal` like `x = …` would be: the component's `variables`
+            // scope in a classic-localmode method, the page `variables` scope at
+            // page level, `local` under localmode="modern". It used to be
+            // `DeclareLocal`ed here, which parked it in the frame's locals in
+            // every shape — so `structKeyExists(variables, "i")` after a page
+            // loop was false, and a UDF called from a method's include could not
+            // see the loop variable Lucee 7.1 stores in `variables`
+            // (tests/core/test_forin_loop_variable_scope.cfm). The compiler's own
+            // `__iter_`/`__idx_`/`__cap_` temporaries stay declared-local above.
+            // `for (var x in …)` and `for (local.x in …)` ARE local (Lucee 7.1).
+            if for_in.var_declared || for_in.variable.starts_with("local.") {
+                instructions.push(BytecodeOp::DeclareLocal(Name::from(&loop_var_name)));
+            }
             instructions.push(BytecodeOp::StoreLocal(Name::from(loop_var_name)));
         }
         self.loop_stack.push((
