@@ -4808,6 +4808,7 @@ impl CfmlVirtualMachine {
         }
         if !r.timezone.is_empty() {
             self.timezone = r.timezone.clone();
+            cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
         }
         self.whitespace_compression = r.whitespace_compression_enabled;
         if let Some(secs) = cfml_config::RuntimeCfg::parse_timeout_seconds(&r.session_timeout) {
@@ -5607,6 +5608,7 @@ impl CfmlVirtualMachine {
         // `setLocale()` in one request would still be in force for the next.
         cfml_common::locale::set_current_locale(&self.locale);
         self.timezone = seed.timezone;
+        cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
         self.whitespace_compression = seed.whitespace_compression;
         self.session_timeout_secs = seed.session_timeout_secs;
         self.application_timeout_secs = seed.application_timeout_secs;
@@ -18280,6 +18282,7 @@ impl CfmlVirtualMachine {
                     match tz::resolve_tz(&id) {
                         Some(t) => {
                             self.timezone = tz::canonical_name(&t);
+                            cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
                             return Ok(CfmlValue::Null);
                         }
                         None => {
@@ -40519,6 +40522,7 @@ impl CfmlVirtualMachine {
         {
             if let Some(zone) = tz::resolve_tz(tz_id.trim()) {
                 self.timezone = tz::canonical_name(&zone);
+                cfml_stdlib::set_request_timezone(Some(self.timezone.clone()));
             }
         }
         if let Some(loc) = config

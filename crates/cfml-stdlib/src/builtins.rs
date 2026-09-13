@@ -1321,6 +1321,42 @@ thread_local! {
     static PRNG_SEEDED: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
+thread_local! {
+    /// The request's timezone (`setTimeZone`, or `this.timezone`), as an IANA
+    /// id. `None` = no request zone set, so the system zone applies.
+    ///
+    /// Date PARSING needs this and cannot reach the VM. An offset-bearing
+    /// string names an absolute instant, and CFML reports instants in the
+    /// REQUEST zone — `dateConvert` already did, via the VM intercept, but the
+    /// parser resolved `+0000` against chrono's `Local` (the SYSTEM zone).
+    /// With `setTimeZone("Asia/Kolkata")` on a UTC box, Lucee 7.1 parses
+    /// "August, 25 2026 09:00:14 +0000" as 14:30:14 and we returned 09:00:14,
+    /// so `dateDiff(dateConvert("utc2Local", d), thatString)` was out by the
+    /// whole zone offset (GH #415's CI failure; measured on Lucee).
+    ///
+    /// It hid locally because the suite leaves a request zone set and most
+    /// developer machines run that same zone as their system zone — the two
+    /// only diverge on a UTC CI box, or under an explicit setTimeZone.
+    static REQUEST_TZ: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the request timezone to the date parser. Called by the VM wherever
+/// its own `timezone` field is assigned; `None` restores the system zone.
+pub fn set_request_timezone(id: Option<String>) {
+    REQUEST_TZ.with(|t| *t.borrow_mut() = id.filter(|s| !s.is_empty()));
+}
+
+/// The zone an instant should be reported in: the request zone when one is set,
+/// otherwise the system zone.
+fn reporting_zone() -> Option<chrono_tz::Tz> {
+    REQUEST_TZ.with(|t| {
+        t.borrow()
+            .as_deref()
+            .and_then(|id| id.parse::<chrono_tz::Tz>().ok())
+    })
+}
+
 fn xorshift64(state: u64) -> u64 {
     let mut x = state;
     x ^= x << 13;
@@ -5241,7 +5277,12 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
     // Wall-clock fields as written, matching the RFC 3339 branch below.
     for fmt in &["%B, %d %Y %H:%M:%S %z", "%b, %d %Y %H:%M:%S %z"] {
         if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
-            return Some(dt.with_timezone(&Local).naive_local());
+            // Report the instant in the REQUEST zone, falling back to the
+            // system zone — `Local` alone ignored setTimeZone (see REQUEST_TZ).
+            return Some(match reporting_zone() {
+                Some(tz) => dt.with_timezone(&tz).naive_local(),
+                None => dt.with_timezone(&Local).naive_local(),
+            });
         }
     }
 

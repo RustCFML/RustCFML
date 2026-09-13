@@ -333,6 +333,7 @@ include "harness.cfm";
 <cf_runtest file="database/test_cfqueryparam_shared_instance_threads.cfm">
 <cf_runtest file="stdlib/test_date_functions_extra.cfm">
 <cf_runtest file="stdlib/test_lucee_json_date_form.cfm">
+<cf_runtest file="stdlib/test_parse_offset_uses_request_timezone.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
