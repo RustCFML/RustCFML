@@ -2589,8 +2589,23 @@ impl CfmlValue {
                 }
                 path.push(ptr);
                 let mut clean = true;
-                let items: Vec<String> = s
-                    .iter()
+                // Take the entries as a flat `Vec` of handle clones rather than
+                // `iter()`, which is `snapshot()` — a clone of the whole backing
+                // `IndexMap`, hashbrown table and all, so every stringification
+                // of a struct paid a full rehash. `Key` and `CfmlValue` are both
+                // refcount bumps, so this copies pointers, not contents.
+                //
+                // The recursion below deliberately runs OUTSIDE the read lock:
+                // `with_map`'s contract forbids calling anything that could touch
+                // the same struct while its lock is held, and a nested value can
+                // reach back to this one. The `path` guard above catches those
+                // cycles, but holding the lock across the walk would turn any
+                // case it did not catch into a deadlock rather than a "{...}".
+                let entries: Vec<(Key, CfmlValue)> = s.with_map(|m| {
+                    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                });
+                let items: Vec<String> = entries
+                    .into_iter()
                     .map(|(k, v)| {
                         let (sv, c) = v.as_string_memo(path, memo);
                         clean &= c;

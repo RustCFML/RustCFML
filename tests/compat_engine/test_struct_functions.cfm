@@ -187,6 +187,45 @@ assert("structSort text first", sortedText[1], "A");
 assert("structSort text second", sortedText[2], "B");
 assert("structSort text third", sortedText[3], "C");
 
+// Descending, and — the point of these — ORDER STABILITY and the
+// struct-valued path. structSort derives each entry's sort key once and then
+// sorts, rather than deriving it inside the comparator; these pin the ordering
+// that rewrite has to preserve. A struct value has no numeric reading, so every
+// entry compares equal and the original key order must survive untouched.
+ssDesc = {c:3, a:1, b:2};
+sortedDesc = structSort(ssDesc, "numeric", "desc");
+assert("structSort numeric desc first", sortedDesc[1], "C");
+assert("structSort numeric desc last", sortedDesc[3], "A");
+
+// All values compare equal, so the engine's own key order decides the result.
+// Lucee's plain struct does not promise insertion order, so cross-engine we
+// assert only that every key survives exactly once; RustCFML additionally
+// pins the stable (insertion) order, which is what the rewrite must not change.
+ssTies = {b:5, a:5, c:5};
+sortedTies = structSort(ssTies, "numeric");
+assert("structSort numeric ties key count", arrayLen(sortedTies), 3);
+assertTrue("structSort numeric ties has A", arrayFindNoCase(sortedTies, "A") GT 0);
+assertTrue("structSort numeric ties has B", arrayFindNoCase(sortedTies, "B") GT 0);
+assertTrue("structSort numeric ties has C", arrayFindNoCase(sortedTies, "C") GT 0);
+if (isRustCFML()) {
+    assert("structSort numeric ties keep insertion order", arrayToList(sortedTies), "B,A,C");
+}
+
+// Struct values have no numeric reading, so they all tie — this is the path
+// that used to clone the whole backing map once per comparison.
+ssNested = {b:{x:1}, a:{y:2}, c:{z:3}};
+sortedNested = structSort(ssNested, "numeric");
+assert("structSort numeric over struct values count", arrayLen(sortedNested), 3);
+assertTrue("structSort numeric over struct values has A", arrayFindNoCase(sortedNested, "A") GT 0);
+if (isRustCFML()) {
+    assert("structSort numeric over struct values order", arrayToList(sortedNested), "B,A,C");
+}
+
+ssNoCase = {b:"banana", a:"apple", c:"cherry"};
+sortedNoCase = structSort(ssNoCase, "textnocase");
+assert("structSort textnocase first", sortedNoCase[1], "A");
+assert("structSort textnocase last", sortedNoCase[3], "C");
+
 // ============================================================
 // StructEach (from Lucee structEach.cfc)
 // ============================================================
