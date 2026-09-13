@@ -2401,6 +2401,13 @@ pub struct CfmlVirtualMachine {
     pub server_scope: CfmlStruct,
     /// HTTP response headers set by cfheader
     pub response_headers: Vec<(String, String)>,
+    /// The `cookie` scope exactly as it arrived on the request, so a write to
+    /// that scope during the request can be recognised at response time and
+    /// turned into a `Set-Cookie` (GH #423). CFML treats `cookie.x = "v"` as
+    /// equivalent to `<cfcookie name="x" value="v">` — the tag path already
+    /// emitted the header, the scope write silently did not, so the cookie was
+    /// readable for the rest of the request and never reached the browser.
+    pub initial_cookies: Vec<(String, String)>,
     /// HTTP response status code set by cfheader
     pub response_status: Option<(u16, String)>,
     /// Content type set by cfcontent
@@ -3344,6 +3351,78 @@ pub fn report_live_bodies() {
 /// same request twice and diff. This is the view neither the heap profiler
 /// (which attributes to allocation SITES, not owners) nor the cycle collector
 /// (which only sees tracked nodes) can give.
+/// Render one `cookie` scope entry as a `Set-Cookie` value (GH #423).
+///
+/// A scalar is `name=value;Path=/`. A struct is Lucee's long form, whose keys
+/// mirror the `cfcookie` attributes:
+///   cookie.x = {value=.., expires=.., secure=.., httponly=.., path=.., domain=..}
+///
+/// `expires` accepts Lucee's words as well as a number of days: "never" is far
+/// future, "now" is the epoch (which is how a cookie is deleted).
+fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> String {
+    let fmt_expiry = |secs_from_now: i64| -> String {
+        let when = chrono::Utc::now() + chrono::Duration::seconds(secs_from_now);
+        when.format("%a, %d-%b-%Y %H:%M:%S GMT").to_string()
+    };
+    let opts = match value {
+        CfmlValue::Struct(s) => s.snapshot(),
+        other => {
+            return format!("{}={};Path=/", name, other.as_string());
+        }
+    };
+    let get = |k: &str| -> Option<CfmlValue> {
+        opts.iter()
+            .find(|(ok, _)| ok.as_str().eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.clone())
+    };
+    let is_true = |v: &CfmlValue| -> bool {
+        let s = v.as_string().to_lowercase();
+        s == "true" || s == "yes" || s == "1"
+    };
+
+    let mut out = format!(
+        "{}={}",
+        name,
+        get("value").map(|v| v.as_string()).unwrap_or_default()
+    );
+    out.push_str(&format!(
+        ";Path={}",
+        get("path").map(|v| v.as_string()).unwrap_or_else(|| "/".to_string())
+    ));
+    if let Some(d) = get("domain") {
+        if !d.as_string().is_empty() {
+            out.push_str(&format!(";Domain={}", d.as_string()));
+        }
+    }
+    if let Some(e) = get("expires") {
+        let raw = e.as_string();
+        let lower = raw.to_lowercase();
+        if lower == "never" {
+            // Lucee pins "never" ~30 years out rather than emitting no expiry,
+            // which is what makes the cookie survive the browser session.
+            out.push_str(&format!(";Expires={}", fmt_expiry(30 * 365 * 24 * 3600)));
+        } else if lower == "now" {
+            out.push_str(";Expires=Thu, 01-Jan-1970 00:00:00 GMT");
+        } else if let Ok(days) = raw.parse::<f64>() {
+            out.push_str(&format!(";Expires={}", fmt_expiry((days * 86400.0) as i64)));
+        } else if !raw.is_empty() {
+            out.push_str(&format!(";Expires={}", raw));
+        }
+    }
+    if get("secure").as_ref().is_some_and(is_true) {
+        out.push_str(";Secure");
+    }
+    if get("httponly").as_ref().is_some_and(is_true) {
+        out.push_str(";HttpOnly");
+    }
+    if let Some(ss) = get("samesite") {
+        if !ss.as_string().is_empty() {
+            out.push_str(&format!(";SameSite={}", ss.as_string()));
+        }
+    }
+    out
+}
+
 impl CfmlVirtualMachine {
     /// The application this request resolved to, if any. Exposed for the
     /// request loop's diagnostic probe roots (`RUSTCFML_GC_ROOTS`), which need
@@ -4432,6 +4511,7 @@ impl CfmlVirtualMachine {
             application_stopped: false,
             server_state: None,
             response_headers: Vec::new(),
+            initial_cookies: Vec::new(),
             response_status: None,
             response_content_type: None,
             web_context: false,
@@ -36704,6 +36784,58 @@ impl CfmlVirtualMachine {
     /// The effective timezone id for tz-aware BIFs: the request/application
     /// zone set via setTimeZone() / cfconfig, else the host system zone, else
     /// UTC. Mirrors the resolution `getTimeZone()` exposes.
+    /// Turn writes made to the `cookie` scope during this request into
+    /// `Set-Cookie` headers (GH #423).
+    ///
+    /// CFML treats `cookie.x = "v"` as equivalent to `<cfcookie name="x"
+    /// value="v">`. The tag path builds the header directly; a scope write had
+    /// no hook at all, so the value was readable for the rest of the request
+    /// and never reached the browser. Diffing against the scope as it arrived
+    /// catches every way of writing it — `cookie.x =`, `structInsert`, a
+    /// `structDelete`-then-set — rather than only the syntax we thought of.
+    ///
+    /// Anything `cfcookie` already emitted is left alone: it has a full
+    /// attribute set (domain, samesite, max-age) that the flat scope value
+    /// cannot express, and re-emitting from the scope would downgrade it.
+    ///
+    /// The struct form `cookie.x = {value=.., expires=.., httponly=..}` is
+    /// Lucee's, and is rendered with the same attribute handling as the tag.
+    pub fn flush_cookie_scope_writes(&mut self) {
+        let current = match self.globals.get("cookie") {
+            Some(CfmlValue::Struct(s)) => s.snapshot(),
+            _ => return,
+        };
+        let already_set: Vec<String> = self
+            .response_headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie"))
+            .filter_map(|(_, v)| v.split('=').next().map(|n| n.trim().to_lowercase()))
+            .collect();
+
+        for (name, value) in current.iter() {
+            let key = name.as_str();
+            // Session plumbing owns its own cookies.
+            if key.eq_ignore_ascii_case("cfid")
+                || key.eq_ignore_ascii_case("cftoken")
+                || key.eq_ignore_ascii_case("jsessionid")
+            {
+                continue;
+            }
+            if already_set.iter().any(|n| n == &key.to_lowercase()) {
+                continue;
+            }
+            let unchanged = self
+                .initial_cookies
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case(key) && *v == value.as_string());
+            if unchanged {
+                continue;
+            }
+            self.response_headers
+                .push(("Set-Cookie".to_string(), render_cookie_scope_entry(key, value)));
+        }
+    }
+
     fn current_timezone_id(&self) -> String {
         if !self.timezone.is_empty() {
             return self.timezone.clone();

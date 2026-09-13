@@ -1296,6 +1296,16 @@ fn compile_and_run(
         vm.globals.insert(name, value);
     }
 
+    // Remember the `cookie` scope as it ARRIVED, so a write to it during the
+    // request can be turned into a Set-Cookie at response time (GH #423).
+    if let Some(CfmlValue::Struct(cs)) = vm.globals.get("cookie") {
+        vm.initial_cookies = cs
+            .snapshot()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.as_string()))
+            .collect();
+    }
+
     // Web request (serve mode) → writeDump emits its HTML widget; CLI runs
     // emit a plain-text tree.
     vm.web_context = web_context;
@@ -1433,6 +1443,10 @@ fn compile_and_run(
     if vm.response_flushed {
         let _ = vm.cfflush();
     }
+
+    // Writes to the `cookie` scope become Set-Cookie headers here, before the
+    // response is assembled (GH #423).
+    vm.flush_cookie_scope_writes();
 
     let response = match result {
         Ok(_) => Ok(CfmlResponse {
