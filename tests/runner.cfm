@@ -383,6 +383,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_reserved_key_visibility.cfm">
 <cf_runtest file="oop/test_component_introspection_surface.cfm">
 <cf_runtest file="oop/test_property_no_accessors_onmissing.cfm">
+<cf_runtest file="oop/test_implicit_accessors_require_accessors_attr.cfm">
 <cf_runtest file="oop/test_unquoted_property_accessors.cfm">
 <cf_runtest file="oop/test_called_name_alias.cfm">
 <cf_runtest file="oop/test_new_returns_init.cfm">

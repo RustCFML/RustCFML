@@ -29628,7 +29628,23 @@ impl CfmlVirtualMachine {
                 // `contains_key_ci` includes the shared method table (component
                 // flyweight), where `onMissingMethod` now lives.
                 let defines_on_missing = s.contains_key_ci("onmissingmethod");
-                let route_to_on_missing = defines_on_missing && !has_accessors;
+                // GH #421: synthesis requires accessors="true". Without it CFML
+                // provides NO implicit accessors at all — `setAnything("x")` is
+                // `Component [X] has no function with name [setAnything]` on
+                // Lucee, whether or not a property of that name is declared.
+                // We used to synthesize whenever the component had no
+                // onMissingMethod, so a typo'd or entirely invented setter
+                // silently created a variable instead of raising. Measured on
+                // Lucee 7.1: with no accessors, setUsername (declared),
+                // setRandomVar (undeclared) and the invoke() forms of both all
+                // throw; with accessors="true", the declared pair works and the
+                // undeclared pair still throws.
+                //
+                // Skipping the block entirely when accessors is off leaves the
+                // call to fall through to onMissingMethod (unchanged — see
+                // tests/oop/test_property_no_accessors_onmissing.cfm) and then
+                // to the no-such-method error, which is the Lucee order.
+                let route_to_on_missing = !has_accessors;
                 if !route_to_on_missing && method_lower.starts_with("get") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
                     let val = s
@@ -33101,19 +33117,41 @@ impl CfmlVirtualMachine {
                 })
         };
 
-        // 2. Implicit getX/setX accessors (lenient — synthesized even without
-        // accessors="true" for data CFCs; a component defining onMissingMethod
-        // routes there instead, Lucee parity).
+        // 2. Implicit getX/setX accessors. These exist ONLY for a component
+        // declaring accessors="true" (GH #421). This path used to synthesize
+        // them for any component without an onMissingMethod, which meant a
+        // setter for a property that does not exist — a typo, or a name
+        // invented wholesale — silently created a variable instead of raising.
+        // Measured on Lucee 7.1: with no accessors, `setUsername` (declared),
+        // `setRandomVar` (undeclared) and the `invoke()` form of each all throw
+        // "has no function with name"; with accessors="true" the declared pair
+        // works and the undeclared pair still throws.
+        //
+        // accessors="true" compiles REAL accessor methods for each declared
+        // property (see compiler.rs), so those are dispatched before this point
+        // and the guard below costs them nothing. What it removes is exactly
+        // the undeclared case, which is the divergence.
+        //
+        // Unchanged: a component WITHOUT accessors that defines onMissingMethod
+        // still routes there (tests/oop/test_property_no_accessors_onmissing.cfm).
+        // Skipping synthesis just lets the call fall through to onMissingMethod
+        // and then to the no-such-method error, which is Lucee's order.
         let ml = method.to_lowercase();
-        if !denied && ml.len() > 3 && ml.starts_with("get") && !defines_on_missing() {
+        let has_accessors = matches!(data_get("__accessors"), Some(CfmlValue::Bool(true)));
+        if !denied && has_accessors && ml.len() > 3 && ml.starts_with("get") && !defines_on_missing() {
             if let Some(v) = data_get(&method[3..]) {
                 return Ok(v);
             }
         }
-        if !denied && ml.len() > 3 && ml.starts_with("set") && !defines_on_missing() {
-            if let Some(value) = extra_args.first().cloned() {
-                this_members.insert(method[3..].to_string(), value);
-                return Ok(object.clone()); // setX returns `this` (fluent — Lucee)
+        if !denied && has_accessors && ml.len() > 3 && ml.starts_with("set") && !defines_on_missing() {
+            // Only a property that actually exists may be set implicitly; a
+            // declared property is materialised as a member at construction, so
+            // "not a member" here means "not declared".
+            if data_get(&method[3..]).is_some() {
+                if let Some(value) = extra_args.first().cloned() {
+                    this_members.insert(method[3..].to_string(), value);
+                    return Ok(object.clone()); // setX returns `this` (fluent — Lucee)
+                }
             }
         }
 
