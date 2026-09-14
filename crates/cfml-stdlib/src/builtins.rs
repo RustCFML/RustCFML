@@ -703,6 +703,21 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("wsPresence".to_string(), fn_ws_stub); // VM intercepts
     f.insert("assertBroadcast".to_string(), fn_ws_stub); // VM intercepts (test harness)
 
+    // ---- MCP BIFs (VM-intercepted in cfml-vm/src/intercepts_mcp.rs) ----
+    // Same story as the realtime BIFs above: registered so the names resolve,
+    // but the behaviour needs the session registry on ServerState (and, for
+    // `mcp()`, the call context on the VM), so the intercept runs first.
+    f.insert("mcp".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpNotify".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpSessions".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpConnect".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpClient".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpText".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpImage".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpAudio".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpResource".to_string(), fn_ws_stub); // VM intercepts
+    f.insert("mcpResourceLink".to_string(), fn_ws_stub); // VM intercepts
+
     // socket.io-lucee compat seam ($sio*) — the flat BIFs the imperative
     // SocketIoServer/Namespace/Socket CFCs call; all VM-intercepted in lib.rs.
     f.insert("$sioRegisterNamespace".to_string(), fn_ws_stub);

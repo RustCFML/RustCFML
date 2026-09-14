@@ -1128,6 +1128,10 @@ include "harness.cfm";
 <cf_runtest file="qoq/test_qoq_component_variables_scope.cfm">
 <cf_runtest file="qoq/test_qoq_arguments_scope.cfm">
 
+<!--- MCP: the CFML-visible BIFs. Protocol behaviour over stdio and HTTP is --->
+<!--- covered by crates/cli/tests/mcp_stdio.rs and mcp_http.rs. --->
+<cf_runtest file="mcp/test_mcp_content.cfm">
+
 <!--- WebSocket / realtime: connection-free harness coverage (live-socket --->
 <!--- behaviour is covered by crates/cli/tests/websocket_raw.rs). --->
 <cf_runtest file="websocket/test_ws_harness.cfm">

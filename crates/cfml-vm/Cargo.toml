@@ -40,6 +40,9 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# MCP client transport (feature `mcp-client`). Same version as cfml-stdlib's,
+# so the two share one build of it.
+ureq = { version = "2", optional = true }
 # Pure-Rust, wasm-safe hashers for the java.security.MessageDigest shim's
 # digest() (matches the algorithms cfml-stdlib's hash() supports).
 sha2 = "0.10"
@@ -114,6 +117,11 @@ component-instance = ["cfml-common/component-instance"]
 # fall back to the synchronous-inline cfthread path (no std::thread on wasm32).
 real-threads = []
 s3 = ["dep:cfml-stdlib", "cfml-stdlib/s3"]
+# The MCP *client* (`mcpConnect`/`mcpClient`): CFML calling OUT to remote MCP
+# servers. Native-only — it needs subprocesses and an HTTP client, neither of
+# which exists on wasm32, so it is gated exactly like `s3` and the wasm crates
+# (which build with default-features = false) never pull `ureq` in.
+mcp-client = ["dep:cfml-stdlib", "cfml-stdlib/http", "dep:ureq"]
 # Dynamic op census — see cfml-common's `op-census`. Probe builds only.
 op-census = ["cfml-common/op-census"]
 # Per-BIF call + argument-shape census — see cfml-common's `bif-census`.

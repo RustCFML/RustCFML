@@ -7,6 +7,7 @@ pub mod extensions;
 mod ext_cli;
 mod rewrite;
 mod session;
+mod mcp;
 mod socketio;
 mod websocket;
 /// OpenTelemetry integration (observability Phase 3). Host-only, behind the
@@ -567,6 +568,12 @@ fn real_main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(|s| s.as_str()) == Some("ext") {
         exit(ext_cli::main(&argv[2..]));
+    }
+    // `rustcfml mcp <name>` serves an MCP server CFC over stdio. Dispatched
+    // here for the same reason `ext` is: it is a subcommand in front of an
+    // otherwise flag-driven CLI.
+    if argv.get(1).map(|s| s.as_str()) == Some("mcp") {
+        exit(mcp::stdio::main(&argv[2..]));
     }
 
     let args = Args::parse();
@@ -2368,10 +2375,24 @@ async fn async_run_server(
     // route serves, sharing one registry.
     let socketio_layer = socketio::build_layer(app_state.clone());
 
-    let app = axum::Router::new()
+    // MCP endpoints are only registered when the app actually has an `mcp/`
+    // directory — otherwise a matched `/mcp/{name}` route would shadow a real
+    // page at that path. Even then each handler falls back to ordinary request
+    // handling when the name resolves to no server CFC.
+    let mut app = axum::Router::new()
         // Raw-WebSocket upgrade for channel CFCs under <docroot>/websockets/.
         // Everything else falls through to the normal request handler.
-        .route("/ws/{channel}", axum::routing::get(websocket::ws_handler))
+        .route("/ws/{channel}", axum::routing::get(websocket::ws_handler));
+    if mcp::app_has_mcp(&app_state.doc_root, &app_state.vfs) {
+        mcp::http::spawn_reaper(app_state.server_state.clone());
+        app = app.route(
+            "/mcp/{name}",
+            axum::routing::post(mcp::http::post)
+                .get(mcp::http::get)
+                .delete(mcp::http::delete),
+        );
+    }
+    let app = app
         .fallback(handle_request)
         .layer(socketio_layer)
         .with_state(app_state);
@@ -2563,6 +2584,16 @@ fn profiler_endpoint(state: &Arc<AppState>) -> Option<axum::response::Response> 
 /// many exits is taken, the request's buffered `<cflog>` lines reach disk before
 /// the response goes out — the durability bound we document for log buffering
 /// (at most one request's lines can be lost to a hard crash).
+/// Ordinary request handling, reachable from the MCP routes so a `/mcp/...`
+/// URL that names no server CFC is still served as the application's own page.
+async fn handle_request_for_mcp(
+    state: axum::extract::State<Arc<AppState>>,
+    addr: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    handle_request(state, addr, req).await
+}
+
 async fn handle_request(
     state: axum::extract::State<Arc<AppState>>,
     addr: axum::extract::ConnectInfo<std::net::SocketAddr>,

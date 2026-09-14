@@ -26,6 +26,7 @@ mod intercepts_querydir;
 mod intercepts_varpath;
 mod intercepts_output;
 mod intercepts_realtime;
+mod intercepts_mcp;
 pub mod application_store;
 /// Host side of the dynamic native-extension ABI (`.rcx`).
 pub mod foreign;
@@ -153,6 +154,7 @@ pub mod fuse_counters {
 pub mod socketio_compat;
 pub mod web;
 pub mod websocket;
+pub mod mcp;
 pub mod flush;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
@@ -1809,6 +1811,11 @@ pub struct ServerState {
     /// node-qualified-id seam so a distributed `Broker` can slot in later
     /// without touching the wire. See `crates/cfml-vm/src/websocket.rs`.
     pub websocket: Arc<websocket::WebSocketRegistry>,
+    /// MCP session registry. Cross-request for the same reason the WebSocket
+    /// registry is: a session outlives the HTTP request that created it, and
+    /// `mcpNotify()` from any page or thread must reach it. See
+    /// `crates/cfml-vm/src/mcp/registry.rs`.
+    pub mcp: Arc<mcp::McpRegistry>,
     /// The live `server` scope — a shared `CfmlStruct` (`Arc<RwLock<…>>`) that
     /// persists server-wide across requests, giving the `server` scope real
     /// write-through semantics (Lucee/ACF parity). It is lazily seeded with the
@@ -1864,6 +1871,7 @@ impl ServerState {
             websocket: Arc::new(websocket::WebSocketRegistry::new(
                 uuid::Uuid::new_v4().to_string(),
             )),
+            mcp: Arc::new(mcp::McpRegistry::new(uuid::Uuid::new_v4().to_string())),
             server_scope: CfmlStruct::empty(),
             #[cfg(feature = "observability")]
             profiler: None,
@@ -2456,6 +2464,20 @@ pub struct CfmlVirtualMachine {
     /// a real registry is also delivering), so the same code is testable from
     /// `tests/runner.cfm` under the CLI.
     pub ws_test_log: Vec<CfmlValue>,
+    /// The MCP call context for the dispatch in flight: `(server name, session
+    /// id, stream ordinal)`. Set only for the duration of an MCP handler, and
+    /// read by `mcp()` so a tool can emit progress/log notifications onto the
+    /// stream its own request opened. `None` on a normal HTTP/CLI request.
+    pub current_mcp_call: Option<mcp::CallContext>,
+    /// The identity attached to the MCP session, consulted by the `secured`
+    /// gate exactly as `socket.data` is for WebSocket handlers. `None` means
+    /// unauthenticated, so a `secured` tool is denied.
+    pub current_mcp_identity: Option<CfmlValue>,
+    /// Every `mcpNotify(...)` this VM made, recorded for connection-free
+    /// testing the same way `ws_test_log` serves `assertBroadcast`. Lets the
+    /// CFML suite assert notification behaviour under the CLI with no client
+    /// attached.
+    pub mcp_test_log: Vec<CfmlValue>,
     /// Body override set by cfcontent (variable/file)
     pub response_body: Option<CfmlValue>,
     /// Redirect URL set by cflocation
@@ -4532,6 +4554,9 @@ impl CfmlVirtualMachine {
             current_ws_channel: None,
             current_ws_instance: None,
             ws_test_log: Vec::new(),
+            current_mcp_call: None,
+            current_mcp_identity: None,
+            mcp_test_log: Vec::new(),
             response_body: None,
             redirect_url: None,
             http_request_data: None,
@@ -11838,7 +11863,9 @@ impl CfmlVirtualMachine {
                         // by name (the design's canonical call form).
                         if matches!(&func_ref, CfmlValue::Function(f)
                             if f.name.eq_ignore_ascii_case("wspublish")
-                                || f.name.eq_ignore_ascii_case("io"))
+                                || f.name.eq_ignore_ascii_case("io")
+                                || f.name.eq_ignore_ascii_case("mcpnotify")
+                                || f.name.eq_ignore_ascii_case("mcpconnect"))
                         {
                             let named: Vec<(String, CfmlValue)> = expanded_names
                                 .iter()
@@ -16095,6 +16122,12 @@ impl CfmlVirtualMachine {
             // `args` only moves into the branch that will consume it.
             if intercepts_realtime::handles(&name_lower) {
                 match self.dispatch_realtime(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
+                }
+            }
+            if intercepts_mcp::handles(&name_lower) {
+                match self.dispatch_mcp_bif(&name_lower, args.clone()) {
                     Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
                     other => return other,
                 }
@@ -40174,6 +40207,193 @@ impl CfmlVirtualMachine {
         let prev_channel = self.current_ws_channel.replace(channel.to_string());
         let result = self.dispatch_ws_event_inner(cfc_path, method, event, args);
         self.current_ws_channel = prev_channel;
+        result
+    }
+
+    // ── MCP dispatch ──────────────────────────────────────────────────────
+    // An MCP server CFC is resolved and invoked exactly like a WebSocket
+    // channel CFC — `resolve_component_template` → `resolve_inheritance` →
+    // `attach_native_parent` — so `extends=` (including `extends="rust:Name"`)
+    // works the same way. The difference is routing: instead of one lifecycle
+    // method per frame type, a request names a tool/resource/prompt and the
+    // manifest says which CFML function that is.
+
+    /// Resolve the server CFC and hand back both the live template (what a
+    /// method is invoked on) and its public view (where `__funcmeta_` and
+    /// `__metadata` live).
+    fn mcp_component_view(
+        &mut self,
+        cfc_path: &str,
+    ) -> Result<(CfmlValue, CfmlStruct), CfmlError> {
+        let locals = ValueMap::default();
+        let template = match self.resolve_component_template(cfc_path, &locals) {
+            Some(t) => t,
+            None => return Err(self.component_load_error(cfc_path)),
+        };
+        let instance = self.resolve_inheritance(template, &locals)?;
+        let template = self.attach_native_parent(instance)?;
+
+        #[cfg(feature = "component-instance")]
+        if let CfmlValue::Instance(ref inst) = template {
+            let view = inst.read().public_map_handle();
+            return Ok((template.clone(), view));
+        }
+
+        match &template {
+            CfmlValue::Struct(s) => Ok((template.clone(), s.clone())),
+            _ => Err(self.wrap_error(CfmlError::runtime(format!(
+                "[{cfc_path}] is not an MCP server component"
+            )))),
+        }
+    }
+
+    /// Read the component's declaration attributes (`component mcp="docs"
+    /// version="1.0.0"`), which the compiler stores as the `__metadata`
+    /// sub-struct.
+    fn mcp_component_attributes(view: &CfmlStruct) -> CfmlStruct {
+        match view.get_ci("__metadata") {
+            Some(CfmlValue::Struct(s)) => s,
+            _ => match CfmlValue::strukt(ValueMap::default()) {
+                CfmlValue::Struct(s) => s,
+                _ => unreachable!("strukt always yields a Struct"),
+            },
+        }
+    }
+
+    /// Build the tool/resource/prompt manifest for an MCP server CFC.
+    ///
+    /// Pure reflection — no handler runs, which is what lets `tools/list` be
+    /// answered cheaply and lets a transport validate a call before spending a
+    /// dispatch on it.
+    pub fn mcp_manifest(
+        &mut self,
+        cfc_path: &str,
+        fallback_name: &str,
+    ) -> Result<mcp::ServerManifest, CfmlError> {
+        let (_, view) = self.mcp_component_view(cfc_path)?;
+        let attrs = Self::mcp_component_attributes(&view);
+        Ok(mcp::manifest_from_component(&view, fallback_name, &attrs))
+    }
+
+    /// Bind an MCP call's named `arguments` object onto a CFML function's
+    /// positional parameter list.
+    ///
+    /// MCP always passes arguments by name; CFML dispatch here is positional.
+    /// A parameter the client omitted takes its declared default, and trailing
+    /// omitted parameters are dropped entirely so the engine applies its own
+    /// defaulting — passing an explicit `null` would defeat it.
+    fn mcp_bind_args(func: &cfml_common::dynamic::CfmlFunction, named: &CfmlStruct) -> Vec<CfmlValue> {
+        let mut args: Vec<CfmlValue> = Vec::with_capacity(func.params.len());
+        let mut last_supplied = 0usize;
+        for (i, p) in func.params.iter().enumerate() {
+            match named.get_ci(&p.name) {
+                Some(v) => {
+                    args.push(v);
+                    last_supplied = i + 1;
+                }
+                None => args.push(p.default.clone().unwrap_or(CfmlValue::Null)),
+            }
+        }
+        args.truncate(last_supplied);
+        args
+    }
+
+    /// Invoke one MCP entity (a tool, resource or prompt handler).
+    ///
+    /// `entity.secured` is enforced before the handler runs, against the
+    /// identity attached to the session — the same contract as a `secured`
+    /// WebSocket handler, so an author learns the annotation once. With no
+    /// identity attached the gate denies, which is the safe direction.
+    pub fn dispatch_mcp(
+        &mut self,
+        cfc_path: &str,
+        entity: &mcp::Entity,
+        arguments: CfmlStruct,
+        ctx: mcp::CallContext,
+    ) -> Result<CfmlValue, CfmlError> {
+        let (template, view) = self.mcp_component_view(cfc_path)?;
+
+        let Some(CfmlValue::Function(func)) = view.get_ci(&entity.function) else {
+            return Err(self.wrap_error(CfmlError::runtime(format!(
+                "MCP handler [{}] not found on [{cfc_path}]",
+                entity.function
+            ))));
+        };
+        if let Some(secured) = &entity.secured {
+            let identity = self.current_mcp_identity.clone();
+            if !Self::ws_secured_ok(secured, identity.as_ref()) {
+                // Deliberately NOT wrapped: a wrapped error carries a stack
+                // trace naming CFC paths and line numbers, and an unauthorized
+                // caller is exactly who must not be told any of that. The
+                // custom type is how the transport recognises this as a
+                // protocol-level denial rather than a tool that threw.
+                return Err(CfmlError::new(
+                    format!("Not authorized to call [{}]", entity.name),
+                    cfml_common::vm::CfmlErrorType::Custom(mcp::UNAUTHORIZED_TYPE.to_string()),
+                ));
+            }
+        }
+        let args = Self::mcp_bind_args(&func, &arguments);
+
+        let prev_call = self.current_mcp_call.replace(ctx);
+        let result = self.dispatch_mcp_invoke(&template, &view, &func, args);
+        self.current_mcp_call = prev_call;
+        result
+    }
+
+    fn dispatch_mcp_invoke(
+        &mut self,
+        template: &CfmlValue,
+        view: &CfmlStruct,
+        func: &Arc<cfml_common::dynamic::CfmlFunction>,
+        args: Vec<CfmlValue>,
+    ) -> Result<CfmlValue, CfmlError> {
+        #[cfg(feature = "component-instance")]
+        if let CfmlValue::Instance(ref inst) = template {
+            let mut extra = args;
+            // NOT privileged: an MCP request is an external caller, so only a
+            // public/remote method is reachable — the manifest already refuses
+            // to expose anything else.
+            return self.call_instance_method(
+                inst,
+                &func.name,
+                &mut extra,
+                None,
+                DispatchCaller::Outside,
+            );
+        }
+
+        // Bind `this` + `__variables` exactly as a lifecycle method does.
+        let mut parent_locals = ValueMap::default();
+        if let Some(vars) = view.get_ci("__variables") {
+            parent_locals.insert("__variables".to_string(), vars);
+        }
+        parent_locals.insert("this".to_string(), template.clone());
+
+        let result =
+            self.call_function(&CfmlValue::Function(func.clone()), args, &parent_locals);
+
+        // Propagate variables/this mutations back into the transient instance,
+        // so a handler that caches into `variables` behaves as it would in a
+        // request (within the one dispatch — a fresh VM per call is the same
+        // contract WebSocket handlers have).
+        if let Some(vars_wb) = self.method_variables_writeback.take() {
+            if let Some(ts) = template.as_cfml_struct() {
+                let vs = ts.get_or_insert_struct("__variables");
+                vs.merge_from(&vars_wb);
+            }
+        }
+        if let Some(modified_this) = self.method_this_writeback.take() {
+            if let Some(ts) = template.as_cfml_struct() {
+                if let CfmlValue::Struct(ref modified_s) = modified_this {
+                    for (k, v) in modified_s.iter() {
+                        if k != "__variables" && k != "__extends" {
+                            ts.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
         result
     }
 

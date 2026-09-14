@@ -35,6 +35,7 @@ cfml-qoq = { workspace = true }
 # Features listed explicitly rather than taking cfml-vm's defaults, so what the
 # CLI links is visible here.
 cfml-vm = { workspace = true, default-features = false, features = [
+    "mcp-client",
     "s3",
     "std",
     "real-threads",
