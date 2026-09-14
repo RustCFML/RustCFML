@@ -47,12 +47,17 @@ rustcfml mcp docs /path/to/webroot
 rustcfml --serve /path/to/webroot     # → http://localhost:8500/mcp/docs
 ```
 
+This works the same in a `--build` self-contained binary — `myapp mcp docs`
+serves the MCP server embedded in it, which is how a client launches one.
+
 In a client's config file:
 
 ```jsonc
 {
   "mcpServers": {
     "docs": { "command": "rustcfml", "args": ["mcp", "docs", "/path/to/webroot"] },
+    // A bundled app carries its own server:
+    "bundled": { "command": "/path/to/myapp", "args": ["mcp", "docs"] },
     // …or, against a running server:
     "docs-http": { "url": "http://localhost:8500/mcp/docs" }
   }

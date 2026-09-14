@@ -24,6 +24,44 @@ use super::engine::{self, Ctx, Handled};
 /// Entry point for the `mcp` subcommand, dispatched before clap sees a
 /// positional filename (the same shape as `rustcfml ext …`).
 pub(crate) fn main(args: &[String]) -> i32 {
+    let Some(out) = claim_stdout() else { return 1 };
+    main_with(args, None, out)
+}
+
+/// The same subcommand inside a `--build` binary.
+///
+/// A bundled app is exactly what a client launches from its config
+/// (`"command": "/path/to/myapp", "args": ["mcp", "docs"]`), so the
+/// subcommand has to exist there too. The difference is the filesystem: the
+/// server CFC lives in the embedded archive, so the VFS and web root are
+/// injected rather than resolved from disk.
+pub(crate) fn embedded(
+    args: &[String],
+    vfs: Arc<dyn Vfs>,
+    base_dir: &str,
+    out: StdoutGuard,
+) -> i32 {
+    main_with(args, Some((vfs, PathBuf::from(base_dir))), out)
+}
+
+/// Take exclusive ownership of stdout before anything can write to it.
+/// Separate from the rest so an embedded binary can claim it on its very
+/// first line, ahead of extension loading and banner printing.
+pub(crate) fn claim_stdout() -> Option<StdoutGuard> {
+    match StdoutGuard::claim() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("rustcfml mcp: could not secure stdout: {e}");
+            None
+        }
+    }
+}
+
+fn main_with(
+    args: &[String],
+    embedded: Option<(Arc<dyn Vfs>, PathBuf)>,
+    mut out: StdoutGuard,
+) -> i32 {
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
             "Usage: rustcfml mcp <name> [webroot]\n\n\
@@ -33,27 +71,23 @@ pub(crate) fn main(args: &[String]) -> i32 {
         return if args.is_empty() { 2 } else { 0 };
     }
     let name = args[0].clone();
-    let webroot = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    let vfs: Arc<dyn Vfs> = Arc::new(RealFs);
+    let (vfs, webroot): (Arc<dyn Vfs>, PathBuf) = match embedded {
+        // A bundled app serves its own embedded files; a `webroot` argument
+        // would be meaningless there.
+        Some((vfs, base)) => (vfs, base),
+        None => (
+            Arc::new(RealFs),
+            args.get(1).map(PathBuf::from).unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            }),
+        ),
+    };
     let Some(info) = super::resolve_server(&webroot, &vfs, &name) else {
         eprintln!(
             "rustcfml mcp: no MCP server named [{name}] — expected {}",
             webroot.join("mcp").join(format!("{name}.cfc")).display()
         );
         return 1;
-    };
-
-    // Claim stdout before anything else can write to it.
-    let mut out = match StdoutGuard::claim() {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("rustcfml mcp: could not secure stdout: {e}");
-            return 1;
-        }
     };
 
     let cfconfig = Arc::new(cfml_config::RustCfmlConfig::default());
@@ -142,7 +176,7 @@ async fn handle_line(
 }
 
 /// Exclusive ownership of the real stdout.
-struct StdoutGuard {
+pub(crate) struct StdoutGuard {
     #[cfg(unix)]
     file: std::fs::File,
     #[cfg(not(unix))]

@@ -4624,6 +4624,14 @@ fn parse_embedded_meta(files: &std::collections::HashMap<String, Vec<u8>>) -> (S
 fn run_embedded_app(mut files: std::collections::HashMap<String, Vec<u8>>) {
     use cfml_common::vfs::{EmbeddedFs, FallbackFs, RealFs};
 
+    // stdout is claimed FIRST, before extension loading or any banner, because
+    // in MCP stdio mode a single stray byte on fd 1 corrupts the protocol
+    // stream irrecoverably. The guard redirects fd 1 to stderr and keeps a
+    // private handle for the protocol writer.
+    let mcp_stdout = (std::env::args().nth(1).as_deref() == Some("mcp"))
+        .then(mcp::stdio::claim_stdout)
+        .flatten();
+
     // A self-contained binary can still load `.rcx` extensions — from beside
     // itself, from the user's directory, or from `extensions/` in the working
     // directory. This path never sees the CLI flags (it returns before they are
@@ -4651,6 +4659,15 @@ fn run_embedded_app(mut files: std::collections::HashMap<String, Vec<u8>>) {
         real: RealFs,
         sandbox: false,
     });
+
+    // `<app> mcp <name>` serves an embedded MCP server CFC over stdio — the
+    // shape a client launches from its config. Dispatched here because the
+    // embedded binary has its own argument parsing and would otherwise treat
+    // the subcommand as noise and start a web server instead.
+    if let Some(out) = mcp_stdout {
+        let argv: Vec<String> = std::env::args().collect();
+        exit(mcp::stdio::embedded(&argv[2..], vfs, &base_dir, out));
+    }
 
     if mode == "cli" {
         run_embedded_cli(vfs, &base_dir, &entry, file_count);
