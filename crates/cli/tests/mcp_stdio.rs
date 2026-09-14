@@ -494,3 +494,35 @@ fn completion_answers_with_no_suggestions_rather_than_an_error() {
     assert_eq!(reply["result"]["completion"]["values"], json!([]));
     assert_eq!(reply["result"]["completion"]["hasMore"], false);
 }
+
+#[test]
+fn every_advertised_capability_has_its_required_methods() {
+    // Found by the reference MCP Inspector, which calls `logging/setLevel`
+    // immediately after the handshake because we advertise `logging`. A server
+    // that declares a capability MUST serve the methods that come with it —
+    // advertising one we did not implement broke the connection on its very
+    // first exchange, before any tool could be called.
+    let mut s = Server::start();
+    let caps = s.initialize()["result"]["capabilities"].clone();
+
+    if caps.get("logging").is_some() {
+        let reply = s.call(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "logging/setLevel",
+            "params": { "level": "warning" }
+        }));
+        assert!(
+            reply.get("error").is_none(),
+            "advertised `logging` but logging/setLevel failed: {reply}"
+        );
+    }
+    // The level is required, and a malformed call is a parameter error rather
+    // than a silently ignored one.
+    let reply = s.call(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "logging/setLevel", "params": {}
+    }));
+    assert_eq!(reply["error"]["code"], -32602);
+
+    // Still usable afterwards.
+    let reply = s.call(json!({ "jsonrpc": "2.0", "id": 4, "method": "ping" }));
+    assert_eq!(reply["id"], 4);
+}

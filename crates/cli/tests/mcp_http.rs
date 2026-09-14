@@ -790,3 +790,36 @@ fn sampling_is_refused_when_the_client_never_declared_it() {
     let text = result["result"]["content"][0]["text"].as_str().expect("message");
     assert!(text.contains("does not support sampling"), "got {text:?}");
 }
+
+#[test]
+fn setting_a_log_level_silences_messages_below_it() {
+    let server = Server::start();
+    let session = server.initialize();
+
+    let res = server.post(
+        &[("Mcp-Session-Id", session.as_str())],
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "logging/setLevel",
+                "params": { "level": "error" } }),
+    );
+    assert_eq!(res.status, 200);
+    assert!(res.json().get("error").is_none(), "body: {}", res.body);
+
+    // `slow` logs at info, which is now below the client's threshold, so the
+    // stream carries the response and nothing else.
+    let res = server.post(
+        &[
+            ("Mcp-Session-Id", session.as_str()),
+            ("Accept", "application/json, text/event-stream"),
+        ],
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "slow", "arguments": { "steps": 2 } } }),
+    );
+    let events = sse_events(&res.body);
+    let methods: Vec<&str> =
+        events.iter().filter_map(|(_, v)| v["method"].as_str()).collect();
+    assert!(
+        methods.is_empty(),
+        "info-level logs must be filtered out once the client asks for error: {methods:?}"
+    );
+    assert_eq!(events.last().unwrap().1["id"], 3, "the response still arrives");
+}

@@ -240,7 +240,7 @@ function reindex( numeric batches = 10 ) tool="reindex" streaming=true {
 | Method | Effect |
 |---|---|
 | `mcp().progress( done [, total] [, message] )` | `notifications/progress` on this call's stream. |
-| `mcp().log( level, data [, logger] )` | `notifications/message` — structured logging into the client's console. |
+| `mcp().log( level, data [, logger] )` | `notifications/message` — structured logging into the client's console. Filtered by whatever the client asked for with `logging/setLevel`. |
 | `mcp().session()` / `.server()` | Identifiers for the conversation and the server. |
 | `mcp().client()` | The client's `initialize` details and its capabilities. |
 | `mcp().streaming()` | Whether this call actually has a stream. |

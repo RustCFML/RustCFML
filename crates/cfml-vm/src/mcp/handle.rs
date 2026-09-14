@@ -77,12 +77,19 @@ impl McpHandle {
     }
 
     /// `notifications/message` — structured logging to the client's console.
+    ///
+    /// Filtered by whatever the client asked for with `logging/setLevel`;
+    /// below that threshold nothing goes on the wire and the caller is told
+    /// it was not delivered.
     fn log(&self, args: &[CfmlValue]) -> CfmlResult {
         let level = args
             .first()
             .map(|v| v.as_string().to_lowercase())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "info".to_string());
+        if !self.registry.logs_at(&self.ctx.session, &level) {
+            return Ok(CfmlValue::Bool(false));
+        }
         let mut params = json!({
             "level": level,
             "data": args.get(1).map(content::to_json).unwrap_or(serde_json::Value::Null),
@@ -437,6 +444,25 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
         assert_eq!(second["params"]["level"], "warning");
         assert_eq!(second["params"]["data"], "careful");
+    }
+
+    #[test]
+    fn logging_below_the_clients_chosen_level_is_not_sent() {
+        let (mut handle, sink) = setup(None);
+        let session = handle.ctx.session.clone();
+        handle.registry.set_log_level(&session, "error");
+
+        let sent = handle
+            .call_method("log", vec![CfmlValue::string("info"), CfmlValue::string("chatter")])
+            .unwrap();
+        assert!(matches!(sent, CfmlValue::Bool(false)), "below threshold");
+        assert!(sink.0.lock().is_empty());
+
+        let sent = handle
+            .call_method("log", vec![CfmlValue::string("error"), CfmlValue::string("real")])
+            .unwrap();
+        assert!(matches!(sent, CfmlValue::Bool(true)));
+        assert_eq!(sink.0.lock().len(), 1);
     }
 
     #[test]

@@ -73,6 +73,7 @@ async fn request(ctx: &Ctx, id: RpcId, method: &str, params: Value) -> Handled {
         methods::PROMPTS_LIST => list(ctx, id, EntityKind::Prompt, "prompts").await,
         methods::PROMPTS_GET => get_prompt(ctx, id, params).await,
         methods::COMPLETION_COMPLETE => complete(ctx, id, params).await,
+        methods::LOGGING_SET_LEVEL => set_log_level(ctx, id, params),
         _ => Handled::Reply(Box::new(Outgoing::error(
             id,
             METHOD_NOT_FOUND,
@@ -277,6 +278,21 @@ async fn complete(ctx: &Ctx, id: RpcId, params: Value) -> Handled {
         id,
         json!({ "completion": { "values": [], "total": 0, "hasMore": false } }),
     )
+}
+
+/// `logging/setLevel`.
+///
+/// Required of any server that advertises the `logging` capability — which we
+/// do, because `mcp().log()` exists. Advertising it without serving this is
+/// what the reference MCP Inspector trips over on its very first handshake.
+fn set_log_level(ctx: &Ctx, id: RpcId, params: Value) -> Handled {
+    let Some(level) = params.get("level").and_then(|v| v.as_str()) else {
+        return fail(id, INVALID_PARAMS, "logging/setLevel requires a \"level\"");
+    };
+    if let Some(session) = &ctx.session {
+        ctx.runtime.server_state.mcp.set_log_level(session, level);
+    }
+    reply(id, json!({}))
 }
 
 /// Shared dispatch for a resource or prompt handler: the same `secured` gate

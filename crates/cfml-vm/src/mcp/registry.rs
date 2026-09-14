@@ -72,6 +72,22 @@ impl StreamState {
     }
 }
 
+/// Rank a syslog-style MCP log level. An unrecognised name sorts as `info`,
+/// so a typo in a handler never silently drops every message.
+pub fn severity(level: &str) -> u8 {
+    match level.to_lowercase().as_str() {
+        "debug" => 0,
+        "info" => 1,
+        "notice" => 2,
+        "warning" => 3,
+        "error" => 4,
+        "critical" => 5,
+        "alert" => 6,
+        "emergency" => 7,
+        _ => 1,
+    }
+}
+
 /// Parse an event id back into `(stream ordinal, sequence)`.
 pub fn parse_event_id(raw: &str) -> Option<(StreamOrd, u64)> {
     let (s, n) = raw.split_once('-')?;
@@ -146,6 +162,10 @@ pub struct McpSession {
     /// this are tolerated but noted — some clients are sloppy about ordering.
     pub initialized: bool,
     pub last_seen_ms: u64,
+    /// Minimum severity the client wants, from `logging/setLevel`. `None`
+    /// until it asks, which means "send everything" — a client that has not
+    /// expressed a preference should not silently lose messages.
+    pub log_level: Option<String>,
     streams: HashMap<StreamOrd, StreamState>,
     next_stream: StreamOrd,
     pending: HashMap<RpcId, Arc<ResponseSlot>>,
@@ -208,12 +228,35 @@ impl McpRegistry {
             capabilities,
             initialized: false,
             last_seen_ms: now_ms,
+            log_level: None,
             streams: HashMap::new(),
             next_stream: 0,
             pending: HashMap::new(),
         };
         self.sessions.write().insert(id.clone(), Arc::new(Mutex::new(session)));
         id
+    }
+
+    /// Record the client's `logging/setLevel` choice. Returns false for an
+    /// unknown session.
+    pub fn set_log_level(&self, session_id: &str, level: &str) -> bool {
+        match self.get(session_id) {
+            Some(s) => {
+                s.lock().log_level = Some(level.to_lowercase());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Should a message of this severity be sent to the session?
+    pub fn logs_at(&self, session_id: &str, level: &str) -> bool {
+        let Some(session) = self.get(session_id) else { return true };
+        let minimum = session.lock().log_level.clone();
+        match minimum {
+            Some(minimum) => severity(level) >= severity(&minimum),
+            None => true,
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Mutex<McpSession>>> {
@@ -644,6 +687,25 @@ mod tests {
         assert_eq!(reaped, vec![stale]);
         assert_eq!(reg.session_count(), 1);
         assert!(reg.get(&fresh).is_some());
+    }
+
+    #[test]
+    fn log_level_filtering_follows_the_clients_choice() {
+        let reg = registry();
+        let id = session(&reg);
+        // No preference expressed yet: everything is sent, rather than a
+        // default silently swallowing a handler's debug output.
+        assert!(reg.logs_at(&id, "debug"));
+
+        assert!(reg.set_log_level(&id, "warning"));
+        assert!(!reg.logs_at(&id, "debug"));
+        assert!(!reg.logs_at(&id, "info"));
+        assert!(reg.logs_at(&id, "warning"));
+        assert!(reg.logs_at(&id, "error"));
+        assert!(reg.logs_at(&id, "emergency"));
+        // An unrecognised level is treated as `info` rather than dropped.
+        assert!(!reg.logs_at(&id, "chatty"));
+        assert!(!reg.set_log_level("no-such-session", "debug"));
     }
 
     #[test]
