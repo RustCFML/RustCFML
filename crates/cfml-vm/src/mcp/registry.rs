@@ -668,9 +668,14 @@ mod tests {
 
         let inner = reg.clone();
         let sid = id.clone();
-        std::thread::spawn(move || inner.end_session(&sid));
+        let teardown = std::thread::spawn(move || inner.end_session(&sid));
         // Would hang forever if teardown did not fail the slot.
         assert!(slot.wait(5_000).is_err());
+        // `end_session` wakes parked slots BEFORE it closes streams, so the
+        // wait above returning proves nothing about the sink yet. Join first:
+        // without this the next assertion races teardown and fails on a loaded
+        // machine (it did, on CI, while passing every time locally).
+        teardown.join().expect("teardown thread");
         assert!(sink.closed.load(Ordering::Relaxed));
         assert!(reg.get(&id).is_none());
         assert!(!reg.touch(&id, 1), "an unknown session is a 404, not a revival");
