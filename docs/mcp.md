@@ -8,10 +8,11 @@ launched as a subprocess over stdio. No sidecar, no SDK, no separate runtime.
 You write CFML functions. The engine derives the JSON Schema, shapes the
 results, and speaks the protocol.
 
-> **Status: phase 5.** RustCFML works in both directions: a CFC is an MCP
+> **Status: phase 6.** RustCFML works in both directions — a CFC is an MCP
 > server (tools, resources, prompts, SSE streaming, sampling), and CFML can
-> call out to remote MCP servers. Authentication is the remaining phase — see
-> [What's not here yet](#whats-not-here-yet).
+> call out to remote MCP servers — with bearer-token authentication, address
+> rules and tool filtering. See [What's not here yet](#whats-not-here-yet)
+> for the remainder.
 
 ## Quick start
 
@@ -423,6 +424,65 @@ This client declares **no** capabilities, so it will decline a server's
 `sampling` or `elicitation` request rather than leaving the server parked
 waiting for an answer it is never going to get.
 
+## Securing an endpoint
+
+An MCP server is a remote-control surface for your application, so the
+defaults are closed: **only this machine may connect**, and `secured` handlers
+are unreachable until tokens exist to authenticate against.
+
+```jsonc
+// .cfconfig.json
+{
+  "mcp": {
+    "enabled": true,
+    "allowedIPs": ["127.0.0.1", "::1", "10.0.0.0/8"],
+    "authToken": [
+      { "token": "admin-token", "roles": ["admin"] },
+      { "token": "readonly-token", "roles": [], "includedTools": ["get_*", "search*"] }
+    ],
+    "excludedTools": ["delete_*"],
+    "corsAllowedOrigins": ["https://*.example.com"],
+    "stdioRoles": []
+  }
+}
+```
+
+| Setting | Default | Means |
+|---|---|---|
+| `enabled` | `true` | Off returns 404, as if the endpoint did not exist. |
+| `allowedIPs` | `["127.0.0.1", "::1"]` | Addresses or CIDR ranges. **Empty means anywhere** — only sensible behind a proxy that authenticates for you. |
+| `authToken` | none | A string, an array of strings, or objects with `roles` and per-token tool filters. With none configured nobody is authenticated, so `secured` handlers stay unreachable. |
+| `includedTools` / `excludedTools` | `["*"]` / none | Globs (`*`, `?`). Exclusions apply after inclusions. A token's own filters replace the global ones. |
+| `corsAllowedOrigins` | none | Browser origins beyond localhost, which is always allowed. |
+| `stdioRoles` | none | Roles granted on the stdio transport. |
+
+### How `secured` gets its identity
+
+A token's `roles` become the identity a handler's `secured` annotation checks —
+the same contract a WebSocket handler's `socket.data` uses:
+
+```cfml
+function purge() tool="purge" secured="admin" { … }   // needs the admin role
+function whoami() tool="whoami" secured { … }         // any authenticated caller
+```
+
+On **stdio** the caller is whoever launched the process, so they are
+authenticated by construction — but their roles come from `stdioRoles`, which
+is empty by default. Running the binary therefore satisfies a bare `secured`
+without silently conferring `admin`.
+
+### What a caller may not use, it cannot see
+
+A tool excluded by a filter is left out of `tools/list`, and calling it
+directly is refused as **unknown** rather than forbidden — a caller should not
+be able to map what it is not allowed to reach. Denials say only
+`Not authorized`, so a probe cannot tell a wrong token from a blocked address.
+
+> **These are static bearer tokens, not the spec's OAuth 2.1 flow.** A 401 is
+> answered with `WWW-Authenticate: Bearer`, and some clients read that as an
+> invitation to start an OAuth handshake; those need the header supplied
+> directly (`"headers": { "Authorization": "Bearer …" }` in their config).
+
 ## Execution model
 
 Each call runs on a **fresh VM**, exactly as a WebSocket frame does. Nothing
@@ -482,7 +542,9 @@ and the client. Still to come:
 - **Client-side sampling** — this client declines a server's `sampling` or
   `elicitation` request. Answering one means giving CFML a way to reach a model,
   which is a larger design question than the transport.
-- **Auth (phase 6)** — bearer tokens, IP allow-lists, per-token tool
-  allow/deny. Until then, a `secured` tool is always refused, because there is
-  no identity to check it against. **Do not expose an MCP endpoint to an
-  untrusted network yet.**
+- **OAuth 2.1** — the spec's full authorization extension, with discovery and
+  token endpoints. Static bearer tokens cover a server you configure yourself;
+  OAuth is what a public multi-tenant endpoint would need.
+- **The deprecated HTTP+SSE transport** (protocol 2024-11-05's `/sse` plus a
+  POST-back endpoint) for clients that predate Streamable HTTP.
+- **A runnable `examples/mcp_demo/`.**

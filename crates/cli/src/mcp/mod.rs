@@ -12,6 +12,7 @@
 //! reachable at `/mcp/<name>`, and the component's attributes are read with a
 //! cheap source scan so an unknown path is rejected without spinning a VM.
 
+pub(crate) mod auth;
 pub(crate) mod dispatch;
 pub(crate) mod engine;
 pub(crate) mod http;

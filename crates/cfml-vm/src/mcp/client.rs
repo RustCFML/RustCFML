@@ -576,8 +576,14 @@ pub fn options_for_named_server(config: &CfmlValue, name: &str) -> Option<(Strin
     let CfmlValue::Struct(config) = config else { return None };
     let CfmlValue::Struct(servers) = config.get_ci("mcpServers")? else { return None };
     let CfmlValue::Struct(entry) = servers.get_ci(name)? else { return None };
+    // Skip empty values: the config struct always emits every key, so a
+    // present-but-blank `url` would otherwise select the HTTP transport for a
+    // stdio server.
     let mut options = ValueMap::default();
     for (k, v) in entry.iter() {
+        if v.as_string().is_empty() && !matches!(v, CfmlValue::Struct(_) | CfmlValue::Array(_)) {
+            continue;
+        }
         options.insert(k.as_str().to_string(), v.clone());
     }
     // `args` alongside `command` is the client-config convention; fold it in so
@@ -585,13 +591,18 @@ pub fn options_for_named_server(config: &CfmlValue, name: &str) -> Option<(Strin
     if let (Some(command), Some(CfmlValue::Array(args))) =
         (options.get("command").cloned(), options.get("args").cloned())
     {
+        let args: Vec<CfmlValue> = args.iter().collect();
         let joined = std::iter::once(command.as_string())
             .chain(args.iter().map(|a| quote_arg(&a.as_string())))
             .collect::<Vec<_>>()
             .join(" ");
         options.insert("command".to_string(), CfmlValue::string(joined));
     }
-    let kind = if options.contains_key("url") { "http" } else { "stdio" };
+    let kind = if options.get("url").map(|u| !u.as_string().is_empty()).unwrap_or(false) {
+        "http"
+    } else {
+        "stdio"
+    };
     Some((kind.to_string(), options))
 }
 

@@ -1,0 +1,1 @@
+<cfoutput>auth fixture</cfoutput>

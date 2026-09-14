@@ -136,6 +136,13 @@ pub struct RustCfmlConfig {
     /// classic footer. See `docs/observability-*.md`.
     pub observability: ObservabilityCfg,
     pub security: SecurityCfg,
+    /// Model Context Protocol — the server this app exposes. See `docs/mcp.md`.
+    pub mcp: McpCfg,
+    /// Remote MCP servers this app can connect to with `mcpClient( name )`.
+    /// Deliberately the same shape an editor's client config uses, so a block
+    /// can be pasted across without translation.
+    #[serde(rename = "mcpServers")]
+    pub mcp_servers: IndexMap<String, McpServerRef>,
     #[serde(rename = "urlRewriting")]
     pub url_rewriting: UrlRewritingCfg,
 
@@ -1269,6 +1276,127 @@ fn expand(s: &mut String) {
 // ─────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────
+
+/// MCP server settings (`"mcp"` in `.cfconfig.json`).
+///
+/// The defaults are deliberately closed: an MCP endpoint is a remote-control
+/// surface for the application, so it answers only to this machine until told
+/// otherwise, and `secured` handlers stay unreachable until tokens exist to
+/// authenticate against.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpCfg {
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub enabled: bool,
+    /// Bearer tokens that may call this server. Accepts a bare string, an
+    /// array of strings, or an array of objects carrying roles and per-token
+    /// tool filters — the shapes an existing `bx-mcp` config uses.
+    #[serde(rename = "authToken", alias = "authTokens", deserialize_with = "de_mcp_tokens")]
+    pub auth_tokens: Vec<McpToken>,
+    /// Callers allowed by address. Individual addresses or CIDR ranges; an
+    /// empty list means "any address", which is only sensible behind a proxy
+    /// that authenticates for you.
+    #[serde(rename = "allowedIPs")]
+    pub allowed_ips: Vec<String>,
+    /// Browser origins allowed to reach the endpoint. Localhost is always
+    /// permitted (a request from the same machine is not the DNS-rebinding
+    /// threat the check exists for); anything else must be listed.
+    #[serde(rename = "corsAllowedOrigins")]
+    pub cors_allowed_origins: Vec<String>,
+    /// Glob allow-list applied to tool names for every caller. `["*"]` = all.
+    #[serde(rename = "includedTools")]
+    pub included_tools: Vec<String>,
+    /// Glob deny-list, applied after the allow-list.
+    #[serde(rename = "excludedTools")]
+    pub excluded_tools: Vec<String>,
+    /// Roles granted to a caller on the **stdio** transport, which has no
+    /// tokens: the client is a subprocess the user launched themselves. Empty
+    /// by default — such a caller is authenticated (so a bare `secured` works)
+    /// but holds no named role, so `secured="admin"` still has to be granted
+    /// deliberately rather than by virtue of running the binary.
+    #[serde(rename = "stdioRoles")]
+    pub stdio_roles: Vec<String>,
+}
+
+impl Default for McpCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth_tokens: Vec::new(),
+            allowed_ips: vec!["127.0.0.1".into(), "::1".into()],
+            cors_allowed_origins: Vec::new(),
+            included_tools: vec!["*".into()],
+            excluded_tools: Vec::new(),
+            stdio_roles: Vec::new(),
+        }
+    }
+}
+
+/// One bearer token and what it may do.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpToken {
+    pub token: String,
+    /// Roles this token carries, matched by a handler's `secured="a,b"`.
+    pub roles: Vec<String>,
+    #[serde(rename = "includedTools")]
+    pub included_tools: Vec<String>,
+    #[serde(rename = "excludedTools")]
+    pub excluded_tools: Vec<String>,
+}
+
+/// A remote MCP server declared under `mcpServers`.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpServerRef {
+    /// stdio: the executable to launch.
+    pub command: String,
+    /// stdio: its arguments, as a client config writes them.
+    pub args: Vec<String>,
+    /// stdio: extra environment for the child.
+    pub env: IndexMap<String, String>,
+    /// http: the endpoint. Its presence is what selects the HTTP transport.
+    pub url: String,
+    /// http: headers sent with every request (an Authorization, typically).
+    pub headers: IndexMap<String, String>,
+    /// Seconds to wait for a response. `0` uses the default.
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub timeout: u32,
+}
+
+/// Accept `"authToken": "secret"`, `["a", "b"]`, or the object form
+/// `[{ "token": "a", "roles": ["admin"] }]`.
+///
+/// Being lenient here is worth the code: a token list is the one setting
+/// somebody will paste from another engine's config, and rejecting the whole
+/// file over its shape would lock them out of their own server.
+fn de_mcp_tokens<'de, D>(d: D) -> Result<Vec<McpToken>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = serde_json::Value::deserialize(d)?;
+    let one = |s: &str| McpToken { token: s.to_string(), ..Default::default() };
+    Ok(match value {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::String(s) if s.is_empty() => Vec::new(),
+        serde_json::Value::String(s) => vec![one(&s)],
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::String(s) if !s.is_empty() => out.push(one(&s)),
+                    serde_json::Value::String(_) => {}
+                    other => out.push(
+                        serde_json::from_value(other).map_err(D::Error::custom)?,
+                    ),
+                }
+            }
+            out
+        }
+        other => vec![serde_json::from_value(other).map_err(D::Error::custom)?],
+    })
+}
 
 #[cfg(test)]
 mod tests {

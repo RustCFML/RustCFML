@@ -19,6 +19,7 @@ use cfml_vm::mcp::protocol::{self, Incoming, Outgoing, RpcId};
 use cfml_vm::mcp::{ClientCapabilities, ServerManifest, StreamKind};
 use serde_json::Value;
 
+use super::auth::{self, Caller, Denied};
 use super::dispatch::McpRuntime;
 use super::engine::{self, Ctx, Handled};
 use super::sse;
@@ -68,12 +69,14 @@ pub(crate) async fn post(
         // No such MCP server: this path belongs to the application, not to us.
         return crate::handle_request_for_mcp(State(state), addr, req).await;
     };
+    let peer = addr.0.ip();
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
 
-    if let Some(deny) = guard(&headers) {
-        return deny;
-    }
+    let caller = match guard(&state, peer, &headers) {
+        Ok(caller) => caller,
+        Err(deny) => return deny,
+    };
     let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
@@ -84,7 +87,7 @@ pub(crate) async fn post(
             )
         }
     };
-    handle_post(state, info, headers, body).await
+    handle_post(state, info, headers, body, caller).await
 }
 
 async fn handle_post(
@@ -92,6 +95,7 @@ async fn handle_post(
     info: ServerInfo,
     headers: HeaderMap,
     body: Bytes,
+    caller: Caller,
 ) -> Response {
     let messages = match protocol::decode(&body) {
         Ok(m) => m,
@@ -164,7 +168,9 @@ async fn handle_post(
         .map(|a| a.contains("text/event-stream"))
         .unwrap_or(false);
     if accepts_sse && wants_stream(&messages, manifest.as_ref()) {
-        return stream_response(state, info, runtime, manifest, session_header, messages);
+        return stream_response(
+            state, info, runtime, manifest, session_header, messages, caller,
+        );
     }
 
     let capabilities = session_capabilities(&registry, session_header.as_deref());
@@ -172,7 +178,7 @@ async fn handle_post(
         runtime,
         info: info.clone(),
         session: session_header.clone(),
-        identity: None,
+        caller,
         capabilities,
         stream: None,
         manifest,
@@ -215,6 +221,7 @@ async fn handle_post(
 
 /// Answer a POST with an SSE stream: the handler runs in the background and
 /// its notifications *and* its eventual response travel on the stream.
+#[allow(clippy::too_many_arguments)]
 fn stream_response(
     state: Arc<AppState>,
     info: ServerInfo,
@@ -222,6 +229,7 @@ fn stream_response(
     manifest: Option<ServerManifest>,
     session: Option<String>,
     messages: Vec<Incoming>,
+    caller: Caller,
 ) -> Response {
     let registry = state.server_state.mcp.clone();
     let Some(session_id) = session else {
@@ -258,7 +266,7 @@ fn stream_response(
         runtime,
         info,
         session: Some(session_id.clone()),
-        identity: None,
+        caller,
         capabilities,
         stream: Some(ord),
         manifest,
@@ -331,7 +339,7 @@ pub(crate) async fn get(
         return crate::handle_request_for_mcp(State(state), addr, req).await;
     }
     let headers = req.headers().clone();
-    if let Some(deny) = guard(&headers) {
+    if let Err(deny) = guard(&state, addr.0.ip(), &headers) {
         return deny;
     }
     // A client that will not accept an event stream cannot be given one; 405 is
@@ -396,7 +404,7 @@ pub(crate) async fn delete(
     if super::resolve_server(&state.doc_root, &state.vfs, &name).is_none() {
         return crate::handle_request_for_mcp(State(state), addr, req).await;
     }
-    if let Some(deny) = guard(req.headers()) {
+    if let Err(deny) = guard(&state, addr.0.ip(), req.headers()) {
         return deny;
     }
     match header_str(req.headers(), SESSION_HEADER) {
@@ -416,32 +424,35 @@ pub(crate) async fn delete(
     }
 }
 
-/// The checks every method shares: origin, then protocol version.
-fn guard(headers: &HeaderMap) -> Option<Response> {
-    origin_rejected(headers).or_else(|| version_rejected(headers))
+/// The checks every method shares: is MCP on, is the address allowed, is the
+/// origin allowed, is there a valid token, and can we speak the version asked
+/// for. Returns the authorized caller, or the response to send instead.
+fn guard(state: &AppState, peer: std::net::IpAddr, headers: &HeaderMap) -> Result<Caller, Response> {
+    let caller = auth::authorize(&state.cfconfig.mcp, peer, headers).map_err(|denied| {
+        let status = match denied {
+            Denied::Disabled => StatusCode::NOT_FOUND,
+            Denied::Origin => StatusCode::FORBIDDEN,
+            // 401 with a challenge, so a client knows to present a token.
+            Denied::Token => StatusCode::UNAUTHORIZED,
+            Denied::Address => StatusCode::FORBIDDEN,
+        };
+        let mut response = rpc_error(status, protocol::INVALID_REQUEST, denied.message());
+        if denied == Denied::Token {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
+    })?;
+    if let Some(deny) = version_rejected(headers) {
+        return Err(deny);
+    }
+    Ok(caller)
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(|s| s.to_string())
-}
-
-/// Reject a cross-origin browser request.
-///
-/// The spec makes this a MUST: without it a web page can drive a local MCP
-/// server through DNS rebinding. Non-browser clients send no `Origin` at all,
-/// which is not a cross-origin request and is allowed through.
-fn origin_rejected(headers: &HeaderMap) -> Option<Response> {
-    let origin = header_str(headers, "origin")?;
-    if origin_is_local(&origin) {
-        return None;
-    }
-    Some((StatusCode::FORBIDDEN, format!("Origin not allowed for MCP: {origin}")).into_response())
-}
-
-fn origin_is_local(origin: &str) -> bool {
-    let authority = origin.split("//").nth(1).unwrap_or(origin);
-    let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority);
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 /// A client that names a protocol revision we cannot speak gets a 400, as the
@@ -497,20 +508,6 @@ mod tests {
             method: protocol::methods::TOOLS_CALL.to_string(),
             params,
         }
-    }
-
-    #[test]
-    fn local_origins_are_allowed_and_others_are_not() {
-        assert!(origin_is_local("http://localhost:8500"));
-        assert!(origin_is_local("http://127.0.0.1:8500"));
-        assert!(origin_is_local("https://localhost"));
-        assert!(!origin_is_local("https://evil.example.com"));
-        assert!(!origin_is_local("http://attacker.localhost.evil.com"));
-    }
-
-    #[test]
-    fn an_absent_origin_is_not_a_cross_origin_request() {
-        assert!(origin_rejected(&HeaderMap::new()).is_none());
     }
 
     #[test]

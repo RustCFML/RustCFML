@@ -3787,7 +3787,7 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
 ///   2. `.cfconfig.json` embedded in the VFS at build time (read via the
 ///      `vfs` arg using the embedded base dir)
 ///   3. Compiled-in defaults
-fn load_embedded_cfconfig(vfs: &dyn Vfs, base_dir: &str) -> RustCfmlConfig {
+pub(crate) fn load_embedded_cfconfig(vfs: &dyn Vfs, base_dir: &str) -> RustCfmlConfig {
     // 1. External next to the binary
     if let Some(dir) = resolve::exe_dir() {
         let external = dir.join(".cfconfig.json");

@@ -35,8 +35,9 @@ pub(crate) struct Ctx {
     pub(crate) runtime: McpRuntime,
     pub(crate) info: ServerInfo,
     pub(crate) session: Option<String>,
-    /// Identity for the `secured` gate. `None` until authentication lands.
-    pub(crate) identity: Option<CfmlValue>,
+    /// Who is calling, and what they may use. Carries the identity the
+    /// `secured` gate checks.
+    pub(crate) caller: super::auth::Caller,
     pub(crate) capabilities: cfml_vm::mcp::ClientCapabilities,
     /// The request-scoped stream, when the transport opened one.
     pub(crate) stream: Option<u64>,
@@ -126,9 +127,13 @@ async fn list(ctx: &Ctx, id: RpcId, kind: EntityKind, key: &str) -> Handled {
         Ok(m) => m,
         Err(h) => return h,
     };
+    // Tools the caller may not use are not listed. Advertising a tool that
+    // will be refused wastes a model's turn and leaks the shape of what it is
+    // not allowed to reach.
     let items: Vec<Value> = manifest
         .of_kind(kind)
         .filter(|e| !e.is_template())
+        .filter(|e| kind != EntityKind::Tool || ctx.caller.may_call(&e.name))
         .map(|e| e.descriptor.clone())
         .collect();
     // No `nextCursor`: the whole list is served in one page. Clients treat an
@@ -147,6 +152,11 @@ async fn call_tool(ctx: &Ctx, id: RpcId, params: Value) -> Handled {
     let Some(entity) = manifest.find(EntityKind::Tool, name) else {
         return fail(id, INVALID_PARAMS, format!("Unknown tool: {name}"));
     };
+    if !ctx.caller.may_call(name) {
+        // The same answer an unknown tool gets: a caller who may not use it
+        // should not be able to discover that it exists.
+        return fail(id, INVALID_PARAMS, format!("Unknown tool: {name}"));
+    }
 
     let arguments = match params.get("arguments") {
         Some(Value::Object(_)) | None => json_args(params.get("arguments")),
@@ -172,7 +182,7 @@ async fn call_tool(ctx: &Ctx, id: RpcId, params: Value) -> Handled {
         entity.clone(),
         arguments,
         call_ctx,
-        ctx.identity.clone(),
+        ctx.caller.identity.clone(),
     )
     .await
     {
@@ -321,7 +331,7 @@ async fn invoke(
         entity.clone(),
         arguments,
         call_ctx,
-        ctx.identity.clone(),
+        ctx.caller.identity.clone(),
     )
     .await
     .map_err(|f| {

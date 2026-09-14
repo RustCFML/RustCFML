@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "allowedIPs": ["127.0.0.1", "::1"],
+    "excludedTools": ["delete_*"],
+    "authToken": [
+      { "token": "admin-token", "roles": ["admin"] },
+      { "token": "plain-token", "roles": [] },
+      { "token": "readonly-token", "roles": [], "includedTools": ["open_*"] }
+    ]
+  }
+}

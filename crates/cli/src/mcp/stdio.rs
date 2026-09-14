@@ -11,7 +11,7 @@
 //! the protocol stream.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cfml_common::vfs::{RealFs, Vfs};
@@ -71,6 +71,7 @@ fn main_with(
         return if args.is_empty() { 2 } else { 0 };
     }
     let name = args[0].clone();
+    let embedded_vfs = embedded.as_ref().map(|(vfs, _)| vfs.clone());
     let (vfs, webroot): (Arc<dyn Vfs>, PathBuf) = match embedded {
         // A bundled app serves its own embedded files; a `webroot` argument
         // would be meaningless there.
@@ -90,9 +91,12 @@ fn main_with(
         return 1;
     };
 
-    let cfconfig = Arc::new(cfml_config::RustCfmlConfig::default());
-    let mut server_state = ServerState::with_config(false, cfconfig);
+    let cfconfig = Arc::new(load_cfconfig(&webroot, embedded_vfs.as_ref()));
+    let mut server_state = ServerState::with_config(false, cfconfig.clone());
     server_state.webroot = Some(webroot.clone());
+    // On stdio the caller IS whoever launched this process, so they are
+    // authenticated; their roles come from configuration.
+    let caller = super::auth::Caller::stdio(&cfconfig.mcp);
     let runtime = McpRuntime { server_state, vfs, sandbox: false };
 
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -115,7 +119,7 @@ fn main_with(
         if line.trim().is_empty() {
             continue;
         }
-        for reply in rt.block_on(handle_line(&runtime, &info, line.as_bytes())) {
+        for reply in rt.block_on(handle_line(&runtime, &info, line.as_bytes(), &caller)) {
             if let Err(e) = out.write_message(&reply) {
                 eprintln!("rustcfml mcp: could not write to stdout: {e}");
                 return 1;
@@ -134,6 +138,7 @@ async fn handle_line(
     runtime: &McpRuntime,
     info: &super::ServerInfo,
     body: &[u8],
+    caller: &super::auth::Caller,
 ) -> Vec<Outgoing> {
     let messages = match protocol::decode(body) {
         Ok(m) => m,
@@ -159,7 +164,7 @@ async fn handle_line(
             runtime: runtime.clone(),
             info: info.clone(),
             session: Some(session.clone()),
-            identity: None,
+            caller: caller.clone(),
             capabilities: capabilities.clone(),
             stream: None,
             manifest: None,
@@ -173,6 +178,29 @@ async fn handle_line(
         }
     }
     out
+}
+
+/// Load `.cfconfig.json` the way serve mode does, so `mcp.stdioRoles`, tool
+/// filters and `mcpServers` all behave identically on this transport. An
+/// embedded binary reads it out of its own archive.
+fn load_cfconfig(webroot: &Path, embedded: Option<&Arc<dyn Vfs>>) -> cfml_config::RustCfmlConfig {
+    if let Some(vfs) = embedded {
+        return crate::load_embedded_cfconfig(vfs.as_ref(), &webroot.to_string_lossy());
+    }
+    let mut search = vec![webroot.to_path_buf()];
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd != webroot {
+            search.push(cwd);
+        }
+    }
+    if let Some(dir) = cfml_config::resolve::exe_dir() {
+        search.push(dir);
+    }
+    cfml_config::RustCfmlConfig::load(&search).unwrap_or_else(|e| {
+        // stderr, never stdout: a warning on fd 1 would corrupt the stream.
+        eprintln!("rustcfml mcp: ignoring unreadable .cfconfig.json: {e}");
+        Default::default()
+    })
 }
 
 /// Exclusive ownership of the real stdout.
