@@ -557,6 +557,12 @@ pub mod well_known {
     pub static PROPERTIES: LazyLock<Key> = LazyLock::new(|| Key::new("__properties"));
     /// A component's class name marker.
     pub static NAME_MARKER: LazyLock<Key> = LazyLock::new(|| Key::new("__name"));
+    /// The .cfc a component instance was built from.
+    pub static SOURCE_FILE: LazyLock<Key> = LazyLock::new(|| Key::new("__source_file"));
+    /// A component instance's stable identity (GH #260).
+    pub static INSTANCE_ID: LazyLock<Key> = LazyLock::new(|| Key::new("__instance_id"));
+    /// Marks the struct standing in for a `super` reference.
+    pub static IS_SUPER: LazyLock<Key> = LazyLock::new(|| Key::new("__is_super"));
     /// The env a LEXICAL closure frame resolves its captured names through —
     /// a `Function` carrier holding the `Arc<RwLock<ValueMap>>`, see
     /// `CfmlVirtualMachine::FRAME_CLOSURE_ENV_KEY`.

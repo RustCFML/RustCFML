@@ -9286,9 +9286,13 @@ impl CfmlVirtualMachine {
             self.call_stack.push(CallFrame {
                 function_name: func.name_arc(),
                 called_name,
+                // `self.source_file` is already an `Arc<str>`; going through
+                // `as_deref().map(Arc::from)` re-allocated and copied a string
+                // we were holding shared, on every call that pushes a frame
+                // (GH #425). Cloning the Arc is a refcount bump.
                 template: func
                     .source_file_arc()
-                    .or_else(|| self.source_file.as_deref().map(Arc::from))
+                    .or_else(|| self.source_file.clone())
                     .unwrap_or_else(|| Arc::from("")),
                 line: 0,
                 caller_line: self.current_line,
@@ -19142,11 +19146,17 @@ impl CfmlVirtualMachine {
                         args
                     };
                     if args.len() >= 2 {
-                        let obj_type = args[0].as_string().to_lowercase();
+                        // GH #425: the type argument was materialised AND
+                        // lowercased on every createObject, two allocations to
+                        // test it against three constants. The comparisons below
+                        // are case-insensitive instead; the error message now
+                        // echoes the caller's own casing.
+                        let obj_type = args[0].as_string();
                         // security.disallowedImports: block component / rust
                         // paths whose argument matches any compiled pattern.
                         if !self.disallowed_imports.is_empty()
-                            && (obj_type == "component" || obj_type == "rust")
+                            && (obj_type.eq_ignore_ascii_case("component")
+                                || obj_type.eq_ignore_ascii_case("rust"))
                         {
                             let target = args[1].as_string();
                             if self
@@ -19160,7 +19170,7 @@ impl CfmlVirtualMachine {
                                 )));
                             }
                         }
-                        if obj_type == "component" {
+                        if obj_type.eq_ignore_ascii_case("component") {
                             let comp_name = args[1].as_string();
                             if let Some(template) =
                                 self.resolve_component_template(&comp_name, parent_locals)
@@ -19179,7 +19189,7 @@ impl CfmlVirtualMachine {
                             // Unresolved component path: throw rather than return
                             // null silently (Lucee/ACF both raise here).
                             return Err(self.component_load_error(&comp_name));
-                        } else if obj_type == "rust" {
+                        } else if obj_type.eq_ignore_ascii_case("rust") {
                             let class_name = args[1].as_string();
                             let key = class_name.to_lowercase();
                             if let Some(ctor) = self.native_classes.get(&key).copied() {
@@ -19197,7 +19207,7 @@ impl CfmlVirtualMachine {
                                 "No native (Rust) class registered with name '{}'",
                                 class_name
                             )));
-                        } else if obj_type == "java" {
+                        } else if obj_type.eq_ignore_ascii_case("java") {
                             let class_name = args[1].as_string().to_lowercase();
                             let empty_args: Vec<CfmlValue> = vec![];
                             return match class_name.as_str() {
@@ -25877,13 +25887,24 @@ impl CfmlVirtualMachine {
     /// Normalize a caller-supplied component path to the dotted name Lucee/ACF
     /// expose in `getMetadata(cfc).name` (e.g. "/app/x/Greeter.cfc" ->
     /// "app.x.Greeter"). Already-dotted names pass through unchanged.
-    fn dotted_component_name(class_name: &str) -> String {
-        let mut n = class_name.to_string();
-        if let Some(stripped) = n.strip_suffix(".cfc").or_else(|| n.strip_suffix(".CFC")) {
-            n = stripped.to_string();
-        }
+    /// Borrowed when the name is already in dotted form — the overwhelmingly
+    /// common case (`new foo.bar.Baz`), where every one of the four allocations
+    /// this used to make produced a byte-identical copy of its input (GH #425).
+    fn dotted_component_name_cow(class_name: &str) -> std::borrow::Cow<'_, str> {
+        let n = class_name
+            .strip_suffix(".cfc")
+            .or_else(|| class_name.strip_suffix(".CFC"))
+            .unwrap_or(class_name);
         let n = n.trim_start_matches(['/', '\\']);
-        n.replace(['/', '\\'], ".")
+        if n.contains(['/', '\\']) {
+            std::borrow::Cow::Owned(n.replace(['/', '\\'], "."))
+        } else {
+            std::borrow::Cow::Borrowed(n)
+        }
+    }
+
+    fn dotted_component_name(class_name: &str) -> String {
+        Self::dotted_component_name_cow(class_name).into_owned()
     }
 
     /// A function value that is a closure or arrow expression (as opposed to a
@@ -34640,8 +34661,17 @@ impl CfmlVirtualMachine {
                 }
             }
             let class_generation = Self::class_generation(cfc_func.global_id, parent_generation);
-            self.class_generations
-                .insert(cfc_path.to_string(), class_generation);
+            // Probe before inserting: the generation for a given .cfc is stable
+            // for the life of its compile, so every construction after the first
+            // re-inserted an identical entry — and paid a String allocation for
+            // the key to do it (GH #425).
+            match self.class_generations.get(&*cfc_path) {
+                Some(&g) if g == class_generation => {}
+                _ => {
+                    self.class_generations
+                        .insert(cfc_path.to_string(), class_generation);
+                }
+            }
             // Cross-request: adopt the tables an earlier request built for this
             // exact compile of the chain, so the first construction in THIS
             // request replays too.
@@ -34708,7 +34738,7 @@ impl CfmlVirtualMachine {
                         } else if !super_methods.is_empty() {
                             inherited_table = Some(Arc::new(super_methods.clone()));
                             super_methods
-                                .insert("__is_super".to_string(), CfmlValue::Bool(true));
+                                .insert(&*cfml_common::key::well_known::IS_SUPER, CfmlValue::Bool(true));
                             let sv = CfmlValue::strukt(super_methods);
                             if let Some(p) = parent_src.as_deref() {
                                 self.class_super_values.insert(p.to_string(), sv.clone());
@@ -34820,7 +34850,7 @@ impl CfmlVirtualMachine {
                         .cloned()
                     {
                         let mut seed: ValueMap = ValueMap::default();
-                        seed.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+                        seed.insert(&*cfml_common::key::well_known::STATIC, CfmlValue::Struct(h.clone()));
                         let _ = self.execute_function_with_args(&initfn, Vec::new(), Some(&seed));
                         let caps = self.captured_locals.take().unwrap_or_default();
                         for (k, v) in caps {
@@ -34897,7 +34927,7 @@ impl CfmlVirtualMachine {
             // component measured ~500 ns each with the suite fully green without
             // it. Kept for declaring types so their behaviour is byte-identical.
             if let (true, Some(ref h)) = (static_declared, &static_handle) {
-                injected_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+                injected_scope.insert(&*cfml_common::key::well_known::STATIC, CfmlValue::Struct(h.clone()));
             }
 
             // Construction-ordering fix: hoist the full method table into a
@@ -35046,7 +35076,7 @@ impl CfmlVirtualMachine {
             }
             self.source_file = old_source_file;
             // Capture component body variables
-            let component_variables = self.captured_locals.take().unwrap_or_default();
+            let mut component_variables = self.captured_locals.take().unwrap_or_default();
             // The CFC's functions were registered into `fn_registry` by global_id
             // when its sub-program was swapped in, and its methods were inserted
             // into `user_functions` by their DefineFunction ops. Stored method
@@ -35166,7 +35196,7 @@ impl CfmlVirtualMachine {
             // Store the CFC source path for parent resolution during inheritance
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 s.insert(
-                    "__source_file".to_string(),
+                    &*cfml_common::key::well_known::SOURCE_FILE,
                     CfmlValue::string(cfc_path.to_string()),
                 );
                 // Stable per-instance identity. Components have value semantics
@@ -35180,7 +35210,7 @@ impl CfmlVirtualMachine {
                 // ordinary hidden field; the guard compares `__instance_id` and only falls
                 // back to `ptr_eq` when it is absent (GH #260).
                 s.insert(
-                    "__instance_id".to_string(),
+                    &*cfml_common::key::well_known::INSTANCE_ID,
                     CfmlValue::Int(Self::next_component_id() as i64),
                 );
                 // Hand the already-resolved parent to `resolve_inheritance`
@@ -35191,7 +35221,7 @@ impl CfmlVirtualMachine {
                     // ENTRIES; a replayed parent keeps those in its table, so hand
                     // the (cached, class-invariant) super struct over directly.
                     if let Some(ref sv) = super_value {
-                        s.insert("__super".to_string(), sv.clone());
+                        s.insert(&*cfml_common::key::well_known::SUPER_NATIVE, sv.clone());
                     }
                 }
                 // Anonymous `component { ... }` declarations get __name = "Anonymous"
@@ -35202,7 +35232,7 @@ impl CfmlVirtualMachine {
                     _ => true,
                 };
                 if needs_override {
-                    s.insert("__name".to_string(), CfmlValue::string(dotted_name.clone()));
+                    s.insert(&*cfml_common::key::well_known::NAME_MARKER, CfmlValue::string(dotted_name.clone()));
                 }
             }
             // Inject functions added by cfinclude inside the component body
@@ -35329,6 +35359,17 @@ impl CfmlVirtualMachine {
                         vars_scope.insert(k.clone(), v.clone());
                     }
                 }
+                // GH #425: the pseudo-constructor's captured locals are fully
+                // CONSUMED by the loop above — every value is cloned into
+                // `vars_scope`, the map itself is never moved out — so its
+                // backing belongs back in the frame pool. A template frame
+                // hands `locals` to `captured_locals` and so cannot recycle at
+                // `Return` (see `recycle_locals_map`); without this the pool was
+                // never refilled from a construction and EVERY `new` allocated a
+                // fresh locals map. This is the one place that knows the escape
+                // is over.
+                #[cfg(feature = "scope-pool")]
+                self.recycle_locals_map(std::mem::take(&mut component_variables));
                 // Backstop: ensure every component method is present in the
                 // variables scope so unqualified in-method calls resolve via the
                 // scope chain. The `body_scope`/`component_variables` loop above
@@ -35380,7 +35421,7 @@ impl CfmlVirtualMachine {
                 // Expose the shared `static` scope to method frames: a CFC method
                 // resolves `static` via its `__variables.__static` handle.
                 if let (true, Some(ref h)) = (static_declared, &static_handle) {
-                    vars_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+                    vars_scope.insert(&*cfml_common::key::well_known::STATIC, CfmlValue::Struct(h.clone()));
                 }
                 // ALWAYS attach the scope, even empty. A component has a
                 // `variables` scope whether or not anything is in it, and
@@ -35400,7 +35441,7 @@ impl CfmlVirtualMachine {
                     // table lost every inherited method from the child.
                     vars_struct.set_method_table(vars_table.clone());
                 }
-                s.insert("__variables".to_string(), CfmlValue::Struct(vars_struct));
+                s.insert(&*cfml_common::key::well_known::VARIABLES, CfmlValue::Struct(vars_struct));
             }
             // Canonicalise each method's `CfmlFunction` value to the shared,
             // per-class cache (`method_arc_cache`) so every instance points at ONE
@@ -36622,7 +36663,7 @@ impl CfmlVirtualMachine {
         // replay, where those live in the table — the cached one the resolver
         // stashed on the child template as `__super`.
         let super_struct: Option<CfmlValue> = if !super_methods.is_empty() {
-            super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
+            super_methods.insert(&*cfml_common::key::well_known::IS_SUPER, CfmlValue::Bool(true));
             Some(CfmlValue::strukt(super_methods))
         } else {
             child_map.get("__super").filter(|v| match v {
@@ -39066,7 +39107,7 @@ impl CfmlVirtualMachine {
                         parent_vars = Some(pvars);
                     }
                     if !super_methods.is_empty() {
-                        super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
+                        super_methods.insert(&*cfml_common::key::well_known::IS_SUPER, CfmlValue::Bool(true));
                         self.pseudo_ctor_super.push(CfmlValue::strukt(super_methods));
                         pushed_super = true;
                     }
