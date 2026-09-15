@@ -127,6 +127,12 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 | **[Threading](docs/threads.md)** | `cfthread` on real OS threads — shared vs copied scopes, join/terminate, caveats |
 | **[WebSockets](docs/websockets.md)** | Realtime channel components, rooms, presence, auth, resumability, multi-node fan-out, ack-by-return — over raw WebSocket **and** socket.io |
 
+### AI & agents
+
+| Topic | Description |
+|---|---|
+| **[MCP](docs/mcp.md)** | Model Context Protocol in both directions — a CFC becomes an MCP server (tools, resources, prompts, SSE streaming, sampling) on the same port as your HTTP traffic or over stdio, and CFML can call out to remote MCP servers; bearer-token auth, address rules, tool filtering |
+
 ### Extend & embed
 
 | Topic | Description |
@@ -180,6 +186,7 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 - **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; in-memory **Query-of-Queries** (`dbtype="query"`) on a pure-Rust SQL engine — see the perf table below; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
 - **Real concurrency** — `cfthread` runs bodies on real OS threads with shared `application`/`request`/`session` scopes and `cflock`. See **[Threading](docs/threads.md)**.
 - **Native WebSockets** — realtime channels on the same port as HTTP: one CFC per channel with convention lifecycle methods, rooms, presence, auth, `lastEventId` resumability, multi-node fan-out, ack-by-return, and emit-from-anywhere (`wsPublish`/`io()`) — reachable over both **raw WebSocket** and the **socket.io** transport, plus an imperative **socket.io-lucee-compatible** API (`new SocketIoServer()`). See **[WebSockets](docs/websockets.md)**.
+- **Native MCP** — a CFC *is* an [MCP](docs/mcp.md) server: annotate a function and the engine derives its JSON Schema from the signature, then serves tools, resources and prompts to Claude or any agent runtime over Streamable HTTP (with SSE streaming, resumable via `Last-Event-ID`) or stdio — on the same port as your HTTP traffic, with no sidecar or SDK. CFML can call remote MCP servers too. See **[MCP](docs/mcp.md)**.
 - **Debugging & observability** — a Lucee-style debug-output footer, a FusionReactor-class threshold-gated **sampling profiler**, **OpenTelemetry** distributed traces (OTLP) + Prometheus RED metrics, and a native CPU **flamegraph profiler** (`--profile`) — all off by default and zero-cost when off. See **[Debugging & observability](docs/debugging.md)** and **[Observability ops](docs/observability-ops.md)**.
 - **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
 - **Extensible** — drop in first-class built-ins and classes written in Rust ([native modules](docs/native-modules.md)).
