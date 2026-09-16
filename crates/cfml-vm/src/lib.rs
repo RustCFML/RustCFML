@@ -8184,6 +8184,14 @@ impl CfmlVirtualMachine {
             // Same rule for the pre-split path operand — it reaches the scope by
             // name exactly as the `String` form it replaced.
             BytecodeOp::SetScopePath(sp) => Self::path_names_arguments_scope(&sp.path),
+            // ...and for `isDefined("arguments.x.y")`, whose LITERAL argument the
+            // compiler folds into this op, so the path never appears as a
+            // `String` op for the scan above to see. Missing it is GH #427: the
+            // frame skipped the eager `arguments` struct, the probe found no
+            // scope to walk, and EVERY `isDefined("arguments.…")` past the
+            // parameter itself answered false (Preside's `_parseRules` gates on
+            // one, so every form lost its validation rules).
+            BytecodeOp::IsDefined(n) => Self::path_names_arguments_scope(n.lower()),
             // `structDelete(arguments, k)` / `structClear(arguments)` (§106).
             BytecodeOp::DeleteScopeKey(n) => n.lower() == "arguments",
             _ => false,
@@ -8331,6 +8339,14 @@ impl CfmlVirtualMachine {
                 // operand names the scope where a `String` scan cannot see it.
                 BytecodeOp::SetScopePath(sp) => {
                     if Self::path_names_arguments_scope(&sp.path) {
+                        return false;
+                    }
+                }
+                // `isDefined("arguments.…")` — the folded literal names the
+                // scope where neither the `String` nor the adjacency scan can
+                // see it (GH #427).
+                BytecodeOp::IsDefined(n) => {
+                    if Self::path_names_arguments_scope(n.lower()) {
                         return false;
                     }
                 }
@@ -30296,13 +30312,38 @@ impl CfmlVirtualMachine {
     /// Check if a variable name (possibly dotted like "request.data.name") is defined
     /// by walking the scope chain: locals → request → application → server → globals
     fn is_variable_defined(&self, var_name: &str, locals: &ValueMap) -> bool {
-        let parts: Vec<&str> = var_name.split('.').collect();
-        if parts.is_empty() {
+        // A bracket subscript inside the path (`s.arr[1].q`, `x.rule[1].param`)
+        // is part of the name, so a plain `split('.')` leaves `arr[1]` as a
+        // literal key that no struct holds and the probe answered false in every
+        // scope (GH #427). Route those through the reflective path parser —
+        // the same one `getVariable`/`structGet` use, so the three keep
+        // agreeing about what a path string means. Paths with no subscript keep
+        // the cheap split (no allocation-per-segment parse, no trimming).
+        let parsed;
+        let segs: &[VarPathSeg] = if var_name.contains('[') {
+            match Self::parse_variable_path(var_name) {
+                // An unreadable name is not a defined one. `getVariable` throws
+                // here; `isDefined` is a probe and answers false.
+                Err(_) => return false,
+                Ok(v) => {
+                    parsed = v;
+                    &parsed
+                }
+            }
+        } else {
+            parsed = var_name
+                .split('.')
+                .map(|p| VarPathSeg::Key(p.to_string()))
+                .collect();
+            &parsed
+        };
+        let Some(VarPathSeg::Key(root_raw)) = segs.first() else {
+            // Empty, or a leading subscript (`[1].x`) with no scope to start from.
             return false;
-        }
-
-        let root = parts[0].to_lowercase();
-        let rest = &parts[1..];
+        };
+        let root = root_raw.to_lowercase();
+        let root_raw: &str = root_raw;
+        let rest = &segs[1..];
 
         // `local` and bare-`variables` roots resolve against the raw locals
         // map. Probe it directly instead of materializing an O(frame) struct
@@ -30358,7 +30399,7 @@ impl CfmlVirtualMachine {
         } else {
             // Check locals (exact then CI)
             locals
-                .get(parts[0])
+                .get(root_raw)
                 .cloned()
                 .or_else(|| {
                     locals
@@ -30368,7 +30409,7 @@ impl CfmlVirtualMachine {
                 })
                 // A lexical closure frame: its captured names (the same chain
                 // the variable READ path walks, see `frame_closure_env`).
-                .or_else(|| Self::closure_chain_get(locals, parts[0]))
+                .or_else(|| Self::closure_chain_get(locals, root_raw))
                 // Check the component `variables` scope. An unscoped var assigned
                 // inside a CFC method (or a closure defined in one) lands in
                 // `__variables`, not the function-local frame — so without this
@@ -30386,7 +30427,7 @@ impl CfmlVirtualMachine {
                 // Check request scope
                 .or_else(|| self.request_scope.get_ci(&root))
                 // Check globals
-                .or_else(|| self.globals.get(parts[0]).cloned())
+                .or_else(|| self.globals.get(root_raw).cloned())
                 .or_else(|| {
                     self.globals
                         .iter()
@@ -30407,11 +30448,15 @@ impl CfmlVirtualMachine {
     /// Empty `segments` means the scope root itself was probed (always defined).
     /// The first segment is resolved in the map (exact then CI, no map copy),
     /// then the remainder walks values via [`Self::path_defined_from`].
-    fn path_defined_from_map(map: &ValueMap, segments: &[&str]) -> bool {
+    fn path_defined_from_map(map: &ValueMap, segments: &[VarPathSeg]) -> bool {
         let Some((first, rest)) = segments.split_first() else {
             return true;
         };
-        let hit = map.get(*first).or_else(|| {
+        // A leading subscript on a scope (`local[1]`) names no key.
+        let VarPathSeg::Key(first) = first else {
+            return false;
+        };
+        let hit = map.get(first.as_str()).or_else(|| {
             map.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(first))
                 .map(|(_, v)| v)
@@ -30425,10 +30470,31 @@ impl CfmlVirtualMachine {
     /// Walk the remaining dotted path segments down from an already-resolved
     /// root value. Extracted from [`Self::is_variable_defined`] so map-rooted
     /// probes (`local.x`) can join the walk without building a struct copy.
-    fn path_defined_from(root_val: CfmlValue, segments: &[&str]) -> bool {
-        // Walk the dotted path segments
+    fn path_defined_from(root_val: CfmlValue, segments: &[VarPathSeg]) -> bool {
+        // Walk the path segments
         let mut current = root_val;
-        for &segment in segments {
+        for segment in segments {
+            // A bare integer subscript indexes an array; anywhere else it falls
+            // back to the literal key, which is what CFML bracket access does
+            // (and what `getVariable`'s `path_step_index` does for the same
+            // string).
+            let idx_key;
+            let segment: &str = match segment {
+                VarPathSeg::Key(k) => k.as_str(),
+                VarPathSeg::Index(n) => {
+                    if matches!(current, CfmlValue::Array(_)) {
+                        match Self::path_step_index(&current, *n) {
+                            Some(v) if !matches!(v, CfmlValue::Null) => {
+                                current = v;
+                                continue;
+                            }
+                            _ => return false,
+                        }
+                    }
+                    idx_key = n.to_string();
+                    &idx_key
+                }
+            };
             let seg_lower = segment.to_lowercase();
             match &current {
                 CfmlValue::Struct(s) => {
