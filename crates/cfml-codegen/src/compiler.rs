@@ -5644,8 +5644,17 @@ impl CfmlCompiler {
                                 if want_value {
                                     instructions.push(BytecodeOp::Dup);
                                 }
-                                // SetProperty needs [obj, value].
-                                self.compile_expression(&access.object, instructions);
+                                // SetProperty needs [obj, value]. GH #426: read the
+                                // base with the AUTO-VIV base compiler, not the
+                                // strict expression path — the twin in
+                                // `Statement::Assignment` already does. A base that
+                                // traverses a not-yet-existing array index or struct
+                                // key (`a[2].x = 1` on a size-1 array, `a[1].y.z =
+                                // 1`) must read as Null so SetProperty and the
+                                // write-back BUILD the chain; §107 made the strict
+                                // read throw, which turned the whole assignment into
+                                // the read error. Lucee 5.4/7.1 auto-create here.
+                                self.compile_index_assign_base(&access.object, instructions);
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetProperty(Name::from(&access.member)));
                                 // Write back through nested chain

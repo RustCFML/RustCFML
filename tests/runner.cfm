@@ -154,6 +154,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_variables_this_live_alias.cfm">
 <cf_runtest file="core/test_isdefined_variables_scope.cfm">
 <cf_runtest file="core/test_isdefined_path_walk.cfm">
+<cf_runtest file="core/test_nested_index_assign_autoviv.cfm">
 <cf_runtest file="core/test_argument_reference_nested.cfm">
 <cf_runtest file="core/test_language_features.cfm">
 <cf_runtest file="core/test_scopes.cfm">
