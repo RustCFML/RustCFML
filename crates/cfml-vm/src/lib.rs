@@ -37203,8 +37203,21 @@ impl CfmlVirtualMachine {
                     // The parent must itself be a directory before a listing is
                     // worth taking: the common "override CFC absent" probe walks
                     // real directories and must not pay for a missing one.
+                    //
+                    // An EMPTY accumulator is the current directory, not a
+                    // missing one: a relative path whose FIRST segment is
+                    // mis-cased ("Views/partial.cfm", or the bare
+                    // "caseone.cfc" a CLI run builds for a component) lands
+                    // here with nothing accumulated yet. Rejecting it left
+                    // exactly those paths unfolded while every absolute one
+                    // resolved (GH #387 follow-up).
                     let parent = acc.to_string_lossy().into_owned();
-                    if parent.is_empty() || !self.is_dir_cached(&parent) {
+                    let parent = if parent.is_empty() {
+                        ".".to_string()
+                    } else {
+                        parent
+                    };
+                    if !self.is_dir_cached(&parent) {
                         return None;
                     }
                     let index = self.dir_fold_index(&parent)?;

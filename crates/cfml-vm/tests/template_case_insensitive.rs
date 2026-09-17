@@ -43,7 +43,15 @@ impl CaseSensitiveFs {
         for comp in p.components() {
             match comp {
                 std::path::Component::Normal(seg) => {
-                    let listed = std::fs::read_dir(&acc)
+                    // An empty accumulator is the current directory: a relative
+                    // path's first segment has to be listed somewhere, or this
+                    // harness calls every relative path non-existent.
+                    let parent = if acc.as_os_str().is_empty() {
+                        std::path::Path::new(".").to_path_buf()
+                    } else {
+                        acc.clone()
+                    };
+                    let listed = std::fs::read_dir(&parent)
                         .map(|rd| {
                             rd.flatten().any(|e| e.file_name() == seg)
                         })
@@ -382,4 +390,39 @@ writeOutput("," & createObject("component","later").ping());
 </cfscript>"#;
     let page = fx.write("index.cfm", src);
     assert_eq!("early=notfound,late", run(&page, src, vec![]));
+}
+
+/// A path with NO parent directory — the shape a CLI run produces, and the one
+/// a relative `<cfinclude>` can still reach in serve mode. The fold walks
+/// segment by segment from an empty accumulator, so the FIRST segment's parent
+/// is the current directory; treating "" as "no directory" left exactly these
+/// paths unfolded while every absolute one resolved. Measured on a
+/// case-sensitive APFS volume before the fix: `rustcfml t.cfm` could not find
+/// `caseone.cfc` over an on-disk `CaseOne.cfc`, while `rustcfml /abs/t.cfm`
+/// could.
+///
+/// This is the one test here that changes the process working directory, so it
+/// holds `CWD_LOCK` for its duration; nothing else in this file depends on the
+/// CWD (every other fixture path is absolute).
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn folds_a_relative_path_whose_first_segment_is_miscased() {
+    let fx = Fixture::new("relfirst");
+    fx.write("CaseOne.cfc", &cfc("cfcA"));
+    fx.write("Views/Partial.cfm", "partial");
+    let src = r#"<cfinclude template="views/partial.cfm"><cfscript>
+writeOutput("," & createObject("component","caseone").ping());
+</cfscript>"#;
+    fx.write("index.cfm", src);
+
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&fx.0).expect("chdir fixture");
+    // The page itself is named relatively, so every path the VM derives from it
+    // is relative too — exactly what the CLI hands the engine.
+    let out = run("index.cfm", src, vec![]);
+    std::env::set_current_dir(prev).expect("chdir back");
+
+    assert_eq!("partial,cfcA", out);
 }

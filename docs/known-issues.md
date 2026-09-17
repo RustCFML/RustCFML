@@ -1758,6 +1758,14 @@ answers `createObject("component","...database.sqlRunner")`, and an on-disk
 `siteTree/` answers `...system.sitetree.SiteService`. macOS (APFS) and Windows
 fold in the filesystem and never reach this code.
 
+Every path shape folds, not only the absolute ones: a *relative* template path
+whose **first** segment is mis-cased (`<cfinclude template="Views/partial.cfm">`
+over an on-disk `views/`, or the bare `caseone.cfc` a CLI run derives from
+`createObject("component","caseone")`) folds the same way. That case was the one
+hole in the original fix — the segment walk rejected an empty parent as "no
+directory" rather than reading it as the current one — and it is pinned by
+`folds_a_relative_path_whose_first_segment_is_miscased`.
+
 **This is a superset, not Lucee parity.** Verified against Lucee 7.1.0.204 on a
 case-sensitive APFS volume: Lucee raises `invalid component definition, can't
 find component [sqlRunner]` for both the relative and the mapped form. We are
