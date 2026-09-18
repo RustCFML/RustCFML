@@ -163,6 +163,71 @@ pub(crate) fn op_mark_accessor_private(
     }
 }
 
+
+/// Lucee's numeric cast for a bracket subscript that addresses a 1-based
+/// position (an array element, a query row, a binary byte).
+///
+/// Lucee casts the subscript to a number and truncates toward zero, so
+/// `a[1.7]` writes element 1 and `a[-1.7]` reports position `-1`; a numeric
+/// STRING casts the same way, which is why `a["2.7"]` and `a["1e1"]` are real
+/// writes on Lucee and were silently dropped here while the subscript was
+/// decoded with `parse::<i64>().unwrap_or(0)` (GH #428). A complex value
+/// raises its own cast error via `to_string_strict`, matching Lucee's
+/// `Can't cast Complex Object Type [Array] to String`.
+fn subscript_position(index: &CfmlValue) -> Result<i64, cfml_common::vm::CfmlError> {
+    match index {
+        CfmlValue::Int(i) => Ok(*i),
+        CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Ok(*d as i64),
+        CfmlValue::Bool(b) => Ok(*b as i64),
+        other => {
+            let s = other.to_string_strict()?;
+            let t = s.trim();
+            if t.is_empty() {
+                return Err(cfml_common::vm::CfmlError::expression(
+                    "can't cast empty string to a number value".to_string(),
+                ));
+            }
+            t.parse::<f64>().map(|d| d as i64).map_err(|_| {
+                cfml_common::vm::CfmlError::expression(format!(
+                    "cannot cast [{}] string to a number value",
+                    t
+                ))
+            })
+        }
+    }
+}
+
+/// Lucee's refusal for an array write outside `1..`. Before GH #428 this write
+/// was a silent no-op — the write neither landed nor complained, so a 0-based
+/// loop ported from another language reported success having stored nothing.
+#[cold]
+fn err_cannot_set_position(pos: i64) -> cfml_common::vm::CfmlError {
+    cfml_common::vm::CfmlError::expression(format!(
+        "can not set Element at position [{}]",
+        pos
+    ))
+}
+
+/// Lucee's refusal for a subscript write into a value that holds no members
+/// (`s = 1; s[2] = 3`). Type wording follows Lucee: `Number`, `Boolean`,
+/// `String`, `user defined function (name)`.
+#[cold]
+fn err_not_a_container(target: &CfmlValue, key: &CfmlValue) -> cfml_common::vm::CfmlError {
+    let type_name = match target {
+        CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::TimeSpan(_) => "Number".to_string(),
+        CfmlValue::Bool(_) => "Boolean".to_string(),
+        CfmlValue::String(_) => "String".to_string(),
+        CfmlValue::Function(f) => format!("user defined function ({})", f.name),
+        CfmlValue::Closure(_) => "user defined function (closure)".to_string(),
+        other => other.type_name().to_string(),
+    };
+    cfml_common::vm::CfmlError::expression(format!(
+        "Can't assign value to an Object of this type [{}] with key [{}]",
+        type_name,
+        key.as_string().to_uppercase()
+    ))
+}
+
 /// `SetIndex`
 #[inline]
 pub(crate) fn op_set_index(
@@ -178,20 +243,17 @@ pub(crate) fn op_set_index(
     }
     match &mut collection {
         CfmlValue::Array(arr) => {
-            // 1-based index; accept Int or numeric Double/String.
-            let one_based: i64 = match &index {
-                CfmlValue::Int(i) => *i,
-                CfmlValue::Double(d) => *d as i64,
-                other => other.as_string().trim().parse::<i64>().unwrap_or(0),
-            };
-            if one_based >= 1 {
-                let idx = (one_based - 1) as usize;
-                // Interior mutability on the shared handle: the
-                // assignment is visible to every alias. Auto-grow
-                // past the end leaves skipped slots as null holes
-                // (Lucee): `a=[]; a[3]="x"` → len 3, [1]/[2] null.
-                arr.set_or_grow(idx, value);
+            // 1-based position, cast the way Lucee casts it (GH #428).
+            let one_based = subscript_position(&index)?;
+            if one_based < 1 {
+                return Err(err_cannot_set_position(one_based));
             }
+            let idx = (one_based - 1) as usize;
+            // Interior mutability on the shared handle: the
+            // assignment is visible to every alias. Auto-grow
+            // past the end leaves skipped slots as null holes
+            // (Lucee): `a=[]; a[3]="x"` → len 3, [1]/[2] null.
+            arr.set_or_grow(idx, value);
         }
         CfmlValue::Struct(s) => {
             // The key is only BORROWED here. `CfmlValue::String` is an
@@ -202,6 +264,21 @@ pub(crate) fn op_set_index(
             // that key again because the entry already existed. Probing with a
             // borrowed `&str` (see `IntoKey::insert_into`) makes the common
             // overwrite allocation-free and leaves the miss path at one copy.
+            // A complex subscript is a cast error on Lucee
+            // (`Can't cast Complex Object Type [Array] to String`), not a
+            // stringified dump used as a key. The discriminant test keeps the
+            // scalar-key fast path below untouched.
+            if matches!(
+                index,
+                CfmlValue::Array(_)
+                    | CfmlValue::Struct(_)
+                    | CfmlValue::Query(_)
+                    | CfmlValue::Component(_)
+                    | CfmlValue::Closure(_)
+                    | CfmlValue::Function(_)
+            ) {
+                index.to_string_strict()?;
+            }
             let key = index.as_str_cow();
             let key = key.as_ref();
             // Propagate to __variables for declared CFC properties
@@ -256,19 +333,21 @@ pub(crate) fn op_set_index(
             // produced this column proxy; assign the 1-based row cell.
             // The column CoW-detaches here; the outer SetIndex's
             // Query arm writes the whole modified column back.
-            let one_based: i64 = match &index {
-                CfmlValue::Int(i) => *i,
-                CfmlValue::Double(d) => *d as i64,
-                other => other.as_string().trim().parse::<i64>().unwrap_or(0),
-            };
-            if one_based >= 1 {
-                let idx = (one_based - 1) as usize;
-                let col = Arc::make_mut(arc);
-                if idx >= col.len() {
-                    col.resize(idx + 1, CfmlValue::Null);
-                }
-                col[idx] = value;
+            // A row outside `1..recordCount` is `invalid row number [n]` on
+            // Lucee. Growing the column instead (the pre-GH #428 behaviour)
+            // desynced it from every other column, so the query itself came
+            // out corrupt — and a row `< 1` was dropped in silence.
+            let one_based = subscript_position(&index)?;
+            let len = arc.len();
+            if one_based < 1 || (one_based as usize) > len {
+                return Err(cfml_common::vm::CfmlError::database(format!(
+                    "invalid row number [{}]",
+                    one_based
+                )));
             }
+            let idx = (one_based - 1) as usize;
+            let col = Arc::make_mut(arc);
+            col[idx] = value;
         }
         CfmlValue::Query(q) => {
             // Outer step of `q[col][row] = v`, or a whole-column
@@ -288,6 +367,35 @@ pub(crate) fn op_set_index(
         #[cfg(feature = "component-instance")]
         CfmlValue::Instance(inst) => {
             inst.read().set_public_member(index.as_string(), value);
+        }
+        // A binary IS a Java `byte[]` on Lucee: an in-range 1-based write
+        // stores the byte, and anything else is
+        // `Invalid index [n] for Native Array, can't expand Native Arrays`
+        // — Lucee will not grow a native array to fit.
+        CfmlValue::Binary(bytes) => {
+            let one_based = subscript_position(&index)?;
+            if one_based < 1 || (one_based as usize) > bytes.len() {
+                return Err(cfml_common::vm::CfmlError::expression(format!(
+                    "Invalid index [{}] for Native Array, can't expand Native Arrays",
+                    one_based
+                )));
+            }
+            // Same numeric cast as the subscript; Lucee stores the low byte.
+            bytes[(one_based - 1) as usize] = subscript_position(&value)? as u8;
+        }
+        // A value with no members cannot take a subscript write. This used to
+        // fall into a bare `_ => {}`, so `s = 1; s[2] = 3` reported success
+        // having done nothing (GH #428); Lucee throws. Container-ish and
+        // engine-internal receivers (Query, NativeObject, Component,
+        // Instance) keep their existing handling above.
+        CfmlValue::Bool(_)
+        | CfmlValue::Int(_)
+        | CfmlValue::Double(_)
+        | CfmlValue::TimeSpan(_)
+        | CfmlValue::String(_)
+        | CfmlValue::Function(_)
+        | CfmlValue::Closure(_) => {
+            return Err(err_not_a_container(&collection, &index));
         }
         _ => {}
     }
