@@ -308,25 +308,23 @@ pub(crate) fn op_set_index(
             s.insert(key, value);
         }
         CfmlValue::Null => {
-            // Auto-vivification: subscript-assigning into a variable
-            // (or member) that does not yet exist creates it, matching
-            // Lucee/ACF/BoxLang. A genuine numeric index creates an
-            // Array; any other key creates a Struct. e.g.
-            // `this.mappings["/app"] = x` where this.mappings is unset.
-            let numeric_idx = match &index {
-                CfmlValue::Int(i) => Some(*i),
-                CfmlValue::Double(d) => Some(*d as i64),
-                _ => None,
-            };
-            if let Some(i) = numeric_idx.filter(|i| *i >= 1) {
-                let arr = cfml_common::dynamic::CfmlArray::empty();
-                arr.set_or_grow((i - 1) as usize, value);
-                collection = CfmlValue::Array(arr);
-            } else {
-                let mut s = ValueMap::default();
-                s.insert(index.as_str_cow().as_ref(), value);
-                collection = CfmlValue::strukt(s);
-            }
+            // Auto-vivification: subscript-assigning into a variable (or
+            // member) that does not yet exist creates it, matching
+            // Lucee/ACF/BoxLang — e.g. `this.mappings["/app"] = x` where
+            // `this.mappings` is unset.
+            //
+            // It is ALWAYS a Struct, whatever the subscript's type (GH #429).
+            // We used to build an Array for a numeric index >= 1, which made
+            // `u[2]=1` an array of length 2 where Lucee has `{"2":1}` — a
+            // difference invisible to the immediate read, and only surfacing
+            // once something inspected the container (isArray/isStruct,
+            // arrayLen vs structCount, serializeJSON, a later arrayAppend).
+            // Lucee has no special vivified type: the result is an ordinary
+            // struct, and the array BIFs accept it via the general
+            // struct->array cast (see `struct_as_array` in cfml-stdlib).
+            let mut s = ValueMap::default();
+            s.insert(index.as_str_cow().as_ref(), value);
+            collection = CfmlValue::strukt(s);
         }
         CfmlValue::QueryColumn(arc, _) => {
             // Inner step of `q[col][row] = v`: GetIndex(query, col)

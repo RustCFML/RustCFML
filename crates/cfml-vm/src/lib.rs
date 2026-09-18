@@ -16489,6 +16489,33 @@ impl CfmlVirtualMachine {
                 }
             }
 
+            // GH #429: the same seam for a numeric-keyed struct. Since an
+            // undefined root with a numeric subscript now vivifies a STRUCT,
+            // the higher-order array BIFs below must see the positional array
+            // view of it — otherwise `arrayMap`/`arrayEach` over a container
+            // built by `for(i=1;i<=n;i++){ u[i]=… }` iterate nothing at all.
+            // Sorting/keyed struct BIFs are unaffected: the guard requires an
+            // `array*` name.
+            // Restricted to the higher-order names handled in the match below.
+            // A broader `starts_with("array")` guard also rewrote args[0] for the
+            // MUTATING BIFs that fall through to cfml-stdlib, so `arrayAppend`
+            // received an array copy and wrote into that instead of the caller's
+            // struct — the very data loss this coercion exists to prevent.
+            const STRUCT_VIEW_HIGHER_ORDER: [&str; 6] = [
+                "arraymap", "arrayfilter", "arrayreduce", "arrayeach", "arraysome", "arrayevery",
+            ];
+            if matches!(args.first(), Some(CfmlValue::Struct(_)))
+                && STRUCT_VIEW_HIGHER_ORDER.contains(&name_lower.as_str())
+            {
+                if let Some(CfmlValue::Struct(s)) = args.first() {
+                    if !cfml_common::dynamic::is_arguments_scope(s) {
+                        if let Ok(view) = cfml_common::dynamic::struct_as_positional_array(s) {
+                            args[0] = CfmlValue::array(view);
+                        }
+                    }
+                }
+            }
+
             // Higher-order standalone functions (arrayMap, arrayFilter, arrayReduce, etc.)
             match name_lower.as_str() {
                 "arraymap" => {

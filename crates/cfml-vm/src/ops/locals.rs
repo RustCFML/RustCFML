@@ -827,6 +827,15 @@ pub(crate) fn op_array_append_local(
                 arr.push(value);
                 return Ok(());
             }
+            // GH #429: a numeric-keyed struct is an array here and must be
+            // APPENDED to, not replaced by a fresh one-element array — that
+            // replacement silently dropped every element already in it. This
+            // fused op is why the bug showed up only INSIDE a function:
+            // `arrayAppend(localVar, x)` never reaches cfml-stdlib.
+            Some(CfmlValue::Struct(s)) if !cfml_common::dynamic::is_arguments_scope(s) => {
+                cfml_common::dynamic::struct_array_push(s, value)?;
+                return Ok(());
+            }
             Some(_) => {
                 slots[*i as usize] = Some(CfmlValue::array(vec![value]));
                 return Ok(());
@@ -840,16 +849,29 @@ pub(crate) fn op_array_append_local(
         arr.push(value);
         return Ok(());
     }
+    // GH #429: ...or a struct standing in for one.
+    if let Some(CfmlValue::Struct(s)) = locals.get(name) {
+        if !cfml_common::dynamic::is_arguments_scope(s) {
+            cfml_common::dynamic::struct_array_push(s, value)?;
+            return Ok(());
+        }
+    }
 
     // Resolve through the full scope chain; the returned handle
     // shares the backing with the scope slot, so a push is seen
     // by the original (globals/__variables/case-insensitive).
     let name_lower: &str = name.lower();
-    if let Some(CfmlValue::Array(arr)) =
-        vm.lookup_name_in_scopes(name, name_lower, &locals)
-    {
-        arr.push(value);
-        return Ok(());
+    match vm.lookup_name_in_scopes(name, name_lower, &locals) {
+        Some(CfmlValue::Array(arr)) => {
+            arr.push(value);
+            return Ok(());
+        }
+        // GH #429: same struct-as-array rule through the scope chain.
+        Some(CfmlValue::Struct(s)) if !cfml_common::dynamic::is_arguments_scope(&s) => {
+            cfml_common::dynamic::struct_array_push(&s, value)?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     // Not found (or not an array): create a fresh single-element

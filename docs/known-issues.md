@@ -3844,3 +3844,109 @@ Lucee returns an empty QUERY, and the mutation counters live on `cfquery`'s
 `result` attribute. Since that suite is skipped unless the env var is set,
 nothing had ever run the assertion. Corrected to what it was actually guarding:
 a non-RETURNING statement must not be routed to the row-returning path.
+
+---
+
+## 113. A subscript write that neither landed nor complained; and a numeric subscript on an undefined root built an array where Lucee builds a struct (GH #428, #429, v0.685.4) 📌
+
+Two array-write divergences from Lucee 7.1.0.204, both in `op_set_index`
+(`crates/cfml-vm/src/ops/frame.rs`). Every expectation below is measured, not
+inferred.
+
+### 113.1 — the silent drop (GH #428)
+
+`SetIndex` decoded the subscript with `parse::<i64>().unwrap_or(0)` and then did
+`if one_based >= 1 { … }` with **no else**, so every miss fell off the end of the
+op in silence. A write that neither lands nor complains is the worst of the three
+failure modes: a 0-based loop ported from another language writes nothing into
+element 1 and reports success. The READ half already matched Lucee (§107,
+v0.673.0) — only the write vanished.
+
+Fixed, and matched message-for-message:
+
+| write | before | Lucee 7.1.0.204 (now ours) |
+|---|---|---|
+| `a[0]=9`, `a[-1]=9`, `a['0']=9`, `a[false]=9` | no-op | `can not set Element at position [0]` / `[-1]` |
+| `a[0.5]=9`, `a[-1.7]=9` | no-op | same, reporting the position truncated **toward zero** |
+| `a['x']=9`, `a['0x2']=9` | no-op | `cannot cast [x] string to a number value` |
+| `a['']=9`, `a[' ']=9` | no-op | `can't cast empty string to a number value` |
+| `a[[1]]=9`, `st[[1]]=9` | no-op / stringified dump used as a key | `Can't cast Complex Object Type [Array] to String` |
+| `a['2.7']=9`, `a['1e1']=9`, `a[1.7]=9`, `a[true]=9` | **no-op** | **real writes** — the old i64 parse failed on a decimal or exponent string and fell back to 0 |
+| `s=1; s[2]=3` | no-op | `Can't assign value to an Object of this type [Number] with key [2]` |
+| `q['a'][0]="z"` | no-op | `invalid row number [0]` |
+| `q['a'][3]="z"` on a 1-row query | **grew the column**, desyncing it from every other column | `invalid row number [3]` |
+| `b[1]=65` on a binary | no-op | stores the byte; out of range is `Invalid index [n] for Native Array, can't expand Native Arrays` |
+
+The query-column case was worse than a dropped write: growing one column past
+`recordCount` left the QUERY corrupt rather than merely losing the value.
+
+Deliberately unchanged: `q['newcol']=[…]` creates the column here (Lucee refuses
+whole-column assignment outright — ours is a working superset); XML receivers
+take the struct arm; a date receiver reports `[String]` where Lucee raises a Java
+`NoSuchFieldException`.
+
+### 113.2 — vivification type, and the struct-as-array view (GH #429)
+
+`u[2]=1` on an undefined root built an ARRAY `[null,1]`; Lucee builds a STRUCT
+`{"2":1}`. Invisible to the immediate read, and only surfacing once something
+inspected the container — `isArray`/`isStruct`, `arrayLen` vs `structCount`,
+`serializeJSON`, or a later `arrayAppend`. Now a struct, whatever the subscript.
+
+That alone would have broken the idiom it enables, because on Lucee the array
+BIFs accept such a struct:
+
+```cfml
+for ( i = 1; i <= n; i++ ) { u[ i ] = …; }   // a struct on both engines
+arrayLen( u ); arrayAppend( u, x ); arrayMap( u, f );   // all still work
+```
+
+Lucee implements that with `StructAsArray`, a **positional** view over the keys
+`"1".."n"` — not the keys sorted. `struct_as_positional_array` in `cfml-common`
+provides the same, applied at the array-BIF argument boundary in `cfml-stdlib`
+and at the higher-order intercept seam in `cfml-vm`. A struct with any
+non-numeric key is refused with Lucee's wording, `can't cast struct to an array,
+key [A] is not a number`, rather than silently counted as zero.
+
+**Where we deliberately diverge.** `StructAsArray` is only coherent when the keys
+are exactly 1..n, and Lucee outside that is self-contradictory:
+
+| case | Lucee 7.1.0.204 | RustCFML |
+|---|---|---|
+| `{20:…,4:…,13:…}` → `arrayToList` | `,,` (three empty strings) | positional rule kept; a missing slot reads null |
+| `{20:…}` → `arrayFirst` | throws `key [1] doesn't exist` | null for the empty slot |
+| `arrayClear({1:10,2:20})` | leaves `{"2":20}` | leaves `{}` |
+| `arrayDeleteAt`, `arrayShift` | do not renumber | renumber 1..n |
+| `arraySort(struct)` | throws | throws, same wording |
+
+Key ORDER is not part of this. Lucee's `serializeJSON` of such a struct prints in
+Java `HashMap` bucket order — `y[3]=…; y[100]=…` prints `{"100":…,"3":…}`, and
+`{20,4,13}` prints `13,4,20` — so it is an implementation artifact, not a
+semantic. RustCFML keeps insertion order (IndexMap); the positional array view
+carries the ordering guarantee.
+
+### Traps found doing this
+
+- **`arrayAppend(localVar, x)` never reaches `cfml-stdlib`.** A fused
+  `ArrayAppendLocal`/`ArrayAppendSlot` opcode handles it, which is why the struct
+  case looked fixed at page scope and stayed broken inside a function. All three
+  paths of that op (slot, frame locals, scope chain) needed the struct arm.
+- **A mutating array BIF's return value is written back over the argument
+  variable.** Returning Lucee's `true` from the struct branch of `arrayPrepend`
+  therefore replaced the container with the boolean. Return the handle, as the
+  array arm does.
+- **Gating the VM coercion seam on `starts_with("array")` was too broad** — it
+  rewrote `args[0]` for the MUTATING BIFs too, so `arrayAppend` received an array
+  copy and wrote into that instead of the caller's struct: the exact data loss
+  the coercion exists to prevent. It is restricted to the six higher-order names
+  handled in that match.
+- **The `arguments` scope must DECLINE the view, not error on it.** It is a
+  hybrid array/struct with marker keys and its own per-BIF handling; routing it
+  through the generic view broke `serializeJSON(arguments)`.
+- **Verify the expectation, don't assume it.** `serializeJSON(arguments)` was
+  written into the new suite as `[1]`; Lucee returns `{"1":1}`, which we already
+  matched. The test was wrong, not the engine.
+
+Pre-existing and NOT addressed here: `arrayPush`/`arrayUnshift` return the array
+where Lucee returns the new length, and `arrayAppend` returns the array where
+Lucee returns `true` — true for plain arrays too, so it is unrelated to these two
+issues.

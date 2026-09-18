@@ -14,17 +14,17 @@ assertTrue("undefined var subscript-assigned with a string key becomes a struct"
 // auto-vivified struct is hash-ordered, so key order isn't guaranteed there.
 if (isRustCFML()) assert("auto-vivified struct keeps both keys", structKeyList(rcfmlAutoVivStruct), "alpha,beta");
 
-// KNOWN DIVERGENCE (under investigation — see docs/lucee-differences.md item E):
-// RustCFML treats a numeric-subscript assign to an undefined var as a 1-based
-// auto-growing ARRAY; Lucee 7.0.4 does NOT (it makes a struct keyed "3"). The
-// two asserts below are RustCFML-only until that semantic is resolved against
-// ACF/BoxLang. Do NOT take this guard as a verdict that RustCFML is correct.
+// RESOLVED (GH ##428/##429, was "known divergence item E"): a numeric subscript
+// vivifies a STRUCT keyed by the subscript, exactly as Lucee does — not a
+// 1-based auto-growing array. Both engines run the asserts below now; the fuller
+// treatment, including the array-BIF view of such a struct, is in
+// tests/core/test_numeric_subscript_vivifies_struct.cfm.
 rcfmlAutoVivArray[3] = "c";
-if (isRustCFML()) {
-    assertTrue("undefined var subscript-assigned with a numeric index becomes an array",
-        isArray(rcfmlAutoVivArray));
-    assert("auto-vivified array auto-grows to the index", arrayLen(rcfmlAutoVivArray), 3);
-}
+assertTrue("undefined var subscript-assigned with a numeric index becomes a struct",
+    isStruct(rcfmlAutoVivArray));
+assertFalse("...and is NOT an array", isArray(rcfmlAutoVivArray));
+assert("the subscript is the key", rcfmlAutoVivArray[3], "c");
+assert("it holds exactly one entry", structCount(rcfmlAutoVivArray), 1);
 
 // ------------------------------------------------------------
 // Verbose, multi-word comparison operator aliases (Lucee/ACF/BoxLang).

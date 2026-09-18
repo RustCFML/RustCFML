@@ -2640,6 +2640,46 @@ fn binary_arg0_as_array(mut args: Vec<CfmlValue>) -> Vec<CfmlValue> {
     args
 }
 
+fn struct_arg0_as_array(mut args: Vec<CfmlValue>) -> Result<Vec<CfmlValue>, CfmlError> {
+    if let Some(CfmlValue::Struct(s)) = args.first() {
+        if !cfml_common::dynamic::is_arguments_scope(s) {
+            let viewed = cfml_common::dynamic::struct_as_positional_array(s)?;
+            args[0] = CfmlValue::array(viewed);
+        }
+    }
+    Ok(args)
+}
+
+/// `args[0]` as a struct that may be used as an array — `None` for the arguments
+/// scope, which keeps its own per-call-site handling (see `is_arguments_scope`).
+#[inline]
+fn struct_array_arg0(args: &[CfmlValue]) -> Option<&cfml_common::dynamic::CfmlStruct> {
+    match args.first() {
+        Some(CfmlValue::Struct(s)) if !cfml_common::dynamic::is_arguments_scope(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// The next 1-based key for an append into a struct being used as an array:
+/// Lucee's `arrayAppend({"1":10,"2":20}, 9)` yields `{"1":10,"2":20,"3":9}`.
+fn struct_array_append(s: &cfml_common::dynamic::CfmlStruct, values: Vec<CfmlValue>) -> Result<(), CfmlError> {
+    for v in values {
+        cfml_common::dynamic::struct_array_push(s, v)?;
+    }
+    Ok(())
+}
+
+/// Rewrite a struct-as-array in place from a positional vector, renumbering the
+/// keys 1..n. Lucee does this for inserts but NOT for removals (its `arrayClear`
+/// on `{"1":10,"2":20}` leaves `{"2":20}`, and `arrayDeleteAt` likewise) — an
+/// internal inconsistency we do not reproduce; a cleared array is empty here.
+fn struct_array_rewrite(s: &cfml_common::dynamic::CfmlStruct, values: Vec<CfmlValue>) {
+    s.clear();
+    for (i, v) in values.into_iter().enumerate() {
+        s.insert((i + 1).to_string().as_str(), v);
+    }
+}
+
 fn fn_array_new(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::array(Vec::new()))
 }
@@ -2668,9 +2708,12 @@ fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
                     .count();
                 return Ok(CfmlValue::Int(count as i64));
             }
-            // Plain struct: count entries with numeric keys (1-based positional args).
-            let count = s.keys().into_iter().filter(|k| k.parse::<usize>().is_ok()).count();
-            Ok(CfmlValue::Int(count as i64))
+            // GH #429: a plain struct is the array-view length, and a
+            // non-numeric key is a cast error rather than a silent count that
+            // quietly skipped it.
+            Ok(CfmlValue::Int(
+                cfml_common::dynamic::struct_as_positional_array(s)?.len() as i64,
+            ))
         }
         _ => Ok(CfmlValue::Int(0)),
     }
@@ -2685,6 +2728,21 @@ fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
         // elements are appended individually instead of as a single nested
         // element (Lucee/ACF semantics).
         let merge = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+        // GH #429: a numeric-keyed struct is an array here. It must be APPENDED
+        // to in place — the legacy fall-through below would replace it with a
+        // one-element array and drop everything already in it.
+        if let Some(s) = struct_array_arg0(&args) {
+            let values = match (&args[1], merge) {
+                (CfmlValue::Array(elems), true) => elems.snapshot(),
+                _ => vec![args[1].clone()],
+            };
+            struct_array_append(s, values)?;
+            // Return the STRUCT handle, not a bool: a mutating array BIF's
+            // result is written back over the argument variable, so returning
+            // `true` replaced the container with the boolean. The array arm
+            // returns its handle for the same reason.
+            return Ok(CfmlValue::Struct(s.clone()));
+        }
         if let CfmlValue::Array(a) = &args[0] {
             match (&args[1], merge) {
                 (CfmlValue::Array(elems), true) => {
@@ -2709,6 +2767,13 @@ fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
+        // GH #429: see `fn_array_append`. Lucee renumbers on an insert.
+        if let Some(s) = struct_array_arg0(&args) {
+            let mut values = cfml_common::dynamic::struct_as_positional_array(s)?;
+            values.insert(0, args[1].clone());
+            struct_array_rewrite(s, values);
+            return Ok(CfmlValue::Struct(s.clone()));
+        }
         if let CfmlValue::Array(a) = &args[0] {
             a.with_write(|v| v.insert(0, args[1].clone()));
             return Ok(CfmlValue::Array(a.clone()));
@@ -2844,6 +2909,8 @@ fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
 /// (`ArrayContains.call`), and its plain-`arrayContains` substring scan is
 /// case-SENSITIVE even though the equality scan below is not — mirrored here.
 fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if args.len() >= 3 && args[2].is_true() {
@@ -2890,6 +2957,8 @@ fn array_contains_substring(
 }
 
 fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
@@ -2920,6 +2989,14 @@ fn fn_array_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_sort(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: arraySort is the one array BIF Lucee does NOT extend to a
+    // struct-as-array, and it says so rather than sorting nothing.
+    if matches!(args.first(), Some(CfmlValue::Struct(_))) {
+        return Err(CfmlError::expression(
+            "Invalid call of the function [ArraySort], first Argument [array] is invalid, cannot sort object from type [struct]"
+                .to_string(),
+        ));
+    }
     if let Some(CfmlValue::Array(arr)) = args.first() {
         let sort_type = if args.len() > 1 { get_str(&args, 1).to_lowercase() } else { "text".to_string() };
         let sort_order = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "asc".to_string() };
@@ -2951,6 +3028,8 @@ fn fn_array_sort(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -2963,6 +3042,8 @@ fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -2995,6 +3076,8 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_to_list(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -3007,6 +3090,17 @@ fn fn_array_to_list(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_merge(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    // arrayMerge is the one case where the SECOND operand is an array too, so
+    // it needs the same view — otherwise merging a vivified container silently
+    // produced an empty result.
+    let mut args = struct_arg0_as_array(args)?;
+    if let Some(CfmlValue::Struct(s)) = args.get(1) {
+        if !cfml_common::dynamic::is_arguments_scope(s) {
+            let viewed = cfml_common::dynamic::struct_as_positional_array(s)?;
+            args[1] = CfmlValue::array(viewed);
+        }
+    }
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
@@ -3032,6 +3126,14 @@ fn fn_array_merge(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a struct-as-array clears to EMPTY. Lucee's own arrayClear leaves
+    // `{"2":20}` behind on `{"1":10,"2":20}` — it drops key "1" and renumbers
+    // nothing — which is a bug we deliberately do not reproduce.
+    if let Some(s) = struct_array_arg0(&args) {
+        cfml_common::dynamic::struct_as_positional_array(s)?;
+        s.clear();
+        return Ok(CfmlValue::Struct(s.clone()));
+    }
     // In-place clear on the shared handle (aliases see the emptied array).
     if let Some(CfmlValue::Array(a)) = args.first() {
         a.with_write(|v| v.clear());
@@ -3041,6 +3143,8 @@ fn fn_array_clear(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
@@ -3112,6 +3216,8 @@ fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_min(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -3127,6 +3233,8 @@ fn fn_array_min(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_max(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -3142,6 +3250,8 @@ fn fn_array_max(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_avg(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -3154,6 +3264,8 @@ fn fn_array_avg(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_sum(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
@@ -3166,9 +3278,13 @@ fn fn_array_sum(args: Vec<CfmlValue>) -> CfmlResult {
 
 // Higher-order array functions (stubs - would need closure support in builtins)
 fn fn_array_map(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     Ok(args.into_iter().next().unwrap_or(CfmlValue::array(Vec::new())))
 }
 fn fn_array_filter(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     Ok(args.into_iter().next().unwrap_or(CfmlValue::array(Vec::new())))
 }
 fn fn_array_reduce(_args: Vec<CfmlValue>) -> CfmlResult {
@@ -3196,6 +3312,8 @@ fn fn_is_array(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     match args.first() {
@@ -3252,6 +3370,8 @@ fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_first(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     match args.first() {
@@ -3261,6 +3381,8 @@ fn fn_array_first(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_last(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     match args.first() {
@@ -9586,6 +9708,13 @@ fn fn_list_reduce(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_pop(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a struct-as-array pops its last position and renumbers.
+    if let Some(s) = struct_array_arg0(&args) {
+        let mut values = cfml_common::dynamic::struct_as_positional_array(s)?;
+        let last = values.pop();
+        struct_array_rewrite(s, values);
+        return last.ok_or_else(|| CfmlError::runtime("Cannot pop from empty array".to_string()));
+    }
     if let Some(CfmlValue::Array(arr)) = args.first() {
         // In-place: removes the last element from the shared array.
         match arr.with_write(|v| v.pop()) {
@@ -9598,6 +9727,16 @@ fn fn_array_pop(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_shift(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a struct-as-array shifts its first position and renumbers.
+    if let Some(s) = struct_array_arg0(&args) {
+        let mut values = cfml_common::dynamic::struct_as_positional_array(s)?;
+        if values.is_empty() {
+            return Err(CfmlError::runtime("Cannot shift from empty array".to_string()));
+        }
+        let first = values.remove(0);
+        struct_array_rewrite(s, values);
+        return Ok(first);
+    }
     if let Some(CfmlValue::Array(arr)) = args.first() {
         // In-place: removes the first element from the shared array.
         match arr.with_write(|v| if v.is_empty() { None } else { Some(v.remove(0)) }) {
@@ -17861,6 +18000,8 @@ fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_median(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     match args.get(0) {
@@ -17888,6 +18029,8 @@ fn fn_array_median(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     match args.get(0) {
@@ -17957,6 +18100,8 @@ fn fn_array_range(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_to_struct(args: Vec<CfmlValue>) -> CfmlResult {
+    // GH #429: a numeric-keyed struct reads as an array here (Lucee parity).
+    let args = struct_arg0_as_array(args)?;
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     match args.get(0) {

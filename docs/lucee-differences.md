@@ -67,49 +67,54 @@ pattern fields are computed directly and need no table.
 
 ---
 
-## E. UNRESOLVED DIVERGENCE — numeric-subscript auto-vivification
+## E. RESOLVED — numeric-subscript auto-vivification makes a struct
 
-**Status:** open — needs a decision on which behaviour is correct. Guarded
-RustCFML-only for now so it doesn't fail the Lucee run, but it is **not** settled.
+**Status:** resolved in GH #429. RustCFML now matches Lucee: a numeric subscript
+assigned into an *undefined* root vivifies a **struct**, not an array. Nothing is
+guarded RustCFML-only any more; the case runs on both engines.
 
-**File:** `tests/core/test_subscript_autovivify.cfm`
+**Files:** `tests/core/test_subscript_autovivify.cfm`,
+`tests/core/test_numeric_subscript_vivifies_struct.cfm`
 
 **The case:**
 ```cfml
 // rcfmlAutoVivArray is undefined here
-rcfmlAutoVivArray[3] = "c";
+rcfmlAutoVivArray[3] = "c";      // both engines: struct { "3": "c" }
 ```
 
-**What each engine does:**
+RustCFML used to vivify a 1-based auto-growing array (`[null,null,"c"]`), which
+was invisible to the immediate read and only surfaced once something inspected
+the container — `isArray`/`isStruct`, `arrayLen` vs `structCount`,
+`serializeJSON`, or a later `arrayAppend`.
 
-| Engine | `isArray(rcfmlAutoVivArray)` | length / shape |
-|---|---|---|
-| **RustCFML** | `true` | a 1-based, auto-growing **array** of length 3 (`[null, null, "c"]`) |
-| **Lucee 7.0.4** | `false` | a **struct** with a single key `"3"` → `"c"` |
+**What made it more than a one-line change:** Lucee's array BIFs accept such a
+struct, so the idiom `for(i=1;i<=n;i++){ u[i]=…; }` still works with `arrayLen`,
+`arrayAppend`, `arrayMap` and the rest. Lucee implements that with
+`StructAsArray`, a **positional** view over the keys `"1".."n"`. RustCFML now
+provides the same view (`struct_as_positional_array` in `cfml-common`), applied
+at the array-BIF argument boundary in `cfml-stdlib` and at the higher-order
+intercept seam in `cfml-vm`.
 
-So assigning a numeric subscript into an *undefined* variable:
-- **RustCFML** vivifies an **array** (and grows it to the index).
-- **Lucee 7.0.4** vivifies a **struct** keyed by the numeric-as-string.
+**Where we deliberately do NOT follow Lucee.** `StructAsArray` is only coherent
+when the keys are exactly 1..n, and Lucee's own behaviour outside that is
+self-contradictory. Measured on Lucee 7.1.0.204:
 
-**Why this matters / why it's flagged:** the test's own comment claims this
-behaviour is *"matching Lucee/ACF/BoxLang"* — but a live Lucee 7.0.4 run
-**contradicts that**. One of these is true:
-1. RustCFML is right and Lucee 7.0.4 differs (then the comment is fine but Lucee
-   is the outlier), or
-2. The test enshrines a RustCFML quirk that diverges from the reference engines
-   (then RustCFML should arguably create a struct keyed `"3"`).
+| case | Lucee 7.1.0.204 | RustCFML | why |
+|---|---|---|---|
+| `s={20:…,4:…,13:…}; arrayToList(s)` | `,,` (three empty strings) | same positional rule, missing slots read null | we keep the rule, not the garbage |
+| `s={20:…}; arrayFirst(s)` | throws `key [1] doesn't exist` | null for the empty slot | an engine-internal leak, not a semantic |
+| `arrayClear({1:10,2:20})` | leaves `{"2":20}` | leaves `{}` | a cleared array holding an element is a bug |
+| `arrayDeleteAt`, `arrayShift` | do not renumber | renumber 1..n | Lucee renumbers on *insert* but not removal |
+| `arraySort(struct)` | throws | throws (same wording) | matched |
 
-**To resolve (next session):**
-- Check Adobe ColdFusion and BoxLang behaviour for `x[3] = "c"` on an undefined
-  `x` (array vs struct, and whether it auto-grows). cfdocs / the BoxLang spec.
-- If the reference engines make a **struct**, RustCFML's auto-viv-to-array is the
-  bug — fix the vivification path (look for the subscript-assign-to-undefined
-  handling in `crates/cfml-vm/src/lib.rs` / the codegen for `AssignTarget::ArrayAccess`
-  on an undefined root) and update the test + comment.
-- If they make an **array**, keep RustCFML's behaviour, correct the test comment
-  (Lucee 7.0.4 is the outlier), and consider whether the guard can be removed
-  (it can't while Lucee stays red, but the comment should say so).
+A struct with any non-numeric key is refused on both engines with Lucee's
+wording: `can't cast struct to an array, key [A] is not a number`.
+
+**Key order is not part of this.** Lucee's `serializeJSON` of a vivified struct
+prints in Java `HashMap` bucket order, not numerically — `y[3]=…; y[100]=…`
+prints `{"100":…,"3":…}`, and `{20,4,13}` prints `13,4,20`. That is an
+implementation artifact, so RustCFML keeps its insertion order (IndexMap) and the
+positional *array view* is what carries the ordering guarantee.
 
 **Note on `string`-key auto-viv:** the sibling case `x["alpha"] = 1` (string key
-→ struct) is *not* in dispute — both engines make a struct; only the numeric case
-diverges.
+→ struct) was never in dispute — both engines make a struct, and always did.

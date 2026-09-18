@@ -2203,6 +2203,62 @@ impl fmt::Debug for CfmlValue {
     }
 }
 
+/// The arguments scope is a hybrid array/struct carrying marker keys. It has its
+/// own array-ish handling at each call site (`arrayLen(arguments)` counts the
+/// bound args), so the generic struct→array view below must decline it rather
+/// than re-view it — coercing it turned `serializeJSON(arguments)` into an error.
+pub fn is_arguments_scope(s: &CfmlStruct) -> bool {
+    s.contains_key("__arguments_scope")
+}
+
+/// Lucee's struct→array view at an array-BIF argument boundary (GH #429).
+///
+/// Since #429 an undefined root subscript-assigned with a numeric index
+/// vivifies a STRUCT (`u[2]=1` → `{"2":1}`, Lucee parity) rather than an array,
+/// so the array BIFs have to accept the container that idiom produces —
+/// otherwise `for(i=1;i<=n;i++){ u[i]=…; } arrayLen(u)` answers nonsense and
+/// `arrayAppend(u,x)` REPLACES the struct with a one-element array, losing every
+/// element already in it.
+///
+/// Lucee wraps such a struct in `StructAsArray`, a POSITIONAL view over the keys
+/// `"1".."n"` where n is the struct's size — NOT the keys sorted. That wrapper is
+/// only coherent when the keys are exactly 1..n: given `{20:…,4:…,13:…}` Lucee's
+/// `arrayToList` yields `,,` (three empty strings) and its `arrayFirst` throws
+/// `key [1] doesn't exist`. We keep the positional rule, which is the part real
+/// code depends on, and render a missing position as null rather than reproduce
+/// the throw — deliberately not bug-for-bug; see docs/known-issues.md.
+///
+/// A struct with any non-numeric key is refused with Lucee's own wording, which
+/// is a genuine cast error on both engines rather than a silent zero.
+pub fn struct_as_positional_array(s: &CfmlStruct) -> Result<Vec<CfmlValue>, CfmlError> {
+    debug_assert!(!is_arguments_scope(s), "callers skip the arguments scope");
+    let keys = s.keys();
+    for k in &keys {
+        if k.parse::<i64>().is_err() {
+            return Err(CfmlError::expression(format!(
+                "can't cast struct to an array, key [{}] is not a number",
+                k.to_uppercase()
+            )));
+        }
+    }
+    let n = keys.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 1..=n {
+        out.push(s.get(i.to_string().as_str()).unwrap_or(CfmlValue::Null));
+    }
+    Ok(out)
+}
+
+/// Append to a struct being used as an array (GH #429): the new entry takes the
+/// key after the last position, so `arrayAppend({"1":10,"2":20}, 9)` yields
+/// `{"1":10,"2":20,"3":9}` exactly as Lucee does. Returns the cast error for a
+/// struct that is not a legal array view.
+pub fn struct_array_push(s: &CfmlStruct, value: CfmlValue) -> Result<(), CfmlError> {
+    let next = struct_as_positional_array(s)?.len() + 1;
+    s.insert(next.to_string().as_str(), value);
+    Ok(())
+}
+
 impl CfmlValue {
     pub fn type_name(&self) -> &'static str {
         match self {
