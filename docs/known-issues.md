@@ -3915,8 +3915,13 @@ are exactly 1..n, and Lucee outside that is self-contradictory:
 | `{20:…,4:…,13:…}` → `arrayToList` | `,,` (three empty strings) | positional rule kept; a missing slot reads null |
 | `{20:…}` → `arrayFirst` | throws `key [1] doesn't exist` | null for the empty slot |
 | `arrayClear({1:10,2:20})` | leaves `{"2":20}` | leaves `{}` |
-| `arrayDeleteAt`, `arrayShift` | do not renumber | renumber 1..n |
 | `arraySort(struct)` | throws | throws, same wording |
+
+The MUTATORS are key-based, not positional, and match Lucee exactly: append
+takes `max numeric key + 1` floored at 1, prepend shifts every existing key up
+by one, and a removal names a position key and refuses one that is absent
+(`can't remove key [1] from struct, key does not exist`) without renumbering
+what remains. Only `arrayClear` diverges, above.
 
 Key ORDER is not part of this. Lucee's `serializeJSON` of such a struct prints in
 Java `HashMap` bucket order — `y[3]=…; y[100]=…` prints `{"100":…,"3":…}`, and
@@ -3945,6 +3950,16 @@ carries the ordering guarantee.
 - **Verify the expectation, don't assume it.** `serializeJSON(arguments)` was
   written into the new suite as `[1]`; Lucee returns `{"1":1}`, which we already
   matched. The test was wrong, not the engine.
+- **A dense fixture hid a destructive bug for a whole release.** v0.685.4 shipped
+  with the append key computed as *positional size + 1*. That equals the right
+  answer for a dense 1..n struct, and every append test used one — so the suite
+  was green while `u[2]=1; arrayAppend(u,5)` produced `{"2":5}`, OVERWRITING the
+  element. The correct rule is `max numeric key + 1`. `arrayPrepend` had the
+  matching fault: renumbering densely to 1..n dropped the shifted value entirely
+  (`{"2":1}` → `{"1":9,"2":null}` instead of `{"1":9,"3":1}`). Fixed in v0.685.5
+  with 14 sparse-shape assertions. **The fixture that matches the issue's own
+  headline example is the one the suite most needs** — `u[2]=1` is sparse, and
+  nothing in the suite was.
 
 Pre-existing and NOT addressed here: `arrayPush`/`arrayUnshift` return the array
 where Lucee returns the new length, and `arrayAppend` returns the array where

@@ -104,11 +104,14 @@ self-contradictory. Measured on Lucee 7.1.0.204:
 | `s={20:…,4:…,13:…}; arrayToList(s)` | `,,` (three empty strings) | same positional rule, missing slots read null | we keep the rule, not the garbage |
 | `s={20:…}; arrayFirst(s)` | throws `key [1] doesn't exist` | null for the empty slot | an engine-internal leak, not a semantic |
 | `arrayClear({1:10,2:20})` | leaves `{"2":20}` | leaves `{}` | a cleared array holding an element is a bug |
-| `arrayDeleteAt`, `arrayShift` | do not renumber | renumber 1..n | Lucee renumbers on *insert* but not removal |
 | `arraySort(struct)` | throws | throws (same wording) | matched |
 
 A struct with any non-numeric key is refused on both engines with Lucee's
 wording: `can't cast struct to an array, key [A] is not a number`.
+
+The mutators follow Lucee's key-based rules exactly: append at `max key + 1`
+(floored at 1), prepend shifts existing keys up by one, and a removal refuses an
+absent position key rather than renumbering. `arrayClear` is the only divergence.
 
 **Key order is not part of this.** Lucee's `serializeJSON` of a vivified struct
 prints in Java `HashMap` bucket order, not numerically — `y[3]=…; y[100]=…`

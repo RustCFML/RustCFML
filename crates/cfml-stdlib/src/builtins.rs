@@ -2669,17 +2669,6 @@ fn struct_array_append(s: &cfml_common::dynamic::CfmlStruct, values: Vec<CfmlVal
     Ok(())
 }
 
-/// Rewrite a struct-as-array in place from a positional vector, renumbering the
-/// keys 1..n. Lucee does this for inserts but NOT for removals (its `arrayClear`
-/// on `{"1":10,"2":20}` leaves `{"2":20}`, and `arrayDeleteAt` likewise) — an
-/// internal inconsistency we do not reproduce; a cleared array is empty here.
-fn struct_array_rewrite(s: &cfml_common::dynamic::CfmlStruct, values: Vec<CfmlValue>) {
-    s.clear();
-    for (i, v) in values.into_iter().enumerate() {
-        s.insert((i + 1).to_string().as_str(), v);
-    }
-}
-
 fn fn_array_new(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::array(Vec::new()))
 }
@@ -2769,9 +2758,7 @@ fn fn_array_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         // GH #429: see `fn_array_append`. Lucee renumbers on an insert.
         if let Some(s) = struct_array_arg0(&args) {
-            let mut values = cfml_common::dynamic::struct_as_positional_array(s)?;
-            values.insert(0, args[1].clone());
-            struct_array_rewrite(s, values);
+            cfml_common::dynamic::struct_array_unshift(s, args[1].clone())?;
             return Ok(CfmlValue::Struct(s.clone()));
         }
         if let CfmlValue::Array(a) = &args[0] {
@@ -9710,10 +9697,11 @@ fn fn_list_reduce(_args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_pop(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #429: a struct-as-array pops its last position and renumbers.
     if let Some(s) = struct_array_arg0(&args) {
-        let mut values = cfml_common::dynamic::struct_as_positional_array(s)?;
-        let last = values.pop();
-        struct_array_rewrite(s, values);
-        return last.ok_or_else(|| CfmlError::runtime("Cannot pop from empty array".to_string()));
+        let n = cfml_common::dynamic::struct_as_positional_array(s)?.len() as i64;
+        if n == 0 {
+            return Err(CfmlError::runtime("Cannot pop from empty array".to_string()));
+        }
+        return cfml_common::dynamic::struct_array_remove_key(s, n);
     }
     if let Some(CfmlValue::Array(arr)) = args.first() {
         // In-place: removes the last element from the shared array.
@@ -9729,13 +9717,10 @@ fn fn_array_pop(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_shift(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #429: a struct-as-array shifts its first position and renumbers.
     if let Some(s) = struct_array_arg0(&args) {
-        let mut values = cfml_common::dynamic::struct_as_positional_array(s)?;
-        if values.is_empty() {
+        if cfml_common::dynamic::struct_as_positional_array(s)?.is_empty() {
             return Err(CfmlError::runtime("Cannot shift from empty array".to_string()));
         }
-        let first = values.remove(0);
-        struct_array_rewrite(s, values);
-        return Ok(first);
+        return cfml_common::dynamic::struct_array_remove_key(s, 1);
     }
     if let Some(CfmlValue::Array(arr)) = args.first() {
         // In-place: removes the first element from the shared array.

@@ -2249,14 +2249,79 @@ pub fn struct_as_positional_array(s: &CfmlStruct) -> Result<Vec<CfmlValue>, Cfml
     Ok(out)
 }
 
-/// Append to a struct being used as an array (GH #429): the new entry takes the
-/// key after the last position, so `arrayAppend({"1":10,"2":20}, 9)` yields
-/// `{"1":10,"2":20,"3":9}` exactly as Lucee does. Returns the cast error for a
-/// struct that is not a legal array view.
+/// Append to a struct being used as an array (GH #429). The new key is
+/// `max(existing numeric key) + 1`, floored at 1 — **not** `size + 1`.
+///
+/// Those coincide only for a dense 1..n struct, which is why size+1 passed every
+/// dense test and then destroyed the sparse case that is the whole point of
+/// #429: `u[2]=1` gives `{"2":1}`, size 1, so size+1 targeted key "2" and
+/// OVERWROTE the element instead of appending. Measured on Lucee 7.1.0.204:
+/// `{"2":1}`→`{"2":1,"3":5}`, `{"5":1}`→`{"5":1,"6":9}`,
+/// `{"1":1,"5":2}`→`{…,"6":9}`, `{}`→`{"1":9}`, and a non-positive max
+/// (`{"0":1}`, `{"-1":1}`) still appends at key 1.
 pub fn struct_array_push(s: &CfmlStruct, value: CfmlValue) -> Result<(), CfmlError> {
-    let next = struct_as_positional_array(s)?.len() + 1;
+    let next = struct_array_max_key(s)? + 1;
     s.insert(next.to_string().as_str(), value);
     Ok(())
+}
+
+/// The largest numeric key of a struct-as-array, floored at 0 (so an append
+/// lands on key 1 for an empty struct, or one keyed only 0 / negative).
+/// Validates the keys the same way the positional view does.
+pub fn struct_array_max_key(s: &CfmlStruct) -> Result<i64, CfmlError> {
+    let mut max = 0i64;
+    for k in s.keys() {
+        match k.parse::<i64>() {
+            Ok(n) => max = max.max(n),
+            Err(_) => {
+                return Err(CfmlError::expression(format!(
+                    "can't cast struct to an array, key [{}] is not a number",
+                    k.to_uppercase()
+                )))
+            }
+        }
+    }
+    Ok(max)
+}
+
+/// Insert at position 1 of a struct-as-array, shifting every existing numeric
+/// key up by one — Lucee's `arrayPrepend` rule. `{"2":1}` becomes
+/// `{"1":9,"3":1}` and `{"5":1}` becomes `{"1":9,"6":1}`; renumbering densely to
+/// 1..n instead DROPPED the shifted value on a sparse struct.
+pub fn struct_array_unshift(s: &CfmlStruct, value: CfmlValue) -> Result<(), CfmlError> {
+    struct_array_max_key(s)?;
+    let mut shifted: Vec<(i64, CfmlValue)> = Vec::with_capacity(s.len());
+    for k in s.keys() {
+        let n: i64 = k.parse().unwrap_or(0);
+        if let Some(v) = s.get(k.as_str()) {
+            shifted.push((n + 1, v));
+        }
+    }
+    s.clear();
+    s.insert("1", value);
+    for (k, v) in shifted {
+        s.insert(k.to_string().as_str(), v);
+    }
+    Ok(())
+}
+
+/// Remove one positional key from a struct-as-array, returning its value.
+/// Lucee refuses a key that is not there — `can't remove key [1] from struct,
+/// key does not exist` — rather than silently doing nothing, and does NOT
+/// renumber what remains (`arrayShift({"1":10,"2":20})` leaves `{"2":20}`).
+pub fn struct_array_remove_key(s: &CfmlStruct, key: i64) -> Result<CfmlValue, CfmlError> {
+    struct_array_max_key(s)?;
+    let k = key.to_string();
+    match s.get(k.as_str()) {
+        Some(v) => {
+            s.remove(k.as_str());
+            Ok(v)
+        }
+        None => Err(CfmlError::expression(format!(
+            "can't remove key [{}] from struct, key does not exist",
+            key
+        ))),
+    }
 }
 
 impl CfmlValue {

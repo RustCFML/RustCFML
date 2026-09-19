@@ -107,7 +107,66 @@ function prependRenumbers() {
 assert( "arrayPrepend inserts at 1 and renumbers", prependRenumbers(),
         '{"1":5,"2":10,"3":20}' );
 
+// ---- 3b. SPARSE struct-as-array: keys, not positions -----------------------
+// The bug that shipped in v0.685.4: the append key was computed as
+// positional-size + 1, which coincides with the correct answer ONLY for a dense
+// 1..n struct. Every test above used a dense one, so it passed while `u[2]=1;
+// arrayAppend(u,5)` -- the headline shape of this very issue -- produced
+// {"2":5}, OVERWRITING the element. Lucee's rule is max-numeric-key + 1.
+function appendSparse()      { var s = {}; s[ 2 ] = 1; arrayAppend( s, 5 ); return serializeJSON( s ); }
+assert( "append onto {2:1} adds key 3, keeping the element", appendSparse(), '{"2":1,"3":5}' );
+
+function appendSparse5()     { var s = {}; s[ 5 ] = 1; arrayAppend( s, 9 ); return serializeJSON( s ); }
+assert( "append onto {5:1} adds key 6", appendSparse5(), '{"5":1,"6":9}' );
+
+function appendGap()         { var s = {}; s[ 1 ] = 1; s[ 5 ] = 2; arrayAppend( s, 9 ); return serializeJSON( s ); }
+assert( "append past a gap uses the MAX key, not the count", appendGap(), '{"1":1,"5":2,"6":9}' );
+
+function appendEmpty()       { var s = {}; arrayAppend( s, 9 ); return serializeJSON( s ); }
+assert( "append onto {} starts at key 1", appendEmpty(), '{"1":9}' );
+
+function appendZeroKey()     { var s = {}; s[ 0 ] = 1; arrayAppend( s, 9 ); return serializeJSON( s ); }
+assert( "a non-positive max still appends at key 1", appendZeroKey(), '{"0":1,"1":9}' );
+
+function appendNegKey()      { var s = {}; s[ -1 ] = 1; arrayAppend( s, 9 ); return serializeJSON( s ); }
+assert( "a negative max still appends at key 1", appendNegKey(), '{"-1":1,"1":9}' );
+
+// arrayPrepend shifts every existing key up by one. Renumbering densely to 1..n
+// instead DROPPED the shifted value on a sparse struct.
+function prependSparse()     { var s = {}; s[ 2 ] = 1; arrayPrepend( s, 9 ); return serializeJSON( s ); }
+assert( "prepend onto {2:1} shifts it to key 3", prependSparse(), '{"1":9,"3":1}' );
+
+function prependSparse5()    { var s = {}; s[ 5 ] = 1; arrayPrepend( s, 9 ); return serializeJSON( s ); }
+assert( "prepend onto {5:1} shifts it to key 6", prependSparse5(), '{"1":9,"6":1}' );
+
+// A removal names a POSITION key and refuses one that is absent, rather than
+// silently doing nothing; and it does not renumber what remains.
+throwsWithLater( "pop on a sparse struct refuses the missing key",
+    function(){ var s = {}; s[ 2 ] = 1; return arrayPop( s ); },
+    "can't remove key [1] from struct, key does not exist" );
+throwsWithLater( "shift on a sparse struct refuses the missing key",
+    function(){ var s = {}; s[ 2 ] = 1; return arrayShift( s ); },
+    "can't remove key [1] from struct, key does not exist" );
+
+function shiftDense()        { var s = { "1": 10, "2": 20 }; var r = arrayShift( s ); return r & "/" & serializeJSON( s ); }
+assert( "shift removes key 1 and does NOT renumber", shiftDense(), '10/{"2":20}' );
+
+function popDense()          { var s = { "1": 10, "2": 20 }; var r = arrayPop( s ); return r & "/" & serializeJSON( s ); }
+assert( "pop removes the last position", popDense(), '20/{"1":10}' );
+
+// The read-only positional view is unchanged by any of this: position 1 of
+// {2:1} does not exist, so the view is a single empty slot (Lucee agrees).
+function sparseToList()      { var s = {}; s[ 2 ] = 1; return "[" & arrayToList( s ) & "]"; }
+assert( "the positional view of {2:1} is one empty slot", sparseToList(), "[]" );
+
+function sparseLen()         { var s = {}; s[ 2 ] = 1; return arrayLen( s ); }
+assert( "arrayLen of {2:1} is the struct size", sparseLen(), 1 );
+
 // ---- 4. a non-numeric key is a cast error, not a silent zero --------------
+function throwsWithLater( required string label, required callback, required string expected ) {
+    try { callback(); assert( arguments.label, "no exception", arguments.expected ); }
+    catch( any e ) { assert( arguments.label, e.message, arguments.expected ); }
+}
 function throwsWith( required string label, required callback, required string expected ) {
     try { callback(); assert( arguments.label, "no exception", arguments.expected ); }
     catch( any e ) { assert( arguments.label, e.message, arguments.expected ); }
