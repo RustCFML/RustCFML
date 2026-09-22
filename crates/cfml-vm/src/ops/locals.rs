@@ -836,10 +836,15 @@ pub(crate) fn op_array_append_local(
                 cfml_common::dynamic::struct_array_push(s, value)?;
                 return Ok(());
             }
-            Some(_) => {
-                slots[*i as usize] = Some(CfmlValue::array(vec![value]));
-                return Ok(());
-            }
+            // GH #430: an existing value that is NOT a container is left ALONE.
+            // Replacing it with a fresh one-element array was this op's own
+            // invention — the `cfml-stdlib` twin builds that array too but its
+            // return value is no longer written back over the argument, so
+            // `arrayAppend(s.b, 68)` leaves `s.b` untouched while
+            // `arrayAppend(b, 68)` silently turned a BINARY into `[68]`. Lucee
+            // refuses the call outright; leaving the value alone is at least one
+            // answer rather than two.
+            Some(_) => return Ok(()),
             None => {}
         }
     }
@@ -871,7 +876,10 @@ pub(crate) fn op_array_append_local(
             cfml_common::dynamic::struct_array_push(&s, value)?;
             return Ok(());
         }
-        _ => {}
+        // GH #430: the name resolves to something that is not a container —
+        // leave it alone rather than replacing it (see the slot arm above).
+        Some(_) => return Ok(()),
+        None => {}
     }
 
     // Not found (or not an array): create a fresh single-element

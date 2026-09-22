@@ -251,6 +251,7 @@ include "harness.cfm";
 <!--- EncodeForHTMLAttribute must encode attribute-dangerous chars (space, =) per OWASP/Lucee; RustCFML leaves them raw. --->
 <cf_runtest file="functions/test_encodeforhtmlattribute_space_equals.cfm">
 <cf_runtest file="stdlib/test_array_functions.cfm">
+<cf_runtest file="stdlib/test_array_mutator_return_values.cfm">
 <cf_runtest file="stdlib/test_array_find_complex.cfm">
 <cf_runtest file="stdlib/test_arrayfind_closure.cfm">
 <cf_runtest file="stdlib/test_arraycontains_circular.cfm">

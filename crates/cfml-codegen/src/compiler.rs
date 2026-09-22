@@ -2091,11 +2091,18 @@ impl CfmlCompiler {
                 // arg would clobber the struct variable with `true`/`false`.
                 // querySort is absent for exactly the same reason (GH #345): it
                 // sorts the shared query handle in place and returns a boolean.
+                // GH #430: the whole ARRAY family left for the same reason. Those
+                // BIFs now return Lucee's status value (`true`, or the new length
+                // for arrayPush/arrayUnshift) rather than the mutated array, and
+                // storing THAT back over the first argument replaces the array
+                // with a boolean. They never needed the write-back: CfmlArray is
+                // an Arc-shared handle, so the in-place mutation already reaches
+                // every alias. (`arrayAppend(<ident>, v)` keeps its fused
+                // ArrayAppendLocal fast path — see `is_inplace_array_append`,
+                // which is now checked independently of this list.)
                 return matches!(name_lower.as_str(),
                     "structappend" | "structinsert" | "structupdate" |
-                    "structclear" | "arrayclear" | "arrayappend" | "arrayprepend" |
-                    "arrayinsert" | "arrayinsertat" | "arraydeleteat" | "arraysort" |
-                    "arrayresize" | "arrayswap" | "arrayreverse" | "arrayset" |
+                    "structclear" |
                     "queryaddcolumn" |
                     "querydeleterow" | "querydeletecolumn"
                 ) && !call.arguments.is_empty();
@@ -2906,21 +2913,30 @@ impl CfmlCompiler {
                 }
                 // Check for mutating function calls: structAppend(a, b), structInsert(a, k, v), etc.
                 // These return the modified struct; store it back to the first arg's location.
+                // Hot path: `arrayAppend(<ident>, value);` as a STATEMENT, with
+                // exactly two args. Push the value, then append in place via the
+                // fused op — no builtin dispatch, no array clone. This turns a
+                // quadratic append loop linear. (GH #430: checked here rather than
+                // inside the write-back branch below, which arrayAppend left when
+                // it started returning `true` instead of the array.)
+                else if matches!(&expr_stmt.expr, Expression::FunctionCall(_))
+                    && matches!(
+                        Self::mutating_call_first_arg(&expr_stmt.expr),
+                        Some(Expression::Identifier(ident))
+                            if Self::is_inplace_array_append(&expr_stmt.expr, ident)
+                    )
+                {
+                    if let (Expression::FunctionCall(call), Some(Expression::Identifier(ident))) = (
+                        &expr_stmt.expr,
+                        Self::mutating_call_first_arg(&expr_stmt.expr),
+                    ) {
+                        self.compile_expression(&call.arguments[1], instructions);
+                        instructions.push(BytecodeOp::ArrayAppendLocal(Name::from(&ident.name)));
+                    }
+                }
                 else if Self::is_mutating_standalone_call(&expr_stmt.expr) {
                     if let Some(first_arg) = Self::mutating_call_first_arg(&expr_stmt.expr) {
                         match first_arg {
-                            Expression::Identifier(ident)
-                                if Self::is_inplace_array_append(&expr_stmt.expr, ident) =>
-                            {
-                                // Hot path: arrayAppend(<ident>, value) with exactly two
-                                // args. Push the value, then append in place via the fused
-                                // op — no array clone, no StoreLocal round-trip. This turns
-                                // a quadratic append loop linear.
-                                if let Expression::FunctionCall(call) = &expr_stmt.expr {
-                                    self.compile_expression(&call.arguments[1], instructions);
-                                }
-                                instructions.push(BytecodeOp::ArrayAppendLocal(Name::from(&ident.name)));
-                            }
                             Expression::Identifier(ident) => {
                                 // Simple: structAppend(a, b) → compile call → StoreLocal(a)
                                 self.compile_expression(&expr_stmt.expr, instructions);

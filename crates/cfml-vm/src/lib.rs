@@ -16262,7 +16262,11 @@ impl CfmlVirtualMachine {
                             i += 1;
                         }
                         arr.with_write(|v| *v = items);
-                        return Ok(args[0].clone());
+                        // GH #430: the STANDALONE BIF reports `true`, like its
+                        // sort-type twin. (The `arr.sort(fn)` member handler
+                        // returns the array — Lucee makes only the member form
+                        // chainable.)
+                        return Ok(CfmlValue::Bool(true));
                     }
                     return Ok(CfmlValue::Bool(true));
                 }
@@ -23048,6 +23052,17 @@ impl CfmlVirtualMachine {
             .any(|s| name.eq_ignore_ascii_case(s))
     }
 
+    /// Array member functions whose Lucee return value is the RECEIVER, not the
+    /// standalone BIF's status value. See the call site in
+    /// `call_member_function_impl` (GH #430).
+    fn array_member_returns_receiver(method_lower: &str) -> bool {
+        matches!(
+            method_lower,
+            "append" | "prepend" | "clear" | "delete" | "deleteat" | "deletenocase"
+                | "insertat" | "resize" | "set" | "sort" | "swap"
+        )
+    }
+
     fn is_mutating_method(method: &str) -> bool {
         // Implicit property setters (setXxx) are mutating
         if method.len() > 3
@@ -23066,9 +23081,18 @@ impl CfmlVirtualMachine {
         };
         matches!(
             lower,
-            // Array mutators
-            "append" | "push" | "prepend" | "deleteat" | "insertat" |
-            "sort" | "reverse" | "clear" |
+            // Array mutators. These member forms return the RECEIVER, so the
+            // write-back re-stores the same shared handle — it is belt-and-braces
+            // for a non-reference receiver, not the mechanism that makes the
+            // mutation visible.
+            //
+            // GH #430: `push` and `reverse` are deliberately absent.
+            // `.push()` returns the new LENGTH on Lucee, so writing its result
+            // back would replace the array with a number; `.reverse()` is PURE on
+            // Lucee (it returns a new array and leaves the receiver alone), so
+            // writing its result back is what used to make ours mutate.
+            "append" | "prepend" | "deleteat" | "insertat" |
+            "sort" | "clear" |
             // Struct mutators
             "delete" | "insert" | "update" |
             // Query mutators
@@ -28404,7 +28428,11 @@ impl CfmlVirtualMachine {
                     shim.insert("__iter_pos".to_string(), CfmlValue::Int(0));
                     return Ok(CfmlValue::strukt(shim));
                 }
-                "append" | "push" => Some("arrayAppend"),
+                "append" => Some("arrayAppend"),
+                // GH #430: `.push()`/`.unshift()` return the NEW LENGTH on both
+                // engines, so they route to their own BIFs rather than sharing
+                // `arrayAppend`/`arrayPrepend`, which return `true`.
+                "push" => Some("arrayPush"),
                 "prepend" => Some("arrayPrepend"),
                 // `arr.addAll(collection)` — java.util.List passthrough that
                 // Lucee exposes on CFML arrays: appends every element of the
@@ -28827,7 +28855,10 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    return Ok(CfmlValue::Null);
+                    // GH #430: the MEMBER form returns the RECEIVER on Lucee
+                    // (`a.each(fn)` is `[1,2]`, `s.each(fn)` is the struct), while
+                    // the STANDALONE arrayEach/structEach return null on both engines.
+                    return Ok(object.clone());
                 }
                 "some" => {
                     if let Some(callback) = extra_args.first().cloned() {
@@ -29059,7 +29090,10 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    return Ok(CfmlValue::Null);
+                    // GH #430: the MEMBER form returns the RECEIVER on Lucee
+                    // (`a.each(fn)` is `[1,2]`, `s.each(fn)` is the struct), while
+                    // the STANDALONE arrayEach/structEach return null on both engines.
+                    return Ok(object.clone());
                 }
                 "map" => {
                     // struct.map(callback) - callback(key, value, struct) returns new value
@@ -29493,7 +29527,21 @@ impl CfmlVirtualMachine {
             if let Some((_, builtin)) = self.builtin_lookup_ci(name, &name_lower) {
                 #[cfg(feature = "bif-census")]
                 cfml_common::perf_counters::bif_census::record(&name_lower, &args);
-                return builtin(args);
+                let result = builtin(args)?;
+                // GH #430: the MEMBER form of a mutating array BIF returns the
+                // array (Lucee makes it chainable — `a.append(3).append(4)`),
+                // while the STANDALONE form returns a status value (`true`, or
+                // the new length for push/unshift). The BIFs carry the standalone
+                // contract, so the receiver is restored here. Only the names
+                // Lucee actually makes chainable are listed: `.push`/`.unshift`
+                // return a length there too, and `.pop`/`.shift`/`.splice`/
+                // `.merge`/`.reverse` return elements or a new array.
+                if matches!(object, CfmlValue::Array(_))
+                    && Self::array_member_returns_receiver(&method_lower)
+                {
+                    return Ok(object.clone());
+                }
+                return Ok(result);
             }
         }
 

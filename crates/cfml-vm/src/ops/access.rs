@@ -559,6 +559,35 @@ pub(crate) fn op_get_index(
                 }
             }
         }
+        // GH #430: a SCALAR has no members — Lucee throws
+        // "there is no property with name [1]  found in [boolean]" where we
+        // pushed Null, so `arrayAppend(a,x)[1]` (and any other subscript of a
+        // value that turned out not to be a container) read as "missing" rather
+        // than as the mistake it is. Null is deliberately NOT included: an
+        // undefined root is read as Null all over the engine (optional chains,
+        // the #429 vivification paths) and must stay quiet here.
+        CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::TimeSpan(_)
+            if throw_on_miss =>
+        {
+            let type_name = match &collection {
+                CfmlValue::Bool(_) => "boolean",
+                CfmlValue::Int(_) => "int",
+                _ => "double",
+            };
+            // Two spaces before "found" mirrors Lucee's message verbatim.
+            let msg = format!(
+                "there is no property with name [{}]  found in [{}]",
+                index.as_string(),
+                type_name
+            );
+            match vm.raise_catchable(stack, &msg, "expression") {
+                Ok(catch_ip) => {
+                    *ip = catch_ip;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
         _ => stack.push(CfmlValue::Null),
     }
     Ok(())

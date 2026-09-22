@@ -1329,12 +1329,12 @@ rather than a view onto the binary's bytes:
 | | Lucee 7.1.0.204 | RustCFML |
 |---|---|---|
 | `b[1] = 99` | mutates the byte in place; `b` stays a 3-byte binary | the write is dropped; `b` is unchanged |
-| `arrayAppend( b, 68 )` | no-op — a `byte[]` is fixed size, so `b` stays a 3-byte binary | `b` becomes a 1-element ARRAY |
+| `arrayAppend( b, 68 )` | no-op — a `byte[]` is fixed size, so `b` stays a 3-byte binary | no-op too, since v0.686.0 (§114) — `b` stays a binary, the appended byte is dropped |
 
-The mutating array BIFs are deliberately excluded from the conversion for the
-second reason: coercing there would silently turn a binary into a real array,
-which is further from Lucee than leaving them alone. Closing this properly means
-a byte-backed array view rather than a per-call copy.
+The mutating array BIFs are deliberately excluded from the conversion: coercing
+there would silently turn a binary into a real array, which is further from Lucee
+than leaving it alone. Closing the first row properly means a byte-backed array
+view rather than a per-call copy.
 
 Two neighbouring divergences found while measuring this were NOT specific to
 binaries and were tracked separately as GH #358 and GH #359 — both **fixed in
@@ -3961,7 +3961,92 @@ carries the ordering guarantee.
   headline example is the one the suite most needs** — `u[2]=1` is sparse, and
   nothing in the suite was.
 
-Pre-existing and NOT addressed here: `arrayPush`/`arrayUnshift` return the array
-where Lucee returns the new length, and `arrayAppend` returns the array where
-Lucee returns `true` — true for plain arrays too, so it is unrelated to these two
-issues.
+Those return values were left out here deliberately and are now fixed in §114.
+
+---
+
+## 114. The mutating array BIFs returned the mutated array where Lucee returns a status; and three refusals they never made (GH #430, v0.686.0) 📌
+
+Standalone `arrayAppend( a, 9 )` returned `[1,2,9]`. Lucee returns `true`. The
+mutation itself was right on both engines in every case — only the answer
+differed — but that answer is load-bearing in two ways.
+
+`arrayPush`/`arrayUnshift` are the sharp pair, because a wrong value there is
+*plausible*: the JS-named functions return the **new length** on Lucee, and code
+written against that name got an array back, which is truthy and non-empty, so
+`if ( arrayPush( a, x ) > 2 )` compared an array to a number instead of failing.
+They were registered as bare aliases of `arrayAppend`/`arrayPrepend` and had to be
+split into their own functions to answer differently.
+
+Measured against Lucee 7.1.0.204 (`a = [1,2]` for each row):
+
+| call | was | now, and on Lucee |
+|---|---|---|
+| `arrayAppend` / `arrayPrepend` / `arrayClear` / `arrayDeleteAt` / `arraySet` / `arrayResize` / `arrayInsertAt` / `arraySort` / `arraySwap` | the mutated array | `true` |
+| `arrayPush( a, 9 )` / `arrayUnshift( a, 9 )` | the mutated array | `3` — the new LENGTH |
+| `arrayReverse( a )` | reversed **in place**, returned the receiver | a NEW reversed array; `a` is untouched (pure on Lucee, in both forms) |
+| `a.push( 9 )` / `a.unshift( 9 )` (member) | the mutated array | `3` |
+| `a.each( fn )` / `s.each( fn )` (member) | `null` | the receiver |
+
+The **member** forms of the rest were already right and still return the array, so
+`a.append( 3 ).append( 4 )` keeps chaining: Lucee's rule is that the member form is
+chainable and the standalone BIF reports status. The standalone `arrayEach`/
+`structEach` return `null` on both engines — only `.each()` differs.
+
+### The write-back is what made this hard to change
+
+A mutating BIF's return value was **stored back over the first argument** by
+codegen (`is_mutating_standalone_call` → `StoreLocal`), so returning `true` used
+to replace the array with the boolean — the trap recorded in §113. That write-back
+was never what made the mutation visible: `CfmlArray` is an `Arc`-shared handle, so
+the in-place mutation already reaches every alias. The whole array family is out of
+that list now (`structAppend`/`structInsert`/`structUpdate`/`structClear` and the
+three `query*` mutators stay), joining `structDelete` and `querySort`, which were
+excluded for exactly this reason years earlier. `arrayAppend( <ident>, v )` as a
+statement keeps its fused `ArrayAppendLocal` fast path — the check moved out of the
+write-back branch so the quadratic-append fix survives.
+
+### Three refusals found while probing, fixed in the same change
+
+These were silent no-ops or, worse, silent mutations of the WRONG element:
+
+| call on `a = [1,2]` | was | now, and on Lucee |
+|---|---|---|
+| `arrayInsertAt( a, 0, 9 )` | prepended — position 0 became index 0 | throws `can't insert value to array at position 0, array goes from 1 to 2` |
+| `arrayInsertAt( a, 4, 9 )` | no-op, reported success | throws |
+| `arrayDeleteAt( a, 0 )` / `arrayDeleteAt( a, "x" )` | deleted the FIRST element | throws `can not remove Element at position [0]` |
+| `arrayDeleteAt( a, 3 )` | no-op, reported success | throws |
+| `arraySwap( a, 1, 3 )` | no-op, reported success | throws `invalid index [3]` |
+| `arraySet( a, 0, 2, "z" )` | treated 0 as 1 | throws |
+| `arrayResize( a, -1 )` | **hung the engine** — `as usize` made the size `usize::MAX` and the grow loop never ended | `true`, no change |
+| `arrayLen( true )` | `0` — a non-array read as an empty one | throws `Can't cast Object type [Boolean] to a value of type [Array]` |
+| `true[ 1 ]` | `null` | throws `there is no property with name [1]  found in [boolean]` |
+
+`Null` is deliberately excluded from that last row: an undefined root reads as
+`Null` all over the engine (optional chains, the §113 vivification paths), and the
+lenient `TryGetIndex` twin (elvis, `isNull` operands, compound-assign reads) keeps
+the quiet read, as it does for the other §107 subscript refusals.
+
+One neighbour improved for free. `arrayAppend( b, 68 )` on a **binary** used to
+replace `b` with a one-element array (§61's second write-divergence row); with the
+write-back gone the nested form leaves the binary alone, and the fused op was
+changed to match — an existing non-container value is now left alone rather than
+replaced by a fresh single-element array. Lucee refuses the call outright; leaving
+the value alone is at least one answer instead of two.
+
+### Traps
+
+- **The member form and the standalone form share one builtin.** Changing the
+  return value changed both. The receiver is restored for the member form at the
+  single `builtin(args)` call site in `call_member_function_impl`
+  (`array_member_returns_receiver`), not by duplicating eleven functions.
+- **`is_mutating_method` writes a METHOD's result back over the receiver too.**
+  That list still held `push` — which now returns a number — and `reverse`, which
+  is what actually made our `.reverse()` mutate: the pure builtin returned a new
+  array and the write-back stored it over the receiver. Both are out.
+- **`arraySort( a, fn )` is VM-intercepted separately** from the sort-type form, so
+  it needed the same return change in `lib.rs`; the `a.sort( fn )` MEMBER handler is
+  a third copy, and correctly still returns the array.
+- **Probe the member form and the standalone form separately, and probe what the
+  array looks like AFTER the call.** `arrayReverse`'s in-place mutation was
+  invisible in a return-value-only probe — both engines return `[2,1]`.

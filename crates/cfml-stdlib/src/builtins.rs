@@ -471,8 +471,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("arrayFindAllNoCase".to_string(), fn_array_find_all_no_case);
     f.insert("arrayFirst".to_string(), fn_array_first);
     f.insert("arrayLast".to_string(), fn_array_last);
-    f.insert("arrayPush".to_string(), fn_array_append);  // alias
-    f.insert("arrayUnshift".to_string(), fn_array_prepend);  // alias
+    // NOT aliases of arrayAppend/arrayPrepend: the JS-named pair returns the
+    // NEW LENGTH where its CFML-named twin returns `true` (GH #430).
+    f.insert("arrayPush".to_string(), fn_array_push);
+    f.insert("arrayUnshift".to_string(), fn_array_unshift);
     f.insert("arrayIndexExists".to_string(), fn_array_index_exists);
     f.insert("arrayResize".to_string(), fn_array_resize);
     f.insert("arrayMedian".to_string(), fn_array_median);
@@ -2704,7 +2706,27 @@ fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
                 cfml_common::dynamic::struct_as_positional_array(s)?.len() as i64,
             ))
         }
-        _ => Ok(CfmlValue::Int(0)),
+        // GH #430: anything else is a CAST ERROR on Lucee. Returning 0 made
+        // `arrayLen( <something that isn't an array> )` read as an empty array,
+        // so a wrong value flowed on as "no elements" instead of failing where
+        // it went wrong.
+        Some(v) => Err(CfmlError::expression(format!(
+            "Can't cast {} to a value of type [Array]",
+            cast_subject(v)
+        ))),
+        None => Ok(CfmlValue::Int(0)),
+    }
+}
+
+/// How Lucee names a value in a "Can't cast X to a value of type [Array]"
+/// message: a string quotes its content, everything else names its type.
+fn cast_subject(v: &CfmlValue) -> String {
+    match v {
+        CfmlValue::String(s) => format!("String [{}]", s),
+        CfmlValue::Bool(_) => "Object type [Boolean]".to_string(),
+        CfmlValue::Int(_) | CfmlValue::Double(_) => "Object type [Number]".to_string(),
+        CfmlValue::Null => "Object type [null]".to_string(),
+        other => format!("Object type [{}]", other.type_name()),
     }
 }
 
@@ -2726,11 +2748,14 @@ fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
                 _ => vec![args[1].clone()],
             };
             struct_array_append(s, values)?;
-            // Return the STRUCT handle, not a bool: a mutating array BIF's
-            // result is written back over the argument variable, so returning
-            // `true` replaced the container with the boolean. The array arm
-            // returns its handle for the same reason.
-            return Ok(CfmlValue::Struct(s.clone()));
+            // GH #430: Lucee returns `true` from the STANDALONE BIF. The
+            // container is a shared handle, so the mutation is already visible
+            // through the caller's variable — codegen no longer stores this
+            // return value back over the first argument (that write-back is what
+            // used to force an array/struct return here). The MEMBER form
+            // (`a.append(x)`) returns the array instead; see
+            // `array_member_returns_receiver` in cfml-vm.
+            return Ok(CfmlValue::Bool(true));
         }
         if let CfmlValue::Array(a) = &args[0] {
             match (&args[1], merge) {
@@ -2740,7 +2765,7 @@ fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
                 }
                 _ => a.push(args[1].clone()),
             }
-            return Ok(CfmlValue::Array(a.clone()));
+            return Ok(CfmlValue::Bool(true));
         }
         // Non-array first arg: build a fresh array (legacy coercion).
         let mut v = Vec::new();
@@ -2759,11 +2784,11 @@ fn fn_array_prepend(args: Vec<CfmlValue>) -> CfmlResult {
         // GH #429: see `fn_array_append`. Lucee renumbers on an insert.
         if let Some(s) = struct_array_arg0(&args) {
             cfml_common::dynamic::struct_array_unshift(s, args[1].clone())?;
-            return Ok(CfmlValue::Struct(s.clone()));
+            return Ok(CfmlValue::Bool(true)); // GH #430 — see `fn_array_append`.
         }
         if let CfmlValue::Array(a) = &args[0] {
             a.with_write(|v| v.insert(0, args[1].clone()));
-            return Ok(CfmlValue::Array(a.clone()));
+            return Ok(CfmlValue::Bool(true)); // GH #430 — see `fn_array_append`.
         }
         Ok(CfmlValue::array(vec![args[1].clone()]))
     } else {
@@ -2771,16 +2796,81 @@ fn fn_array_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// The length of the container a push/unshift just mutated. `target` is the
+/// pre-call handle (shared backing, so it already reflects the mutation);
+/// `result` covers the legacy-coercion case where a fresh array was built
+/// instead of an existing one being mutated.
+fn pushed_len(target: Option<&CfmlValue>, result: &CfmlValue) -> i64 {
+    match target {
+        Some(CfmlValue::Array(a)) => a.len() as i64,
+        Some(CfmlValue::Struct(s)) if !cfml_common::dynamic::is_arguments_scope(s) => {
+            cfml_common::dynamic::struct_as_positional_array(s)
+                .map(|v| v.len())
+                .unwrap_or(0) as i64
+        }
+        _ => match result {
+            CfmlValue::Array(a) => a.len() as i64,
+            _ => 0,
+        },
+    }
+}
+
+/// `arrayPush(array, value)` — appends and returns the NEW LENGTH (Lucee 7
+/// parity, and the JS `Array.prototype.push` contract the name comes from).
+/// Its CFML-named twin `arrayAppend` returns `true` instead; code written
+/// against the JS name expects a number, so the two cannot share a body.
+fn fn_array_push(args: Vec<CfmlValue>) -> CfmlResult {
+    let target = args.first().cloned();
+    let result = fn_array_append(args)?;
+    Ok(CfmlValue::Int(pushed_len(target.as_ref(), &result)))
+}
+
+/// `arrayUnshift(array, value)` — prepends and returns the NEW LENGTH.
+/// See `fn_array_push`.
+fn fn_array_unshift(args: Vec<CfmlValue>) -> CfmlResult {
+    let target = args.first().cloned();
+    let result = fn_array_prepend(args)?;
+    Ok(CfmlValue::Int(pushed_len(target.as_ref(), &result)))
+}
+
+/// A 1-based array index argument, refused the way Lucee refuses it: a
+/// non-numeric string is a cast error rather than a silent `0` (GH #430). The
+/// RANGE is checked by the caller, whose message differs per BIF.
+fn get_index_arg(args: &[CfmlValue], idx: usize) -> Result<i64, CfmlError> {
+    match args.get(idx).map(|v| v.query_column_scalar()) {
+        Some(CfmlValue::Int(i)) => Ok(*i),
+        Some(CfmlValue::Double(d)) => Ok(*d as i64),
+        Some(CfmlValue::Bool(b)) => Ok(if *b { 1 } else { 0 }),
+        Some(CfmlValue::String(s)) => s.trim().parse::<f64>().map(|f| f as i64).map_err(|_| {
+            CfmlError::expression(format!("can't cast [{}] string to a number value", s))
+        }),
+        other => Err(CfmlError::expression(format!(
+            "can't cast [{}] to a number value",
+            other.map(|v| v.as_string()).unwrap_or_default()
+        ))),
+    }
+}
+
 fn fn_array_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Array(a) = &args[0] {
-            let idx = (get_int(&args, 1) as usize).saturating_sub(1);
+            // GH #430: an out-of-range position is an ERROR on Lucee, not a
+            // silent no-op — and `0`/`"x"` used to reach `saturating_sub(1)` as
+            // index 0 and delete the FIRST element instead.
+            let pos = get_index_arg(&args, 1)?;
+            if pos < 1 || pos as usize > a.len() {
+                return Err(CfmlError::expression(format!(
+                    "can not remove Element at position [{}]",
+                    pos
+                )));
+            }
+            let idx = pos as usize - 1;
             a.with_write(|v| {
                 if idx < v.len() {
                     v.remove(idx);
                 }
             });
-            Ok(CfmlValue::Array(a.clone()))
+            Ok(CfmlValue::Bool(true)) // GH #430 — see `fn_array_append`.
         } else {
             Ok(CfmlValue::Bool(false))
         }
@@ -2792,13 +2882,23 @@ fn fn_array_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Array(a) = &args[0] {
-            let idx = (get_int(&args, 1) as usize).saturating_sub(1);
+            // GH #430: Lucee accepts 1..len+1 (len+1 appends) and ERRORS on
+            // anything else. Position 0 used to land at index 0 and prepend.
+            let pos = get_index_arg(&args, 1)?;
+            let len = a.len();
+            if pos < 1 || pos as usize > len + 1 {
+                return Err(CfmlError::expression(format!(
+                    "can't insert value to array at position {}, array goes from 1 to {}",
+                    pos, len
+                )));
+            }
+            let idx = pos as usize - 1;
             a.with_write(|v| {
                 if idx <= v.len() {
                     v.insert(idx, args[2].clone());
                 }
             });
-            Ok(CfmlValue::Array(a.clone()))
+            Ok(CfmlValue::Bool(true)) // GH #430 — see `fn_array_append`.
         } else {
             Ok(CfmlValue::Bool(false))
         }
@@ -3008,7 +3108,7 @@ fn fn_array_sort(args: Vec<CfmlValue>) -> CfmlResult {
                 v.reverse();
             }
         });
-        Ok(CfmlValue::Array(arr.clone()))
+        Ok(CfmlValue::Bool(true)) // GH #430 — see `fn_array_append`.
     } else {
         Ok(CfmlValue::array(Vec::new()))
     }
@@ -3020,9 +3120,13 @@ fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        // In-place reverse on the shared handle.
-        arr.with_write(|v| v.reverse());
-        Ok(CfmlValue::Array(arr.clone()))
+        // GH #430: arrayReverse is PURE on Lucee — in BOTH the standalone and the
+        // member form it returns a new array and leaves the original alone.
+        // (`a=[1,2]; a.reverse(); a` is still `[1,2]` there.) We used to reverse
+        // the shared handle in place, so the receiver silently changed too.
+        let mut snap = arr.snapshot();
+        snap.reverse();
+        Ok(CfmlValue::array(snap))
     } else {
         Ok(CfmlValue::array(Vec::new()))
     }
@@ -3119,14 +3223,14 @@ fn fn_array_clear(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(s) = struct_array_arg0(&args) {
         cfml_common::dynamic::struct_as_positional_array(s)?;
         s.clear();
-        return Ok(CfmlValue::Struct(s.clone()));
+        return Ok(CfmlValue::Bool(true)); // GH #430 — see `fn_array_append`.
     }
     // In-place clear on the shared handle (aliases see the emptied array).
     if let Some(CfmlValue::Array(a)) = args.first() {
         a.with_write(|v| v.clear());
-        return Ok(CfmlValue::Array(a.clone()));
+        return Ok(CfmlValue::Bool(true)); // GH #430 — see `fn_array_append`.
     }
-    Ok(CfmlValue::array(Vec::new()))
+    Ok(CfmlValue::Bool(true))
 }
 
 fn fn_array_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
@@ -3162,8 +3266,17 @@ fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
     // arraySet(array, start, end, value) — in-place on the shared handle.
     if args.len() >= 4 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let start = (get_int(&args, 1) as usize).saturating_sub(1);
-            let end = get_int(&args, 2) as usize;
+            // GH #430: Lucee refuses a start index below 1 rather than silently
+            // treating it as 1.
+            let start_pos = get_index_arg(&args, 1)?;
+            if start_pos < 1 {
+                return Err(CfmlError::expression(format!(
+                    "Start index of the function arraySet must be greater than zero; now [{}]",
+                    start_pos
+                )));
+            }
+            let start = start_pos as usize - 1;
+            let end = get_index_arg(&args, 2)?.max(0) as usize;
             arr.with_write(|v| {
                 while v.len() < end {
                     v.push(CfmlValue::Null);
@@ -3172,7 +3285,7 @@ fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
                     v[i] = args[3].clone();
                 }
             });
-            return Ok(CfmlValue::Array(arr.clone()));
+            return Ok(CfmlValue::Bool(true)); // GH #430 — see `fn_array_append`.
         }
     }
     // Was `Ok(Bool(false))`: a too-short or non-array call mutated nothing and
@@ -3186,6 +3299,15 @@ fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Array(arr) = &args[0] {
+            // GH #430: both positions must exist; Lucee reports the offending
+            // one rather than swapping nothing and claiming success.
+            let len = arr.len();
+            for a in 1..=2 {
+                let pos = get_index_arg(&args, a)?;
+                if pos < 1 || pos as usize > len {
+                    return Err(CfmlError::expression(format!("invalid index [{}]", pos)));
+                }
+            }
             let i = (get_int(&args, 1) as usize).saturating_sub(1);
             let j = (get_int(&args, 2) as usize).saturating_sub(1);
             arr.with_write(|v| {
@@ -3193,7 +3315,7 @@ fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
                     v.swap(i, j);
                 }
             });
-            return Ok(CfmlValue::Array(arr.clone()));
+            return Ok(CfmlValue::Bool(true)); // GH #430 — see `fn_array_append`.
         }
     }
     // Was `Ok(Bool(false))` — a silent no-op on a bad call (GH #307 no-op audit).
@@ -17969,7 +18091,12 @@ fn fn_array_index_exists(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
-            let size = get_int(&args, 1) as usize;
+            // GH #430: `get_int(..) as usize` turned a NEGATIVE size into
+            // usize::MAX and the grow loop below never terminated — a one-line
+            // hang (`arrayResize(a,-1)`) reachable from user input. Lucee
+            // accepts it as a no-op. A size at or below the current length is
+            // also a no-op there (arrayResize only grows).
+            let size = get_index_arg(&args, 1)?.max(0) as usize;
             // In-place grow on the shared handle.
             arr.with_write(|v| {
                 while v.len() < size {
@@ -17978,7 +18105,7 @@ fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
                     v.push(CfmlValue::Null);
                 }
             });
-            Ok(CfmlValue::Array(arr.clone()))
+            Ok(CfmlValue::Bool(true)) // GH #430 — see `fn_array_append`.
         }
         _ => Err(CfmlError::runtime("arrayResize() requires an array".to_string())),
     }
