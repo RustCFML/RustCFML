@@ -6376,6 +6376,193 @@ pub fn handle_java_decimalformatsymbols(
     }
 }
 
+/// `java.text.DecimalFormat` — pattern-based number formatting.
+/// `createObject("java","java.text.DecimalFormat").init("0.##").format(n)`.
+///
+/// Supports the pattern vocabulary that real CFML code uses: `0` (a digit
+/// position that always prints), `#` (one that prints only when significant),
+/// `,` (grouping), `.` (the decimal separator), `%` (scale by 100 and append),
+/// and a literal prefix/suffix outside the number pattern. Locale-specific
+/// separators, scientific notation (`E`), per-mille (`\u{2030}`) and the
+/// positive;negative two-pattern form are NOT applied — see docs/known-issues.md.
+///
+/// Half-EVEN rounding, matching java.text.DecimalFormat's documented default
+/// (`RoundingMode.HALF_EVEN`) rather than the half-up most people expect: 0.125
+/// at two decimals is "0.12" on both.
+pub fn handle_java_decimalformat(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let pattern_of = |o: &CfmlValue| -> String {
+        if let CfmlValue::Struct(s) = o {
+            if let Some(p) = s.get("__df_pattern") {
+                return p.as_string();
+            }
+        }
+        String::new()
+    };
+    let make = |pattern: String| {
+        let mut shim = jshim("java.text.decimalformat");
+        shim.insert("__df_pattern".to_string(), CfmlValue::string(pattern));
+        CfmlValue::strukt(shim)
+    };
+    match method {
+        "init" => {
+            if args.is_empty() {
+                return Ok(CfmlValue::strukt(jshim("java.text.decimalformat")));
+            }
+            Ok(make(args[0].as_string()))
+        }
+        // java.text mutates the receiver and returns void. The shim is a struct
+        // with a shared backing, so writing the key IS the in-place mutation —
+        // returning a fresh shim instead left the caller's formatter on its old
+        // pattern, silently.
+        "applypattern" | "applylocalizedpattern" => {
+            let pattern = args.first().map(|v| v.as_string()).unwrap_or_default();
+            if let CfmlValue::Struct(s) = object {
+                s.insert("__df_pattern".to_string(), CfmlValue::string(pattern));
+                return Ok(CfmlValue::Null);
+            }
+            Ok(make(pattern))
+        }
+        "topattern" | "tolocalizedpattern" => Ok(CfmlValue::string(pattern_of(object))),
+        "format" => {
+            let pattern = {
+                let p = pattern_of(object);
+                if p.is_empty() {
+                    // A bare class-ref receiver formats with Java's default
+                    // pattern (grouping on, up to 3 decimals).
+                    "#,##0.###".to_string()
+                } else {
+                    p
+                }
+            };
+            let n = args
+                .first()
+                .map(|v| v.as_string().trim().parse::<f64>().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            Ok(CfmlValue::string(format_decimal_pattern(&pattern, n)))
+        }
+        // Only the accessors whose answer we can state truthfully from the
+        // pattern. Anything else (rounding mode, currency, symbol swaps) would
+        // be a guess, so it reports unhandled rather than a plausible default.
+        "getmaximumfractiondigits" => Ok(CfmlValue::Int(
+            decimal_fraction_bounds(&pattern_of(object)).1 as i64,
+        )),
+        "getminimumfractiondigits" => Ok(CfmlValue::Int(
+            decimal_fraction_bounds(&pattern_of(object)).0 as i64,
+        )),
+        "isgroupingused" => Ok(CfmlValue::Bool(pattern_of(object).contains(','))),
+        _ => Err(CfmlError::shim_unhandled(method)),
+    }
+}
+
+/// `(minimum, maximum)` fraction digits a DecimalFormat pattern asks for:
+/// `0` positions after the decimal point are required, `#` positions optional.
+fn decimal_fraction_bounds(pattern: &str) -> (usize, usize) {
+    let body = decimal_pattern_body(pattern).1;
+    match body.split_once('.') {
+        Some((_, frac)) => (
+            frac.chars().filter(|c| *c == '0').count(),
+            frac.chars().filter(|c| *c == '0' || *c == '#').count(),
+        ),
+        None => (0, 0),
+    }
+}
+
+/// Split a pattern into `(prefix, number-body, suffix)`. The body is the run of
+/// pattern characters (`0 # , .`); anything either side is a literal.
+fn decimal_pattern_body(pattern: &str) -> (String, String, String) {
+    let is_body = |c: char| matches!(c, '0' | '#' | ',' | '.');
+    let start = pattern.find(is_body).unwrap_or(pattern.len());
+    let end = pattern.rfind(is_body).map(|i| i + 1).unwrap_or(start);
+    (
+        pattern[..start].to_string(),
+        pattern[start..end].to_string(),
+        pattern[end..].to_string(),
+    )
+}
+
+/// Render `value` under a DecimalFormat `pattern`.
+///
+/// Rounding is delegated to Rust's float formatter, which converts the EXACT
+/// binary value and breaks a true tie to even — which is what java.text does.
+/// Scaling by a power of ten and rounding the product does NOT work: `0.005 *
+/// 100` rounds to exactly `0.5` in f64, losing the fact that 0.005 is really a
+/// hair above it, so `0.005` at two decimals came out `0.00` where java.text
+/// gives `0.01`. (`0.125` IS exactly representable, so it is a real tie and
+/// correctly goes to the even `0.12` on both.)
+fn format_decimal_pattern(pattern: &str, value: f64) -> String {
+    let (prefix, body, suffix) = decimal_pattern_body(pattern);
+    // `%` anywhere in the literal parts scales by 100, as java.text does.
+    let percent = prefix.contains('%') || suffix.contains('%');
+    let value = if percent { value * 100.0 } else { value };
+
+    let (min_frac, max_frac) = match body.split_once('.') {
+        Some((_, frac)) => (
+            frac.chars().filter(|c| *c == '0').count(),
+            frac.chars().filter(|c| *c == '0' || *c == '#').count(),
+        ),
+        None => (0, 0),
+    };
+    let int_pattern = body.split('.').next().unwrap_or("");
+    let min_int = int_pattern.chars().filter(|c| *c == '0').count();
+    // The GROUP SIZE comes from the pattern, not a fixed 3: java.text uses the
+    // digit positions after the LAST comma, so `#,#0.00` groups by TWO and
+    // formats 1234567.891 as "1,23,45,67.89" (the Indian lakh/crore grouping is
+    // written exactly this way). Verified against a real java.text.DecimalFormat.
+    let group_size = match int_pattern.rfind(',') {
+        Some(i) => int_pattern[i + 1..]
+            .chars()
+            .filter(|c| *c == '0' || *c == '#')
+            .count(),
+        None => 0,
+    };
+    let grouping = group_size > 0;
+
+    let negative = value < 0.0;
+    let rendered = format!("{:.*}", max_frac, value.abs());
+    let (mut int_str, frac_src) = match rendered.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (rendered, String::new()),
+    };
+    // `#` positions drop trailing zeros; `0` positions keep them.
+    let mut frac_str = frac_src;
+    while frac_str.len() > min_frac && frac_str.ends_with('0') {
+        frac_str.pop();
+    }
+
+    while int_str.len() < min_int {
+        int_str.insert(0, '0');
+    }
+    // NB no leading-zero suppression: `#.##` of 0.5 is "0.5" in java.text, not
+    // ".5" — an all-`#` integer pattern still prints the units digit.
+    if grouping && int_str.len() > group_size {
+        let mut grouped = String::new();
+        for (i, c) in int_str.chars().enumerate() {
+            if i > 0 && (int_str.len() - i) % group_size == 0 {
+                grouped.push(',');
+            }
+            grouped.push(c);
+        }
+        int_str = grouped;
+    }
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&prefix);
+    out.push_str(&int_str);
+    if !frac_str.is_empty() {
+        out.push('.');
+        out.push_str(&frac_str);
+    }
+    out.push_str(&suffix);
+    out
+}
+
 /// `java.text.MessageFormat` — locale-aware message templating with `{index}`
 /// argument placeholders (optionally `{index,number[,style]}` / `{index,date}` /
 /// `{index,time}`). Mura/Masa's `resourceBundle.formatRB()` builds one via

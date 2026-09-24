@@ -762,6 +762,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("queryRecordCount".to_string(), fn_query_record_count as BuiltinFunction);
     f.insert("queryColumnCount".to_string(), fn_query_column_count as BuiltinFunction);
     f.insert("queryColumnList".to_string(), fn_query_column_list as BuiltinFunction);
+    f.insert("queryClear".to_string(), fn_query_clear as BuiltinFunction);
     f.insert("queryDeleteRow".to_string(), fn_query_delete_row as BuiltinFunction);
     f.insert("queryDeleteColumn".to_string(), fn_query_delete_column as BuiltinFunction);
     f.insert("queryAppend".to_string(), fn_query_append as BuiltinFunction);
@@ -948,6 +949,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cftransaction_end".to_string(), fn_cftransaction_end_stub);
     f.insert("cfdirectory".to_string(), fn_cfdirectory);
     f.insert("cffile".to_string(), fn_cffile);
+    f.insert("cfadmin".to_string(), fn_cfadmin_stub);
     f.insert("cfdbinfo".to_string(), fn_cfdbinfo_stub);
     f.insert("dbinfo".to_string(), fn_cfdbinfo_stub);
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -7769,7 +7771,9 @@ fn fn_query_add_column(args: Vec<CfmlValue>) -> CfmlResult {
             // see the new column, and subsequent per-row cell writes hit the same
             // query rather than an orphaned clone.
             q.with_write(|d| d.add_column(col_name, values));
-            return Ok(args[0].clone());
+            // Standalone returns the new column's number (Lucee 7.1); the
+            // member form returns the query (`query_member_returns_receiver`).
+            return Ok(CfmlValue::Int(q.column_count() as i64));
         }
     }
     Ok(CfmlValue::Null)
@@ -7871,60 +7875,112 @@ fn fn_query_column_array(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// `queryDeleteRow(query, row)` — deletes IN PLACE (every alias of the query
+/// sees it) and returns `true`; the member form returns the query (see the VM's
+/// `query_member_returns_receiver`). Lucee 7.1.
 fn fn_query_delete_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut data = q.with_read(|d| d.clone());
-            let row_idx = (get_int(&args, 1) as usize).saturating_sub(1);
-            if data.remove_row(row_idx).is_some() {
-                return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            let row = get_int(&args, 1);
+            let removed = row >= 1 && q.with_write(|d| d.remove_row(row as usize - 1)).is_some();
+            if removed {
+                return Ok(CfmlValue::Bool(true));
             }
-            return Err(CfmlError::runtime(format!("queryDeleteRow: row {} is out of range", row_idx + 1)));
+            return Err(CfmlError::runtime(format!("invalid row number [{}]", row)));
         }
     }
     Ok(CfmlValue::Null)
 }
 
+/// `queryDeleteColumn(query, column)` — removes the column IN PLACE and returns
+/// its values as an array (Lucee 7.1); a missing column throws.
 fn fn_query_delete_column(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut data = q.with_read(|d| d.clone());
             let col_name = args[1].as_string();
-            data.remove_column_by_name(&col_name);
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            let values = q.column_values_ci(&col_name);
+            let Some(values) = values else {
+                return Err(CfmlError::runtime(format!(
+                    "Cannot remove column [{}], it doesn't exist",
+                    col_name
+                )));
+            };
+            q.with_write(|d| d.remove_column_by_name(&col_name));
+            return Ok(CfmlValue::array((*values).clone()));
         }
     }
     Ok(CfmlValue::Null)
 }
 
+/// Lucee requires the two queries of `queryAppend` / `queryPrepend` /
+/// `queryInsertAt` to have the same column set (compared case-insensitively,
+/// in any order), and names both lists in the error.
+fn query_columns_must_match(a: &CfmlQueryData, b: &CfmlQueryData) -> Result<(), CfmlError> {
+    let same = a.columns.len() == b.columns.len()
+        && a.columns.iter().all(|c| b.column_index_ci(c).is_some());
+    if same {
+        return Ok(());
+    }
+    let list = |d: &CfmlQueryData| d.columns.iter().map(|c| c.to_lowercase()).collect::<Vec<_>>().join(", ");
+    Err(CfmlError::runtime(format!(
+        "column names [{}] of the first query does not match the column names [{}] of the second query",
+        list(a),
+        list(b)
+    )))
+}
+
+/// `queryAppend(query, other)` — appends IN PLACE and returns the query.
 fn fn_query_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let (CfmlValue::Query(q1), CfmlValue::Query(q2)) = (&args[0], &args[1]) {
-            let mut data = q1.with_read(|d| d.clone());
-            q2.with_read(|d2| data.append_query(d2));
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            // Snapshot first: `queryAppend(q, q)` would otherwise read and
+            // write the same lock.
+            let other = q2.with_read(|d| d.clone());
+            q1.with_read(|d| query_columns_must_match(d, &other))?;
+            q1.with_write(|d| d.append_query(&other));
+            return Ok(args[0].clone());
         }
     }
     Err(CfmlError::runtime("queryAppend() requires two query arguments".to_string()))
 }
 
+/// `queryInsertAt(query, value, position)` — inserts IN PLACE before
+/// `position` (1 … recordCount+1) and returns the query. `value` is a query
+/// (all its rows; same column set) or a struct (one row).
 fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut data = q.with_read(|d| d.clone());
-            let position = (get_int(&args, 2) as usize).saturating_sub(1);
-            if position > data.row_count() {
+            let index = get_int(&args, 2);
+            let rc = q.row_count() as i64;
+            if index < 1 || index > rc + 1 {
                 return Err(CfmlError::runtime(format!(
-                    "queryInsertAt: position {} is out of range (query has {} rows)",
-                    position + 1, data.row_count()
+                    "Invalid call of the function [QueryInsertAt], third Argument [index] is invalid, \
+                     index [{}] cannot be bigger than recordcount [{}] of the query plus 1.",
+                    index, rc
                 )));
             }
-            let row_data: ValueMap = match &args[1] {
-                CfmlValue::Struct(d) => d.snapshot(),
-                _ => ValueMap::default(),
-            };
-            data.insert_row_named(position, row_data);
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            let at = index as usize - 1;
+            match &args[1] {
+                CfmlValue::Query(other) => {
+                    let other = other.with_read(|d| d.clone());
+                    q.with_read(|d| query_columns_must_match(d, &other))?;
+                    q.with_write(|d| {
+                        for (i, row) in other.synthesise_rows().into_iter().enumerate() {
+                            d.insert_row_named(at + i, row);
+                        }
+                    });
+                }
+                CfmlValue::Struct(row) => {
+                    let row = row.snapshot();
+                    q.with_write(|d| d.insert_row_named(at, row));
+                }
+                _ => {
+                    return Err(CfmlError::runtime(
+                        "queryInsertAt() value must be a query or a struct".to_string(),
+                    ))
+                }
+            }
+            return Ok(args[0].clone());
         }
     }
     Err(CfmlError::runtime("queryInsertAt() requires a query, row data, and position".to_string()))
@@ -7933,9 +7989,10 @@ fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let (CfmlValue::Query(q1), CfmlValue::Query(q2)) = (&args[0], &args[1]) {
-            let mut data = q1.with_read(|d| d.clone());
-            q2.with_read(|d2| data.prepend_query(d2));
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            let other = q2.with_read(|d| d.clone());
+            q1.with_read(|d| query_columns_must_match(d, &other))?;
+            q1.with_write(|d| d.prepend_query(&other));
+            return Ok(args[0].clone());
         }
     }
     Err(CfmlError::runtime("queryPrepend() requires two query arguments".to_string()))
@@ -7950,62 +8007,70 @@ fn fn_query_reverse(args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("queryReverse() requires a query argument".to_string()))
 }
 
+/// `queryRowSwap(query, source, destination)` — swaps IN PLACE and returns the
+/// query.
 fn fn_query_row_swap(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut data = q.with_read(|d| d.clone());
-            let row1 = (get_int(&args, 1) as usize).saturating_sub(1);
-            let row2 = (get_int(&args, 2) as usize).saturating_sub(1);
-            let rc = data.row_count();
-            if row1 >= rc {
-                return Err(CfmlError::runtime(format!(
-                    "queryRowSwap: row1 {} is out of range (query has {} rows)",
-                    row1 + 1, rc
-                )));
+            let rc = q.row_count() as i64;
+            let src = get_int(&args, 1);
+            let dst = get_int(&args, 2);
+            for (arg, which, v) in [("second", "source", src), ("third", "destination", dst)] {
+                if v < 1 || v > rc {
+                    return Err(CfmlError::runtime(format!(
+                        "Invalid call of the function [QueryRowSwap], {} Argument [{}] is invalid, \
+                         {} [{}] cannot be bigger than recordcount [{}] of the query.",
+                        arg, which, which, v, rc
+                    )));
+                }
             }
-            if row2 >= rc {
-                return Err(CfmlError::runtime(format!(
-                    "queryRowSwap: row2 {} is out of range (query has {} rows)",
-                    row2 + 1, rc
-                )));
-            }
-            data.swap_rows(row1, row2);
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            q.with_write(|d| d.swap_rows(src as usize - 1, dst as usize - 1));
+            return Ok(args[0].clone());
         }
     }
     Err(CfmlError::runtime("queryRowSwap() requires a query and two row numbers".to_string()))
 }
 
+/// `querySetRow(query, row, data)` — sets the named cells of one row IN PLACE
+/// and returns `true` (both forms, Lucee 7.1). Columns the struct does not name
+/// keep their values.
 fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut data = q.with_read(|d| d.clone());
-            let row_idx = (get_int(&args, 1) as usize).saturating_sub(1);
-            let rc = data.row_count();
-            if row_idx >= rc {
+            let row = get_int(&args, 1);
+            let rc = q.row_count() as i64;
+            if row < 1 || row > rc {
                 return Err(CfmlError::runtime(format!(
                     "querySetRow: row {} is out of range (query has {} rows)",
-                    row_idx + 1, rc
+                    row, rc
                 )));
             }
             let row_data: ValueMap = match &args[2] {
                 CfmlValue::Struct(d) => d.snapshot(),
                 _ => ValueMap::default(),
             };
-            // Replace cells in the existing row.
-            for ci in 0..data.columns.len() {
-                let col_name = data.columns[ci].clone();
-                let val = row_data
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&col_name))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(CfmlValue::Null);
-                std::sync::Arc::make_mut(&mut data.data[ci])[row_idx] = val;
+            for (k, v) in row_data {
+                q.set_cell(row as usize - 1, k.as_str().to_string(), v);
             }
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            return Ok(CfmlValue::Bool(true));
         }
     }
     Err(CfmlError::runtime("querySetRow() requires a query, row number, and row data".to_string()))
+}
+
+/// `queryClear(query)` — removes every row IN PLACE, keeping the columns, and
+/// returns the query (Lucee 7.1).
+fn fn_query_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    if let Some(CfmlValue::Query(q)) = args.first() {
+        q.with_write(|d| {
+            for col in d.data.iter_mut() {
+                std::sync::Arc::make_mut(col).clear();
+            }
+        });
+        q.set_current_row(1);
+        return Ok(args[0].clone());
+    }
+    Err(CfmlError::runtime("queryClear() requires a query".to_string()))
 }
 
 fn fn_query_ho_stub(_args: Vec<CfmlValue>) -> CfmlResult {
@@ -9051,6 +9116,9 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     let recurse = if args.len() >= 2 { args[1].is_true() } else { false };
     let list_info = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "path".to_string() };
     let filter = if args.len() >= 4 { get_str(&args, 3) } else { String::new() };
+    // 5th arg `sort` — applied to the QUERY form only; Lucee returns the
+    // `name`/`path` arrays in filesystem order whatever it says.
+    let sort = if args.len() >= 5 { get_str(&args, 4) } else { String::new() };
     // 6th arg `type` (dir|file|all, default all) — Lucee parity. Wheels' plugin
     // loader uses directoryList(..., "dir") to enumerate only sub-directories.
     let type_filter = if args.len() >= 6 { get_str(&args, 5).to_lowercase() } else { "all".to_string() };
@@ -9151,7 +9219,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
     enum Entry {
         Scalar(CfmlValue),
-        Row { name: String, directory: String, size: u64, is_dir: bool },
+        Row { name: String, directory: String, size: u64, is_dir: bool, modified: String, mode: String },
     }
 
     fn list_dir(
@@ -9200,11 +9268,16 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
             if (is_file || is_dir) && type_ok && matches_filter(&file_name, filter) {
                 match list_info {
                     "query" => {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let meta = entry_path.metadata().ok();
+                        // Lucee reports a directory's size as 0, not the
+                        // filesystem's directory-record size.
+                        let size = if is_dir { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) };
                         let directory = entry_path.parent()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        results.push(Entry::Row { name: file_name.clone(), directory, size, is_dir });
+                        let modified = cfml_common::dirlist::date_last_modified(meta.as_ref());
+                        let mode = cfml_common::dirlist::mode(meta.as_ref());
+                        results.push(Entry::Row { name: file_name.clone(), directory, size, is_dir, modified, mode });
                     }
                     "name" => results.push(Entry::Scalar(CfmlValue::string(file_name.clone()))),
                     _ => results.push(Entry::Scalar(CfmlValue::string(full_path.clone()))),
@@ -9255,18 +9328,19 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 ];
                 let q = cfml_common::dynamic::CfmlQuery::new(columns);
                 for e in entries {
-                    if let Entry::Row { name, directory, size, is_dir } = e {
+                    if let Entry::Row { name, directory, size, is_dir, modified, mode } = e {
                         let mut row = ValueMap::default();
                         row.insert("name".to_string(), CfmlValue::string(name));
                         row.insert("directory".to_string(), CfmlValue::string(directory));
                         row.insert("size".to_string(), CfmlValue::Int(size as i64));
                         row.insert("type".to_string(), CfmlValue::string(if is_dir { "Dir" } else { "File" }));
-                        row.insert("dateLastModified".to_string(), CfmlValue::string(String::new()));
+                        row.insert("dateLastModified".to_string(), CfmlValue::string(modified));
                         row.insert("attributes".to_string(), CfmlValue::string(String::new()));
-                        row.insert("mode".to_string(), CfmlValue::string(String::new()));
+                        row.insert("mode".to_string(), CfmlValue::string(mode));
                         q.add_row(row);
                     }
                 }
+                cfml_common::dirlist::sort_listing_query(&q, &sort);
                 Ok(CfmlValue::Query(q))
             } else {
                 let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
@@ -19063,6 +19137,12 @@ fn fn_cfloop_file_cursor_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cfexecute_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfexecute requires VM intercept".into()))
+}
+
+/// `cfadmin` reads and writes live engine state (the debugging config, the
+/// per-application datasource registry), none of which exists outside the VM.
+fn fn_cfadmin_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("cfadmin requires VM intercept".into()))
 }
 
 // Without `smtp`, the early `return Err` makes the rest of the body

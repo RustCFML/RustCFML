@@ -19,6 +19,7 @@ type AppFnIdSet = HashSet<i64, ValueBuildHasher>;
 /// `(kind tag, Arc pointer)` cycle guard for the same walk.
 type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 
+mod intercepts_admin;
 mod intercepts_common;
 mod intercepts_extensions;
 mod intercepts_deferred;
@@ -2259,6 +2260,13 @@ pub struct CfmlVirtualMachine {
     stack_pool: Vec<Vec<CfmlValue>>,
     /// Try-catch handler stack
     pub(crate) try_stack: Vec<TryHandler>,
+    /// One entry per `for (row in query)` loop in progress: the query and the
+    /// current row it had when the loop started. Lucee puts that row back when
+    /// the loop exits, however it exits — `ForInExit` does it for the end and
+    /// `break`, [`Self::unwind_for_in_cursors`] for a `return` (frame exit) and
+    /// a caught throw (`TryHandler::for_in_cursor_depth`). Loops over anything
+    /// else never touch it.
+    pub(crate) for_in_cursors: Vec<(CfmlQuery, usize)>,
     /// Current exception (if any)
     #[allow(dead_code)]
     current_exception: Option<CfmlValue>,
@@ -4298,6 +4306,9 @@ pub(crate) struct TryHandler {
     /// ancestry). A tag that throws before its end op must not stay visible as
     /// an ancestor to whatever the catch block runs.
     base_tag_depth: usize,
+    /// Depth of `for_in_cursors`: a throw caught here puts back the current
+    /// row of every query loop it escaped.
+    pub(crate) for_in_cursor_depth: usize,
 }
 
 /// One entry in the custom-tag ancestry exposed by `getBaseTagList()` /
@@ -4516,6 +4527,7 @@ impl CfmlVirtualMachine {
             locals_pool: Vec::new(),
             stack_pool: Vec::new(),
             try_stack: Vec::new(),
+            for_in_cursors: Vec::new(),
             current_exception: None,
             last_exception: None,
             exception_save_stack: Vec::new(),
@@ -7707,7 +7719,21 @@ impl CfmlVirtualMachine {
         self.custom_tag_stack.truncate(entry_tag_depth);
     }
 
+    /// Put back, innermost first, the current row of every query for-in loop
+    /// opened above `depth` — ones a `return` or a throw left without reaching
+    /// their `ForInExit`.
+    pub(crate) fn unwind_for_in_cursors(&mut self, depth: usize) {
+        while self.for_in_cursors.len() > depth {
+            if let Some((q, row)) = self.for_in_cursors.pop() {
+                q.set_current_row(row);
+            }
+        }
+    }
+
     pub(crate) fn restore_capture_state(&mut self, handler: &TryHandler) {
+        if self.for_in_cursors.len() > handler.for_in_cursor_depth {
+            self.unwind_for_in_cursors(handler.for_in_cursor_depth);
+        }
         while self.saved_output_buffers.len() > handler.saved_buffers_depth {
             self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
         }
@@ -9329,6 +9355,8 @@ impl CfmlVirtualMachine {
         // assertion throws). Truncating back to this depth on every exit path
         // discards any handlers this frame leaked.
         let entry_try_depth = self.try_stack.len();
+        // Query for-in loops this frame leaves by `return` (see `for_in_cursors`).
+        let entry_cursor_depth = self.for_in_cursors.len();
 
         // Same idea for custom-tag pairs. A `__cfcustomtag_start` and its
         // `__cfcustomtag_end` are always emitted into the SAME frame, so any
@@ -12525,6 +12553,9 @@ impl CfmlVirtualMachine {
                     // Discard any try-handlers this frame leaked by returning from
                     // inside an open try block (see entry_try_depth comment).
                     self.try_stack.truncate(entry_try_depth);
+                    if self.for_in_cursors.len() > entry_cursor_depth {
+                        self.unwind_for_in_cursors(entry_cursor_depth);
+                    }
                     // …and any custom-tag pair left open by returning from inside
                     // a tag body (see entry_tag_depth comment).
                     self.unwind_abandoned_tag_pairs(entry_tag_depth, entry_buffers_depth);
@@ -14083,7 +14114,14 @@ impl CfmlVirtualMachine {
                                     &result,
                                     CfmlValue::Struct(res) if res.contains_key("__java_shim")
                                 );
-                                if !clobbers_cfc && !bool_over_struct && !shim_over_nonshim {
+                                // A query is a shared handle and every query
+                                // mutator changes it in place, so a result that
+                                // is not a query (`q.setRow()` → `true`, a
+                                // `set*` name the implicit-setter rule matches)
+                                // must never replace it.
+                                let nonquery_over_query = matches!(&cur_val, Some(CfmlValue::Query(_)))
+                                    && !matches!(&result, CfmlValue::Query(_));
+                                if !clobbers_cfc && !bool_over_struct && !shim_over_nonshim && !nonquery_over_query {
                                     self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
                                 } else if bool_over_struct
                                     && !cur_is_cfc
@@ -14136,6 +14174,12 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                     if reached {
+                                        // See `nonquery_over_query` above.
+                                        if matches!(&node, CfmlValue::Query(_))
+                                            && !matches!(&result, CfmlValue::Query(_))
+                                        {
+                                            skip_for_identity = true;
+                                        }
                                         if let CfmlValue::Struct(cur) = &node {
                                             let same_instance = matches!(
                                                 &result,
@@ -14774,6 +14818,9 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::GetKeys => { ops::access::op_get_keys(&mut stack); }
                 BytecodeOp::IterLen => { ops::access::op_iter_len(&mut stack); }
+                BytecodeOp::ForInPrepare => { ops::access::op_for_in_prepare(self, &mut stack); }
+                BytecodeOp::ForInElement => { ops::access::op_for_in_element(self, &mut stack, &mut ip, &locals)?; }
+                BytecodeOp::ForInExit => { ops::access::op_for_in_exit(self, &mut stack); }
                 BytecodeOp::ArgConcatWriteThrough(name) => {
                     // See the op's doc. Pops the duplicated result; the following
                     // StoreLocal stores the original.
@@ -15282,6 +15329,9 @@ impl CfmlVirtualMachine {
         // Discard any try-handlers this frame leaked by returning from inside an
         // open try block, or via cfexit/running off the end (see entry_try_depth).
         self.try_stack.truncate(entry_try_depth);
+        if self.for_in_cursors.len() > entry_cursor_depth {
+            self.unwind_for_in_cursors(entry_cursor_depth);
+        }
         // …and any custom-tag pair left open the same way (see entry_tag_depth).
         self.unwind_abandoned_tag_pairs(entry_tag_depth, entry_buffers_depth);
 
@@ -16161,6 +16211,13 @@ impl CfmlVirtualMachine {
 
             if intercepts_querydir::handles(&name_lower) {
                 match self.dispatch_querydir(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
+                }
+            }
+
+            if intercepts_admin::handles(&name_lower) {
+                match self.dispatch_admin(&name_lower, args.clone()) {
                     Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
                     other => return other,
                 }
@@ -19484,6 +19541,9 @@ impl CfmlVirtualMachine {
                                 }
                                 "java.text.messageformat" => {
                                     java_shims::handle_java_messageformat("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.text.decimalformat" => {
+                                    java_shims::handle_java_decimalformat("init", empty_args, &CfmlValue::Null)
                                 }
                                 "java.lang.class" => {
                                     java_shims::handle_java_class("init", empty_args, &CfmlValue::Null)
@@ -23063,6 +23123,18 @@ impl CfmlVirtualMachine {
         )
     }
 
+    /// Query member functions whose Lucee return value is the RECEIVER, while
+    /// the standalone BIF returns a status value (`true`, a row or column
+    /// number, the removed column's values). `setRow` is not one: it returns
+    /// `true` in both forms. `reverse`/`slice` return a NEW query. Lucee 7.1.
+    fn query_member_returns_receiver(method_lower: &str) -> bool {
+        matches!(
+            method_lower,
+            "addrow" | "addcolumn" | "deleterow" | "deletecolumn" | "setcell" | "sort"
+                | "clear" | "append" | "prepend" | "insertat" | "rowswap"
+        )
+    }
+
     fn is_mutating_method(method: &str) -> bool {
         // Implicit property setters (setXxx) are mutating
         if method.len() > 3
@@ -23631,9 +23703,17 @@ impl CfmlVirtualMachine {
                 if !filter_carry(k, v) {
                     continue;
                 }
-                if plan.lexical && InheritedKeys::structural_bit(k.as_str()).is_some() {
+                if plan.lexical
+                    && plan.env.is_some()
+                    && InheritedKeys::structural_bit(k.as_str()).is_some()
+                {
                     // Lexical callee: the env loop above already seeded whatever
                     // structural scopes it captured; the caller's are not its.
+                    // A STRIPPED copy (no env — see the carrier exception above)
+                    // takes the caller's: that chain IS its lexical scope, and
+                    // skipping them left a closure called from inside another
+                    // closure (or recursing into itself) with no `this` /
+                    // `variables`, so an unscoped private method was not found.
                     continue;
                 }
                 if let Some(env) = env_guard.as_deref() {
@@ -24760,6 +24840,11 @@ impl CfmlVirtualMachine {
                 // `writeLog(text=…, file=…, type=…)` deliver "file" as `type`.
                 // Bundling into one options struct keeps names attached.
                 | "writelog"
+                // `cfadmin(action=…, returnVariable="x")` and the statement form
+                // `admin action=… returnVariable="x";` both bundle into the one
+                // options struct the cfadmin intercept reads, and `x` is picked
+                // up as the result write-back target (tag_call_writeback_attr).
+                | "cfadmin"
         )
     }
 
@@ -24774,6 +24859,9 @@ impl CfmlVirtualMachine {
         let tag = tag.trim_start_matches("__");
         match tag.to_lowercase().as_str() {
             "cfhttp" => &["result"],
+            // cfadmin names its output variable `returnVariable` — the whole
+            // point of a read action (`action="getDebug" returnVariable="s"`).
+            "cfadmin" => &["returnvariable"],
             // cfimage writes its result to `name` (read/resize/rotate → image)
             // or `structName` (action="info" → metadata struct). Mirrors the
             // tag form's `name = cfimage({...})` rewrite so the script-call
@@ -27881,6 +27969,9 @@ impl CfmlVirtualMachine {
                     "java.text.messageformat" => {
                         java_shims::handle_java_messageformat(&m, all_args, object)
                     }
+                    "java.text.decimalformat" => {
+                        java_shims::handle_java_decimalformat(&m, all_args, object)
+                    }
                     _ => Ok(CfmlValue::Null),
                 };
                 // A shim that mutated the filesystem must invalidate the same
@@ -29271,6 +29362,20 @@ impl CfmlVirtualMachine {
                 // `q.addColumn(...)` threw "does not exist in the Query."
                 "addcolumn" => Some("queryAddColumn"),
                 "getrow" => Some("queryGetRow"),
+                // The rest of Lucee's query member API. Each maps onto its
+                // standalone BIF; which of them hand back the query rather than
+                // the BIF's status value is `query_member_returns_receiver`.
+                "deleterow" => Some("queryDeleteRow"),
+                "deletecolumn" => Some("queryDeleteColumn"),
+                "append" => Some("queryAppend"),
+                "prepend" => Some("queryPrepend"),
+                "insertat" => Some("queryInsertAt"),
+                "rowswap" => Some("queryRowSwap"),
+                "setrow" => Some("querySetRow"),
+                "setcell" => Some("querySetCell"),
+                "clear" => Some("queryClear"),
+                "reverse" => Some("queryReverse"),
+                "slice" => Some("querySlice"),
                 "each" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (i, row) in q.rows().into_iter().enumerate() {
@@ -29538,6 +29643,12 @@ impl CfmlVirtualMachine {
                 // `.merge`/`.reverse` return elements or a new array.
                 if matches!(object, CfmlValue::Array(_))
                     && Self::array_member_returns_receiver(&method_lower)
+                {
+                    return Ok(object.clone());
+                }
+                // Same for the query mutators (Lucee 7.1).
+                if matches!(object, CfmlValue::Query(_))
+                    && Self::query_member_returns_receiver(&method_lower)
                 {
                     return Ok(object.clone());
                 }
@@ -38316,7 +38427,6 @@ impl CfmlVirtualMachine {
         }
         self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
         entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
-        Self::sort_directory_entries(&mut entries, sort);
         // Lucee/ACF: `cfdirectory action="list" listinfo="name"` returns a
         // single-column (`name`) query whose `name` is the path RELATIVE to the
         // listed directory (subdirectories included, `/`-separated) when
@@ -38327,10 +38437,17 @@ impl CfmlVirtualMachine {
         // default `listinfo="all"` query keeps `name` = basename + a `directory`
         // column. (The `directoryList()` BIF returns basenames for both, which
         // already matches Lucee — that path is unchanged.)
-        if list_info == "name" {
-            return Ok(Self::build_directory_name_query(&entries, path));
+        let listing = if list_info == "name" {
+            Self::build_directory_name_query(&entries, path)
+        } else {
+            Self::build_directory_query(&entries, path)
+        };
+        // Same rules as `directoryList()` (Lucee 7.1): case-sensitive text,
+        // numeric size, an invalid spec leaves the filesystem order.
+        if let CfmlValue::Query(ref q) = listing {
+            cfml_common::dirlist::sort_listing_query(q, sort);
         }
-        Ok(Self::build_directory_query(&entries, path))
+        Ok(listing)
     }
 
     /// Build the single-column `name` query for `cfdirectory listinfo="name"`,
@@ -38349,65 +38466,6 @@ impl CfmlVirtualMachine {
             query.add_row(row);
         }
         CfmlValue::Query(query)
-    }
-
-    /// Sort collected directory entries in place per the `cfdirectory` `sort`
-    /// attribute — "col [asc|desc][, col2 [asc|desc] …]", default ascending
-    /// (Lucee/ACF). Supports `name` (default), `size`, `type` ("Dir" < "File"),
-    /// and `datelastmodified`. Without this the OS enumeration order leaked
-    /// through, so `<cfdirectory sort="name asc">` + a driving loop (e.g. Masa's
-    /// schema-migration runner) executed files out of order.
-    fn sort_directory_entries(entries: &mut [(String, String, bool)], sort: &str) {
-        let keys: Vec<(String, bool)> = sort
-            .split(',')
-            .filter_map(|part| {
-                let mut it = part.split_whitespace();
-                let col = it.next()?.to_lowercase();
-                let asc = !it
-                    .next()
-                    .map(|d| d.eq_ignore_ascii_case("desc"))
-                    .unwrap_or(false);
-                Some((col, asc))
-            })
-            .collect();
-        if keys.is_empty() {
-            return;
-        }
-        entries.sort_by(|a, b| {
-            for (col, asc) in &keys {
-                let ord = match col.as_str() {
-                    "size" => {
-                        let sz = |e: &(String, String, bool)| -> u64 {
-                            if e.2 {
-                                0
-                            } else {
-                                std::fs::metadata(&e.1).map(|m| m.len()).unwrap_or(0)
-                            }
-                        };
-                        sz(a).cmp(&sz(b))
-                    }
-                    // Lucee reports type as "Dir"/"File"; "Dir" sorts before "File".
-                    "type" => {
-                        let t = |e: &(String, String, bool)| if e.2 { "dir" } else { "file" };
-                        t(a).cmp(t(b))
-                    }
-                    "datelastmodified" => {
-                        let dt = |e: &(String, String, bool)| {
-                            std::fs::metadata(&e.1).and_then(|m| m.modified()).ok()
-                        };
-                        dt(a).cmp(&dt(b))
-                    }
-                    // "name" (default) and any unrecognised column → by name,
-                    // case-insensitive (textual, matching Lucee's default).
-                    _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-                };
-                let ord = if *asc { ord } else { ord.reverse() };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
     }
 
     /// Build a real `Query` value from collected directory entries
@@ -38433,14 +38491,7 @@ impl CfmlVirtualMachine {
             } else {
                 meta.as_ref().map(|m| m.len() as i64).unwrap_or(0)
             };
-            let date = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .map(|t| {
-                    let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                })
-                .unwrap_or_default();
+            let date = cfml_common::dirlist::date_last_modified(meta.as_ref());
             let directory = std::path::Path::new(full_path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -38454,7 +38505,10 @@ impl CfmlVirtualMachine {
             );
             row.insert("dateLastModified".to_string(), CfmlValue::string(date));
             row.insert("attributes".to_string(), CfmlValue::string(String::new()));
-            row.insert("mode".to_string(), CfmlValue::string(String::new()));
+            row.insert(
+                "mode".to_string(),
+                CfmlValue::string(cfml_common::dirlist::mode(meta.as_ref())),
+            );
             row.insert("directory".to_string(), CfmlValue::string(directory));
             query.add_row(row);
         }
@@ -42496,6 +42550,9 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
         BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::IterLen => (1, 1),
+        BytecodeOp::ForInPrepare => (1, 1),     // iterable → iterable'
+        BytecodeOp::ForInElement => (1, 2),     // iterable + idx → element
+        BytecodeOp::ForInExit => (0, 1),        // iterable → (nothing)
         BytecodeOp::ArgConcatWriteThrough(_) => (0, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object

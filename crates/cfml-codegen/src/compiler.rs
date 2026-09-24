@@ -1099,6 +1099,21 @@ pub enum BytecodeOp {
     /// (Lucee: delete skips the next element and ends early; append is
     /// iterated). Replaces the hoisted `len()` call (§107).
     IterLen,
+    /// For-in entry, in place of `GetKeys`. A query stays a query — its rows
+    /// are read live by `ForInElement` — and its current row is pushed on the
+    /// VM's cursor stack for `ForInExit`. Anything else becomes what `GetKeys`
+    /// gives.
+    ForInPrepare,
+    /// For-in element fetch, in place of `GetIndex`: pops `[iterable, idx]`.
+    /// Over a query it moves the query's current row to `idx` and pushes a copy
+    /// of that row (Lucee: `q.col` / `q.currentRow` follow a `for (row in q)`
+    /// loop); for anything else it is exactly `GetIndex`.
+    ForInElement,
+    /// For-in normal exit (the end, or a `break`): pops the iterable. Over a
+    /// query, pops the loop's saved row off the VM's cursor stack and puts it
+    /// back. A `return`/throw out of the body is unwound by the frame exit /
+    /// catch instead. Pushes nothing.
+    ForInExit,
     /// `a &= expr` on a PARAMETER under `localmode="modern"` (§109). Emitted
     /// right before the StoreLocal, with the result duplicated on the stack: if
     /// the frame is modern, `a` is a declared param not yet rebound as a local
@@ -1620,11 +1635,14 @@ impl BytecodeOp {
             Self::TryGetIndex => 130,
             Self::IterLen => 131,
             Self::ArgConcatWriteThrough(..) => 132,
+            Self::ForInPrepare => 133,
+            Self::ForInElement => 134,
+            Self::ForInExit => 135,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 133] = [
+    pub const CENSUS_NAMES: [&'static str; 136] = [
         "Null",
         "True",
         "False",
@@ -1758,6 +1776,9 @@ impl BytecodeOp {
         "TryGetIndex",
         "IterLen",
         "ArgConcatWriteThrough",
+        "ForInPrepare",
+        "ForInElement",
+        "ForInExit",
     ];
 }
 
@@ -2091,6 +2112,10 @@ impl CfmlCompiler {
                 // arg would clobber the struct variable with `true`/`false`.
                 // querySort is absent for exactly the same reason (GH #345): it
                 // sorts the shared query handle in place and returns a boolean.
+                // So is every other query mutator: they all change the shared
+                // query in place and return a status value (queryDeleteRow
+                // `true`, queryDeleteColumn the removed values, queryAddColumn
+                // the column number) that must not land over the query.
                 // GH #430: the whole ARRAY family left for the same reason. Those
                 // BIFs now return Lucee's status value (`true`, or the new length
                 // for arrayPush/arrayUnshift) rather than the mutated array, and
@@ -2102,9 +2127,7 @@ impl CfmlCompiler {
                 // which is now checked independently of this list.)
                 return matches!(name_lower.as_str(),
                     "structappend" | "structinsert" | "structupdate" |
-                    "structclear" |
-                    "queryaddcolumn" |
-                    "querydeleterow" | "querydeletecolumn"
+                    "structclear"
                 ) && !call.arguments.is_empty();
             }
         }
@@ -4198,8 +4221,10 @@ impl CfmlCompiler {
         // Compile iterable
         self.compile_expression(iterable, instructions);
 
-        // GetKeys: if struct, convert to array of keys; arrays pass through unchanged
-        instructions.push(BytecodeOp::GetKeys);
+        // A struct becomes its key array and arrays pass through unchanged, as
+        // `GetKeys`; a query stays a query, and its current row is saved for
+        // `ForInExit` (see there).
+        instructions.push(BytecodeOp::ForInPrepare);
 
         // Unique per-loop temp names (so nested for-in don't collide).
         let iter_var = format!("__iter_{}", instructions.len());
@@ -4249,10 +4274,11 @@ impl CfmlCompiler {
         let jump_false_idx = instructions.len();
         instructions.push(BytecodeOp::JumpIfFalse(0));
 
-        // Set loop variable = iterable[idx]
+        // Set loop variable = iterable[idx] (over a query, also moves its
+        // current row to idx).
         instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
         instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
-        instructions.push(BytecodeOp::GetIndex);
+        instructions.push(BytecodeOp::ForInElement);
         // GH #351: `for ( local.X in … )` at TEMPLATE level. `local` is an
         // ordinary variable there, so the loop variable is `variables.local.X`
         // and stripping the prefix would write a bare `X` that the body's
@@ -4376,6 +4402,12 @@ impl CfmlCompiler {
         for idx in continue_indices {
             instructions[idx] = BytecodeOp::Jump(continue_target);
         }
+
+        // The end or a `break` (both land here): over a query, put its current
+        // row back as it was before the loop (Lucee). A `return` or a throw out
+        // of the body skips this; the frame exit / catch unwinds it instead.
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
+        instructions.push(BytecodeOp::ForInExit);
     }
 
     fn compile_while(&mut self, while_stmt: &While, instructions: &mut Vec<BytecodeOp>) {

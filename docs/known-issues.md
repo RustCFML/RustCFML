@@ -282,6 +282,75 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cfthread action="...">` outside run/join/terminate | Throws "not supported". |
 | `createObject("java", "…")` for a class outside the shimmed set | Throws "Java class […] is not supported" (RustCFML has no JVM; only a curated set of `java.*` standard-library classes are shimmed). |
 | Dynamically-loaded Java classes (`cbjavaloader` / `java.net.URLClassLoader`) | The classloader *plumbing* (`URLClassLoader`, `coldfusion.runtime.java.JavaProxy`, `Class.forName`, `java.lang.reflect.Array`, `array.iterator()`) is shimmed so ColdBox's `cbjavaloader` module boots, but **invoking a class it loads throws** — there is no JVM to load JAR bytecode. Runtime features that genuinely need a loaded class (e.g. GoogleAuthenticator 2FA) fail loudly when used, not at boot. |
+| An unimplemented CFML tag, in **either** syntax | `<cfldap …>` and the CFScript statement form `ldap …;` both throw `Tag <cfldap> is not implemented.` See §6.1 for the list. |
+| `<cfadmin>` / `admin …;` for an action we cannot map | Throws, naming the action and listing what is supported. See §6.2. |
+
+<a id="6.1"></a>
+
+### 6.1 — CFML tags that are not implemented 🛑
+
+Lucee accepts `tag attr="v";` in CFScript for **any** tag, so both syntaxes are real
+code and both must refuse. Until v0.687.0 only the tag form did: the statement form
+parsed as a bare identifier followed by a run of assignments, so it did nothing, said
+nothing, and left the attribute names behind as variables in the caller's scope. That
+is how `admin action="updateDatasource" …;` — Preside's env-injected datasource
+registration — silently registered no datasource at all.
+
+Not implemented, in either syntax:
+
+`cfajaximport` `cfajaxproxy` `cfapplet` `cfassociate` `cfcalendar` `cfchart`
+`cfchartdata` `cfchartseries` `cfclient` `cfclientsettings` `cfcol` `cfcollection`
+`cfdiv` `cfdocument`¹ `cfdocumentitem` `cfdocumentsection` `cfexchangecalendar`
+`cfexchangeconnection` `cfexchangecontact` `cfexchangefilter` `cfexchangemail`
+`cfexchangetask` `cffeed` `cffileupload` `cfform` `cfformgroup` `cfformitem` `cfftp`
+`cfgrid` `cfgridcolumn` `cfgridrow` `cfgridupdate` `cfimap` `cfimapfilter` `cfindex`
+`cfinput` `cfinsert` `cflayout` `cflayoutarea` `cfldap` `cflogin`² `cfmap` `cfmapitem`
+`cfmediaplayer` `cfmenu` `cfmenuitem` `cfmessagebox` `cfntauthenticate` `cfobject`³
+`cfobjectcache` `cfpdf` `cfpdfform` `cfpdfformparam` `cfpdfparam` `cfpdfsubsection`
+`cfpod` `cfpop` `cfpresentation` `cfpresentationslide` `cfpresenter` `cfprint`
+`cfprogressbar` `cfregistry` `cfreport` `cfreportparam` `cfschedule` `cfsearch`
+`cfselect` `cfsharepoint` `cfslider` `cfsprydataset` `cftable` `cftextarea`
+`cftooltip` `cftrace` `cftree` `cftreeitem` `cfupdate` `cfwddx` `cfwebsocket`⁴
+`cfwindow` `cfxml`
+
+¹ `__cfdocument` appears in the intercept declaration table, but nothing reaches it:
+neither the tag nor a `cfdocument()` function form is wired. There is no PDF engine.
+² `<cfloginuser>`/`<cflogout>` **are** implemented (they need a session, so they no-op
+in CLI mode and work under `--serve`); only the `<cflogin>` wrapper is not.
+³ `createObject()` covers the same ground, including the Java shims.
+⁴ RustCFML has native WebSocket support with a different surface — see `docs/websockets.md`.
+
+The list lives in `UNSUPPORTED_TAG_STATEMENTS` (`crates/cfml-compiler/src/parser.rs`).
+Implementing a tag means **deleting it from that list**;
+`tests/core/test_script_tag_statement_refusals.cfm` asserts the two syntaxes agree, so
+a stale entry fails the suite rather than quietly disabling the new support.
+
+<a id="6.2"></a>
+
+### 6.2 — `<cfadmin>`: what is shimmed and what is not 🛑
+
+RustCFML has no Administrator, and the shim is not one. But most of what real code asks
+`cfadmin` for is not administration — it is the engine reporting its *own* configuration,
+which we hold. Supported actions (v0.687.0):
+
+| action | backed by | notes |
+|---|---|---|
+| `getDebug` | the `debugging` cfconfig block | Lucee's key shape: `debug`, `database`, `exception`, `tracing`, `timer`, `implicitAccess`, `queryUsage`, `dump`, `debugTemplate`, `maxLogs`. Reports the **real** state — it never claims debugging is on when it is off |
+| `updateDebug` | same | applies to the live config for this request; it does **not** rewrite `.cfconfig.json`. An attribute you omit is left alone |
+| `updateDebugSetting` | `debugging.maxRecords` | only `maxLogs` is mapped |
+| `getDebugEntry` | — | always an empty array: we have a fixed set of debug templates (`debugging.template`), not a registry of user-registered renderer CFCs |
+| `getCompilerSettings` | the `runtime` cfconfig block | `dotNotationUpperCase`, `nullSupport`, `suppressWSBeforeArg`, `templateCharset` (always `UTF-8` — every template is read as UTF-8) |
+| `updateCompilerSettings` | same | accepts a request that matches what the engine already does; `dotNotationUpperCase=true` is **refused** rather than reported as done (RustCFML preserves struct key case and has no uppercasing mode) |
+| `updateDatasource` | the per-application datasource registry | the same registry `this.datasources` and the cfconfig `datasources` block feed. Lucee's `dbusername`/`dbpassword` and `dbdriver`/`type` attribute names are understood |
+
+**Every other action throws**, naming the action and listing the supported set. That is
+deliberate: a caller doing feature detection wraps the call in `try`/`catch` (Preside's
+`LuceeAdminApiWrapper.canConnect()` is exactly that), and a throw is what makes it
+correctly report "no Administrator here". Returning an empty struct instead is how this
+whole class of bug started.
+
+`returnVariable` works in all three syntaxes — `<cfadmin …>`, `admin …;` and
+`cfadmin(…)` — including a scope-qualified target (`returnVariable="local.settings"`).
 
 > **`evaluate()` is supported** (read-only). It compiles and runs each string
 > argument as a CFML expression against the caller's scope and returns the value

@@ -1697,6 +1697,21 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             }
             (format!("__cflocation({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
+        "cfadmin" => {
+            // <cfadmin action="getDebug" returnVariable="s" …>
+            // → cfadmin({ action: "getDebug", returnVariable: "s", … });
+            // The VM intercept delivers the result to the (possibly dotted)
+            // `returnVariable` target — the same write-back path the script
+            // statement form `admin action=… returnVariable="s";` uses, so both
+            // syntaxes share one tested code path. RustCFML has no Administrator;
+            // the supported actions report or update the engine's own config
+            // (see `intercepts_admin.rs`), and an unsupported one throws.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+            }
+            (format!("cfadmin({{ {} }});\n", parts.join(", ")), tag_end - start)
+        }
         "cfdbinfo" => {
             // <cfdbinfo type="columns" name="cols" table="t" datasource="ds">
             // → cfdbinfo({ type: "columns", name: "cols", ... });

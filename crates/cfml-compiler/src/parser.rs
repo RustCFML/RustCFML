@@ -50,6 +50,33 @@ pub struct ParseError {
     pub column: usize,
 }
 
+/// CFML tags RustCFML does not implement, whose CFScript STATEMENT form
+/// (`tag attr="v";` — valid Lucee syntax for any tag) must therefore refuse
+/// exactly as the `<cftag …>` form already does.
+///
+/// Measured, not guessed: every name here throws "Tag <cfX> is not implemented"
+/// in tag form today. **Implementing one means deleting it from this list** —
+/// `tests/core/test_script_tag_statement_refusals.cfm` asserts the two agree, so
+/// a stale entry here (a tag that now works in tag form but refuses in script)
+/// fails the suite rather than quietly disabling the new support.
+///
+/// Names are stored WITHOUT the `cf` prefix; the statement form accepts either
+/// spelling. `admin` is deliberately absent — see `intercepts_admin.rs`.
+const UNSUPPORTED_TAG_STATEMENTS: &[&str] = &[
+    "ajaximport", "ajaxproxy", "applet", "associate", "calendar", "chart", "chartdata",
+    "chartseries", "client", "clientsettings", "col", "collection", "div", "document",
+    "documentitem", "documentsection", "exchangecalendar", "exchangeconnection",
+    "exchangecontact", "exchangefilter", "exchangemail", "exchangetask", "feed", "fileupload",
+    "form", "formgroup", "formitem", "ftp", "grid", "gridcolumn", "gridrow", "gridupdate",
+    "imap", "imapfilter", "index", "input", "insert", "layout", "layoutarea", "ldap", "login",
+    "map", "mapitem", "mediaplayer", "menu", "menuitem", "messagebox", "ntauthenticate",
+    "object", "objectcache", "pdf", "pdfform", "pdfformparam", "pdfparam", "pdfsubsection",
+    "pod", "pop", "presentation", "presentationslide", "presenter", "print", "progressbar",
+    "registry", "report", "reportparam", "schedule", "search", "select", "sharepoint",
+    "slider", "sprydataset", "table", "textarea", "tooltip", "trace", "tree", "treeitem",
+    "update", "wddx", "websocket", "window", "xml",
+];
+
 impl Parser {
     pub fn new(source: String) -> Self {
         let mut lexer = Lexer::new(source);
@@ -1049,10 +1076,13 @@ impl Parser {
             //   StructArg(fn) → fn({ attrs })          (VM intercept takes one struct)
             //   NamedCall(fn) → fn(attr=…, …)          (flows through is_tag_call_builtin)
             //   Dump          → writeDump(attr=…, …)
+            //   Unsupported   → throw("Tag <cfX> is not implemented.")
             enum TagStmt {
                 StructArg(&'static str),
                 NamedCall(&'static str),
                 Dump,
+                /// Carries the bare (un-prefixed) tag name for the message.
+                Unsupported(String),
             }
             let strategy = if let Token::Identifier(ref s) = self.peek(0) {
                 let lower = s.to_lowercase();
@@ -1107,6 +1137,32 @@ impl Parser {
                     "file" => Some(TagStmt::NamedCall("cffile")),
                     "zip" => Some(TagStmt::NamedCall("cfzip")),
                     "dump" => Some(TagStmt::Dump),
+                    // `admin action="…" returnVariable="x";` — Lucee's
+                    // Administrator API tag in statement form. Shimmed onto the
+                    // engine's own configuration (see `intercepts_admin.rs`);
+                    // before that it parsed as a bare `admin` identifier plus a
+                    // run of assignments, so Preside's env-injected datasource
+                    // registration did nothing and said nothing.
+                    "admin" => Some(TagStmt::NamedCall("cfadmin")),
+                    // Every CFML tag we do NOT implement, so its statement form
+                    // REFUSES exactly as its tag form already does. Lucee accepts
+                    // `tag attr=…;` in script for any tag, so this shape is real
+                    // code, not a typo — and without an arm here it parsed as a
+                    // bare identifier plus a run of assignments: no error, no
+                    // effect, and the attribute names left behind as variables in
+                    // the caller's scope. That is the GH #355 class, and it is
+                    // how `admin action="updateDatasource" …;` (Preside's
+                    // env-injected datasource setup) did nothing at all while
+                    // reporting success.
+                    //
+                    // The list is measured, not guessed: every name here throws
+                    // "Tag <cfX> is not implemented" in TAG form today. Implement
+                    // one and you must delete it from here — the two lists are
+                    // asserted disjoint by
+                    // `tests/core/test_script_tag_statement_refusals.cfm`.
+                    _ if UNSUPPORTED_TAG_STATEMENTS.contains(&bare) => {
+                        Some(TagStmt::Unsupported(bare.to_string()))
+                    }
                     _ => None,
                 }
             } else {
@@ -1129,6 +1185,23 @@ impl Parser {
                     self.match_token(&Token::Semicolon);
 
                     let (func_name, arguments) = match strategy {
+                        TagStmt::Unsupported(ref bare) => {
+                            // The attributes were consumed above, so the whole
+                            // statement is replaced by the same refusal the tag
+                            // form emits. Runtime rather than parse-time so a
+                            // never-executed branch still compiles, matching the
+                            // tag lowering.
+                            (
+                                "throw",
+                                vec![Expression::Literal(Literal {
+                                    value: LiteralValue::String(format!(
+                                        "Tag <cf{}> is not implemented.",
+                                        bare
+                                    )),
+                                    location: stmt_loc.clone(),
+                                })],
+                            )
+                        }
                         TagStmt::StructArg(func) => {
                             let pairs = attrs
                                 .into_iter()

@@ -20,7 +20,7 @@ use super::*;
 /// [`intercepts_common::unhandled`].
 #[inline]
 pub(crate) fn handles(name_lower: &str) -> bool {
-    matches!(name_lower, "cfdirectory" | "__cfdirectory" | "queryappend" | "querysetrow")
+    matches!(name_lower, "cfdirectory" | "__cfdirectory")
 }
 
 impl CfmlVirtualMachine {
@@ -43,52 +43,6 @@ impl CfmlVirtualMachine {
                         return self.cfdirectory_list_from_opts(opts);
                     }
                 }
-            }
-
-            // queryAppend: mutates the first query in-place (reference-typed —
-            // the shared handle propagates to the caller), returns boolean.
-            if name_lower == "queryappend" {
-                if let (Some(CfmlValue::Query(q1)), Some(CfmlValue::Query(q2))) =
-                    (args.first(), args.get(1))
-                {
-                    let q2_data: cfml_common::dynamic::CfmlQueryData =
-                        q2.with_read(|d| d.clone());
-                    q1.with_write(|d| d.append_query(&q2_data));
-                    return Ok(CfmlValue::Bool(true));
-                }
-                return Ok(CfmlValue::Bool(false));
-            }
-
-            // querySetRow: mutates query in-place, returns boolean.
-            if name_lower == "querysetrow" {
-                if let (Some(CfmlValue::Query(q)), Some(row_pos), Some(CfmlValue::Struct(new_row))) =
-                    (args.first(), args.get(1), args.get(2))
-                {
-                    let pos = match row_pos {
-                        CfmlValue::Int(i) => *i as usize,
-                        CfmlValue::Double(d) => *d as usize,
-                        _ => 0,
-                    };
-                    let new_row = new_row.snapshot();
-                    let ok = q.with_write(|d| {
-                        if pos >= 1 && pos <= d.row_count() {
-                            for ci in 0..d.columns.len() {
-                                let col_name = d.columns[ci].clone();
-                                let val = new_row
-                                    .iter()
-                                    .find(|(k, _)| k.eq_ignore_ascii_case(&col_name))
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or(CfmlValue::Null);
-                                std::sync::Arc::make_mut(&mut d.data[ci])[pos - 1] = val;
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    return Ok(CfmlValue::Bool(ok));
-                }
-                return Ok(CfmlValue::Bool(false));
             }
 
             // In-place array mutators that return boolean (matches Lucee):

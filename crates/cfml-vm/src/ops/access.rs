@@ -737,9 +737,58 @@ pub(crate) fn op_iter_len(stack: &mut Vec<CfmlValue>) {
         }
         CfmlValue::Binary(b) => b.len() as i64,
         CfmlValue::QueryColumn(..) => v.as_string().chars().count() as i64,
+        // A for-in over a query iterates it live (`ForInPrepare`): a row added
+        // or deleted by the body is seen, as on Lucee.
+        CfmlValue::Query(q) => q.row_count() as i64,
         _ => 0,
     };
     stack.push(CfmlValue::Int(n));
+}
+
+/// `ForInPrepare` — for-in entry (see the op's doc). A query is left in
+/// place and its current row saved on the VM's cursor stack; anything else goes
+/// through `GetKeys`.
+pub(crate) fn op_for_in_prepare(vm: &mut CfmlVirtualMachine, stack: &mut Vec<CfmlValue>) {
+    match stack.last() {
+        Some(CfmlValue::Query(q)) => vm.for_in_cursors.push((q.clone(), q.current_row())),
+        _ => op_get_keys(stack),
+    }
+}
+
+/// `ForInElement` — pops `[iterable, idx]`. Over a query: move its current row
+/// to `idx` and push a copy of that row. Otherwise `GetIndex`.
+pub(crate) fn op_for_in_element(
+    vm: &mut CfmlVirtualMachine,
+    stack: &mut Vec<CfmlValue>,
+    ip: &mut usize,
+    locals: &ValueMap,
+) -> Result<(), CfmlError> {
+    let n = stack.len();
+    if n >= 2 {
+        if let (CfmlValue::Query(q), CfmlValue::Int(i)) = (&stack[n - 2], &stack[n - 1]) {
+            let row = *i as usize;
+            let value = q.get_row(row.saturating_sub(1)).map(CfmlValue::strukt);
+            q.set_current_row(row);
+            stack.truncate(n - 2);
+            stack.push(value.unwrap_or(CfmlValue::Null));
+            return Ok(());
+        }
+    }
+    op_get_index(vm, stack, ip, locals, true)
+}
+
+/// `ForInExit` — pops the iterable. Over a query, pops this loop's cursor
+/// entry and puts the saved row back. Entries above it (a labelled `continue`
+/// that skipped an inner loop's exit) are unwound with it; matching on the
+/// query's identity keeps the stack in step either way.
+#[inline]
+pub(crate) fn op_for_in_exit(vm: &mut CfmlVirtualMachine, stack: &mut Vec<CfmlValue>) {
+    if let Some(CfmlValue::Query(q)) = stack.pop() {
+        let ptr = q.backing_ptr();
+        if let Some(pos) = vm.for_in_cursors.iter().rposition(|(c, _)| c.backing_ptr() == ptr) {
+            vm.unwind_for_in_cursors(pos);
+        }
+    }
 }
 
 pub(crate) fn op_get_keys(

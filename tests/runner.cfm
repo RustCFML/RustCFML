@@ -16,6 +16,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_script_tag_statement_refusals.cfm" rustcfmlOnly="true">
 <cf_runtest file="core/test_numeric_string_equality.cfm">
 <cf_runtest file="core/test_closure_var_shadows_captured_after_nested_call.cfm">
 <cf_runtest file="core/test_page_variables_scope_members.cfm">
@@ -141,6 +142,7 @@ include "harness.cfm";
 <!--- Runtime-level (wrong values, no parse error), so registration is safe. --->
 <cf_runtest file="core/test_local_shadows_arguments.cfm">
 <cf_runtest file="core/test_forin_loop_variable_scope.cfm">
+<cf_runtest file="core/test_forin_query_current_row.cfm">
 <cf_runtest file="core/test_arguments_scope_shape.cfm">
 <cf_runtest file="core/test_structdelete_arguments.cfm">
 <cf_runtest file="core/test_error_wording_lucee.cfm">
@@ -252,6 +254,8 @@ include "harness.cfm";
 <cf_runtest file="functions/test_encodeforhtmlattribute_space_equals.cfm">
 <cf_runtest file="stdlib/test_array_functions.cfm">
 <cf_runtest file="stdlib/test_array_mutator_return_values.cfm">
+<cf_runtest file="stdlib/test_cfadmin_shim.cfm" rustcfmlOnly="true">
+<cf_runtest file="stdlib/test_java_decimalformat.cfm">
 <cf_runtest file="stdlib/test_array_find_complex.cfm">
 <cf_runtest file="stdlib/test_arrayfind_closure.cfm">
 <cf_runtest file="stdlib/test_arraycontains_circular.cfm">
@@ -323,6 +327,8 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_binarydecode_excess_padding.cfm">
 <cf_runtest file="stdlib/test_base64_hex_codec.cfm">
 <cf_runtest file="stdlib/test_query_mutations.cfm">
+<cf_runtest file="stdlib/test_query_mutation_parity.cfm">
+<cf_runtest file="stdlib/test_directorylist_sort.cfm">
 <cf_runtest file="stdlib/test_query_new_empty_addcolumn_metadata.cfm">
 <cf_runtest file="database/test_lucee_query_builder.cfm" rustcfmlOnly="true" why="datasource-less cfquery via the RustCFML VFS/QoQ overlay">
 <cf_runtest file="database/test_datasource_list_maxrows.cfm" rustcfmlOnly="true">
@@ -437,6 +443,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_component_construction_semantics.cfm">
 <cf_runtest file="oop/test_injected_method_frame.cfm">
 <cf_runtest file="oop/test_closure_lexical_binding.cfm">
+<cf_runtest file="oop/test_closure_nested_component_scope.cfm">
 <cf_runtest file="oop/test_static_across_requests.cfm">
 <cf_runtest file="oop/test_class_cache_across_requests.cfm">
 <cf_runtest file="oop/test_appcfc_extends_parent_methods.cfm">
