@@ -114,6 +114,13 @@ opentelemetry-otlp = { version = "0.32", optional = true, default-features = fal
 opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true }
 
+# Kubernetes peer discovery (`cluster` feature): list pods through the API
+# server, trusting the cluster CA from the service-account mount. The same
+# ureq/rustls/pki-types the stdlib's cfhttp already ships — no new crates.
+ureq = { version = "2", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", optional = true, features = ["std"] }
+
 [features]
 default = ["memcached", "cluster", "component-instance", "mimalloc", "obs-otel"]
 # OpenTelemetry distributed traces (OTLP push) + RED metrics (native Prometheus
@@ -162,7 +169,7 @@ memprofile = ["dep:backtrace"]
 # depend on the CLI.
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 memcached = ["dep:memcache", "dep:openssl"]
-cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
+cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2", "dep:ureq", "dep:rustls", "dep:rustls-pki-types"]
 # Phase C (component-model flyweight): passthrough to the VM's `Instance` backing.
 # DEFAULT-ON as of v0.519.0 (the Slice-6 flip); also reaches the binary transitively
 # via cfml-vm's default. The wasm crates opt out (default-features = false), so the

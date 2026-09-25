@@ -87,6 +87,9 @@ mod inner {
         /// bincode would fail. Mirrors how `SessionData` is JSON-encoded inside
         /// the Automerge doc.
         Ws(String),
+        /// An application message on a named channel (`cbjgroups`' JChannel):
+        /// handed to `cfml_vm::cluster_bus`, which runs the listeners.
+        App { channel: String, payload: Vec<u8> },
     }
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -124,6 +127,39 @@ mod inner {
         /// The WebSocket registry, so inbound `Ws` frames and peer departures
         /// reach it. `None` if the cluster carries sessions only.
         ws_registry: Option<Arc<WebSocketRegistry>>,
+        /// When this node's cluster runtime started (unix millis). Gossiped in
+        /// the node metadata: the oldest member of a channel is its coordinator,
+        /// as in JGroups.
+        started_ms: u64,
+        /// Application channels this node has connected (gossiped metadata).
+        channels: Mutex<Vec<String>>,
+        /// Online members as last seen, refreshed on every membership event, so
+        /// `cluster_bus` can answer `isCoordinator()` without an async round trip.
+        members: Mutex<Vec<cfml_vm::cluster_bus::Member>>,
+        /// Asks the metadata task to re-gossip this node's metadata.
+        meta_tx: mpsc::UnboundedSender<()>,
+    }
+
+    /// Node metadata on the wire: `rcfm1\n<started_ms>\n<channel,channel>`.
+    fn encode_meta(started_ms: u64, channels: &[String]) -> String {
+        format!("rcfm1\n{}\n{}", started_ms, channels.join(","))
+    }
+
+    fn decode_meta(raw: &[u8]) -> Option<(u64, Vec<String>)> {
+        let text = std::str::from_utf8(raw).ok()?;
+        let mut lines = text.splitn(3, '\n');
+        if lines.next()? != "rcfm1" {
+            return None;
+        }
+        let started = lines.next()?.parse().ok()?;
+        let channels = lines
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect();
+        Some((started, channels))
     }
 
     impl SharedState {
@@ -138,6 +174,9 @@ mod inner {
         fn dispatch(&self, msg: ClusterMsg) {
             match msg {
                 ClusterMsg::Session(s) => self.apply_session(s),
+                ClusterMsg::App { channel, payload } => {
+                    cfml_vm::cluster_bus::deliver_remote(&channel, payload)
+                }
                 ClusterMsg::Ws(json) => {
                     let Some(reg) = &self.ws_registry else { return };
                     match serde_json::from_str::<BrokerMsg>(&json) {
@@ -268,8 +307,18 @@ mod inner {
     }
 
     impl NodeDelegate for ClusterDelegate {
-        async fn node_meta(&self, _limit: usize) -> Meta {
-            Meta::empty()
+        async fn node_meta(&self, limit: usize) -> Meta {
+            let channels = self.shared.channels.lock().map(|c| c.clone()).unwrap_or_default();
+            let text = encode_meta(self.shared.started_ms, &channels);
+            if text.len() > limit.min(Meta::MAX_SIZE) {
+                eprintln!(
+                    "[cluster] too many channel names to gossip ({} bytes, limit {}); announcing none",
+                    text.len(),
+                    limit.min(Meta::MAX_SIZE)
+                );
+                return Meta::try_from(encode_meta(self.shared.started_ms, &[])).unwrap_or_default();
+            }
+            Meta::try_from(text).unwrap_or_default()
         }
 
         async fn notify_message(&self, msg: Cow<'_, [u8]>) {
@@ -411,13 +460,22 @@ mod inner {
                 .map_err(|e| format!("invalid listenAddr {}: {}", listen_addr, e))?;
 
             let (tx, mut rx) = mpsc::channel::<ClusterMsg>(OUTBOUND_QUEUE_CAP);
+            let (meta_tx, mut meta_rx) = mpsc::unbounded_channel::<()>();
 
+            let started_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             let shared = Arc::new(SharedState {
                 docs: Mutex::new(HashMap::new()),
                 tombstones: Mutex::new(HashMap::new()),
                 node_name: node_name.clone(),
                 tx,
                 ws_registry: ws_registry.clone(),
+                started_ms,
+                channels: Mutex::new(Vec::new()),
+                members: Mutex::new(Vec::new()),
+                meta_tx,
             });
 
             let node_id = NodeId::try_from(node_name.clone())
@@ -450,15 +508,41 @@ mod inner {
 
             let memberlist = Arc::new(memberlist);
 
-            // Drain membership events: on a peer leaving, evict the WebSocket
-            // roster entries it owned (conn ids carry its `{node}:` prefix).
-            if let Some(reg) = ws_registry.clone() {
+            // Drain membership events: refresh the member view the application
+            // channels read, tell them the view changed, and on a peer leaving
+            // evict the WebSocket roster entries it owned (conn ids carry its
+            // `{node}:` prefix).
+            {
+                let reg = ws_registry.clone();
+                let shared_ev = shared.clone();
+                let mlist_ev = memberlist.clone();
                 tokio::spawn(async move {
+                    store_members(&shared_ev, &mlist_ev.online_members().await);
                     while let Ok(ev) = ev_subscriber.recv().await {
                         if ev.kind() == EventKind::Leave {
-                            let gone = ev.node_state().id().to_string();
-                            reg.drop_node(&gone);
+                            if let Some(reg) = &reg {
+                                reg.drop_node(&ev.node_state().id().to_string());
+                            }
                         }
+                        store_members(&shared_ev, &mlist_ev.online_members().await);
+                        cfml_vm::cluster_bus::notify_view_changed();
+                    }
+                });
+            }
+
+            // Re-gossip this node's metadata when its channel set changes.
+            {
+                let shared_meta = shared.clone();
+                let mlist_meta = memberlist.clone();
+                tokio::spawn(async move {
+                    while meta_rx.recv().await.is_some() {
+                        // Coalesce a burst of connects into one update.
+                        while meta_rx.try_recv().is_ok() {}
+                        if let Err(e) = mlist_meta.update_node(Duration::from_secs(5)).await {
+                            eprintln!("[cluster] failed to announce channel membership: {}", e);
+                        }
+                        store_members(&shared_meta, &mlist_meta.online_members().await);
+                        cfml_vm::cluster_bus::notify_view_changed();
                     }
                 });
             }
@@ -624,6 +708,90 @@ mod inner {
         /// the registry via `WebSocketRegistry::set_broker`.
         pub fn ws_broker(&self) -> Arc<dyn Broker> {
             Arc::new(ClusterWsBroker { shared: self.shared.clone() })
+        }
+
+        /// The application-messaging transport (`cfml_vm::cluster_bus`) over
+        /// this node.
+        pub fn app_transport(&self) -> Arc<dyn cfml_vm::cluster_bus::ClusterTransport> {
+            Arc::new(ClusterAppTransport { shared: self.shared.clone() })
+        }
+    }
+
+    /// Store the online members (from `online_members()`) and their metadata
+    /// as the cached view.
+    fn store_members(
+        shared: &SharedState,
+        online: &[Arc<memberlist::proto::NodeState<NodeId, SocketAddr>>],
+    ) {
+        let view: Vec<cfml_vm::cluster_bus::Member> = online
+            .iter()
+            .map(|n| {
+                let (started_ms, channels) = decode_meta(n.meta()).unwrap_or((u64::MAX, Vec::new()));
+                cfml_vm::cluster_bus::Member {
+                    name: n.id().to_string(),
+                    started_ms,
+                    channels,
+                }
+            })
+            .collect();
+        if let Ok(mut m) = shared.members.lock() {
+            *m = view;
+        }
+    }
+
+    /// Application messaging over the shared cluster: one `ClusterMsg::App`
+    /// frame per send, on the same outbound queue as sessions and WebSockets.
+    struct ClusterAppTransport {
+        shared: Arc<SharedState>,
+    }
+
+    impl cfml_vm::cluster_bus::ClusterTransport for ClusterAppTransport {
+        fn node_name(&self) -> String {
+            self.shared.node_name.clone()
+        }
+
+        fn started_ms(&self) -> u64 {
+            self.shared.started_ms
+        }
+
+        fn members(&self) -> Vec<cfml_vm::cluster_bus::Member> {
+            let mut view = self.shared.members.lock().map(|m| m.clone()).unwrap_or_default();
+            // This node's own entry reflects its channel set NOW, ahead of the
+            // gossip round trip.
+            let mine = self.shared.channels.lock().map(|c| c.clone()).unwrap_or_default();
+            match view.iter_mut().find(|m| m.name == self.shared.node_name) {
+                Some(me) => {
+                    me.channels = mine;
+                    me.started_ms = self.shared.started_ms;
+                }
+                None => view.push(cfml_vm::cluster_bus::Member {
+                    name: self.shared.node_name.clone(),
+                    started_ms: self.shared.started_ms,
+                    channels: mine,
+                }),
+            }
+            view
+        }
+
+        fn publish(&self, channel: &str, payload: Vec<u8>) {
+            // Blocking-capable send: application messages are state (a cache
+            // clear), not best-effort like a WebSocket frame. The caller is a VM
+            // thread, never the runtime, so waiting for queue space is safe.
+            if self
+                .shared
+                .tx
+                .blocking_send(ClusterMsg::App { channel: channel.to_string(), payload })
+                .is_err()
+            {
+                eprintln!("[cluster] outbound queue closed; application message dropped");
+            }
+        }
+
+        fn set_channels(&self, channels: Vec<String>) {
+            if let Ok(mut c) = self.shared.channels.lock() {
+                *c = channels;
+            }
+            let _ = self.shared.meta_tx.send(());
         }
     }
 

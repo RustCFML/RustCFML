@@ -437,17 +437,23 @@ Cluster properties:
 | `static`   | Connects to the addresses in `seeds`. No refresh. | Tests, fixed 2–3 node deployments. |
 | `dns`      | Resolves a DNS name to A/AAAA records every `intervalSecs` and joins any new addresses. | **Fly.io**, Kubernetes headless services, ECS / Nomad service discovery, anywhere the platform exposes peers via DNS. |
 | `multicast`| UDP multicast announce / listen on `group:port`. | LAN / bare-metal / VMware development; Kubernetes clusters using a CNI that carries multicast (Calico VXLAN, Weave, Flannel VXLAN). **Does not work** on AWS VPC CNI, Fly.io, GCP, Azure. |
+| `kubernetes` | Lists the pods matching `labelSelector` through the Kubernetes API every `intervalSecs` and joins the running ones — what JGroups' `KUBE_PING` does. Uses the pod's service account. | Kubernetes, without a headless Service. Needs RBAC `list` on `pods` (see the recipe below). |
 
 Common `discovery` fields:
 
 | Field | Default | Used by | Description |
 |-------|---------|---------|-------------|
-| `method` | (legacy: `static` if `seeds` set) | all | `"static"` / `"dns"` / `"multicast"`. |
+| `method` | (legacy: `static` if `seeds` set) | all | `"static"` / `"dns"` / `"multicast"` / `"kubernetes"`. |
 | `name` | (empty) | `dns` | DNS name to resolve. |
 | `port` | derived from `listenAddr` | `dns`, `multicast` | Port to attach to discovered addresses. |
 | `intervalSecs` | `10` for dns, `5` for multicast | `dns`, `multicast` | Refresh / announce interval in seconds. |
 | `group` | `239.255.42.42` | `multicast` | IPv4 multicast group (admin-scoped `239/8` recommended). |
 | `seeds` | (empty) | `static` | Per-strategy seed list; overrides the top-level `seeds` when set. |
+| `labelSelector` | (required) | `kubernetes` | Label selector for the peer pods, e.g. `app=myproject`. |
+| `namespace` | the pod's own | `kubernetes` | Namespace to list. Defaults to the service account's namespace. |
+| `apiServer` | in-cluster service | `kubernetes` | API base URL; defaults to `https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`, trusting the service account's `ca.crt`. |
+
+`${VAR}` placeholders are expanded in every cluster field (`listenAddr`, `advertiseAddr`, `nodeName`, `seeds`, and the `discovery` fields), so a pod can use `${POD_IP}` or `${KUBE_NAMESPACE}` from its environment.
 
 ### Fly.io recipe (DNS discovery on 6PN)
 
@@ -475,6 +481,45 @@ Variants:
 - `<region>.${FLY_APP_NAME}.internal` — region-scoped cluster (`lhr.…`, `iad.…`).
 - `${FLY_PROCESS_GROUP}.process.${FLY_APP_NAME}.internal` — process-group-scoped.
 
+### Kubernetes recipe (API discovery, like JGroups `KUBE_PING`)
+
+The pods find each other by label, exactly as a JGroups `KUBE_PING` stack does, so no extra Service is needed. Give the pod's service account permission to list pods:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: rustcfml-cluster }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: rustcfml-cluster }
+subjects: [{ kind: ServiceAccount, name: default }]
+roleRef: { kind: Role, name: rustcfml-cluster, apiGroup: rbac.authorization.k8s.io }
+```
+
+Expose the pod IP to the container (`env: [{ name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }]`) and point discovery at the pods' label:
+
+```json
+{
+    "cluster": {
+        "listenAddr":    "0.0.0.0:7946",
+        "advertiseAddr": "${POD_IP}:7946",
+        "nodeName":      "${HOSTNAME}",
+        "discovery": {
+            "method":        "kubernetes",
+            "labelSelector": "app=${PROJID}",
+            "port":          7946
+        }
+    }
+}
+```
+
+A 403 from the API server is logged with the missing permission named.
+
 ### Kubernetes recipe (DNS via headless service)
 
 Create a headless `Service` (`clusterIP: None`) for the session cluster pods with `publishNotReadyAddresses: true`. Then point each pod at its DNS name:
@@ -497,6 +542,31 @@ Create a headless `Service` (`clusterIP: None`) for the session cluster pods wit
 ```
 
 For EKS clusters running Calico/Weave/Flannel that carry multicast, `discovery.method = "multicast"` also works.
+
+### The cluster on its own (`cluster` block)
+
+The gossip cluster does not have to carry sessions. A top-level `cluster` block — same keys as a cluster cache's `properties` — starts it by itself, for application messaging (below) and WebSocket fan-out, while sessions stay wherever `sessionStorage` puts them (a Preside site's database, say). When `sessionStorage` also names a `provider: "cluster"` cache, both use the one node.
+
+```json
+{
+    "cluster": {
+        "listenAddr": "0.0.0.0:7946",
+        "discovery":  { "method": "kubernetes", "labelSelector": "app=myproject" }
+    }
+}
+```
+
+### Application messaging between nodes (`cbjgroups`)
+
+The [`cbjgroups`](https://forgebox.io/view/cbjgroups) ColdBox module — the one `preside-ext-cluster-helpers` and `preside-ext-k8s-essentials` use to run a ColdBox event on every node, and to elect the one node that runs the task manager — works unchanged: its `CbJGroupsClusterWrapper` is provided natively over this cluster.
+
+- `runEvent()` reaches every node that has connected the same cluster name, in send order per sender; `discardOwnMessages` is honoured.
+- `isCoordinator()` is true on exactly one node: the oldest member of that cluster name, as in JGroups. When it leaves, the next oldest takes over and every member receives a new view (`onJgroupsClusterMemberChange`).
+- `getStats()` reports `members` (coordinator first), `self`, `connection`, `is_coordinator` and the sent/received message and byte counts.
+- The module's JGroups XML (`jgroupsConfigXmlPath`) is not read — membership comes from the `cluster` config here. A startup line says so.
+- With no cluster configured, a channel is a working one-node cluster (it is its own coordinator), as a JGroups channel that finds no peers is.
+
+`scripts/cluster-smoke.sh <binary>` checks the multi-node behaviour on localhost.
 
 ### Local development (multicast)
 

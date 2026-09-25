@@ -118,6 +118,12 @@ pub struct RustCfmlConfig {
     #[serde(rename = "mailServers")]
     pub mail_servers: Vec<MailServerCfg>,
     pub caches: IndexMap<String, CacheCfg>,
+    /// The node-to-node cluster on its own: gossip membership plus application
+    /// messaging (`cbjgroups`), without clustering sessions. Same keys as a
+    /// `provider: "cluster"` cache's properties (`listenAddr`, `advertiseAddr`,
+    /// `nodeName`, `discovery`). When sessions ALSO use a cluster cache, both
+    /// share this one node.
+    pub cluster: Option<CacheProperties>,
     #[serde(rename = "sessionStorage")]
     pub session_storage: String,
     pub session: SessionCfg,
@@ -713,6 +719,18 @@ pub struct Discovery {
     /// IPv4 multicast group, e.g. "239.255.42.42". Admin-scoped (239/8) recommended.
     pub group: String,
 
+    // kubernetes
+    /// Namespace whose pods to list. Defaults to the pod's own namespace (the
+    /// service-account `namespace` file).
+    pub namespace: String,
+    /// Kubernetes label selector for the peer pods, e.g. `app=myproject`.
+    #[serde(rename = "labelSelector")]
+    pub label_selector: String,
+    /// API server base URL. Defaults to the in-cluster service
+    /// (`https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`).
+    #[serde(rename = "apiServer")]
+    pub api_server: String,
+
     // shared
     /// Refresh interval in seconds. Default 10s for dns, 5s for multicast.
     #[serde(rename = "intervalSecs")]
@@ -728,6 +746,9 @@ impl Default for Discovery {
             port: 0,
             seeds: Vec::new(),
             group: "239.255.42.42".into(),
+            namespace: String::new(),
+            label_selector: String::new(),
+            api_server: String::new(),
             interval_secs: 0,
         }
     }
@@ -1260,6 +1281,30 @@ impl RustCfmlConfig {
             expand(&mut c.properties.eviction_policy);
         }
         expand(&mut self.session_storage);
+        // Cluster addressing is where `${POD_IP}` / `${KUBE_NAMESPACE}` belong.
+        let cluster_props = self
+            .caches
+            .values_mut()
+            .map(|c| &mut c.properties)
+            .chain(self.cluster.as_mut());
+        for p in cluster_props {
+            expand(&mut p.listen_addr);
+            expand(&mut p.advertise_addr);
+            expand(&mut p.node_name);
+            for seed in p.seeds.iter_mut() {
+                expand(seed);
+            }
+            let d = &mut p.discovery;
+            expand(&mut d.method);
+            expand(&mut d.name);
+            expand(&mut d.group);
+            expand(&mut d.namespace);
+            expand(&mut d.label_selector);
+            expand(&mut d.api_server);
+            for seed in d.seeds.iter_mut() {
+                expand(seed);
+            }
+        }
         // logging
         expand(&mut self.logging.logs_directory);
         expand(&mut self.logging.level);

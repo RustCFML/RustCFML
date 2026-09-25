@@ -4119,3 +4119,44 @@ the value alone is at least one answer instead of two.
 - **Probe the member form and the standalone form separately, and probe what the
   array looks like AFTER the call.** `arrayReverse`'s in-place mutation was
   invisible in a return-value-only probe — both engines return `[2,1]`.
+
+<a id="115"></a>
+
+## 115. `cbjgroups` and `cbehcache` run natively — where they differ from JGroups and EhCache (v0.690.0) 📌
+
+`preside-ext-cluster-helpers` (and `preside-ext-k8s-essentials`, through it) are built
+on two Pixl8 modules whose Java RustCFML now provides: `cbjgroups`
+(`CbJGroupsClusterWrapper`, over the gossip cluster — see
+[configuration.md](configuration.md#application-messaging-between-nodes-cbjgroups))
+and `cbehcache` (`CbEhCacheService` / `org.ehcache.Cache`). Both modules run
+unchanged. What is deliberately different:
+
+**cbjgroups**
+- The JGroups protocol stack is not used: `jgroupsConfigXmlPath` is ignored (logged
+  once at startup) and membership comes from the `cluster` config. The protocols it
+  names that cluster-helpers never calls — `CENTRAL_LOCK`, `COUNTER`, `STATE_TRANSFER`
+  — have no equivalent.
+- The coordinator is the oldest member *of that cluster name* by cluster start time,
+  as in JGroups; views converge over gossip, typically within a second.
+- Delivery is ordered per sender and runs the listener on a background VM seeded from
+  the request that created the channel (its application scope included). A delivery
+  has its own request scope and no session.
+
+**cbehcache**
+- A heap cache capped by `maxSizeInMb` (no `maxObjects`) measures values with the
+  engine's size estimate, not a JVM object sizer.
+- The offheap and disk tiers store serialised copies and accept data values only; a
+  component, closure or native object is refused (EhCache would fail to serialise it).
+- A disk cache's time-to-idle clock is in memory: after a restart an entry's last
+  access is its creation time.
+- There is no tiering (heap in front of disk): each cache has the one tier its
+  `storage` names, as `CbEhCacheService` configures it.
+
+### Found on the way (fixed)
+- `expandPath()` of an **existing absolute filesystem path** prefixed the web root
+  (`expandPath( getDirectoryFromPath( getCurrentTemplatePath() ) & "../lib/x.jar" )`
+  — how both modules locate their jars). Lucee returns an existing absolute path
+  as-is and treats only a missing one as web-root relative; so does RustCFML now.
+- The method-call **write-back on a deep path** (`variables.cache.put( k, v )`) wrote a
+  Java shim method's plain return value (null, for EhCache's `put`) over the shim.
+  The direct path already refused that; the deep path now does too.

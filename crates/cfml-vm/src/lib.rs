@@ -20,6 +20,8 @@ type AppFnIdSet = HashSet<i64, ValueBuildHasher>;
 type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 
 mod intercepts_admin;
+mod cluster_shims;
+mod ehcache_shim;
 mod intercepts_common;
 mod intercepts_extensions;
 mod intercepts_deferred;
@@ -153,6 +155,7 @@ pub mod fuse_counters {
     }
 }
 pub mod socketio_compat;
+pub mod cluster_bus;
 pub mod web;
 pub mod websocket;
 pub mod mcp;
@@ -5844,7 +5847,12 @@ impl CfmlVirtualMachine {
                     .map(|v| v.as_string())
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| "run".to_string());
-                let mut args: Vec<CfmlValue> = vec![];
+                // Optional positional arguments (a cluster delivery passes the
+                // message / view to its listener's receive()/viewAccepted()).
+                let mut args: Vec<CfmlValue> = match s.get("__async_invoke_args") {
+                    Some(CfmlValue::Array(a)) => a.snapshot(),
+                    _ => vec![],
+                };
                 self.call_member_function(&target, &method, &mut args, None, parent_locals)
             }
             _ => self.call_function(closure, vec![], parent_locals),
@@ -14207,6 +14215,20 @@ impl CfmlVirtualMachine {
                                         {
                                             skip_for_identity = true;
                                         }
+                                        // The deep form of the direct path's
+                                        // `shim_over_nonshim` guard: a Java shim
+                                        // method matched by the mutating-name rule
+                                        // (`Map.put`, a `set*`) returns a plain value
+                                        // — the prior value, or null — not the
+                                        // receiver. `variables.cache.put(k, v)`
+                                        // on an EhCache handle wrote that null over
+                                        // `variables.cache`, so every later call
+                                        // through the provider hit a null.
+                                        if matches!(&node, CfmlValue::Struct(cur) if cur.contains_key("__java_shim"))
+                                            && !matches!(&result, CfmlValue::Struct(res) if res.contains_key("__java_shim"))
+                                        {
+                                            skip_for_identity = true;
+                                        }
                                         if let CfmlValue::Struct(cur) = &node {
                                             let same_instance = matches!(
                                                 &result,
@@ -18164,7 +18186,7 @@ impl CfmlVirtualMachine {
                                 break;
                             }
                         }
-                        found.unwrap_or_else(|| {
+                        let candidate = found.unwrap_or_else(|| {
                             let stripped = rel.trim_start_matches('/');
                             if let Some(webroot) =
                                 self.server_state.as_ref().and_then(|s| s.webroot.as_ref())
@@ -18178,7 +18200,24 @@ impl CfmlVirtualMachine {
                             } else {
                                 base_dir.join(stripped)
                             }
-                        })
+                        });
+                        // Lucee 7.1: when the mapping / web-root resolution does
+                        // not exist but the path itself is an existing absolute
+                        // filesystem path, that path is the answer — how a module
+                        // finds its own jar (`expandPath(getDirectoryFromPath(
+                        // getCurrentTemplatePath()) & "../lib/x.jar")`) and how
+                        // `expandPath(getTempDirectory())` stays the temp dir. The
+                        // web-root result wins whenever it exists, so
+                        // `expandPath("/")` is still the web root.
+                        let exists = |p: &std::path::Path| {
+                            self.vfs.exists(&Self::lexically_normalize_path(p).to_string_lossy())
+                        };
+                        let physical = std::path::PathBuf::from(&rel);
+                        if !exists(&candidate) && exists(&physical) {
+                            physical
+                        } else {
+                            candidate
+                        }
                     } else {
                         base_dir.join(&rel)
                     };
@@ -19341,6 +19380,12 @@ impl CfmlVirtualMachine {
                         } else if obj_type.eq_ignore_ascii_case("java") {
                             let class_name = args[1].as_string().to_lowercase();
                             let empty_args: Vec<CfmlValue> = vec![];
+                            if cluster_shims::constructs(&class_name) {
+                                return self.construct_cluster_shim(&class_name);
+                            }
+                            if ehcache_shim::constructs(&class_name) {
+                                return self.construct_ehcache_shim();
+                            }
                             return match class_name.as_str() {
                                 "java.security.messagedigest" => {
                                     handle_java_messagedigest("init", empty_args, &CfmlValue::Null)
@@ -25958,6 +26003,10 @@ impl CfmlVirtualMachine {
             // expose the page context itself as the "factory" so the chained
             // resetPageContext() lands back here as a harmless no-op.
             "getcfmlfactory" => Ok(object.clone()),
+            // cbjgroups captures the creating request's application context and
+            // re-selects it on each cluster delivery (see cluster_shims).
+            "getapplicationcontext" => Ok(self.page_application_context()),
+            "setapplicationcontext" => self.set_page_application_context(extra_args.first()),
             "resetpagecontext" | "releasepagecontext" => Ok(CfmlValue::Null),
             // `getCFMLFactory().getActiveRequests()`: requests in flight, this
             // one included (Lucee 7.1 reports 1 for a lone request). Outside the
@@ -27707,6 +27756,12 @@ impl CfmlVirtualMachine {
                 // with an empty arg list and silently no-opped (GH #239).
                 let fallthrough_args = all_args.clone();
                 let result = match java_class.as_str() {
+                    c if cluster_shims::handles(c) => {
+                        return self.dispatch_cluster_shim(c, &m, all_args, object);
+                    }
+                    c if ehcache_shim::handles(c) => {
+                        return self.dispatch_ehcache_shim(c, &m, all_args, object);
+                    }
                     SESSION_TRACKER_CLASS => self.handle_session_tracker(&m),
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),

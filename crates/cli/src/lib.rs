@@ -1803,7 +1803,9 @@ fn build_discovery(
     props: &cfml_config::CacheProperties,
     listen_addr: &str,
 ) -> session::discovery::Discovery {
-    use session::discovery::{Discovery, DnsDiscovery, MulticastDiscovery, StaticSeeds};
+    use session::discovery::{
+        Discovery, DnsDiscovery, KubernetesDiscovery, MulticastDiscovery, StaticSeeds,
+    };
 
     // Default port for DNS/multicast: pull from listen_addr.
     let default_port: u16 = listen_addr
@@ -1844,6 +1846,26 @@ fn build_discovery(
                 props.discovery.port
             };
             Discovery::Dns(DnsDiscovery::new(name, port, props.discovery.interval_secs))
+        }
+        "kubernetes" | "k8s" => {
+            if props.discovery.label_selector.trim().is_empty() {
+                eprintln!(
+                    "[session/cluster] discovery.method=kubernetes needs discovery.labelSelector (e.g. \"app=myproject\") — falling back to static seeds"
+                );
+                return Discovery::Static(StaticSeeds::new(&props.seeds));
+            }
+            let port = if props.discovery.port == 0 {
+                default_port
+            } else {
+                props.discovery.port
+            };
+            Discovery::Kubernetes(KubernetesDiscovery::new(
+                &props.discovery.api_server,
+                &props.discovery.namespace,
+                &props.discovery.label_selector,
+                port,
+                props.discovery.interval_secs,
+            ))
         }
         "multicast" => {
             let group = props.discovery.group.clone();
@@ -1896,6 +1918,76 @@ fn build_discovery(
 /// Resolution order: `sessionStorage` name in cfconfig → look up `caches`
 /// entry → dispatch on `provider` (or Lucee `class`). Falls back to
 /// `MemoryStore` if no config is present or the named cache is not found.
+/// The process's one gossip cluster node, shared by clustered sessions,
+/// WebSocket fan-out and application messaging (`cbjgroups`).
+#[cfg(feature = "cluster")]
+static CLUSTER_NODE: tokio::sync::OnceCell<Option<session::cluster::ClusterNode>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Start the cluster node from `props` — the top-level `cluster` block or a
+/// `provider: "cluster"` cache — unless one is already running, in which case
+/// that one is returned (a second set of addressing is ignored, and said so).
+#[cfg(feature = "cluster")]
+async fn ensure_cluster_node(
+    props: &cfml_config::CacheProperties,
+    ws_registry: &Arc<cfml_vm::websocket::WebSocketRegistry>,
+) -> Option<&'static session::cluster::ClusterNode> {
+    if CLUSTER_NODE.initialized() {
+        if !props.listen_addr.is_empty() {
+            println!(
+                "[cluster] a cluster node is already running; ignoring the second cluster configuration (listenAddr {})",
+                props.listen_addr
+            );
+        }
+        return CLUSTER_NODE.get().and_then(|n| n.as_ref());
+    }
+    CLUSTER_NODE
+        .get_or_init(|| async {
+            let listen_addr = if !props.listen_addr.is_empty() {
+                props.listen_addr.clone()
+            } else {
+                "0.0.0.0:7946".to_string()
+            };
+            let node_name = if !props.node_name.is_empty() {
+                props.node_name.clone()
+            } else if !props.advertise_addr.is_empty() {
+                props.advertise_addr.clone()
+            } else {
+                format!("{}-{}", listen_addr, uuid::Uuid::new_v4().simple())
+            };
+            let discovery = build_discovery(props, &listen_addr);
+            let label = discovery.label();
+            // Unify the WebSocket registry's node id with the cluster node name
+            // BEFORE any connection: cross-node ids and `NodeGone` eviction key
+            // off this match. Must happen before the registry mints conn ids.
+            ws_registry.set_node_id(node_name.clone());
+            match session::cluster::ClusterNode::start(
+                &listen_addr,
+                discovery,
+                node_name.clone(),
+                Some(ws_registry.clone()),
+            )
+            .await
+            {
+                Ok(node) => {
+                    println!(
+                        "[cluster] node '{}' up (listen={}, discovery={})",
+                        node_name, listen_addr, label
+                    );
+                    ws_registry.set_broker(node.ws_broker());
+                    cfml_vm::cluster_bus::install_transport(node.app_transport());
+                    Some(node)
+                }
+                Err(e) => {
+                    eprintln!("[cluster] failed to start the cluster node on {}: {}", listen_addr, e);
+                    None
+                }
+            }
+        })
+        .await
+        .as_ref()
+}
+
 async fn build_session_store(
     cfconfig: &RustCfmlConfig,
     #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
@@ -2014,51 +2106,16 @@ async fn build_session_store(
         }
 
         #[cfg(feature = "cluster")]
-        "cluster" => {
-            let listen_addr = if !cache_cfg.properties.listen_addr.is_empty() {
-                cache_cfg.properties.listen_addr.clone()
-            } else {
-                "0.0.0.0:7946".to_string()
-            };
-            let node_name = if !cache_cfg.properties.node_name.is_empty() {
-                cache_cfg.properties.node_name.clone()
-            } else if !cache_cfg.properties.advertise_addr.is_empty() {
-                cache_cfg.properties.advertise_addr.clone()
-            } else {
-                format!("{}-{}", listen_addr, uuid::Uuid::new_v4().simple())
-            };
-            let discovery = build_discovery(&cache_cfg.properties, &listen_addr);
-            let label = discovery.label();
-            // Unify the WebSocket registry's node id with the cluster node name
-            // BEFORE any connection: cross-node ids and `NodeGone` eviction key
-            // off this match. Must happen before the registry mints conn ids.
-            ws_registry.set_node_id(node_name.clone());
-            let result = session::cluster::ClusterNode::start(
-                &listen_addr,
-                discovery,
-                node_name.clone(),
-                Some(ws_registry.clone()),
-            )
-            .await;
-            match result {
-                Ok(node) => {
-                    println!(
-                        "[session] Using cluster session store (listen={}, discovery={}); WebSocket fan-out clustered",
-                        listen_addr, label
-                    );
-                    // Install the distributed fan-out adapter on the registry.
-                    ws_registry.set_broker(node.ws_broker());
-                    Arc::new(node.session_store())
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[session] Failed to start cluster store on {}: {} — falling back to memory store",
-                        listen_addr, e
-                    );
-                    Arc::new(cfml_vm::session_store::MemoryStore::new())
-                }
+        "cluster" => match ensure_cluster_node(&cache_cfg.properties, ws_registry).await {
+            Some(node) => {
+                println!("[session] Using cluster session store; WebSocket fan-out clustered");
+                Arc::new(node.session_store())
             }
-        }
+            None => {
+                eprintln!("[session] Cluster unavailable — falling back to memory store");
+                Arc::new(cfml_vm::session_store::MemoryStore::new())
+            }
+        },
 
         #[cfg(not(feature = "cluster"))]
         "cluster" => {
@@ -2215,6 +2272,12 @@ async fn async_run_server(
     cfconfig: Arc<RustCfmlConfig>,
 ) {
     let mut server_state = ServerState::with_config(production, cfconfig.clone());
+    // The standalone cluster (`cluster` block) comes up first, so a cluster
+    // session store configured alongside it shares the same node.
+    #[cfg(feature = "cluster")]
+    if let Some(props) = cfconfig.cluster.as_ref() {
+        ensure_cluster_node(props, &server_state.websocket).await;
+    }
     server_state.sessions = build_session_store(&cfconfig, &server_state.websocket).await;
     // `strip_verbatim_prefix`: on Windows `canonicalize` yields the `\\?\D:\...`
     // extended-length form, and the webroot is the ROOT of every path expandPath

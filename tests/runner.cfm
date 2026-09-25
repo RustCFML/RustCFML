@@ -144,6 +144,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_forin_loop_variable_scope.cfm">
 <cf_runtest file="core/test_forin_query_current_row.cfm">
 <cf_runtest file="core/test_lucee_runtime_counters.cfm">
+<cf_runtest file="core/test_expandpath_absolute_existing.cfm">
 <cf_runtest file="core/test_arguments_scope_shape.cfm">
 <cf_runtest file="core/test_structdelete_arguments.cfm">
 <cf_runtest file="core/test_error_wording_lucee.cfm">
@@ -256,6 +257,8 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_array_functions.cfm">
 <cf_runtest file="stdlib/test_array_mutator_return_values.cfm">
 <cf_runtest file="stdlib/test_cfadmin_shim.cfm" rustcfmlOnly="true">
+<cf_runtest file="stdlib/test_cbjgroups_shim.cfm" rustcfmlOnly="true">
+<cf_runtest file="stdlib/test_cbehcache_shim.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_java_decimalformat.cfm">
 <cf_runtest file="stdlib/test_array_find_complex.cfm">
 <cf_runtest file="stdlib/test_arrayfind_closure.cfm">

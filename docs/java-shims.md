@@ -108,6 +108,10 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 |---|---|
 | `getPageContext().getCFMLFactory()` | `getActiveRequests()`: requests in flight, **this one included** (1 for a lone request, as on Lucee 7.1; 1 in a CLI run); `resetPageContext()`/`releasePageContext()` are no-ops |
 | `coldfusion.runtime.SessionTracker` | `getSessionCount()`: live sessions across all applications, from the in-memory or cluster session store. **Throws** with the datasource or memcached store, which cannot count without scanning the backend. A session exists once a request uses the `session` scope. Other methods **throw** |
+| `org.pixl8.cbjgroups.CbJGroupsClusterWrapper` *(the `cbjgroups` module)* | `init(configXmlPath, discardOwnMessages, listener, logger, contextRoot)`, `connect(name)`, `isConnected()`, `sendMessage(string)`, `getStats()`, `isCoordinator()`, `close()` — over RustCFML's cluster; the listener's `receive(msg)` / `viewAccepted(view)` run on background VMs in the creating application. See [configuration.md](configuration.md#application-messaging-between-nodes-cbjgroups) |
+| `org.jgroups.Message` / `org.jgroups.View` *(indirect, passed to the listener)* | `getBuffer()`, `getLength()` / `getMembers()`, `size()`, `toString()` |
+| `org.pixl8.cbehcache.CbEhCacheService` *(the `cbehcache` CacheBox provider)* | `init(dir)`, `init()`, `close()`, `getStatus()`, `createCache(name, config)`, `getStats(name)` — EhCache 3 semantics: minute TTL/TTI, `maxObjects` / `maxSizeInMb`, `heap` (by reference) / `offheap` / `disk` (serialised; `persistent` survives a restart), enforced `valueClass`, LRU eviction |
+| `org.ehcache.Cache` *(indirect, from `createCache`)* | `get`, `put`, `containsKey`, `remove`, `clear`, `iterator()` (→ entries with `getKey()` / `getValue()`); statistics: `getCacheHits/Misses/Evictions()`, `getCacheHitPercentage()`, `getKnownStatistics()` (with `…:MappingCount`), `clear()` |
 
 ### Third-party libraries
 
