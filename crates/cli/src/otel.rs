@@ -46,6 +46,11 @@ pub struct OtelRuntime {
     pub depth_cap: usize,
     pub allow: Vec<String>,
     pub metrics: Option<std::sync::Arc<Metrics>>,
+    /// False in metrics-only mode ([`init_metrics_only`]): no tracer, no spans,
+    /// no per-function hook.
+    pub traces: bool,
+    /// Where the Prometheus endpoint is served.
+    pub metrics_path: String,
 }
 
 /// Initialise the global tracer provider + W3C propagator from config. Returns
@@ -53,7 +58,10 @@ pub struct OtelRuntime {
 /// carrying the per-request knobs the observer needs. Returns `None` when the
 /// OTLP exporter can't be built (bad endpoint) — the server still runs, just
 /// without traces.
-pub fn init(cfg: &cfml_config::OtelCfg) -> Option<(SdkTracerProvider, OtelRuntime)> {
+pub fn init(
+    cfg: &cfml_config::OtelCfg,
+    metrics_path: &str,
+) -> Option<(SdkTracerProvider, OtelRuntime)> {
     // Only the `http-proto` (protobuf) transport is compiled in; `http/json`
     // would need the `http-json` feature. Config may still name a protocol for
     // forward-compat, but we always export protobuf.
@@ -89,10 +97,35 @@ pub fn init(cfg: &cfml_config::OtelCfg) -> Option<(SdkTracerProvider, OtelRuntim
         depth_cap: cfg.span_depth_cap,
         allow: cfg.span_allow_list.clone(),
         metrics,
+        traces: true,
+        metrics_path: metrics_path.to_string(),
     };
     PROVIDER.set(provider.clone()).ok();
     OTEL_RT.set(rt.clone()).ok();
     Some((provider, rt))
+}
+
+/// `observability.metrics` without `otel`: the Prometheus RED metrics alone.
+/// No tracer provider is set up, so nothing is exported anywhere, and the
+/// per-request observer only watches queries (for the DB metrics) — it takes
+/// no function-level interest, so calls pay nothing.
+pub fn init_metrics_only(metrics_path: &str) {
+    OTEL_RT
+        .set(OtelRuntime {
+            depth_cap: 0,
+            allow: Vec::new(),
+            metrics: Some(std::sync::Arc::new(Metrics::new())),
+            traces: false,
+            metrics_path: metrics_path.to_string(),
+        })
+        .ok();
+}
+
+/// The Prometheus endpoint path, when metrics are on.
+pub fn metrics_path() -> Option<&'static str> {
+    let rt = OTEL_RT.get()?;
+    rt.metrics.as_ref()?;
+    Some(rt.metrics_path.as_str())
 }
 
 // OTel is process-wide config, so — like the global tracer provider it wraps —
@@ -122,6 +155,14 @@ pub fn render_metrics() -> Option<String> {
 pub fn begin_request(vm: &mut cfml_vm::CfmlVirtualMachine) -> Option<(Context, String)> {
     let rt = OTEL_RT.get()?;
     let cgi = |k: &str| vm.web_scope_value("cgi", k).unwrap_or_default();
+    if !rt.traces {
+        // Metrics only: no root span; watch queries for the DB metrics.
+        let route = cgi("script_name");
+        if let Some(m) = &rt.metrics {
+            vm.install_observer(std::sync::Arc::new(MetricsObserver { metrics: m.clone() }));
+        }
+        return Some((Context::new(), route));
+    }
     let method = {
         let m = cgi("request_method");
         if m.is_empty() {
@@ -159,7 +200,9 @@ pub fn end_request(
     elapsed_secs: f64,
     error_type: Option<&str>,
 ) {
-    end_root_span(root, status);
+    if OTEL_RT.get().is_some_and(|rt| rt.traces) {
+        end_root_span(root, status);
+    }
     if let Some(rt) = OTEL_RT.get() {
         if let Some(m) = &rt.metrics {
             m.record_request(route, status, elapsed_secs, error_type);
@@ -253,6 +296,21 @@ struct StackEntry {
     depth: usize,
     #[allow(dead_code)]
     kind: EntryKind,
+}
+
+/// The metrics-only observer: records DB query metrics and nothing else.
+pub struct MetricsObserver {
+    metrics: std::sync::Arc<Metrics>,
+}
+
+impl VmObserver for MetricsObserver {
+    fn interest(&self) -> Interest {
+        Interest::QUERY
+    }
+
+    fn on_query(&self, q: &QueryEvent) {
+        self.metrics.record_query(q.datasource, q.elapsed_us);
+    }
 }
 
 /// Per-request OTel observer. Holds the request's root context and an explicit
@@ -618,6 +676,8 @@ mod tests {
             depth_cap: 3,
             allow: vec!["*".to_string()],
             metrics: None,
+            traces: true,
+            metrics_path: "/__rustcfml/metrics".to_string(),
         };
 
         // Open the request root and drive a call chain: outer → inner, a query

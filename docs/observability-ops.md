@@ -8,7 +8,7 @@ observability cheap and useful in production: an OpenTelemetry Collector doing
 
 ## Why tail sampling
 
-RustCFML's `obs-otel` build does **head sampling** — it decides whether to record
+RustCFML does **head sampling** — it decides whether to record
 a trace *when the request starts*, before it knows whether the request will be
 slow or error. That keeps the hot path cheap, but it means a low sample ratio can
 miss the exact traces you care about.
@@ -55,7 +55,7 @@ brings up Collector → Tempo → Grafana in one command:
 
 ```bash
 # 1. Run RustCFML with OTel on, pointed at the collector:
-cargo run --release --features obs-otel -- --serve ./www
+cargo run --release -- --serve ./www
 #    (.cfconfig.json → observability.otel.enabled: true,
 #     endpoint: "http://localhost:4318", sampleRatio: 1.0)
 

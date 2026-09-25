@@ -219,12 +219,37 @@ tree. It 404s when the profiler is off.
 The third observability layer exports **distributed traces** and **RED metrics**
 as standard OpenTelemetry, so a slow or errored request in production can be
 inspected in Grafana Tempo / Jaeger / Honeycomb / Datadog without runtime
-degradation. It is only present in a build compiled with the **`obs-otel`** Cargo
-feature (host-only — never in the wasm/worker build) and is off until configured.
+degradation. It is in every release binary (the `obs-otel` Cargo feature is on by
+default; it is not in the wasm/worker build) and does nothing until configured.
 
-```bash
-cargo build --release --features obs-otel
+### Prometheus metrics only
+
+To expose the RED metrics without tracing — no collector, no OTLP export, no
+per-function hook — enable `observability.metrics`:
+
+```json
+{
+  "observability": {
+    "enabled": true,
+    "metrics": { "enabled": true, "prometheusPath": "/__rustcfml/metrics" }
+  }
+}
 ```
+
+Then point Prometheus at `http://<host>:<port>/__rustcfml/metrics`:
+
+| Metric | Labels |
+|---|---|
+| `rustcfml_http_requests_total` | `route`, `status` (the status the client received, including `cfheader`'s and 404s) |
+| `rustcfml_http_errors_total` | `route`, `error_type` |
+| `rustcfml_http_request_duration_seconds` (histogram) | `route` |
+| `rustcfml_db_queries_total` | `datasource` |
+| `rustcfml_db_query_duration_seconds` (histogram) | `datasource` |
+
+The endpoint is served by the engine, so anyone who can reach the server can read
+it; restrict it at your proxy if the route names are sensitive.
+
+### Traces and metrics
 
 - **Traces** reproduce the request → CFC-method → query transaction tree as OTel
   spans and export over **OTLP (HTTP/protobuf)** on a background batch thread, so
@@ -245,7 +270,7 @@ cargo build --release --features obs-otel
     "enabled": true,
     "otel": {
       "enabled": true,
-      "endpoint": "http://localhost:4318",   // OTLP/HTTP collector; /v1/traces is appended
+      "endpoint": "http://localhost:4318",   // OTLP/HTTP collector (plain http only); /v1/traces is appended
       "serviceName": "rustcfml",
       "sampleRatio": 0.05,                    // head sampling (0.0–1.0)
       "spanDepthCap": 3,                      // user fns at/under this depth may be spanned

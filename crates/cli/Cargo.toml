@@ -115,11 +115,13 @@ opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true }
 
 [features]
-default = ["memcached", "cluster", "component-instance", "mimalloc"]
+default = ["memcached", "cluster", "component-instance", "mimalloc", "obs-otel"]
 # OpenTelemetry distributed traces (OTLP push) + RED metrics (native Prometheus
-# scrape endpoint). Host-only; never enabled by the wasm crates. Implies the VM's
-# `observability` hook bus.
-obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:prometheus", "opentelemetry_sdk/testing"]
+# scrape endpoint). On by default — every release binary carries it, and it stays
+# inert until `observability.otel` or `observability.metrics` is enabled in
+# config (measured: +1.4 MB on a 60 MB binary). Host-only; this crate never
+# builds for wasm. Implies the VM's `observability` hook bus.
+obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:prometheus"]
 # Native CPU/wall-clock sampling profiler (`--profile`), emitting a flamegraph +
 # pprof protobuf. Unix-only (uses SIGPROF/setitimer) — the `pprof` dependency is
 # declared under the unix target table; never built for wasm or Windows.
@@ -169,6 +171,9 @@ component-instance = ["cfml-vm/component-instance"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.28"
+# The in-memory span exporter the otel tests assert against — test builds only,
+# so it no longer ships in the release dependency set.
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "testing"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [target.'cfg(unix)'.dependencies]

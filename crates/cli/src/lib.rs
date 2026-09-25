@@ -1409,10 +1409,17 @@ fn compile_and_run(
     if let Some((ref root, ref route)) = otel_req {
         // Coarse error label — the message is high-cardinality (never a metric
         // label); the exception *type* is recorded on the span by on_error.
+        // The status is the one the client receives: a `cfheader statuscode`
+        // wins (as in `build_success_response`), and an unhandled missing
+        // template is the 404 the router falls back to. Recording 200 for both
+        // made every 404/503 count as a success.
+        let set_status = vm.response_status.as_ref().map(|(c, _)| *c);
+        let unhandled_missing = vm.missing_template.is_some() && !vm.missing_template_handled;
         let (status, err): (u16, Option<&str>) = match &result {
-            Ok(_) => (200, None),
-            Err(e) if e.message == "__cflocation_redirect" => (302, None),
-            Err(e) if e.message == "__cfabort" => (200, None),
+            Ok(_) if unhandled_missing => (404, None),
+            Ok(_) => (set_status.unwrap_or(200), None),
+            Err(e) if e.message == "__cflocation_redirect" => (set_status.unwrap_or(302), None),
+            Err(e) if e.message == "__cfabort" => (set_status.unwrap_or(200), None),
             Err(_) => (500, Some("error")),
         };
         otel::end_request(root, route, status, otel_start.elapsed().as_secs_f64(), err);
@@ -2253,14 +2260,24 @@ async fn async_run_server(
     // per-request span-building observer is installed only when this succeeds.
     #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
     {
-        let ocfg = &cfconfig.observability.otel;
-        if cfconfig.observability.enabled && ocfg.enabled {
-            if otel::init(ocfg).is_some() {
+        let obs = &cfconfig.observability;
+        let ocfg = &obs.otel;
+        // `observability.metrics` (metrics alone) names the path when it is on.
+        let metrics_path = if obs.metrics.enabled {
+            obs.metrics.prometheus_path.as_str()
+        } else {
+            ocfg.metrics.prometheus_path.as_str()
+        };
+        if obs.enabled && ocfg.enabled {
+            if otel::init(ocfg, metrics_path).is_some() {
                 println!(
                     "OpenTelemetry enabled — traces → OTLP {} (sampleRatio {}), metrics → {}",
-                    ocfg.endpoint, ocfg.sample_ratio, ocfg.metrics.prometheus_path
+                    ocfg.endpoint, ocfg.sample_ratio, metrics_path
                 );
             }
+        } else if obs.enabled && obs.metrics.enabled {
+            otel::init_metrics_only(metrics_path);
+            println!("Prometheus metrics enabled → {}", metrics_path);
         }
     }
 
@@ -2960,7 +2977,7 @@ async fn handle_request_inner(
     // OpenTelemetry RED metrics scrape endpoint (Phase 3). Prometheus text
     // exposition; 404s (falls through) when metrics are off.
     #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
-    if raw_path == state.cfconfig.observability.otel.metrics.prometheus_path {
+    if otel::metrics_path() == Some(raw_path) {
         if let Some(text) = otel::render_metrics() {
             use axum::response::IntoResponse;
             return (

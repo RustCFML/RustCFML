@@ -43,8 +43,10 @@ cfdirectory( action = "list", directory = _dlRoot, name = "d", sort = "name" );
 assert( "cfdirectory name", _dlNames( d ), "Alpha,B.txt,a.txt,beta,c.txt" );
 cfdirectory( action = "list", directory = _dlRoot, name = "d", sort = "name desc" );
 assert( "cfdirectory name desc", _dlNames( d ), "c.txt,beta,a.txt,B.txt,Alpha" );
-cfdirectory( action = "list", directory = _dlRoot, name = "d", sort = "size desc" );
-assert( "cfdirectory size desc", _dlNames( d ), "c.txt,a.txt,B.txt,beta,Alpha" );
+// Files only: both directories have size 0, and entries that tie keep the
+// filesystem's listing order, which differs between macOS and Linux.
+cfdirectory( action = "list", directory = _dlRoot, name = "d", filter = "*.txt", sort = "size desc" );
+assert( "cfdirectory size desc", _dlNames( d ), "c.txt,a.txt,B.txt" );
 cfdirectory( action = "list", directory = _dlRoot, name = "d", sort = "type, name" );
 assert( "cfdirectory type, name", _dlNames( d ), "Alpha,beta,B.txt,a.txt,c.txt" );
 cfdirectory( action = "list", directory = _dlRoot, name = "d", listInfo = "name", sort = "name desc" );

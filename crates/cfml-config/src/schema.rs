@@ -975,9 +975,10 @@ pub struct ObservabilityCfg {
     pub enabled: bool,
     /// Threshold-gated cooperative sampling profiler (Phase 2).
     pub profiler: ProfilerCfg,
-    /// OpenTelemetry traces + RED metrics (Phase 3). Only active in a build with
-    /// the `obs-otel` Cargo feature.
+    /// OpenTelemetry traces + RED metrics (Phase 3).
     pub otel: OtelCfg,
+    /// Prometheus RED metrics on their own — no tracer, no collector.
+    pub metrics: MetricsCfg,
 }
 
 impl Default for ObservabilityCfg {
@@ -986,6 +987,31 @@ impl Default for ObservabilityCfg {
             enabled: false,
             profiler: ProfilerCfg::default(),
             otel: OtelCfg::default(),
+            metrics: MetricsCfg::default(),
+        }
+    }
+}
+
+/// `observability.metrics` — the Prometheus RED metrics (request rate, errors,
+/// duration; DB query count and duration) WITHOUT OpenTelemetry tracing: no
+/// tracer, no OTLP exporter, no per-function span hook. Off by default. (With
+/// `otel.enabled`, metrics are also on, governed by `otel.metrics`; this block's
+/// path wins when both are set.)
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct MetricsCfg {
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub enabled: bool,
+    /// Path Prometheus scrapes for the text exposition.
+    #[serde(rename = "prometheusPath")]
+    pub prometheus_path: String,
+}
+
+impl Default for MetricsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prometheus_path: "/__rustcfml/metrics".into(),
         }
     }
 }
