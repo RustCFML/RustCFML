@@ -102,6 +102,13 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 | `java.net.InetAddress` | static `getLocalHost()`, `getByName(host)`; `getHostName()`, `getHostAddress()`, `getCanonicalHostName()`, `isLoopbackAddress()`, `toString()`. `getByName` resolves through the system resolver and raises `java.net.UnknownHostException` when it cannot; IP literals and `localhost` short-circuit without a lookup |
 | `java.net.URL` | `init(spec)` (or protocol/host/port/file), `getProtocol()`, `getHost()`, `getPort()`, `getDefaultPort()`, `getPath()`, `getQuery()`, `getRef()`, `getFile()`, `getAuthority()`, `getUserInfo()`, `toString()`/`toExternalForm()`, `equals()`. **`openConnection`/`openStream`/`getContent`/`getInputStream` throw** — use `<cfhttp>` |
 
+### Engine runtime (Lucee / ColdFusion)
+
+| Class (and aliases) | Supported methods |
+|---|---|
+| `getPageContext().getCFMLFactory()` | `getActiveRequests()`: requests in flight, **this one included** (1 for a lone request, as on Lucee 7.1; 1 in a CLI run); `resetPageContext()`/`releasePageContext()` are no-ops |
+| `coldfusion.runtime.SessionTracker` | `getSessionCount()`: live sessions across all applications, from the in-memory or cluster session store. **Throws** with the datasource or memcached store, which cannot count without scanning the backend. A session exists once a request uses the `session` scope. Other methods **throw** |
+
 ### Third-party libraries
 
 | Class (and aliases) | Supported methods |

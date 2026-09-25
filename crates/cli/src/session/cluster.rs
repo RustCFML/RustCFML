@@ -683,6 +683,19 @@ mod inner {
             Some(s)
         }
 
+        /// Every node holds the full replicated set, so the count is local
+        /// and exact; expired records (not yet reaped) are skipped.
+        fn session_count(&self) -> Option<usize> {
+            let now = now_unix_secs();
+            let docs = self.shared.docs.lock().ok()?;
+            Some(
+                docs.values()
+                    .filter_map(read_session)
+                    .filter(|s| now.saturating_sub(s.last_accessed_secs) <= s.timeout_secs)
+                    .count(),
+            )
+        }
+
         fn set(&self, app: &str, id: &str, data: SessionData) {
             let key = composite_key(app, id);
             let mut docs = match self.shared.docs.lock() {

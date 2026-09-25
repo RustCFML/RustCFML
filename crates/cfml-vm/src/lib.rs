@@ -1659,10 +1659,36 @@ pub struct ClassCacheEntry {
     pub blueprints: Vec<(String, std::sync::Arc<cfml_common::component::ClassBlueprint>)>,
 }
 
+/// Counts one in-flight request on [`ServerState::active_requests`] for as
+/// long as it lives, so an early return or a panic cannot leave the count high.
+pub struct ActiveRequestGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ActiveRequestGuard {
+    pub fn new(state: &ServerState) -> Self {
+        state
+            .active_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(state.active_requests.clone())
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `coldfusion.runtime.SessionTracker`, lowercased as the shim dispatch sees it.
+const SESSION_TRACKER_CLASS: &str = "coldfusion.runtime.sessiontracker";
+
 #[derive(Clone)]
 pub struct ServerState {
     pub applications: Arc<dyn ApplicationStore>,
     pub sessions: Arc<dyn SessionStore>,
+    /// Requests currently being served, the current one included — what
+    /// Lucee's `getPageContext().getCFMLFactory().getActiveRequests()` reports.
+    /// The serve loop holds an [`ActiveRequestGuard`] for each request.
+    pub active_requests: Arc<std::sync::atomic::AtomicUsize>,
     /// Named locks for cflock: name → RwLock (exclusive = write, readonly = read)
     pub named_locks: Arc<Mutex<HashMap<String, Arc<NamedLock>>>>,
     /// Bytecode cache — skips recompilation when file mtime is unchanged
@@ -1852,6 +1878,7 @@ impl ServerState {
         Self {
             applications: Arc::new(MemoryApplicationStore::new()),
             sessions: Arc::new(MemoryStore::new()),
+            active_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             named_locks: Arc::new(Mutex::new(HashMap::new())),
             bytecode_cache: BytecodeCache::with_trust(production_mode),
             webroot: None,
@@ -19614,6 +19641,18 @@ impl CfmlVirtualMachine {
                                 | "coldfusion.runtime.java.javaproxy" => {
                                     Ok(java_shims::make_deferred_java(&args[1].as_string()))
                                 }
+                                // Adobe's session tracker, which Lucee also ships.
+                                // Only `getSessionCount()` is backed (see
+                                // `handle_session_tracker`).
+                                SESSION_TRACKER_CLASS => {
+                                    let mut m = ValueMap::default();
+                                    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                                    m.insert(
+                                        "__java_class".to_string(),
+                                        CfmlValue::string("coldfusion.runtime.SessionTracker".to_string()),
+                                    );
+                                    Ok(CfmlValue::strukt(m))
+                                }
                                 // Legacy Preside/Mura password hashing. The shim's
                                 // gensalt/hashpw/checkpw route to the native
                                 // bcrypt builtins (see handle_jbcrypt_method). The
@@ -25869,6 +25908,36 @@ impl CfmlVirtualMachine {
         out
     }
 
+    /// `coldfusion.runtime.SessionTracker`. `getSessionCount()` reports the live
+    /// sessions the store holds, across applications, like Lucee's. A store
+    /// that cannot count in-process (datasource, memcached) makes it throw
+    /// rather than guess; any other method is unsupported and throws too.
+    fn handle_session_tracker(&self, method_lower: &str) -> CfmlResult {
+        match method_lower {
+            "getsessioncount" => {
+                let store = match self.server_state.as_ref() {
+                    Some(ss) => ss.sessions.clone(),
+                    // No server: no sessions exist outside a request cycle.
+                    None => return Ok(CfmlValue::Int(0)),
+                };
+                match store.session_count() {
+                    Some(n) => Ok(CfmlValue::Int(n as i64)),
+                    None => Err(CfmlError::runtime(
+                        "coldfusion.runtime.SessionTracker.getSessionCount() is not available \
+                         with this session storage: it cannot count sessions without scanning \
+                         the backing store. Use the in-memory or cluster session store."
+                            .to_string(),
+                    )),
+                }
+            }
+            other => Err(CfmlError::runtime(format!(
+                "coldfusion.runtime.SessionTracker.{}() is not supported by RustCFML; only \
+                 getSessionCount() is.",
+                other
+            ))),
+        }
+    }
+
     /// Dispatch a method on the getPageContext() shim. getRequest()/getResponse()
     /// hand back the embedded servlet shims; the request-side accessors Lucee and
     /// BoxLang expose directly on the page context (getRequestURL, getMethod, …)
@@ -25890,6 +25959,16 @@ impl CfmlVirtualMachine {
             // resetPageContext() lands back here as a harmless no-op.
             "getcfmlfactory" => Ok(object.clone()),
             "resetpagecontext" | "releasepagecontext" => Ok(CfmlValue::Null),
+            // `getCFMLFactory().getActiveRequests()`: requests in flight, this
+            // one included (Lucee 7.1 reports 1 for a lone request). Outside the
+            // server there is exactly one: the run itself.
+            "getactiverequests" => Ok(CfmlValue::Int(
+                self.server_state
+                    .as_ref()
+                    .map(|ss| ss.active_requests.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(1)
+                    .max(1) as i64,
+            )),
             // Lucee: getRequestTimeout() returns the timeout in MILLISECONDS
             // (Wheels' engineAdapter divides by 1000). Set via cfsetting requesttimeout.
             "getrequesttimeout" => Ok(CfmlValue::Int(self.request_timeout_ms)),
@@ -27628,6 +27707,7 @@ impl CfmlVirtualMachine {
                 // with an empty arg list and silently no-opped (GH #239).
                 let fallthrough_args = all_args.clone();
                 let result = match java_class.as_str() {
+                    SESSION_TRACKER_CLASS => self.handle_session_tracker(&m),
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
                     java_shims::ESAPI_SECURITY_CONFIG_CLASS => {

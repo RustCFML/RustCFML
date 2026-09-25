@@ -143,6 +143,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_local_shadows_arguments.cfm">
 <cf_runtest file="core/test_forin_loop_variable_scope.cfm">
 <cf_runtest file="core/test_forin_query_current_row.cfm">
+<cf_runtest file="core/test_lucee_runtime_counters.cfm">
 <cf_runtest file="core/test_arguments_scope_shape.cfm">
 <cf_runtest file="core/test_structdelete_arguments.cfm">
 <cf_runtest file="core/test_error_wording_lucee.cfm">

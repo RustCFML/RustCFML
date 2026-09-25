@@ -1170,6 +1170,8 @@ fn compile_and_run(
     // mode, where a flush writes to stdout. See `cfml_vm::flush`.
     flush_sink: Option<Box<dyn cfml_vm::flush::FlushSink>>,
 ) -> Result<CfmlResponse, CfmlRunError> {
+    // Counted for `getCFMLFactory().getActiveRequests()` until this returns.
+    let _active = server_state.map(cfml_vm::ActiveRequestGuard::new);
     // Connection-per-request DB isolation. Serve-mode requests run on reused
     // tokio blocking threads, and each request holds one pooled DB connection per
     // datasource (so session/user state persists across a request's statements —

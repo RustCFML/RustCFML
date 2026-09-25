@@ -68,6 +68,14 @@ pub trait SessionStore: Send + Sync + 'static {
         None
     }
 
+    /// Number of live (unexpired) sessions across every application, when the
+    /// store can count them in-process (`coldfusion.runtime.SessionTracker
+    /// .getSessionCount()`). `None` for stores that would need a network scan
+    /// to answer; callers must say so rather than report a number.
+    fn session_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Every live session's `variables`, for diagnostics only.
     ///
     /// The session store is a persistent root the collector cannot see: the
@@ -189,6 +197,16 @@ impl SessionStore for MemoryStore {
         self.get(app, id).is_some()
     }
 
+    fn session_count(&self) -> Option<usize> {
+        let now = crate::now_epoch_secs();
+        let m = self.inner.lock().ok()?;
+        Some(
+            m.values()
+                .filter(|s| now.saturating_sub(s.last_accessed_secs) <= s.timeout_secs)
+                .count(),
+        )
+    }
+
     fn take_expired(&self, now_secs: u64) -> Vec<(String, String, ValueMap)> {
         if let Ok(mut m) = self.inner.lock() {
             let expired: Vec<String> = m
@@ -244,6 +262,19 @@ mod tests {
         assert!(!store.contains("appA", "dead"), "contains must agree with get");
         // It was opportunistically removed, so take_expired finds nothing left.
         assert!(store.take_expired(now).is_empty(), "get should have evicted it");
+    }
+
+    #[test]
+    fn session_count_counts_live_sessions_across_apps() {
+        // SessionTracker.getSessionCount(): every application's live sessions,
+        // an expired (not yet swept) one excluded.
+        let store = MemoryStore::new();
+        let now = now_epoch_secs();
+        store.set("appA", "a1", session("appA", now, 1800));
+        store.set("appA", "a2", session("appA", now, 1800));
+        store.set("appB", "a1", session("appB", now, 1800));
+        store.set("appB", "dead", session("appB", now - 10_000, 5));
+        assert_eq!(store.session_count(), Some(3));
     }
 
     #[test]
