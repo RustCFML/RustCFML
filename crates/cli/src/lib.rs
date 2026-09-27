@@ -2334,14 +2334,14 @@ async fn async_run_server(
             ocfg.metrics.prometheus_path.as_str()
         };
         if obs.enabled && ocfg.enabled {
-            if otel::init(ocfg, metrics_path).is_some() {
+            if otel::init(ocfg, metrics_path, obs.metrics.jvm_compatibility).is_some() {
                 println!(
                     "OpenTelemetry enabled — traces → OTLP {} (sampleRatio {}), metrics → {}",
                     ocfg.endpoint, ocfg.sample_ratio, metrics_path
                 );
             }
         } else if obs.enabled && obs.metrics.enabled {
-            otel::init_metrics_only(metrics_path);
+            otel::init_metrics_only(metrics_path, obs.metrics.jvm_compatibility);
             println!("Prometheus metrics enabled → {}", metrics_path);
         }
     }

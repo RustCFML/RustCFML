@@ -1026,6 +1026,14 @@ pub struct MetricsCfg {
     /// Path Prometheus scrapes for the text exposition.
     #[serde(rename = "prometheusPath")]
     pub prometheus_path: String,
+    /// Also emit the engine's memory, collector time and CPU load under the
+    /// names the Prometheus JMX exporter gives the JVM's
+    /// (`java_lang_Memory_HeapMemoryUsage_used`,
+    /// `java_lang_GarbageCollector_CollectionTime`,
+    /// `java_lang_OperatingSystem_ProcessCpuLoad`), so a dashboard built for a
+    /// Lucee container keeps working unchanged. Off by default.
+    #[serde(rename = "jvmCompatibility", deserialize_with = "de_lenient_bool")]
+    pub jvm_compatibility: bool,
 }
 
 impl Default for MetricsCfg {
@@ -1033,6 +1041,7 @@ impl Default for MetricsCfg {
         Self {
             enabled: false,
             prometheus_path: "/__rustcfml/metrics".into(),
+            jvm_compatibility: false,
         }
     }
 }

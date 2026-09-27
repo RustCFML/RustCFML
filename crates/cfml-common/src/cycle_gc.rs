@@ -89,6 +89,25 @@ pub fn collected_total() -> usize {
     COLLECTED_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Nanoseconds spent collecting, process-wide, across every sweep (request-end,
+/// incremental, deferred). The engine's counterpart to a JVM collector's
+/// `CollectionTime`, which is how the metrics endpoint reports it.
+static COLLECTION_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cumulative time spent collecting, in milliseconds.
+pub fn collection_time_ms() -> u64 {
+    COLLECTION_NANOS.load(Ordering::Relaxed) / 1_000_000
+}
+
+/// Adds its lifetime to [`COLLECTION_NANOS`], on every exit path.
+struct CollectionTimer(std::time::Instant);
+
+impl Drop for CollectionTimer {
+    fn drop(&mut self) {
+        COLLECTION_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 /// One logged allocation, held weakly so the log never extends an object's
 /// lifetime (a dead object's `Weak` simply fails to upgrade at collection time).
 #[derive(Clone)]
@@ -1662,6 +1681,7 @@ fn collect_from_log_carrying(
     mut log: Vec<TrackedAlloc>,
     carry: Option<&mut Vec<(usize, TrackedAlloc)>>,
 ) -> usize {
+    let _timer = CollectionTimer(std::time::Instant::now());
     if log.is_empty() {
         recycle_log(log);
         return 0;

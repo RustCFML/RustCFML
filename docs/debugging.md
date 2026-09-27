@@ -249,6 +249,22 @@ Then point Prometheus at `http://<host>:<port>/__rustcfml/metrics`:
 The endpoint is served by the engine, so anyone who can reach the server can read
 it; restrict it at your proxy if the route names are sensitive.
 
+#### Dashboards built for a Lucee container (`jvmCompatibility`)
+
+A Lucee container usually runs the Prometheus JMX exporter, and its dashboards query
+JVM metric names. With `"jvmCompatibility": true` in `observability.metrics`, the
+endpoint also emits the engine's nearest equivalents **under those names**, so such a
+dashboard keeps working unchanged:
+
+| Metric (JMX-exporter name) | RustCFML value |
+|---|---|
+| `java_lang_Memory_HeapMemoryUsage_used` | process memory footprint, bytes (there is no separate heap) |
+| `java_lang_GarbageCollector_CollectionTime` | cumulative cycle-collector time, milliseconds — `rate(...[3m])/180` gives the share of time collecting, as for a JVM |
+| `java_lang_OperatingSystem_ProcessCpuLoad` | process CPU since the previous scrape, 0–1 across the available cores (container CPU quota honoured) |
+
+The rest of what the JMX exporter emits (per-pool, per-thread and class-loading MBeans)
+has no RustCFML equivalent and is not emitted.
+
 ### Traces and metrics
 
 - **Traces** reproduce the request → CFC-method → query transaction tree as OTel

@@ -51,6 +51,8 @@ pub struct OtelRuntime {
     pub traces: bool,
     /// Where the Prometheus endpoint is served.
     pub metrics_path: String,
+    /// Append the JMX-exporter-named engine gauges (`jvm_compat_text`).
+    pub jvm_compat: bool,
 }
 
 /// Initialise the global tracer provider + W3C propagator from config. Returns
@@ -61,6 +63,7 @@ pub struct OtelRuntime {
 pub fn init(
     cfg: &cfml_config::OtelCfg,
     metrics_path: &str,
+    jvm_compat: bool,
 ) -> Option<(SdkTracerProvider, OtelRuntime)> {
     // Only the `http-proto` (protobuf) transport is compiled in; `http/json`
     // would need the `http-json` feature. Config may still name a protocol for
@@ -99,7 +102,12 @@ pub fn init(
         metrics,
         traces: true,
         metrics_path: metrics_path.to_string(),
+        jvm_compat,
     };
+    if jvm_compat {
+        // Baseline now, so the first scrape measures from server start.
+        let _ = process_cpu_load();
+    }
     PROVIDER.set(provider.clone()).ok();
     OTEL_RT.set(rt.clone()).ok();
     Some((provider, rt))
@@ -109,7 +117,11 @@ pub fn init(
 /// No tracer provider is set up, so nothing is exported anywhere, and the
 /// per-request observer only watches queries (for the DB metrics) — it takes
 /// no function-level interest, so calls pay nothing.
-pub fn init_metrics_only(metrics_path: &str) {
+pub fn init_metrics_only(metrics_path: &str, jvm_compat: bool) {
+    if jvm_compat {
+        // Baseline now, so the first scrape measures from server start.
+        let _ = process_cpu_load();
+    }
     OTEL_RT
         .set(OtelRuntime {
             depth_cap: 0,
@@ -117,6 +129,7 @@ pub fn init_metrics_only(metrics_path: &str) {
             metrics: Some(std::sync::Arc::new(Metrics::new())),
             traces: false,
             metrics_path: metrics_path.to_string(),
+            jvm_compat,
         })
         .ok();
 }
@@ -145,7 +158,88 @@ pub fn shutdown() {
 
 /// Render the Prometheus metrics text exposition, or `None` when metrics are off.
 pub fn render_metrics() -> Option<String> {
-    OTEL_RT.get()?.metrics.as_ref().map(|m| m.render())
+    let rt = OTEL_RT.get()?;
+    let m = rt.metrics.as_ref()?;
+    let mut text = m.render();
+    if rt.jvm_compat {
+        text.push_str(&jvm_compat_text());
+    }
+    Some(text)
+}
+
+/// The engine's memory, collector time and CPU load under the names the
+/// Prometheus JMX exporter gives a JVM's, so a dashboard built for a Lucee
+/// container reads them unchanged. Each is the nearest real equivalent:
+///
+/// - `java_lang_Memory_HeapMemoryUsage_used` — the process's memory footprint
+///   (what `--max-memory` measures): there is no separate heap.
+/// - `java_lang_GarbageCollector_CollectionTime` — cumulative milliseconds in
+///   the cycle collector, as a JVM collector's `CollectionTime` counts.
+/// - `java_lang_OperatingSystem_ProcessCpuLoad` — process CPU time over wall
+///   time since the previous scrape, divided by the available cores (0.0-1.0),
+///   as the JVM defines it. `available_parallelism` honours a container's CPU
+///   quota, like the JVM's processor count.
+fn jvm_compat_text() -> String {
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, value: String| {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"));
+    };
+    if let Some(bytes) = crate::memory_limit::footprint_bytes() {
+        gauge(
+            "java_lang_Memory_HeapMemoryUsage_used",
+            "RustCFML process memory footprint in bytes (JMX-exporter name).",
+            bytes.to_string(),
+        );
+    }
+    gauge(
+        "java_lang_GarbageCollector_CollectionTime",
+        "RustCFML cumulative cycle-collector time in milliseconds (JMX-exporter name).",
+        cfml_common::cycle_gc::collection_time_ms().to_string(),
+    );
+    if let Some(load) = process_cpu_load() {
+        gauge(
+            "java_lang_OperatingSystem_ProcessCpuLoad",
+            "RustCFML process CPU load since the previous scrape, 0-1 across available cores (JMX-exporter name).",
+            format!("{load:.4}"),
+        );
+    }
+    out
+}
+
+/// Process CPU seconds (user + system) so far.
+#[cfg(unix)]
+fn process_cpu_seconds() -> Option<f64> {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return None;
+    }
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Some(tv(ru.ru_utime) + tv(ru.ru_stime))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_seconds() -> Option<f64> {
+    None
+}
+
+/// CPU load since the previous call, normalised over the available cores. The
+/// metrics runtime calls this once at startup, so the first scrape measures
+/// from server start rather than from an instant ago.
+fn process_cpu_load() -> Option<f64> {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, f64)>> = std::sync::Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let cpu = process_cpu_seconds()?;
+    let now = std::time::Instant::now();
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    let mut last = LAST.lock().ok()?;
+    let (then, cpu_then) = last.unwrap_or((start, 0.0));
+    *last = Some((now, cpu));
+    let wall = now.duration_since(then).as_secs_f64();
+    if wall <= 0.0 {
+        return Some(0.0);
+    }
+    Some(((cpu - cpu_then) / wall / cores).clamp(0.0, 1.0))
 }
 
 /// Open the request root span and install the per-request [`OtelObserver`] on the
@@ -647,6 +741,23 @@ mod tests {
     }
 
     #[test]
+    fn jvm_compat_text_uses_the_jmx_exporter_names() {
+        let text = jvm_compat_text();
+        assert!(text.contains("# TYPE java_lang_GarbageCollector_CollectionTime gauge\n"));
+        assert!(text.contains("\njava_lang_GarbageCollector_CollectionTime "));
+        if cfg!(unix) {
+            assert!(text.contains("\njava_lang_OperatingSystem_ProcessCpuLoad "));
+            let load: f64 = text
+                .lines()
+                .find(|l| l.starts_with("java_lang_OperatingSystem_ProcessCpuLoad "))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .expect("a numeric load");
+            assert!((0.0..=1.0).contains(&load), "load {load} out of range");
+        }
+    }
+
+    #[test]
     fn metrics_render_contains_names() {
         let m = Metrics::new();
         m.record_request("/posts", 200, 0.012, None);
@@ -678,6 +789,7 @@ mod tests {
             metrics: None,
             traces: true,
             metrics_path: "/__rustcfml/metrics".to_string(),
+            jvm_compat: false,
         };
 
         // Open the request root and drive a call chain: outer → inner, a query
