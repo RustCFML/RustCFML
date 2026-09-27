@@ -22,6 +22,7 @@ type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 mod intercepts_admin;
 mod cluster_shims;
 mod ehcache_shim;
+mod lucee_config_shim;
 mod intercepts_common;
 mod intercepts_extensions;
 mod intercepts_deferred;
@@ -26006,6 +26007,8 @@ impl CfmlVirtualMachine {
             // cbjgroups captures the creating request's application context and
             // re-selects it on each cluster delivery (see cluster_shims).
             "getapplicationcontext" => Ok(self.page_application_context()),
+            // Lucee's ConfigWeb, for connection-pool gauges (lucee_config_shim).
+            "getconfig" => Ok(self.page_config_shim()),
             "setapplicationcontext" => self.set_page_application_context(extra_args.first()),
             "resetpagecontext" | "releasepagecontext" => Ok(CfmlValue::Null),
             // `getCFMLFactory().getActiveRequests()`: requests in flight, this
@@ -27761,6 +27764,9 @@ impl CfmlVirtualMachine {
                     }
                     c if ehcache_shim::handles(c) => {
                         return self.dispatch_ehcache_shim(c, &m, all_args, object);
+                    }
+                    c if lucee_config_shim::handles(c) => {
+                        return self.dispatch_lucee_config(c, &m, all_args, object);
                     }
                     SESSION_TRACKER_CLASS => self.handle_session_tracker(&m),
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),

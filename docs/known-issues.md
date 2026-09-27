@@ -4160,3 +4160,23 @@ unchanged. What is deliberately different:
 - The method-call **write-back on a deep path** (`variables.cache.put( k, v )`) wrote a
   Java shim method's plain return value (null, for EhCache's `put`) over the shim.
   The direct path already refused that; the deep path now does too.
+
+<a id="116"></a>
+
+## 116. `getConfig().getDatasourceConnectionPool()`: active/idle counts are unknown, reported empty (v0.691.0) 🛑
+
+Approved stand-in. Lucee's pool object reports `getNumActive()`, `getNumIdle()` and
+`getMaxTotal()`; monitoring code (preside-ext-k8s-essentials' Prometheus collector)
+reads all three. RustCFML's MySQL pool keeps its connection counts private, so the
+two counts cannot be reported truthfully.
+
+They return an **empty string**, not 0: a 0 would read as "no connections in use" —
+the healthy value — and hide a saturated pool. The collector formats values with
+`IsNumeric()`, so it emits `NaN`, which Prometheus records as "no data" and Grafana
+draws as a gap. (Not null: passing null to an optional argument leaves it undefined,
+and the formatter would throw.) `getMaxTotal()` is real — the driver pool's fixed
+maximum (MySQL 100; SQLite, PostgreSQL, SQL Server 10).
+
+Real counts need the pool to expose them (a patched or replaced MySQL pool).
+`getDatasource()` also accepts an application's datasources, where Lucee's sees only
+configured ones — the two are not distinguishable once registered.

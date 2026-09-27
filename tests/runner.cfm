@@ -259,6 +259,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_cfadmin_shim.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_cbjgroups_shim.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_cbehcache_shim.cfm" rustcfmlOnly="true">
+<cf_runtest file="stdlib/test_lucee_config_pool_shim.cfm" rustcfmlOnly="true">
 <cf_runtest file="stdlib/test_java_decimalformat.cfm">
 <cf_runtest file="stdlib/test_array_find_complex.cfm">
 <cf_runtest file="stdlib/test_arrayfind_closure.cfm">
