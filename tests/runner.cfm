@@ -349,6 +349,7 @@ include "harness.cfm";
 <!--- A non-SELECT statement returns an empty query (docs/known-issues.md §37). --->
 <cf_runtest file="database/test_dml_returns_empty_query.cfm">
 <cf_runtest file="database/test_query_error_catch_type_database.cfm">
+<cf_runtest file="database/test_transaction_statement_datasource.cfm">
 <cf_runtest file="database/test_query_error_sqlstate_members.cfm">
 <cf_runtest file="database/test_pg_comment_placeholder_scan.cfm">
 <cf_runtest file="database/test_cfqueryparam_shared_instance_threads.cfm">
