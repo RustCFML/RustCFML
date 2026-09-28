@@ -95,7 +95,12 @@ component {
         // it must still THROW (proving this.datasources is resolved, not a
         // silent sqlite fallthrough), but in ~1s instead of the 30s the r2d2
         // pool would otherwise spend retrying a doomed connection.
-        "rc_app_bad"     : { driver: "postgresql", host: "127.0.0.1", port: "1", database: "definitely_absent", username: "x", password: "y", connectionTimeout: 1 }
+        "rc_app_bad"     : { driver: "postgresql", host: "127.0.0.1", port: "1", database: "definitely_absent", username: "x", password: "y", connectionTimeout: 1 },
+        // A JDBC datasource for a driver RustCFML does not bundle (H2), declared
+        // the Lucee/ACF way. It must throw, not fall through to the sqlite
+        // catch-all with the JDBC URL as the database file path.
+        // Exercised by tests/database/test_unsupported_jdbc_driver.cfm.
+        "rc_app_h2"      : { class: "org.h2.Driver", connectionString: "jdbc:h2:file:" & getTempDirectory() & "rc_app_h2/test;MODE=MySQL", username: "sa" }
     };
 
 }

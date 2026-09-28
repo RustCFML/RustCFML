@@ -339,6 +339,7 @@ include "harness.cfm";
 <cf_runtest file="database/test_lucee_query_builder.cfm" rustcfmlOnly="true" why="datasource-less cfquery via the RustCFML VFS/QoQ overlay">
 <cf_runtest file="database/test_datasource_list_maxrows.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_sqlite_datasource_paths.cfm" rustcfmlOnly="true">
+<cf_runtest file="database/test_unsupported_jdbc_driver.cfm" rustcfmlOnly="true" why="Lucee bundles an H2 driver, so the datasource legitimately works there">
 <cf_runtest file="database/test_cfquery_tag_forwards_columnkey_maxrows.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_duplicate_result_columns.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_update_affected_rows_matched.cfm" rustcfmlOnly="true">
