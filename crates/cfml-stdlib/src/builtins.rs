@@ -550,7 +550,11 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("javacast".to_string(), fn_java_cast);
     f.insert("createTimeSpan".to_string(), fn_create_time_span);
     f.insert("yesNoFormat".to_string(), fn_yes_no_format);
-    f.insert("booleanFormat".to_string(), fn_yes_no_format);  // alias
+    // Lucee returns "true"/"false" (ACF returns "Yes"/"No"). Preside emits
+    // `data-use-multi-actions="#booleanFormat( false )#"` and reads it back
+    // with jQuery `.data()`, which turns "false" into a boolean but leaves
+    // "No" a truthy string — the listing then skipped its first column.
+    f.insert("booleanFormat".to_string(), fn_true_false_format);
     f.insert("trueFalseFormat".to_string(), fn_true_false_format);
     f.insert("nullValue".to_string(), fn_null_value);
     f.insert("incrementValue".to_string(), fn_increment_value);

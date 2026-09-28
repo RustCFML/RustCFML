@@ -29,6 +29,10 @@ assert("yesNoFormat false", yesNoFormat(false), "No");
 // --- booleanFormat ---
 bfTrue = booleanFormat(true);
 assertTrue("booleanFormat true is truthy", bfTrue);
+// Lucee parity: booleanFormat is the true/false form, not Yes/No (that is yesNoFormat).
+assert("booleanFormat true is 'true'", booleanFormat(true), "true");
+assert("booleanFormat false is 'false'", booleanFormat(false), "false");
+assert("booleanFormat 1 is 'true'", booleanFormat(1), "true");
 
 // --- incrementValue / decrementValue ---
 assert("incrementValue", incrementValue(5), 6);
