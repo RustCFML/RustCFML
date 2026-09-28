@@ -151,6 +151,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_param_write_modes.cfm">
 <cf_runtest file="core/test_struct_append_null_keys.cfm">
 <cf_runtest file="core/test_rethrow_across_dynamic_include.cfm">
+<cf_runtest file="core/test_include_preserves_exception.cfm">
 <cf_runtest file="core/test_local_write_argumentcollection_collision.cfm">
 <cf_runtest file="core/test_rethrow_after_nested_catch.cfm">
 <cf_runtest file="core/test_unscoped_nested_autoviv.cfm">

@@ -15102,22 +15102,10 @@ impl CfmlVirtualMachine {
                                         stack.pop();
                                     }
                                     self.restore_capture_state(&handler);
-                                    let mut err_struct = ValueMap::default();
-                                    err_struct.insert(
-                                        "message".to_string(),
-                                        CfmlValue::string(e.message.clone()),
-                                    );
-                                    err_struct.insert(
-                                        "type".to_string(),
-                                        CfmlValue::string(e.error_type.type_name()),
-                                    );
-                                    err_struct.insert(
-                                        "detail".to_string(),
-                                        CfmlValue::string(String::new()),
-                                    );
-                                    err_struct
-                                        .insert("tagcontext".to_string(), self.build_tag_context());
-                                    let error_val = CfmlValue::strukt(err_struct);
+                                    // The included template's own throw is in `last_exception` with its
+                                    // type/detail/errorcode intact; rebuilding a bare struct here turned
+                                    // every custom exception into `Runtime` (GH #431).
+                                    let error_val = self.resolve_catch_error_val(&e);
                                     stack.push(error_val);
                                     ip = handler.catch_ip;
                                 } else {
@@ -15150,20 +15138,8 @@ impl CfmlVirtualMachine {
                                     stack.pop();
                                 }
                                 self.restore_capture_state(&handler);
-                                let mut err_struct = ValueMap::default();
-                                err_struct.insert(
-                                    "message".to_string(),
-                                    CfmlValue::string(err.message.clone()),
-                                );
-                                err_struct.insert(
-                                    "type".to_string(),
-                                    CfmlValue::string(err.error_type.type_name()),
-                                );
-                                err_struct
-                                    .insert("detail".to_string(), CfmlValue::string(String::new()));
-                                err_struct
-                                    .insert("tagcontext".to_string(), self.build_tag_context());
-                                let error_val = CfmlValue::strukt(err_struct);
+                                // Same struct as every other catch site (GH #431).
+                                let error_val = self.resolve_catch_error_val(&err);
                                 stack.push(error_val);
                                 ip = handler.catch_ip;
                             } else {
@@ -15281,22 +15257,10 @@ impl CfmlVirtualMachine {
                                         stack.pop();
                                     }
                                     self.restore_capture_state(&handler);
-                                    let mut err_struct = ValueMap::default();
-                                    err_struct.insert(
-                                        "message".to_string(),
-                                        CfmlValue::string(e.message.clone()),
-                                    );
-                                    err_struct.insert(
-                                        "type".to_string(),
-                                        CfmlValue::string(e.error_type.type_name()),
-                                    );
-                                    err_struct.insert(
-                                        "detail".to_string(),
-                                        CfmlValue::string(String::new()),
-                                    );
-                                    err_struct
-                                        .insert("tagcontext".to_string(), self.build_tag_context());
-                                    let error_val = CfmlValue::strukt(err_struct);
+                                    // The included template's own throw is in `last_exception` with its
+                                    // type/detail/errorcode intact; rebuilding a bare struct here turned
+                                    // every custom exception into `Runtime` (GH #431).
+                                    let error_val = self.resolve_catch_error_val(&e);
                                     // The catch block this jumps into may `rethrow` —
                                     // codegen synthesises one for the cleanup arm of
                                     // `lock {}` / `try {} finally {}` — and `rethrow`
@@ -15336,20 +15300,8 @@ impl CfmlVirtualMachine {
                                     stack.pop();
                                 }
                                 self.restore_capture_state(&handler);
-                                let mut err_struct = ValueMap::default();
-                                err_struct.insert(
-                                    "message".to_string(),
-                                    CfmlValue::string(err.message.clone()),
-                                );
-                                err_struct.insert(
-                                    "type".to_string(),
-                                    CfmlValue::string(err.error_type.type_name()),
-                                );
-                                err_struct
-                                    .insert("detail".to_string(), CfmlValue::string(String::new()));
-                                err_struct
-                                    .insert("tagcontext".to_string(), self.build_tag_context());
-                                let error_val = CfmlValue::strukt(err_struct);
+                                // Same struct as every other catch site (GH #431).
+                                let error_val = self.resolve_catch_error_val(&err);
                                 stack.push(error_val);
                                 ip = handler.catch_ip;
                             } else {
