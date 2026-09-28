@@ -615,7 +615,11 @@ fn start_cluster_node(http_port: u16, gossip_port: u16, peer_gossip: u16, node: 
     // an opaque connect panic in the first request.
     let mut child = child;
     for _ in 0..600 {
-        if std::net::TcpStream::connect(("127.0.0.1", http_port)).is_ok() {
+        // A socket whose local and peer addresses match connected to ITSELF (Linux
+        // TCP simultaneous open on an ephemeral-range port), not to a server.
+        if std::net::TcpStream::connect(("127.0.0.1", http_port))
+            .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
+        {
             return child;
         }
         if let Ok(Some(status)) = child.try_wait() {

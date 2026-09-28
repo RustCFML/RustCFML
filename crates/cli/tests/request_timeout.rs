@@ -58,7 +58,11 @@ fn start_server() -> Server {
         .spawn()
         .expect("spawn rustcfml --serve");
     for _ in 0..200 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        // A socket whose local and peer addresses match connected to ITSELF (Linux
+        // TCP simultaneous open on an ephemeral-range port), not to a server.
+        if TcpStream::connect(("127.0.0.1", port))
+            .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));

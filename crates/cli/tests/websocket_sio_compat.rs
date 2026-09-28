@@ -78,7 +78,11 @@ async fn start_server() -> Server {
     let mut server = Server { child, port };
     let mut ready = false;
     for _ in 0..600 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        // A socket whose local and peer addresses match connected to ITSELF (Linux
+        // TCP simultaneous open on an ephemeral-range port), not to a server.
+        if std::net::TcpStream::connect(("127.0.0.1", port))
+            .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
+        {
             ready = true;
             break;
         }

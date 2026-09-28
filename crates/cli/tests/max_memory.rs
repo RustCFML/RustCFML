@@ -81,7 +81,11 @@ fn start_server(max_memory: &str) -> Server {
     });
     let mut server = Server { child, port, stderr };
     for _ in 0..600 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        // A socket whose local and peer addresses match connected to ITSELF (Linux
+        // TCP simultaneous open on an ephemeral-range port), not to a server.
+        if TcpStream::connect(("127.0.0.1", port))
+            .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
+        {
             return server;
         }
         if let Ok(Some(status)) = server.child.try_wait() {
