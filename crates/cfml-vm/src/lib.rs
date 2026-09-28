@@ -42389,18 +42389,30 @@ pub(crate) fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
         // String-number comparison: try to coerce. A boolean-literal string
         // (true/yes/false/no) coerces to 1/0 so `1 == "yes"`, `0 == "false"`,
         // `"no" == 0` hold (`2 == "true"` stays false — 2 ≠ 1).
+        //
+        // A numeric string compares with a number by VALUE, through the same
+        // definition of "numeric string" that string-string equality uses
+        // (GH #398): "1.00", "1e2" and "+1.0" all equal 1. Only an integer
+        // spelling used to match an Int here, so a DECIMAL column (which a SQL
+        // driver hands back as "1.00") tested against an integer literal was
+        // unequal on every row, while `gte`/`lte` against the same literal were
+        // both true. An integer spelling still compares exactly, so i64 values
+        // beyond f64's 2^53 keep matching themselves.
         (CfmlValue::String(s), CfmlValue::Int(i)) | (CfmlValue::Int(i), CfmlValue::String(s)) => {
             if let Some(n) = bool_literal_to_num(s) {
                 return n == *i as f64;
             }
-            s.trim().parse::<i64>().map_or(false, |n| n == *i)
+            if let Ok(n) = s.trim().parse::<i64>() {
+                return n == *i;
+            }
+            cfml_common::numeric::numeric_string_value(s).map_or(false, |n| n == *i as f64)
         }
         (CfmlValue::String(s), CfmlValue::Double(d))
         | (CfmlValue::Double(d), CfmlValue::String(s)) => {
             if let Some(n) = bool_literal_to_num(s) {
                 return n == *d;
             }
-            s.trim().parse::<f64>().map_or(false, |n| n == *d)
+            cfml_common::numeric::numeric_string_value(s).map_or(false, |n| n == *d)
         }
         (CfmlValue::String(s), CfmlValue::Bool(b)) | (CfmlValue::Bool(b), CfmlValue::String(s)) => {
             // Empty string is NOT a boolean (isBoolean("") is false), so comparison fails.
@@ -42409,11 +42421,12 @@ pub(crate) fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
                 "true" | "yes" => *b,
                 "false" | "no" => !*b,
                 _ => {
-                    // Numeric string: non-zero is true, zero is false
-                    if let Ok(n) = s.trim().parse::<f64>() {
-                        (n != 0.0) == *b
-                    } else {
-                        false
+                    // Numeric string: non-zero is true, zero is false. The IEEE
+                    // spellings ("inf", "NaN") are not numeric to CFML, so they
+                    // equal neither boolean (GH #398's shared definition).
+                    match cfml_common::numeric::numeric_string_value(s) {
+                        Some(n) => (n != 0.0) == *b,
+                        None => false,
                     }
                 }
             }
