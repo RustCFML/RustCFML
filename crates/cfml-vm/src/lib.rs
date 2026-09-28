@@ -19287,7 +19287,9 @@ impl CfmlVirtualMachine {
                         // test it against three constants. The comparisons below
                         // are case-insensitive instead; the error message now
                         // echoes the caller's own casing.
-                        let obj_type = args[0].as_string();
+                        // Borrowed: a `String` operand is read in place; only a
+                        // non-string type argument materialises (GH #425).
+                        let obj_type = args[0].as_str_cow();
                         // security.disallowedImports: block component / rust
                         // paths whose argument matches any compiled pattern.
                         if !self.disallowed_imports.is_empty()
@@ -19307,7 +19309,7 @@ impl CfmlVirtualMachine {
                             }
                         }
                         if obj_type.eq_ignore_ascii_case("component") {
-                            let comp_name = args[1].as_string();
+                            let comp_name = args[1].as_str_cow();
                             if let Some(template) =
                                 self.resolve_component_template(&comp_name, parent_locals)
                             {
@@ -33183,9 +33185,17 @@ impl CfmlVirtualMachine {
             CfmlValue::Struct(s) if cfml_common::component::is_component_backing(s) => s.clone(),
             _ => return marker,
         };
-        let source_file = s
+        // Both marker strings are held as the values' own `Arc<String>`s —
+        // copying them out cost two allocations per construction (GH #425).
+        let arc_string = |v: CfmlValue| -> Arc<String> {
+            match v {
+                CfmlValue::String(a) => a,
+                other => Arc::new(other.as_string()),
+            }
+        };
+        let source_file: Arc<String> = s
             .get_ci("__source_file")
-            .map(|v| v.as_string())
+            .map(arc_string)
             .unwrap_or_default();
         let instance_id = match s.get_ci("__instance_id") {
             Some(CfmlValue::Int(id)) => id as u64,
@@ -33202,7 +33212,7 @@ impl CfmlVirtualMachine {
         // mapping-prefix specs). Same name ⟹ identical FQN-resolution context ⟹
         // safe to Arc-share. Anonymous/inline components (no source file) always
         // get a fresh blueprint.
-        let bp_name = s.get_ci("__name").map(|v| v.as_string()).unwrap_or_default();
+        let bp_name: Arc<String> = s.get_ci("__name").map(arc_string).unwrap_or_default();
         // Top up the shared per-class `static` scope from `static_stores` (the
         // authoritative per-type store, keyed by source file) — the finished
         // instance's `__variables` doesn't retain `__static`, so `from_marker`
@@ -33226,14 +33236,14 @@ impl CfmlVirtualMachine {
             // probe costs no formatting, and it is the one that hits.
             let bare_hit = self
                 .component_blueprints
-                .get(&source_file)
-                .filter(|bp| bp.name == bp_name)
+                .get(source_file.as_str())
+                .filter(|bp| bp.name == *bp_name)
                 .cloned();
             let cache_key = || {
-                if self.component_blueprints.contains_key(&source_file) {
+                if self.component_blueprints.contains_key(source_file.as_str()) {
                     format!("{}\u{0}{}", source_file, bp_name)
                 } else {
-                    source_file.clone()
+                    (*source_file).clone()
                 }
             };
             if let Some(bp) = bare_hit {
@@ -33249,7 +33259,7 @@ impl CfmlVirtualMachine {
                 let bp = build_bp(self, &s, &source_file);
                 let k = cache_key();
                 self.component_blueprints.insert(k, bp.clone());
-                let (n, published) = (bp_name.clone(), bp.clone());
+                let (n, published) = ((*bp_name).clone(), bp.clone());
                 self.publish_class_cache(&source_file, move |e| {
                     if !e.blueprints.iter().any(|(k, _)| *k == n) {
                         e.blueprints.push((n, published));
@@ -34054,8 +34064,10 @@ impl CfmlVirtualMachine {
         // Cache key: the CFC's physical source file (stable per class, like
         // `static_stores`). Without one (rare hand-built struct) leave methods
         // inline — correctness over the memory win.
-        let src = match s.get("__source_file") {
-            Some(CfmlValue::String(p)) if !p.is_empty() => p.to_string(),
+        // Held as the value's own `Arc<String>`; the `String` copy this used to
+        // make served only as a lookup key (GH #425).
+        let src: Arc<String> = match s.get("__source_file") {
+            Some(CfmlValue::String(p)) if !p.is_empty() => p,
             _ => return,
         };
         let vars = match s.get(&*cfml_common::key::well_known::VARIABLES) {
@@ -34063,7 +34075,7 @@ impl CfmlVirtualMachine {
             _ => None,
         };
         let (this_table, vars_table) =
-            if let Some(pair) = self.class_method_tables.get(&src) {
+            if let Some(pair) = self.class_method_tables.get(src.as_str()) {
                 pair.clone()
             } else {
                 let this_table = Arc::new(Self::collect_scope_methods(s));
@@ -34073,7 +34085,7 @@ impl CfmlVirtualMachine {
                         .unwrap_or_default(),
                 );
                 let pair = (this_table.clone(), vars_table.clone());
-                self.class_method_tables.insert(src.clone(), pair.clone());
+                self.class_method_tables.insert((*src).clone(), pair.clone());
                 let published = pair.clone();
                 self.publish_class_cache(&src, move |e| e.method_tables = Some(published));
                 pair
@@ -34913,7 +34925,9 @@ impl CfmlVirtualMachine {
             let old_program = self.push_program_swap(sub_program);
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
-            self.source_file = Some(Arc::from(&*cfc_path));
+            // `cfc_path` is already the shared `Arc<str>`; `Arc::from(&*cfc_path)`
+            // re-allocated and copied the path on every construction (GH #425).
+            self.source_file = Some(Arc::clone(&cfc_path));
             let main_idx = self
                 .program
                 .functions
@@ -34939,13 +34953,15 @@ impl CfmlVirtualMachine {
             // emits `String("__name"); String(<that name>)` first). The finalize
             // takes the template out of globals by THIS key, so it never has to
             // scan page globals for it.
-            let mut parent_name: Option<String> = None;
-            let mut template_name: Option<String> = None;
+            // Both are refcount bumps of the constant-pool `Arc<String>`; copying
+            // them out cost an allocation each per construction (GH #425).
+            let mut parent_name: Option<Arc<String>> = None;
+            let mut template_name: Option<Arc<String>> = None;
             for w in cfc_func.instructions.windows(2) {
                 if let [BytecodeOp::String(s1), BytecodeOp::String(s2)] = w {
                     match s1.as_str() {
-                        "__extends" if parent_name.is_none() => parent_name = Some((**s2).clone()),
-                        "__name" if template_name.is_none() => template_name = Some((**s2).clone()),
+                        "__extends" if parent_name.is_none() => parent_name = Some(Arc::clone(s2)),
+                        "__name" if template_name.is_none() => template_name = Some(Arc::clone(s2)),
                         _ => {}
                     }
                     if parent_name.is_some() && template_name.is_some() {
@@ -35354,7 +35370,7 @@ impl CfmlVirtualMachine {
                     CfmlValue::Struct(body_vars.clone()),
                 );
                 if let Some(ref h) = static_handle {
-                    s.insert("__static", CfmlValue::Struct(h.clone()));
+                    s.insert(&*cfml_common::key::well_known::STATIC, CfmlValue::Struct(h.clone()));
                 }
                 s
             };
@@ -35415,7 +35431,7 @@ impl CfmlVirtualMachine {
             // `new X()` — no constructor run, shared `this` state (Lucee runs it
             // every time). Remember what the candidate keys held so the finalize
             // can TAKE the template out and put any prior value back.
-            let template_name: &str = template_name.as_deref().unwrap_or("Anonymous");
+            let template_name: &str = template_name.as_ref().map(|s| s.as_str()).unwrap_or("Anonymous");
             let prev_class_global: Option<CfmlValue> = self.globals.get(template_name).cloned();
             let body_result =
                 self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
@@ -35498,8 +35514,12 @@ impl CfmlVirtualMachine {
             // is captured with the other body locals below; it must not become a
             // `variables.<ClassName>` self-reference on the instance (Lucee has
             // no such key — and it made every instance a reference cycle).
-            let baked_local_name: Option<String> = match &result {
-                Some(CfmlValue::Struct(s)) => s.get("__name").map(|v| v.as_string()),
+            let baked_local_name: Option<Arc<String>> = match &result {
+                Some(CfmlValue::Struct(s)) => s.get("__name").map(|v| match v {
+                    // Refcount bump, not a copy (GH #425).
+                    CfmlValue::String(a) => a,
+                    other => Arc::new(other.as_string()),
+                }),
                 _ => None,
             };
             // No deep copy. The template is a fresh struct this construction
@@ -35553,9 +35573,16 @@ impl CfmlVirtualMachine {
             }
             // Store the CFC source path for parent resolution during inheritance
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
+                // One `CfmlValue` per compile of the file, shared by every
+                // instance: `cfc_func` IS this compile (`compile_file_cached_req`
+                // is keyed by the path), so the value never goes stale. Building
+                // it per construction cost the path copy AND the `Arc` (GH #425).
                 s.insert(
                     &*cfml_common::key::well_known::SOURCE_FILE,
-                    CfmlValue::string(cfc_path.to_string()),
+                    cfc_func
+                        .source_file_value
+                        .get_or_init(|| CfmlValue::string(cfc_path.to_string()))
+                        .clone(),
                 );
                 // Stable per-instance identity. Components have value semantics
                 // here (deep-copied above), and `return this` yields a copy on a
@@ -35590,7 +35617,8 @@ impl CfmlVirtualMachine {
                     _ => true,
                 };
                 if needs_override {
-                    s.insert(&*cfml_common::key::well_known::NAME_MARKER, CfmlValue::string(dotted_name.clone()));
+                    // Last use of `dotted_name`: move it in rather than copy.
+                    s.insert(&*cfml_common::key::well_known::NAME_MARKER, CfmlValue::string(dotted_name));
                 }
             }
             // Inject functions added by cfinclude inside the component body
@@ -35671,7 +35699,10 @@ impl CfmlVirtualMachine {
                 // Function values carry stable global_ids (no index fixup
                 // needed); strip their captured_scope because CFC methods
                 // resolve via __variables, not closures.
-                let body_scope = body_vars.snapshot();
+                // Read under the handle's lock: `snapshot()` deep-cloned the
+                // body's whole locals map (two allocations) to iterate it once.
+                // Nothing in the loop touches `body_vars` (GH #425).
+                body_vars.with_map(|body_scope| {
                 for (k, v) in body_scope.iter().chain(component_variables.iter()) {
                     if k.eq_ignore_ascii_case("this")
                         || k.eq_ignore_ascii_case("arguments")
@@ -35717,6 +35748,7 @@ impl CfmlVirtualMachine {
                         vars_scope.insert(k.clone(), v.clone());
                     }
                 }
+                });
                 // GH #425: the pseudo-constructor's captured locals are fully
                 // CONSUMED by the loop above — every value is cloned into
                 // `vars_scope`, the map itself is never moved out — so its
@@ -35746,35 +35778,43 @@ impl CfmlVirtualMachine {
                 // O(body-size) `shadowed_by_ctor` scan that produced an identical
                 // result — a slot occupied by a ctor value is, by definition,
                 // already present here.)
-                for (k, v) in s.iter() {
-                    if k.starts_with("__") {
-                        continue;
-                    }
-                    if let CfmlValue::Function(ref f) = v {
-                        if vars_scope.contains_key(&k) {
+                // Both walks read under the handle's lock: `CfmlStruct::iter()`
+                // is a full clone of the backing map (the v0.678.0 lesson), and
+                // it was paid on every construction here (GH #425). Neither
+                // loop touches `s` — they only fill `vars_scope`.
+                s.with_map(|m| {
+                    for (k, v) in m.iter() {
+                        if k.starts_with("__") {
                             continue;
                         }
-                        // Only clone the wrapper when there's a captured_scope to
-                        // strip (usually None) — avoids a per-method CfmlFunction
-                        // clone.
-                        if f.captured_scope.is_some() {
-                            let mut clean = f.clone();
-                            Arc::make_mut(&mut clean).captured_scope = None;
-                            vars_scope.insert(k.clone(), CfmlValue::Function(clean));
-                        } else {
-                            vars_scope.insert(k.clone(), v.clone());
+                        if let CfmlValue::Function(f) = v {
+                            if vars_scope.contains_key(k) {
+                                continue;
+                            }
+                            // Only clone the wrapper when there's a captured_scope to
+                            // strip (usually None) — avoids a per-method CfmlFunction
+                            // clone.
+                            if f.captured_scope.is_some() {
+                                let mut clean = f.clone();
+                                Arc::make_mut(&mut clean).captured_scope = None;
+                                vars_scope.insert(k.clone(), CfmlValue::Function(clean));
+                            } else {
+                                vars_scope.insert(k.clone(), v.clone());
+                            }
                         }
                     }
-                }
+                });
                 // Merge compiler-generated __variables (property defaults) into
                 // the runtime vars_scope. Runtime values take priority, but
                 // defaults for properties not set during pseudo-constructor are preserved.
                 if let Some(CfmlValue::Struct(ref compiled_vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                    for (k, v) in compiled_vars.iter() {
-                        if !vars_scope.contains_key(&k) {
-                            vars_scope.insert(k, v);
+                    compiled_vars.with_map(|m| {
+                        for (k, v) in m.iter() {
+                            if !vars_scope.contains_key(k) {
+                                vars_scope.insert(k.clone(), v.clone());
+                            }
                         }
-                    }
+                    });
                 }
                 // Expose the shared `static` scope to method frames: a CFC method
                 // resolves `static` via its `__variables.__static` handle.

@@ -278,18 +278,32 @@ pub(crate) fn op_build_array(stack: &mut Vec<CfmlValue>, count: usize) {
 
 #[inline(always)]
 pub(crate) fn op_build_struct(stack: &mut Vec<CfmlValue>, count: usize) {
-    let mut pairs = Vec::new();
-    for _ in 0..count {
-        let value = stack.pop().unwrap_or(CfmlValue::Null);
-        let key = stack.pop().unwrap_or(CfmlValue::string(String::new()));
-        // §3.5: the map key must be owned, but `key` was just popped
-        // off the stack — move its String out instead of copying.
-        pairs.push((key.into_string(), value));
+    // Operands sit on the stack as key, value, key, value… in source order:
+    // drain them in place rather than popping into a reversed temp `Vec`,
+    // and pre-size the map so it never regrows (GH #425: the temp `Vec` plus
+    // two regrowths were four allocations per CFC template header).
+    let base = stack.len().saturating_sub(count * 2);
+    let mut map = ValueMap::with_capacity(count);
+    let mut drained = stack.drain(base..);
+    while let Some(key) = drained.next() {
+        let value = drained.next().unwrap_or(CfmlValue::Null);
+        // A `String` key still owned by the constant pool is interned from a
+        // borrow (one allocation); copying it to a `String` first cost two.
+        match key {
+            CfmlValue::String(arc) => match std::sync::Arc::try_unwrap(arc) {
+                Ok(owned) => {
+                    map.insert(owned, value);
+                }
+                Err(shared) => {
+                    map.insert(shared.as_str(), value);
+                }
+            },
+            other => {
+                map.insert(other.as_string(), value);
+            }
+        }
     }
-    let mut map = ValueMap::default();
-    for (k, v) in pairs.into_iter().rev() {
-        map.insert(k, v);
-    }
+    drop(drained);
     stack.push(CfmlValue::strukt(map));
 }
 

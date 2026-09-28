@@ -285,6 +285,10 @@ pub struct BytecodeFunction {
     /// dropped it again on return. `new Expectation()` in TestBox's `expect()`
     /// paid that per assertion.
     pub cfc_body: std::sync::OnceLock<std::sync::Arc<BytecodeFunction>>,
+    /// For a CFC's `__main__`: the `__source_file` marker VALUE, built once per
+    /// compile and refcount-shared by every instance (the resolver used to
+    /// copy the path into a fresh `Arc<String>` per construction, GH #425).
+    pub source_file_value: std::sync::OnceLock<cfml_common::dynamic::CfmlValue>,
     /// Which params are required (parallel to `params`; true = required)
     pub required_params: Vec<bool>,
     /// Which params declare a default value (parallel to `params`; true = has
@@ -1846,6 +1850,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: Vec::new(),
@@ -4878,6 +4883,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
@@ -5165,6 +5171,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
@@ -5265,6 +5272,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
                     required_params: vec![true],
                     has_default: vec![false],
                     instructions: setter_instructions,
@@ -5460,6 +5468,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
                 required_params: Vec::new(),
                 has_default: Vec::new(),
                 instructions: static_instrs,
@@ -6550,6 +6559,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
@@ -6651,6 +6661,7 @@ impl CfmlCompiler {
                     args_never_escapes: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
+                    source_file_value: Default::default(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
