@@ -33197,26 +33197,40 @@ impl CfmlVirtualMachine {
     /// [`cfml_common::component::make_instance_value`].
     #[cfg(feature = "component-instance")]
     fn to_instance_value(&mut self, marker: CfmlValue) -> CfmlValue {
+        let mut _ti = cfml_common::perf_counters::ctor_phases::Stopwatch::start();
         let s = match &marker {
-            CfmlValue::Struct(s) if cfml_common::component::is_component_backing(s) => s.clone(),
+            CfmlValue::Struct(s) => s.clone(),
             _ => return marker,
         };
         // Both marker strings are held as the values' own `Arc<String>`s —
         // copying them out cost two allocations per construction (GH #425).
-        let arc_string = |v: CfmlValue| -> Arc<String> {
+        let arc_string = |v: &CfmlValue| -> Arc<String> {
             match v {
-                CfmlValue::String(a) => a,
+                CfmlValue::String(a) => a.clone(),
                 other => Arc::new(other.as_string()),
             }
         };
-        let source_file: Arc<String> = s
-            .get_ci("__source_file")
-            .map(arc_string)
-            .unwrap_or_default();
-        let instance_id = match s.get_ci("__instance_id") {
-            Some(CfmlValue::Int(id)) => id as u64,
-            _ => Self::next_component_id(),
+        // ONE read lock for the backing test and the three marker probes; they
+        // took five separate locks on every construction (GH #425).
+        use cfml_common::key::well_known as wk;
+        let probed: Option<(Arc<String>, Option<u64>, Arc<String>)> = s.with_map(|m| {
+            let is_backing = m.contains_key(&*wk::VARIABLES)
+                && (m.contains_key(&*wk::THIS) || m.contains_key(&*wk::NAME_MARKER));
+            if !is_backing {
+                return None;
+            }
+            let source_file = m.get(&*wk::SOURCE_FILE).map(arc_string).unwrap_or_default();
+            let instance_id = match m.get(&*wk::INSTANCE_ID) {
+                Some(CfmlValue::Int(id)) => Some(*id as u64),
+                _ => None,
+            };
+            let bp_name = m.get(&*wk::NAME_MARKER).map(arc_string).unwrap_or_default();
+            Some((source_file, instance_id, bp_name))
+        });
+        let Some((source_file, instance_id, bp_name)) = probed else {
+            return marker;
         };
+        let instance_id = instance_id.unwrap_or_else(Self::next_component_id);
         // The blueprint holds both the class-invariant bulk (methods) AND the
         // per-load-context-dependent name/metadata/type_ids. The SAME .cfc file
         // loaded under different mapping/package prefixes (unqualified `new X()`
@@ -33228,7 +33242,6 @@ impl CfmlVirtualMachine {
         // mapping-prefix specs). Same name ⟹ identical FQN-resolution context ⟹
         // safe to Arc-share. Anonymous/inline components (no source file) always
         // get a fresh blueprint.
-        let bp_name: Arc<String> = s.get_ci("__name").map(arc_string).unwrap_or_default();
         // Top up the shared per-class `static` scope from `static_stores` (the
         // authoritative per-type store, keyed by source file) — the finished
         // instance's `__variables` doesn't retain `__static`, so `from_marker`
@@ -33284,6 +33297,7 @@ impl CfmlVirtualMachine {
                 bp
             }
         };
+        _ti.lap(16);
         cfml_common::component::make_instance_value(&s, blueprint, instance_id)
     }
 
@@ -35576,6 +35590,7 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
+            _ct.lap(19);
             // The component struct's method values carry stable global_ids (set
             // when the CFC body's DefineFunction ops ran), so no func_idx fixup
             // is needed here any more.
@@ -35592,8 +35607,31 @@ impl CfmlVirtualMachine {
             // None, so the unconditional make_mut needlessly cloned every method
             // body on every component resolution. Skipping it when None keeps the
             // instance's methods as cheap shared Arcs.
+            // One write lock for the whole stamp (GH #425): the captured-scope
+            // strip, the `__source_file`/`__instance_id` markers, the resolved
+            // parent hand-off and the `__name` override used to take SIX
+            // separate locks (and six shape bumps) on every construction.
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
+                let rp = resolved_parent_stash.take();
+                let sv = if rp.is_some() { super_value.clone() } else { None };
+                // One `CfmlValue` per compile of the file, shared by every
+                // instance: `cfc_func` IS this compile (`compile_file_cached_req`
+                // is keyed by the path), so the value never goes stale.
+                let src_val = cfc_func
+                    .source_file_value
+                    .get_or_init(|| CfmlValue::string(cfc_path.to_string()))
+                    .clone();
+                // Stable per-instance identity (GH #260): the method-call
+                // write-back's chained-CFC identity guard compares
+                // `__instance_id` and only falls back to `ptr_eq` when absent.
+                let id_val = CfmlValue::Int(Self::next_component_id() as i64);
                 s.with_write(|m| {
+                    // Strip captured_scope from CFC methods: they resolve via
+                    // `__variables`, not closures, and the scope DefineFunction
+                    // attached carries stale data. `make_mut` only when there is
+                    // something to strip — the Arcs are shared with the cached
+                    // program, so an unconditional make_mut deep-copied every
+                    // method body per construction.
                     for (_, v) in m.iter_mut() {
                         if let CfmlValue::Function(f) = v {
                             if f.captured_scope.is_some() {
@@ -35601,58 +35639,32 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
+                    m.insert(&*cfml_common::key::well_known::SOURCE_FILE, src_val);
+                    m.insert(&*cfml_common::key::well_known::INSTANCE_ID, id_val);
+                    // Hand the already-resolved parent to `resolve_inheritance`
+                    // (which removes this key before merging) — see the stash above.
+                    if let Some(rp) = rp {
+                        m.insert(Self::RESOLVED_PARENT_KEY.to_string(), rp);
+                        // The merge derives `__super` from the parent's method
+                        // ENTRIES; a replayed parent keeps those in its table, so
+                        // hand the (cached, class-invariant) super struct over.
+                        if let Some(sv) = sv {
+                            m.insert(&*cfml_common::key::well_known::SUPER_NATIVE, sv);
+                        }
+                    }
+                    // Anonymous `component { ... }` declarations get __name =
+                    // "Anonymous" baked in by the parser. Override with the dotted
+                    // path the caller used so getMetadata(cfc).name matches Lucee.
+                    let needs_override = match m.get(&*cfml_common::key::well_known::NAME_MARKER) {
+                        Some(CfmlValue::String(n)) => n.as_str() == "Anonymous",
+                        _ => true,
+                    };
+                    if needs_override {
+                        m.insert(&*cfml_common::key::well_known::NAME_MARKER, CfmlValue::string(dotted_name));
+                    }
                 });
             }
-            // Store the CFC source path for parent resolution during inheritance
-            if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
-                // One `CfmlValue` per compile of the file, shared by every
-                // instance: `cfc_func` IS this compile (`compile_file_cached_req`
-                // is keyed by the path), so the value never goes stale. Building
-                // it per construction cost the path copy AND the `Arc` (GH #425).
-                s.insert(
-                    &*cfml_common::key::well_known::SOURCE_FILE,
-                    cfc_func
-                        .source_file_value
-                        .get_or_init(|| CfmlValue::string(cfc_path.to_string()))
-                        .clone(),
-                );
-                // Stable per-instance identity. Components have value semantics
-                // here (deep-copied above), and `return this` yields a copy on a
-                // fresh Arc — so `ptr_eq` cannot tell "the same logical instance
-                // returned via `this`" (a fluent `obj.$(..).$(..)` chain) from "a
-                // getter that returned a *different* CFC" (`a.getDep().mutate()`).
-                // The method-call write-back's chained-CFC identity guard needs
-                // exactly that distinction. Stamp each freshly constructed instance
-                // with a monotonic id that survives clone/merge/snapshot as an
-                // ordinary hidden field; the guard compares `__instance_id` and only falls
-                // back to `ptr_eq` when it is absent (GH #260).
-                s.insert(
-                    &*cfml_common::key::well_known::INSTANCE_ID,
-                    CfmlValue::Int(Self::next_component_id() as i64),
-                );
-                // Hand the already-resolved parent to `resolve_inheritance`
-                // (which removes this key before merging) — see the stash above.
-                if let Some(rp) = resolved_parent_stash.take() {
-                    s.insert(Self::RESOLVED_PARENT_KEY.to_string(), rp);
-                    // The merge derives `__super` from the parent's method
-                    // ENTRIES; a replayed parent keeps those in its table, so hand
-                    // the (cached, class-invariant) super struct over directly.
-                    if let Some(ref sv) = super_value {
-                        s.insert(&*cfml_common::key::well_known::SUPER_NATIVE, sv.clone());
-                    }
-                }
-                // Anonymous `component { ... }` declarations get __name = "Anonymous"
-                // baked in by the parser. Override with the dotted path the caller
-                // used (e.g. "oop.Greeter") so getMetadata(cfc).name matches Lucee/ACF.
-                let needs_override = match s.get("__name") {
-                    Some(CfmlValue::String(n)) => n.as_str() == "Anonymous",
-                    _ => true,
-                };
-                if needs_override {
-                    // Last use of `dotted_name`: move it in rather than copy.
-                    s.insert(&*cfml_common::key::well_known::NAME_MARKER, CfmlValue::string(dotted_name));
-                }
-            }
+            _ct.lap(20);
             // Inject functions added by cfinclude inside the component body
             // These were registered in user_functions during execution but aren't
             // in the component struct (which was built at compile time)
@@ -35787,6 +35799,7 @@ impl CfmlVirtualMachine {
                 // is over.
                 #[cfg(feature = "scope-pool")]
                 self.recycle_locals_map(std::mem::take(&mut component_variables));
+                _ct.lap(21);
                 // Backstop: ensure every component method is present in the
                 // variables scope so unqualified in-method calls resolve via the
                 // scope chain. The `body_scope`/`component_variables` loop above
@@ -35868,6 +35881,7 @@ impl CfmlVirtualMachine {
                 }
                 s.insert(&*cfml_common::key::well_known::VARIABLES, CfmlValue::Struct(vars_struct));
             }
+            _ct.lap(22);
             _ct.lap(10);
             // Canonicalise each method's `CfmlFunction` value to the shared,
             // per-class cache (`method_arc_cache`) so every instance points at ONE

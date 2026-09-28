@@ -1766,7 +1766,7 @@ pub mod frame_census {
 pub mod ctor_phases {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub const N: usize = 16;
+    pub const N: usize = 24;
     pub const LABELS: [&str; N] = [
         "resolve path (locals/globals probes, cache key hash, request cache hit)",
         "program fetch (request_validated_files read + bytecode cache Vec clone)",
@@ -1784,6 +1784,14 @@ pub mod ctor_phases {
         "resolve_inheritance (share_methods_into_table on a flat class)",
         "attach_native_parent + attach_implements_chain",
         "to_instance_value (blueprint probe, Instance::from_marker)",
+        "  to_instance: marker probes + blueprint lookup",
+        "  to_instance: from_marker (partition x2, tables, aliases)",
+        "  to_instance: Arc + log_instance + self-ref fixups + alias",
+        "  finalize: own-table set + baked name + super-this-writes",
+        "  finalize: captured_scope strip + source/id/parent/name inserts",
+        "  finalize: body-added fns check + vars loop",
+        "  finalize: backstop loop + compiled defaults + variables struct",
+        "  (unused)",
     ];
 
     #[allow(clippy::declare_interior_mutable_const)]

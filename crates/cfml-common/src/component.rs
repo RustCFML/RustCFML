@@ -510,12 +510,59 @@ impl Instance {
         class: std::sync::Arc<ClassBlueprint>,
         instance_id: u64,
     ) -> Instance {
-        let this_members = partition_data_map(marker);
-        let variables_members = match marker.get_ci("__variables") {
-            Some(CfmlValue::Struct(vars)) => partition_data_map(&vars),
+        // ONE pass over the marker under one read lock: the data partition,
+        // the `__variables` handle, the accessor-private set and a native
+        // parent are all read from the same map, and separate probes for each
+        // took four extra locks per construction (GH #425).
+        let mut accessor_private = std::collections::HashSet::new();
+        let mut native_parent: Option<CfmlValue> = None;
+        let mut vars_struct: Option<CfmlStruct> = None;
+        let this_data = marker.with_read(|m| {
+            let mut data = crate::dynamic::ValueMap::default();
+            for (k, v) in m.iter() {
+                if matches!(v, CfmlValue::Function(_)) {
+                    continue; // method → shared blueprint
+                }
+                if is_reserved_component_key(k) {
+                    // Engine bookkeeping → blueprint / typed Instance fields.
+                    // Keys are stored case-folded, so exact compares suffice.
+                    let ks = k.as_str();
+                    if ks == "__variables" {
+                        if let CfmlValue::Struct(vs) = v {
+                            vars_struct = Some(vs.clone());
+                        }
+                    } else if ks == crate::dynamic::ACCESSOR_PRIVATE_MARKER {
+                        if let CfmlValue::Struct(am) = v {
+                            am.with_read(|mm| {
+                                for (ak, _) in mm.iter() {
+                                    accessor_private.insert(ak.to_ascii_lowercase());
+                                }
+                            });
+                        }
+                    } else if ks == "__super" {
+                        // A `rust:` extends yields a NativeObject under `__super`
+                        // (per-instance parent state). A CFML super struct is
+                        // class-invariant and lives on the blueprint instead.
+                        if matches!(v, CfmlValue::NativeObject(_)) {
+                            native_parent = Some(v.clone());
+                        }
+                    }
+                    continue;
+                }
+                if k.eq_ignore_ascii_case("this") || k.eq_ignore_ascii_case("super") {
+                    continue; // scope handle, re-derived on dispatch (not data)
+                }
+                data.insert(k.clone(), v.clone());
+            }
+            data
+        });
+        // UNTRACKED: owned by the Instance's Arc (see `partition_data_map`).
+        let this_members = CfmlStruct::new_untracked(this_data);
+        let variables_members = match vars_struct {
+            Some(vars) => partition_data_map(&vars),
             // Untracked, like `partition_data_map`'s output — owned by the Instance
             // Arc, never an independent cycle-GC candidate.
-            _ => CfmlStruct::empty_untracked(),
+            None => CfmlStruct::empty_untracked(),
         };
         // Hang the shared blueprint method table off BOTH data maps so `get_ci`
         // falls through to methods on a data miss — this is what makes `this.foo()`,
@@ -540,25 +587,6 @@ impl Instance {
         // injection). Weak ⇒ no Arc cycle ⇒ no per-request leak — the same mechanism
         // the marker path used, reused here rather than a strong self-reference.
         variables_members.set_this_alias_if_changed(&this_members);
-        // Capture the construction-time accessor-private property set (the marker's
-        // `__cfml_accessor_private__`, a case-insensitive name set) so introspection
-        // hides those public-map values exactly as the marker path did.
-        let mut accessor_private = std::collections::HashSet::new();
-        if let Some(CfmlValue::Struct(m)) = marker.get_ci(crate::dynamic::ACCESSOR_PRIVATE_MARKER) {
-            m.with_read(|mm| {
-                for (k, _) in mm.iter() {
-                    accessor_private.insert(k.to_ascii_lowercase());
-                }
-            });
-        }
-        // Capture the PER-INSTANCE native parent (a `rust:` extends yields a
-        // `NativeObject` under `__super`, holding this instance's parent state).
-        // A CFC super struct (`__is_super`-tagged) is class-invariant and lives on
-        // the blueprint instead, so only a NativeObject is taken here.
-        let native_parent = match marker.get_ci("__super") {
-            Some(v @ CfmlValue::NativeObject(_)) => Some(v),
-            _ => None,
-        };
         Instance {
             class,
             this_members,
@@ -795,7 +823,9 @@ pub fn make_instance_value(
     class: std::sync::Arc<ClassBlueprint>,
     instance_id: u64,
 ) -> CfmlValue {
+    let mut _mi = crate::perf_counters::ctor_phases::Stopwatch::start();
     let inst = Instance::from_marker(marker, class, instance_id);
+    _mi.lap(17);
     // Step 0.5 footprint sizing: instances produced and how wide they are.
     // Read BEFORE the handle is wrapped so no lock is held (`len()` on the two
     // data maps takes their own short read guards).
@@ -830,6 +860,7 @@ pub fn make_instance_value(
         // stamped by `from_marker` on a read (writes still reach the public scope).
         g.variables_members.set_this_instance_alias(&handle);
     }
+    _mi.lap(18);
     CfmlValue::Instance(handle)
 }
 
