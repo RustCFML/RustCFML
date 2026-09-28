@@ -1495,6 +1495,35 @@ impl std::ops::DerefMut for MetaTemplateScope<'_> {
 }
 
 /// `path` is an `Arc<str>` so a hit clones a pointer, not the path bytes.
+/// Per-request, per-class construction record (GH #425): everything the
+/// resolver re-derived on EVERY warm construction that is in fact fixed for
+/// the request — the compiled program (request-validated), the header facts
+/// (`extends=`, declared name), the dotted name for a qualified class path,
+/// the chain generation of a flat class, the replay tables and the static
+/// scope handle. Keyed by the same u64 the path cache is keyed by, filled at
+/// the end of a class's first construction; `replay_tables` is refreshed
+/// lazily because the tables only exist after that construction's finalize.
+/// Lives on the per-request VM, so it is dropped with everything it caches.
+pub struct ClassRecord {
+    program: BytecodeProgram,
+    main_idx: usize,
+    cfc_func: Arc<BytecodeFunction>,
+    parent_name: Option<Arc<String>>,
+    template_name: Option<Arc<String>>,
+    /// Only for a qualified (dotted/slashed) class path: an UNQUALIFIED name
+    /// is package-qualified from the constructing `this`, which is per call.
+    dotted_name: Option<String>,
+    /// Only meaningful for a flat class (no `extends=`): a child's generation
+    /// folds in its parent's, which is resolved per construction.
+    class_generation: u64,
+    replay_tables: Option<(
+        Arc<cfml_common::dynamic::ValueMap>,
+        Arc<cfml_common::dynamic::ValueMap>,
+    )>,
+    static_handle: Option<CfmlStruct>,
+    static_declared: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ComponentPathEntry {
     /// The requested class name, as given (compared case-insensitively).
@@ -2989,6 +3018,8 @@ pub struct CfmlVirtualMachine {
     /// `exists()` storm when a request instantiates the same component many times.
     /// Same key/value shape as the production layer (see [`ComponentPathEntry`]).
     pub request_component_cache: FxHashMap<u64, ComponentPathEntry>,
+    /// See [`ClassRecord`]. Keyed like `request_component_cache`.
+    class_records: FxHashMap<u64, Arc<ClassRecord>>,
     /// Request-scoped memo of [`Self::build_inheritance_metadata`], keyed by
     /// [`MetaMemoKey`].
     ///
@@ -4708,6 +4739,7 @@ impl CfmlVirtualMachine {
             static_holders: HashMap::new(),
             class_meta_cache: FxHashMap::default(),
             request_component_cache: FxHashMap::default(),
+            class_records: FxHashMap::default(),
             component_inherit_meta_cache: HashMap::new(),
             component_path_meta_cache: HashMap::new(),
             resolved_template_keys_seen: FxHashSet::default(),
@@ -34874,6 +34906,7 @@ impl CfmlVirtualMachine {
             }
         }
 
+        let warm_hit = cached.is_some();
         let cfc_path: Arc<str> = if let Some(hit) = cached {
             cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CACHE_HITS);
             hit
@@ -34941,8 +34974,18 @@ impl CfmlVirtualMachine {
             resolved
         };
 
+        // Warm hit: the class record answers the program, the header scan, the
+        // dotted name, the generation and the static scope in one probe.
+        let record: Option<Arc<ClassRecord>> = if warm_hit {
+            self.class_records.get(&cache_key).cloned()
+        } else {
+            None
+        };
         _ct.lap(0);
-        let compiled = self.compile_file_cached_req(&cfc_path);
+        let compiled = match &record {
+            Some(r) => Ok(r.program.clone()),
+            None => self.compile_file_cached_req(&cfc_path),
+        };
         _ct.lap(1);
         // A parse/tag error inside an EXISTING component file must not be silently
         // swallowed into the caller's "Could not find the component" message
@@ -34956,18 +34999,24 @@ impl CfmlVirtualMachine {
             }
         }
         if let Ok(sub_program) = compiled {
+            // Kept for the record on a first construction (a Vec of Arcs).
+            let program_for_record: Option<BytecodeProgram> =
+                record.is_none().then(|| sub_program.clone());
             let old_program = self.push_program_swap(sub_program);
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
             // `cfc_path` is already the shared `Arc<str>`; `Arc::from(&*cfc_path)`
             // re-allocated and copied the path on every construction (GH #425).
             self.source_file = Some(Arc::clone(&cfc_path));
-            let main_idx = self
-                .program
-                .functions
-                .iter()
-                .position(|f| f.name == "__main__")
-                .unwrap_or(0);
+            let main_idx = match &record {
+                Some(r) => r.main_idx,
+                None => self
+                    .program
+                    .functions
+                    .iter()
+                    .position(|f| f.name == "__main__")
+                    .unwrap_or(0),
+            };
             let cfc_func = self.program.functions[main_idx].clone();
 
             // Bug G fix: detect `extends="<parent>"` in the cfc body bytecode
@@ -34991,15 +35040,20 @@ impl CfmlVirtualMachine {
             // them out cost an allocation each per construction (GH #425).
             let mut parent_name: Option<Arc<String>> = None;
             let mut template_name: Option<Arc<String>> = None;
-            for w in cfc_func.instructions.windows(2) {
-                if let [BytecodeOp::String(s1), BytecodeOp::String(s2)] = w {
-                    match s1.as_str() {
-                        "__extends" if parent_name.is_none() => parent_name = Some(Arc::clone(s2)),
-                        "__name" if template_name.is_none() => template_name = Some(Arc::clone(s2)),
-                        _ => {}
-                    }
-                    if parent_name.is_some() && template_name.is_some() {
-                        break;
+            if let Some(r) = &record {
+                parent_name = r.parent_name.clone();
+                template_name = r.template_name.clone();
+            } else {
+                for w in cfc_func.instructions.windows(2) {
+                    if let [BytecodeOp::String(s1), BytecodeOp::String(s2)] = w {
+                        match s1.as_str() {
+                            "__extends" if parent_name.is_none() => parent_name = Some(Arc::clone(s2)),
+                            "__name" if template_name.is_none() => template_name = Some(Arc::clone(s2)),
+                            _ => {}
+                        }
+                        if parent_name.is_some() && template_name.is_some() {
+                            break;
+                        }
                     }
                 }
             }
@@ -35045,13 +35099,18 @@ impl CfmlVirtualMachine {
             // This class's dotted `__name`, decided now (the body has not run;
             // nothing it needs depends on it) so the parent resolution below can
             // anchor the parent's own name on it. Applied at the finalize.
-            let dotted_name: String = self.qualified_template_name(
-                class_name,
-                &cfc_path,
-                locals,
-                old_source_file.as_deref(),
-                extends_anchor.as_ref(),
-            );
+            let dotted_name: String = match record.as_ref().and_then(|r| r.dotted_name.clone()) {
+                Some(d) => d,
+                None => self.qualified_template_name(
+                    class_name,
+                    &cfc_path,
+                    locals,
+                    old_source_file.as_deref(),
+                    extends_anchor.as_ref(),
+                ),
+            };
+            let dotted_name_for_record: Option<String> =
+                (record.is_none() && class_name.contains(['.', '/', '\\'])).then(|| dotted_name.clone());
             _ct.lap(3);
             let mut resolved_parent_stash: Option<CfmlValue> = None;
             let mut parent_generation: u64 = 0;
@@ -35072,25 +35131,58 @@ impl CfmlVirtualMachine {
             }
             _ct.lap(4);
             let class_generation = Self::class_generation(cfc_func.global_id, parent_generation);
-            // Probe before inserting: the generation for a given .cfc is stable
-            // for the life of its compile, so every construction after the first
-            // re-inserted an identical entry — and paid a String allocation for
-            // the key to do it (GH #425).
-            match self.class_generations.get(&*cfc_path) {
-                Some(&g) if g == class_generation => {}
-                _ => {
-                    self.class_generations
-                        .insert(cfc_path.to_string(), class_generation);
+            // A recorded flat class already has its generation registered and
+            // its cross-request tables adopted; a child re-derives (its parent's
+            // generation is per construction).
+            let recorded_flat = record.is_some() && parent_name.is_none();
+            if !recorded_flat {
+                // Probe before inserting: the generation for a given .cfc is stable
+                // for the life of its compile, so every construction after the first
+                // re-inserted an identical entry — and paid a String allocation for
+                // the key to do it (GH #425).
+                match self.class_generations.get(&*cfc_path) {
+                    Some(&g) if g == class_generation => {}
+                    _ => {
+                        self.class_generations
+                            .insert(cfc_path.to_string(), class_generation);
+                    }
                 }
+                // Cross-request: adopt the tables an earlier request built for this
+                // exact compile of the chain, so the first construction in THIS
+                // request replays too.
+                self.adopt_class_cache(&cfc_path, class_generation);
             }
-            // Cross-request: adopt the tables an earlier request built for this
-            // exact compile of the chain, so the first construction in THIS
-            // request replays too.
-            self.adopt_class_cache(&cfc_path, class_generation);
             let replay_tables: Option<(
                 Arc<cfml_common::dynamic::ValueMap>,
                 Arc<cfml_common::dynamic::ValueMap>,
-            )> = self.class_method_tables.get(&*cfc_path).cloned();
+            )> = match record.as_ref().and_then(|r| r.replay_tables.clone()) {
+                Some(t) => Some(t),
+                // The record was filled before this class's first finalize built
+                // its tables (they are attached in `resolve_inheritance`), so
+                // probe once more and, if they exist now, remember them.
+                None => {
+                    let t = self.class_method_tables.get(&*cfc_path).cloned();
+                    if let (Some(t), Some(r)) = (&t, &record) {
+                        if r.replay_tables.is_none() {
+                            let mut fresh = ClassRecord {
+                                program: r.program.clone(),
+                                main_idx: r.main_idx,
+                                cfc_func: r.cfc_func.clone(),
+                                parent_name: r.parent_name.clone(),
+                                template_name: r.template_name.clone(),
+                                dotted_name: r.dotted_name.clone(),
+                                class_generation: r.class_generation,
+                                replay_tables: None,
+                                static_handle: r.static_handle.clone(),
+                                static_declared: r.static_declared,
+                            };
+                            fresh.replay_tables = Some(t.clone());
+                            self.class_records.insert(cache_key, Arc::new(fresh));
+                        }
+                    }
+                    t
+                }
+            };
             let injected_scope: ValueMap =
                 if let Some(CfmlValue::Struct(ref ps)) = resolved_parent_stash {
                     {
@@ -35197,15 +35289,21 @@ impl CfmlVirtualMachine {
             // `__main__` global_id, so a cross-request static scope built for an
             // older compile is recognised as stale and rebuilt.
             let static_generation: u32 = cfc_func.global_id;
-            let shared_static: Option<StaticScopeEntry> = self.server_state.as_ref().and_then(|ss| {
-                ss.static_scopes
-                    .read()
-                    .get(static_key)
-                    .filter(|e| e.generation == static_generation)
-                    .cloned()
-            });
+            let shared_static: Option<StaticScopeEntry> = if record.is_some() {
+                None
+            } else {
+                self.server_state.as_ref().and_then(|ss| {
+                    ss.static_scopes
+                        .read()
+                        .get(static_key)
+                        .filter(|e| e.generation == static_generation)
+                        .cloned()
+                })
+            };
             let static_handle: Option<CfmlStruct> =
-                if let Some(h) = self.static_stores.get(static_key) {
+                if let Some(r) = &record {
+                    r.static_handle.clone()
+                } else if let Some(h) = self.static_stores.get(static_key) {
                     Some(h.clone())
                 } else if let Some(entry) = shared_static {
                     // Initialised by an earlier request: adopt it. The static
@@ -35329,8 +35427,10 @@ impl CfmlVirtualMachine {
                 };
             _ct.lap(6);
             // One probe per construction, shared by the two seeding sites below.
-            let static_declared = static_handle.is_some()
-                && self.static_ctor_types.contains(static_key);
+            let static_declared = match &record {
+                Some(r) => r.static_declared,
+                None => static_handle.is_some() && self.static_ctor_types.contains(static_key),
+            };
             let mut injected_scope = injected_scope;
             // Seed the pseudo-constructor frame ONLY for types that declare or
             // inherit a `static {}` block. Method frames get `__static` from the
@@ -35474,6 +35574,7 @@ impl CfmlVirtualMachine {
             // `new X()` — no constructor run, shared `this` state (Lucee runs it
             // every time). Remember what the candidate keys held so the finalize
             // can TAKE the template out and put any prior value back.
+            let template_name_arc: Option<Arc<String>> = template_name.clone();
             let template_name: &str = template_name.as_ref().map(|s| s.as_str()).unwrap_or("Anonymous");
             let prev_class_global: Option<CfmlValue> = self.globals.get(template_name).cloned();
             _ct.lap(7);
@@ -35934,6 +36035,30 @@ impl CfmlVirtualMachine {
             // so an ordinary request (which never gets near it) pays one
             // thread-local length read per `new`.
             cfml_common::cycle_gc::collect_incremental();
+            // First construction of this class under this key in the request:
+            // record what every later construction can take from one probe.
+            // Only for a file-resolved class (a warm path-cache key fully
+            // determines the file); the tables are filled in lazily above.
+            if record.is_none() && result.is_some() {
+                let rec = ClassRecord {
+                    program: match program_for_record {
+                        Some(p) => p,
+                        None => BytecodeProgram { functions: Vec::new() },
+                    },
+                    main_idx,
+                    cfc_func: cfc_func.clone(),
+                    parent_name: parent_name.clone(),
+                    template_name: template_name_arc,
+                    dotted_name: dotted_name_for_record,
+                    class_generation,
+                    replay_tables: replay_tables.clone(),
+                    static_handle: static_handle.clone(),
+                    static_declared,
+                };
+                if !rec.program.functions.is_empty() {
+                    self.class_records.insert(cache_key, Arc::new(rec));
+                }
+            }
             _ct.lap(11);
             return result;
         }
