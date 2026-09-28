@@ -27,6 +27,7 @@ cfml-module-abi = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-stdlib = { workspace = true, default-features = false, optional = true }
 indexmap = { workspace = true }
+rustc-hash = { workspace = true }
 hashbrown = { workspace = true }
 cfml-codegen = { workspace = true }
 thiserror = { workspace = true }

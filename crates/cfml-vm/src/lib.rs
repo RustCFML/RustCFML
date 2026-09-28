@@ -10,6 +10,12 @@ use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+/// Fx-hashed maps for the engine's own path/id-keyed caches (GH #425): every
+/// construction probes a dozen of these with an ~80-byte source path, and
+/// SipHash cost ~40 ns per probe against Fx's ~8. Internal keys only — never
+/// for user-controlled input.
+type FxHashMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type FxHashSet<K> = HashSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -747,7 +753,7 @@ pub struct CachedProgram {
 /// Skips recompilation when a file's mtime is unchanged.
 #[derive(Clone)]
 pub struct BytecodeCache {
-    entries: Arc<parking_lot::RwLock<HashMap<String, CachedProgram>>>,
+    entries: Arc<parking_lot::RwLock<FxHashMap<String, CachedProgram>>>,
     /// When true, skip the per-hit `vfs.modified()` stat and always trust
     /// cached entries. Set from the `--production` flag.
     trusted: bool,
@@ -760,7 +766,7 @@ impl BytecodeCache {
 
     pub fn with_trust(trusted: bool) -> Self {
         Self {
-            entries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            entries: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
             trusted,
         }
     }
@@ -1544,30 +1550,28 @@ fn component_cache_hash(
     base_template: &str,
     mappings_fp: u64,
 ) -> u64 {
-    let mut h = FNV_OFFSET;
-    let byte = |b: u8, h: &mut u64| {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(FNV_PRIME);
-    };
-    for b in mappings_fp.to_le_bytes() {
-        byte(b, &mut h);
-    }
-    for (part, fold_case) in [
-        (class_name, true),
-        // Paths stay case-sensitive: `matches` compares them exactly, so folding
-        // them here would only make two differently-cased dirs collide and evict
-        // each other instead of coexisting.
-        (source_dir, false),
-        (base_template, false),
-    ] {
-        for b in (part.len() as u64).to_le_bytes() {
-            byte(b, &mut h);
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write_u64(mappings_fp);
+    // Class name folded to ASCII lowercase as it is consumed, 8 bytes at a
+    // time. The byte-at-a-time FNV this replaced cost ~1 ns per byte over a
+    // ~200-byte key on every construction (GH #425).
+    h.write_usize(class_name.len());
+    for chunk in class_name.as_bytes().chunks(8) {
+        let mut buf = [0u8; 8];
+        for (d, b) in buf.iter_mut().zip(chunk) {
+            *d = b.to_ascii_lowercase();
         }
-        for &b in part.as_bytes() {
-            byte(if fold_case { b.to_ascii_lowercase() } else { b }, &mut h);
-        }
+        h.write(&buf[..chunk.len()]);
     }
-    h
+    // Paths stay case-sensitive: `matches` compares them exactly, so folding
+    // them here would only make two differently-cased dirs collide and evict
+    // each other instead of coexisting.
+    h.write_usize(source_dir.len());
+    h.write(source_dir.as_bytes());
+    h.write_usize(base_template.len());
+    h.write(base_template.as_bytes());
+    h.finish()
 }
 
 /// Content fingerprint of a mappings table, in stored (longest-prefix-first)
@@ -1815,7 +1819,7 @@ pub struct ServerState {
     /// read 1 forever). The entry records the compile generation (the CFC
     /// `__main__`'s process-unique `global_id`) so a file edited in dev — a new
     /// compile, a new id — gets a fresh static scope, as a redeploy would.
-    pub static_scopes: Arc<parking_lot::RwLock<HashMap<String, StaticScopeEntry>>>,
+    pub static_scopes: Arc<parking_lot::RwLock<FxHashMap<String, StaticScopeEntry>>>,
     /// Per-class construction tables (method tables, own-method table, `super`
     /// struct), keyed by the CFC's source file, shared across requests. The
     /// per-request VM builds these on a class's FIRST construction in the
@@ -1824,7 +1828,7 @@ pub struct ServerState {
     /// a page that constructs most classes once (the Preside shape) never saw
     /// the replay path at all. Entries carry the chain generation, so an edited
     /// file (dev mode recompile, new `global_id`s) misses and rebuilds.
-    pub class_caches: Arc<parking_lot::RwLock<HashMap<String, ClassCacheEntry>>>,
+    pub class_caches: Arc<parking_lot::RwLock<FxHashMap<String, ClassCacheEntry>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -1896,8 +1900,8 @@ impl ServerState {
             dir_fold_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             object_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            static_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            class_caches: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            static_scopes: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
+            class_caches: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
@@ -2194,7 +2198,7 @@ pub struct CfmlVirtualMachine {
     /// User-defined functions (name -> function definition)
     /// Held as `Arc<BytecodeFunction>` so that cloning (very hot on every call)
     /// is a refcount bump rather than a deep clone of the whole bytecode body.
-    pub user_functions: HashMap<String, Arc<BytecodeFunction>>,
+    pub user_functions: IndexMap<String, Arc<BytecodeFunction>>,
     /// ASCII-lowercased name -> declared-spelling key index over
     /// `user_functions`, so the case-insensitive resolution fallback (a bare
     /// call spelled with a casing that differs from the declaration) is one
@@ -2218,7 +2222,7 @@ pub struct CfmlVirtualMachine {
     /// one `Arc` (an 8-byte refcount bump). `Arc::make_mut` keeps the rare
     /// per-instance mutation (binding a captured_scope) copy-on-write, so sharing
     /// is safe. See COMPONENT_MODEL_PHASE_C2_PROTOTYPE.md.
-    pub method_arc_cache: HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
+    pub method_arc_cache: FxHashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
     /// Component-model flyweight: shared per-class method tables, keyed by the
     /// CFC's source file. `.0` is the `this`-scope table (public members), `.1`
     /// the `__variables`-scope table (all members). Built once per class from the
@@ -2226,7 +2230,7 @@ pub struct CfmlVirtualMachine {
     /// method entries and points its scope structs at these shared `Arc`s — so
     /// the ~40 method map entries a method-heavy CFC used to carry per instance
     /// (in BOTH scopes) live once per class instead. This is the memory win.
-    pub class_method_tables: HashMap<
+    pub class_method_tables: FxHashMap<
         String,
         (
             Arc<cfml_common::dynamic::ValueMap>,
@@ -2239,16 +2243,16 @@ pub struct CfmlVirtualMachine {
     /// `replay_tables`). Deliberately not the merged table: the template's
     /// `this` is what leaf metadata (`getComponentMetaData(X).functions`) and the
     /// inheritance merge read, and both must see only the class's own methods.
-    pub class_own_method_tables: HashMap<String, Arc<cfml_common::dynamic::ValueMap>>,
+    pub class_own_method_tables: FxHashMap<String, Arc<cfml_common::dynamic::ValueMap>>,
     /// The `__is_super`-tagged dispatch struct for a parent class (its full
     /// method set), keyed by the PARENT's source file. Built by the first child
     /// construction that resolves that parent; a replayed construction reuses it
     /// instead of folding the parent's method table back into a fresh map.
-    pub class_super_values: HashMap<String, CfmlValue>,
+    pub class_super_values: FxHashMap<String, CfmlValue>,
     /// Chain generation of every class resolved in this request, keyed by
     /// source file — the key under which its tables are published to and
     /// adopted from `ServerState::class_caches`. See `class_generation`.
-    pub class_generations: HashMap<String, u64>,
+    pub class_generations: FxHashMap<String, u64>,
     /// Source file path (for include resolution)
     pub source_file: Option<Arc<str>>,
     /// Call stack for tracking execution
@@ -2774,7 +2778,7 @@ pub struct CfmlVirtualMachine {
     /// First-function `global_id` of every program `register_program_fns` has
     /// registered into this VM, so a re-swap of a cached program skips the
     /// per-function walk (see `register_program_fns`).
-    registered_programs: std::collections::HashSet<u32>,
+    registered_programs: FxHashSet<u32>,
     /// (The v0.442/Lever-A/Lever-C per-VM memo caches that lived here moved
     /// onto `BytecodeFunction` itself as `OnceLock` fields — computed once per
     /// PROCESS instead of probed via SipHash per call and rebuilt per request.)
@@ -2950,7 +2954,7 @@ pub struct CfmlVirtualMachine {
     /// component's `static { ... }` block) and reused for every later instance,
     /// so static members are shared per-type. Lives for the VM's lifetime (one
     /// request in serve mode; the whole run in CLI mode).
-    pub static_stores: HashMap<String, CfmlStruct>,
+    pub static_stores: FxHashMap<String, CfmlStruct>,
     /// Component types whose PSEUDO-CONSTRUCTOR frame is seeded with the shared
     /// `__static` handle — i.e. those that declare their own `static {}` block or
     /// inherit one.
@@ -2960,7 +2964,7 @@ pub struct CfmlVirtualMachine {
     /// blueprint, which tops itself up from [`Self::static_stores`]. Seeding it
     /// unconditionally cost ~500 ns on EVERY component construction (+7.8% on a
     /// construction-dense loop) to no effect — the whole suite passes without it.
-    pub static_ctor_types: std::collections::HashSet<String>,
+    pub static_ctor_types: FxHashSet<String>,
     /// Cached static "holder" per component name (lowercased) — a built template
     /// instance whose `__variables.__static` is the shared static scope. Lets the
     /// `::` operator reach static members/methods without re-instantiating.
@@ -2976,7 +2980,7 @@ pub struct CfmlVirtualMachine {
     /// `rust:` parents) or `__variables` (the mutable instance scope). Production
     /// mode only: classes are immutable there, so the cache can't go stale;
     /// dev keeps per-instance copies. Same VM lifetime as `static_stores`.
-    pub class_meta_cache: HashMap<String, Arc<Vec<(String, CfmlValue)>>>,
+    pub class_meta_cache: FxHashMap<String, Arc<Vec<(String, CfmlValue)>>>,
     /// Request-scoped cache of a component name → its resolved `.cfc` path.
     /// Sibling of `ServerState::component_path_cache` (cross-request, production
     /// only), but on the per-request VM so it is safe in ALL modes: the on-disk
@@ -2984,7 +2988,7 @@ pub struct CfmlVirtualMachine {
     /// dev still picks up new/edited files next request. Kills the candidate-path
     /// `exists()` storm when a request instantiates the same component many times.
     /// Same key/value shape as the production layer (see [`ComponentPathEntry`]).
-    pub request_component_cache: HashMap<u64, ComponentPathEntry>,
+    pub request_component_cache: FxHashMap<u64, ComponentPathEntry>,
     /// Request-scoped memo of [`Self::build_inheritance_metadata`], keyed by
     /// [`MetaMemoKey`].
     ///
@@ -3012,7 +3016,7 @@ pub struct CfmlVirtualMachine {
     /// Diagnostics only (`RUSTCFML_COUNTERS=1`): keys already resolved by
     /// `resolve_component_template` this request, to size how often a template
     /// EXECUTION is repeated rather than just its filename lookup.
-    resolved_template_keys_seen: std::collections::HashSet<u64>,
+    resolved_template_keys_seen: FxHashSet<u64>,
     /// Request-scoped cache of EXECUTED component templates, consulted only
     /// while deriving metadata (`meta_template_depth > 0`).
     ///
@@ -3034,7 +3038,7 @@ pub struct CfmlVirtualMachine {
     /// Entries are stored and returned as DEEP COPIES: callers mutate the
     /// template (inheritance merges the parent into the child in place), so a
     /// shared handle would let one derivation corrupt every later one.
-    component_meta_template_cache: HashMap<u64, CfmlValue>,
+    component_meta_template_cache: FxHashMap<u64, CfmlValue>,
     /// Depth of the current metadata derivation; `> 0` enables the cache above.
     /// A counter rather than a bool because the builder recurses into parents.
     meta_template_depth: u32,
@@ -3044,7 +3048,7 @@ pub struct CfmlVirtualMachine {
     /// request), which is safe — blueprints are immutable and cheap to rebuild.
     #[cfg(feature = "component-instance")]
     pub component_blueprints:
-        HashMap<String, std::sync::Arc<cfml_common::component::ClassBlueprint>>,
+        FxHashMap<String, std::sync::Arc<cfml_common::component::ClassBlueprint>>,
     /// Request-scoped cache of a path → its `canonicalize()` (realpath) result.
     /// Request-lifetime sibling of `ServerState::canonicalize_cache`; safe in all
     /// modes for the same reason. `RwLock` because `canonicalize_cached` is `&self`.
@@ -3075,7 +3079,7 @@ pub struct CfmlVirtualMachine {
     /// can't change, so once validated we skip the stat on repeat loads (see
     /// `compile_file_cached_req`). Dropped at request end → next request
     /// re-checks. `RwLock` so the `&self` wrapper composes with self-borrowed args.
-    pub request_validated_files: parking_lot::RwLock<std::collections::HashSet<String>>,
+    pub request_validated_files: parking_lot::RwLock<FxHashSet<String>>,
     /// Request-scoped memo of `(source_dir, path_spec)` → resolved custom-tag
     /// template path. `resolve_custom_tag_path` probes up to every custom-tag
     /// path and mapping with raw `exists()` stats per `<cfmodule>`/`cf_` call —
@@ -3712,7 +3716,7 @@ pub fn report_live_seeds() {
 #[derive(Clone)]
 pub struct ThreadSeed {
     pub program: BytecodeProgram,
-    pub user_functions: HashMap<String, Arc<BytecodeFunction>>,
+    pub user_functions: IndexMap<String, Arc<BytecodeFunction>>,
     /// Per-thread copy of the parent `variables` scope at spawn (CFML copy
     /// semantics: top-level reassignments don't leak back; nested objects stay
     /// by-reference since `CfmlValue` arrays/structs are `Arc`-backed).
@@ -4542,14 +4546,14 @@ impl CfmlVirtualMachine {
             type_check_is_valid: None,
             output_buffer: String::new(),
             vfs: Arc::new(RealFs),
-            user_functions: HashMap::new(),
+            user_functions: IndexMap::new(),
             user_fn_lc: HashMap::default(),
             user_fn_lc_src_len: 0,
-            method_arc_cache: HashMap::new(),
-            class_method_tables: HashMap::new(),
-            class_own_method_tables: HashMap::new(),
-            class_super_values: HashMap::new(),
-            class_generations: HashMap::new(),
+            method_arc_cache: FxHashMap::default(),
+            class_method_tables: FxHashMap::default(),
+            class_own_method_tables: FxHashMap::default(),
+            class_super_values: FxHashMap::default(),
+            class_generations: FxHashMap::default(),
             source_file: None,
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
@@ -4660,7 +4664,7 @@ impl CfmlVirtualMachine {
             app_fn_gids: Vec::new(),
             pending_app_fns: Vec::new(),
             fn_registry: Vec::new(),
-            registered_programs: std::collections::HashSet::new(),
+            registered_programs: FxHashSet::default(),
             app_fn_table_dirty: false,
             cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cache_hits: 0,
@@ -4699,23 +4703,23 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             cancel_flag: None,
-            static_stores: HashMap::new(),
-            static_ctor_types: std::collections::HashSet::new(),
+            static_stores: FxHashMap::default(),
+            static_ctor_types: FxHashSet::default(),
             static_holders: HashMap::new(),
-            class_meta_cache: HashMap::new(),
-            request_component_cache: HashMap::new(),
+            class_meta_cache: FxHashMap::default(),
+            request_component_cache: FxHashMap::default(),
             component_inherit_meta_cache: HashMap::new(),
             component_path_meta_cache: HashMap::new(),
-            resolved_template_keys_seen: std::collections::HashSet::new(),
-            component_meta_template_cache: HashMap::new(),
+            resolved_template_keys_seen: FxHashSet::default(),
+            component_meta_template_cache: FxHashMap::default(),
             meta_template_depth: 0,
             #[cfg(feature = "component-instance")]
-            component_blueprints: HashMap::new(),
+            component_blueprints: FxHashMap::default(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
             request_cfconfig_scope_memo: parking_lot::RwLock::new(None),
             resolved_fn_memo: HashMap::new(),
             arg_sources_memo: HashMap::new(),
-            request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            request_validated_files: parking_lot::RwLock::new(FxHashSet::default()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
             request_dir_fold_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -8995,7 +8999,13 @@ impl CfmlVirtualMachine {
                 .is_some_and(|e| !e.is_empty());
         #[cfg(feature = "call-phases")]
         let _p4_needed_probe = !is_template_frame && !has_overflow_args;
-        let build_arguments_eager = is_template_frame
+        // A component pseudo-constructor (`__cfc_body__`) is a template frame
+        // with no caller `arguments` to bridge (that seed is `__main__`-only,
+        // below), so it takes the eager path only when its body observably
+        // uses the scope — the same static scan every method frame relies on.
+        // Building the struct unconditionally was three allocations plus a
+        // cycle-GC log entry on every construction (GH #425).
+        let build_arguments_eager = (is_template_frame && func.name != "__cfc_body__")
             || has_overflow_args
             || self.arguments_scope_needed(func)
             // Last, and behind the mode flag: in `classic` (the default on every
@@ -19290,6 +19300,7 @@ impl CfmlVirtualMachine {
                         // Borrowed: a `String` operand is read in place; only a
                         // non-string type argument materialises (GH #425).
                         let obj_type = args[0].as_str_cow();
+                        let mut _co = cfml_common::perf_counters::ctor_phases::Stopwatch::start();
                         // security.disallowedImports: block component / rust
                         // paths whose argument matches any compiled pattern.
                         if !self.disallowed_imports.is_empty()
@@ -19310,18 +19321,23 @@ impl CfmlVirtualMachine {
                         }
                         if obj_type.eq_ignore_ascii_case("component") {
                             let comp_name = args[1].as_str_cow();
+                            _co.lap(12);
                             if let Some(template) =
                                 self.resolve_component_template(&comp_name, parent_locals)
                             {
+                                _co.reset();
                                 let instance = self.resolve_inheritance(template, parent_locals)?;
+                                _co.lap(13);
                                 let instance = self.attach_native_parent(instance)?;
                                 let instance =
                                     self.attach_implements_chain(instance, parent_locals)?;
+                                _co.lap(14);
                                 // Phase C.3 — Slice 6b: convert createObject's finished
                                 // marker into the flyweight Instance, mirroring new X().
                                 // Feature-gated OFF by default.
                                 #[cfg(feature = "component-instance")]
                                 let instance = self.to_instance_value(instance);
+                                _co.lap(15);
                                 return Ok(instance);
                             }
                             // Unresolved component path: throw rather than return
@@ -34125,7 +34141,7 @@ impl CfmlVirtualMachine {
     }
 
     fn canon_method_scope(
-        cache: &HashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
+        cache: &FxHashMap<u32, Arc<cfml_common::dynamic::CfmlFunction>>,
         sc: &CfmlStruct,
     ) {
         // Pure read under the lock (`with_map`), so no per-instance clone of the
@@ -34682,6 +34698,8 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
         cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CALLS);
+        cfml_common::perf_counters::ctor_phases::bump_calls();
+        let mut _ct = cfml_common::perf_counters::ctor_phases::Stopwatch::start();
         // Set by the child's resolver when THIS resolution is for its `extends=`
         // parent (see `qualified_template_name`). Taken first so it can never
         // leak into a `new` made from inside the body below.
@@ -34909,7 +34927,9 @@ impl CfmlVirtualMachine {
             resolved
         };
 
+        _ct.lap(0);
         let compiled = self.compile_file_cached_req(&cfc_path);
+        _ct.lap(1);
         // A parse/tag error inside an EXISTING component file must not be silently
         // swallowed into the caller's "Could not find the component" message
         // (which sends you hunting for a missing file/mapping). Stash the real
@@ -34969,6 +34989,7 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
+            _ct.lap(2);
             // Also build the `super` object so `super.method(...)` calls inside
             // the pseudo-constructor resolve to the parent's methods. CFML makes
             // `super` available throughout the component body (e.g. Preside's
@@ -35017,6 +35038,7 @@ impl CfmlVirtualMachine {
                 old_source_file.as_deref(),
                 extends_anchor.as_ref(),
             );
+            _ct.lap(3);
             let mut resolved_parent_stash: Option<CfmlValue> = None;
             let mut parent_generation: u64 = 0;
             if let Some(ref pname) = parent_name {
@@ -35034,6 +35056,7 @@ impl CfmlVirtualMachine {
                     resolved_parent_stash = Some(resolved_parent);
                 }
             }
+            _ct.lap(4);
             let class_generation = Self::class_generation(cfc_func.global_id, parent_generation);
             // Probe before inserting: the generation for a given .cfc is stable
             // for the life of its compile, so every construction after the first
@@ -35148,6 +35171,7 @@ impl CfmlVirtualMachine {
                     ValueMap::default()
                 };
 
+            _ct.lap(5);
             // Resolve the shared `static` scope for this component type. Keyed by
             // source path so it is built once and reused across instances. On
             // first load run the compiled `__cfc_static_init__` block (if any),
@@ -35289,6 +35313,7 @@ impl CfmlVirtualMachine {
                         Some(h)
                     }
                 };
+            _ct.lap(6);
             // One probe per construction, shared by the two seeding sites below.
             let static_declared = static_handle.is_some()
                 && self.static_ctor_types.contains(static_key);
@@ -35378,8 +35403,12 @@ impl CfmlVirtualMachine {
             // Snapshot user_functions AFTER parent resolution (parent body may have
             // registered helper functions which should not be flagged as
             // "added by cfinclude" inside this child body).
-            let pre_exec_func_names: std::collections::HashSet<String> =
-                self.user_functions.keys().cloned().collect();
+            // `user_functions` is insertion-ordered and never removed from, so
+            // the functions the body registers are exactly the entries past
+            // this index. Snapshotting every registered NAME into a HashSet
+            // here cost one String allocation per function in the application
+            // on EVERY construction (GH #425).
+            let pre_exec_func_len: usize = self.user_functions.len();
             // CFC body executes with a scope containing parent's variables (so
             // unscoped lookups inside the child body resolve inherited values).
             // Mark as "__cfc_body__" so the VM treats it as function scope
@@ -35433,8 +35462,10 @@ impl CfmlVirtualMachine {
             // can TAKE the template out and put any prior value back.
             let template_name: &str = template_name.as_ref().map(|s| s.as_str()).unwrap_or("Anonymous");
             let prev_class_global: Option<CfmlValue> = self.globals.get(template_name).cloned();
+            _ct.lap(7);
             let body_result =
                 self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            _ct.lap(8);
             let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
             self.pseudo_ctor_super_this_writes = saved_super_this_writes;
             self.pending_pseudo_ctor_parent_this = None;
@@ -35498,6 +35529,7 @@ impl CfmlVirtualMachine {
             } else {
                 None
             };
+            _ct.lap(9);
             // The body ran with the class's FULL method set on the template
             // `this` (see `pending_pseudo_ctor_inherited_table`). From here on the
             // template must carry only the class's OWN methods: the inheritance
@@ -35627,10 +35659,7 @@ impl CfmlVirtualMachine {
             // Only when the body actually registered something new: the key-set
             // build below is O(members) with an allocation per key, and a
             // pseudo-constructor that cfincludes a function is rare.
-            let body_added_user_fns = self
-                .user_functions
-                .keys()
-                .any(|n| !pre_exec_func_names.contains(n));
+            let body_added_user_fns = self.user_functions.len() > pre_exec_func_len;
             if let Some(s) = result
                 .as_mut()
                 .filter(|_| body_added_user_fns)
@@ -35638,10 +35667,8 @@ impl CfmlVirtualMachine {
             {
                 let existing_keys: std::collections::HashSet<String> =
                     s.all_keys().into_iter().map(|k| k.to_lowercase()).collect();
-                for (func_name, func_def) in &self.user_functions {
-                    if !pre_exec_func_names.contains(func_name)
-                        && !existing_keys.contains(&func_name.to_lowercase())
-                    {
+                for (func_name, func_def) in self.user_functions.iter().skip(pre_exec_func_len) {
+                    if !existing_keys.contains(&func_name.to_lowercase()) {
                         // Expose the function if it belongs to this program,
                         // referencing it by its stable global_id.
                         if self
@@ -35841,6 +35868,7 @@ impl CfmlVirtualMachine {
                 }
                 s.insert(&*cfml_common::key::well_known::VARIABLES, CfmlValue::Struct(vars_struct));
             }
+            _ct.lap(10);
             // Canonicalise each method's `CfmlFunction` value to the shared,
             // per-class cache (`method_arc_cache`) so every instance points at ONE
             // `Arc` per method instead of the fresh copy the component body created
@@ -35892,6 +35920,7 @@ impl CfmlVirtualMachine {
             // so an ordinary request (which never gets near it) pays one
             // thread-local length read per `new`.
             cfml_common::cycle_gc::collect_incremental();
+            _ct.lap(11);
             return result;
         }
         None

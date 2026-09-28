@@ -323,6 +323,11 @@ pub fn report() -> String {
         out.push('\n');
         out.push_str(&exists_census::report(25));
     }
+    let ctor = ctor_phases::report();
+    if !ctor.is_empty() {
+        out.push('\n');
+        out.push_str(&ctor);
+    }
     out
 }
 
@@ -1747,6 +1752,95 @@ pub mod frame_census {
                 a.self_ops as f64 / a.calls as f64,
                 names.get(id).map(|s| s.as_str()).unwrap_or("<unknown>"),
             ));
+        }
+        out
+    }
+}
+
+/// Component-construction phase timer (GH #425). Sizes where the fixed cost
+/// of `new`/`createObject` goes on a WARM cache hit, per construction. The
+/// laps are taken inside `resolve_component_template_impl` and the
+/// `createObject` arm; a lap is only ever a clock read when
+/// [`enabled`] is on, so the shipped engine pays one branch per lap.
+/// Laps are keyed by index into [`ctor_phases::LABELS`].
+pub mod ctor_phases {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub const N: usize = 16;
+    pub const LABELS: [&str; N] = [
+        "resolve path (locals/globals probes, cache key hash, request cache hit)",
+        "program fetch (request_validated_files read + bytecode cache Vec clone)",
+        "program swap + __main__ scan + header windows(2) scan",
+        "qualified_template_name (dotted name)",
+        "parent resolve (extends chain; 0 for a flat class)",
+        "class generation + adopt_class_cache + replay_tables + injected_scope",
+        "static scope (static_scopes RwLock read + static_stores probe)",
+        "frame seed (body_vars, injected_scope, user_functions key-set, pushes)",
+        "pseudo-constructor frame (execute_function_with_args)",
+        "restore + take template out of globals",
+        "finalize this/vars scopes (loops, inserts, __variables struct)",
+        "canonicalize_method_arcs + gc check",
+        "createObject pre-resolve (disallowed-imports test)",
+        "resolve_inheritance (share_methods_into_table on a flat class)",
+        "attach_native_parent + attach_implements_chain",
+        "to_instance_value (blueprint probe, Instance::from_marker)",
+    ];
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    pub static NS: [AtomicU64; N] = [ZERO; N];
+    /// Constructions measured (one per `resolve_component_template_impl` entry).
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// A lap stopwatch that reads no clock unless counters are enabled.
+    pub struct Stopwatch(Option<std::time::Instant>);
+
+    impl Stopwatch {
+        #[inline]
+        pub fn start() -> Self {
+            Stopwatch(super::enabled().then(std::time::Instant::now))
+        }
+        /// Restart the lap clock without charging the elapsed time anywhere
+        /// (the interval belonged to a callee that times itself).
+        #[inline]
+        pub fn reset(&mut self) {
+            if self.0.is_some() {
+                self.0 = Some(std::time::Instant::now());
+            }
+        }
+        /// Charge the time since the previous lap (or start) to `phase`.
+        #[inline]
+        pub fn lap(&mut self, phase: usize) {
+            if let Some(t) = self.0 {
+                let now = std::time::Instant::now();
+                if let Some(c) = NS.get(phase) {
+                    c.fetch_add(now.duration_since(t).as_nanos() as u64, Relaxed);
+                }
+                self.0 = Some(now);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn bump_calls() {
+        CALLS.fetch_add(1, Relaxed);
+    }
+
+    pub fn report() -> String {
+        let calls = CALLS.load(Relaxed);
+        if calls == 0 {
+            return String::new();
+        }
+        let tot: u64 = NS.iter().map(|c| c.load(Relaxed)).sum();
+        let mut out = format!(
+            "--- CFC construction phases (GH #425): {} constructions, {:.0} ns each measured ---",
+            calls,
+            tot as f64 / calls as f64
+        );
+        for (i, label) in LABELS.iter().enumerate() {
+            let ns = NS[i].load(Relaxed) as f64 / calls as f64;
+            let pct = if tot > 0 { NS[i].load(Relaxed) as f64 / tot as f64 * 100.0 } else { 0.0 };
+            out.push_str(&format!("\n{:>8.0} ns {:>5.1}%  {}", ns, pct, label));
         }
         out
     }
