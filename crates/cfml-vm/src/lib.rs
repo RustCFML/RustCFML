@@ -5471,13 +5471,26 @@ impl CfmlVirtualMachine {
         if !self.show_debug_output {
             return;
         }
-        // gate 4 — renderable: not a redirect, and HTML/text content.
+        // gate 4 — renderable: not a redirect, and an HTML response. The footer
+        // is HTML; appended to anything else it corrupts the body — a
+        // `text/plain` Prometheus exposition (preside-ext-k8s-essentials'
+        // /metrics/) stopped parsing. The type is the EFFECTIVE one: an explicit
+        // `Content-Type` header (`<cfheader>` / `header name=`) wins over
+        // `<cfcontent type=>`, and neither means the default text/html. Matching
+        // "text" as well (as this once did) let text/plain, text/csv and
+        // text/xml through.
         if self.redirect_url.is_some() {
             return;
         }
-        if let Some(ct) = &self.response_content_type {
-            let ctl = ct.to_ascii_lowercase();
-            if !(ctl.contains("html") || ctl.contains("text")) {
+        let effective_type = self
+            .response_headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+            .map(|(_, v)| v.clone())
+            .or_else(|| self.response_content_type.clone());
+        if let Some(ct) = effective_type {
+            if !ct.to_ascii_lowercase().contains("html") {
                 return;
             }
         }
@@ -43381,6 +43394,42 @@ mod debug_footer_gate_tests {
         let _child = frame_exclusive_us(&mut stack, 200);
         let parent = frame_exclusive_us(&mut stack, 100); // child(200) > parent(100)
         assert_eq!(parent, 0);
+    }
+
+    /// The footer is HTML and goes on HTML responses only. A `text/plain`
+    /// Prometheus exposition (preside-ext-k8s-essentials' /metrics/, which sets
+    /// its type with `header name="Content-Type"`) was getting it appended.
+    #[test]
+    fn footer_only_on_html_responses() {
+        let rendered = |content_type: Option<&str>, header: Option<&str>| -> bool {
+            let mut vm = vm();
+            vm.web_context = true;
+            vm.debug_config.enabled = true;
+            vm.globals.insert("url", scope(&[]));
+            vm.globals.insert("cgi", scope(&[("remote_addr", "127.0.0.1")]));
+            vm.maybe_install_debug_collector();
+            assert!(vm.is_debug_mode(), "collector installed for loopback");
+            vm.response_content_type = content_type.map(str::to_string);
+            if let Some(h) = header {
+                vm.response_headers.push(("Content-Type".to_string(), h.to_string()));
+            }
+            vm.output_buffer = "body".to_string();
+            vm.maybe_render_debug_footer();
+            vm.output_buffer != "body"
+        };
+        assert!(rendered(None, None), "no type set: the default text/html page gets it");
+        assert!(rendered(Some("text/html; charset=utf-8"), None));
+        assert!(!rendered(Some("text/plain;"), None), "cfcontent text/plain");
+        assert!(
+            !rendered(None, Some("text/plain; version=0.0.4; charset=utf-8")),
+            "a Content-Type header alone (the Prometheus case)"
+        );
+        assert!(
+            !rendered(Some("text/html"), Some("text/plain; version=0.0.4")),
+            "an explicit header wins over cfcontent"
+        );
+        assert!(rendered(Some("text/plain"), Some("text/html")), "and the other way round");
+        assert!(!rendered(Some("application/json"), None));
     }
 
     #[test]
