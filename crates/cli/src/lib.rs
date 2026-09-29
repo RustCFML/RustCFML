@@ -1230,10 +1230,10 @@ fn compile_and_run(
         };
         let source = source.as_str();
 
-        // Lexical analysis
-        let tokens = lexer::tokenize(source.to_string());
-
+        // The token dump is debug-only: the parser lexes the source itself, so
+        // tokenizing here unconditionally lexed every script twice.
         if debug {
+            let tokens = lexer::tokenize(source.to_string());
             println!("=== TOKENS ===");
             for (i, tok) in tokens.iter().enumerate() {
                 println!("{:3}: {:?}", i, tok.token);
@@ -4062,8 +4062,8 @@ fn compile_repl_line(source: &str, debug: bool) -> Result<cfml_codegen::Bytecode
     } else {
         source.to_string()
     };
-    let tokens = lexer::tokenize(source.clone());
     if debug {
+        let tokens = lexer::tokenize(source.clone());
         eprintln!("=== TOKENS ===");
         for (i, tok) in tokens.iter().enumerate() {
             eprintln!("{:3}: {:?}", i, tok.token);
