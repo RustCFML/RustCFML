@@ -33276,7 +33276,7 @@ impl CfmlVirtualMachine {
         ) {
             return None;
         }
-        inst.read().get_member(name)
+        inst.read().get_insider_member(name)
     }
 
     /// The caller half of [`instance_method_accessible`]: is the code making this

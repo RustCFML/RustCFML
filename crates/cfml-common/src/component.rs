@@ -722,6 +722,18 @@ impl Instance {
         Some(found)
     }
 
+    /// What code INSIDE the receiver's class sees through the instance
+    /// (`this.x`, `this[ "x" ]`, `sibling[ "x" ]`): the `this` scope including
+    /// private methods, but NOT the private `variables` data. Lucee 7.0/7.1
+    /// answer null for `this[ "secret" ]` / `sibling[ "secret" ]` when `secret`
+    /// lives only in `variables`, while a private method resolves.
+    pub fn get_insider_member(&self, name: &str) -> Option<CfmlValue> {
+        if name.eq_ignore_ascii_case("__variables") {
+            return Some(CfmlValue::Struct(self.variables_members.clone()));
+        }
+        self.this_members.get_ci(name)
+    }
+
     pub fn get_member(&self, name: &str) -> Option<CfmlValue> {
         // Compat shim: `instance.__variables` exposes the private scope as a struct,
         // the way the marker representation did (a few RustCFML tests / helpers poke
