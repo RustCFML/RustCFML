@@ -36,7 +36,9 @@ try {
     for (m in members) {
         assert("native-error cfcatch has member " & m, structKeyExists(e, m), true);
     }
-    assert("native errorCode is empty string", e.errorCode, "");
+    // Lucee 7.0/7.1: an engine-raised error reports errorCode "0" (throw()
+    // without an errorCode leaves it "").
+    assert("native errorCode is 0", e.errorCode, "0");
     assert("native extendedInfo is empty string", e.extendedInfo, "");
 }
 

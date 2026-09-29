@@ -26,6 +26,10 @@ component {
     // there and the suite aborts mid-file.
     this.mappings["/compat_engine"] = getDirectoryFromPath(getCurrentTemplatePath()) & "compat_engine/";
 
+    // Map "gc" so `new gc.ClosureHolder(...)` / `new gc.SweepModel(...)` resolve
+    // on Lucee too (same reason as /compat_engine above).
+    this.mappings["/gc"] = getDirectoryFromPath(getCurrentTemplatePath()) & "gc/";
+
     // Map "java_shims" so `new java_shims.ConcurrentPoolTask(...)` resolves on
     // Lucee too (same reason as /compat_engine above).
     this.mappings["/java_shims"] = getDirectoryFromPath(getCurrentTemplatePath()) & "java_shims/";

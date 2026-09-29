@@ -63,7 +63,10 @@ assert("tag: prop3 type", tp3.type, "string");
 // names from Hash(SerializeJson(property))), so a stable, source-ordered key
 // list is required — name first, then the synthesized `type` default ("any",
 // Lucee parity — every property carries a type), then attributes as written.
-assert("tag: prop2 attr order is source order", structKeyList(tp2), "name,type,inject,hint");
+// RustCFML-only: Lucee does not keep attribute order in property metadata.
+if ( isRustCFML() ) {
+	assert("tag: prop2 attr order is source order", structKeyList(tp2), "name,type,inject,hint");
+}
 
 // --- required="false" must be PRESERVED in property metadata (Lucee parity) ---
 // Previously `required` was collapsed to a bool field that codegen only emitted

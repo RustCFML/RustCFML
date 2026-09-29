@@ -21,7 +21,11 @@ assert( "peer reachable through the live scope", obj.readPeer(), "b" );
 
 // Mutating through the closure must reach the same live scope, not a copy.
 obj.writeViaClosure( "c" );
-assert( "closure writes through to the live scope", obj.readId(), "c" );
+// RustCFML-only: on Lucee 7.1 the closure's write is visible to the closure but
+// NOT to the component's own method (readId() still returns "a").
+if ( isRustCFML() ) {
+	assert( "closure writes through to the live scope", obj.readId(), "c" );
+}
 assert( "and the closure re-reads it", obj.readViaClosure(), "c" );
 
 suiteEnd();

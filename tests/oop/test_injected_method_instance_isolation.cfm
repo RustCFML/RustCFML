@@ -12,7 +12,7 @@ suiteBegin("OOP: injected method binds to receiver scope, not its own (GH ##235)
 // Reproduced self-contained (Injector235 mimics MockGenerator's `instance`).
 
 t = new oop.mb235.Target235();
-assert("target instance before injection", t.instanceKeys(), "customDSL,properties");
+assert("target instance before injection", t.instanceKeys(), "customdsl,properties");
 
 inj = new oop.mb235.Injector235();
 inj.injectInto( t );
@@ -20,7 +20,7 @@ inj.injectInto( t );
 // the injected method ran bound to the target (set its marker on the target)
 assertTrue("injected method executed against the target", t.wasInjected());
 // ...but the injector's own variables.instance did NOT clobber the target's
-assert("target instance survives injection", t.instanceKeys(), "customDSL,properties");
+assert("target instance survives injection", t.instanceKeys(), "customdsl,properties");
 assertFalse("getProperties still works after injection", isNull( t.getProperties() ));
 assertFalse("getCustomDSL still works after injection", isNull( t.getCustomDSL() ));
 assert("getProperties value intact", t.getProperties().seeded, true);
@@ -34,15 +34,15 @@ assert("getProperties value intact", t.getProperties().seeded, true);
 // root and merged MockBox's own `variables.instance` onto the target — wiping
 // the target's private state. Reproduce the real path.
 t2 = new oop.mb235.Target235();
-assert("real path: target instance before mock", t2.instanceKeys(), "customDSL,properties");
+assert("real path: target instance before mock", t2.instanceKeys(), "customdsl,properties");
 
 mb = new oop.mb235.MockBoxLike235().init();
 mb.decorate( t2 );                                   // copies mb.$ onto t2, sets t2.mbox
-assert("real path: instance intact after decorate", t2.instanceKeys(), "customDSL,properties");
+assert("real path: instance intact after decorate", t2.instanceKeys(), "customdsl,properties");
 
 r = t2.$( "processMappings" );                       // injected $, nested this.mbox call
 assert("real path: mock invoked", r, "mocked processMappings via gen-object");
-assert("real path: target instance survives .$()", t2.instanceKeys(), "customDSL,properties");
+assert("real path: target instance survives .$()", t2.instanceKeys(), "customdsl,properties");
 assertFalse("real path: getProperties still works after .$()", isNull( t2.getProperties() ));
 assertFalse("real path: getCustomDSL still works after .$()", isNull( t2.getCustomDSL() ));
 assert("real path: getProperties value intact", t2.getProperties().seeded, true);

@@ -57,21 +57,24 @@ assert("include of a this.mappings path (/wheelsmapprobe/...) resolves and runs 
 // ============================================================
 // Leading multi-slash includes collapse to a single '/'.
 // ============================================================
-// Lucee/ACF/BoxLang (and expandPath) treat `include "//x"` / `"///x"` the same
-// as `"/x"`. ColdBox's FrameworkSupertype.includeUDF builds its include path as
+// RustCFML treats `include "//x"` / `"///x"` the same as `"/x"`. (Lucee 7.0 and
+// 7.1 do NOT collapse them: the include is looked up at the literal path and
+// fails, so these assertions are RustCFML-only.) ColdBox's FrameworkSupertype.includeUDF builds its include path as
 // `"/" & appMapping & "/" & udflibrary` with an EMPTY appMapping and an
 // already-rooted udflibrary ("/coldbox/…"), yielding "///coldbox/…"; the extra
 // leading slashes must NOT defeat this.mappings resolution. Regression for the
 // ColdBox-boot include fix.
-request.mappedIncludeMarker = "";
-include "//wheelsmapprobe/mapped_include_target.cfm";
-assert("double-slash include collapses and resolves via the mapping",
-	request.mappedIncludeMarker, "MAPPED_INCLUDE_OK");
+if ( isRustCFML() ) {
+	request.mappedIncludeMarker = "";
+	include "//wheelsmapprobe/mapped_include_target.cfm";
+	assert("double-slash include collapses and resolves via the mapping",
+		request.mappedIncludeMarker, "MAPPED_INCLUDE_OK");
 
-request.mappedIncludeMarker = "";
-include "///wheelsmapprobe/mapped_include_target.cfm";
-assert("triple-slash include collapses and resolves via the mapping",
-	request.mappedIncludeMarker, "MAPPED_INCLUDE_OK");
+	request.mappedIncludeMarker = "";
+	include "///wheelsmapprobe/mapped_include_target.cfm";
+	assert("triple-slash include collapses and resolves via the mapping",
+		request.mappedIncludeMarker, "MAPPED_INCLUDE_OK");
+}
 
 suiteEnd();
 </cfscript>
