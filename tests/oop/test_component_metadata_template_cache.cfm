@@ -39,11 +39,15 @@ assertFalse("ChildB lacks ownA", hasFn(mdB, "ownA"));
 // --- 2. a mutating caller must not poison the memo -------------------------
 // ColdBox's getInheritedMetaData edits the struct it is given; entries are
 // stored and returned as deep copies precisely so this cannot propagate.
-mdA.name = "MUTATED";
-mdA.extends.name = "MUTATED_PARENT";
-mdA2 = getComponentMetaData("oop.metacache.ChildA");
-assert("re-read name unpoisoned", listLast(mdA2.name, "."), "ChildA");
-assert("re-read parent unpoisoned", listLast(mdA2.extends.name, "."), "SharedBase");
+// RustCFML-only guarantee: Lucee 7.0/7.1 hand back their shared cached struct,
+// so a caller's edit IS visible to the next caller there.
+if ( isRustCFML() ) {
+	mdA.name = "MUTATED";
+	mdA.extends.name = "MUTATED_PARENT";
+	mdA2 = getComponentMetaData("oop.metacache.ChildA");
+	assert("re-read name unpoisoned", listLast(mdA2.name, "."), "ChildA");
+	assert("re-read parent unpoisoned", listLast(mdA2.extends.name, "."), "SharedBase");
+}
 
 // --- 3. THE INVARIANT: instantiation still runs the pseudo-constructor ------
 // SharedBase increments a request-scoped counter in its body. Reading metadata

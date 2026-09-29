@@ -29,7 +29,13 @@ assert( "L2 name via extends", first.extends.name, "oop.GcmCacheL2" );
 assert( "L2 own functions", fnNames( first.extends.functions ), "l2One,l2Two" );
 assert( "L3 name via extends.extends", first.extends.extends.name, "oop.GcmCacheL3" );
 assert( "L3 own functions", fnNames( first.extends.extends.functions ), "l3One,l3Two" );
-assertFalse( "L3 is the top of the chain", structKeyExists( first.extends.extends, "extends" ) );
+// Lucee 7.0/7.1 give the top of every chain an `extends` for its base component
+// (org.lucee.cfml.Component); RustCFML stops at the last user component.
+if ( isRustCFML() ) {
+	assertFalse( "L3 is the top of the chain", structKeyExists( first.extends.extends, "extends" ) );
+} else {
+	assert( "L3 extends the Lucee base component", first.extends.extends.extends.name, "org.lucee.cfml.Component" );
+}
 
 // --- repeated calls are identical ---
 second = getComponentMetaData( "oop.GcmCacheL1" );
@@ -42,22 +48,26 @@ assert( "2nd call same grandparent functions",
 	fnNames( second.extends.extends.functions ), fnNames( first.extends.extends.functions ) );
 
 // --- each call hands back an INDEPENDENT struct (callers mutate it) ---
-second.injectedByCaller = "mutated";
-second.functions = [];
-structDelete( second, "extends" );
-third = getComponentMetaData( "oop.GcmCacheL1" );
-assertFalse( "caller mutation does not leak into the next call",
-	structKeyExists( third, "injectedByCaller" ) );
-assert( "functions survive a caller emptying its own copy",
-	fnNames( third.functions ), "init,l1One,l1Two" );
-assertTrue( "extends survives a caller deleting it from its own copy",
-	structKeyExists( third, "extends" ) );
-assert( "extends still resolves the chain", third.extends.extends.name, "oop.GcmCacheL3" );
+// RustCFML-only guarantee: Lucee 7.0/7.1 return their shared cached struct, so
+// a caller's edits (and deletions) ARE visible to the next caller there.
+if ( isRustCFML() ) {
+	second.injectedByCaller = "mutated";
+	second.functions = [];
+	structDelete( second, "extends" );
+	third = getComponentMetaData( "oop.GcmCacheL1" );
+	assertFalse( "caller mutation does not leak into the next call",
+		structKeyExists( third, "injectedByCaller" ) );
+	assert( "functions survive a caller emptying its own copy",
+		fnNames( third.functions ), "init,l1One,l1Two" );
+	assertTrue( "extends survives a caller deleting it from its own copy",
+		structKeyExists( third, "extends" ) );
+	assert( "extends still resolves the chain", third.extends.extends.name, "oop.GcmCacheL3" );
 
-// mutating a NESTED level must not leak either
-third.extends.name = "clobbered";
-fourth = getComponentMetaData( "oop.GcmCacheL1" );
-assert( "nested mutation does not leak", fourth.extends.name, "oop.GcmCacheL2" );
+	// mutating a NESTED level must not leak either
+	third.extends.name = "clobbered";
+	fourth = getComponentMetaData( "oop.GcmCacheL1" );
+	assert( "nested mutation does not leak", fourth.extends.name, "oop.GcmCacheL2" );
+}
 
 // --- the instance form (blueprint-cached) still agrees with the path form ---
 inst = createObject( "component", "oop.GcmCacheL1" );
