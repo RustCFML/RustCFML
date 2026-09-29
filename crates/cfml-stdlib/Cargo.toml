@@ -90,8 +90,8 @@ uuid = { version = "1", optional = true }
 # memcache openssl dep). MSSQL is not built for the wasm targets.
 tiberius = { version = "0.12", default-features = false, features = [ "native-tls", "chrono", "time", "bigdecimal", "rust_decimal", "tds-uuid", "tds73", "sql-browser-tokio" ], optional = true }
 # Azure AD token fetching for Azure SQL authentication
-azure_identity = { version = "0.21", optional = true }
-azure_core = { version = "0.21", optional = true }
+azure-identity = { version = "0.21", optional = true }
+azure-core = { version = "0.21", optional = true }
 tokio = { version = "1", features = ["rt", "net"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 r2d2 = "0.8"
