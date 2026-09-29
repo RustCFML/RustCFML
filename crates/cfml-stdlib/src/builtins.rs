@@ -4888,9 +4888,10 @@ fn fn_is_custom_function(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_closure(args: Vec<CfmlValue>) -> CfmlResult {
-    // Lucee parity: `isClosure()` is true for a closure/arrow-function
-    // expression (`function(){}` / `()=>{}`) but false for a plain named UDF
-    // or component method. At runtime an anonymous function expression is a
+    // Lucee parity: `isClosure()` is true for a closure expression
+    // (`function(){}`) but false for an arrow function (`()=>{}`, a lambda on
+    // Lucee 7.0/7.1, where isCustomFunction() is still true), a plain named UDF
+    // or a component method. At runtime an anonymous function expression is a
     // `CfmlValue::Function` (like every UDF) whose `captured_scope` is `Some`
     // — but so is every named UDF's, so that flag can't distinguish them. The
     // reliable signal is the compiler-synthesized name: closures compile to
@@ -4908,7 +4909,7 @@ fn fn_is_closure(args: Vec<CfmlValue>) -> CfmlResult {
     let is = match args.first() {
         Some(CfmlValue::Closure(_)) => true,
         Some(CfmlValue::Function(f)) => {
-            f.name.starts_with("__closure_") || f.name.starts_with("__arrow_")
+            f.name.starts_with("__closure_")
         }
         _ => false,
     };
@@ -4972,7 +4973,15 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             "array" => fn_is_array(vec![value.clone()]),
             "struct" => fn_is_struct(vec![value.clone()]),
             "binary" => fn_is_binary(vec![value.clone()]),
-            "component" | "object" | "class" => fn_is_object(vec![value.clone()]),
+            // Lucee: `object` is anything isObject() accepts (Java objects
+            // included); `component`/`class` are CFC instances only.
+            "object" => fn_is_object(vec![value.clone()]),
+            "component" | "class" => Ok(CfmlValue::Bool(match value {
+                CfmlValue::Component(_) => true,
+                CfmlValue::Struct(s) => s.contains_key("__name") && !s.contains_key("__java_shim"),
+                CfmlValue::NativeObject(_) => false,
+                other => other.is_component(),
+            })),
             "email" => {
                 let s = value.as_string();
                 Ok(CfmlValue::Bool(EMAIL_REGEX.is_match(&s)))
@@ -5002,11 +5011,15 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 // this the type fell through to `false`, flipping setupComplete to
                 // true on a fresh DB and skipping the setup wizard (which Lucee
                 // shows) — booting straight into an unbuilt schema instead.
+                // Lucee also accepts a dotted name (`a.b.c`) when every segment is
+                // itself an identifier; `a..b`, `.a`, `a.` and `a.1` are not.
                 let s = value.as_string();
-                let mut chars = s.chars();
-                let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-                Ok(CfmlValue::Bool(ok))
+                let ident = |seg: &str| {
+                    let mut chars = seg.chars();
+                    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                };
+                Ok(CfmlValue::Bool(s.split('.').all(ident)))
             }
             "range" => {
                 // isValid("range", value, min, max)

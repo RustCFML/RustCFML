@@ -25051,7 +25051,7 @@ impl CfmlVirtualMachine {
                 }
                 let format = java_shims::detect_image_format(&sniff_bytes);
                 Ok(java_shims::make_commons_imaging_info(
-                    width, height, format, bpp, transparent, grayscale,
+                    width, height, format, bpp, transparent, grayscale, &sniff_bytes,
                 ))
             }
             "getbufferedimage" => self.call_named_builtin("imageRead", vec![builtin_source]),

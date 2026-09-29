@@ -745,6 +745,77 @@ pub fn detect_image_format(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// What Apache Commons Imaging reports for a format: `getFormatName()`,
+/// `getFormatDetails()`, and (where the library derives them from the file
+/// rather than the decoded image) bits per pixel and the image count. Strings
+/// taken from the real library on Lucee 7.1. Preside stores the format name in
+/// asset metadata, so these have to match it exactly.
+fn commons_imaging_format_facts(format: &str, bytes: &[u8]) -> (String, String, Option<i64>, i64) {
+    match format {
+        "PNG" => ("PNG Portable Network Graphics".into(), "Png".into(), None, 1),
+        "JPEG" => {
+            // APP0 JFIF segment: FF D8 FF E0 len(2) "JFIF\0" major minor
+            let details = if bytes.len() >= 13 && &bytes[6..11] == b"JFIF\0" {
+                format!("Jpeg/JFIF v.{}.{}", bytes[11], bytes[12])
+            } else {
+                "Jpeg".to_string()
+            };
+            ("JPEG (Joint Photographic Experts Group) Format".into(), details, None, 1)
+        }
+        "GIF" => {
+            let version = if bytes.starts_with(b"GIF87a") { "87a" } else { "89a" };
+            // Logical screen descriptor packed field: bits 4-6 are the colour
+            // resolution, which the library reports as bits per pixel - 1.
+            let bpp = bytes.get(10).map(|p| (((p >> 4) & 0x07) + 1) as i64);
+            ("GIF Graphics Interchange Format".into(), format!("Gif {}", version), bpp, 1)
+        }
+        "BMP" => (
+            "BMP Windows Bitmap".into(),
+            "Bmp (BM: Windows 3.1x, 95, NT,)".into(),
+            None,
+            -1,
+        ),
+        other => (other.to_string(), format!("{} image", other), None, 1),
+    }
+}
+
+/// `(transparent, interlaced)` for the first frame of a GIF: walk the blocks
+/// after the header and global colour table up to the first image descriptor.
+fn gif_flags(b: &[u8]) -> (bool, bool) {
+    if b.len() < 13 {
+        return (false, false);
+    }
+    let mut i = 13;
+    if b[10] & 0x80 != 0 {
+        i += 3 * (1usize << ((b[10] & 0x07) + 1));
+    }
+    let mut transparent = false;
+    while i < b.len() {
+        match b[i] {
+            0x21 => {
+                // Extension: label, then sub-blocks until a zero-length one.
+                let label = b.get(i + 1).copied().unwrap_or(0);
+                if label == 0xF9 && b.get(i + 2) == Some(&4) {
+                    transparent = b.get(i + 3).map(|p| p & 0x01 != 0).unwrap_or(false);
+                }
+                i += 2;
+                while let Some(&len) = b.get(i) {
+                    i += 1 + len as usize;
+                    if len == 0 {
+                        break;
+                    }
+                }
+            }
+            0x2C => {
+                let interlaced = b.get(i + 9).map(|p| p & 0x40 != 0).unwrap_or(false);
+                return (transparent, interlaced);
+            }
+            _ => break,
+        }
+    }
+    (transparent, false)
+}
+
 /// Build the `ImageInfo` result shim returned by `Imaging.getImageInfo(...)`.
 /// Carries the computed metadata as stored keys; the getter methods
 /// (`getWidth()` etc.) read them back in `handle_java_commons_imaging_info`.
@@ -755,8 +826,23 @@ pub fn make_commons_imaging_info(
     bits_per_pixel: i64,
     transparent: bool,
     grayscale: bool,
+    bytes: &[u8],
 ) -> CfmlValue {
+    let (name, details, file_bpp, images) = commons_imaging_format_facts(format, bytes);
+    let bits_per_pixel = file_bpp.unwrap_or(bits_per_pixel);
+    // For a GIF the library reads both flags from the file, not the decoded
+    // image: transparency from the Graphic Control Extension, progressive from
+    // the image descriptor's interlace bit.
+    let (transparent, progressive) = if format == "GIF" {
+        gif_flags(bytes)
+    } else {
+        (transparent, false)
+    };
     let mut m = java_shim_map(COMMONS_IMAGING_INFO_CLASS);
+    m.insert("__progressive".to_string(), CfmlValue::Bool(progressive));
+    m.insert("__format_name".to_string(), CfmlValue::string(name));
+    m.insert("__format_details".to_string(), CfmlValue::string(details));
+    m.insert("__number_of_images".to_string(), CfmlValue::Int(images));
     m.insert("__width".to_string(), CfmlValue::Int(width));
     m.insert("__height".to_string(), CfmlValue::Int(height));
     m.insert("__format".to_string(), CfmlValue::string(format.to_string()));
@@ -788,12 +874,16 @@ pub fn handle_java_commons_imaging_info(
     match method {
         "getwidth" => Ok(CfmlValue::Int(get_int("__width"))),
         "getheight" => Ok(CfmlValue::Int(get_int("__height"))),
-        "getformatname" => Ok(CfmlValue::string(format)),
-        "getformatdetails" => Ok(CfmlValue::string(format!("{} image", format))),
+        "getformatname" => Ok(s
+            .get("__format_name")
+            .unwrap_or_else(|| CfmlValue::string(format.clone()))),
+        "getformatdetails" => Ok(s
+            .get("__format_details")
+            .unwrap_or_else(|| CfmlValue::string(format!("{} image", format)))),
         "getbitsperpixel" => Ok(CfmlValue::Int(get_int("__bitsperpixel"))),
-        "isprogressive" => Ok(CfmlValue::Bool(false)),
+        "isprogressive" => Ok(CfmlValue::Bool(get_bool("__progressive"))),
         "istransparent" => Ok(CfmlValue::Bool(get_bool("__transparent"))),
-        "getnumberofimages" => Ok(CfmlValue::Int(1)),
+        "getnumberofimages" => Ok(s.get("__number_of_images").unwrap_or(CfmlValue::Int(1))),
         "getcompressionalgorithm" => Ok(CfmlValue::string("UNKNOWN".to_string())),
         "getcolortype" | "getcolortypedescription" => Ok(CfmlValue::string(
             if grayscale { "GRAYSCALE" } else { "RGB" }.to_string(),
