@@ -381,15 +381,9 @@ pub fn end_root_span(root: &Context, status_code: u16) {
 
 // ── The VM observer ─────────────────────────────────────────────────────────
 
-enum EntryKind {
-    Function,
-}
-
 struct StackEntry {
     cx: Context,
     depth: usize,
-    #[allow(dead_code)]
-    kind: EntryKind,
 }
 
 /// The metrics-only observer: records DB query metrics and nothing else.
@@ -465,7 +459,6 @@ impl VmObserver for OtelObserver {
         stack.push(StackEntry {
             cx,
             depth: f.depth,
-            kind: EntryKind::Function,
         });
     }
 

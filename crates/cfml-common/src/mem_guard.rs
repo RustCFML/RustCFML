@@ -90,10 +90,6 @@ pub fn set_pressure(on: bool) {
     PRESSURE.store(on, Ordering::Release);
 }
 
-pub fn aborted_total() -> usize {
-    ABORTED.load(Ordering::Relaxed)
-}
-
 /// RAII registration for one in-flight request. Dropping it deregisters, so a
 /// panicking or early-returning request cannot leave a stale slot behind.
 pub struct RequestGuard {

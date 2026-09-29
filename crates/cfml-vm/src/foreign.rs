@@ -1391,10 +1391,6 @@ pub unsafe fn adopt(
     })
 }
 
-/// A struct built from a `ValueMap`, for `throw`'s `extras`.
-#[allow(dead_code)]
-fn _unused(_: ValueMap) {}
-
 // ---------------------------------------------------------------------------
 // Tier 2 — the scope facade
 // ---------------------------------------------------------------------------

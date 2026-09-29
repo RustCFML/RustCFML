@@ -51,7 +51,7 @@ use crate::dynamic::{
 use crate::component::Instance;
 use parking_lot::RwLock as PlRwLock;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Pointer-keyed set/map used throughout the collector. The keys are `Arc`
 /// addresses (already well distributed), so `FxHash` beats SipHash here and the
@@ -82,11 +82,6 @@ pub fn disarm() {
 #[inline]
 pub fn is_armed() -> bool {
     GC_ARMED.load(Ordering::Relaxed)
-}
-
-/// Cumulative count of cycle nodes reclaimed (for the debug footer / logs).
-pub fn collected_total() -> usize {
-    COLLECTED_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Nanoseconds spent collecting, process-wide, across every sweep (request-end,
@@ -1298,25 +1293,6 @@ pub fn collect_incremental() -> usize {
         );
     }
     reclaimed
-}
-
-/// Cheap poll for [`collect_incremental`]: is this thread's log past its
-/// budget? Two thread-local reads and no allocation.
-///
-/// Not wired into the frame-exit path. It was tried, to catch workloads that
-/// allocate heavily without constructing components (the Wheels suite runs its
-/// log from 322k to the 16M cap between two `new` checks). Measured: sweeps
-/// became timely (80 vs ~40 per suite run) but freed nothing extra — the suite's
-/// 8-14M "live" nodes are acyclic request-lifetime data that refcounting frees
-/// when the test frames return, so the collector had nothing to take — and the
-/// run got ~15% slower. Kept as a utility for a caller with a real need.
-#[inline]
-pub fn incremental_due() -> bool {
-    let budget = NEXT_SWEEP.with(|c| c.get());
-    if budget == usize::MAX {
-        return false;
-    }
-    ALLOC_LOG.with(|c| c.borrow().as_ref().is_some_and(|v| v.len() >= budget))
 }
 
 /// --- The cross-request survivor set -----------------------------------------

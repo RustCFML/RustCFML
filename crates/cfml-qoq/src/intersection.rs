@@ -64,14 +64,6 @@ impl Intersections {
         self.flat.extend_from_slice(row);
     }
 
-    /// Append `prev` (width − 1 entries) followed by `extra` as a new row.
-    #[inline]
-    pub fn push_row_with_tail(&mut self, prev: &[usize], extra: usize) {
-        debug_assert_eq!(prev.len() + 1, self.width);
-        self.flat.extend_from_slice(prev);
-        self.flat.push(extra);
-    }
-
     /// Iterate rows as `&[usize]` slices of length `width`.
     #[inline]
     pub fn iter(&self) -> std::slice::ChunksExact<'_, usize> {
@@ -81,16 +73,6 @@ impl Intersections {
         } else {
             self.flat.chunks_exact(self.width)
         }
-    }
-
-    /// Sequential chunked iteration: each chunk is up to `rows_per_chunk` rows.
-    #[inline]
-    pub fn chunks_rows(&self, rows_per_chunk: usize) -> impl Iterator<Item = InterChunk<'_>> {
-        let w = self.width.max(1);
-        let cs = rows_per_chunk.max(1).saturating_mul(w);
-        self.flat
-            .chunks(cs)
-            .map(move |s| InterChunk { width: self.width, flat: s })
     }
 
     /// Rayon parallel chunked iteration.

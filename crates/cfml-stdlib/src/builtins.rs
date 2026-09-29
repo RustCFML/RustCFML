@@ -1214,11 +1214,6 @@ fn create_builtin_func(name: &str) -> CfmlValue {
 
 // ---- Helper functions ----
 
-#[allow(dead_code)]
-fn get_arg(args: &[CfmlValue], idx: usize) -> &CfmlValue {
-    args.get(idx).unwrap_or(&CfmlValue::Null)
-}
-
 fn get_str(args: &[CfmlValue], idx: usize) -> String {
     args.get(idx).map(|v| v.as_string()).unwrap_or_default()
 }
@@ -5084,27 +5079,6 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-/// `isValid( type_name, value )` as a plain predicate, for the declared
-/// parameter/return-type enforcement in `cfml-vm/src/type_check.rs` (§29). That
-/// check needs the format predicates (`date`, `xml`, `uuid`, `guid`,
-/// `variablename`) which live here with their regexes and date parser; the
-/// container/simple-value rules it owns itself, because a declared type is not
-/// `isValid()` (`isValid("string", [])` and `string`-typed arguments disagree
-/// on more than one cell).
-pub fn value_is_valid_type(type_name: &str, value: &CfmlValue) -> bool {
-    matches!(
-        fn_is_valid(vec![CfmlValue::string(type_name.to_string()), value.clone()]),
-        Ok(CfmlValue::Bool(true))
-    )
-}
-
-/// Is `value` a component instance of any class (including a Java-shim struct
-/// or a native/Rust object)? `isObject()` as a plain predicate — see
-/// `value_is_valid_type` for why cfml-vm needs these.
-pub fn value_is_component_instance(value: &CfmlValue) -> bool {
-    matches!(fn_is_object(vec![value.clone()]), Ok(CfmlValue::Bool(true)))
-}
-
 /// Runtime helper emitted by the `cfparam`/`param` lowering to enforce the
 /// `type` (and `min`/`max`/`pattern`) attribute. CFML validates the resulting
 /// value's type and throws on mismatch — previously `type` was silently
@@ -6820,41 +6794,6 @@ pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         Ok(CfmlValue::string(body))
     }
-}
-
-/// Serialize a value to JSON. `visited` tracks the backing-Arc pointers of the
-/// containers currently on the recursion path: reference-typed arrays/structs
-/// (and components, which materialise as marker-bearing structs) can alias and
-/// form cycles — e.g. a TestBox mock holds `this.mockBox`, whose generator holds
-/// the mock back. Without this guard such a cycle recurses until the native
-/// stack overflows and aborts the whole process (uncatchable SIGABRT). On
-/// revisiting a container we emit `null` to break the cycle, mirroring
-/// `as_string_guarded`/`deep_copy_guarded`.
-/// Escape a string for inclusion in a JSON string literal, per RFC 8259 §7.
-/// Standard short escapes for `" \ \b \f \n \r \t`, and `\u00XX` for every other
-/// control character (U+0000–U+001F). All other bytes (including non-ASCII
-/// Unicode) pass through unchanged. Required so serializeJSON output containing a
-/// control char (e.g. chr(7) BEL) is valid JSON that deserializeJSON — and any
-/// RFC-conformant parser — accepts; previously the raw control byte was emitted
-/// and the serializer's own parser rejected its output (GitHub #213). Also
-/// escapes backslashes in struct keys / column names, which the old per-site
-/// `"`-only replace missed.
-fn json_escape_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) -> String {
@@ -12150,23 +12089,6 @@ fn expand_sql_placeholders(sql: &str, counts: &[usize]) -> String {
         i += 1;
     }
     result
-}
-
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn coerce_by_sqltype(val_str: &str, sqltype: &str) -> CfmlValue {
-    match sqltype {
-        s if s.contains("integer") || s.contains("bigint") || s.contains("smallint") || s.contains("tinyint") => {
-            val_str.parse::<i64>().map(CfmlValue::Int).unwrap_or(CfmlValue::string(val_str.to_string()))
-        }
-        s if s.contains("float") || s.contains("double") || s.contains("decimal") || s.contains("numeric") || s.contains("real") || s.contains("money") => {
-            val_str.parse::<f64>().map(CfmlValue::Double).unwrap_or(CfmlValue::string(val_str.to_string()))
-        }
-        s if s.contains("bit") || s.contains("boolean") => {
-            let lower = val_str.to_lowercase();
-            CfmlValue::Bool(lower == "true" || lower == "yes" || lower == "1")
-        }
-        _ => CfmlValue::string(val_str.to_string()),
-    }
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -18759,55 +18681,6 @@ fn fn_write_log(args: Vec<CfmlValue>) -> CfmlResult {
     };
     logging::write_entry(&name, level, "", "", &text).map_err(CfmlError::runtime)?;
     Ok(CfmlValue::Null)
-}
-
-/// Convert CFML locale name (friendly or code) to Java locale code (e.g. "en_US").
-/// Matches Lucee's behavior: setLocale("English (US)") returns "en_US".
-fn cfml_locale_to_code(name: &str) -> String {
-    let trimmed = name.trim();
-    let lower = trimmed.to_lowercase();
-    match lower.as_str() {
-        "english (us)" | "english (united states)" | "en_us" | "en-us" => "en_US".to_string(),
-        "english (uk)" | "english (united kingdom)" | "en_gb" | "en-gb" => "en_GB".to_string(),
-        "english (australian)" | "en_au" | "en-au" => "en_AU".to_string(),
-        "english (canadian)" | "en_ca" | "en-ca" => "en_CA".to_string(),
-        "german (standard)" | "german" | "de_de" | "de-de" => "de_DE".to_string(),
-        "french (standard)" | "french" | "fr_fr" | "fr-fr" => "fr_FR".to_string(),
-        "spanish (standard)" | "spanish" | "es_es" | "es-es" => "es_ES".to_string(),
-        "italian (standard)" | "italian" | "it_it" | "it-it" => "it_IT".to_string(),
-        "portuguese (standard)" | "portuguese" | "pt_pt" | "pt-pt" => "pt_PT".to_string(),
-        "dutch (standard)" | "dutch" | "nl_nl" | "nl-nl" => "nl_NL".to_string(),
-        "japanese" | "ja_jp" | "ja-jp" => "ja_JP".to_string(),
-        "chinese (china)" | "zh_cn" | "zh-cn" => "zh_CN".to_string(),
-        // If already looks like a Java locale code (xx_XX), keep as-is
-        _ => {
-            if trimmed.contains('_') || trimmed.contains('-') {
-                trimmed.replace('-', "_")
-            } else {
-                trimmed.to_string()
-            }
-        }
-    }
-}
-
-/// Convert Java locale code back to Lucee's friendly lowercase name.
-/// e.g. "en_US" -> "english (us)"
-fn locale_code_to_friendly(code: &str) -> String {
-    match code {
-        "en_US" => "english (us)".to_string(),
-        "en_GB" => "english (uk)".to_string(),
-        "en_AU" => "english (australian)".to_string(),
-        "en_CA" => "english (canadian)".to_string(),
-        "de_DE" => "german (standard)".to_string(),
-        "fr_FR" => "french (standard)".to_string(),
-        "es_ES" => "spanish (standard)".to_string(),
-        "it_IT" => "italian (standard)".to_string(),
-        "pt_PT" => "portuguese (standard)".to_string(),
-        "nl_NL" => "dutch (standard)".to_string(),
-        "ja_JP" => "japanese".to_string(),
-        "zh_CN" => "chinese (china)".to_string(),
-        _ => code.to_lowercase(),
-    }
 }
 
 // GH #304: both of these were inert — setLocale() computed a code and discarded

@@ -84,8 +84,6 @@ pub static IK_SET_CREATED: AtomicU64 = AtomicU64::new(0);
 pub static WB_SKIPPED_FUTILE: AtomicU64 = AtomicU64::new(0);
 /// Locals entries walked by the diff, summed over every frame that ran one.
 pub static WB_KEYS_SCANNED: AtomicU64 = AtomicU64::new(0);
-/// Entries that survived the filters and cost a `values_equal_shallow` compare.
-pub static WB_KEYS_COMPARED: AtomicU64 = AtomicU64::new(0);
 /// Entries that actually propagated to the caller — the diff's real output.
 pub static WB_KEYS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Wall-clock nanoseconds spent inside the diff, summed over both exit paths.
@@ -353,7 +351,6 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
          frames reaching the diff:    {:>12}\n\
            .. skipped futile:         {:>12}\n\
            .. locals entries scanned: {:>12}\n\
-           .. entries compared:       {:>12}\n\
            .. entries written back:   {:>12}\n\
            .. total time (us):        {:>12}\n\
          --- parent-scope seed copy (3A first half) ---\n\
@@ -424,7 +421,6 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         g(&WB_FRAMES),
         g(&WB_SKIPPED_FUTILE),
         g(&WB_KEYS_SCANNED),
-        g(&WB_KEYS_COMPARED),
         g(&WB_KEYS_WRITTEN),
         g(&WB_NANOS) / 1_000,
         g(&SEED_FRAMES),
@@ -581,27 +577,6 @@ pub mod call_phases {
         CALLS.fetch_add(1, Relaxed);
     }
 
-    /// Calls whose callee carried a captured scope, so the caller pre-call
-    /// (phase 8) had to CLONE the whole captured env map before merging the
-    /// caller's locals into it. Paired with the key count, this says whether
-    /// that clone is worth removing with a layered scope view.
-    pub static ENV_CLONE_CALLS: AtomicU64 = AtomicU64::new(0);
-    /// Keys copied by those clones (env size + the caller locals merged in).
-    pub static ENV_CLONE_KEYS: AtomicU64 = AtomicU64::new(0);
-    /// Calls that passed the caller's locals straight through (no clone).
-    pub static ENV_PASSTHROUGH_CALLS: AtomicU64 = AtomicU64::new(0);
-
-    #[inline]
-    pub fn bump_env_clone(keys: u64) {
-        ENV_CLONE_CALLS.fetch_add(1, Relaxed);
-        ENV_CLONE_KEYS.fetch_add(keys, Relaxed);
-    }
-
-    #[inline]
-    pub fn bump_env_passthrough() {
-        ENV_PASSTHROUGH_CALLS.fetch_add(1, Relaxed);
-    }
-
     /// Frames that built the `arguments` scope EAGERLY vs took the lazy path
     /// (Lever A). Phase 4 is 338 ns/frame on live Preside, so which side of this
     /// branch the real workload sits on decides whether the fix is "make eager
@@ -696,16 +671,11 @@ pub mod call_phases {
         let (e, l) = (g(&ARGS_EAGER), g(&ARGS_LAZY));
         let (t, pl) = (g(&RET_THIS_WRITEBACK), g(&RET_PLAIN));
         format!(
-            "--- caller pre-call scope handling (phase 8) ---\n\
-             env CLONED (closure callee):  {:>12}\n\
-               .. keys copied:             {:>12}\n\
-             locals passed through:        {:>12}\n\
-             --- call-path branch split ---\n\
+            "--- call-path branch split ---\n\
              arguments scope eager:  {:>12}  ({:.1}%)\n\
              arguments scope lazy:   {:>12}  ({:.1}%)\n\
              Return with this-wb:    {:>12}  ({:.1}%)\n\
              Return plain:           {:>12}  ({:.1}%)",
-            g(&ENV_CLONE_CALLS), g(&ENV_CLONE_KEYS), g(&ENV_PASSTHROUGH_CALLS),
             e, e as f64 / (e + l).max(1) as f64 * 100.0,
             l, l as f64 / (e + l).max(1) as f64 * 100.0,
             t, t as f64 / (t + pl).max(1) as f64 * 100.0,
@@ -846,10 +816,6 @@ pub mod call_phases {
     /// Calls whose `arg_sources_cached` memo probe hit vs had to scan.
     pub static P8_ARGSRC_HIT: AtomicU64 = AtomicU64::new(0);
     pub static P8_ARGSRC_MISS: AtomicU64 = AtomicU64::new(0);
-    /// Of the hits, how many returned a vector with ANY `Some` source. Every
-    /// call pays a `HashMap` probe + `Arc` clone to obtain this; if it is
-    /// almost always all-`None` the whole lookup can collapse to a cached bool.
-    pub static P8_ARGSRC_USEFUL: AtomicU64 = AtomicU64::new(0);
     /// Calls where the callee actually reported a by-ref mutation, i.e. the
     /// only calls that still need `arg_sources` now the lookup is deferred.
     /// This is the RESIDUAL of the phase-24 lever.

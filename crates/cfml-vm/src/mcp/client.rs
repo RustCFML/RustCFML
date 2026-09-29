@@ -9,7 +9,6 @@
 //! and an HTTP client. `cfml-vm` must keep building for `wasm32`, where neither
 //! exists — the same reason the `s3` surface is feature-gated.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicU64, Ordering};

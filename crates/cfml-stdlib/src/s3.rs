@@ -12,11 +12,11 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::Client;
 use cfml_common::{
     dynamic::{CfmlValue, ValueMap},
-    vm::{CfmlError, CfmlErrorType, CfmlResult},
+    vm::{CfmlError, CfmlErrorType},
 };
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 // ---------- Tokio runtime bridge ----------
 
@@ -442,8 +442,6 @@ pub fn app_s3_settings() -> Option<ValueMap> {
     APP_S3_SETTINGS.with(|c| c.borrow().clone())
 }
 
-pub type SharedS3Clients = Arc<S3Clients>;
-
 /// Process-global client cache. S3 clients are cheap to keep alive and
 /// expensive to rebuild (credential provider chain + HTTPS connector), so a
 /// single shared cache across the whole process is the right granularity.
@@ -854,10 +852,6 @@ impl S3AppConfig {
         }
     }
 
-    pub fn from_struct(s: &ValueMap) -> Self {
-        Self { settings: s.clone() }
-    }
-
     pub fn as_map(&self) -> &ValueMap {
         &self.settings
     }
@@ -901,21 +895,6 @@ pub fn client_and_config(
     Ok((client, cfg))
 }
 
-/// Build a client from an S3Url + VM app config, applying inline URL creds.
-pub fn client_for_url(
-    clients: &S3Clients,
-    url: &S3Url,
-    app: Option<&S3AppConfig>,
-) -> Result<Client, CfmlError> {
-    let cfg = resolve_config(
-        url.access_key.as_deref(),
-        url.secret_key.as_deref(),
-        url.host.as_deref(),
-        app,
-    )?;
-    Ok(clients.get_or_create(&cfg))
-}
-
 /// Same as `client_for_url` but also returns the resolved config so the
 /// caller can apply `key_prefix`. The prefix is suppressed when the URL
 /// itself carried inline credentials or a custom host.
@@ -947,23 +926,6 @@ pub fn arg_string(args: &[CfmlValue], idx: usize) -> Result<String, CfmlError> {
             _ => None,
         })
         .ok_or_else(|| err(format!("expected string argument at position {}", idx + 1)))
-}
-
-/// Result type returned by VM dispatcher.
-pub fn ok_void() -> CfmlResult {
-    Ok(CfmlValue::Null)
-}
-
-pub fn ok_string(s: String) -> CfmlResult {
-    Ok(CfmlValue::string(s))
-}
-
-pub fn ok_bool(b: bool) -> CfmlResult {
-    Ok(CfmlValue::Bool(b))
-}
-
-pub fn ok_binary(bytes: Vec<u8>) -> CfmlResult {
-    Ok(CfmlValue::Binary(bytes))
 }
 
 /// Map a key extension to a content-type guess. Returns None when unknown.

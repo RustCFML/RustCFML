@@ -69,14 +69,6 @@ pub enum TableRef {
 }
 
 impl TableRef {
-    /// The name this table is addressed by in column references (its alias if
-    /// present, otherwise the source name).
-    pub fn binding_name(&self) -> &str {
-        match self {
-            TableRef::Named { name, alias } => alias.as_deref().unwrap_or(name),
-            TableRef::Derived { alias, .. } => alias,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

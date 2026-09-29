@@ -229,32 +229,6 @@ pub(crate) fn op_rethrow(
     Ok(())
 }
 
-/// Statement-level output (`Print`), newline-terminated.
-#[inline]
-pub(crate) fn op_print(
-    vm: &mut CfmlVirtualMachine,
-    stack: &mut Vec<CfmlValue>,
-    ip: &mut usize,
-) -> Result<(), CfmlError> {
-    if let Some(val) = stack.pop() {
-        // Lucee parity: outputting a complex value throws a
-        // catchable `expression` error rather than dumping it.
-        let s = match val.to_string_strict() {
-            Ok(s) => s,
-            Err(e) => match vm.raise_catchable(stack, &e.message, "expression") {
-                Ok(catch_ip) => {
-                    *ip = catch_ip;
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            },
-        };
-        vm.output_buffer.push_str(&s);
-        vm.output_buffer.push('\n');
-    }
-    Ok(())
-}
-
 /// Trailing op of a lowered `__cfcustomtag_end()`; re-enters the tag body when
 /// `<cfexit method="loop">` armed a repeat.
 #[inline]

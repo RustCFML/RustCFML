@@ -159,18 +159,6 @@ pub fn logs_directory() -> Option<PathBuf> {
     config().lock().as_ref().and_then(|c| c.directory.clone())
 }
 
-/// Whether a line at `level` for log `name` would be written. Callers can use
-/// this to skip formatting work for a suppressed line.
-pub fn is_enabled(name: &str, level: LogLevel) -> bool {
-    let guard = config().lock();
-    let cfg = match guard.as_ref() {
-        Some(c) => c,
-        // Unconfigured: fall back to stderr, and stderr takes everything.
-        None => return true,
-    };
-    threshold(cfg, name).is_some_and(|min| level >= min)
-}
-
 fn threshold(cfg: &LoggingConfig, name: &str) -> Option<LogLevel> {
     match cfg.levels.get(&name.to_ascii_lowercase()) {
         Some(explicit) => *explicit,

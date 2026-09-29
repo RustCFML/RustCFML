@@ -246,12 +246,6 @@ impl ValueMap {
     }
 
     #[inline]
-    pub fn raw_mut(&mut self) -> &mut RawValueMap {
-        self.1 = self.1.wrapping_add(1);
-        &mut self.0
-    }
-
-    #[inline]
     pub fn into_raw(self) -> RawValueMap {
         self.0
     }
@@ -1494,42 +1488,6 @@ impl CfmlStruct {
         None
     }
 
-    /// v0.99.5 — case-insensitive lookup that also returns the IndexMap
-    /// entry index. For a member-access index cache:
-    /// `(name → idx)` is stable while `shape_id` doesn't change, so the
-    /// IC can hit `map.get_index(cached_idx)` on the fast path.
-    /// v0.599 — one probe (the map key is itself case-insensitive); this used
-    /// to walk the map twice on a case mismatch.
-    #[cfg_attr(feature = "probe-sites", track_caller)]
-    pub fn get_ci_indexed(&self, key: impl ProbeKey) -> Option<(usize, CfmlValue)> {
-        let key = key.probe();
-        let g = self.0.read();
-        g.map.get_full(key).map(|(i, _, v)| (i, v.clone()))
-    }
-
-    /// v0.99.5 — read the value at a specific IndexMap entry index. Used
-    /// by an index cache fast path after the cached shape matched. Returns
-    /// `None` if the index is out of range (shouldn't happen when shape
-    /// matched, but defensive).
-    #[inline]
-    pub fn get_at_index(&self, idx: usize) -> Option<CfmlValue> {
-        self.0.read().map.get_index(idx).map(|(_, v)| v.clone())
-    }
-
-    /// v0.100.0 — write a value at a specific IndexMap entry index. Used by
-    /// a member-write index cache fast path: when a cached `(shape, idx)` hit
-    /// confirms the key is at the position we recorded, replace the value
-    /// in place. Does NOT bump `shape_id` — the key set is unchanged, only
-    /// the value at that slot. Returns the previous value, or `None` if the
-    /// index is out of range (defensive — shape match implies in-range).
-    #[inline]
-    pub fn set_at_index(&self, idx: usize, value: CfmlValue) -> Option<CfmlValue> {
-        let mut g = self.0.write();
-        g.map
-            .get_index_mut(idx)
-            .map(|(_, slot)| std::mem::replace(slot, value))
-    }
-
     /// v0.442 — resolve `key` case-insensitively to the ORIGINAL-cased key as
     /// stored in the map, in O(1) via the ci index. Returns `None` if no
     /// case-variant is present. Used by `structKeyExists`/`structFindKey`-style
@@ -1886,12 +1844,6 @@ impl CfmlStruct {
     #[inline]
     pub fn data_contains_key(&self, key: impl ProbeKey) -> bool {
         self.0.read().map.contains_key(key.probe())
-    }
-
-    /// Alias for `snapshot()` — owned copy of the entries.
-    #[inline]
-    pub fn to_indexmap(&self) -> ValueMap {
-        self.snapshot()
     }
 
     /// Run a closure with exclusive (write) access to the backing map. The
@@ -3111,7 +3063,7 @@ impl CfmlValue {
         let mut seen: HashMap<usize, CfmlValue> = HashMap::new();
         // `duplicate()` clones everything, including nested components (Lucee's
         // deep `duplicate()` recurses into a struct's nested CFCs).
-        self.deep_copy_guarded(&mut seen, false, true)
+        self.deep_copy_guarded(&mut seen)
     }
 
     /// One-level copy — what `duplicate(value, false)` does on Lucee.
@@ -3200,33 +3152,7 @@ impl CfmlValue {
         }
     }
 
-    /// Deep-copy sharing a caller-supplied `seen` map, so that a series of
-    /// deep-copies preserves aliasing ACROSS calls: an object already copied in
-    /// an earlier `deep_copy_with` (recorded in `seen`) resolves to that same
-    /// copy here. Component instantiation relies on this — the instance's `this`
-    /// scope is deep-copied first, then its `variables` scope is deep-copied
-    /// through the same map, so an object the pseudo-constructor stored in both
-    /// `this.x` and `variables.x` stays one shared reference in the instance.
-    ///
-    /// This is the INSTANTIATION path, so it treats a *nested* component instance
-    /// as a **reference boundary**: a component value stored inside the template
-    /// (e.g. an injected `variables.controller` singleton) is SHARED (Arc clone),
-    /// not deep-copied. Components are reference types in CFML — Lucee/BoxLang
-    /// never clone a referenced component at `new`. Without this, every `new X()`
-    /// re-cloned the entire graph of every singleton it referenced (the ColdBox
-    /// `Controller` graph was copied 332× in one spec run → ~10 GB). `is_root` is
-    /// true for the template's own backing struct (which MUST be copied so the
-    /// instance gets independent scopes) and false for content values.
-    pub fn deep_copy_with(&self, seen: &mut HashMap<usize, CfmlValue>, is_root: bool) -> CfmlValue {
-        self.deep_copy_guarded(seen, true, is_root)
-    }
-
-    fn deep_copy_guarded(
-        &self,
-        seen: &mut HashMap<usize, CfmlValue>,
-        share_nested_components: bool,
-        is_root: bool,
-    ) -> CfmlValue {
+    fn deep_copy_guarded(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
         match self {
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
@@ -3241,20 +3167,12 @@ impl CfmlValue {
                 let items: Vec<CfmlValue> = a
                     .snapshot()
                     .iter()
-                    .map(|v| v.deep_copy_guarded(seen, share_nested_components, false))
+                    .map(|v| v.deep_copy_guarded(seen))
                     .collect();
                 dest.with_write(|w| *w = items);
                 CfmlValue::Array(dest)
             }
             CfmlValue::Struct(s) => {
-                // Reference boundary: on the instantiation path, a nested component
-                // instance is a reference, not a value — share its Arc handle
-                // rather than recursively cloning its (often huge, cyclic, shared)
-                // backing graph. The instance's OWN backing struct is `is_root` and
-                // still gets copied so its scopes are independent.
-                if share_nested_components && !is_root && is_component_backing(s) {
-                    return CfmlValue::Struct(s.clone());
-                }
                 let ptr = s.backing_ptr();
                 if let Some(existing) = seen.get(&ptr) {
                     return existing.clone();
@@ -3263,7 +3181,7 @@ impl CfmlValue {
                 seen.insert(ptr, CfmlValue::Struct(dest.clone()));
                 let entries: ValueMap = s
                     .iter()
-                    .map(|(k, v)| (k, v.deep_copy_guarded(seen, share_nested_components, false)))
+                    .map(|(k, v)| (k, v.deep_copy_guarded(seen)))
                     .collect();
                 dest.with_write(|w| *w = entries);
                 // Preserve the shared per-class method table (component
@@ -3298,7 +3216,7 @@ impl CfmlValue {
                     .map(|col| {
                         Arc::new(
                             col.iter()
-                                .map(|v| v.deep_copy_guarded(seen, share_nested_components, false))
+                                .map(|v| v.deep_copy_guarded(seen))
                                 .collect(),
                         )
                     })
@@ -3349,14 +3267,14 @@ impl CfmlValue {
                 crate::cycle_gc::log_instance(&new_inst);
                 seen.insert(ptr, CfmlValue::Instance(new_inst.clone()));
                 for (k, v) in g.public_entries() {
-                    let dv = v.deep_copy_guarded(seen, share_nested_components, false);
+                    let dv = v.deep_copy_guarded(seen);
                     this_members.insert(k, dv);
                 }
                 for (k, v) in g.private_entries() {
                     if k.eq_ignore_ascii_case("__static") {
                         continue; // shared, already attached
                     }
-                    let dv = v.deep_copy_guarded(seen, share_nested_components, false);
+                    let dv = v.deep_copy_guarded(seen);
                     variables_members.insert(k, dv);
                 }
                 CfmlValue::Instance(new_inst)
@@ -3716,14 +3634,6 @@ impl CfmlQueryData {
             // case-insensitive scan this replaces was redundant.
             let val = row.get(col_name).cloned().unwrap_or(CfmlValue::Null);
             Arc::make_mut(&mut self.data[ci]).push(val);
-        }
-    }
-
-    pub fn insert_row_positional(&mut self, at: usize, mut vals: Vec<CfmlValue>) {
-        let n = self.columns.len();
-        vals.resize_with(n, || CfmlValue::Null);
-        for (ci, v) in vals.into_iter().enumerate() {
-            Arc::make_mut(&mut self.data[ci]).insert(at, v);
         }
     }
 

@@ -10,8 +10,8 @@
 //! call/store arms should get the struct instead.
 //!
 //! Ops with a `*Slot*` twin take `op: &BytecodeOp` so the body can pull the slot
-//! index out of the variant exactly as it did in the match — keeping the move
-//! verbatim, and matching what a Tier-0 shim would hand over anyway.
+//! index out of the variant exactly as it did in the match, keeping the move
+//! verbatim.
 
 use crate::{
     cfml_compare, cfml_equal, CfmlVirtualMachine, DeclaredLocals, InheritedKeys, TryHandler,

@@ -163,8 +163,8 @@ pub struct CfmlCompiler {
     /// the RHS of an enclosing assignment (`a = b = c`), so the assignment must
     /// leave its assigned value on the stack for the outer store to consume. A
     /// statement-level assignment leaves it false: the consuming store ops emit
-    /// NO extra `Dup`, keeping the bytecode the static admission analyser
-    /// accepts (a stray `Dup` in a hot setter disqualified the function).
+    /// NO extra `Dup`, so a statement-level store does no stack traffic it then
+    /// has to pop.
     need_assign_value: bool,
     /// Source file path this program is being compiled from, stamped onto every
     /// `BytecodeFunction` so app-scope functions carry a stable, serializable
@@ -1065,8 +1065,7 @@ pub enum BytecodeOp {
     Contains,
     DoesNotContain,
 
-    // Logical
-    And,
+    // Logical (`and` compiles to short-circuit jumps, not an op)
     Or,
     Not,
     Xor,
@@ -1346,9 +1345,6 @@ pub enum BytecodeOp {
     // Named-argument variant of CallComputedMethod. Names box matches CallNamed.
     CallComputedMethodNamed(Box<Vec<String>>, usize),
 
-    // For-in support
-    GetKeys,  // Pop value: if struct, push array of keys; if array, leave as-is
-
     // Include
     Include(std::sync::Arc<String>),  // Include and execute a file (static path)
     IncludeDynamic,   // Include: pop path from stack (dynamic expression)
@@ -1404,8 +1400,6 @@ pub enum BytecodeOp {
     /// traffic.
     ValidateParamType(usize),
 
-    // Output
-    Print,
     Halt,
 
     // Variable existence check
@@ -1540,113 +1534,110 @@ impl BytecodeOp {
             Self::Gte => 31,
             Self::Contains => 32,
             Self::DoesNotContain => 33,
-            Self::And => 34,
-            Self::Or => 35,
-            Self::Not => 36,
-            Self::Xor => 37,
-            Self::Eqv => 38,
-            Self::Imp => 39,
-            Self::Jump(..) => 40,
-            Self::JumpIfFalse(..) => 41,
-            Self::JumpIfTrue(..) => 42,
-            Self::JumpIfLocalCmpConstFalse(..) => 43,
-            Self::ForLoopStep(..) => 44,
-            Self::Call(..) => 45,
-            Self::Return => 46,
-            Self::BuildArray(..) => 47,
-            Self::BuildStruct(..) => 48,
-            Self::GetIndex => 49,
-            Self::SetIndex => 50,
-            Self::GetProperty(..) => 51,
-            Self::TryGetProperty(..) => 52,
-            Self::LoadSuper => 53,
-            Self::LoadStaticHolder(..) => 54,
-            Self::GetStaticProperty(..) => 55,
-            Self::LoadLocalProperty(..) => 56,
-            Self::StoreLocalProperty(..) => 57,
-            Self::LoadLocalKey(..) => 58,
-            Self::TryLoadLocalProperty(..) => 59,
-            Self::TryLoadLocalKey(..) => 60,
-            Self::SetProperty(..) => 61,
-            Self::MarkAccessorPrivate(..) => 62,
-            Self::SetDynamicVar => 63,
-            Self::UnsetPath(..) => 64,
-            Self::DeleteScopeKey(..) => 65,
-            Self::NewObject(..) => 66,
-            Self::NewObjectNamed(..) => 67,
-            Self::DefineFunction(..) => 68,
-            Self::Increment(..) => 69,
-            Self::Decrement(..) => 70,
-            Self::AddLocalConst(..) => 71,
-            Self::MulLocalConst(..) => 72,
-            Self::TryStart(..) => 73,
-            Self::TryEnd => 74,
-            Self::Throw => 75,
-            Self::Rethrow => 76,
-            Self::SaveException => 77,
-            Self::RestoreException => 78,
-            Self::SetLastExceptionFromLocal(..) => 79,
-            Self::CatchMatch(..) => 80,
-            Self::CallMethod(..) => 81,
-            Self::CallMethodNamed(..) => 82,
-            Self::CallComputedMethod(..) => 83,
-            Self::CallComputedMethodNamed(..) => 84,
-            Self::GetKeys => 85,
-            Self::Include(..) => 86,
-            Self::IncludeDynamic => 87,
-            Self::IsNull => 88,
-            Self::JumpIfNotNull(..) => 89,
-            Self::JumpIfArgPresent(..) => 90,
-            Self::ValidateParamType(..) => 91,
-            Self::Print => 92,
-            Self::Halt => 93,
-            Self::IsDefined(..) => 94,
-            Self::ConcatArrays => 95,
-            Self::MergeStructs => 96,
-            Self::CallSpread => 97,
-            Self::LineInfo(..) => 98,
-            Self::TagLoopBack(..) => 99,
-            Self::AbandonTagPairs(..) => 100,
-            Self::TryLoadLocal(..) => 101,
-            Self::DeclareLocal(..) => 102,
-            Self::DeclareSlot(..) => 103,
-            Self::LoadSlot(..) => 104,
-            Self::TryLoadSlot(..) => 105,
-            Self::StoreSlot(..) => 106,
-            Self::IncrementSlot(..) => 107,
-            Self::DecrementSlot(..) => 108,
-            Self::AddSlotConst(..) => 109,
-            Self::MulSlotConst(..) => 110,
-            Self::JumpIfSlotCmpConstFalse(..) => 111,
-            Self::ForSlotStep(..) => 112,
-            Self::LoadSlotKey(..) => 113,
-            Self::TryLoadSlotKey(..) => 114,
-            Self::LoadSlotProperty(..) => 115,
-            Self::TryLoadSlotProperty(..) => 116,
-            Self::StoreSlotProperty(..) => 117,
-            Self::ArrayAppendSlot(..) => 118,
-            Self::CallNamed(..) => 119,
-            Self::CallRustSuperCtor(..) => 120,
-            Self::CallBuiltin(..) => 121,
-            Self::SeedArgumentKey(..) => 122,
-            Self::StoreLocalScopeKey(..) => 123,
-            Self::DefineComponentMethods(..) => 124,
-            Self::StoreVariablesKey(..) => 125,
-            Self::BuildStructStatic(..) => 126,
-            Self::LoadArgKey(..) => 127,
-            Self::TryLoadArgKey(..) => 128,
-            Self::SetScopePath(..) => 129,
-            Self::TryGetIndex => 130,
-            Self::IterLen => 131,
-            Self::ArgConcatWriteThrough(..) => 132,
-            Self::ForInPrepare => 133,
-            Self::ForInElement => 134,
-            Self::ForInExit => 135,
+            Self::Or => 34,
+            Self::Not => 35,
+            Self::Xor => 36,
+            Self::Eqv => 37,
+            Self::Imp => 38,
+            Self::Jump(..) => 39,
+            Self::JumpIfFalse(..) => 40,
+            Self::JumpIfTrue(..) => 41,
+            Self::JumpIfLocalCmpConstFalse(..) => 42,
+            Self::ForLoopStep(..) => 43,
+            Self::Call(..) => 44,
+            Self::Return => 45,
+            Self::BuildArray(..) => 46,
+            Self::BuildStruct(..) => 47,
+            Self::GetIndex => 48,
+            Self::SetIndex => 49,
+            Self::GetProperty(..) => 50,
+            Self::TryGetProperty(..) => 51,
+            Self::LoadSuper => 52,
+            Self::LoadStaticHolder(..) => 53,
+            Self::GetStaticProperty(..) => 54,
+            Self::LoadLocalProperty(..) => 55,
+            Self::StoreLocalProperty(..) => 56,
+            Self::LoadLocalKey(..) => 57,
+            Self::TryLoadLocalProperty(..) => 58,
+            Self::TryLoadLocalKey(..) => 59,
+            Self::SetProperty(..) => 60,
+            Self::MarkAccessorPrivate(..) => 61,
+            Self::SetDynamicVar => 62,
+            Self::UnsetPath(..) => 63,
+            Self::DeleteScopeKey(..) => 64,
+            Self::NewObject(..) => 65,
+            Self::NewObjectNamed(..) => 66,
+            Self::DefineFunction(..) => 67,
+            Self::Increment(..) => 68,
+            Self::Decrement(..) => 69,
+            Self::AddLocalConst(..) => 70,
+            Self::MulLocalConst(..) => 71,
+            Self::TryStart(..) => 72,
+            Self::TryEnd => 73,
+            Self::Throw => 74,
+            Self::Rethrow => 75,
+            Self::SaveException => 76,
+            Self::RestoreException => 77,
+            Self::SetLastExceptionFromLocal(..) => 78,
+            Self::CatchMatch(..) => 79,
+            Self::CallMethod(..) => 80,
+            Self::CallMethodNamed(..) => 81,
+            Self::CallComputedMethod(..) => 82,
+            Self::CallComputedMethodNamed(..) => 83,
+            Self::Include(..) => 84,
+            Self::IncludeDynamic => 85,
+            Self::IsNull => 86,
+            Self::JumpIfNotNull(..) => 87,
+            Self::JumpIfArgPresent(..) => 88,
+            Self::ValidateParamType(..) => 89,
+            Self::Halt => 90,
+            Self::IsDefined(..) => 91,
+            Self::ConcatArrays => 92,
+            Self::MergeStructs => 93,
+            Self::CallSpread => 94,
+            Self::LineInfo(..) => 95,
+            Self::TagLoopBack(..) => 96,
+            Self::AbandonTagPairs(..) => 97,
+            Self::TryLoadLocal(..) => 98,
+            Self::DeclareLocal(..) => 99,
+            Self::DeclareSlot(..) => 100,
+            Self::LoadSlot(..) => 101,
+            Self::TryLoadSlot(..) => 102,
+            Self::StoreSlot(..) => 103,
+            Self::IncrementSlot(..) => 104,
+            Self::DecrementSlot(..) => 105,
+            Self::AddSlotConst(..) => 106,
+            Self::MulSlotConst(..) => 107,
+            Self::JumpIfSlotCmpConstFalse(..) => 108,
+            Self::ForSlotStep(..) => 109,
+            Self::LoadSlotKey(..) => 110,
+            Self::TryLoadSlotKey(..) => 111,
+            Self::LoadSlotProperty(..) => 112,
+            Self::TryLoadSlotProperty(..) => 113,
+            Self::StoreSlotProperty(..) => 114,
+            Self::ArrayAppendSlot(..) => 115,
+            Self::CallNamed(..) => 116,
+            Self::CallRustSuperCtor(..) => 117,
+            Self::CallBuiltin(..) => 118,
+            Self::SeedArgumentKey(..) => 119,
+            Self::StoreLocalScopeKey(..) => 120,
+            Self::DefineComponentMethods(..) => 121,
+            Self::StoreVariablesKey(..) => 122,
+            Self::BuildStructStatic(..) => 123,
+            Self::LoadArgKey(..) => 124,
+            Self::TryLoadArgKey(..) => 125,
+            Self::SetScopePath(..) => 126,
+            Self::TryGetIndex => 127,
+            Self::IterLen => 128,
+            Self::ArgConcatWriteThrough(..) => 129,
+            Self::ForInPrepare => 130,
+            Self::ForInElement => 131,
+            Self::ForInExit => 132,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 136] = [
+    pub const CENSUS_NAMES: [&'static str; 133] = [
         "Null",
         "True",
         "False",
@@ -1681,7 +1672,6 @@ impl BytecodeOp {
         "Gte",
         "Contains",
         "DoesNotContain",
-        "And",
         "Or",
         "Not",
         "Xor",
@@ -1732,14 +1722,12 @@ impl BytecodeOp {
         "CallMethodNamed",
         "CallComputedMethod",
         "CallComputedMethodNamed",
-        "GetKeys",
         "Include",
         "IncludeDynamic",
         "IsNull",
         "JumpIfNotNull",
         "JumpIfArgPresent",
         "ValidateParamType",
-        "Print",
         "Halt",
         "IsDefined",
         "ConcatArrays",
@@ -2072,7 +2060,6 @@ impl CfmlCompiler {
                 self.compile_expression(expr, instructions);
                 instructions.push(BytecodeOp::Pop);
             }
-            _ => {}
         }
     }
 
@@ -2817,8 +2804,6 @@ impl CfmlCompiler {
             Statement::Continue(c) => Some(c.location.start.line),
             Statement::Import(i) => Some(i.location.start.line),
             Statement::Output(o) => Some(o.location.start.line),
-            Statement::PropertyDecl(p) => Some(p.prop.location.start.line),
-            Statement::Exit => None,
         }
     }
 
@@ -3416,16 +3401,12 @@ impl CfmlCompiler {
             Statement::Import(_) => {
                 // Import not yet supported at bytecode level
             }
-            Statement::Exit => {
-                instructions.push(BytecodeOp::Halt);
-            }
             Statement::Output(output) => {
                 // Compile each statement in the output block body
                 for body_stmt in &output.body {
                     self.compile_statement(body_stmt, instructions);
                 }
             }
-            _ => {}
         }
     }
 
@@ -5877,7 +5858,6 @@ impl CfmlCompiler {
                         let op = match unary.operator {
                             UnaryOpType::Minus => BytecodeOp::Negate,
                             UnaryOpType::Not => BytecodeOp::Not,
-                            UnaryOpType::BitNot => BytecodeOp::Not,
                             _ => unreachable!(),
                         };
                         instructions.push(op);

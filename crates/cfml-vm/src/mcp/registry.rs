@@ -172,15 +172,6 @@ pub struct McpSession {
 }
 
 impl McpSession {
-    pub fn stream_count(&self) -> usize {
-        self.streams.values().filter(|s| !s.closed).count()
-    }
-
-    pub fn has_standalone(&self) -> bool {
-        self.streams
-            .values()
-            .any(|s| !s.closed && s.kind == StreamKind::Standalone)
-    }
 }
 
 /// Cross-request MCP state. Lives on `ServerState`.

@@ -68,9 +68,6 @@ pub enum Incoming {
 }
 
 impl Incoming {
-    pub fn is_request(&self) -> bool {
-        matches!(self, Incoming::Request { .. })
-    }
 
     /// True for the one method allowed to arrive without a session id.
     pub fn is_initialize(&self) -> bool {

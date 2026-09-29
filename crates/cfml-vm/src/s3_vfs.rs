@@ -11,7 +11,7 @@
 #![cfg(feature = "s3")]
 
 use crate::CfmlVirtualMachine;
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_stdlib::s3::{
     client_and_config_for_url, guess_content_type, objects_to_query_struct, s3_copy_object,
@@ -367,11 +367,4 @@ impl CfmlVirtualMachine {
 
         Some(res)
     }
-}
-
-// IndexMap is referenced via `Arc::new(IndexMap::...)` patterns elsewhere; keep
-// the import alive so future expansions don't have to re-import.
-#[allow(dead_code)]
-fn _unused_indexmap_marker() -> ValueMap {
-    ValueMap::default()
 }

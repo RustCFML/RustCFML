@@ -161,17 +161,6 @@ fn arg_int(args: &[CfmlValue], i: usize) -> i64 {
     }
 }
 
-fn arg_bool(args: &[CfmlValue], i: usize, default: bool) -> bool {
-    match args.get(i) {
-        Some(CfmlValue::Bool(b)) => *b,
-        Some(CfmlValue::Null) | None => default,
-        Some(other) => {
-            let s = other.as_string();
-            !(s.eq_ignore_ascii_case("false") || s == "0" || s.is_empty())
-        }
-    }
-}
-
 /// The native workbook handle carried by any shim in the graph.
 fn workbook_of(object: &CfmlValue) -> Option<CfmlValue> {
     get(object, "__wb")

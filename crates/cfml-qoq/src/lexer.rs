@@ -339,11 +339,4 @@ impl Lexer {
         }
     }
 
-    /// Peek at the next token without consuming it.
-    pub fn peek_token(&mut self) -> Token {
-        let saved = self.pos;
-        let tok = self.next_token();
-        self.pos = saved;
-        tok
-    }
 }

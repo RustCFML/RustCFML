@@ -4,10 +4,6 @@ use cfml_common::position::SourceLocation;
 
 #[derive(Debug, Clone)]
 pub enum CfmlNode {
-    Program(Program),
-    Template(Template),
-    Component(Component),
-    Function(Function),
     Statement(Statement),
     Expression(Expression),
 }
@@ -15,13 +11,6 @@ pub enum CfmlNode {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub statements: Vec<CfmlNode>,
-    pub location: SourceLocation,
-}
-
-#[derive(Debug, Clone)]
-pub struct Template {
-    pub name: Option<String>,
-    pub body: Vec<Statement>,
     pub location: SourceLocation,
 }
 
@@ -140,11 +129,9 @@ pub enum Statement {
     Var(Var),
     ComponentDecl(ComponentDecl),
     InterfaceDecl(InterfaceDecl),
-    PropertyDecl(PropertyDecl),
     FunctionDecl(FunctionDecl),
     Output(Output),
     Include(Include),
-    Exit,
 }
 
 #[derive(Debug, Clone)]
@@ -308,11 +295,6 @@ pub struct InterfaceDecl {
 }
 
 #[derive(Debug, Clone)]
-pub struct PropertyDecl {
-    pub prop: Property,
-}
-
-#[derive(Debug, Clone)]
 pub struct FunctionDecl {
     pub func: Function,
 }
@@ -471,7 +453,6 @@ pub struct UnaryOp {
 pub enum UnaryOpType {
     Minus,
     Not,
-    BitNot,
     PrefixIncrement,
     PrefixDecrement,
 }

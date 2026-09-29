@@ -49,15 +49,6 @@ fn is_transcoder(class_lower: &str) -> bool {
     matches!(class_lower, PNG_TRANSCODER | JPEG_TRANSCODER | TIFF_TRANSCODER)
 }
 
-/// The image format a transcoder class produces.
-fn output_format(class_lower: &str) -> &'static str {
-    match class_lower {
-        JPEG_TRANSCODER => "jpg",
-        TIFF_TRANSCODER => "tiff",
-        _ => "png",
-    }
-}
-
 fn shim(class: &str) -> ValueMap {
     let mut m = ValueMap::default();
     m.insert("__java_shim".to_string(), CfmlValue::Bool(true));

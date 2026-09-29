@@ -721,7 +721,6 @@ pub(crate) fn op_set_property(
     Ok(())
 }
 
-#[inline]
 /// `IterLen` — the for-in loop bound, re-read every iteration. Same rules as
 /// the `len()` builtin so the loop count is unchanged for every iterable type
 /// the old hoisted `len()` call accepted.

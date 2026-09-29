@@ -178,17 +178,6 @@ impl Parser {
         false
     }
 
-    #[allow(dead_code)]
-    fn match_any(&mut self, tokens: &[Token]) -> Option<Token> {
-        for token in tokens {
-            if self.check(token) {
-                let t = self.advance().token.clone();
-                return Some(t);
-            }
-        }
-        None
-    }
-
     /// True if the token at `offset` is an identifier equal (case-insensitive)
     /// to `word`. Used to recognise the verbose, multi-word comparison operators
     /// (GREATER THAN, DOES NOT CONTAIN, EQUAL, ...) whose words are NOT reserved

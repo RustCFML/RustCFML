@@ -186,8 +186,6 @@ struct Inner {
     /// `(channel, room)` → member connection ids. Local membership index; the
     /// distributed `Broker` merges remote membership on top (Phase 2).
     rooms: HashMap<(String, String), HashSet<ConnId>>,
-    /// Discovered channel → CFC file path (bytecode-cached at dispatch time).
-    channels: HashMap<String, String>,
     /// Presence roster: `(channel, key)` → `conn → meta`. A key (e.g. a user id)
     /// can have several metas — one per connection/device — exactly like Phoenix
     /// Presence. `BTreeMap` keeps the metas list deterministic. The distributed
@@ -289,19 +287,6 @@ impl WebSocketRegistry {
             id: self.next_id(),
             ref_id: None,
         }
-    }
-
-    // ── channel discovery cache ───────────────────────────────────────────
-
-    pub fn set_channel(&self, channel: &str, cfc_path: &str) {
-        self.inner
-            .write()
-            .channels
-            .insert(channel.to_lowercase(), cfc_path.to_string());
-    }
-
-    pub fn channel_cfc(&self, channel: &str) -> Option<String> {
-        self.inner.read().channels.get(&channel.to_lowercase()).cloned()
     }
 
     // ── connection lifecycle ──────────────────────────────────────────────

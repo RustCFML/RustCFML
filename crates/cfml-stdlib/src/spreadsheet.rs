@@ -31,7 +31,7 @@ use umya_spreadsheet::{
     Break, Chart, ChartType, Color, ColorScale, Comment, ConditionalFormatting,
     ConditionalFormattingRule, ConditionalFormatValueObject, ConditionalFormatValueObjectValues,
     ConditionalFormatValues, ConditionalFormattingOperatorValues, Coordinate, DataValidation,
-    DataValidations, DataValidationOperatorValues, DataValidationValues, Formula, Hyperlink,
+    DataValidations, DataValidationOperatorValues, DataValidationValues, Formula,
     HorizontalAlignmentValues, Image as XlsxImage, NumberingFormat, OddFooter, OddHeader,
     OrientationValues, Pane, PaneStateValues, PaneValues, SheetView, Style,
     VerticalAlignmentValues, Workbook,

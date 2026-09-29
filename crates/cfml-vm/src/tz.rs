@@ -12,7 +12,7 @@
 //! in the table has its numeric facts available but no verified names, so the
 //! name-bearing callers (getTimeZoneInfo, DateFormat `zzzz`) fail loudly.
 
-use chrono::{DateTime, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono::{NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::{OffsetComponents, Tz};
 
 /// Verified zone display names: (shortStd, shortDst, longStd, longDst).
@@ -179,14 +179,6 @@ pub fn local_to_utc(tz: &Tz, local: NaiveDateTime) -> Option<NaiveDateTime> {
 /// Convert a UTC wall-clock time to local wall-clock time in `tz`.
 pub fn utc_to_local(tz: &Tz, utc: NaiveDateTime) -> NaiveDateTime {
     tz.from_utc_datetime(&utc).naive_local()
-}
-
-/// Interpret an absolute epoch-millis instant as a wall-clock time in `tz`,
-/// returning the wall clock plus the signed offset seconds at that instant.
-pub fn epoch_millis_to_wall(tz: &Tz, ms: i64) -> Option<(NaiveDateTime, i64)> {
-    let utc = DateTime::from_timestamp_millis(ms)?.naive_utc();
-    let off = tz.offset_from_utc_datetime(&utc).fix().local_minus_utc() as i64;
-    Some((utc_to_local(tz, utc), off))
 }
 
 #[cfg(test)]

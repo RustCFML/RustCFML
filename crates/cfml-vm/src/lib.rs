@@ -2330,9 +2330,6 @@ pub struct CfmlVirtualMachine {
     /// a caught throw (`TryHandler::for_in_cursor_depth`). Loops over anything
     /// else never touch it.
     pub(crate) for_in_cursors: Vec<(CfmlQuery, usize)>,
-    /// Current exception (if any)
-    #[allow(dead_code)]
-    current_exception: Option<CfmlValue>,
     /// Last thrown exception (for rethrow support)
     pub(crate) last_exception: Option<CfmlValue>,
     /// Save-stack for `last_exception`, used to protect the caught exception
@@ -4593,7 +4590,6 @@ impl CfmlVirtualMachine {
             stack_pool: Vec::new(),
             try_stack: Vec::new(),
             for_in_cursors: Vec::new(),
-            current_exception: None,
             last_exception: None,
             exception_save_stack: Vec::new(),
             current_line: 0,
@@ -9158,11 +9154,8 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                                                let already = false;
-                        if !already {
-                            _p4_typechecks += 1;
-                            self.check_declared_param_type(func, i, param_name, ptype, &value)?;
-                        }
+                        _p4_typechecks += 1;
+                        self.check_declared_param_type(func, i, param_name, ptype, &value)?;
                     }
                     _p4_supplied += 1;
                     if build_arguments_eager {
@@ -11309,7 +11302,6 @@ impl CfmlVirtualMachine {
                 BytecodeOp::DoesNotContain => ops::value::op_does_not_contain(&mut stack),
 
                 // Logical
-                BytecodeOp::And => ops::value::op_and(&mut stack),
                 BytecodeOp::Or => ops::value::op_or(&mut stack),
                 BytecodeOp::Not => ops::value::op_not(&mut stack),
                 BytecodeOp::Xor => ops::value::op_xor(&mut stack),
@@ -11359,10 +11351,7 @@ impl CfmlVirtualMachine {
                     // but one dispatch instead of two.
                     //
                     // T3.1 slot fast path: the counter lives in its slot — step
-                    // and test in place, no map traffic. Deliberately does NOT
-                    // attempt OSR (the slot interpreter path is already the
-                    // optimisation; extending OSR to slot regions is a follow-up
-                    // noted in SLOT_LOCALS_PLAN.md). An inactive slot falls
+                    // and test in place, no map traffic. An inactive slot falls
                     // through to the generic named body below.
                     if let BytecodeOp::ForSlotStep(i, ..) = op {
                         let idx = *i as usize;
@@ -14901,7 +14890,6 @@ impl CfmlVirtualMachine {
                     stack.push(result);
                 }
 
-                BytecodeOp::GetKeys => { ops::access::op_get_keys(&mut stack); }
                 BytecodeOp::IterLen => { ops::access::op_iter_len(&mut stack); }
                 BytecodeOp::ForInPrepare => { ops::access::op_for_in_prepare(self, &mut stack); }
                 BytecodeOp::ForInElement => { ops::access::op_for_in_element(self, &mut stack, &mut ip, &locals)?; }
@@ -15333,7 +15321,6 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::Print => { ops::effect::op_print(self, &mut stack, &mut ip)?; }
                 BytecodeOp::IsDefined(var_name) => { ops::frame::op_is_defined(self, &mut stack, &locals, var_name); }
 
                 BytecodeOp::ConcatArrays => ops::value::op_concat_arrays(&mut stack),
@@ -25229,38 +25216,6 @@ impl CfmlVirtualMachine {
         ))))
     }
 
-    /// §29 — validate every supplied argument against its declared parameter
-    /// type, in parameter order.
-    ///
-    /// Extracted so the binding prologue has exactly one definition. This is
-    /// not hypothetical tidiness: while a second, compiled entry path existed
-    /// it entered the body WITHOUT this prologue, and `function f( numeric n )`
-    /// silently accepted `"1,000"`, `"0x10"`, `[]` and `{}` for as long as that
-    /// path served the call. Declared RETURN types never had the hole — they
-    /// are enforced in the call wrapper (`execute_function_with_args`), which
-    /// every path returns through.
-    ///
-    /// `Null` is "not supplied" in CFML and is never checked, matching the
-    /// prologue: an omitted optional argument is simply absent.
-    fn check_declared_param_types(
-        &mut self,
-        func: &BytecodeFunction,
-        args: &[CfmlValue],
-    ) -> Result<(), CfmlError> {
-        for (i, param_name) in func.params.iter().enumerate() {
-            let Some(Some(ptype)) = func.param_types.get(i) else {
-                continue;
-            };
-            match args.get(i) {
-                Some(value) if !matches!(value, CfmlValue::Null) => {
-                    self.check_declared_param_type(func, i, param_name, ptype, value)?;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
     /// §29 — enforce a declared RETURN type, on the way out of a call.
     ///
     /// A function that returns nothing yields `Null`, which is never a
@@ -26198,10 +26153,6 @@ impl CfmlVirtualMachine {
         seed
     }
 
-    fn spawn_async_body(&mut self, arg: CfmlValue) -> CfmlResult {
-        self.spawn_task(arg, None)
-    }
-
     /// Spawn one executor task. `thread_name` is the name
     /// `Thread.currentThread().getName()` reports inside the body (the
     /// ThreadFactory pattern); the hostname rides on the proxy itself.
@@ -26902,7 +26853,7 @@ impl CfmlVirtualMachine {
                 if timed_out {
                     for f in &futs {
                         if !self.future_is_done(f) {
-                            self.future_call(f, "cancel", vec![CfmlValue::Bool(true)]);
+                            let _ = self.future_call(f, "cancel", vec![CfmlValue::Bool(true)]);
                         }
                     }
                 }
@@ -26935,7 +26886,7 @@ impl CfmlVirtualMachine {
                             let winner = f.clone();
                             for other in &futs {
                                 if !self.future_is_done(other) {
-                                    self.future_call(
+                                    let _ = self.future_call(
                                         other,
                                         "cancel",
                                         vec![CfmlValue::Bool(true)],
@@ -26948,7 +26899,7 @@ impl CfmlVirtualMachine {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d {
                             for f in &futs {
-                                self.future_call(f, "cancel", vec![CfmlValue::Bool(true)]);
+                                let _ = self.future_call(f, "cancel", vec![CfmlValue::Bool(true)]);
                             }
                             return Err(CfmlError::new(
                                 "Timed out waiting for a task to complete".to_string(),
@@ -31540,14 +31491,6 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Reserved key under which a closure env stores a live link to its lexical
-    /// PARENT env. The link is a throwaway `Function` value — the only `CfmlValue`
-    /// that can carry an `Arc<RwLock<ValueMap>>` (its `captured_scope`) — so the
-    /// parent stays reachable exactly as long as the child env does, with no
-    /// side-table to leak or dangle. `__`-prefixed and Function-typed, so every
-    /// existing env guard (closure_env_capture_value, write_back_to_captured_scope,
-    /// reconcile_closure_env_into_locals, scope views) already skips it.
-    const CLOSURE_PARENT_KEY: &'static str = "__closure_parent_env__";
     /// Reserved frame key under which a LEXICAL closure invocation holds its
     /// captured (defining) env — the same throwaway-`Function` carrier as
     /// `CLOSURE_PARENT_KEY`. The closure's frame does NOT copy the env's data
@@ -31640,12 +31583,6 @@ impl CfmlVirtualMachine {
             None => false,
         }
     }
-    /// Reserved key holding an `Array` of THIS env's OWN key names — the frame's
-    /// params and `var`-declared locals. `refresh_env_from_parent_chain` never
-    /// overwrites an own key from an ancestor, so a closure factory's captured
-    /// argument (`makeAdder(x)` → `x`) stays frozen even when the shared page
-    /// scope happens to hold an unrelated variable of the same name.
-    const CLOSURE_OWN_KEYS: &'static str = "__closure_own_keys__";
 
     /// Attach `parent` as `map`'s lexical-parent link plus its own-key set (see
     /// `CLOSURE_PARENT_KEY` / `CLOSURE_OWN_KEYS`).
@@ -42249,32 +42186,6 @@ where
     Ok(CfmlValue::Double(op(arith_operand(a)?, arith_operand(b)?)))
 }
 
-pub(crate) fn numeric_op<F>(a: &CfmlValue, b: &CfmlValue, op: F) -> CfmlValue
-where
-    F: FnOnce(f64, f64) -> f64,
-{
-    match (a, b) {
-        (CfmlValue::Int(i), CfmlValue::Int(j)) => {
-            // Try integer arithmetic first
-            let fi = *i as f64;
-            let fj = *j as f64;
-            let result = op(fi, fj);
-            if result == (result as i64 as f64) && result.abs() < i64::MAX as f64 {
-                CfmlValue::Int(result as i64)
-            } else {
-                CfmlValue::Double(result)
-            }
-        }
-        _ => {
-            // Date-aware coercion so `date - date` (days between) and
-            // `date - n` behave like Lucee (numeric serial result).
-            let x = to_arith_number(a).unwrap_or(0.0);
-            let y = to_arith_number(b).unwrap_or(0.0);
-            CfmlValue::Double(op(x, y))
-        }
-    }
-}
-
 /// Coerce an arithmetic operand to a number, or produce Lucee's error.
 ///
 /// CFML arithmetic is numeric-only (`&` concatenates), and Lucee refuses an
@@ -42681,7 +42592,6 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         | BytecodeOp::Gte
         | BytecodeOp::Contains
         | BytecodeOp::DoesNotContain
-        | BytecodeOp::And
         | BytecodeOp::Or
         | BytecodeOp::Xor
         | BytecodeOp::Eqv
@@ -42722,7 +42632,6 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::SetScopePath(_) => (0, 1), // value → (stored through the path)
         BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
-        BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::IterLen => (1, 1),
         BytecodeOp::ForInPrepare => (1, 1),     // iterable → iterable'
         BytecodeOp::ForInElement => (1, 2),     // iterable + idx → element
@@ -42769,7 +42678,6 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::StoreLocalScopeKey(_) => (0, 1), // pops the value, pushes nothing
         BytecodeOp::ValidateParamType(_) => (0, 0),   // reads a local, throws or nothing
         // Output
-        BytecodeOp::Print => (0, 1),
         BytecodeOp::Halt => (0, 0),
         // Misc
         BytecodeOp::IsDefined(_) => (1, 0),

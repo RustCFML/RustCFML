@@ -229,11 +229,6 @@ pub(crate) fn op_does_not_contain(stack: &mut Vec<CfmlValue>) {
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn op_and(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| CfmlValue::Bool(a.is_true() && b.is_true()));
-}
-
-#[inline]
 pub(crate) fn op_or(stack: &mut Vec<CfmlValue>) {
     binary_op(stack, |a, b| CfmlValue::Bool(a.is_true() || b.is_true()));
 }

@@ -128,7 +128,6 @@ impl Shape {
 /// and request. Holds the class-invariant bulk (methods + metadata) that the
 /// marker-struct representation currently copies into each instance.
 #[cfg(feature = "component-instance")]
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ClassBlueprint {
     /// Dotted component name (`__name`).
@@ -203,7 +202,6 @@ pub struct ClassBlueprint {
 /// Thin, per-instance value. Revives `CfmlValue::Component` conceptually as an
 /// `Arc<RwLock<Instance>>` with real `Arc::ptr_eq` identity.
 #[cfg(feature = "component-instance")]
-#[allow(dead_code)]
 pub struct Instance {
     /// Shared blueprint — zero per-instance copy.
     pub class: std::sync::Arc<ClassBlueprint>,
@@ -249,7 +247,6 @@ impl std::fmt::Debug for Instance {
 }
 
 #[cfg(feature = "component-instance")]
-#[allow(dead_code)]
 impl Instance {
     /// The dotted type identifiers this instance satisfies (own name + superclass
     /// chain + interface lists), precomputed on the blueprint at produce time (see
@@ -285,7 +282,6 @@ impl Instance {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "component-instance")]
-#[allow(dead_code)]
 impl ClassBlueprint {
     /// Build the class-invariant blueprint from a finished marker instance.
     ///
@@ -496,7 +492,6 @@ pub mod blueprint_census {
 }
 
 #[cfg(feature = "component-instance")]
-#[allow(dead_code)]
 impl Instance {
     /// Partition a finished marker instance into the flyweight two-map form.
     ///
