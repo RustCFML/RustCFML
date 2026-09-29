@@ -134,31 +134,10 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
-/// Encode to standard padded base64. Needed for the request side too: a
-/// multipart upload carrying binary parts cannot travel as a JSON string.
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
+// Request-side encoding (a multipart upload carrying binary parts cannot travel
+// as a JSON string) uses the stdlib's encoder.
+#[cfg(any(target_arch = "wasm32", test))]
+use cfml_stdlib::builtins::base64_encode_bytes as base64_encode;
 
 fn attr<'a>(opts: &'a ValueMap, key: &str) -> Option<&'a CfmlValue> {
     opts.get(key)

@@ -16100,7 +16100,8 @@ fn b64_val(c: u8) -> u32 {
     }
 }
 
-pub(crate) fn base64_encode_bytes(data: &[u8]) -> String {
+/// Standard padded base64. Public so the Workers HTTP provider shares it.
+pub fn base64_encode_bytes(data: &[u8]) -> String {
     // 4 output chars per 3 input bytes, rounded up — exact, so no reallocs.
     let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
