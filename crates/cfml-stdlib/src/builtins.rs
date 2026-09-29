@@ -9629,34 +9629,35 @@ fn fn_encode_for_html_attribute(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(result))
 }
 
+/// XML encoding as Lucee does it (the OWASP Java Encoder's `forXml` /
+/// `forXmlAttribute`). Unlike `xmlFormat`, quotes become numeric references and
+/// characters XML cannot carry become a space: C0 controls other than tab, LF
+/// and CR, U+007F..U+009F, and every Unicode noncharacter. In an attribute `>`
+/// is left alone, as is whitespace.
+fn owasp_xml_encode(s: &str, attribute: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' if !attribute => out.push_str("&gt;"),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            '\t' | '\n' | '\r' => out.push(c),
+            c if (c as u32) < 0x20 || ('\u{7f}'..='\u{9f}').contains(&c) => out.push(' '),
+            c if ('\u{fdd0}'..='\u{fdef}').contains(&c) || (c as u32 & 0xfffe) == 0xfffe => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn fn_encode_for_xml(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    Ok(CfmlValue::string(
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;"),
-    ))
+    Ok(CfmlValue::string(owasp_xml_encode(&get_str(&args, 0), false)))
 }
 
 fn fn_encode_for_xml_attribute(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            '&' => result.push_str("&amp;"),
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '"' => result.push_str("&quot;"),
-            '\'' => result.push_str("&apos;"),
-            '\t' => result.push_str("&#x9;"),
-            '\n' => result.push_str("&#xA;"),
-            '\r' => result.push_str("&#xD;"),
-            _ => result.push(c),
-        }
-    }
-    Ok(CfmlValue::string(result))
+    Ok(CfmlValue::string(owasp_xml_encode(&get_str(&args, 0), true)))
 }
 
 fn fn_encode_for(args: Vec<CfmlValue>) -> CfmlResult {

@@ -226,6 +226,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_java_shim_silent_noops.cfm">
 <cf_runtest file="stdlib/test_string_functions.cfm">
 <cf_runtest file="stdlib/test_replace_nocase_unicode.cfm">
+<cf_runtest file="stdlib/test_encode_for_xml_lucee.cfm">
 <cf_runtest file="stdlib/test_string_functions_regex.cfm">
 <cf_runtest file="functions/test_string_position_unicode.cfm">
 <cf_runtest file="stdlib/test_string_split_member.cfm">
