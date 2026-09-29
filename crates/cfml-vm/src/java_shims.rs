@@ -7214,8 +7214,11 @@ fn format_java_pattern(
 /// methods) or a CFML date value/string (the `*LocaleFormat` methods):
 ///   - epoch millis is an absolute instant → shifted into `tz`'s wall clock,
 ///     with the offset/DST taken at that instant.
-///   - a CFML date string is already a wall clock → used verbatim, with the
-///     offset/DST computed by interpreting it as local time in `tz`.
+///   - a CFML date string is a wall clock in the REQUEST timezone (setTimezone,
+///     else the system zone), i.e. an instant: when `tz` is that same zone it is
+///     used verbatim; otherwise it is converted into `tz`, as Lucee does. (It
+///     used to be taken verbatim in `tz`, so `setTimeZone(newYork)` on a London
+///     server relabelled 14:05 as "2:05 PM EDT" instead of converting it.)
 /// Returns `(wall_clock, offset_secs, is_dst)`.
 fn parse_dateformat_arg(arg: &CfmlValue, tz: &chrono_tz::Tz) -> Option<(NaiveDateTime, i64, bool)> {
     let from_epoch_millis = |ms: i64| -> Option<(NaiveDateTime, i64, bool)> {
@@ -7261,8 +7264,20 @@ fn parse_dateformat_arg(arg: &CfmlValue, tz: &chrono_tz::Tz) -> Option<(NaiveDat
                     None
                 })?
             };
-            let info = crate::tz::offset_info_for_local(tz, wall);
-            Some((wall, info.total_secs, info.is_dst()))
+            let req_id = cfml_common::clock::request_timezone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(crate::tz::system_tz_id);
+            match crate::tz::resolve_tz(&req_id) {
+                Some(req) if req != *tz => {
+                    let utc = crate::tz::local_to_utc(&req, wall)?;
+                    let info = crate::tz::offset_info_at(tz, utc);
+                    Some((crate::tz::utc_to_local(tz, utc), info.total_secs, info.is_dst()))
+                }
+                _ => {
+                    let info = crate::tz::offset_info_for_local(tz, wall);
+                    Some((wall, info.total_secs, info.is_dst()))
+                }
+            }
         }
     }
 }
