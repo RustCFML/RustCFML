@@ -50,7 +50,7 @@ sqlite = ["rusqlite"]
 mysql_db = ["dep:mysql"]
 postgres_db = ["dep:postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:rust_decimal", "dep:uuid"]
 #mssql_db = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread"]
-mssql_db = [ "dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread", "dep:rust_decimal", "dep:uuid", "dep:azure-identity", "dep:azure-core" ]
+mssql_db = [ "dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread", "dep:rust_decimal", "dep:uuid", "dep:azure_identity", "dep:azure_core" ]
 all-databases = ["sqlite", "mysql_db", "postgres_db", "mssql_db"]
 xml = ["quick-xml"]
 html = ["scraper", "ego-tree", "dep:html5ever"]
@@ -90,8 +90,8 @@ uuid = { version = "1", optional = true }
 # memcache openssl dep). MSSQL is not built for the wasm targets.
 tiberius = { version = "0.12", default-features = false, features = [ "native-tls", "chrono", "time", "bigdecimal", "rust_decimal", "tds-uuid", "tds73", "sql-browser-tokio" ], optional = true }
 # Azure AD token fetching for Azure SQL authentication
-azure-identity = { version = "0.21", optional = true }
-azure-core = { version = "0.21", optional = true }
+azure_identity = { version = "0.21", optional = true }
+azure_core = { version = "0.21", optional = true }
 tokio = { version = "1", features = ["rt", "net"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 r2d2 = "0.8"
