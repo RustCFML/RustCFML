@@ -88,7 +88,7 @@ uuid = { version = "1", optional = true }
 # tiberius 0.12.3 is the latest and has no rustls-0.23 path. native-tls uses the
 # OS TLS stack / vendored openssl (already vendored globally via the cli's
 # memcache openssl dep). MSSQL is not built for the wasm targets.
-tiberius = { version = "0.12", default-features = false, features = ["native-tls", "chrono", "time", "bigdecimal", "rust_decimal", "uuid", "tds73", "sql-browser-tokio", "integrated-auth-gssapi"], optional = true }
+tiberius = { version = "0.12", default-features = false, features = ["native-tls", "chrono", "time", "bigdecimal", "rust_decimal", "tds-uuid", "tds73", "sql-browser-tokio", "integrated-auth-gssapi"], optional = true }
 # Azure AD token fetching for Azure SQL authentication
 azure_identity = { version = "0.21", optional = true }
 azure_core = { version = "0.21", optional = true }
