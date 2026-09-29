@@ -19934,7 +19934,8 @@ impl CfmlVirtualMachine {
                         other => other.map(|v| v.as_string().to_lowercase()),
                     }
                     .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| "exittemplate".to_string());
+                    // No method: "exittag", CFML's default, same as the tag form.
+                    .unwrap_or_else(|| "exittag".to_string());
                     // `loop` re-executes the body of the custom tag, so it is
                     // only meaningful while a custom tag's END phase is running.
                     // Lucee raises here, at the `cfexit` itself, rather than

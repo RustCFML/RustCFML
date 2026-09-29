@@ -2692,12 +2692,15 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfexit" => {
             // <cfexit method="exittag|exittemplate|loop">. When `method` is
-            // omitted the default is "exittemplate". Lowered to the VM-intercepted
-            // `__cfexit` control-flow signal.
+            // omitted the default is "exittag", as on Lucee and ACF: a bare
+            // <cfexit> in a custom tag's start phase skips the tag's body and
+            // end phase. Outside a custom tag exittag behaves like exittemplate
+            // (the template stops and an includer carries on). Lowered to the
+            // VM-intercepted `__cfexit` control-flow signal.
             let method = attrs
                 .get("method")
                 .map(|m| m.trim().to_lowercase())
-                .unwrap_or_else(|| "exittemplate".to_string());
+                .unwrap_or_else(|| "exittag".to_string());
             (format!("__cfexit(\"{}\");\n", method), tag_end - start)
         }
         "cfhtmlhead" | "cfhtmlbody" => {

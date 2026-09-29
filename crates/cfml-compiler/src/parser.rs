@@ -1917,6 +1917,31 @@ impl Parser {
             })));
         }
 
+        // A bare `exit;` is <cfexit> with the default method (exittag). The
+        // `exit method=…;` form is handled with the other tag statements above;
+        // without this arm the bare form parsed as a lone `exit` identifier and
+        // the template ran on. Like `abort`, `exit` is a soft keyword, so it is
+        // only the statement when nothing follows it but the end of the
+        // statement or block.
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("exit"))
+            && matches!(self.peek(1), Token::Semicolon | Token::RBrace | Token::Eof)
+        {
+            self.advance(); // consume 'exit'
+            self.match_token(&Token::Semicolon);
+            let exit_call = Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "__cfexit".to_string(),
+                    location: stmt_loc.clone(),
+                })),
+                arguments: vec![],
+                location: stmt_loc.clone(),
+            }));
+            return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                expr: exit_call,
+                location: stmt_loc,
+            })));
+        }
+
         // Expression statement (may be assignment)
         let expr = self.parse_expression()?;
 
