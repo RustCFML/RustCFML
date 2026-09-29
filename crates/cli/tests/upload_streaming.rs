@@ -41,7 +41,16 @@ impl Drop for Server {
     }
 }
 
+/// Held from picking a port until the server is accepting on it. free_port()
+/// binds :0 and releases it, so two tests starting at once can be handed the
+/// SAME port: one server binds, the other exits with "Address already in use",
+/// both readiness probes still succeed (they reach the survivor), and the loser
+/// then gets "Connection refused" once the other test kills its server. Seen as
+/// an intermittent CI failure of streamed_upload_arrives_intact_and_exposes_no_raw_body.
+static START: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn start_server() -> Server {
+    let _serialised = START.lock().unwrap_or_else(|e| e.into_inner());
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
         .arg("--serve")

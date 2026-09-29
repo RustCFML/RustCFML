@@ -63,7 +63,15 @@ fn warmup_get(port: u16) {
     let _ = stream.read_to_end(&mut buf);
 }
 
+/// Held from picking a port until the server is accepting on it: free_port()
+/// binds :0 and releases it, so two tests starting at once can be handed the
+/// same port. One server then fails to bind and exits, both readiness probes
+/// still succeed against the survivor, and the loser's requests are refused
+/// once the other test stops its server (an intermittent CI failure).
+static START: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn start_server() -> Server {
+    let _serialised = START.lock().unwrap_or_else(|e| e.into_inner());
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
         .arg("--serve")
