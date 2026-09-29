@@ -1669,17 +1669,29 @@ fn fn_find_one_of(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 /// Byte offset of the `n`th character of `s` (0-based), or `s.len()` when `s`
-/// has `n` characters or fewer. ASCII text is indexed directly; otherwise the
-/// walk stops at the target instead of copying the string into a `Vec<char>`,
-/// which is what `mid`/`left`/`right` used to do on every call.
+/// has `n` characters or fewer. Costs O(n), not O(len): when the first `n`
+/// bytes are ASCII they are exactly the first `n` characters. `mid`/`left`/
+/// `right` used to copy the whole string into a `Vec<char>` on every call.
 fn char_offset(s: &str, n: usize) -> usize {
     if n >= s.len() {
         return s.len();
     }
-    if s.is_ascii() {
+    if s.as_bytes()[..n].is_ascii() {
         return n;
     }
     s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Byte offset where the last `n` characters of `s` begin (0 when `s` has `n`
+/// characters or fewer), walking back from the end.
+fn char_offset_from_end(s: &str, n: usize) -> usize {
+    if n == 0 {
+        return s.len();
+    }
+    if n <= s.len() && s.as_bytes()[s.len() - n..].is_ascii() {
+        return s.len() - n;
+    }
+    s.char_indices().rev().nth(n - 1).map(|(b, _)| b).unwrap_or(0)
 }
 
 fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
@@ -1709,9 +1721,7 @@ fn fn_left(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_right(args: Vec<CfmlValue>) -> CfmlResult {
     let string = get_str(&args, 0);
     let count = get_int(&args, 1).max(0) as usize;
-    let total = if string.is_ascii() { string.len() } else { string.chars().count() };
-    let skip = total.saturating_sub(count);
-    Ok(CfmlValue::string(string[char_offset(&string, skip)..].to_string()))
+    Ok(CfmlValue::string(string[char_offset_from_end(&string, count)..].to_string()))
 }
 
 fn fn_reverse(args: Vec<CfmlValue>) -> CfmlResult {
