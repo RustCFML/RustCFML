@@ -31,8 +31,11 @@ shim = createObject("java", "java.util.Date").init(0);
 savecontent variable="shimdump" {
     writeDump(shim);
 }
-assertTrue("java shim labelled Java", findNoCase("Java", shimdump) GT 0);
-assertTrue("java shim shows class", findNoCase("java.util.date", shimdump) GT 0);
+// RustCFML's dump markup (Lucee renders a java.util.Date as a plain date).
+if ( isRustCFML() ) {
+	assertTrue("java shim labelled Java", findNoCase("Java", shimdump) GT 0);
+	assertTrue("java shim shows class", findNoCase("java.util.date", shimdump) GT 0);
+}
 assertFalse("java shim hides __java_shim marker", findNoCase("__java_shim", shimdump) GT 0);
 
 // output="console" sends the dump to the server console (stdout), NOT the page
@@ -55,7 +58,10 @@ savecontent variable="qdump" {
 }
 assertTrue("query dump labelled Query", findNoCase("Query", qdump) GT 0);
 assertTrue("query dump shows column", findNoCase("name", qdump) GT 0);
-assertTrue("query dump shows record count", findNoCase("1 row", qdump) GT 0 OR findNoCase("Records: 1", qdump) GT 0);
+// RustCFML's dump wording; Lucee's markup words the count differently.
+if ( isRustCFML() ) {
+	assertTrue("query dump shows record count", findNoCase("1 row", qdump) GT 0 OR findNoCase("Records: 1", qdump) GT 0);
+}
 // Executed (QoQ) queries carry an execution time, surfaced as "ms".
 assertTrue("query dump shows execution time", findNoCase(" ms", qdump) GT 0);
 // And the originating SQL.
