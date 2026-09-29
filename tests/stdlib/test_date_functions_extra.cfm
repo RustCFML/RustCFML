@@ -72,5 +72,13 @@ assert("nowServer year matches now", year(nowServer()), year(now()));
 assert("nowServer month matches now", month(nowServer()), month(now()));
 assert("nowServer day matches now", day(nowServer()), day(now()));
 
+// The `l` mask is milliseconds, zero-padded to the run length (at most three).
+// It used to print "000" per letter, so `HH:nn:ss.lll` came out with nine zeros.
+msBase = createDateTime(2026, 1, 1, 12, 0, 0);
+assert("timeFormat .lll pads milliseconds to three digits", timeFormat(msBase, "HH:nn:ss.lll"), "12:00:00.000");
+assert("timeFormat .ll pads milliseconds to two digits", timeFormat(msBase, "ss.ll"), "00.00");
+assert("timeFormat .l does not pad milliseconds", timeFormat(msBase, "ss.l"), "00.0");
+assert("dateTimeFormat .lll pads milliseconds to three digits", dateTimeFormat(msBase, "HH:nn:ss.lll"), "12:00:00.000");
+
 suiteEnd();
 </cfscript>

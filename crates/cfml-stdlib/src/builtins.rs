@@ -1491,7 +1491,11 @@ fn fn_replace(args: Vec<CfmlValue>) -> CfmlResult {
         let find = get_str(&args, 1);
         let replace_with = get_str(&args, 2);
         let scope = if args.len() >= 4 { get_str(&args, 3).to_lowercase() } else { "one".to_string() };
-        if scope == "all" {
+        if find.is_empty() {
+            // Lucee returns the input unchanged; Rust's str::replace("") would
+            // insert the replacement between every character.
+            Ok(CfmlValue::string(string))
+        } else if scope == "all" {
             Ok(CfmlValue::string(string.replace(&find, &replace_with)))
         } else {
             Ok(CfmlValue::string(string.replacen(&find, &replace_with, 1)))
@@ -1506,35 +1510,97 @@ fn fn_replace_no_case(args: Vec<CfmlValue>) -> CfmlResult {
         let string = get_str(&args, 0);
         let find = get_str(&args, 1);
         let replace_with = get_str(&args, 2);
-        let scope = if args.len() >= 4 { get_str(&args, 3).to_lowercase() } else { "one".to_string() };
-        let find_lower = find.to_lowercase();
-
-        if scope == "all" {
-            let mut result = String::new();
-            let lower = string.to_lowercase();
-            let mut start = 0;
-            while let Some(pos) = lower[start..].find(&find_lower) {
-                result.push_str(&string[start..start + pos]);
-                result.push_str(&replace_with);
-                start += pos + find.len();
-            }
-            result.push_str(&string[start..]);
-            Ok(CfmlValue::string(result))
-        } else {
-            let lower = string.to_lowercase();
-            if let Some(pos) = lower.find(&find_lower) {
-                let mut result = String::new();
-                result.push_str(&string[..pos]);
-                result.push_str(&replace_with);
-                result.push_str(&string[pos + find.len()..]);
-                Ok(CfmlValue::string(result))
-            } else {
-                Ok(CfmlValue::string(string))
-            }
+        let all = args.len() >= 4 && get_str(&args, 3).eq_ignore_ascii_case("all");
+        if find.is_empty() {
+            // Lucee refuses an empty substring here (plain replace() does not).
+            return Err(CfmlError::expression(
+                "Invalid call of the function [ReplaceNoCase], second Argument [sub1] is invalid, \
+                 The string length must be greater than 0"
+                    .to_string(),
+            ));
         }
+        Ok(CfmlValue::string(replace_nocase_str(&string, &find, &replace_with, all)))
     } else {
         Ok(CfmlValue::string(get_str(&args, 0)))
     }
+}
+
+/// The character `find_nocase` compares: the simple (one-to-one) uppercase
+/// mapping, or `c` itself when Unicode maps it to several characters. `ß` has
+/// no single-character uppercase, yet Lucee matches it with the capital `ẞ`,
+/// so both fold to `ß`.
+fn simple_upper(c: char) -> char {
+    if c == '\u{1E9E}' {
+        return '\u{DF}';
+    }
+    let mut it = c.to_uppercase();
+    match (it.next(), it.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
+/// Case-insensitive search for `needle` in `hay` from byte offset `from`.
+/// Returns the byte range of the match IN `hay`, so the caller can slice the
+/// original string.
+///
+/// Characters are compared one at a time after simple uppercasing, which is
+/// what Lucee's replaceNoCase does: `ı`/`ſ` match `I`/`S`, while `İ`, the
+/// Kelvin sign and the Ohm sign match nothing but themselves. Lowercasing the
+/// whole string instead is wrong twice over: some characters change byte
+/// length when lowercased (`İ` is 2 bytes, `i̇` is 3), so offsets found in the
+/// lowercased copy sliced the original off a char boundary and panicked the
+/// engine.
+fn find_nocase(hay: &str, needle: &str, from: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() || from > hay.len() {
+        return None;
+    }
+    let rest = &hay[from..];
+    if rest.is_ascii() && needle.is_ascii() {
+        // ASCII case-folding keeps every byte offset, so a folded copy is exact.
+        let pos = rest.to_ascii_lowercase().find(&needle.to_ascii_lowercase())?;
+        return Some((from + pos, from + pos + needle.len()));
+    }
+    let pat: Vec<char> = needle.chars().map(simple_upper).collect();
+    for (start, _) in rest.char_indices() {
+        let mut it = rest[start..].char_indices();
+        let mut matched = true;
+        let mut end = rest.len();
+        for (i, pc) in pat.iter().enumerate() {
+            match it.next() {
+                Some((_, hc)) if simple_upper(hc) == *pc => {
+                    if i + 1 == pat.len() {
+                        end = it.next().map(|(o, _)| start + o).unwrap_or(rest.len());
+                    }
+                }
+                _ => {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if matched {
+            return Some((from + start, from + end));
+        }
+    }
+    None
+}
+
+/// Replace the first (or every, non-overlapping) case-insensitive occurrence
+/// of `find` in `string`. `find` must be non-empty.
+fn replace_nocase_str(string: &str, find: &str, replace_with: &str, all: bool) -> String {
+    let mut result = String::with_capacity(string.len());
+    let mut start = 0;
+    while let Some((m_start, m_end)) = find_nocase(string, find, start) {
+        result.push_str(&string[start..m_start]);
+        result.push_str(replace_with);
+        start = m_end;
+        if !all {
+            break;
+        }
+    }
+    result.push_str(&string[start..]);
+    result
 }
 
 /// Byte offset in `s` for the given 0-based CHARACTER index. Returns `s.len()`
@@ -2573,17 +2639,7 @@ fn fn_replace_list_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     let items2: Vec<&str> = list2.split(|c: char| delimiter.contains(c)).filter(|s| !s.is_empty()).collect();
     for (i, find) in items1.iter().enumerate() {
         let replace_with = items2.get(i).unwrap_or(&"");
-        let lower = string.to_lowercase();
-        let find_lower = find.to_lowercase();
-        let mut result = String::new();
-        let mut start = 0;
-        while let Some(pos) = lower[start..].find(&find_lower) {
-            result.push_str(&string[start..start + pos]);
-            result.push_str(replace_with);
-            start += pos + find.len();
-        }
-        result.push_str(&string[start..]);
-        string = result;
+        string = replace_nocase_str(&string, find, replace_with, true);
     }
     Ok(CfmlValue::string(string))
 }
@@ -5785,7 +5841,19 @@ fn match_format_token(chars: &[char], pos: usize, dt: &NaiveDateTime, mode: Form
             'n' | 'N' => return Some((1, format!("{}", dt.minute()))),
             's' | 'S' => return Some((1, format!("{}", dt.second()))),
             't' | 'T' => return Some((1, if dt.hour() < 12 { "A".into() } else { "P".into() })),
-            'l' | 'L' => return Some((1, "000".into())),
+            'l' | 'L' => {
+                // Milliseconds, zero-padded to the run length, at most three:
+                // Lucee formats 5ms as `l`=5, `ll`=05, `lll`=005, and `llll` as
+                // `lll` followed by `l`. This arm emitted "000" per letter, so
+                // the common `HH:nn:ss.lll` mask printed nine zeros.
+                let run = chars[pos..]
+                    .iter()
+                    .take(3)
+                    .take_while(|c| c.eq_ignore_ascii_case(&'l'))
+                    .count();
+                let ms = dt.nanosecond() / 1_000_000;
+                return Some((run, format!("{:0width$}", ms, width = run)));
+            }
             _ => {}
         }
     }

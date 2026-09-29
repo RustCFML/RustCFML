@@ -225,6 +225,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_hash_unknown_algorithm.cfm">
 <cf_runtest file="stdlib/test_java_shim_silent_noops.cfm">
 <cf_runtest file="stdlib/test_string_functions.cfm">
+<cf_runtest file="stdlib/test_replace_nocase_unicode.cfm">
 <cf_runtest file="stdlib/test_string_functions_regex.cfm">
 <cf_runtest file="functions/test_string_position_unicode.cfm">
 <cf_runtest file="stdlib/test_string_split_member.cfm">
@@ -693,6 +694,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cflog_file_logging.cfm">
 <cf_runtest file="tags/test_tags_cfzip.cfm">
 <cf_runtest file="tags/test_tags_tld.cfm">
+<cf_runtest file="tags/test_tags_tld_tagfile.cfm" rustcfmlOnly="true" why="Lucee does not map CFML custom tags through a .tld tag-file entry">
 <cf_runtest file="tags/test_tags_whitespace.cfm">
 
 <!--- --- Includes --- --->

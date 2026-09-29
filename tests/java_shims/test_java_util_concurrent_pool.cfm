@@ -31,7 +31,7 @@ function makePool( required string policy, required numeric queueSize, numeric m
 		, 0
 		, createObject( "java", "java.util.concurrent.TimeUnit" ).SECONDS
 		, q
-		, javacast( "null", "" )
+		, createObject( "java", "java.util.concurrent.Executors" ).defaultThreadFactory()
 		, pol
 	);
 }
@@ -90,13 +90,18 @@ assert( "AbortPolicy raises RejectedExecutionException", caught, "java.util.conc
 assertTrue( "AbortPolicy accepts only what fits (running + queued)", accepted > 0 && accepted < 12 );
 
 // ---- DiscardPolicy drops the overflow instead of queueing it ----
-logC  = poolLog( "discard" );
-poolC = makePool( "DiscardPolicy", 2 );
-fsC   = [];
-for ( i = 1; i <= 12; i++ ) { arrayAppend( fsC, poolC.submit( task( logC, 100 ) ) ); }
-for ( f in fsC ) { f.get(); }
-assertTrue( "DiscardPolicy runs fewer tasks than were submitted", startCount( logC ) < 12 );
-assertTrue( "a discarded task's future reports cancelled", arrayLen( fsC.filter( function( f ){ return f.isCancelled(); } ) ) > 0 );
+// RustCFML-only: a discarded task's Future resolves as CANCELLED here, while the
+// JVM's never completes, so `f.get()` blocks forever on Lucee (a deliberate
+// divergence, docs/known-issues.md §76).
+if ( isRustCFML() ) {
+	logC  = poolLog( "discard" );
+	poolC = makePool( "DiscardPolicy", 2 );
+	fsC   = [];
+	for ( i = 1; i <= 12; i++ ) { arrayAppend( fsC, poolC.submit( task( logC, 100 ) ) ); }
+	for ( f in fsC ) { f.get(); }
+	assertTrue( "DiscardPolicy runs fewer tasks than were submitted", startCount( logC ) < 12 );
+	assertTrue( "a discarded task's future reports cancelled", arrayLen( fsC.filter( function( f ){ return f.isCancelled(); } ) ) > 0 );
+}
 
 // ---- CallerRunsPolicy drops nothing: the overflow runs on this thread ----
 logD  = poolLog( "callerruns" );
@@ -138,7 +143,7 @@ assert( "fileExists() sees a file created inside a task", denied, 0 );
 // was the adhoc-task heartbeat running its DB-migration check hundreds of times
 // per second.
 tickLog = getTempDirectory() & "/rustcfml_pool_tick_" & createUUID() & ".log";
-sched   = createObject( "java", "java.util.concurrent.ScheduledThreadPoolExecutor" ).init( 5, javacast( "null", "" ), javacast( "null", "" ) );
+sched   = createObject( "java", "java.util.concurrent.ScheduledThreadPoolExecutor" ).init( 5 );
 tickFuture = sched.scheduleAtFixedRate(
 	  createDynamicProxy( new java_shims.ConcurrentTickTask( tickLog ), [ "java.lang.Runnable" ] )
 	, 0
@@ -183,7 +188,7 @@ fileDelete( secLog );
 // application scope. Preside rebuilds its executors on every ?fwreinit=true, so
 // this leaked ~100MB per reload.
 shutLog = getTempDirectory() & "/rustcfml_pool_shut_" & createUUID() & ".log";
-shutExec = createObject( "java", "java.util.concurrent.ScheduledThreadPoolExecutor" ).init( 2, javacast( "null", "" ), javacast( "null", "" ) );
+shutExec = createObject( "java", "java.util.concurrent.ScheduledThreadPoolExecutor" ).init( 2 );
 shutExec.scheduleAtFixedRate(
 	  createDynamicProxy( new java_shims.ConcurrentTickTask( shutLog ), [ "java.lang.Runnable" ] )
 	, 0
@@ -199,6 +204,28 @@ ticksAtShutdown = listLen( fileRead( shutLog ), chr(10) );
 sleep( 400 );
 assert( "shutdown() stops the executor's periodic schedules", listLen( fileRead( shutLog ), chr(10) ), ticksAtShutdown );
 fileDelete( shutLog );
+
+// ---- the pool size bounds concurrent SCHEDULED runs too ----
+// ScheduledThreadPoolExecutor( 1 ) runs one task at a time across ALL of its
+// schedules: Preside builds its heartbeat pool with exactly 1 thread and relies
+// on its heartbeats never overlapping. Each schedule's runs were serialised, but
+// two schedules on one pool ran side by side.
+oneLog  = poolLog( "sched_bound" );
+oneExec = createObject( "java", "java.util.concurrent.ScheduledThreadPoolExecutor" ).init( 1 );
+for ( i = 1; i <= 2; i++ ) {
+	oneExec.scheduleAtFixedRate(
+		  createDynamicProxy( new java_shims.ConcurrentPoolTask( oneLog, 100 ), [ "java.lang.Runnable" ] )
+		, 0
+		, 40
+		, timeUnit.MILLISECONDS
+	);
+}
+sleep( 700 );
+oneExec.shutdown();
+sleep( 300 );
+assert( "a 1-thread scheduled pool never runs two schedules at once", peakConcurrency( oneLog ), 1 );
+assertTrue( "both schedules still get to run (got " & startCount( oneLog ) & " runs)", startCount( oneLog ) >= 3 );
+fileDelete( oneLog );
 
 suiteEnd();
 </cfscript>

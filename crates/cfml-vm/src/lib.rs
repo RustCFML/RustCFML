@@ -1214,7 +1214,7 @@ pub fn compile_file_cached(
     let needs_tag_parse =
         cfml_compiler::tag_parser::has_cfml_tags(&source_code) || is_template_ext;
     let source_code = if needs_tag_parse {
-        let converted = cfml_compiler::tag_parser::tags_to_script_checked(&source_code)
+        let converted = cfml_compiler::tag_parser::tags_to_script_checked_at(&source_code, path)
             .map_err(|msg| CfmlError::runtime(format!("{} in '{}'", msg, path)))?;
         if std::env::var("RUSTCFML_DUMP_TAGS").is_ok() {
             eprintln!(
@@ -26460,8 +26460,14 @@ impl CfmlVirtualMachine {
                     if let Some(ref p) = pool {
                         Self::with_pool(p, |pl| pl.register_schedule(outer_cancel.clone()));
                     }
+                    // Runs from a pooled schedule share the pool's size bound
+                    // (the JVM's corePoolSize), so a pool of 1 never runs two
+                    // schedules at once. An unpooled `_schedule` stays unbounded.
+                    let permits = pool
+                        .as_ref()
+                        .and_then(|p| Self::with_pool(p, |pl| pl.scheduled_permits()));
 
-                    if delay_ms <= 0 && period.is_none() {
+                    if delay_ms <= 0 && period.is_none() && permits.is_none() {
                         let handle = spawn_fn(seed);
                         let fut = async_kernel::FutureNative::from_handle(handle);
                         return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
@@ -26524,6 +26530,17 @@ impl CfmlVirtualMachine {
                             let mut first = true;
                             let mut run_at = first_at;
                             loop {
+                                if let Some(ref pm) = permits {
+                                    if !pm.acquire(&cancel_for_relay) {
+                                        // Cancelled while queued behind a
+                                        // sibling run: the schedule is over.
+                                        let _ = tx.send(ThreadResult {
+                                            status: "TERMINATED".to_string(),
+                                            ..Default::default()
+                                        });
+                                        return;
+                                    }
+                                }
                                 let inner = spawn_fn(seed.clone());
                                 // Wait for the inner cfthread to publish.
                                 let res = inner.rx.recv().ok();
@@ -26532,6 +26549,9 @@ impl CfmlVirtualMachine {
                                     h.join.take()
                                 } {
                                     let _ = j.join();
+                                }
+                                if let Some(ref pm) = permits {
+                                    pm.release();
                                 }
                                 let terminated = res
                                     .as_ref()

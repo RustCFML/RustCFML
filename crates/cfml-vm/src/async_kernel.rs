@@ -744,22 +744,44 @@ impl ExecutorPoolNative {
         }
     }
 
-    /// Block until a scheduled run may start, honouring the pool size. The
-    /// JVM's ScheduledThreadPoolExecutor bounds concurrent runs by corePoolSize
-    /// too — Preside builds its heartbeat pool with exactly 1 — so periodic
-    /// tasks must not each get a free thread.
-    pub fn acquire_scheduled(&self) {
+    /// A handle a schedule relay thread can hold to take run permits from this
+    /// pool without holding the executor object's lock while it waits.
+    pub fn scheduled_permits(&self) -> ScheduledPermits {
+        ScheduledPermits { inner: Arc::clone(&self.inner) }
+    }
+}
+
+/// Run permits for scheduled tasks. The JVM's ScheduledThreadPoolExecutor
+/// bounds concurrent runs by corePoolSize, and Preside builds its heartbeat
+/// pool with exactly 1, so two schedules on one pool must never run at once.
+#[derive(Clone)]
+pub struct ScheduledPermits {
+    inner: Arc<(std::sync::Mutex<PoolShared>, std::sync::Condvar)>,
+}
+
+impl ScheduledPermits {
+    /// Block until a scheduled run may start. Returns false, without taking a
+    /// permit, if `cancel` is set while waiting: a cancelled schedule must not
+    /// stay parked behind a long-running sibling.
+    pub fn acquire(&self, cancel: &std::sync::atomic::AtomicBool) -> bool {
         let (lock, cv) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         while g.scheduled_running >= g.max_concurrent {
-            g = cv.wait(g).unwrap();
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            g = cv
+                .wait_timeout(g, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
         g.scheduled_running += 1;
+        true
     }
 
-    pub fn release_scheduled(&self) {
+    pub fn release(&self) {
         let (lock, cv) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         g.scheduled_running = g.scheduled_running.saturating_sub(1);
         cv.notify_all();
     }

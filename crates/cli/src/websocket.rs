@@ -172,8 +172,11 @@ pub(crate) fn extract_client_events(src: &str) -> Vec<String> {
 /// at handshake time to read channel metadata (`socket=`, `history=`) without
 /// spinning up a VM.
 fn extract_attr(src: &str, name: &str) -> Option<String> {
-    let needle = format!("{}=", name.to_lowercase());
-    let lower = src.to_lowercase();
+    // ASCII folding only: it keeps byte offsets, so `pos` can slice `src`. A
+    // full Unicode lowercase changes the length of some characters (`İ`) and
+    // made the slice below panic mid-handshake.
+    let needle = format!("{}=", name.to_ascii_lowercase());
+    let lower = src.to_ascii_lowercase();
     let pos = lower.find(&needle)?;
     let rest = &src[pos + needle.len()..];
     let rest = rest.trim_start();
@@ -693,5 +696,19 @@ fn parse_json(text: &str) -> CfmlValue {
     match cfml_stdlib::builtins::fn_deserialize_json(vec![CfmlValue::string(text.to_string())]) {
         Ok(v) => v,
         Err(_) => CfmlValue::string(text.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `İ` lowercases to two characters, so a full lowercase shifted the match
+    /// position and the slice panicked (or read the wrong text) mid-handshake.
+    #[test]
+    fn extract_attr_after_length_changing_character() {
+        let src = "/** \u{130}stanbul \u{e9}\u{e9} */ component socket=\"chat\" history=\"5\" {}";
+        assert_eq!(extract_attr(src, "socket").as_deref(), Some("chat"));
+        assert_eq!(extract_attr(src, "History").as_deref(), Some("5"));
     }
 }

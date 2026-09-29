@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<taglib>
+    <tlib-version>1.0</tlib-version>
+    <short-name>tagfilelib</short-name>
+    <!-- The tag name differs from its file, so the tag only resolves if this
+         descriptor is actually read. -->
+    <tag>
+        <name>greet</name>
+        <tag-file>greeting_impl.cfm</tag-file>
+    </tag>
+</taglib>

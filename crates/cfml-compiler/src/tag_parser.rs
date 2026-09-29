@@ -36,7 +36,15 @@ use std::collections::HashMap;
 
 // TLD cache: prefix → (tag-name → file-name) parsed from .tld files.
 thread_local! {
+    /// prefix -> (tag name -> tag file), from the `.tld` files of the taglibs
+    /// imported by the template being compiled. Reset per compile: it used to
+    /// live for the whole thread, so a later template importing the same
+    /// prefix picked up an earlier template's tag mapping.
     static TLD_CACHE: RefCell<HashMap<String, HashMap<String, String>>> = RefCell::new(HashMap::new());
+    /// Directory of the template being compiled, when the caller knows it.
+    /// A relative `<cfimport taglib=...>` is resolved against it, like the
+    /// runtime resolves the emitted custom-tag path.
+    static SOURCE_DIR: RefCell<Option<std::path::PathBuf>> = RefCell::new(None);
 }
 
 /// Parse a .tld file and return tag-name → file-name mapping.
@@ -48,7 +56,9 @@ fn parse_tld_file(tld_path: &str) -> HashMap<String, String> {
     };
     // Best-effort parsing: find <tag><name>foo</name></tag> blocks
     // and optional <tag-class> or <tag-file> elements
-    let lower = content.to_lowercase();
+    // ASCII folding keeps byte offsets, so positions found in `lower` can slice
+    // `content`. A full Unicode lowercase shifts them past any `İ`.
+    let lower = content.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut pos = 0;
     while pos < bytes.len() {
@@ -56,7 +66,7 @@ fn parse_tld_file(tld_path: &str) -> HashMap<String, String> {
             let abs_start = pos + tag_start;
             if let Some(tag_end) = lower[abs_start..].find("</tag>") {
                 let block = &content[abs_start..abs_start + tag_end + 6];
-                let block_lower = block.to_lowercase();
+                let block_lower = block.to_ascii_lowercase();
                 // Extract <name>
                 let name = extract_tld_element(&block_lower, block, "name");
                 if let Some(tag_name) = name {
@@ -309,6 +319,7 @@ pub fn tags_to_script(source: &str) -> String {
     // surface in every rendered response.
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut imports = std::collections::HashMap::<String, String>::new();
+    TLD_CACHE.with(|c| c.borrow_mut().clear());
     PREPROCESS_ERROR.with(|e| *e.borrow_mut() = None);
     TAG_NEST_DEPTH.with(|d| d.set(0));
     tags_to_script_impl(source, &mut imports)
@@ -324,6 +335,17 @@ pub fn tags_to_script_checked(source: &str) -> Result<String, String> {
         Some(msg) => Err(msg),
         None => Ok(out),
     }
+}
+
+/// [`tags_to_script_checked`] for a source read from `source_path`, so a
+/// relative `<cfimport taglib=...>` finds its `.tld` next to the template
+/// instead of relative to the process's working directory.
+pub fn tags_to_script_checked_at(source: &str, source_path: &str) -> Result<String, String> {
+    let dir = std::path::Path::new(source_path).parent().map(|p| p.to_path_buf());
+    SOURCE_DIR.with(|d| *d.borrow_mut() = dir);
+    let out = tags_to_script_checked(source);
+    SOURCE_DIR.with(|d| *d.borrow_mut() = None);
+    out
 }
 
 /// Internal implementation that threads cfimport prefix→taglib mappings through.
@@ -2655,8 +2677,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let (Some(taglib), Some(prefix)) = (attrs.get("taglib"), attrs.get("prefix")) {
                 let prefix_lower = prefix.to_lowercase();
                 imports.insert(prefix_lower.clone(), taglib.clone());
-                // Check for .tld files in the taglib directory
-                if let Ok(entries) = std::fs::read_dir(taglib) {
+                // Check for .tld files in the taglib directory. A relative
+                // taglib is relative to the template, not the process CWD.
+                let taglib_dir = {
+                    let p = std::path::Path::new(taglib.as_str());
+                    match SOURCE_DIR.with(|d| d.borrow().clone()) {
+                        Some(dir) if p.is_relative() => dir.join(p),
+                        _ => p.to_path_buf(),
+                    }
+                };
+                TLD_CACHE.with(|cache| {
+                    cache.borrow_mut().remove(&prefix_lower);
+                });
+                if let Ok(entries) = std::fs::read_dir(&taglib_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.extension().map_or(false, |e| e == "tld") {
@@ -4915,6 +4948,28 @@ fn parse_cfprocresult_tags(body: &str) -> Vec<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `İ` lowercases to two characters (3 bytes vs 2). The parser found tag
+    /// positions in a lowercased copy and sliced the ORIGINAL with them, so one
+    /// `İ` before a tag and a multi-byte character after it put the slice
+    /// inside that character and panicked the compiler.
+    #[test]
+    fn test_tld_offsets_survive_length_changing_lowercase() {
+        let dir = std::env::temp_dir().join(format!("rustcfml_tld_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.tld");
+        std::fs::write(
+            &path,
+            "<taglib><description>\u{130}</description>\
+             <tag><name>Hello</name><tag-file>hello.cfm</tag-file></tag>\u{e9}\
+             <tag><name>upper</name></tag></taglib>",
+        )
+        .unwrap();
+        let map = parse_tld_file(&path.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(map.get("hello").map(String::as_str), Some("hello.cfm"));
+        assert_eq!(map.get("upper").map(String::as_str), Some("upper.cfm"));
+    }
 
     /// Every `<cfhttp>` attribute must reach the options struct. The lowering
     /// used to copy a fixed ten-key whitelist, so `name=`/`file=`/`path=` (and

@@ -26,6 +26,10 @@ component {
     // there and the suite aborts mid-file.
     this.mappings["/compat_engine"] = getDirectoryFromPath(getCurrentTemplatePath()) & "compat_engine/";
 
+    // Map "java_shims" so `new java_shims.ConcurrentPoolTask(...)` resolves on
+    // Lucee too (same reason as /compat_engine above).
+    this.mappings["/java_shims"] = getDirectoryFromPath(getCurrentTemplatePath()) & "java_shims/";
+
     // Map "comments" so createObject("component", "comments.BlockCommentTags")
     // resolves (issue #69 fixture).
     this.mappings["/comments"] = getDirectoryFromPath(getCurrentTemplatePath()) & "comments/";
