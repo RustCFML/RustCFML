@@ -1,0 +1,12 @@
+#Windows security hardening 
+#this is an open source project, the clients code still should have baseline security out of the gate
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-Ccontrol-flow-guard",     # Enables Control Flow Guard (CFG)
+    "-Clink-arg=/DYNAMICBASE",   # Enables ASLR
+    "-Clink-arg=/NXCOMPAT",      # Enables DEP / NX
+    "-Clink-arg=/HIGHENTROPYVA", # High-entropy 64-bit ASLR
+    "-Clink-arg=/CETCOMPAT",     # Control-flow Enforcement Technology
+    "-Clink-arg=/DEBUG:NONE",    # Disables/strips debug symbol generation
+    "-Cstack-protector=strong"  # Stack clash / canary protection
+]
