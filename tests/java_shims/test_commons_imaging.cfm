@@ -18,7 +18,10 @@ imageInfo = imaging.getImageInfo( fileobj );
 
 assert( "getWidth reports the pixel width",  imageInfo.getWidth(),  120 );
 assert( "getHeight reports the pixel height", imageInfo.getHeight(), 80 );
-assert( "getFormatName detects PNG from magic bytes", imageInfo.getFormatName(), "PNG" );
+// The real library's strings (checked against Commons Imaging on Lucee 7.1):
+// Preside stores the format name in asset metadata.
+assert( "getFormatName detects PNG from magic bytes", imageInfo.getFormatName(), "PNG Portable Network Graphics" );
+assert( "getFormatDetails", imageInfo.getFormatDetails(), "Png" );
 assertTrue( "getNumberOfImages is at least 1", imageInfo.getNumberOfImages() >= 1 );
 assertFalse( "a baseline PNG is not progressive", imageInfo.isProgressive() );
 assertTrue( "bitsPerPixel is populated", isNumeric( imageInfo.getBitsPerPixel() ) && imageInfo.getBitsPerPixel() > 0 );
