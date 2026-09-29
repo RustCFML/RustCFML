@@ -580,38 +580,9 @@ fn short_path(p: &str) -> &str {
     p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
 
-/// A minimal case-insensitive glob: `*` matches any run of characters. Supports
-/// leading/trailing/embedded `*`; everything else is a literal.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let p = pattern.to_ascii_lowercase();
-    let n = name.to_ascii_lowercase();
-    let parts: Vec<&str> = p.split('*').collect();
-    if parts.len() == 1 {
-        return p == n;
-    }
-    let mut pos = 0usize;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            if !n[pos..].starts_with(part) {
-                return false;
-            }
-            pos += part.len();
-        } else if i == parts.len() - 1 {
-            return n[pos..].ends_with(part);
-        } else if let Some(idx) = n[pos..].find(part) {
-            pos += idx + part.len();
-        } else {
-            return false;
-        }
-    }
-    true
-}
+// Span-name filters use the MCP allow-list glob: `*` and `?`, case-insensitive.
+// (This file carried its own `*`-only copy; CFML names never contain `?`.)
+use crate::mcp::auth::glob_match;
 
 // ── RED metrics (Prometheus) ──────────────────────────────────────────────
 
