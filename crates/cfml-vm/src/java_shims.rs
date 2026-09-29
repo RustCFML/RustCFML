@@ -5999,8 +5999,10 @@ pub fn handle_java_timezone(method: &str, args: Vec<CfmlValue>, object: &CfmlVal
             return Ok(CfmlValue::strukt(shim));
         }
         "getdefault" => {
-            let id = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
-            return Ok(make_tz(&id));
+            // The JVM default is the host zone — the same one a DateFormat with
+            // no setTimeZone() formats in. This read only $TZ and otherwise said
+            // "UTC", so on a host with no $TZ it disagreed with the formatter.
+            return Ok(make_tz(&crate::tz::system_tz_id()));
         }
         "gettimezone" => {
             let id = args.first().map(|v| v.as_string()).unwrap_or_else(|| "UTC".to_string());

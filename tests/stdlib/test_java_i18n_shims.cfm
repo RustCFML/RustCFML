@@ -56,6 +56,13 @@ assert( "DateFormat.LONG", df.LONG, 1 );
 assert( "DateFormat.MEDIUM", df.MEDIUM, 2 );
 assert( "DateFormat.SHORT", df.SHORT, 3 );
 
+// A formatter with no setTimeZone() formats in the JVM default zone (the host's),
+// and `d` is an instant in the REQUEST zone, so the expected text below holds
+// only when the two agree. The test config pins the request zone
+// (Europe/London) while CI hosts run UTC: pin the request zone to the host's
+// for this block, and restore it at the end.
+dfPriorTz = getTimezone();
+setTimezone( timeZone.getDefault().getID() );
 d = createDateTime( 2024, 6, 10, 14, 5, 9 );
 enGB = aLocale.init( "en", "GB" );
 
@@ -100,6 +107,7 @@ setTimezone( "UTC" );
 dUtc = createDateTime( 2024, 6, 10, 14, 5, 9 );
 assert( "a UTC instant formatted in New York is converted", fLong.format( dUtc ), "10:05:09" & nnbsp & "AM EDT" );
 setTimezone( priorTz );
+setTimezone( dfPriorTz );
 
 // RustCFML-specific: rather than emit a guessed string, the shim still throws
 // for what it can't reproduce faithfully — an unverified locale (CLDR pattern
