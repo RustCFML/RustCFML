@@ -521,10 +521,7 @@ impl Drop for McpClient {
 /// Build a client from the `mcpConnect()` arguments.
 pub fn connect_from_options(kind: &str, options: &ValueMap) -> Result<McpClient, String> {
     let get = |key: &str| {
-        options
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.clone())
+        options.get(key).cloned()
     };
     let timeout = get("timeout")
         .and_then(|v| v.as_string().parse::<f64>().ok())

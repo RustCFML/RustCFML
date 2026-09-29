@@ -173,9 +173,7 @@ impl CfmlVirtualMachine {
         // `type` on the TAG is the admin context ("web"/"server"); on a
         // datasource it is the driver. `dbdriver` is unambiguous, so when it is
         // present `type` is dropped rather than mistaken for the driver.
-        let has_dbdriver = opts
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("dbdriver"));
+        let has_dbdriver = opts.data_contains_key("dbdriver");
         let mut def = ValueMap::default();
         for (k, v) in opts.iter() {
             let lk = k.to_lowercase();

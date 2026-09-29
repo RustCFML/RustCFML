@@ -10171,30 +10171,21 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
     let (mut url, method, headers, body, timeout_secs, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port, get_as_binary) = match &arg {
         CfmlValue::String(url) => ((**url).clone(), "GET".to_string(), HashMap::<String, String>::new(), None::<Vec<u8>>, 30u64, false, true, true, None::<u16>, None::<String>, None::<u16>, false),
         CfmlValue::Struct(opts) => {
-            let mut url = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("url"))
-                .map(|(_, v)| v.as_string())
+            let mut url = opts.data_get("url").map(|v| v.as_string())
                 .unwrap_or_default();
-            let method = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("method"))
-                .map(|(_, v)| v.as_string().to_uppercase())
+            let method = opts.data_get("method").map(|v| v.as_string().to_uppercase())
                 .unwrap_or_else(|| "GET".to_string());
-            let mut hdrs: HashMap<String, String> = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("headers"))
-                .and_then(|(_,v)| if let CfmlValue::Struct(h) = v {
+            let mut hdrs: HashMap<String, String> = opts.data_get("headers").and_then(|v| if let CfmlValue::Struct(h) = v {
                     Some(h.iter().map(|(k, v)| (k.as_str().to_string(), v.as_string())).collect())
                 } else { None })
                 .unwrap_or_default();
             // Process cfhttpparam params array
-            if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
+            if let Some(CfmlValue::Array(params)) = opts.data_get("params") {
                 for param in params.iter() {
                     if let CfmlValue::Struct(p) = param {
-                        let ptype = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("type"))
-                            .map(|(_, v)| v.as_string().to_lowercase()).unwrap_or_default();
-                        let pname = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                            .map(|(_, v)| v.as_string()).unwrap_or_default();
-                        let pvalue = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                            .map(|(_, v)| v.as_string()).unwrap_or_default();
+                        let ptype = p.data_get("type").map(|v| v.as_string().to_lowercase()).unwrap_or_default();
+                        let pname = p.data_get("name").map(|v| v.as_string()).unwrap_or_default();
+                        let pvalue = p.data_get("value").map(|v| v.as_string()).unwrap_or_default();
                         match ptype.as_str() {
                             "header" => { hdrs.insert(pname, pvalue); }
                             "cookie" => { hdrs.entry("Cookie".to_string()).and_modify(|v| { v.push_str(&format!("; {}={}", pname, pvalue)); }).or_insert(format!("{}={}", pname, pvalue)); }
@@ -10208,22 +10199,18 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             // Explicit body attr (string) — wins over param-built body.
-            let explicit_body: Option<Vec<u8>> = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("body"))
-                .and_then(|(_, v)| if matches!(v, CfmlValue::Null) { None } else { Some(v.as_string().into_bytes()) });
+            let explicit_body: Option<Vec<u8>> = opts.data_get("body").and_then(|v| if matches!(v, CfmlValue::Null) { None } else { Some(v.as_string().into_bytes()) });
 
             // Multipart attr: true/yes/"true"/"yes" → opt-in. A type="file"
             // cfhttpparam also forces multipart (Lucee parity — you can't send
             // file uploads as urlencoded).
-            let multipart_attr = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("multipart"))
-                .map(|(_, v)| match v {
+            let multipart_attr = opts.data_get("multipart").map(|v| match v {
                     CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
                     _ => false,
                 })
                 .unwrap_or(false);
-            let has_file_param = if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
+            let has_file_param = if let Some(CfmlValue::Array(params)) = opts.data_get("params") {
                 params.iter().any(|p| {
                     if let CfmlValue::Struct(s) = p {
                         s.iter().any(|(k, v)| k.eq_ignore_ascii_case("type") && v.as_string().eq_ignore_ascii_case("file"))
@@ -10234,7 +10221,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
 
             // Build body from cfhttpparam params if no explicit body attr.
             let body: Option<Vec<u8>> = if explicit_body.is_none() {
-                if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
+                if let Some(CfmlValue::Array(params)) = opts.data_get("params") {
                     if use_multipart {
                         // Generate a boundary unlikely to collide with body bytes.
                         // Combines a fixed prefix, the request URL hash, and a
@@ -10250,14 +10237,11 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                         let crlf = b"\r\n";
                         for param in params.iter() {
                             let p = match param { CfmlValue::Struct(s) => s, _ => continue };
-                            let ptype = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("type"))
-                                .map(|(_, v)| v.as_string().to_lowercase()).unwrap_or_default();
-                            let pname = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                                .map(|(_, v)| v.as_string()).unwrap_or_default();
+                            let ptype = p.data_get("type").map(|v| v.as_string().to_lowercase()).unwrap_or_default();
+                            let pname = p.data_get("name").map(|v| v.as_string()).unwrap_or_default();
                             match ptype.as_str() {
                                 "formfield" => {
-                                    let pvalue = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                                        .map(|(_, v)| v.as_string()).unwrap_or_default();
+                                    let pvalue = p.data_get("value").map(|v| v.as_string()).unwrap_or_default();
                                     buf.extend_from_slice(dashes);
                                     buf.extend_from_slice(boundary.as_bytes());
                                     buf.extend_from_slice(crlf);
@@ -10266,10 +10250,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                     buf.extend_from_slice(crlf);
                                 }
                                 "file" => {
-                                    let file_path = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("file"))
-                                        .map(|(_, v)| v.as_string()).unwrap_or_default();
-                                    let mime = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("mimetype"))
-                                        .map(|(_, v)| v.as_string())
+                                    let file_path = p.data_get("file").map(|v| v.as_string()).unwrap_or_default();
+                                    let mime = p.data_get("mimetype").map(|v| v.as_string())
                                         .filter(|s| !s.is_empty())
                                         .unwrap_or_else(|| "application/octet-stream".to_string());
                                     // `value=` supplies the content inline; `file=` then names
@@ -10325,12 +10307,9 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                         let mut xml_body = None;
                         for param in params.iter() {
                             if let CfmlValue::Struct(p) = param {
-                                let ptype = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("type"))
-                                    .map(|(_, v)| v.as_string().to_lowercase()).unwrap_or_default();
-                                let pname = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                                    .map(|(_, v)| v.as_string()).unwrap_or_default();
-                                let pvalue = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                                    .map(|(_, v)| v.as_string()).unwrap_or_default();
+                                let ptype = p.data_get("type").map(|v| v.as_string().to_lowercase()).unwrap_or_default();
+                                let pname = p.data_get("name").map(|v| v.as_string()).unwrap_or_default();
+                                let pvalue = p.data_get("value").map(|v| v.as_string()).unwrap_or_default();
                                 match ptype.as_str() {
                                     "formfield" => form_parts.push(format!("{}={}", pname, pvalue)),
                                     "body" => xml_body = Some(pvalue),
@@ -10354,18 +10333,12 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             } else {
                 explicit_body
             };
-            let timeout = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("timeout"))
-                .map(|(_, v)| match v { CfmlValue::Int(i) => i as u64, CfmlValue::Double(d) => d as u64, CfmlValue::String(s) => s.parse().unwrap_or(30), _ => 30 })
+            let timeout = opts.data_get("timeout").map(|v| match v { CfmlValue::Int(i) => i as u64, CfmlValue::Double(d) => d as u64, CfmlValue::String(s) => s.parse().unwrap_or(30), _ => 30 })
                 .unwrap_or(30);
 
             // username/password -> Basic Auth
-            let username = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("username"))
-                .map(|(_, v)| v.as_string());
-            let password = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("password"))
-                .map(|(_, v)| v.as_string());
+            let username = opts.data_get("username").map(|v| v.as_string());
+            let password = opts.data_get("password").map(|v| v.as_string());
             if let (Some(ref user), Some(ref pass)) = (&username, &password) {
                 if !user.is_empty() {
                     let credentials = format!("{}:{}", user, pass);
@@ -10375,7 +10348,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             }
 
             // useragent -> User-Agent header
-            if let Some((_, v)) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("useragent")) {
+            if let Some(v) = opts.data_get("useragent") {
                 let ua = v.as_string();
                 if !ua.is_empty() {
                     hdrs.entry("User-Agent".to_string()).or_insert(ua);
@@ -10383,9 +10356,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             }
 
             // throwonerror
-            let throw_on_error = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("throwonerror"))
-                .map(|(_, v)| match v {
+            let throw_on_error = opts.data_get("throwonerror").map(|v| match v {
                     CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
                     _ => false,
@@ -10393,9 +10364,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 .unwrap_or(false);
 
             // redirect
-            let follow_redirects = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("redirect"))
-                .map(|(_, v)| match v {
+            let follow_redirects = opts.data_get("redirect").map(|v| match v {
                     CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no"),
                     _ => true,
@@ -10403,9 +10372,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 .unwrap_or(true);
 
             // encodeurl (default true)
-            let encode_url = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("encodeurl"))
-                .map(|(_, v)| match v {
+            let encode_url = opts.data_get("encodeurl").map(|v| match v {
                     CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no"),
                     _ => true,
@@ -10413,9 +10380,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 .unwrap_or(true);
 
             // port
-            let port = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("port"))
-                .and_then(|(_, v)| match v {
+            let port = opts.data_get("port").and_then(|v| match v {
                     CfmlValue::Int(i) => Some(i as u16),
                     CfmlValue::Double(d) => Some(d as u16),
                     CfmlValue::String(s) => s.parse::<u16>().ok(),
@@ -10423,21 +10388,15 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 });
 
             // proxyserver / proxyport
-            let proxy_server = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("proxyserver"))
-                .map(|(_, v)| v.as_string());
-            let proxy_port = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("proxyport"))
-                .and_then(|(_, v)| match v {
+            let proxy_server = opts.data_get("proxyserver").map(|v| v.as_string());
+            let proxy_port = opts.data_get("proxyport").and_then(|v| match v {
                     CfmlValue::Int(i) => Some(i as u16),
                     CfmlValue::Double(d) => Some(d as u16),
                     CfmlValue::String(s) => s.parse::<u16>().ok(),
                     _ => None,
                 });
 
-            let get_as_binary = opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("getasbinary"))
-                .map(|(_, v)| cfhttp_get_as_binary_enabled(&v))
+            let get_as_binary = opts.data_get("getasbinary").map(|v| cfhttp_get_as_binary_enabled(&v))
                 .unwrap_or(false);
 
             (url, method, hdrs, body, timeout, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port, get_as_binary)
@@ -10700,7 +10659,7 @@ pub(crate) fn datasource_attr_string(v: &CfmlValue) -> String {
     match v {
         CfmlValue::Struct(ds) => {
             for key in ["connectionString", "url", "database"] {
-                if let Some((_, cs)) = ds.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                if let Some(cs) = ds.data_get(key) {
                     let s = cs.as_string();
                     if !s.is_empty() {
                         return s;
@@ -12008,14 +11967,11 @@ fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlE
 /// always-compiled (no DB feature gate), so the helper has to be too.
 pub(crate) fn cfqueryparam_unwrap(v: &CfmlValue) -> CfmlValue {
     if let CfmlValue::Struct(s) = v {
-        let has_value = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+        let has_value = s.data_contains_key("value");
         if !has_value {
             return v.clone();
         }
-        let is_null = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("null"))
-            .map(|(_, nv)| match nv {
+        let is_null = s.data_get("null").map(|nv| match nv {
                 CfmlValue::Bool(b) => b,
                 CfmlValue::String(s) => {
                     s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
@@ -12026,10 +11982,7 @@ pub(crate) fn cfqueryparam_unwrap(v: &CfmlValue) -> CfmlValue {
         if is_null {
             return CfmlValue::Null;
         }
-        return s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-            .map(|(_, val)| val.clone())
+        return s.data_get("value")
             .unwrap_or(CfmlValue::Null);
     }
     v.clone()
@@ -12043,20 +11996,16 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
         CfmlValue::Array(arr) if !arr.is_empty() => {
             // Check if first element is a struct with "value" key (cfqueryparam style)
             if let Some(CfmlValue::Struct(first)) = arr.first() {
-                let has_value_key = first.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+                let has_value_key = first.data_contains_key("value");
                 if has_value_key {
                     let mut values = Vec::with_capacity(arr.len());
                     let mut type_hints = Vec::with_capacity(arr.len());
                     for item in arr.iter() {
                         if let CfmlValue::Struct(s) = item {
-                            let value = s.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                                .map(|(_, v)| v.clone())
+                            let value = s.data_get("value")
                                 .unwrap_or(CfmlValue::Null);
 
-                            let is_null = s.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("null"))
-                                .map(|(_, v)| {
+                            let is_null = s.data_get("null").map(|v| {
                                     match v {
                                         CfmlValue::Bool(b) => b,
                                         CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
@@ -12065,14 +12014,10 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                                 })
                                 .unwrap_or(false);
 
-                            let cfsqltype = s.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("cfsqltype"))
-                                .map(|(_, v)| v.as_string().to_lowercase())
+                            let cfsqltype = s.data_get("cfsqltype").map(|v| v.as_string().to_lowercase())
                                 .unwrap_or_else(|| "cf_sql_varchar".to_string());
 
-                            let is_list = s.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("list"))
-                                .map(|(_, v)| {
+                            let is_list = s.data_get("list").map(|v| {
                                     match v {
                                         CfmlValue::Bool(b) => b,
                                         CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
@@ -12081,9 +12026,7 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                                 })
                                 .unwrap_or(false);
 
-                            let separator = s.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
-                                .map(|(_, v)| v.as_string())
+                            let separator = s.data_get("separator").map(|v| v.as_string())
                                 .unwrap_or_else(|| ",".to_string());
 
                             if is_null {
@@ -12125,9 +12068,7 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
         CfmlValue::Array(arr) => {
             arr.iter().map(|item| {
                 if let CfmlValue::Struct(s) = item {
-                    let is_list = s.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("list"))
-                        .map(|(_, v)| {
+                    let is_list = s.data_get("list").map(|v| {
                             match v {
                                 CfmlValue::Bool(b) => b,
                                 CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
@@ -12136,13 +12077,9 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
                         })
                         .unwrap_or(false);
                     if is_list {
-                        let separator = s.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
-                            .map(|(_, v)| v.as_string())
+                        let separator = s.data_get("separator").map(|v| v.as_string())
                             .unwrap_or_else(|| ",".to_string());
-                        let value = s.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                            .map(|(_, v)| v.clone())
+                        let value = s.data_get("value")
                             .unwrap_or(CfmlValue::Null);
                         // Must agree with the expansion in the builder below,
                         // or the `?` count and the bind count drift apart.
@@ -12864,10 +12801,7 @@ pub fn fn_query_execute_dynamic(args: Vec<CfmlValue>) -> CfmlResult {
     let options_arg = args.get(2).cloned().unwrap_or(CfmlValue::Null);
 
     let datasource_attr: Option<String> = match &options_arg {
-        CfmlValue::Struct(opts) => opts
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| datasource_attr_string(&v)),
+        CfmlValue::Struct(opts) => opts.data_get("datasource").map(|v| datasource_attr_string(&v)),
         _ => None,
     };
     let ds_name = datasource_attr.unwrap_or_default();
@@ -12907,7 +12841,7 @@ pub fn fn_query_execute_dynamic(args: Vec<CfmlValue>) -> CfmlResult {
 fn normalize_positional_params(sql: String, raw_params: &CfmlValue) -> (String, CfmlValue) {
     if let CfmlValue::Array(arr) = raw_params {
         if let Some(CfmlValue::Struct(first)) = arr.first() {
-            if first.iter().any(|(k, _)| k.eq_ignore_ascii_case("value")) {
+            if first.data_contains_key("value") {
                 let (values, _hints) = normalize_query_params(raw_params);
                 // Check if any list params require SQL expansion
                 let placeholder_counts = get_list_placeholder_counts(raw_params);
@@ -13077,10 +13011,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     // omitted one entirely; final fallback is the historical `:memory:`
     // sqlite default so existing tests keep working.
     let datasource_attr: Option<String> = match &options_arg {
-        CfmlValue::Struct(opts) => opts
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| datasource_attr_string(&v)),
+        CfmlValue::Struct(opts) => opts.data_get("datasource").map(|v| datasource_attr_string(&v)),
         _ => None,
     };
 
@@ -13091,10 +13022,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     // has any `user:pass@` userinfo stripped — an exception struct routinely
     // ends up in a log or an error page, and must not carry a password there.
     let datasource_label: String = match &options_arg {
-        CfmlValue::Struct(opts) => match opts
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v)
+        CfmlValue::Struct(opts) => match opts.data_get("datasource")
         {
             Some(CfmlValue::Struct(_)) => "__temp__".to_string(),
             Some(v) => redact_datasource_credentials(&v.as_string()),
@@ -13145,10 +13073,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     // server-side KILL QUERY watchdog (see execute_mysql); other drivers accept
     // the option but do not yet enforce it (docs/known-issues.md).
     let query_timeout: Option<u32> = match &options_arg {
-        CfmlValue::Struct(opts) => opts
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("timeout"))
-            .and_then(|(_, v)| {
+        CfmlValue::Struct(opts) => opts.data_get("timeout").and_then(|v| {
                 let n = v.as_string().trim().parse::<i64>().ok()?;
                 if n > 0 { Some(n as u32) } else { None }
             }),
@@ -13159,10 +13084,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     // Lucee's "no limit" sentinel. Applied post-execution so it works uniformly
     // across every driver (GitHub #251 — was QoQ-only before).
     let max_rows: Option<usize> = match &options_arg {
-        CfmlValue::Struct(opts) => opts
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("maxrows"))
-            .and_then(|(_, v)| {
+        CfmlValue::Struct(opts) => opts.data_get("maxrows").and_then(|v| {
                 let n = v.as_string().trim().parse::<i64>().ok()?;
                 if n >= 0 { Some(n as usize) } else { None }
             }),
@@ -13376,12 +13298,10 @@ fn rewrite_mysql_system_vars(sql: &str) -> String {
 #[cfg(feature = "sqlite")]
 fn expand_sqlite_param_values(v: &CfmlValue) -> Vec<CfmlValue> {
     if let CfmlValue::Struct(s) = v {
-        let has_value_key = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+        let has_value_key = s.data_contains_key("value");
         if has_value_key {
             let flag = |name: &str| {
-                s.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                    .map(|(_, val)| match val {
+                s.data_get(name).map(|val| match val {
                         CfmlValue::Bool(b) => b,
                         CfmlValue::String(st) => {
                             st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes")
@@ -13393,16 +13313,10 @@ fn expand_sqlite_param_values(v: &CfmlValue) -> Vec<CfmlValue> {
             if flag("null") {
                 return vec![CfmlValue::Null];
             }
-            let value = s
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                .map(|(_, val)| val.clone())
+            let value = s.data_get("value")
                 .unwrap_or(CfmlValue::Null);
             if flag("list") {
-                let separator = s
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
-                    .map(|(_, val)| val.as_string())
+                let separator = s.data_get("separator").map(|val| val.as_string())
                     .unwrap_or_else(|| ",".to_string());
                 return cfml_common::dynamic::expand_list_param(&value, &separator);
             }
@@ -13435,9 +13349,7 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec
                     }
                     if end > start {
                         let param_name: String = String::from_utf8_lossy(&bytes[start..end]).to_string();
-                        let raw = map.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
-                            .map(|(_, v)| v)
+                        let raw = map.data_get(&param_name)
                             .unwrap_or(CfmlValue::Null);
                         // Named params may carry a cfqueryparam-style struct
                         // ({value, cfsqltype, null, list, ...}). Expand honouring
@@ -13556,10 +13468,7 @@ fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
         return unwrapped; // null=true (or a genuine NULL value) — no type coercion
     }
     if let CfmlValue::Struct(s) = v {
-        if let Some(cfsqltype) = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("cfsqltype"))
-            .map(|(_, val)| val.as_string().to_lowercase())
+        if let Some(cfsqltype) = s.data_get("cfsqltype").map(|val| val.as_string().to_lowercase())
         {
             return coerce_by_sqltype_value(&unwrapped, &cfsqltype);
         }
@@ -13577,11 +13486,9 @@ fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
 #[cfg(feature = "mysql_db")]
 fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
     if let CfmlValue::Struct(s) = v {
-        let has_value_key = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+        let has_value_key = s.data_contains_key("value");
         if has_value_key {
-            let is_null = s.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("null"))
-                .map(|(_, val)| match val {
+            let is_null = s.data_get("null").map(|val| match val {
                     CfmlValue::Bool(b) => b,
                     CfmlValue::String(st) => st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes"),
                     _ => false,
@@ -13590,26 +13497,18 @@ fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
             if is_null {
                 return vec![CfmlValue::Null];
             }
-            let value = s.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                .map(|(_, val)| val.clone())
+            let value = s.data_get("value")
                 .unwrap_or(CfmlValue::Null);
-            let cfsqltype = s.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("cfsqltype"))
-                .map(|(_, val)| val.as_string().to_lowercase())
+            let cfsqltype = s.data_get("cfsqltype").map(|val| val.as_string().to_lowercase())
                 .unwrap_or_else(|| "cf_sql_varchar".to_string());
-            let is_list = s.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("list"))
-                .map(|(_, val)| match val {
+            let is_list = s.data_get("list").map(|val| match val {
                     CfmlValue::Bool(b) => b,
                     CfmlValue::String(st) => st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes"),
                     _ => false,
                 })
                 .unwrap_or(false);
             if is_list {
-                let separator = s.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
-                    .map(|(_, val)| val.as_string())
+                let separator = s.data_get("separator").map(|val| val.as_string())
                     .unwrap_or_else(|| ",".to_string());
                 return cfml_common::dynamic::expand_list_param(&value, &separator)
                     .iter()
@@ -13649,10 +13548,7 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
             }
             if end > start {
                 let param_name: String = String::from_utf8_lossy(&bytes[start..end]).to_string();
-                let raw = map
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
-                    .map(|(_, v)| v)
+                let raw = map.data_get(&param_name)
                     .unwrap_or(CfmlValue::Null);
                 let expanded = expand_cfqueryparam_values(&raw);
                 out_sql.push_str(&sql[seg_start..i]);
@@ -16093,9 +15989,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                     .collect();
                 if !keys.is_empty() {
                     let cell = |row: &ValueMap, col: &str| -> CfmlValue {
-                        row.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(col))
-                            .map(|(_, v)| v.clone())
+                        row.get(col).cloned()
                             .unwrap_or(CfmlValue::Null)
                     };
                     rows.sort_by(|a, b| {
@@ -17182,10 +17076,7 @@ fn fn_jwt_verify(args: Vec<CfmlValue>) -> CfmlResult {
     let header_json = String::from_utf8_lossy(&base64url_decode(parts[0])).to_string();
     let header = fn_deserialize_json(vec![CfmlValue::string(header_json)])?;
     let alg_in_token = match &header {
-        CfmlValue::Struct(h) => h
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("alg"))
-            .map(|(_, v)| v.as_string())
+        CfmlValue::Struct(h) => h.data_get("alg").map(|v| v.as_string())
             .unwrap_or_default(),
         _ => String::new(),
     };
@@ -17210,12 +17101,12 @@ fn fn_jwt_verify(args: Vec<CfmlValue>) -> CfmlResult {
     let claims = fn_deserialize_json(vec![CfmlValue::string(payload_json)])?;
     if let CfmlValue::Struct(c) = &claims {
         let now = chrono::Utc::now().timestamp();
-        if let Some(exp) = c.iter().find(|(k, _)| k.eq_ignore_ascii_case("exp")).and_then(|(_, v)| jwt_claim_seconds(&v)) {
+        if let Some(exp) = c.data_get("exp").and_then(|v| jwt_claim_seconds(&v)) {
             if exp < now {
                 return Err(CfmlError::runtime("JwtVerify: token has expired.".to_string()));
             }
         }
-        if let Some(nbf) = c.iter().find(|(k, _)| k.eq_ignore_ascii_case("nbf")).and_then(|(_, v)| jwt_claim_seconds(&v)) {
+        if let Some(nbf) = c.data_get("nbf").and_then(|v| jwt_claim_seconds(&v)) {
             if nbf > now {
                 return Err(CfmlError::runtime("JwtVerify: token is not yet valid (nbf).".to_string()));
             }
@@ -19325,9 +19216,7 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     };
 
     let get_opt = |key: &str| -> Option<String> {
-        opts.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.as_string())
+        opts.data_get(key).map(|v| v.as_string())
     };
 
     let to = get_opt("to").unwrap_or_default();
@@ -19420,19 +19309,14 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     // `body`; a part may also wrap its attributes in an `attributeCollection`
     // struct (the form Wheels' Global.cfc $mail() emits), so look there too.
     #[cfg(feature = "smtp")]
-    let mail_parts: Vec<(String, String)> = if let Some((_, CfmlValue::Array(parts))) =
-        opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("parts"))
+    let mail_parts: Vec<(String, String)> = if let Some(CfmlValue::Array(parts)) = opts.data_get("parts")
     {
         parts.iter().filter_map(|p| {
             if let CfmlValue::Struct(ps) = p {
                 let lookup = |key: &str| -> Option<String> {
-                    ps.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
-                        .map(|(_, v)| v.as_string())
-                        .or_else(|| ps.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("attributeCollection"))
-                            .and_then(|(_, v)| if let CfmlValue::Struct(ac) = v {
-                                ac.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
-                                    .map(|(_, v)| v.as_string())
+                    ps.data_get(key).map(|v| v.as_string())
+                        .or_else(|| ps.data_get("attributeCollection").and_then(|v| if let CfmlValue::Struct(ac) = v {
+                                ac.data_get(key).map(|v| v.as_string())
                             } else { None }))
                 };
                 Some((lookup("type").unwrap_or_else(|| "text".into()),
@@ -19449,13 +19333,11 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     let mut attachments: Vec<String> = Vec::new();
     let mut remove_after_send: Vec<String> = Vec::new();
     let mut custom_headers: Vec<(String, String)> = Vec::new();
-    if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
+    if let Some(CfmlValue::Array(params)) = opts.data_get("params") {
         for param in params.iter() {
             if let CfmlValue::Struct(p) = param {
                 let field = |key: &str| -> Option<String> {
-                    p.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                        .map(|(_, v)| v.as_string())
+                    p.data_get(key).map(|v| v.as_string())
                 };
                 let file_path = field("file").filter(|f| !f.is_empty());
                 if let Some(file_path) = file_path {
@@ -20060,7 +19942,7 @@ fn fn_ls_day_of_week(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_exception_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if let (Some(CfmlValue::Struct(s)), Some(key)) = (args.get(0), args.get(1)) {
         let key_str = key.as_string().to_lowercase();
-        let exists = s.keys().iter().any(|k| k.eq_ignore_ascii_case(&key_str));
+        let exists = s.data_contains_key(&key_str);
         Ok(CfmlValue::Bool(exists))
     } else {
         Ok(CfmlValue::Bool(false))
@@ -21570,10 +21452,7 @@ mod cfhttp_connection_reuse_tests {
             opts.insert("url".to_string(), CfmlValue::string(url.clone()));
             let result = fn_cfhttp(vec![CfmlValue::strukt(opts)]).expect("cfhttp ok");
             let s = match &result {
-                CfmlValue::Struct(m) => m
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("fileContent"))
-                    .map(|(_, v)| v.as_string())
+                CfmlValue::Struct(m) => m.data_get("fileContent").map(|v| v.as_string())
                     .unwrap_or_default(),
                 _ => String::new(),
             };

@@ -45,10 +45,7 @@ impl CfmlVirtualMachine {
             CfmlValue::Struct(s) => s,
             _ => return None,
         };
-        let s3v = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("s3"))
-            .map(|(_, v)| v)?;
+        let s3v = s.data_get("s3")?;
         S3AppConfig::from_value(&s3v)
     }
 

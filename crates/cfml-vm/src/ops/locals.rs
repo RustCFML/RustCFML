@@ -1117,9 +1117,7 @@ pub(crate) fn op_load_super(
             (vm.source_file.as_ref(), g.class.super_map.as_ref())
         {
             if let Some(sup) = map.get(&*src).or_else(|| {
-                map.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(src))
-                    .map(|(_, v)| v.clone())
+                map.data_get(src)
             }) {
                 stack.push(sup);
                 pushed = true;
@@ -1163,9 +1161,7 @@ pub(crate) fn op_load_super(
             (vm.source_file.as_ref(), s.get_ci("__super_map"))
         {
             if let Some(sup) = map.get(&*src).or_else(|| {
-                map.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(src))
-                    .map(|(_, v)| v.clone())
+                map.data_get(src)
             }) {
                 stack.push(sup);
                 pushed = true;

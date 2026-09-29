@@ -840,9 +840,7 @@ impl CfmlNative for ExecutorPoolNative {
 /// Read a numeric option from a CFML struct (case-insensitive). Returns
 /// `None` when the key is absent or unparseable.
 pub fn struct_get_i64(s: &ValueMap, key: &str) -> Option<i64> {
-    s.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .and_then(|(_, v)| match v {
+    s.get(key).and_then(|v| match v {
             CfmlValue::Int(i) => Some(*i),
             CfmlValue::Double(d) => Some(*d as i64),
             CfmlValue::Bool(b) => Some(if *b { 1 } else { 0 }),

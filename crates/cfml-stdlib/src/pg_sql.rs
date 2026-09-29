@@ -115,10 +115,7 @@ pub fn prepare_pg_statements(
                 let params = names
                     .iter()
                     .map(|name| {
-                        let raw = map
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                            .map(|(_, v)| v.query_column_scalar().clone())
+                        let raw = map.data_get(name).map(|v| v.query_column_scalar().clone())
                             .unwrap_or(CfmlValue::Null);
                         // Named param may be a cfqueryparam-style struct
                         // ({value, cfsqltype, null, ...}); unwrap to the

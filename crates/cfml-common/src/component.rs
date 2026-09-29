@@ -1490,7 +1490,7 @@ mod producer_tests {
         let inst = Instance::from_marker(&marker, bp, 7);
 
         // The raw data MAP (iter is map-only; methods live in the shared table).
-        let map_has = |s: &CfmlStruct, k: &str| s.iter().any(|(mk, _)| mk.eq_ignore_ascii_case(k));
+        let map_has = |s: &CfmlStruct, k: &str| s.data_contains_key(k);
 
         // Public DATA: plain + the `__`/`___`/`_` user keys survive; methods and
         // reserved bookkeeping keys are NOT in the data map.

@@ -70,10 +70,7 @@ fn cfhttp_char_attr(opts: &ValueMap, key: &str, default: Option<char>) -> Option
 pub fn cfhttp_body_to_query(body: &str, opts: &ValueMap) -> CfmlResult {
     let delimiter = cfhttp_char_attr(opts, "delimiter", Some(',')).unwrap_or(',');
     let qualifier = cfhttp_char_attr(opts, "textqualifier", Some('"'));
-    let first_row_as_headers = opts
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("firstrowasheaders"))
-        .map(|(_, v)| match v {
+    let first_row_as_headers = opts.get("firstrowasheaders").map(|v| match v {
             CfmlValue::Bool(b) => *b,
             CfmlValue::String(s) => !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no"),
             CfmlValue::Int(i) => *i != 0,
@@ -81,10 +78,7 @@ pub fn cfhttp_body_to_query(body: &str, opts: &ValueMap) -> CfmlResult {
             _ => true,
         })
         .unwrap_or(true);
-    let explicit_columns: Option<Vec<String>> = opts
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("columns"))
-        .map(|(_, v)| v.as_string())
+    let explicit_columns: Option<Vec<String>> = opts.get("columns").map(|v| v.as_string())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.split(',').map(|c| c.trim().to_string()).collect());
 

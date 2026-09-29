@@ -39,9 +39,7 @@ pub fn fn_dbinfo_impl(args: Vec<CfmlValue>) -> CfmlResult {
         }
     };
     let attr = |k: &str| -> Option<String> {
-        opts.iter()
-            .find(|(kk, _)| kk.eq_ignore_ascii_case(k))
-            .map(|(_, v)| v.as_string())
+        opts.get(k).map(|v| v.as_string())
             .filter(|s| !s.is_empty())
     };
 
@@ -146,8 +144,8 @@ fn run(ds: &str, sql: &str, params: Vec<CfmlValue>) -> Result<CfmlQuery, CfmlErr
 
 /// Case-insensitive cell read from a row.
 fn cell<'a>(row: &'a ValueMap, name: &str) -> Option<&'a CfmlValue> {
+    // Case-insensitive: `ValueMap` keys compare without case.
     row.get(name)
-        .or_else(|| row.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
 }
 
 fn cell_str(row: &ValueMap, name: &str) -> String {

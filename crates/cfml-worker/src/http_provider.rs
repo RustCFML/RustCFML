@@ -161,9 +161,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn attr<'a>(opts: &'a ValueMap, key: &str) -> Option<&'a CfmlValue> {
-    opts.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v)
+    opts.get(key)
 }
 
 fn attr_string(opts: &ValueMap, key: &str) -> Option<String> {

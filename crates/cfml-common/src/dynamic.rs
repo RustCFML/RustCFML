@@ -1872,6 +1872,22 @@ impl CfmlStruct {
         self.snapshot().into_iter()
     }
 
+    /// The value stored under `key` in this struct's own DATA map: what
+    /// [`iter`](Self::iter) walks, without the shared method table or the live
+    /// `this` alias that [`get`](Self::get) also consults. Case-insensitive,
+    /// and O(1) — use it instead of `iter().find(|(k, _)| k.eq_ignore_ascii_case(..))`,
+    /// which snapshots the whole map to answer one key.
+    #[inline]
+    pub fn data_get(&self, key: impl ProbeKey) -> Option<CfmlValue> {
+        self.0.read().map.get(key.probe()).cloned()
+    }
+
+    /// Whether this struct's own DATA map holds `key` (see [`data_get`](Self::data_get)).
+    #[inline]
+    pub fn data_contains_key(&self, key: impl ProbeKey) -> bool {
+        self.0.read().map.contains_key(key.probe())
+    }
+
     /// Alias for `snapshot()` — owned copy of the entries.
     #[inline]
     pub fn to_indexmap(&self) -> ValueMap {
@@ -3721,10 +3737,7 @@ impl CfmlQueryData {
         }
         for ci in 0..self.columns.len() {
             let col_name = self.columns[ci].as_str();
-            let val = row
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
-                .map(|(_, v)| v.clone())
+            let val = row.get(col_name).cloned()
                 .unwrap_or(CfmlValue::Null);
             Arc::make_mut(&mut self.data[ci]).insert(at, val);
         }

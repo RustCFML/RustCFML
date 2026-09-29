@@ -166,9 +166,7 @@ pub struct CallContext {
 
 /// Read an annotation off a `__funcmeta_<name>` struct, case-insensitively.
 fn funcmeta_value(meta: &CfmlStruct, key: &str) -> Option<String> {
-    meta.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.as_string())
+    meta.data_get(key).map(|v| v.as_string())
 }
 
 /// Build a server manifest from a component's public view.

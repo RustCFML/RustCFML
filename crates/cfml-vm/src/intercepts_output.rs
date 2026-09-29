@@ -64,9 +64,7 @@ impl CfmlVirtualMachine {
                 };
                 let lookup = |key: &str| -> Option<CfmlValue> {
                     opts.and_then(|o| {
-                        o.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                            .map(|(_, v)| v.clone())
+                        o.data_get(key)
                     })
                 };
 

@@ -556,15 +556,12 @@ fn render_text_child(value: &CfmlValue, indent: usize, out: &mut String, visited
 /// public members in declaration order, minus the markers. Returns the
 /// component's name and its public entries, or None if not a component struct.
 fn component_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<(String, CfmlValue)>)> {
-    let has_vars = snap.keys().any(|k| k.eq_ignore_ascii_case("__variables"));
-    let has_name = snap.keys().any(|k| k.eq_ignore_ascii_case("__name"));
+    let has_vars = snap.contains_key("__variables");
+    let has_name = snap.contains_key("__name");
     if !has_vars || !has_name {
         return None;
     }
-    let name = snap
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("__name"))
-        .map(|(_, v)| value_string(v))
+    let name = snap.get("__name").map(|v| value_string(v))
         .unwrap_or_default();
     let mut entries = Vec::new();
     for (k, v) in snap.iter() {
@@ -590,10 +587,7 @@ fn java_shim_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<
     if !is_shim {
         return None;
     }
-    let class = snap
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("__java_class"))
-        .map(|(_, v)| value_string(v))
+    let class = snap.get("__java_class").map(|v| value_string(v))
         .unwrap_or_else(|| "object".to_string());
     let mut entries = Vec::new();
     for (k, v) in snap.iter() {

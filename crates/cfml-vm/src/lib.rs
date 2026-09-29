@@ -6768,15 +6768,12 @@ impl CfmlVirtualMachine {
                 if let CfmlValue::Query(q) = cur { Some(q) } else { None }
             }
             let vm_get = |m: &ValueMap, k: &str| {
-                m.iter().find(|(kk, _)| kk.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone())
+                m.get(k).cloned()
             };
             match segs[0] {
                 "variables" if segs.len() > 1 => {
                     // CFC method: component `variables` lives on `__variables`.
-                    if let Some(CfmlValue::Struct(v)) = parent_locals
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("__variables"))
-                        .map(|(_, v)| v.clone())
+                    if let Some(CfmlValue::Struct(v)) = parent_locals.get("__variables").cloned()
                     {
                         if let Some(v0) = v.get_ci(segs[1]) {
                             if let Some(q) = walk(v0, &segs[2..]) { return Some(q); }
@@ -6831,10 +6828,7 @@ impl CfmlVirtualMachine {
                     if let Some(v0) = vm_get(parent_locals, segs[0]).or_else(|| vm_get(&self.globals, segs[0])) {
                         if let Some(q) = walk(v0, &segs[1..]) { return Some(q); }
                     }
-                    if let Some(CfmlValue::Struct(vars)) = parent_locals
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("__variables"))
-                        .map(|(_, v)| v.clone())
+                    if let Some(CfmlValue::Struct(vars)) = parent_locals.get("__variables").cloned()
                     {
                         if let Some(v0) = vars.get_ci(segs[0]) {
                             if let Some(q) = walk(v0, &segs[1..]) { return Some(q); }
@@ -6846,10 +6840,7 @@ impl CfmlVirtualMachine {
         }
         // Cloning a query handle shares the Arc (cheap) — the QoQ engine only
         // reads the source tables, so sharing is correct and avoids a deep copy.
-        if let Some(CfmlValue::Query(q)) = parent_locals
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-            .map(|(_, v)| v)
+        if let Some(CfmlValue::Query(q)) = parent_locals.get(&lower)
         {
             return Some(q.clone());
         }
@@ -6859,15 +6850,9 @@ impl CfmlVirtualMachine {
         // — or an unscoped write under classic localmode — lands there, so QoQ
         // source tables must be resolvable from it. Masa's pluginManager builds
         // `variables.rsScripts` via QoQ, then a second QoQ reads it back.
-        if let Some(CfmlValue::Struct(vars)) = parent_locals
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("__variables"))
-            .map(|(_, v)| v)
+        if let Some(CfmlValue::Struct(vars)) = parent_locals.get("__variables")
         {
-            if let Some(CfmlValue::Query(q)) = vars
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-                .map(|(_, v)| v)
+            if let Some(CfmlValue::Query(q)) = vars.data_get(&lower)
             {
                 return Some(q.clone());
             }
@@ -7031,15 +7016,11 @@ impl CfmlVirtualMachine {
         // `arguments.exception.stacktrace`). Synthesised from message + tagContext
         // when a builder didn't set one. Centralised here so every exception
         // struct that gets a rootCause also gets a stackTrace.
-        if !exc.keys().any(|k| k.eq_ignore_ascii_case("stacktrace")) {
-            let msg = exc
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("message"))
-                .map(|(_, v)| v.as_string())
+        if !exc.contains_key("stacktrace") {
+            let msg = exc.get("message").map(|v| v.as_string())
                 .unwrap_or_default();
             let mut st = msg;
-            if let Some((_, CfmlValue::Array(frames))) =
-                exc.iter().find(|(k, _)| k.eq_ignore_ascii_case("tagcontext"))
+            if let Some(CfmlValue::Array(frames)) = exc.get("tagcontext")
             {
                 for f in frames.snapshot() {
                     if let CfmlValue::Struct(fr) = f {
@@ -7061,13 +7042,13 @@ impl CfmlVirtualMachine {
         // a secondary "Variable X is undefined" (post-v0.408), masking the real
         // error and aborting sibling TestBox specs (GitHub #250). Centralised here
         // alongside stackTrace so every exception struct carries the full set.
-        if !exc.keys().any(|k| k.eq_ignore_ascii_case("errorcode")) {
+        if !exc.contains_key("errorcode") {
             exc.insert("errorCode".to_string(), CfmlValue::string(String::new()));
         }
-        if !exc.keys().any(|k| k.eq_ignore_ascii_case("extendedinfo")) {
+        if !exc.contains_key("extendedinfo") {
             exc.insert("extendedInfo".to_string(), CfmlValue::string(String::new()));
         }
-        if exc.keys().any(|k| k.eq_ignore_ascii_case("rootcause")) {
+        if exc.contains_key("rootcause") {
             return;
         }
         let mut rc = ValueMap::default();
@@ -15941,9 +15922,7 @@ impl CfmlVirtualMachine {
 
         if let Some(CfmlValue::Struct(opts)) = args.first() {
             let get = |key: &str| -> Option<CfmlValue> {
-                opts.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                    .map(|(_, v)| v)
+                opts.data_get(key)
             };
             let name = get("name").map(|v| v.as_string()).filter(|s| !s.is_empty());
             let scope = get("scope")
@@ -19792,10 +19771,7 @@ impl CfmlVirtualMachine {
                     )
                     .map_err(|e| self.wrap_error(e))?;
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        if let Some(code_val) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "statuscode")
-                            .map(|(_, v)| v.clone())
+                        if let Some(code_val) = opts.data_get("statuscode")
                         {
                             let code = match &code_val {
                                 CfmlValue::Int(n) => *n as u16,
@@ -19803,21 +19779,12 @@ impl CfmlVirtualMachine {
                                 CfmlValue::Double(d) => *d as u16,
                                 _ => 200,
                             };
-                            let text = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "statustext")
-                                .map(|(_, v)| v.as_string())
+                            let text = opts.data_get("statustext").map(|v| v.as_string())
                                 .unwrap_or_else(|| "OK".to_string());
                             self.response_status = Some((code, text));
-                        } else if let Some(name_val) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "name")
-                            .map(|(_, v)| v.as_string())
+                        } else if let Some(name_val) = opts.data_get("name").map(|v| v.as_string())
                         {
-                            let value = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "value")
-                                .map(|(_, v)| v.as_string())
+                            let value = opts.data_get("value").map(|v| v.as_string())
                                 .unwrap_or_default();
                             self.response_headers.push((name_val, value));
                         }
@@ -19831,19 +19798,13 @@ impl CfmlVirtualMachine {
                     self.error_if_flushed("Content was already flushed", CfmlErrorType::Application)
                         .map_err(|e| self.wrap_error(e))?;
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        if let Some(reset_val) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "reset")
-                            .map(|(_, v)| v.clone())
+                        if let Some(reset_val) = opts.data_get("reset")
                         {
                             if reset_val.is_true() {
                                 self.output_buffer.clear();
                             }
                         }
-                        if let Some(ct) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "type")
-                            .map(|(_, v)| v.as_string())
+                        if let Some(ct) = opts.data_get("type").map(|v| v.as_string())
                         {
                             // `cfcontent type=` is the authoritative response
                             // content-type (Lucee/ACF). Write it into BOTH channels:
@@ -19863,17 +19824,11 @@ impl CfmlVirtualMachine {
                                 .push(("Content-Type".to_string(), ct.clone()));
                             self.response_content_type = Some(ct);
                         }
-                        if let Some(var_val) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "variable")
-                            .map(|(_, v)| v.clone())
+                        if let Some(var_val) = opts.data_get("variable")
                         {
                             self.response_body = Some(var_val);
                         }
-                        if let Some(file_path) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "file")
-                            .map(|(_, v)| v.as_string())
+                        if let Some(file_path) = opts.data_get("file").map(|v| v.as_string())
                         {
                             // Read the file as raw BYTES, not UTF-8 text: `cfcontent
                             // file=…` streams the file verbatim as the response body,
@@ -19926,10 +19881,7 @@ impl CfmlVirtualMachine {
                     // or a bundled options struct (the script forms `exit
                     // method=…;` and `cfexit(method=…)`).
                     let method = match args.get(0) {
-                        Some(CfmlValue::Struct(opts)) => opts
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("method"))
-                            .map(|(_, v)| v.as_string().to_lowercase()),
+                        Some(CfmlValue::Struct(opts)) => opts.data_get("method").map(|v| v.as_string().to_lowercase()),
                         other => other.map(|v| v.as_string().to_lowercase()),
                     }
                     .filter(|m| !m.is_empty())
@@ -19961,10 +19913,7 @@ impl CfmlVirtualMachine {
                     // `cfhtmlhead(text="…")` bundles a `{text: …}` options struct
                     // (see is_tag_call_builtin). Unwrap the struct's `text` key.
                     let text = match args.get(0) {
-                        Some(CfmlValue::Struct(opts)) => opts
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("text"))
-                            .map(|(_, v)| v.as_string())
+                        Some(CfmlValue::Struct(opts)) => opts.data_get("text").map(|v| v.as_string())
                             .unwrap_or_default(),
                         Some(v) => v.as_string(),
                         None => String::new(),
@@ -20004,15 +19953,9 @@ impl CfmlVirtualMachine {
                     // arrives as raw positional args. Support both.
                     let (url, status_code) = match args.get(0) {
                         Some(CfmlValue::Struct(opts)) => {
-                            let url = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "url")
-                                .map(|(_, v)| v.as_string())
+                            let url = opts.data_get("url").map(|v| v.as_string())
                                 .unwrap_or_default();
-                            let status_code = opts
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "statuscode")
-                                .map(|(_, v)| to_status(&v))
+                            let status_code = opts.data_get("statuscode").map(|v| to_status(&v))
                                 .unwrap_or(302);
                             (url, status_code)
                         }
@@ -20380,25 +20323,16 @@ impl CfmlVirtualMachine {
                         }
                         if let Some(coll) = attr_coll {
                             for (ik, iv) in coll.into_iter() {
-                                if !merged.keys().any(|mk| mk.eq_ignore_ascii_case(&ik)) {
+                                if !merged.contains_key(&ik) {
                                     merged.insert(ik, iv);
                                 }
                             }
                         }
-                        result_name = merged
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("result"))
-                            .map(|(_, v)| v.as_string())
+                        result_name = merged.get("result").map(|v| v.as_string())
                             .filter(|s| !s.is_empty());
-                        name_attr = merged
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                            .map(|(_, v)| v.as_string())
+                        name_attr = merged.get("name").map(|v| v.as_string())
                             .filter(|s| !s.is_empty());
-                        return_type_opt = merged
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
-                            .map(|(_, v)| v.as_string().to_lowercase());
+                        return_type_opt = merged.get("returntype").map(|v| v.as_string().to_lowercase());
                         args[2] = CfmlValue::strukt(merged);
                     }
 
@@ -20773,16 +20707,13 @@ impl CfmlVirtualMachine {
                     if let Some(coll_key) = attr_coll {
                         if let Some(CfmlValue::Struct(inner)) = attrs.shift_remove(&coll_key) {
                             for (ik, iv) in inner.snapshot().into_iter() {
-                                if !attrs.keys().any(|mk| mk.eq_ignore_ascii_case(&ik)) {
+                                if !attrs.contains_key(&ik) {
                                     attrs.insert(ik, iv);
                                 }
                             }
                         }
                     }
-                    let name_attr = attrs
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                        .map(|(_, v)| v.as_string())
+                    let name_attr = attrs.get("name").map(|v| v.as_string())
                         .filter(|s| !s.is_empty())
                         .ok_or_else(|| {
                             CfmlError::runtime("Missing attribute [name] on cfdbinfo".to_string())
@@ -20790,10 +20721,7 @@ impl CfmlVirtualMachine {
                     // Per-application datasource resolution (this.datasources /
                     // per-app cfconfig) — same routing queryExecute gets.
                     if !self.app_datasources.is_empty() || self.app_default_datasource.is_some() {
-                        let current = attrs
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-                            .map(|(_, v)| Self::datasource_arg_to_name(v));
+                        let current = attrs.get("datasource").map(|v| Self::datasource_arg_to_name(v));
                         let new_url = match current {
                             Some(ref n) => self.resolve_app_datasource(n),
                             None => self.app_default_datasource.clone(),
@@ -20849,9 +20777,7 @@ impl CfmlVirtualMachine {
                         _ => ValueMap::default(),
                     };
                     let attr = |key: &str| -> Option<String> {
-                        opts.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                            .map(|(_, v)| v.as_string())
+                        opts.get(key).map(|v| v.as_string())
                             .filter(|s| !s.is_empty())
                     };
                     let name_attr = attr("name");
@@ -20963,9 +20889,7 @@ impl CfmlVirtualMachine {
                     // — the tag preprocessor bundles every attribute into one struct.
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         let attr = |k: &str| {
-                            opts.iter()
-                                .find(|(key, _)| key.eq_ignore_ascii_case(k))
-                                .map(|(_, v)| v.as_string())
+                            opts.data_get(k).map(|v| v.as_string())
                         };
                         let text = attr("text").unwrap_or_default();
                         let log_type = attr("type").unwrap_or_else(|| "Information".to_string());
@@ -21097,10 +21021,7 @@ impl CfmlVirtualMachine {
                     // for a page that uses it there is no application start to
                     // establish them at (GH #374).
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        let mapping_struct = opts
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("mappings"))
-                            .and_then(|(_, v)| match v {
+                        let mapping_struct = opts.data_get("mappings").and_then(|v| match v {
                                 CfmlValue::Struct(m) => Some(m.snapshot()),
                                 _ => None,
                             });
@@ -21162,9 +21083,7 @@ impl CfmlVirtualMachine {
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         // enableCFOutputOnly: counter-based. true increments, false decrements.
                         // "reset" forces counter to 0. When > 0, only <cfoutput> content is emitted.
-                        if let Some((_, v)) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "enablecfoutputonly")
+                        if let Some(v) = opts.data_get("enablecfoutputonly")
                         {
                             let val_str = v.as_string().to_lowercase();
                             if val_str == "reset" {
@@ -21177,9 +21096,7 @@ impl CfmlVirtualMachine {
                         }
                         // requesttimeout (seconds) — store as ms so
                         // getPageContext().getRequestTimeout() reports Lucee-style ms.
-                        if let Some((_, v)) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "requesttimeout")
+                        if let Some(v) = opts.data_get("requesttimeout")
                         {
                             let secs = v.as_string().trim().parse::<f64>().unwrap_or(0.0);
                             if secs > 0.0 {
@@ -21190,9 +21107,7 @@ impl CfmlVirtualMachine {
                         // classic debug footer (Adobe/Lucee). Only ever turns it
                         // off; can never bypass the IP/trigger gates.
                         #[cfg(feature = "observability")]
-                        if let Some((_, v)) = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "showdebugoutput")
+                        if let Some(v) = opts.data_get("showdebugoutput")
                         {
                             self.show_debug_output = matches!(
                                 v.as_string().to_lowercase().as_str(),
@@ -21251,47 +21166,34 @@ impl CfmlVirtualMachine {
                         } else {
                             snap
                         };
-                        let name = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "name")
-                            .map(|(_, v)| v.as_string())
+                        let name = opts.get("name").map(|v| v.as_string())
                             .unwrap_or_default();
-                        let value = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "value")
-                            .map(|(_, v)| v.as_string())
+                        let value = opts.get("value").map(|v| v.as_string())
                             .unwrap_or_default();
                         let mut cookie = format!("{}={}", name, value);
-                        if let Some((_, expires)) =
-                            opts.iter().find(|(k, _)| k.to_lowercase() == "expires")
+                        if let Some(expires) = opts.get("expires")
                         {
                             cookie.push_str(&format!(
                                 "; Expires={}",
                                 format_cookie_expires(&expires.as_string())
                             ));
                         }
-                        if let Some((_, domain)) =
-                            opts.iter().find(|(k, _)| k.to_lowercase() == "domain")
+                        if let Some(domain) = opts.get("domain")
                         {
                             cookie.push_str(&format!("; Domain={}", domain.as_string()));
                         }
                         // Lucee defaults an omitted path to "/" so the cookie is
                         // site-wide rather than scoped to the request directory.
-                        let path = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "path")
-                            .map(|(_, v)| v.as_string())
+                        let path = opts.get("path").map(|v| v.as_string())
                             .unwrap_or_else(|| "/".to_string());
                         cookie.push_str(&format!("; Path={}", path));
-                        if let Some((_, samesite)) =
-                            opts.iter().find(|(k, _)| k.to_lowercase() == "samesite")
+                        if let Some(samesite) = opts.get("samesite")
                         {
                             if let Some(value) = format_cookie_samesite(&samesite.as_string()) {
                                 cookie.push_str(&format!("; SameSite={}", value));
                             }
                         }
-                        if let Some((_, secure)) =
-                            opts.iter().find(|(k, _)| k.to_lowercase() == "secure")
+                        if let Some(secure) = opts.get("secure")
                         {
                             if secure.as_string().to_lowercase() == "true"
                                 || secure.as_string() == "yes"
@@ -21299,8 +21201,7 @@ impl CfmlVirtualMachine {
                                 cookie.push_str("; Secure");
                             }
                         }
-                        if let Some((_, httponly)) =
-                            opts.iter().find(|(k, _)| k.to_lowercase() == "httponly")
+                        if let Some(httponly) = opts.get("httponly")
                         {
                             if httponly.as_string().to_lowercase() == "true"
                                 || httponly.as_string() == "yes"
@@ -21345,20 +21246,11 @@ impl CfmlVirtualMachine {
 
                     if let CfmlValue::Struct(form) = form_scope {
                         let field_lower = form_field.to_lowercase();
-                        if let Some(CfmlValue::Struct(file_info)) = form
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&field_lower))
-                            .map(|(_, v)| v)
+                        if let Some(CfmlValue::Struct(file_info)) = form.data_get(&field_lower)
                         {
-                            let temp_path = file_info
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "tempfilepath")
-                                .map(|(_, v)| v.as_string())
+                            let temp_path = file_info.data_get("tempfilepath").map(|v| v.as_string())
                                 .unwrap_or_default();
-                            let client_file = file_info
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == "clientfile")
-                                .map(|(_, v)| v.as_string())
+                            let client_file = file_info.data_get("clientfile").map(|v| v.as_string())
                                 .unwrap_or_default();
 
                             if !temp_path.is_empty() {
@@ -21445,19 +21337,13 @@ impl CfmlVirtualMachine {
                     if let CfmlValue::Struct(form) = form_scope {
                         for (_, val) in form.iter() {
                             if let CfmlValue::Struct(file_info) = val {
-                                let temp_path = file_info
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "tempfilepath")
-                                    .map(|(_, v)| v.as_string())
+                                let temp_path = file_info.data_get("tempfilepath").map(|v| v.as_string())
                                     .unwrap_or_default();
                                 if temp_path.is_empty() {
                                     continue;
                                 }
 
-                                let client_file = file_info
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "clientfile")
-                                    .map(|(_, v)| v.as_string())
+                                let client_file = file_info.data_get("clientfile").map(|v| v.as_string())
                                     .unwrap_or_default();
 
                                 let dest_dir = std::path::Path::new(&destination);
@@ -21707,9 +21593,7 @@ impl CfmlVirtualMachine {
                     let (name, roles_str) = match args.get(0) {
                         Some(CfmlValue::Struct(opts)) => {
                             let get = |k: &str| {
-                                opts.iter()
-                                    .find(|(ok, _)| ok.eq_ignore_ascii_case(k))
-                                    .map(|(_, v)| v.as_string())
+                                opts.data_get(k).map(|v| v.as_string())
                                     .unwrap_or_default()
                             };
                             (get("name"), get("roles"))
@@ -21822,7 +21706,7 @@ impl CfmlVirtualMachine {
                     // the throw surfaced as a bare "Application" error.
                     if let Some(CfmlValue::Struct(coll)) = args.get(6) {
                         for (k, v) in coll.snapshot().into_iter() {
-                            if !exception.keys().any(|ek| ek.eq_ignore_ascii_case(&k)) {
+                            if !exception.contains_key(&k) {
                                 exception.insert(k, v);
                             }
                         }
@@ -21837,7 +21721,7 @@ impl CfmlVirtualMachine {
                                 exc.insert(key.to_string(), CfmlValue::string(v));
                             }
                             None => {
-                                if !exc.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+                                if !exc.contains_key(key) {
                                     exc.insert(key.to_string(), CfmlValue::string(default.to_string()));
                                 }
                             }
@@ -21851,15 +21735,12 @@ impl CfmlVirtualMachine {
                     // Preserve the original tagcontext when re-throwing an object;
                     // otherwise capture the current location.
                     if !object_supplied
-                        || !exception.keys().any(|k| k.eq_ignore_ascii_case("tagcontext"))
+                        || !exception.contains_key("tagcontext")
                     {
                         exception.insert("tagcontext".to_string(), self.build_tag_context());
                     }
 
-                    let message = exception
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("message"))
-                        .map(|(_, v)| v.as_string())
+                    let message = exception.get("message").map(|v| v.as_string())
                         .unwrap_or_default();
 
                     // Observability: record the raised exception for the debug
@@ -21872,10 +21753,7 @@ impl CfmlVirtualMachine {
                     if self.interest.contains(observe::Interest::ERROR) {
                         if let Some(o) = &self.observer {
                             let field = |k: &str| {
-                                exception
-                                    .iter()
-                                    .find(|(ek, _)| ek.eq_ignore_ascii_case(k))
-                                    .map(|(_, v)| v.as_string())
+                                exception.get(k).map(|v| v.as_string())
                                     .unwrap_or_default()
                             };
                             let etype = field("type");
@@ -22248,15 +22126,9 @@ impl CfmlVirtualMachine {
                     // cached as present.
                     self.clear_exists_caches_wholesale();
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        let cmd_name = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "name")
-                            .map(|(_, v)| v.as_string())
+                        let cmd_name = opts.data_get("name").map(|v| v.as_string())
                             .unwrap_or_default();
-                        let arguments = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "arguments")
-                            .map(|(_, v)| v.as_string())
+                        let arguments = opts.data_get("arguments").map(|v| v.as_string())
                             .unwrap_or_default();
                         // `variable` arrives in one of two shapes. The TAG
                         // lowering emits `variable: true` — a capture flag — and
@@ -22267,10 +22139,7 @@ impl CfmlVirtualMachine {
                         // here (GH #341/#355). Distinguish by shape, and treat a
                         // literal "true"/"false" string as the flag so the tag
                         // path is unchanged.
-                        let variable_attr = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "variable")
-                            .map(|(_, v)| v);
+                        let variable_attr = opts.data_get("variable");
                         let mut out_target: Option<String> = None;
                         let has_variable = match variable_attr {
                             Some(CfmlValue::Bool(b)) => b,
@@ -22288,16 +22157,10 @@ impl CfmlVirtualMachine {
                             }
                             _ => false,
                         };
-                        let err_target = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "errorvariable")
-                            .map(|(_, v)| v.as_string())
+                        let err_target = opts.data_get("errorvariable").map(|v| v.as_string())
                             .filter(|t| !t.trim().is_empty())
                             .map(|t| t.trim().to_string());
-                        let body = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "body")
-                            .map(|(_, v)| v.as_string());
+                        let body = opts.data_get("body").map(|v| v.as_string());
 
                         // Lucee tokenizes this string shell-style: a quoted
                         // span is ONE argument with the quotes stripped. See
@@ -23508,9 +23371,7 @@ impl CfmlVirtualMachine {
         // Check __variables scope for CFC methods
         if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
             if let Some(v) = vars.get(name).or_else(|| {
-                vars.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                    .map(|(_, v)| v)
+                vars.data_get(&name_lower)
             }) {
                 return Some(v.clone());
             }
@@ -30176,10 +30037,7 @@ impl CfmlVirtualMachine {
                 let route_to_on_missing = !has_accessors;
                 if !route_to_on_missing && method_lower.starts_with("get") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
-                    let val = s
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&prop_name))
-                        .map(|(_, v)| v.clone());
+                    let val = s.data_get(&prop_name);
                     if let Some(v) = val {
                         // Collision: `this.<prop>` holds a same-named METHOD — a CFC may
                         // declare both `property name="x"` and a method `x()`. The property
@@ -30204,7 +30062,7 @@ impl CfmlVirtualMachine {
                     // fall through so onMissingMethod handles it (Lucee routes there).
                     // (The accessors="true"+onMissingMethod case is already handled by
                     // `route_to_on_missing` above for a declared-but-unset property.)
-                    let is_known_member = s.iter().any(|(k, _)| k.eq_ignore_ascii_case(prop_name))
+                    let is_known_member = s.data_contains_key(prop_name)
                         || s.iter().any(|(k, v)| {
                             k.eq_ignore_ascii_case("__properties")
                                 && matches!(v, CfmlValue::Array(arr) if arr.iter().any(|p| {
@@ -30763,10 +30621,7 @@ impl CfmlVirtualMachine {
                 .get(root_raw)
                 .cloned()
                 .or_else(|| {
-                    locals
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&root))
-                        .map(|(_, v)| v.clone())
+                    locals.get(&root).cloned()
                 })
                 // A lexical closure frame: its captured names (the same chain
                 // the variable READ path walks, see `frame_closure_env`).
@@ -30818,9 +30673,7 @@ impl CfmlVirtualMachine {
             return false;
         };
         let hit = map.get(first.as_str()).or_else(|| {
-            map.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(first))
-                .map(|(_, v)| v)
+            map.get(first)
         });
         match hit {
             Some(v) => Self::path_defined_from(v.clone(), rest),
@@ -31060,10 +30913,7 @@ impl CfmlVirtualMachine {
                     .get(root)
                     .cloned()
                     .or_else(|| {
-                        locals
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&root_lower))
-                            .map(|(_, v)| v.clone())
+                        locals.get(&root_lower).cloned()
                     })
                     .or_else(|| {
                         locals
@@ -38688,10 +38538,7 @@ impl CfmlVirtualMachine {
             // --- cfdirectory tag: allow list, block create/delete/rename ---
             "cfdirectory" | "__cfdirectory" => {
                 if let Some(CfmlValue::Struct(opts)) = args.first() {
-                    let action = opts
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == "action")
-                        .map(|(_, v)| v.as_string().to_lowercase())
+                    let action = opts.data_get("action").map(|v| v.as_string().to_lowercase())
                         .unwrap_or_else(|| "list".to_string());
                     match action.as_str() {
                         "list" => Some(self.cfdirectory_list_from_opts(opts)),
@@ -39296,10 +39143,7 @@ impl CfmlVirtualMachine {
     fn datasource_arg_to_name(val: &CfmlValue) -> String {
         match val {
             CfmlValue::Struct(s) => {
-                if let Some(name) = s
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                    .map(|(_, v)| v.as_string())
+                if let Some(name) = s.data_get("name").map(|v| v.as_string())
                     .filter(|n| !n.is_empty())
                 {
                     return name;
@@ -39318,9 +39162,7 @@ impl CfmlVirtualMachine {
             CfmlValue::String(s) if !s.is_empty() => Some((s.to_string(), 0)),
             CfmlValue::Struct(s) => {
                 let get = |key: &str| -> String {
-                    s.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                        .map(|(_, v)| v.as_string())
+                    s.data_get(key).map(|v| v.as_string())
                         .unwrap_or_default()
                 };
                 let mut ds = cfml_config::DatasourceCfg::default();
@@ -39362,10 +39204,7 @@ impl CfmlVirtualMachine {
     /// — previously RustCFML ignored `this.datasources` entirely.
     fn seed_app_datasources_from_template(&mut self, template: &CfmlValue) {
         let CfmlValue::Struct(s) = template else { return };
-        if let Some(CfmlValue::Struct(map)) = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("datasources"))
-            .map(|(_, v)| v)
+        if let Some(CfmlValue::Struct(map)) = s.data_get("datasources")
         {
             for (name, def) in map.iter() {
                 if let Some((url, timeout)) = Self::datasource_value_to_url(&def) {
@@ -39380,10 +39219,7 @@ impl CfmlVirtualMachine {
         // definition — so extract the resolvable identifier rather than
         // stringifying the struct (which produced a bogus "{name: masa, …}"
         // default that no query could resolve).
-        if let Some(name) = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| Self::datasource_arg_to_name(&v))
+        if let Some(name) = s.data_get("datasource").map(|v| Self::datasource_arg_to_name(&v))
             .filter(|n| !n.is_empty())
         {
             // Resolve the named default through the per-app map; if it isn't a
@@ -39431,10 +39267,7 @@ impl CfmlVirtualMachine {
             Some(CfmlValue::Struct(opts)) => opts.snapshot(),
             _ => ValueMap::default(),
         };
-        let current = map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| Self::datasource_arg_to_name(v))
+        let current = map.get("datasource").map(|v| Self::datasource_arg_to_name(v))
             .filter(|s| !s.is_empty());
         let new_url = match current {
             Some(ref name) => self.resolve_app_datasource(name),
@@ -40090,9 +39923,7 @@ impl CfmlVirtualMachine {
     /// predates this); everything else lands here.
     fn apply_cfapplication_settings(&mut self, opts: &ValueMap) -> Result<(), CfmlError> {
         let get = |key: &str| -> Option<CfmlValue> {
-            opts.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .map(|(_, v)| v.clone())
+            opts.get(key).cloned()
         };
         fn truthy(v: &CfmlValue) -> bool {
             match v {
@@ -40264,10 +40095,7 @@ impl CfmlVirtualMachine {
         };
 
         // Case-insensitive lookup for this.name
-        let app_name = s
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "name")
-            .and_then(|(_, v)| match v {
+        let app_name = s.data_get("name").and_then(|v| match v {
                 CfmlValue::String(s) => Some(s.to_string()),
                 _ => None,
             })
@@ -40282,10 +40110,7 @@ impl CfmlVirtualMachine {
 
         // Extract mappings from this.mappings (case-insensitive key lookup)
         let mut mappings = Vec::new();
-        if let Some(mappings_val) = s
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "mappings")
-            .map(|(_, v)| v.clone())
+        if let Some(mappings_val) = s.data_get("mappings")
         {
             if let CfmlValue::Struct(map_struct) = mappings_val {
                 for (key, val) in map_struct.iter() {
@@ -40300,10 +40125,7 @@ impl CfmlVirtualMachine {
                     // Extract path: either a String directly or a Struct with a "path" key
                     let path = match val {
                         CfmlValue::String(p) => Some(p.to_string()),
-                        CfmlValue::Struct(inner) => inner
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "path")
-                            .and_then(|(_, v)| match v {
+                        CfmlValue::Struct(inner) => inner.data_get("path").and_then(|v| match v {
                                 CfmlValue::String(p) => Some(p.to_string()),
                                 _ => None,
                             }),
@@ -40321,20 +40143,14 @@ impl CfmlVirtualMachine {
         }
 
         // Extract session management config
-        let session_management = s
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "sessionmanagement")
-            .map(|(_, v)| match v {
+        let session_management = s.data_get("sessionmanagement").map(|v| match v {
                 CfmlValue::Bool(b) => b,
                 CfmlValue::String(s) => s.to_lowercase() == "true" || s.to_lowercase() == "yes",
                 _ => false,
             })
             .unwrap_or(false);
 
-        let session_timeout = s
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "sessiontimeout")
-            .and_then(|(_, v)| match v {
+        let session_timeout = s.data_get("sessiontimeout").and_then(|v| match v {
                 // `createTimeSpan(d,h,m,s)` returns a Double expressed in
                 // *days* (e.g. one hour = 1/24 ≈ 0.0417). It must be scaled
                 // to seconds — casting the day-fraction straight to u64
@@ -40354,10 +40170,7 @@ impl CfmlVirtualMachine {
 
         // Extract customTagPaths from this.customTagPaths (case-insensitive)
         let mut custom_tag_paths = Vec::new();
-        if let Some(ctp_val) = s
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "customtagpaths")
-            .map(|(_, v)| v.clone())
+        if let Some(ctp_val) = s.data_get("customtagpaths")
         {
             match ctp_val {
                 CfmlValue::Array(arr) => {
@@ -40384,10 +40197,7 @@ impl CfmlVirtualMachine {
         // Present-but-unparseable counts as specified-false rather than
         // silently falling back to cfconfig: `is_true()` is the same coercion
         // every other CFML boolean goes through.
-        let custom_tag_deep_search = s
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("customtagdeepsearch"))
-            .map(|(_, v)| v.is_true());
+        let custom_tag_deep_search = s.data_get("customtagdeepsearch").map(|v| v.is_true());
 
         // Extract this.localMode (Lucee compatibility — modern vs classic
         // function-local scope semantics). Accepts the same aliases as the
@@ -40424,19 +40234,13 @@ impl CfmlVirtualMachine {
             if let CfmlValue::Struct(cache_map) = cache_val {
                 for (cache_name, cache_def) in cache_map.iter() {
                     if let CfmlValue::Struct(def) = cache_def {
-                        let provider = def
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("provider"))
-                            .and_then(|(_, v)| match v {
+                        let provider = def.data_get("provider").and_then(|v| match v {
                                 CfmlValue::String(s) => Some(s.to_string()),
                                 _ => None,
                             })
                             .unwrap_or_default();
                         let mut props = cfml_config::schema::CacheProperties::default();
-                        if let Some(CfmlValue::Struct(p)) = def
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("properties"))
-                            .map(|(_, v)| v)
+                        if let Some(CfmlValue::Struct(p)) = def.data_get("properties")
                         {
                             for (pk, pv) in p.iter() {
                                 match pk.to_lowercase().as_str() {
@@ -40765,10 +40569,7 @@ impl CfmlVirtualMachine {
     fn ws_secured_annotation(s: &CfmlStruct, fname: &str) -> Option<String> {
         let fmeta = s.get_ci(&format!("__funcmeta_{}", fname))?;
         let CfmlValue::Struct(fm) = fmeta else { return None };
-        let val = fm
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("secured"))
-            .map(|(_, v)| v.as_string())?;
+        let val = fm.data_get("secured").map(|v| v.as_string())?;
         // `secured="false"` opts out explicitly.
         if val.eq_ignore_ascii_case("false") {
             return None;
@@ -42339,23 +42140,15 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// Return the actual (case-preserving) key in `m` that matches `key`
 /// case-insensitively, if any. CFML identifiers are case-insensitive, so a
 /// store/lookup for `rsCheck` must find an existing `rscheck`.
+// `ValueMap` keys already compare without case, so the probe alone is the
+// case-insensitive lookup; these used to follow it with a linear scan that
+// could never find anything the probe had missed.
 fn imap_key_ci(m: &ValueMap, key: &str) -> Option<String> {
-    if m.contains_key(key) {
-        return Some(key.to_string());
-    }
-    m.keys().find(|k| k.eq_ignore_ascii_case(key)).map(|k| k.as_str().to_string())
+    m.contains_key(key).then(|| key.to_string())
 }
 
 pub(crate) fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
-    if m.shift_remove(key).is_some() {
-        return true;
-    }
-    let found = m.keys().find(|k| k.eq_ignore_ascii_case(key)).map(|k| k.as_str().to_string());
-    if let Some(k) = found {
-        m.shift_remove(&k);
-        return true;
-    }
-    false
+    m.shift_remove(key).is_some()
 }
 
 pub(crate) fn binary_op<F>(stack: &mut Vec<CfmlValue>, op: F)

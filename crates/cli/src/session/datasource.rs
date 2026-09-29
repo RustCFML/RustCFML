@@ -215,10 +215,7 @@ fn first_data_cell(result: CfmlResult) -> Option<String> {
     let val = result.ok()?;
     if let CfmlValue::Array(arr) = val {
         if let Some(CfmlValue::Struct(row)) = arr.snapshot().into_iter().next() {
-            return row
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("data"))
-                .map(|(_, v)| v.as_string());
+            return row.data_get("data").map(|v| v.as_string());
         }
     }
     None
@@ -229,10 +226,7 @@ fn affected_rows(result: &CfmlResult) -> i64 {
     let Ok(CfmlValue::Struct(m)) = result else {
         return 0;
     };
-    let Some(v) = m
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("recordcount"))
-        .map(|(_, v)| v.clone())
+    let Some(v) = m.data_get("recordcount")
     else {
         return 0;
     };
@@ -417,9 +411,7 @@ impl SessionStore for DatasourceStore {
         for row in rows {
             let CfmlValue::Struct(r) = row else { continue };
             let cell = |name: &str| {
-                r.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                    .map(|(_, v)| v.as_string())
+                r.data_get(name).map(|v| v.as_string())
                     .unwrap_or_default()
             };
             let cfid = cell("cfid");

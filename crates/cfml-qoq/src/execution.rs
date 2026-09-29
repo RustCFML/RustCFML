@@ -56,10 +56,7 @@ impl QoQParams {
     }
 
     fn lookup_named(&self, name: &str) -> Option<&CfmlValue> {
-        self.named
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v)
+        self.named.get(name)
     }
 }
 
