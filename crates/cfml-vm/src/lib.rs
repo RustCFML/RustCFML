@@ -38191,6 +38191,19 @@ impl CfmlVirtualMachine {
     }
 
     fn file_write_targets(name_lower: &str, args: &[CfmlValue]) -> Vec<String> {
+        // A write through a file handle: the file comes into being on the
+        // handle's FIRST write (fileOpen defers it, as Lucee does), so only that
+        // write is a creation. Later writes change nothing the caches track.
+        if matches!(name_lower, "filewrite" | "filewriteline") {
+            if let Some(CfmlValue::Struct(h)) = args.first() {
+                if h.data_contains_key("__handle_id") {
+                    return match (h.data_get("__pending_write"), h.data_get("filepath")) {
+                        (Some(CfmlValue::Bool(true)), Some(CfmlValue::String(p))) => vec![p.to_string()],
+                        _ => Vec::new(),
+                    };
+                }
+            }
+        }
         // Index of the path arg(s) that get written/created/removed. For copy the
         // destination (1) is written; for move/rename both the source (0, now
         // gone) and destination (1) change. Delete/write/append target arg 0.
@@ -38202,7 +38215,9 @@ impl CfmlVirtualMachine {
             // (`fileOpen` alone did that 835 times on one Preside boot).
             "filewrite" | "fileappend" | "filewriteline" | "filedelete"
             | "directorycreate" => &[0],
-            // `fileOpen` creates or truncates its target only in a write mode.
+            // `fileOpen` in a write mode no longer touches the file (it is
+            // created on the first handle write, handled above); it stays a
+            // target so a negative cached before the open is retired.
             // A read-mode open changes nothing, yet it was treated as a writer:
             // two `realpath()`s (before and after the call) plus a scan of every
             // validated template, per open. Preside's boot opens every view file
