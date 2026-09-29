@@ -31,8 +31,9 @@
 //! (`imageTypes.GIF`), so they are real keys on the shim struct, carrying the
 //! format name the builtin takes.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field as get};
 
 pub const QRCODE_CLASS: &str = "net.glxn.qrgen.javase.qrcode";
 pub const IMAGE_TYPE_CLASS: &str = "net.glxn.qrgen.core.image.imagetype";
@@ -48,13 +49,6 @@ pub fn is_qrgen_class(class_lower: &str) -> bool {
     matches!(class_lower, QRCODE_CLASS | IMAGE_TYPE_CLASS | STREAM_CLASS)
 }
 
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
 pub fn construct(class_lower: &str) -> CfmlResult {
     let mut m = shim(class_lower);
     if class_lower == IMAGE_TYPE_CLASS {
@@ -65,13 +59,6 @@ pub fn construct(class_lower: &str) -> CfmlResult {
         }
     }
     Ok(CfmlValue::strukt(m))
-}
-
-fn get(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn unsupported(method: &str) -> CfmlError {

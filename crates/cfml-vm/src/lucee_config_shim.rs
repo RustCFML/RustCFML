@@ -17,6 +17,7 @@
 //! optional argument makes it undefined, and the formatter would then throw.
 
 use super::*;
+use crate::shim_util::{shim, field};
 
 pub(crate) const CONFIG_CLASS: &str = "lucee.runtime.config.configwebimpl";
 const DATASOURCE_CLASS: &str = "lucee.runtime.db.datasourceimpl";
@@ -24,20 +25,6 @@ const POOL_CLASS: &str = "lucee.runtime.config.datasourceconnpool";
 
 pub(crate) fn handles(class_lower: &str) -> bool {
     matches!(class_lower, CONFIG_CLASS | DATASOURCE_CLASS | POOL_CLASS)
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
-fn field(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 /// The fixed maximum of the pool a connection URL is served by (see the pool

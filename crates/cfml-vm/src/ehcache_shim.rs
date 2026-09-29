@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use crate::shim_util::{shim, field};
 
 pub(crate) const SERVICE_CLASS: &str = "org.pixl8.cbehcache.cbehcacheservice";
 const CACHE_CLASS: &str = "org.ehcache.cache";
@@ -125,28 +126,11 @@ fn managers() -> &'static Mutex<HashMap<u64, Arc<Manager>>> {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    cfml_common::clock::now_unix_millis() as u64
 }
 
 fn err(msg: impl Into<String>) -> CfmlError {
     CfmlError::runtime(msg.into())
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
-fn field(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn int_field(object: &CfmlValue, key: &str) -> Option<u64> {

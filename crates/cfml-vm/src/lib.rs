@@ -57,6 +57,7 @@ mod antisamy_shim;
 mod cmdline;
 mod java_security;
 mod java_shims;
+mod shim_util;
 mod xmp_shim;
 mod javax_crypto_shim;
 mod io_csv_shim;

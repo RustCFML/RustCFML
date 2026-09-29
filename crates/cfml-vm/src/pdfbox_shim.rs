@@ -30,8 +30,9 @@
 //! renders RGB either way: the engine's image objects are RGBA, and writing a
 //! JPEG flattens to RGB at encode time regardless.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field as get};
 
 pub const PD_DOCUMENT: &str = "org.apache.pdfbox.pdmodel.pddocument";
 pub const PDF_IMAGE_WRITER: &str = "org.apache.pdfbox.util.pdfimagewriter";
@@ -43,13 +44,6 @@ pub fn is_pdfbox_class(class_lower: &str) -> bool {
         class_lower,
         PD_DOCUMENT | PDF_IMAGE_WRITER | PDF_RENDERER | BUFFERED_IMAGE
     )
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
 }
 
 pub fn construct(class_lower: &str) -> CfmlResult {
@@ -70,13 +64,6 @@ pub fn construct(class_lower: &str) -> CfmlResult {
         }
     }
     Ok(CfmlValue::strukt(m))
-}
-
-fn get(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn io_exception(message: impl std::fmt::Display) -> CfmlError {

@@ -29,9 +29,10 @@
 //! these classes *are* the file layer, and the VM applies the same
 //! existence-cache invalidation to them as to any other mutating shim.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use std::io::Write;
+use crate::shim_util::{shim, field};
 
 pub const FILE_WRITER_CLASS: &str = "java.io.filewriter";
 pub const BUFFERED_WRITER_CLASS: &str = "java.io.bufferedwriter";
@@ -48,22 +49,8 @@ pub fn is_writer_class(class_lower: &str) -> bool {
     )
 }
 
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
 pub fn construct(class_lower: &str) -> CfmlResult {
     Ok(CfmlValue::strukt(shim(class_lower)))
-}
-
-fn field(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn field_str(object: &CfmlValue, key: &str) -> String {

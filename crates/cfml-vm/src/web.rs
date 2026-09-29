@@ -443,17 +443,16 @@ pub fn url_decode(s: &str) -> String {
         if bytes[i] == b'+' {
             result.push(b' ');
             i += 1;
-        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
-                16,
-            ) {
-                result.push(byte);
-                i += 3;
-            } else {
-                result.push(bytes[i]);
-                i += 1;
-            }
+        } else if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            // Two real hex digits: `from_str_radix` alone also accepts a sign,
+            // so `%+1` decoded to byte 0x01 instead of staying literal.
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hex = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+            result.push(hex(bytes[i + 1]) << 4 | hex(bytes[i + 2]));
+            i += 3;
         } else {
             result.push(bytes[i]);
             i += 1;
@@ -1080,5 +1079,16 @@ mod tests {
             .filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie"))
             .collect();
         assert_eq!(cookies.len(), 2);
+    }
+
+    /// `%` must be followed by two hex digits to decode. `from_str_radix`
+    /// alone also accepts a sign, so `%+1` became byte 0x01.
+    #[test]
+    fn url_decode_requires_two_hex_digits() {
+        assert_eq!(url_decode("a%41b"), "aAb");
+        assert_eq!(url_decode("a+b%2Bc"), "a b+c");
+        assert_eq!(url_decode("%+1"), "% 1");
+        assert_eq!(url_decode("%zz%4"), "%zz%4");
+        assert_eq!(url_decode("%C3%A9"), "\u{e9}");
     }
 }

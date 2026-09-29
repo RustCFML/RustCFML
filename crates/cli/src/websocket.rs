@@ -229,29 +229,11 @@ pub(crate) fn parse_query(query: Option<&str>) -> cfml_common::dynamic::ValueMap
     let Some(q) = query else { return map };
     for pair in q.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        map.insert(url_decode(k), CfmlValue::string(url_decode(v)));
+        map.insert(cfml_vm::web::url_decode(k), CfmlValue::string(cfml_vm::web::url_decode(v)));
     }
     map
 }
 
-fn url_decode(s: &str) -> String {
-    let bytes = s.replace('+', " ");
-    let bytes = bytes.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
 
 /// One tokio task per connection: registers it, runs the `onConnect` reject
 /// gate, pumps inbound frames into blocking dispatches, and tears down (fire

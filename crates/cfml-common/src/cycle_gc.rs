@@ -1539,11 +1539,7 @@ const DISPLACE_RETRY_SECS: u64 = 5;
 const DISPLACE_MAX_ATTEMPTS: usize = 6;
 
 fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_millis() as u64
 }
 
 /// Run the pending displacement sweep, if there is one and the retry policy

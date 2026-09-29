@@ -26,8 +26,9 @@
 //! sanitiser that quietly answered `null` would be a security failure that
 //! looks like working code.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::shim;
 
 pub const ANTISAMY_CLASS: &str = "org.owasp.validator.html.antisamy";
 pub const POLICY_CLASS: &str = "org.owasp.validator.html.policy";
@@ -35,13 +36,6 @@ pub const CLEAN_RESULTS_CLASS: &str = "org.owasp.validator.html.cleanresults";
 
 pub fn is_antisamy_class(class_lower: &str) -> bool {
     matches!(class_lower, ANTISAMY_CLASS | POLICY_CLASS | CLEAN_RESULTS_CLASS)
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
 }
 
 /// `org.owasp.validator.html.PolicyException` — what the Java library raises

@@ -34,8 +34,9 @@
 //! read-then-iterate (`setProperty`, `serializeToString`, the schema registry)
 //! **throws** rather than answering wrongly; see `unsupported()`.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field};
 
 pub const FACTORY_CLASS: &str = "com.adobe.xmp.xmpmetafactory";
 pub const META_CLASS: &str = "com.adobe.xmp.impl.xmpmetaimpl";
@@ -51,13 +52,6 @@ pub fn is_xmp_class(class_lower: &str) -> bool {
         class_lower,
         FACTORY_CLASS | META_CLASS | ITERATOR_CLASS | PROPERTY_INFO_CLASS
     )
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
 }
 
 /// `com.adobe.xmp.XMPException` — what XMPCore raises for a malformed packet,
@@ -132,13 +126,6 @@ fn normalize_prop_name(path: &str) -> String {
 
 pub fn construct(class_lower: &str) -> CfmlResult {
     Ok(CfmlValue::strukt(shim(class_lower)))
-}
-
-fn field(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 /// Turn the `{ path: value }` map `xmpParse()` produces into the ordered

@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::cluster_bus;
+use crate::shim_util::shim;
 
 pub(crate) const WRAPPER_CLASS: &str = "org.pixl8.cbjgroups.cbjgroupsclusterwrapper";
 pub(crate) const MESSAGE_CLASS: &str = "org.jgroups.message";
@@ -28,13 +29,6 @@ pub(crate) fn handles(class_lower: &str) -> bool {
         class_lower,
         WRAPPER_CLASS | MESSAGE_CLASS | VIEW_CLASS | APP_CONTEXT_CLASS
     )
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
 }
 
 fn obj_field(object: &CfmlValue, key: &str) -> Option<CfmlValue> {

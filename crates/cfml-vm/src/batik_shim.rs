@@ -29,8 +29,9 @@
 //! `java.io.FileOutputStream`, which already knows its own path — so both ends
 //! of the transcode resolve to plain filesystem paths.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field as get};
 
 pub const PNG_TRANSCODER: &str = "org.apache.batik.transcoder.image.pngtranscoder";
 pub const JPEG_TRANSCODER: &str = "org.apache.batik.transcoder.image.jpegtranscoder";
@@ -47,13 +48,6 @@ pub fn is_batik_class(class_lower: &str) -> bool {
 
 fn is_transcoder(class_lower: &str) -> bool {
     matches!(class_lower, PNG_TRANSCODER | JPEG_TRANSCODER | TIFF_TRANSCODER)
-}
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
 }
 
 pub fn construct(class_lower: &str) -> CfmlResult {
@@ -74,13 +68,6 @@ pub fn construct(class_lower: &str) -> CfmlResult {
         }
     }
     Ok(CfmlValue::strukt(m))
-}
-
-fn get(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn transcoder_exception(message: impl std::fmt::Display) -> CfmlError {

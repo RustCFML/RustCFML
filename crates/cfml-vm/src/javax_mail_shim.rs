@@ -32,8 +32,9 @@
 //! Sending is **not** shimmed: `Transport.send( message )` needs the whole
 //! `MimeMessage` object graph, and CFML already has `<cfmail>` for that. It throws.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field};
 
 pub const SESSION_CLASS: &str = "javax.mail.session";
 pub const TRANSPORT_CLASS: &str = "javax.mail.transport";
@@ -42,22 +43,8 @@ pub fn is_mail_class(class_lower: &str) -> bool {
     matches!(class_lower, SESSION_CLASS | TRANSPORT_CLASS)
 }
 
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
 pub fn construct(class_lower: &str) -> CfmlResult {
     Ok(CfmlValue::strukt(shim(class_lower)))
-}
-
-fn field(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn field_str(object: &CfmlValue, key: &str) -> String {

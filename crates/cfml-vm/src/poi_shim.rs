@@ -52,6 +52,7 @@
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field as get};
 
 pub const WORKBOOK_XSSF: &str = "org.apache.poi.xssf.usermodel.xssfworkbook";
 pub const WORKBOOK_SXSSF: &str = "org.apache.poi.xssf.streaming.sxssfworkbook";
@@ -98,13 +99,6 @@ pub fn handles(class_lower: &str) -> bool {
     is_poi_class(class_lower) || class_lower == ITERATOR
 }
 
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
 pub fn construct(class_lower: &str) -> CfmlResult {
     // Construction is deferred to `init()`: `createObject("java", X)` with no
     // arguments is how CFML reaches the class object, and the real constructor
@@ -135,13 +129,6 @@ const CELL_UTIL_CONSTANTS: &[(&str, &str)] = &[
     ("FONT", "font"),
     ("FILL_FOREGROUND_COLOR", "fgcolor"),
 ];
-
-fn get(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
-}
 
 fn get_int(object: &CfmlValue, key: &str) -> i64 {
     match get(object, key) {

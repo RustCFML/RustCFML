@@ -22,6 +22,7 @@ use cfml_common::dynamic::{CfmlValue, ValueMap};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
+use crate::shim_util::shim;
 
 /// One node as the cluster sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,10 +70,7 @@ fn local_started_ms() -> u64 {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    cfml_common::clock::now_unix_millis() as u64
 }
 
 fn local_node_name() -> String {
@@ -382,13 +380,6 @@ pub fn stats(id: u64) -> ValueMap {
 pub const MESSAGE_CLASS: &str = "org.jgroups.Message";
 /// `org.jgroups.View`, as `viewAccepted(view)` sees it.
 pub const VIEW_CLASS: &str = "org.jgroups.View";
-
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
 
 fn message_shim(bytes: Vec<u8>) -> CfmlValue {
     let mut m = shim(MESSAGE_CLASS);

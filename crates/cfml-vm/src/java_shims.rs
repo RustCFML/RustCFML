@@ -3,6 +3,7 @@
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use chrono::{Datelike, NaiveDateTime, Timelike};
+use crate::shim_util::shim as java_shim_map;
 
 /// Process-global system-properties map, shared by every `java.lang.System`
 /// shim instance (mirrors the JVM's single process-wide property table). Written
@@ -202,14 +203,6 @@ fn to_i64(v: &CfmlValue) -> i64 {
             other.as_string().trim().parse::<f64>().map(|f| f as i64).unwrap_or(0)
         }),
     }
-}
-
-/// Build a bare java-shim marker map for `class`.
-fn java_shim_map(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
 }
 
 // ─────────────────────────────────────────────
@@ -1192,10 +1185,7 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             // `Date()` (no arg) = now; `Date(long)` = the given epoch millis.
             let millis = match args.first() {
                 Some(v) => to_millis(v),
-                None => std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
+                None => now_millis(),
             };
             let mut shim = ValueMap::default();
             shim.insert(
@@ -6007,11 +5997,10 @@ pub fn handle_java_timezone(method: &str, args: Vec<CfmlValue>, object: &CfmlVal
     })
 }
 
+/// Epoch millis via `cfml_common::clock`: `SystemTime::now()` panics on
+/// wasm32, and these shims are compiled for the worker too.
 fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    cfml_common::clock::now_unix_millis() as i64
 }
 
 /// Days in a given month, leap years included.

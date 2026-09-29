@@ -56,20 +56,11 @@ mod inner {
     const TOMBSTONE_TTL: Duration = Duration::from_secs(60);
     const OUTBOUND_QUEUE_CAP: usize = 1024;
 
-    /// Per-session doc keys (and the opaque `id` on the wire) are the composite
-    /// `(application name, session id)` so two apps sharing a CFID map to two
-    /// distinct Automerge docs across the whole cluster. Every node computes
-    /// the same key, so deltas/tombstones stay consistent. App names are
-    /// case-insensitive in CFML — lowercase the app segment.
-    fn composite_key(app: &str, id: &str) -> String {
-        format!("{}\u{1f}{}", app.to_lowercase(), id)
-    }
-
-    /// Recover the bare session id from a composite doc key (everything after
-    /// the last unit separator).
-    fn id_from_key(key: &str) -> &str {
-        key.rsplit('\u{1f}').next().unwrap_or(key)
-    }
+    // Per-session doc keys (and the opaque `id` on the wire) are the same
+    // `(application name, session id)` composite the in-process store uses, so
+    // two apps sharing a CFID map to two distinct Automerge docs and every node
+    // computes the same key.
+    use cfml_vm::session_store::{composite_key, id_from_key};
 
     // ─────────────────────────────────────────────
     // Wire frames
@@ -377,10 +368,7 @@ mod inner {
 
     /// Current unix epoch seconds (wall clock), for read-path expiry checks.
     fn now_unix_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+        cfml_common::clock::now_unix_secs()
     }
 
     fn write_session(doc: &mut automerge::AutoCommit, data: &SessionData) -> Result<(), String> {

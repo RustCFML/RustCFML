@@ -38,6 +38,7 @@
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use crate::shim_util::{shim, field as get};
 
 pub const JSOUP_CLASS: &str = "org.jsoup.jsoup";
 pub const DOCUMENT_CLASS: &str = "org.jsoup.nodes.document";
@@ -52,22 +53,8 @@ pub fn is_jsoup_class(class_lower: &str) -> bool {
     )
 }
 
-fn shim(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
-
 pub fn construct(class_lower: &str) -> CfmlResult {
     Ok(CfmlValue::strukt(shim(class_lower)))
-}
-
-fn get(object: &CfmlValue, key: &str) -> Option<CfmlValue> {
-    match object {
-        CfmlValue::Struct(s) => s.get(key),
-        _ => None,
-    }
 }
 
 fn get_int(object: &CfmlValue, key: &str) -> i64 {

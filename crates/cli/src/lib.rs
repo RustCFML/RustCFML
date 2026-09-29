@@ -2217,10 +2217,7 @@ fn spawn_session_reaper(server_state: cfml_vm::ServerState, cfconfig: &RustCfmlC
 
 /// Current unix epoch seconds (wall clock).
 fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    cfml_common::clock::now_unix_secs()
 }
 
 /// The serve-mode startup banner. Called ONLY after a listener has been bound,

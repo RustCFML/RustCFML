@@ -12,9 +12,10 @@
 //! `__p_days/__p_months/__p_years`. Enum-like holders (ChronoUnit, ChronoField,
 //! DayOfWeek, Month) expose their constants as string-token keys for field reads.
 
-use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlResult};
 use chrono::{Datelike, Months, NaiveDateTime, TimeZone, Timelike, Utc};
+use crate::shim_util::shim as shim_map;
 
 pub const LOCALDATETIME_CLASS: &str = "java.time.localdatetime";
 pub const LOCALDATE_CLASS: &str = "java.time.localdate";
@@ -29,13 +30,6 @@ pub const CHRONOFIELD_CLASS: &str = "java.time.temporal.chronofield";
 pub const DAYOFWEEK_CLASS: &str = "java.time.dayofweek";
 pub const MONTH_CLASS: &str = "java.time.month";
 pub const TEMPORALADJUSTERS_CLASS: &str = "java.time.temporal.temporaladjusters";
-
-fn shim_map(class: &str) -> ValueMap {
-    let mut m = ValueMap::default();
-    m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-    m.insert("__java_class".to_string(), CfmlValue::string(class.to_string()));
-    m
-}
 
 fn now_millis() -> i64 {
     Utc::now().timestamp_millis()

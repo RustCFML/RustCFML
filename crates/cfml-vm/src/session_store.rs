@@ -119,14 +119,14 @@ pub struct MemoryStore {
 
 /// Build the composite map key. App names are case-insensitive in CFML, so
 /// lowercase the app portion for consistent lookups.
-fn composite_key(app: &str, id: &str) -> String {
+pub fn composite_key(app: &str, id: &str) -> String {
     format!("{}\u{1f}{}", app.to_lowercase(), id)
 }
 
 /// Recover the bare session id from a composite key (everything after the
 /// last unit separator). Falls back to the whole key if no separator is
 /// present (defensive — never happens for keys we mint).
-fn id_from_key(key: &str) -> &str {
+pub fn id_from_key(key: &str) -> &str {
     key.rsplit('\u{1f}').next().unwrap_or(key)
 }
 
