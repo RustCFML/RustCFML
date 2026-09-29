@@ -1668,25 +1668,33 @@ fn fn_find_one_of(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// Byte offset of the `n`th character of `s` (0-based), or `s.len()` when `s`
+/// has `n` characters or fewer. ASCII text is indexed directly; otherwise the
+/// walk stops at the target instead of copying the string into a `Vec<char>`,
+/// which is what `mid`/`left`/`right` used to do on every call.
+fn char_offset(s: &str, n: usize) -> usize {
+    if n >= s.len() {
+        return s.len();
+    }
+    if s.is_ascii() {
+        return n;
+    }
+    s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
+}
+
 fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
-    if args.len() >= 3 {
+    if args.len() >= 2 {
         let string = get_str(&args, 0);
         let start = (get_int(&args, 1).max(1) as usize).saturating_sub(1);
-        let length = get_int(&args, 2).max(0) as usize;
-        let chars: Vec<char> = string.chars().collect();
-        if start >= chars.len() {
-            return Ok(CfmlValue::string(String::new()));
-        }
-        let end = (start + length).min(chars.len());
-        Ok(CfmlValue::string(chars[start..end].iter().collect::<String>()))
-    } else if args.len() >= 2 {
-        let string = get_str(&args, 0);
-        let start = (get_int(&args, 1).max(1) as usize).saturating_sub(1);
-        let chars: Vec<char> = string.chars().collect();
-        if start >= chars.len() {
-            return Ok(CfmlValue::string(String::new()));
-        }
-        Ok(CfmlValue::string(chars[start..].iter().collect::<String>()))
+        let from = char_offset(&string, start);
+        let rest = &string[from..];
+        let slice = if args.len() >= 3 {
+            let length = get_int(&args, 2).max(0) as usize;
+            &rest[..char_offset(rest, length)]
+        } else {
+            rest
+        };
+        Ok(CfmlValue::string(slice.to_string()))
     } else {
         Ok(CfmlValue::string(String::new()))
     }
@@ -1695,16 +1703,15 @@ fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_left(args: Vec<CfmlValue>) -> CfmlResult {
     let string = get_str(&args, 0);
     let count = get_int(&args, 1).max(0) as usize;
-    let chars: Vec<char> = string.chars().collect();
-    Ok(CfmlValue::string(chars[..count.min(chars.len())].iter().collect::<String>()))
+    Ok(CfmlValue::string(string[..char_offset(&string, count)].to_string()))
 }
 
 fn fn_right(args: Vec<CfmlValue>) -> CfmlResult {
     let string = get_str(&args, 0);
     let count = get_int(&args, 1).max(0) as usize;
-    let chars: Vec<char> = string.chars().collect();
-    let start = chars.len().saturating_sub(count);
-    Ok(CfmlValue::string(chars[start..].iter().collect::<String>()))
+    let total = if string.is_ascii() { string.len() } else { string.chars().count() };
+    let skip = total.saturating_sub(count);
+    Ok(CfmlValue::string(string[char_offset(&string, skip)..].to_string()))
 }
 
 fn fn_reverse(args: Vec<CfmlValue>) -> CfmlResult {
