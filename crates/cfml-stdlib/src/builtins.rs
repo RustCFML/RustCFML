@@ -908,6 +908,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("fileReadLine".to_string(), fn_file_read_line);
     f.insert("fileWriteLine".to_string(), fn_file_write_line);
     f.insert("fileIsEOF".to_string(), fn_file_is_eof);
+    f.insert("fileSeek".to_string(), fn_file_seek);
+    f.insert("fileSkipBytes".to_string(), fn_file_skip_bytes);
     f.insert("fileUpload".to_string(), fn_file_upload);
     f.insert("fileUploadAll".to_string(), fn_file_upload_all);
     f.insert("__cffile_upload".to_string(), fn_cffile_upload);
@@ -8895,6 +8897,10 @@ fn with_optional_newline(args: &[CfmlValue], data_index: usize, flag_index: usiz
 }
 
 fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
+    // `fileRead( handle [, charsOrBytes] )` reads from an open handle.
+    if crate::file_handles::handle_id(args.first()).is_some() {
+        return crate::file_handles::read(args);
+    }
     let path = get_str(&args, 0);
     // Optional second argument: the charset to decode with (`fileRead(path,
     // charset)` / `<cffile action="read" charset=…>`). It used to be ignored, so
@@ -8914,6 +8920,10 @@ fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_file_write(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() < 2 {
         return Err(CfmlError::runtime("fileWrite requires path and data".to_string()));
+    }
+    // `fileWrite( handle, data )` writes through an open handle.
+    if crate::file_handles::handle_id(args.first()).is_some() {
+        return crate::file_handles::write("fileWrite", args, false);
     }
     let path = get_str(&args, 0);
     // Binary data must be written as raw bytes; only stringify simple values.
@@ -18909,6 +18919,9 @@ fn fn_profile_now_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 // ---- File functions ----
 
 fn fn_file_read_binary(args: Vec<CfmlValue>) -> CfmlResult {
+    if crate::file_handles::handle_id(args.first()).is_some() {
+        return crate::file_handles::read_binary(args);
+    }
     let path = get_str(&args, 0);
     match std::fs::read(&path) {
         Ok(bytes) => Ok(CfmlValue::Binary(bytes)),
@@ -18983,49 +18996,32 @@ fn fn_directory_copy(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+// Real file handles live in `crate::file_handles` (a process-wide registry);
+// these are the registration-table entry points.
 fn fn_file_open(args: Vec<CfmlValue>) -> CfmlResult {
-    // Returns the file path as a handle identifier (actual file handle management would need VM support)
-    let path = get_str(&args, 0);
-    let _mode = if args.len() > 1 { get_str(&args, 1) } else { "read".to_string() };
-    // Return a struct representing the file handle
-    let mut handle = ValueMap::default();
-    handle.insert("path".to_string(), CfmlValue::string(path));
-    handle.insert("isOpen".to_string(), CfmlValue::Bool(true));
-    handle.insert("line".to_string(), CfmlValue::Int(0));
-    Ok(CfmlValue::strukt(handle))
+    crate::file_handles::open(args)
 }
 
-fn fn_file_close(_args: Vec<CfmlValue>) -> CfmlResult {
-    // Stub - actual file handle management needs VM support
-    Ok(CfmlValue::Null)
+fn fn_file_close(args: Vec<CfmlValue>) -> CfmlResult {
+    crate::file_handles::close(args)
 }
 
 fn fn_file_read_line(args: Vec<CfmlValue>) -> CfmlResult {
-    // Simplified: reads the Nth line from the file indicated by the handle
-    match args.get(0) {
-        Some(CfmlValue::Struct(handle)) => {
-            let path = handle.get("path").map(|v| v.as_string()).unwrap_or_default();
-            let line_num = handle.get("line").map(|v| match v {
-                CfmlValue::Int(i) => i as usize,
-                _ => 0,
-            }).unwrap_or(0);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let lines: Vec<&str> = content.lines().collect();
-                    if line_num < lines.len() {
-                        Ok(CfmlValue::string(lines[line_num].to_string()))
-                    } else {
-                        Ok(CfmlValue::string(String::new()))
-                    }
-                }
-                Err(e) => Err(CfmlError::runtime(format!("fileReadLine(): {}", e))),
-            }
-        }
-        _ => Err(CfmlError::runtime("fileReadLine() requires a file handle".to_string())),
-    }
+    crate::file_handles::read_line(args)
+}
+
+fn fn_file_seek(args: Vec<CfmlValue>) -> CfmlResult {
+    crate::file_handles::seek(args)
+}
+
+fn fn_file_skip_bytes(args: Vec<CfmlValue>) -> CfmlResult {
+    crate::file_handles::skip_bytes(args)
 }
 
 fn fn_file_write_line(args: Vec<CfmlValue>) -> CfmlResult {
+    if crate::file_handles::handle_id(args.first()).is_some() {
+        return crate::file_handles::write("fileWriteLine", args, true);
+    }
     match args.get(0) {
         Some(CfmlValue::Struct(handle)) => {
             let path = handle.get("path").map(|v| v.as_string()).unwrap_or_default();
@@ -19044,23 +19040,7 @@ fn fn_file_write_line(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_file_is_eof(args: Vec<CfmlValue>) -> CfmlResult {
-    match args.get(0) {
-        Some(CfmlValue::Struct(handle)) => {
-            let path = handle.get("path").map(|v| v.as_string()).unwrap_or_default();
-            let line_num = handle.get("line").map(|v| match v {
-                CfmlValue::Int(i) => i as usize,
-                _ => 0,
-            }).unwrap_or(0);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let line_count = content.lines().count();
-                    Ok(CfmlValue::Bool(line_num >= line_count))
-                }
-                Err(_) => Ok(CfmlValue::Bool(true)),
-            }
-        }
-        _ => Ok(CfmlValue::Bool(true)),
-    }
+    crate::file_handles::is_eof(args)
 }
 
 // ---- VM Stub functions for tag infrastructure ----

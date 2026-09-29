@@ -1226,7 +1226,6 @@ pub fn compile_file_cached(
     } else {
         source_code
     };
-
     // Parse
     let ast = cfml_compiler::parser::Parser::new(source_code)
         .parse()
@@ -38155,6 +38154,8 @@ impl CfmlVirtualMachine {
             // biggest source of spurious invalidation on a real workload.
             "fileopen",
             "fileclose",
+            "fileseek",
+            "fileskipbytes",
             // Creations / overwrites. After each of these the target EXISTS, so a
             // cached positive is still correct and a cached negative never existed.
             "filewrite",
@@ -38221,6 +38222,8 @@ impl CfmlVirtualMachine {
             // single biggest spurious retirer measured on a Preside boot (835 of
             // them), the exact mirror of the positive-side bug fixed in c9fa07f.
             "fileclose",
+            "fileseek",
+            "fileskipbytes",
         ];
         if READ_ONLY.contains(&name_lower) {
             return false;
@@ -38330,6 +38333,25 @@ impl CfmlVirtualMachine {
     /// `tests/intercept_declaration_guard.rs`, which harvests string literals in
     /// a window after each `name_lower` and would read an attribute key as an
     /// undeclared intercepted builtin name.
+    /// Whether a `fileOpen()` call's mode argument (index 1) creates or
+    /// truncates its target. Its own function for the same reason as
+    /// `cfimage_destination`: the mode names are string literals that the
+    /// intercept-declaration guard would otherwise read as builtin names.
+    fn file_open_mode_writes(args: &[CfmlValue]) -> bool {
+        match args.get(1) {
+            Some(CfmlValue::String(m)) => {
+                let m = m.as_str();
+                m.eq_ignore_ascii_case("write")
+                    || m.eq_ignore_ascii_case("writebinary")
+                    || m.eq_ignore_ascii_case("append")
+                    || m.eq_ignore_ascii_case("appendbinary")
+            }
+            // No mode argument means "read".
+            None => false,
+            _ => true,
+        }
+    }
+
     fn cfimage_destination(args: &[CfmlValue]) -> Vec<String> {
         match args.first() {
             Some(CfmlValue::Struct(s)) => s
@@ -38351,8 +38373,20 @@ impl CfmlVirtualMachine {
             // both can bring a path into being, and both name it in argument 0, so
             // attributing them beats retiring every cached negative in the process
             // (`fileOpen` alone did that 835 times on one Preside boot).
-            "filewrite" | "fileappend" | "filewriteline" | "filedelete" | "fileopen"
+            "filewrite" | "fileappend" | "filewriteline" | "filedelete"
             | "directorycreate" => &[0],
+            // `fileOpen` creates or truncates its target only in a write mode.
+            // A read-mode open changes nothing, yet it was treated as a writer:
+            // two `realpath()`s (before and after the call) plus a scan of every
+            // validated template, per open. Preside's boot opens every view file
+            // for reading (857 on one site) — 28% of a 4 s boot went here.
+            "fileopen" => {
+                if Self::file_open_mode_writes(args) {
+                    &[0]
+                } else {
+                    return Vec::new();
+                }
+            }
             "filecopy" => &[1],
             "filemove" => &[0, 1],
             // Object-then-path writers. These create a file every bit as much as

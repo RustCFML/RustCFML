@@ -294,6 +294,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_query_higher_order.cfm">
 <cf_runtest file="stdlib/test_type_checking.cfm">
 <cf_runtest file="stdlib/test_conversion.cfm">
+<cf_runtest file="stdlib/test_file_handles.cfm">
 <cf_runtest file="stdlib/test_timespan_type.cfm">
 <cf_runtest file="stdlib/test_json.cfm">
 <cf_runtest file="stdlib/test_serialize.cfm">

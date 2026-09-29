@@ -78,7 +78,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [46](#46) | Member-function dispatch lowercases the method name per call | 🏗 edges |
 | [47](#47) | Surplus built-in function arguments accepted, not rejected | 🏗 edges |
 | [48](#48) | Elvis operator accepts any left operand (Lucee restricts it) | 🏗 edges |
-| [49](#49) | `fileOpen( f, "write" )` does not create the file | 🏗 edges |
+| [49](#49) | `fileOpen( f, "write" )` does not create the file | ✅ resolved (v0.697.0) |
 | [50](#50) | AntiSamy sanitiser — cosmetic divergences from the Java library | 🏗 edges |
 | [51](#51) | Tag-mode parsing — two constructs compile here that Lucee rejects | 🏗 edges |
 | [53](#53) | `private`/`package` methods are gated on CALLS, not on member reads | 🏗 edges |
@@ -1120,29 +1120,23 @@ engines.
 
 <a id="49"></a>
 
-## 49. `fileOpen( f, "write" )` does not create the file 🏗
+## 49. `fileOpen( f, "write" )` does not create the file ✅ resolved (v0.697.0)
 
-Lucee's `fileOpen()` in a write mode creates the target immediately, so
-`fileExists()` is true before anything is written and the handle can be closed
-without ever producing content. RustCFML defers creation until the first
-`fileWrite()` on the handle, so:
+File handles are real handles now. `fileOpen()` registers an open `File` (a
+buffered reader for `read`/`readBinary`, a buffered writer for `write`/
+`writeBinary`/`append`) and returns a struct carrying its id plus Lucee's
+`filename`/`filepath`/`mode`/`status` keys; `fileReadLine`/`fileIsEof`/
+`fileRead(handle[,n])`/`fileReadBinary(handle[,n])`/`fileWrite(handle,…)`/
+`fileWriteLine(handle,…)`/`fileSeek`/`fileSkipBytes` operate on it and
+`fileClose` drops it (flushing). A write-mode open creates or truncates the
+file immediately, as Lucee does.
 
-```cfml
-h = fileOpen( f, "write" );
-fileClose( h );
-fileExists( f );   // Lucee: true.  RustCFML: false — nothing was created
-```
-
-Confirmed to be genuine absence rather than a stale cached answer: after the
-sequence above the path is invisible to `directoryList()` (a different code path
-from the existence memo) and absent on disk. `fileClose()` is itself a no-op stub
-in RustCFML, which is why nothing flushes a zero-byte file on close.
-
-The existence cache is unaffected either way, since it never caches an answer the
-filesystem does not agree with. Fixing it means giving handles a real
-create-on-open, which also wants `fileClose()` to stop being a stub.
-
-<a id="50"></a>
+Before this, the handle was a struct holding the path and a line counter:
+`fileReadLine` re-read and re-split the WHOLE file on every call and
+`fileIsEof` re-read it and counted its lines (447 µs on a 2 KB file), so any
+line loop was quadratic. Preside's boot opens every view file to read its
+first line (`Renderer._isViewFeatureDisabled`); on an 857-view site the scan
+went from 364 ms to 130 ms.
 
 ## 50. AntiSamy sanitiser: cosmetic divergences from the Java library 🏗
 
