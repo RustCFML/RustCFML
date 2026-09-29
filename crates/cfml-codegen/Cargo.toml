@@ -21,5 +21,3 @@ publish = false
 [dependencies]
 cfml-common = { workspace = true }
 cfml-compiler = { workspace = true }
-thiserror = { workspace = true }
-log = { workspace = true }

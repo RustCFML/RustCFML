@@ -37,7 +37,6 @@ cfml-qoq = { workspace = true }
 cfml-vm = { workspace = true, default-features = false, features = [
     "mcp-client",
     "s3",
-    "std",
     "real-threads",
     "observability",
     "scope-pool",
@@ -49,7 +48,6 @@ cfml-stdlib = { workspace = true, features = ["default", "all-databases", "s3"] 
 log = { workspace = true }
 env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }
-anyhow = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
 # Only for `LengthLimitError`: lets a body-read failure be classified as a real
 # over-limit (413) rather than lumping every transport error in with it.
@@ -111,7 +109,6 @@ libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", optional = true, features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
-opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true }
 
 # Kubernetes peer discovery (`cluster` feature): list pods through the API
@@ -122,13 +119,13 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 
 [features]
-default = ["memcached", "cluster", "component-instance", "mimalloc", "obs-otel"]
+default = ["memcached", "cluster", "mimalloc", "obs-otel"]
 # OpenTelemetry distributed traces (OTLP push) + RED metrics (native Prometheus
 # scrape endpoint). On by default — every release binary carries it, and it stays
 # inert until `observability.otel` or `observability.metrics` is enabled in
 # config (measured: +1.4 MB on a 60 MB binary). Host-only; this crate never
 # builds for wasm. Implies the VM's `observability` hook bus.
-obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:prometheus"]
+obs-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:prometheus"]
 # Native CPU/wall-clock sampling profiler (`--profile`), emitting a flamegraph +
 # pprof protobuf. Unix-only (uses SIGPROF/setitimer) — the `pprof` dependency is
 # declared under the unix target table; never built for wasm or Windows.
@@ -144,7 +141,7 @@ bif-census = ["cfml-common/bif-census", "cfml-vm/bif-census"]
 call-phases = ["cfml-common/call-phases", "cfml-vm/call-phases"]
 # Per-frame exclusive accounting. Also swaps in a counting global allocator
 # (wrapping mimalloc) so allocations can be attributed per frame.
-frame-census = ["cfml-common/frame-census", "cfml-vm/frame-census"]
+frame-census = ["cfml-vm/frame-census"]
 # Existence-probe outcome census (known-issues §45 sizing) — see
 # cfml-common/Cargo.toml. Sizing builds only.
 exists-census = ["cfml-common/exists-census", "cfml-vm/exists-census"]
@@ -170,18 +167,12 @@ memprofile = ["dep:backtrace"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2", "dep:ureq", "dep:rustls", "dep:rustls-pki-types"]
-# Phase C (component-model flyweight): passthrough to the VM's `Instance` backing.
-# DEFAULT-ON as of v0.519.0 (the Slice-6 flip); also reaches the binary transitively
-# via cfml-vm's default. The wasm crates opt out (default-features = false), so the
-# demo/worker keep the marker representation.
-component-instance = ["cfml-vm/component-instance"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.28"
 # The in-memory span exporter the otel tests assert against — test builds only,
 # so it no longer ships in the release dependency set.
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "testing"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

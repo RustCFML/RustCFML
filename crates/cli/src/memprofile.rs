@@ -31,7 +31,8 @@
 //!   when it never shows up in RSS.
 //!
 //! Each is also written as a `.folded` collapsed-stack text file (inferno /
-//! flamegraph.pl format, and trivial to roll up categorically with `awk`).
+//! flamegraph.pl format). The repo-root `memprof_report.py` rolls one up into
+//! subsystem categories.
 //!
 //! # Statistical correctness
 //!

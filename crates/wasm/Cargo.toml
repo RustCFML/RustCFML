@@ -25,7 +25,7 @@ wasm-bindgen = "0.2"
 cfml-common = { path = "../cfml-common" }
 cfml-compiler = { path = "../cfml-compiler" }
 cfml-codegen = { path = "../cfml-codegen" }
-cfml-vm = { path = "../cfml-vm", default-features = false, features = ["std"] }
+cfml-vm = { path = "../cfml-vm", default-features = false }
 # Enable the pure-Rust stdlib features that build fine on wasm32 (verified). The
 # crate opts out of `default` (which drags in native-only http/database/smtp via
 # ureq→ring, rusqlite→C, lettre→native-TLS — none have a wasm target), then
@@ -34,12 +34,7 @@ cfml-vm = { path = "../cfml-vm", default-features = false, features = ["std"] }
 # they were silently absent (e.g. isValid("xml",…), xmlParse, encrypt, bcrypt).
 # `security` pulls `rand`→`getrandom`, which needs its `js` backend on wasm.
 cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security", "image_support"] }
-js-sys = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
-
-[dependencies.web-sys]
-version = "0.3"
-features = ["console"]
 
 # wasm-pack runs Binaryen's `wasm-opt -O` as a post-build step. The bundled
 # wasm-opt SIGSEGVs (signal 11) on this module in CI — it can't handle the wasm

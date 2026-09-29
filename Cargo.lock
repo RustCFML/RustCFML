@@ -1566,8 +1566,6 @@ version = "0.697.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
- "log",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1578,11 +1576,9 @@ dependencies = [
  "indexmap",
  "js-sys",
  "log",
- "num-traits",
  "parking_lot",
  "rustc-hash 1.1.0",
  "serde",
- "thiserror 1.0.69",
  "wasm-bindgen",
 ]
 
@@ -1591,8 +1587,6 @@ name = "cfml-compiler"
 version = "0.697.0"
 dependencies = [
  "cfml-common",
- "log",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1700,7 +1694,6 @@ dependencies = [
 name = "cfml-vm"
 version = "0.697.0"
 dependencies = [
- "anyhow",
  "cfml-codegen",
  "cfml-common",
  "cfml-compiler",
@@ -1729,7 +1722,6 @@ dependencies = [
  "serde_json",
  "sha1 0.10.6",
  "sha2 0.10.9",
- "thiserror 1.0.69",
  "ureq",
  "uuid",
 ]
@@ -5280,12 +5272,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry-semantic-conventions"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
-
-[[package]]
 name = "opentelemetry_sdk"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6813,7 +6799,6 @@ dependencies = [
 name = "rustcfml-cli"
 version = "0.697.0"
 dependencies = [
- "anyhow",
  "automerge",
  "axum",
  "backtrace",
@@ -6845,7 +6830,6 @@ dependencies = [
  "openssl",
  "opentelemetry",
  "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "pprof",
  "prometheus",
@@ -6881,9 +6865,7 @@ dependencies = [
  "cfml-stdlib",
  "cfml-vm",
  "getrandom 0.2.17",
- "js-sys",
  "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]

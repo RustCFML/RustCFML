@@ -20,5 +20,3 @@ publish = false
 
 [dependencies]
 cfml-common = { workspace = true }
-thiserror = { workspace = true }
-log = { workspace = true }

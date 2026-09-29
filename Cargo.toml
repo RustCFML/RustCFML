@@ -56,14 +56,12 @@ cfml-module-abi = { path = "crates/cfml-module-abi", version = "0.1.0" }
 
 log = "0.4"
 thiserror = "1.0"
-anyhow = "1.0"
 parking_lot = "0.12"
 indexmap = "2.0"
 # The raw table behind indexmap, taken directly for `InheritedKeys` (see
 # `cfml-vm`). Same version and same `default-features = false` indexmap
 # already requests, so this adds no crate and no feature to the graph.
 hashbrown = { version = "0.17", default-features = false }
-num-traits = "0.2"
 rustc-hash = "1.1"
 # IANA timezone database for chrono. Pure generated data — compiles on
 # wasm32 with no system deps. `case-insensitive` lets us resolve tz ids
