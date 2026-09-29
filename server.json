@@ -8,5 +8,8 @@
         "http":{
             "port":"8599"
         }
+    },
+    "cfconfig":{
+        "file":".cfconfig-lucee-tests.json"
     }
 }
