@@ -698,7 +698,15 @@ impl WebSocketRegistry {
                 .insert(conn_id.to_string(), meta.clone());
             channel
         };
-        // Snapshot to the tracking connection, join diff to the rest.
+        // Join diff to the rest FIRST, then the snapshot to the tracker. The other
+        // order had a window: once the tracker held its snapshot, a connection
+        // that joined the channel before this broadcast ran received the
+        // tracker's join diff ahead of its OWN presence_state snapshot.
+        let join = self.presence_diff_frame(&channel, true, key, &meta);
+        // The join diff reaches remote clients via this broadcast's auto-publish;
+        // the separate PresenceTrack replicates the *roster* so remote
+        // `presence_state()` is cluster-correct (it merges state, no re-broadcast).
+        self.broadcast(&channel, join, Some(conn_id));
         let state = self.presence_state(&channel);
         let state_frame = WireEnvelope {
             t: "presence".to_string(),
@@ -709,11 +717,6 @@ impl WebSocketRegistry {
             ref_id: None,
         };
         self.emit_to(conn_id, state_frame);
-        let join = self.presence_diff_frame(&channel, true, key, &meta);
-        // The join diff reaches remote clients via this broadcast's auto-publish;
-        // the separate PresenceTrack replicates the *roster* so remote
-        // `presence_state()` is cluster-correct (it merges state, no re-broadcast).
-        self.broadcast(&channel, join, Some(conn_id));
         self.publish(BrokerMsg::PresenceTrack {
             channel,
             key: key.to_string(),
