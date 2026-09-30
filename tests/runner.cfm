@@ -342,6 +342,7 @@ include "harness.cfm";
 <cf_runtest file="database/test_lucee_query_builder.cfm" rustcfmlOnly="true" why="datasource-less cfquery via the RustCFML VFS/QoQ overlay">
 <cf_runtest file="database/test_datasource_list_maxrows.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_sqlite_datasource_paths.cfm" rustcfmlOnly="true">
+<cf_runtest file="database/test_unsupported_jdbc_driver.cfm">
 <cf_runtest file="database/test_cfquery_tag_forwards_columnkey_maxrows.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_duplicate_result_columns.cfm" rustcfmlOnly="true">
 <cf_runtest file="database/test_update_affected_rows_matched.cfm" rustcfmlOnly="true">
@@ -349,6 +350,8 @@ include "harness.cfm";
 <!--- A non-SELECT statement returns an empty query (docs/known-issues.md §37). --->
 <cf_runtest file="database/test_dml_returns_empty_query.cfm">
 <cf_runtest file="database/test_query_error_catch_type_database.cfm">
+<cf_runtest file="database/test_transaction_statement_datasource.cfm" rustcfmlOnly="true" why="the Lucee harness has no SQLite JDBC driver (Lucee 7.1 behaviour probed on PostgreSQL: each datasource runs in the transaction on its own connection)">
+<cf_runtest file="database/test_transaction_multi_datasource.cfm" rustcfmlOnly="true" why="the Lucee harness has no SQLite JDBC driver">
 <cf_runtest file="database/test_query_error_sqlstate_members.cfm">
 <cf_runtest file="database/test_pg_comment_placeholder_scan.cfm">
 <cf_runtest file="database/test_cfqueryparam_shared_instance_threads.cfm">

@@ -10641,6 +10641,11 @@ pub(crate) enum DbDriver {
     Mysql(String),
     Postgres(String),
     Mssql(String),
+    /// A `jdbc:` URL for a driver this build does not bundle (H2, Oracle, …),
+    /// carrying the subprotocol. Every dispatch site rejects it: before this
+    /// variant existed the URL fell through to the bare-path arm and SQLite
+    /// silently created an empty database file named after it.
+    Unsupported(String),
 }
 
 /// Read the `datasource` option value as a connection string. Usually a plain
@@ -10686,6 +10691,8 @@ pub(crate) fn parse_datasource(ds: &str) -> DbDriver {
         {
             return parse_datasource(rest);
         }
+        let subprotocol = rest.split(|c| c == ':' || c == ';' || c == '/').next().unwrap_or("");
+        return DbDriver::Unsupported(subprotocol.to_ascii_lowercase());
     }
     if ds.starts_with("mysql://") {
         DbDriver::Mysql(ds.to_string())
@@ -10700,6 +10707,17 @@ pub(crate) fn parse_datasource(ds: &str) -> DbDriver {
     } else {
         DbDriver::Sqlite(ds.to_string()) // :memory: or file path
     }
+}
+
+/// The error for a `jdbc:` datasource whose driver this build does not bundle.
+/// `database`-typed, so `catch( database e )` sees it like any other
+/// connection failure.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub(crate) fn unsupported_jdbc_driver_error(subprotocol: &str) -> CfmlError {
+    CfmlError::database(format!(
+        "JDBC driver [{}] is not supported. RustCFML connects to SQLite (jdbc:sqlite:), MySQL/MariaDB (jdbc:mysql://, jdbc:mariadb://), PostgreSQL (jdbc:postgresql://) and SQL Server (mssql://).",
+        subprotocol
+    ))
 }
 
 /// Does `s` look like an explicit connection string (rather than a bare
@@ -13084,6 +13102,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         DbDriver::Postgres(url) => execute_postgres(&url, &sql, &params_arg, &return_type),
         #[cfg(feature = "mssql_db")]
         DbDriver::Mssql(url) => execute_mssql(&url, &sql, &params_arg, &return_type),
+        DbDriver::Unsupported(sub) => Err(unsupported_jdbc_driver_error(&sub)),
         #[allow(unreachable_patterns)]
         _ => Err(CfmlError::runtime(format!(
             "queryExecute: database driver not available for datasource '{}'. Enable the appropriate feature (sqlite, mysql_db, postgres_db, mssql_db).",
@@ -15212,6 +15231,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
             mssql_txn_control(&mut m.client, &mut m.broken, "BEGIN TRANSACTION", "BEGIN")?;
             Ok(TransactionConn::Mssql(conn))
         }
+        DbDriver::Unsupported(sub) => Err(unsupported_jdbc_driver_error(&sub)),
         #[allow(unreachable_patterns)]
         _ => Err(CfmlError::runtime(format!(
             "cftransaction: unsupported datasource '{}'", datasource

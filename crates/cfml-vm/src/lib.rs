@@ -2616,6 +2616,12 @@ pub struct CfmlVirtualMachine {
     pub transaction_conn: Option<Box<dyn std::any::Any>>,
     /// Datasource URL of the active transaction
     pub transaction_datasource: Option<String>,
+    /// Connections for the OTHER datasources a transaction's statements named,
+    /// keyed by the resolved datasource. Lucee gives every datasource used
+    /// inside a transaction its own connection in that transaction, and
+    /// commits, rolls back and savepoints them together; before this, every
+    /// statement ran on the first datasource's connection whatever it named.
+    pub transaction_extra_conns: Vec<(String, Box<dyn std::any::Any>)>,
     /// True while inside a `transaction { }` block whose connection has NOT yet
     /// been established because no datasource was resolvable at block entry.
     /// The first query inside the block begins the transaction lazily on its
@@ -2662,6 +2668,11 @@ pub struct CfmlVirtualMachine {
     /// so without the same fallback here a `transaction { }` over an app with
     /// only a global default never began and ran its queries unwrapped.
     pub default_datasource_fn: Option<fn() -> Option<String>>,
+    /// Function pointer: resolve a registered datasource NAME to its URL
+    /// (unregistered names come back unchanged). Lets a transaction tell
+    /// whether a statement's datasource is one it already holds a connection
+    /// for, whichever way the statement spelled it.
+    pub datasource_resolve_fn: Option<fn(&str) -> String>,
     /// Function pointer: execute query normally (args) -> result
     pub query_execute_fn: Option<fn(Vec<CfmlValue>) -> CfmlResult>,
     /// Session ID for current request
@@ -4649,6 +4660,7 @@ impl CfmlVirtualMachine {
             dispatch_caller_this: None,
             transaction_conn: None,
             transaction_datasource: None,
+            transaction_extra_conns: Vec::new(),
             transaction_pending: false,
             transaction_depth: 0,
             transaction_savepoints: Vec::new(),
@@ -4661,6 +4673,7 @@ impl CfmlVirtualMachine {
             txn_rollback_to_savepoint: None,
             txn_execute: None,
             default_datasource_fn: None,
+            datasource_resolve_fn: None,
             session_id: None,
             missing_template: None,
             missing_template_handled: false,
@@ -19884,7 +19897,8 @@ impl CfmlVirtualMachine {
                         other => other.map(|v| v.as_string().to_lowercase()),
                     }
                     .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| "exittemplate".to_string());
+                    // No method: "exittag", CFML's default, same as the tag form.
+                    .unwrap_or_else(|| "exittag".to_string());
                     // `loop` re-executes the body of the custom tag, so it is
                     // only meaningful while a custom tag's END phase is running.
                     // Lucee raises here, at the `cfexit` itself, rather than
@@ -20449,14 +20463,25 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
-                        // Route through the transaction conn if one is active.
+                        // Route through the transaction conn if one is active —
+                        // the conn for the datasource this statement names.
                         if self.transaction_conn.is_some() && self.txn_execute.is_some() {
                             let txn_execute = self.txn_execute.unwrap();
                             let sql = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                             let params_arg = args.get(1).cloned().unwrap_or(CfmlValue::Null);
                             let return_type =
                                 return_type_opt.clone().unwrap_or_else(|| "query".to_string());
-                            let txn_conn = self.transaction_conn.as_mut().unwrap();
+                            let stmt_ds = match args.get(2) {
+                                Some(CfmlValue::Struct(opts)) => opts
+                                    .get_ci("datasource")
+                                    .map(|v| Self::datasource_arg_to_name(&v)),
+                                _ => None,
+                            }
+                            .filter(|s| !s.is_empty());
+                            let txn_conn = match stmt_ds {
+                                Some(ds) => self.transaction_conn_for(&ds)?,
+                                None => self.transaction_conn.as_mut().unwrap(),
+                            };
                             txn_execute(txn_conn, &sql, &params_arg, &return_type)?
                         } else if let Some(qe_fn) = self.query_execute_fn {
                             // No active transaction — delegate to the normal
@@ -32557,6 +32582,9 @@ impl CfmlVirtualMachine {
                     (self.txn_savepoint, self.transaction_conn.as_mut())
                 {
                     savepoint(conn, &name)?;
+                    for (_, extra) in self.transaction_extra_conns.iter_mut() {
+                        savepoint(extra, &name)?;
+                    }
                     self.transaction_savepoints.push(Some(name));
                 } else {
                     self.transaction_savepoints.push(None);
@@ -32627,6 +32655,9 @@ impl CfmlVirtualMachine {
                     (self.txn_release_savepoint, self.transaction_conn.as_mut())
                 {
                     release(conn, &name)?;
+                    for (_, extra) in self.transaction_extra_conns.iter_mut() {
+                        release(extra, &name)?;
+                    }
                 }
             }
             return Ok(CfmlValue::Null);
@@ -32638,10 +32669,19 @@ impl CfmlVirtualMachine {
         // issues a SAVEPOINT on a connection that has none (GH #224:
         // "SAVEPOINT cftxn_spN does not exist", counter climbing across
         // specs).
-        let commit_result = match (self.transaction_conn.as_mut(), self.txn_commit) {
+        let mut commit_result = match (self.transaction_conn.as_mut(), self.txn_commit) {
             (Some(conn), Some(txn_commit)) => txn_commit(conn),
             _ => Ok(()),
         };
+        if let Some(txn_commit) = self.txn_commit {
+            for (_, mut extra) in std::mem::take(&mut self.transaction_extra_conns) {
+                let r = txn_commit(&mut extra);
+                if commit_result.is_ok() {
+                    commit_result = r;
+                }
+            }
+        }
+        self.transaction_extra_conns.clear();
         self.transaction_conn = None;
         self.transaction_datasource = None;
         self.transaction_pending = false;
@@ -32663,16 +32703,28 @@ impl CfmlVirtualMachine {
                     (self.txn_rollback_to_savepoint, self.transaction_conn.as_mut())
                 {
                     rollback_to(conn, &name)?;
+                    for (_, extra) in self.transaction_extra_conns.iter_mut() {
+                        rollback_to(extra, &name)?;
+                    }
                 }
             }
             return Ok(CfmlValue::Null);
         }
         // Top-level rollback — reset all state unconditionally (see the
         // commit handler above for why). GH #224.
-        let rollback_result = match (self.transaction_conn.as_mut(), self.txn_rollback) {
+        let mut rollback_result = match (self.transaction_conn.as_mut(), self.txn_rollback) {
             (Some(conn), Some(txn_rollback)) => txn_rollback(conn),
             _ => Ok(()),
         };
+        if let Some(txn_rollback) = self.txn_rollback {
+            for (_, mut extra) in std::mem::take(&mut self.transaction_extra_conns) {
+                let r = txn_rollback(&mut extra);
+                if rollback_result.is_ok() {
+                    rollback_result = r;
+                }
+            }
+        }
+        self.transaction_extra_conns.clear();
         self.transaction_conn = None;
         self.transaction_datasource = None;
         self.transaction_pending = false;
@@ -32699,11 +32751,55 @@ impl CfmlVirtualMachine {
         {
             let _ = txn_rollback(conn);
         }
+        if let Some(txn_rollback) = self.txn_rollback {
+            for (_, mut extra) in std::mem::take(&mut self.transaction_extra_conns) {
+                let _ = txn_rollback(&mut extra);
+            }
+        }
+        self.transaction_extra_conns.clear();
         self.transaction_conn = None;
         self.transaction_datasource = None;
         self.transaction_pending = false;
         self.transaction_depth = 0;
         self.transaction_savepoints.clear();
+    }
+
+    /// The open transaction's connection for datasource `ds`: the transaction's
+    /// own when `ds` is the datasource it began on, otherwise a connection
+    /// opened into the same transaction on first use. A connection that joins
+    /// after nested blocks set savepoints gets those savepoints too, so a
+    /// nested rollback reaches every datasource the block touched.
+    fn transaction_conn_for(&mut self, ds: &str) -> Result<&mut Box<dyn std::any::Any>, CfmlError> {
+        let resolve = |s: &str| match self.datasource_resolve_fn {
+            Some(f) => f(s),
+            None => s.to_string(),
+        };
+        let key = resolve(ds);
+        let primary = self.transaction_datasource.as_deref().map(resolve);
+        if primary.map_or(true, |p| p.eq_ignore_ascii_case(&key)) {
+            return Ok(self.transaction_conn.as_mut().unwrap());
+        }
+        let idx = match self
+            .transaction_extra_conns
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(&key))
+        {
+            Some(i) => i,
+            None => {
+                let txn_begin = self.txn_begin.ok_or_else(|| {
+                    CfmlError::runtime("cftransaction: transaction support not initialized".to_string())
+                })?;
+                let mut conn = txn_begin(ds)?;
+                if let Some(savepoint) = self.txn_savepoint {
+                    for name in self.transaction_savepoints.iter().flatten() {
+                        savepoint(&mut conn, name)?;
+                    }
+                }
+                self.transaction_extra_conns.push((key, conn));
+                self.transaction_extra_conns.len() - 1
+            }
+        };
+        Ok(&mut self.transaction_extra_conns[idx].1)
     }
 
     /// Get default datasource from application scope or request scope

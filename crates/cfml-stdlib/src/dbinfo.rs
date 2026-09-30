@@ -57,6 +57,9 @@ pub fn fn_dbinfo_impl(args: Vec<CfmlValue>) -> CfmlResult {
         })?,
     };
     let driver = parse_datasource(&ds);
+    if let DbDriver::Unsupported(sub) = &driver {
+        return Err(crate::builtins::unsupported_jdbc_driver_error(sub));
+    }
 
     let table = attr("table");
     let pattern = attr("pattern");
@@ -214,6 +217,7 @@ fn missing_table_error(table: &str) -> CfmlError {
 
 fn table_exists(ds: &str, driver: &DbDriver, table: &str, schema: Option<&str>) -> bool {
     let probe = match driver {
+        DbDriver::Unsupported(_) => return false,
         DbDriver::Sqlite(_) => run(
             ds,
             "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND lower(name) = lower(?)",
@@ -268,6 +272,7 @@ fn fold_case(driver: &DbDriver, ident: &str) -> String {
 
 fn type_version(ds: &str, driver: &DbDriver) -> CfmlResult {
     let (product, version, driver_name) = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => {
             let v = run(ds, "SELECT sqlite_version() AS v", vec![])?
                 .rows()
@@ -484,6 +489,7 @@ fn type_columns(
     let schema = schema_owned.as_deref();
 
     let (cols, fk_map) = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => {
             let base = run(
                 ds,
@@ -962,6 +968,7 @@ fn type_tables(
     }
     // (catalog, schema, name, raw_type)
     let raw: Vec<(String, String, String, String)> = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => run(
             ds,
             "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') \
@@ -1118,6 +1125,7 @@ fn type_index(ds: &str, driver: &DbDriver, table: &str, schema: Option<&str>) ->
     };
 
     match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => {
             // Named indexes (incl. UNIQUE auto-indexes) + PRIMARY KEY rows —
             // the same shape Wheels' SQLite shim emits.
@@ -1296,6 +1304,7 @@ fn type_foreignkeys(ds: &str, driver: &DbDriver, table: &str, schema: Option<&st
     ];
     // (pkcolumn, fktable, fkcolumn, key_seq, update_rule, delete_rule, fk_name)
     let raw: Vec<(String, String, String, i64, String, String, String)> = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => run(
             ds,
             "SELECT m.name AS fktable, fk.\"from\" AS fkcol, COALESCE(fk.\"to\", '') AS pkcol, \
@@ -1414,6 +1423,7 @@ fn type_foreignkeys(ds: &str, driver: &DbDriver, table: &str, schema: Option<&st
 fn type_dbnames(ds: &str, driver: &DbDriver, pattern: Option<&str>) -> CfmlResult {
     // (database_name, type)
     let raw: Vec<(String, String)> = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => run(ds, "SELECT name FROM pragma_database_list", vec![])?
             .rows()
             .iter()
@@ -1499,6 +1509,7 @@ fn type_procedures(ds: &str, driver: &DbDriver, pattern: Option<&str>) -> CfmlRe
     ];
     // (catalog, schema, name, type)
     let raw: Vec<(String, String, String, String)> = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         // SQLite has no stored procedures.
         DbDriver::Sqlite(_) => Vec::new(),
         DbDriver::Mysql(_) => run(
@@ -1586,6 +1597,7 @@ fn type_procedure_columns(ds: &str, driver: &DbDriver, procedure: &str) -> CfmlR
     ];
     // (proc, column, mode, type, ordinal)
     let raw: Vec<(String, String, String, String, i64)> = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => Vec::new(),
         DbDriver::Mysql(_) => run(
             ds,
@@ -1650,6 +1662,7 @@ fn type_procedure_columns(ds: &str, driver: &DbDriver, procedure: &str) -> CfmlR
 fn type_users(ds: &str, driver: &DbDriver) -> CfmlResult {
     // Lucee's typeUsers is getSchemas() with TABLE_SCHEM renamed to USER.
     let names: Vec<String> = match driver {
+        DbDriver::Unsupported(sub) => return Err(crate::builtins::unsupported_jdbc_driver_error(sub)),
         DbDriver::Sqlite(_) => run(ds, "SELECT name FROM pragma_database_list", vec![])?
             .rows()
             .iter()
@@ -1693,7 +1706,7 @@ fn type_users(ds: &str, driver: &DbDriver) -> CfmlResult {
 
 fn type_terms(driver: &DbDriver) -> CfmlValue {
     let (proc_term, cat_term, schema_term) = match driver {
-        DbDriver::Sqlite(_) => ("procedure", "catalog", "schema"),
+        DbDriver::Sqlite(_) | DbDriver::Unsupported(_) => ("procedure", "catalog", "schema"),
         DbDriver::Mysql(_) => ("procedure", "database", ""),
         DbDriver::Postgres(_) => ("function", "database", "schema"),
         DbDriver::Mssql(_) => ("procedure", "database", "schema"),
