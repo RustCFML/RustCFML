@@ -11857,7 +11857,7 @@ impl r2d2::ManageConnection for MssqlConnectionManager {
     type Connection = MssqlConn;
     type Error = MssqlConnError;
 
-    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+fn connect(&self) -> Result<Self::Connection, Self::Error> {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
         let mut config = self.config.clone();
         let addr = self.addr.clone();
@@ -11889,16 +11889,6 @@ impl r2d2::ManageConnection for MssqlConnectionManager {
         })?;
         Ok(MssqlConn { client, broken: false })
     }
-
-    fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        // Pool does not validate on checkout (test_on_check_out(false)).
-        Ok(())
-    }
-
-    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
-        conn.broken
-    }
-}
 
 /// Parse an `mssql://`/`sqlserver://` URL into a tiberius `Config` plus the
 /// `host:port` to dial. Extracted from the old inline `execute_mssql` body so
