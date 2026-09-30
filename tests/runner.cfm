@@ -737,6 +737,8 @@ include "harness.cfm";
 
 <!--- --- Java Shims --- --->
 <cf_runtest file="java_shims/test_all.cfm">
+<!--- Needs a live S3 endpoint via S3SHIM_TEST_* env vars; skips otherwise. --->
+<cf_runtest file="java_shims/test_s3storageprovider_shim.cfm">
 <cf_runtest file="java_shims/test_java_util_concurrent_pool.cfm">
 <cf_runtest file="java_shims/test_java_regex_quote_and_replacement.cfm">
 <cf_runtest file="java_shims/test_java_date_shim_date_bifs.cfm">

@@ -28,6 +28,7 @@ type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 mod intercepts_admin;
 mod cluster_shims;
 mod ehcache_shim;
+mod s3storageprovider_shim;
 mod lucee_config_shim;
 mod intercepts_common;
 mod intercepts_extensions;
@@ -19392,6 +19393,11 @@ impl CfmlVirtualMachine {
                             if ehcache_shim::constructs(&class_name) {
                                 return self.construct_ehcache_shim();
                             }
+                            // The third (bundle-name) argument is ignored: there
+                            // is no OSGi container to load it from.
+                            if s3storageprovider_shim::constructs(&class_name) {
+                                return self.construct_s3storageprovider_shim();
+                            }
                             return match class_name.as_str() {
                                 "java.security.messagedigest" => {
                                     handle_java_messagedigest("init", empty_args, &CfmlValue::Null)
@@ -27655,6 +27661,9 @@ impl CfmlVirtualMachine {
                     }
                     c if ehcache_shim::handles(c) => {
                         return self.dispatch_ehcache_shim(c, &m, all_args, object);
+                    }
+                    c if s3storageprovider_shim::handles(c) => {
+                        return self.dispatch_s3storageprovider_shim(&m, all_args, object);
                     }
                     c if lucee_config_shim::handles(c) => {
                         return self.dispatch_lucee_config(c, &m, all_args, object);

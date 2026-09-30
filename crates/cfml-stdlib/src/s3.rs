@@ -31,7 +31,7 @@ static FALLBACK_RT: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .expect("failed to build fallback tokio runtime for s3")
 });
 
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // We're already inside a runtime; run on the current handle without
@@ -349,7 +349,7 @@ fn normalize_prefix(p: String) -> String {
     }
 }
 
-fn normalize_endpoint(host: &str) -> String {
+pub(crate) fn normalize_endpoint(host: &str) -> String {
     if host.starts_with("http://") || host.starts_with("https://") {
         host.to_string()
     } else {
