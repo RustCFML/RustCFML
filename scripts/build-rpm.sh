@@ -10,7 +10,7 @@ TARGET="x86_64-unknown-linux-gnu"
 PROFILE="release-pgo"
 BINARY="target/${TARGET}/${PROFILE}/rustcfml"
 
-echo "==> Building hardened RHEL-compatible RustCFML binary..."
+echo "==> Compiling hardened RHEL target binary..."
 
 cargo build \
   --locked \
@@ -18,11 +18,11 @@ cargo build \
   --target "$TARGET" \
   -p rustcfml-cli
 
-echo "==> Stripping production binary..."
+echo "==> Stripping release binary..."
 
 strip -s "$BINARY"
 
-echo "==> Inspecting binary..."
+echo "==> Inspecting ELF binary..."
 
 file "$BINARY"
 readelf -h "$BINARY"
@@ -32,7 +32,7 @@ echo "==> Generating SHA-256..."
 
 sha256sum "$BINARY" > rustcfml-rhel-x86_64.sha256
 
-echo "==> Generating RPM..."
+echo "==> Generating RPM artifact..."
 
 cargo generate-rpm \
   -p crates/cli \
@@ -40,12 +40,8 @@ cargo generate-rpm \
   --target "$TARGET" \
   --metadata-overwrite scripts/rpm/rustcfml.toml
 
-echo "==> RPM contents..."
+echo "==> Verifying RPM..."
 
-rpm -qpl target/${TARGET}/generate-rpm/*.rpm
-
-echo "==> RPM metadata..."
-
-rpm -qpi target/${TARGET}/generate-rpm/*.rpm
+find target -name '*.rpm' -print
 
 echo "==> RPM build complete."
