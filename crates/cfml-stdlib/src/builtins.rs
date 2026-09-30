@@ -11888,8 +11888,8 @@ fn connect(&self) -> Result<Self::Connection, Self::Error> {
                 .map_err(|e| MssqlConnError(format!("MSSQL connection error: {}", e)))
         })?;
         Ok(MssqlConn { client, broken: false })
+        }
     }
-
 /// Parse an `mssql://`/`sqlserver://` URL into a tiberius `Config` plus the
 /// `host:port` to dial. Extracted from the old inline `execute_mssql` body so
 /// the pool manager can re-establish connections without re-parsing per query.
