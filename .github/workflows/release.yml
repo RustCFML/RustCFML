@@ -126,7 +126,7 @@ jobs:
           path: target/release-pgo/rustcfml${{ matrix.ext }}
 
   release:
-    needs: build
+    needs: [build, build-rpm]
     runs-on: ubuntu-latest
     steps:
       # Needed so LICENSE / THIRD-PARTY.txt can be attached as release assets.
@@ -145,6 +145,7 @@ jobs:
             chmod +x "release/rustcfml-${name}"
           done
           cp "artifacts/windows-x86_64/rustcfml.exe" "release/rustcfml-windows-x86_64.exe"
+          cp "artifacts/rhel-x86_64-rpm/*.rpm release"
 
       # Ship the notices alongside the binaries. They are also embedded in each
       # binary (`rustcfml --licenses`); these assets make them readable without
@@ -171,4 +172,64 @@ jobs:
             [latest stable release](https://github.com/RustCFML/RustCFML/releases/latest).
             An edge build becomes stable by promotion — the same artifacts, no
             rebuild.
+          files: release/*
+
+          build-rpm:
+    needs: licenses
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Build Dependencies & Rust
+        run: |
+          dnf install -y gcc binutils git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build & Package RPM
+        run: ./scripts/build-rpm.sh
+
+      - name: Upload RPM Artifact
+        uses: actions/upload-artifact@v8
+        with:
+          name: rhel-x86_64-rpm
+          path: target/generate-rpm/*.rpm
+
+  release:
+    needs: [build, build-rpm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for name in macos-aarch64 linux-x86_64 linux-aarch64; do
+            cp "artifacts/${name}/rustcfml" "release/rustcfml-${name}"
+            chmod +x "release/rustcfml-${name}"
+          done
+          cp "artifacts/windows-x86_64/rustcfml.exe" "release/rustcfml-windows-x86_64.exe"
+          cp artifacts/rhel-x86_64-rpm/*.rpm release/
+
+      - name: Attach license notices
+        run: cp LICENSE THIRD-PARTY.txt release/
+
+      - name: Create GitHub Release (edge / prerelease)
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          prerelease: true
+          make_latest: false
+          body: |
+            **Edge build.** Every push of a version tag publishes here after the full gate.
           files: release/*
