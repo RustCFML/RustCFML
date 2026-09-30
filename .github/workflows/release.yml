@@ -1,243 +1,527 @@
 name: Release Binaries
 
 on:
-  push:
-    tags: ["v*"]
+push:
+tags: ["v*"]
 
 permissions:
-  contents: write
+contents: write
 
 jobs:
-  # License compliance gate. Runs BEFORE the binaries are built so a tag can
-  # never ship an artifact whose attribution notice is stale or whose
-  # dependency graph has picked up terms we haven't reviewed.
-  licenses:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+# ---------------------------------------------------------------------------
+# LICENSE COMPLIANCE
+# ---------------------------------------------------------------------------
+#
+# Runs before any binaries are produced.
+#
+# A release must not ship if:
+#
+#   * dependency licensing has changed unexpectedly
+#   * THIRD-PARTY.txt is stale
+#
+licenses:
+runs-on: ubuntu-latest
 
-      # Prebuilt binaries — `cargo install` would compile both tools from
-      # source on every tag (several minutes) for no benefit.
-      #
-      # cargo-about is PINNED on purpose: the staleness check below diffs its
-      # output against the committed THIRD-PARTY.txt, so an upstream formatting
-      # change would fail the gate spuriously. Bump deliberately, and
-      # regenerate THIRD-PARTY.txt in the same commit.
-      - name: Install cargo-about + cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-about@0.9.1,cargo-deny@0.20.2
+steps:
+  - uses: actions/checkout@v4
 
-      # Fails the build if any crate in the shipped graph is licensed under
-      # terms outside the allow-list in deny.toml.
-      - name: Check dependency licenses
-        run: cargo deny check licenses
+  - name: Install Rust
+	uses: dtolnay/rust-toolchain@stable
 
-      # THIRD-PARTY.txt is committed (it is include_str!'d into the binary), so
-      # it can drift behind a dependency bump. Regenerate and diff.
-      - name: Verify THIRD-PARTY.txt is up to date
-        run: |
-          ./scripts/gen-licenses.sh
-          if ! git diff --exit-code -- THIRD-PARTY.txt; then
-            echo "::error::THIRD-PARTY.txt is out of date. Run ./scripts/gen-licenses.sh and commit the result."
-            exit 1
-          fi
+  # Prebuilt binaries are used here rather than compiling these tools from
+  # source on every release.
+  #
+  # cargo-about is deliberately pinned because THIRD-PARTY.txt is generated
+  # from its output. Changing cargo-about can change formatting and therefore
+  # should be done deliberately together with THIRD-PARTY.txt.
+  - name: Install cargo-about + cargo-deny
+	uses: taiki-e/install-action@v2
+	with:
+	  tool: cargo-about@0.9.1,cargo-deny@0.20.2
 
-  build:
-    needs: licenses
-    strategy:
-      # Do not cancel sibling targets when one fails: a single broken target used to
-      # cancel the other three mid-build, so a Windows-only fault looked like a
-      # total failure and the healthy targets produced no evidence.
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            name: macos-aarch64
-            ext: ""
-          - os: ubuntu-latest
-            name: linux-x86_64
-            ext: ""
-          - os: ubuntu-24.04-arm
-            name: linux-aarch64
-            ext: ""
-          - os: windows-latest
-            name: windows-x86_64
-            ext: ".exe"
+  - name: Check dependency licenses
+	run: cargo deny check licenses
 
-    runs-on: ${{ matrix.os }}
+  - name: Verify THIRD-PARTY.txt is up to date
+	run: |
+	  ./scripts/gen-licenses.sh
 
-    steps:
-      - uses: actions/checkout@v4
+	  if ! git diff --exit-code -- THIRD-PARTY.txt; then
+		echo "::error::THIRD-PARTY.txt is out of date. Run ./scripts/gen-licenses.sh and commit the result."
+		exit 1
+	  fi
 
-      # PINNED, not `stable`. A PGO profile is tied to the LLVM version that
-      # produced it (rustc 1.93.0 = LLVM 21.1.8), so a silent stable bump would
-      # invalidate pgo/rustcfml.profdata and quietly ship an un-profiled binary.
-      # Bump this deliberately, and regenerate the profile in the same commit
-      # (docs/pgo.md has the recipe).
-      - name: Install Rust (pinned for PGO)
-        uses: dtolnay/rust-toolchain@1.93.0
-        with:
-          components: llvm-tools
+# ---------------------------------------------------------------------------
+# STANDARD RELEASE BUILDS
+# ---------------------------------------------------------------------------
+#
+# These are normal production release binaries.
+#
+# They are NOT debug/development binaries.
+#
+# They use:
+#
+#   * pinned Rust
+#   * PGO
+#   * release-pgo Cargo profile
+#
+# They intentionally do not receive the additional platform-specific
+# hardening flags used by build-hardened below.
+#
+build:
+needs: licenses
 
-      # Fail LOUD rather than degrade quietly. `-Cprofile-use` with an
-      # unreadable/incompatible profile is the failure mode that matters: the
-      # build succeeds and the binary is simply slower, with nothing to notice.
-      - name: Verify the PGO profile is loadable by this toolchain
-        shell: bash
-        run: |
-          PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata*' | head -1)
-          if [ -z "$PROFDATA" ]; then echo "llvm-profdata not found in sysroot"; exit 1; fi
-          "$PROFDATA" show pgo/rustcfml.profdata > profile-summary.txt || {
-            echo "::error::pgo/rustcfml.profdata is not readable by rustc $(rustc --version)."
-            echo "::error::Regenerate it with docs/pgo.md, or unpin the toolchain."
-            exit 1
-          }
-          FUNCS=$(grep -i 'Total functions' profile-summary.txt | grep -oE '[0-9]+')
-          echo "profile carries $FUNCS functions"
-          # A profile that has lost most of its functions is stale, not merely old.
-          if [ "${FUNCS:-0}" -lt 5000 ]; then
-            echo "::error::profile has only $FUNCS functions — expected >5000. Stale?"
-            exit 1
-          fi
+strategy:
+  fail-fast: false
 
-      # Shipped artifacts are PGO'd. `cargo build --release` stays thin-LTO and
-      # fast for everyday local use; this profile is fat LTO (see Cargo.toml).
-      #
-      # ⚠️ RUSTFLAGS goes through `env:`, and this step must NOT set `shell: bash`.
-      # v0.595.0's release failed exactly there: `shell: bash` switches the Windows
-      # runner to Git-Bash, which puts MSYS Perl (/usr/share/perl5/core_perl) ahead
-      # of Strawberry Perl on PATH — and MSYS Perl cannot configure vendored OpenSSL
-      # for VC-WIN64A, so openssl-sys's build script dies. The default per-OS shell
-      # (pwsh on Windows) has the right Perl. Using `env:` also sidesteps quoting a
-      # Windows path that contains backslashes.
-      - name: Build (PGO)
-        env:
-          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
-        run: cargo build --profile release-pgo -p rustcfml-cli
+  matrix:
+	include:
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: target/release-pgo/rustcfml${{ matrix.ext }}
+	  - os: macos-latest
+		name: macos-aarch64
+		ext: ""
 
-  build-rpm:
-    needs: licenses
-    runs-on: ubuntu-latest
+	  - os: ubuntu-latest
+		name: linux-x86_64
+		ext: ""
 
-    container:
-      image: rockylinux:9
+	  - os: ubuntu-24.04-arm
+		name: linux-aarch64
+		ext: ""
 
-    steps:
-      - uses: actions/checkout@v5
+	  - os: windows-latest
+		name: windows-x86_64
+		ext: ".exe"
 
-      - name: Install RHEL build dependencies
-        run: |
-          dnf install -y \
-            gcc \
-            gcc-c++ \
-            binutils \
-            git \
-            curl \
-            findutils \
-            file \
-            rpm
+runs-on: ${{ matrix.os }}
 
-      - name: Install pinned Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.93.0
+steps:
+  - uses: actions/checkout@v4
 
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+  # PINNED, not stable.
+  #
+  # The PGO profile is tied to the LLVM version that generated it.
+  #
+  # rustc 1.93.0 = LLVM 21.1.8
+  #
+  # When this version changes, pgo/rustcfml.profdata must be regenerated.
+  - name: Install Rust (pinned for PGO)
+	uses: dtolnay/rust-toolchain@1.93.0
+	with:
+	  components: llvm-tools
 
-      - name: Install LLVM tools
-        run: |
-          . "$HOME/.cargo/env"
-          rustup component add llvm-tools
+  # Fail loudly if the committed PGO profile can no longer be consumed by
+  # the compiler used for the release.
+  - name: Verify the PGO profile is loadable by this toolchain
+	shell: bash
+	run: |
+	  PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata*' | head -1)
 
-      - name: Install cargo-generate-rpm
-        run: |
-          . "$HOME/.cargo/env"
-          cargo install --locked cargo-generate-rpm
+	  if [ -z "$PROFDATA" ]; then
+		echo "llvm-profdata not found in sysroot"
+		exit 1
+	  fi
 
-      - name: Verify PGO profile
-        run: |
-          . "$HOME/.cargo/env"
+	  "$PROFDATA" show pgo/rustcfml.profdata > profile-summary.txt || {
+		echo "::error::pgo/rustcfml.profdata is not readable by rustc $(rustc --version)."
+		echo "::error::Regenerate it using docs/pgo.md."
+		exit 1
+	  }
 
-          PROFDATA=$(find "$(rustc --print sysroot)" \
-            -name 'llvm-profdata*' | head -1)
+	  FUNCS=$(grep -i 'Total functions' profile-summary.txt | grep -oE '[0-9]+' || true)
 
-          if [ -z "$PROFDATA" ]; then
-            echo "::error::llvm-profdata not found"
-            exit 1
-          fi
+	  echo "profile carries ${FUNCS:-0} functions"
 
-          "$PROFDATA" show \
-            pgo/rustcfml.profdata \
-            > profile-summary.txt
+	  if [ "${FUNCS:-0}" -lt 5000 ]; then
+		echo "::error::profile has only ${FUNCS:-0} functions -- expected >5000. Stale profile?"
+		exit 1
+	  fi
 
-          FUNCS=$(grep -i 'Total functions' profile-summary.txt \
-            | grep -oE '[0-9]+' || true)
+  # IMPORTANT:
+  #
+  # Do NOT set shell: bash on this build step.
+  #
+  # On Windows, doing so switches the runner to Git-Bash and can put the
+  # wrong Perl implementation ahead of Strawberry Perl. That breaks the
+  # vendored OpenSSL build.
+  - name: Build (PGO)
+	env:
+	  RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
+	run: cargo build --locked --profile release-pgo -p rustcfml-cli
 
-          echo "PGO profile carries ${FUNCS:-0} functions"
+  - name: Upload artifact
+	uses: actions/upload-artifact@v7
+	with:
+	  name: ${{ matrix.name }}
+	  path: target/release-pgo/rustcfml${{ matrix.ext }}
+	  if-no-files-found: error
 
-          if [ "${FUNCS:-0}" -lt 5000 ]; then
-            echo "::error::PGO profile appears stale"
-            exit 1
-          fi
+# ---------------------------------------------------------------------------
+# PRODUCTION HARDENED BUILDS
+# ---------------------------------------------------------------------------
+#
+# Same RustCFML source.
+# Same pinned Rust compiler.
+# Same PGO profile.
+# Same release-pgo Cargo profile.
+#
+# The difference is additional release-only compiler/linker hardening.
+#
+# These settings intentionally live HERE rather than .cargo/config.toml.
+#
+# Therefore:
+#
+#     cargo build
+#
+# remains a normal contributor build.
+#
+# No Rust feature flag is required to obtain a hardened executable.
+#
+build-hardened:
+needs: licenses
 
-      - name: Build hardened RHEL RPM
-        env:
-          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
-        run: |
-          . "$HOME/.cargo/env"
-          ./scripts/build-rpm.sh
+strategy:
+  fail-fast: false
 
-      - name: Upload RPM Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: rhel-x86_64-rpm
-          path: |
-            target/**/*.rpm
-            rustcfml-rhel-x86_64.sha256
-          if-no-files-found: error
+  matrix:
+	include:
 
-  release:
-    needs: [build, build-rpm]
-    runs-on: ubuntu-latest
-    steps:
-      # Needed so LICENSE / THIRD-PARTY.txt can be attached as release assets.
-      - uses: actions/checkout@v4
+	  # Linux x86_64 hardened build.
+	  #
+	  # Full RELRO:
+	  #     -z relro
+	  #     -z now
+	  #
+	  # Explicitly marks the stack non-executable.
+	  - os: ubuntu-latest
+		name: linux-x86_64-hardened
+		ext: ""
+		rustflags: >-
+		  -Clink-arg=-Wl,-z,relro
+		  -Clink-arg=-Wl,-z,now
+		  -Clink-arg=-Wl,-z,noexecstack
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+	  # Linux ARM64 hardened build.
+	  - os: ubuntu-24.04-arm
+		name: linux-aarch64-hardened
+		ext: ""
+		rustflags: >-
+		  -Clink-arg=-Wl,-z,relro
+		  -Clink-arg=-Wl,-z,now
+		  -Clink-arg=-Wl,-z,noexecstack
 
-      - name: Rename binaries
-        run: |
-          mkdir -p release
-          for name in macos-aarch64 linux-x86_64 linux-aarch64; do
-            cp "artifacts/${name}/rustcfml" "release/rustcfml-${name}"
-            chmod +x "release/rustcfml-${name}"
-          done
-          cp "artifacts/windows-x86_64/rustcfml.exe" "release/rustcfml-windows-x86_64.exe"
-          cp artifacts/rhel-x86_64-rpm/*.rpm release/
+	  # Windows production hardened build.
+	  #
+	  # Uses stable rustc/link.exe controls only.
+	  #
+	  # No -Z flags.
+	  # No stack-protector flag.
+	  - os: windows-latest
+		name: windows-x86_64-hardened
+		ext: ".exe"
+		rustflags: >-
+		  -Ccontrol-flow-guard=yes
+		  -Clink-arg=/DYNAMICBASE
+		  -Clink-arg=/NXCOMPAT
+		  -Clink-arg=/HIGHENTROPYVA
+		  -Clink-arg=/CETCOMPAT
 
-      # Ship the notices alongside the binaries.
-      - name: Attach license notices
-        run: cp LICENSE THIRD-PARTY.txt release/
+runs-on: ${{ matrix.os }}
 
-      - name: Create GitHub Release (edge / prerelease)
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          prerelease: true
-          make_latest: false
-          body: |
-            **Edge build.** Every push of a version tag publishes here after the full gate (workspace + engine test suites, the CFML suite on the CLI and served in both modes, wasm). It has not yet been run in anger. For the vetted build, take the [latest stable release](https://github.com/RustCFML/RustCFML/releases/latest). An edge build becomes stable by promotion — the same artifacts, no rebuild.
-          files: release/*
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Install Rust (pinned for PGO)
+	uses: dtolnay/rust-toolchain@1.93.0
+	with:
+	  components: llvm-tools
+
+  - name: Verify the PGO profile is loadable by this toolchain
+	shell: bash
+	run: |
+	  PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata*' | head -1)
+
+	  if [ -z "$PROFDATA" ]; then
+		echo "llvm-profdata not found in sysroot"
+		exit 1
+	  fi
+
+	  "$PROFDATA" show pgo/rustcfml.profdata > profile-summary.txt || {
+		echo "::error::pgo/rustcfml.profdata is not readable by rustc $(rustc --version)."
+		echo "::error::Regenerate it using docs/pgo.md."
+		exit 1
+	  }
+
+	  FUNCS=$(grep -i 'Total functions' profile-summary.txt | grep -oE '[0-9]+' || true)
+
+	  echo "profile carries ${FUNCS:-0} functions"
+
+	  if [ "${FUNCS:-0}" -lt 5000 ]; then
+		echo "::error::profile has only ${FUNCS:-0} functions -- expected >5000. Stale profile?"
+		exit 1
+	  fi
+
+  # IMPORTANT:
+  #
+  # Do NOT specify shell: bash here.
+  #
+  # Windows must retain its native PowerShell environment so the expected
+  # Perl/OpenSSL toolchain remains on PATH.
+  - name: Build (PGO + production hardening)
+	env:
+	  RUSTFLAGS: >-
+		-Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
+		${{ matrix.rustflags }}
+	run: cargo build --locked --profile release-pgo -p rustcfml-cli
+
+  - name: Upload hardened artifact
+	uses: actions/upload-artifact@v7
+	with:
+	  name: ${{ matrix.name }}
+	  path: target/release-pgo/rustcfml${{ matrix.ext }}
+	  if-no-files-found: error
+
+# ---------------------------------------------------------------------------
+# HARDENED RHEL / ROCKY / ALMA RPM
+# ---------------------------------------------------------------------------
+#
+# Enterprise Linux package built inside Rocky Linux 9.
+#
+# This is intentionally a specialized release artifact rather than changing
+# the normal Linux build environment.
+#
+build-rpm:
+needs: licenses
+
+runs-on: ubuntu-latest
+
+container:
+  image: rockylinux:9
+
+steps:
+  - uses: actions/checkout@v5
+
+  - name: Install RHEL build dependencies
+	run: |
+	  dnf install -y \
+		gcc \
+		gcc-c++ \
+		binutils \
+		git \
+		curl \
+		findutils \
+		file \
+		rpm
+
+  - name: Install pinned Rust
+	run: |
+	  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+		| sh -s -- -y --default-toolchain 1.93.0
+
+	  echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+  - name: Install LLVM tools
+	run: |
+	  . "$HOME/.cargo/env"
+	  rustup component add llvm-tools
+
+  - name: Install cargo-generate-rpm
+	run: |
+	  . "$HOME/.cargo/env"
+	  cargo install --locked cargo-generate-rpm
+
+  - name: Verify PGO profile
+	run: |
+	  . "$HOME/.cargo/env"
+
+	  PROFDATA=$(find "$(rustc --print sysroot)" \
+		-name 'llvm-profdata*' | head -1)
+
+	  if [ -z "$PROFDATA" ]; then
+		echo "::error::llvm-profdata not found"
+		exit 1
+	  fi
+
+	  "$PROFDATA" show \
+		pgo/rustcfml.profdata \
+		> profile-summary.txt
+
+	  FUNCS=$(grep -i 'Total functions' profile-summary.txt \
+		| grep -oE '[0-9]+' || true)
+
+	  echo "PGO profile carries ${FUNCS:-0} functions"
+
+	  if [ "${FUNCS:-0}" -lt 5000 ]; then
+		echo "::error::PGO profile appears stale"
+		exit 1
+	  fi
+
+  # RHEL-compatible builds receive the Linux release-hardening flags as
+  # part of the build environment rather than through .cargo/config.toml.
+  - name: Build hardened RHEL RPM
+	env:
+	  RUSTFLAGS: >-
+		-Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
+		-Clink-arg=-Wl,-z,relro
+		-Clink-arg=-Wl,-z,now
+		-Clink-arg=-Wl,-z,noexecstack
+	run: |
+	  . "$HOME/.cargo/env"
+	  ./scripts/build-rpm.sh
+
+  - name: Upload hardened RPM artifact
+	uses: actions/upload-artifact@v7
+	with:
+	  name: rhel-x86_64-hardened-rpm
+	  path: |
+		target/**/*.rpm
+		rustcfml-rhel-x86_64.sha256
+	  if-no-files-found: error
+
+# ---------------------------------------------------------------------------
+# GITHUB RELEASE
+# ---------------------------------------------------------------------------
+#
+# A release is published only after:
+#
+#   * standard builds
+#   * hardened builds
+#   * hardened RHEL RPM
+#
+# all succeed.
+#
+release:
+needs:
+  - build
+  - build-hardened
+  - build-rpm
+
+runs-on: ubuntu-latest
+
+steps:
+  # LICENSE and THIRD-PARTY.txt are attached to every release.
+  - uses: actions/checkout@v4
+
+  - name: Download all artifacts
+	uses: actions/download-artifact@v8
+	with:
+	  path: artifacts
+
+  - name: Prepare release binaries
+	run: |
+	  mkdir -p release
+
+	  # ------------------------------------------------------------------
+	  # STANDARD RELEASE BINARIES
+	  # ------------------------------------------------------------------
+
+	  for name in macos-aarch64 linux-x86_64 linux-aarch64; do
+		cp "artifacts/${name}/rustcfml" \
+		   "release/rustcfml-${name}"
+
+		chmod +x "release/rustcfml-${name}"
+	  done
+
+	  cp \
+		"artifacts/windows-x86_64/rustcfml.exe" \
+		"release/rustcfml-windows-x86_64.exe"
+
+	  # ------------------------------------------------------------------
+	  # HARDENED LINUX BINARIES
+	  # ------------------------------------------------------------------
+
+	  for name in linux-x86_64 linux-aarch64; do
+		cp \
+		  "artifacts/${name}-hardened/rustcfml" \
+		  "release/rustcfml-${name}-hardened"
+
+		chmod +x "release/rustcfml-${name}-hardened"
+	  done
+
+	  # ------------------------------------------------------------------
+	  # HARDENED WINDOWS BINARY
+	  # ------------------------------------------------------------------
+
+	  cp \
+		"artifacts/windows-x86_64-hardened/rustcfml.exe" \
+		"release/rustcfml-windows-x86_64-hardened.exe"
+
+	  # ------------------------------------------------------------------
+	  # HARDENED RHEL / ROCKY / ALMA RPM
+	  # ------------------------------------------------------------------
+
+	  for rpm in artifacts/rhel-x86_64-hardened-rpm/*.rpm; do
+		base=$(basename "$rpm" .rpm)
+
+		cp \
+		  "$rpm" \
+		  "release/${base}-hardened.rpm"
+	  done
+
+	  # ------------------------------------------------------------------
+	  # RHEL SHA-256
+	  # ------------------------------------------------------------------
+
+	  if [ -f \
+		artifacts/rhel-x86_64-hardened-rpm/rustcfml-rhel-x86_64.sha256 \
+	  ]; then
+
+		cp \
+		  artifacts/rhel-x86_64-hardened-rpm/rustcfml-rhel-x86_64.sha256 \
+		  release/rustcfml-rhel-x86_64-hardened.sha256
+
+	  fi
+
+	  # ------------------------------------------------------------------
+	  # SHOW EXACTLY WHAT WILL SHIP
+	  # ------------------------------------------------------------------
+
+	  echo
+	  echo "Release artifacts:"
+	  echo
+
+	  ls -lh release/
+
+  # Ship attribution notices beside the executables.
+  - name: Attach license notices
+	run: |
+	  cp LICENSE THIRD-PARTY.txt release/
+
+  - name: Create GitHub Release (edge / prerelease)
+	uses: softprops/action-gh-release@v3
+	with:
+	  generate_release_notes: true
+	  prerelease: true
+	  make_latest: false
+
+	  body: |
+		**Edge build.**
+
+		Every push of a version tag publishes here after the full release gate.
+
+		### Standard builds
+
+		Standard binaries are PGO-optimized production releases intended for normal use.
+
+		These are not debug builds.
+
+		Standard release filenames do not contain `-hardened`.
+
+		### Production-hardened builds
+
+		Files containing `-hardened` are built from the same RustCFML source and the same PGO profile, with additional operating-system-specific compiler and linker security controls enabled only during the release build.
+
+		Hardened builds do not alter contributor or debug builds and do not require a Cargo feature flag.
+
+		### RHEL-compatible systems
+
+		The hardened RPM is built inside a Rocky Linux 9 environment and is intended for compatible Enterprise Linux systems such as RHEL, Rocky Linux and AlmaLinux.
+
+		`hardened` describes the binary build configuration. It does not by itself represent FedRAMP authorization or FIPS certification.
+
+		This edge build has not yet been promoted to the vetted stable release.
+
+		For the vetted build, use the latest stable release. An edge build becomes stable by promotion — the same artifacts, no rebuild.
+
+	  files: release/*
