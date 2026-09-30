@@ -3,8 +3,12 @@ name = "rustcfml"
 version = "0.590.0"
 summary = "High-performance CFML runtime"
 assets = [
-    { source = "target/x86_64-unknown-linux-gnu/release/rustcfml", dest = "/usr/bin/rustcfml", mode = "755" }
+  { source = "target/x86_64-unknown-linux-gnu/release/rustcfml", dest = "/usr/bin/rustcfml", mode = "755" }
 ]
 
 [package.metadata.generate-rpm.requires]
 glibc = ">= 2.34"
+
+# Pre-package compilation instruction
+[package.metadata.generate-rpm.build]
+args = ["build", "--release", "--target", "x86_64-unknown-linux-gnu", "-p", "rustcfml-cli"]
