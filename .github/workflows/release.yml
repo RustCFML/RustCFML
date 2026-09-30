@@ -128,28 +128,83 @@ jobs:
   build-rpm:
     needs: licenses
     runs-on: ubuntu-latest
+
     container:
       image: rockylinux:9
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install Build Dependencies & Rust
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install RHEL build dependencies
         run: |
-          dnf install -y gcc binutils git
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          dnf install -y \
+            gcc \
+            gcc-c++ \
+            binutils \
+            git \
+            curl \
+            findutils \
+            file \
+            rpm
+
+      - name: Install pinned Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.93.0
+
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM tools
+        run: |
+          . "$HOME/.cargo/env"
+          rustup component add llvm-tools
 
       - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install --locked cargo-generate-rpm
 
-      - name: Build & Package RPM
-        run: ./scripts/build-rpm.sh
+      - name: Verify PGO profile
+        run: |
+          . "$HOME/.cargo/env"
+
+          PROFDATA=$(find "$(rustc --print sysroot)" \
+            -name 'llvm-profdata*' | head -1)
+
+          if [ -z "$PROFDATA" ]; then
+            echo "::error::llvm-profdata not found"
+            exit 1
+          fi
+
+          "$PROFDATA" show \
+            pgo/rustcfml.profdata \
+            > profile-summary.txt
+
+          FUNCS=$(grep -i 'Total functions' profile-summary.txt \
+            | grep -oE '[0-9]+' || true)
+
+          echo "PGO profile carries ${FUNCS:-0} functions"
+
+          if [ "${FUNCS:-0}" -lt 5000 ]; then
+            echo "::error::PGO profile appears stale"
+            exit 1
+          fi
+
+      - name: Build hardened RHEL RPM
+        env:
+          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
+        run: |
+          . "$HOME/.cargo/env"
+          ./scripts/build-rpm.sh
 
       - name: Upload RPM Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rhel-x86_64-rpm
-          path: target/generate-rpm/*.rpm
+          path: |
+            target/**/*.rpm
+            rustcfml-rhel-x86_64.sha256
+          if-no-files-found: error
 
   release:
     needs: [build, build-rpm]
