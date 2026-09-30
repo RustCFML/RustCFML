@@ -7,8 +7,7 @@ rustflags = [
     "-Clink-arg=/NXCOMPAT",      # Enables DEP / NX
     "-Clink-arg=/HIGHENTROPYVA", # High-entropy 64-bit ASLR
     "-Clink-arg=/CETCOMPAT",     # Control-flow Enforcement Technology
-    "-Clink-arg=/DEBUG:NONE",    # Disables/strips debug symbol generation
-    "-Cstack-protector=strong"  # Stack clash / canary protection
+    "-Clink-arg=/DEBUG:NONE"    # Disables/strips debug symbol generation
 ]
 
 # RHEL 9/10 x86_64 Linux Build Configuration
@@ -18,6 +17,5 @@ rustflags = [
     "-Clink-arg=-Wl,-z,relro",         # Read-Only Relocations (RELRO)
     "-Clink-arg=-Wl,-z,now",           # Full RELRO (binds GOT at startup, prevents memory exploits)
     "-Clink-arg=-Wl,-z,noexecstack",    # Non-executable stack (NX/DEP)
-    #"-Cstack-protector=strong",        # Stack canary protection against buffer overflows
-    "-Cdebuginfo=0",                   # Strip debug symbols for slim production binary
+    "-Cdebuginfo=0"                   # Strip debug symbols for slim production binary
 ]
