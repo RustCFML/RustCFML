@@ -14,7 +14,7 @@ jobs:
   licenses:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,7 +71,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       # PINNED, not `stable`. A PGO profile is tied to the LLVM version that
       # produced it (rustc 1.93.0 = LLVM 21.1.8), so a silent stable bump would
