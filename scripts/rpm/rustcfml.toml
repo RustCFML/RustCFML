@@ -5,7 +5,7 @@ summary = "High-performance CFML runtime"
 license = "MIT"
 
 assets = [
-    { source = "target/x86_64-unknown-linux-gnu/release/rustcfml", dest = "/usr/bin/rustcfml", mode = "755" }
+    { source = "target/release/rustcfml", dest = "/usr/bin/rustcfml", mode = "755" }
 ]
 
 [package.metadata.generate-rpm.requires]
