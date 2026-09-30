@@ -1,16 +1,51 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 cd "$REPO_ROOT"
 
-echo "==> Compiling RHEL target binary..."
-cargo build --release --target x86_64-unknown-linux-gnu -p rustcfml-cli
+TARGET="x86_64-unknown-linux-gnu"
+PROFILE="release-pgo"
+BINARY="target/${TARGET}/${PROFILE}/rustcfml"
 
-echo "==> Stripping release binary..."
-strip -s target/x86_64-unknown-linux-gnu/release/rustcfml
+echo "==> Building hardened RHEL-compatible RustCFML binary..."
 
-echo "==> Generating RPM artifact..."
-cargo generate-rpm --metadata-overwrite scripts/rpm/rustcfml.toml
+cargo build \
+  --locked \
+  --profile "$PROFILE" \
+  --target "$TARGET" \
+  -p rustcfml-cli
 
-echo "==> RPM build complete: target/generate-rpm/"
+echo "==> Stripping production binary..."
+
+strip -s "$BINARY"
+
+echo "==> Inspecting binary..."
+
+file "$BINARY"
+readelf -h "$BINARY"
+readelf -l "$BINARY"
+
+echo "==> Generating SHA-256..."
+
+sha256sum "$BINARY" > rustcfml-rhel-x86_64.sha256
+
+echo "==> Generating RPM..."
+
+cargo generate-rpm \
+  -p crates/cli \
+  --profile "$PROFILE" \
+  --target "$TARGET" \
+  --metadata-overwrite scripts/rpm/rustcfml.toml
+
+echo "==> RPM contents..."
+
+rpm -qpl target/${TARGET}/generate-rpm/*.rpm
+
+echo "==> RPM metadata..."
+
+rpm -qpi target/${TARGET}/generate-rpm/*.rpm
+
+echo "==> RPM build complete."
