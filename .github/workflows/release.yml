@@ -131,7 +131,7 @@ jobs:
     container:
       image: rockylinux:9
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install Build Dependencies & Rust
         run: |
