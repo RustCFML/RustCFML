@@ -11862,7 +11862,7 @@ impl r2d2::ManageConnection for MssqlConnectionManager {
         let mut config = self.config.clone();
         let addr = self.addr.clone();
 
-        // Check if Entra ID / Azure SQL token auth is requested
+        // Check if Entra ID / Azure SQL token authentication is requested
         let addr_lower = addr.to_lowercase();
         if addr_lower.contains("entra") || addr_lower.contains("activedirectory") || addr_lower.contains("azure") {
             use azure_identity::DefaultAzureCredential;
@@ -11872,7 +11872,7 @@ impl r2d2::ManageConnection for MssqlConnectionManager {
             let token_resp = mssql_runtime().block_on(async move {
                 creds.get_token("https://database.windows.net/.default")
                     .await
-                    .map_err(|e| MssqlConnError(format!("Entra ID token acquisition failed: {e}")))
+                    .map_err(|e| MssqlConnError(format!("Entra ID token acquisition failed: {}", e)))
             })?;
 
             config.authentication(tiberius::AuthMethod::Token(token_resp.token.secret().to_string()));
