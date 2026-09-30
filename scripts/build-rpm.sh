@@ -3,14 +3,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
 cd "$REPO_ROOT"
 
 TARGET="x86_64-unknown-linux-gnu"
 PROFILE="release-pgo"
 BINARY="target/${TARGET}/${PROFILE}/rustcfml"
 
-echo "==> Compiling hardened RHEL target binary..."
+echo "==> Building RustCFML RHEL hardened binary"
 
 cargo build \
   --locked \
@@ -18,21 +17,27 @@ cargo build \
   --target "$TARGET" \
   -p rustcfml-cli
 
-echo "==> Stripping release binary..."
+echo "==> Stripping binary"
 
 strip -s "$BINARY"
 
-echo "==> Inspecting ELF binary..."
+echo "==> Inspecting binary"
 
 file "$BINARY"
+
 readelf -h "$BINARY"
 readelf -l "$BINARY"
 
-echo "==> Generating SHA-256..."
+echo "==> Dynamic dependencies"
 
-sha256sum "$BINARY" > rustcfml-rhel-x86_64.sha256
+ldd "$BINARY"
 
-echo "==> Generating RPM artifact..."
+echo "==> Generating SHA-256"
+
+sha256sum "$BINARY" \
+  > rustcfml-rhel-x86_64.sha256
+
+echo "==> Generating RPM"
 
 cargo generate-rpm \
   -p crates/cli \
@@ -40,8 +45,6 @@ cargo generate-rpm \
   --target "$TARGET" \
   --metadata-overwrite scripts/rpm/rustcfml.toml
 
-echo "==> Verifying RPM..."
+echo "==> RPM created"
 
 find target -name '*.rpm' -print
-
-echo "==> RPM build complete."
