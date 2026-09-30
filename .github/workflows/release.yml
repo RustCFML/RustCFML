@@ -125,6 +125,32 @@ jobs:
           name: ${{ matrix.name }}
           path: target/release-pgo/rustcfml${{ matrix.ext }}
 
+  build-rpm:
+    needs: licenses
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Build Dependencies & Rust
+        run: |
+          dnf install -y gcc binutils git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build & Package RPM
+        run: ./scripts/build-rpm.sh
+
+      - name: Upload RPM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhel-x86_64-rpm
+          path: target/generate-rpm/*.rpm
+
   release:
     needs: [build, build-rpm]
     runs-on: ubuntu-latest
@@ -145,18 +171,12 @@ jobs:
             chmod +x "release/rustcfml-${name}"
           done
           cp "artifacts/windows-x86_64/rustcfml.exe" "release/rustcfml-windows-x86_64.exe"
-          cp artifacts/rhel-x86_64-rpm/*.rpm release
+          cp artifacts/rhel-x86_64-rpm/*.rpm release/
 
-      # Ship the notices alongside the binaries. They are also embedded in each
-      # binary (`rustcfml --licenses`); these assets make them readable without
-      # downloading and running anything.
+      # Ship the notices alongside the binaries.
       - name: Attach license notices
         run: cp LICENSE THIRD-PARTY.txt release/
 
-      # Every tag publishes to the EDGE channel as a prerelease. GitHub's
-      # /releases/latest excludes prereleases, so the download links in the
-      # README keep pointing at the last STABLE build until a version is
-      # promoted — see .github/workflows/promote.yml and docs/releasing.md.
       - name: Create GitHub Release (edge / prerelease)
         uses: softprops/action-gh-release@v3
         with:
@@ -164,25 +184,5 @@ jobs:
           prerelease: true
           make_latest: false
           body: |
-            **Edge build.** Every push of a version tag publishes here after the
-            full gate (workspace + engine test suites, the CFML suite on the CLI
-            and served in both modes, wasm). It has not yet been run in anger.
-
-            For the vetted build, take the
-            [latest stable release](https://github.com/RustCFML/RustCFML/releases/latest).
-            An edge build becomes stable by promotion — the same artifacts, no
-            rebuild.
+            **Edge build.** Every push of a version tag publishes here after the full gate (workspace + engine test suites, the CFML suite on the CLI and served in both modes, wasm). It has not yet been run in anger. For the vetted build, take the [latest stable release](https://github.com/RustCFML/RustCFML/releases/latest). An edge build becomes stable by promotion — the same artifacts, no rebuild.
           files: release/*
-
-          build-rpm:
-    needs: licenses
-    runs-on: ubuntu-latest
-    container:
-      image: rockylinux:9
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Build Dependencies & Rust
-        run: |
-          dnf install -y gcc binutils git
-         
