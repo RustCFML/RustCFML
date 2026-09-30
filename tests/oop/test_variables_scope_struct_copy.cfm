@@ -12,7 +12,11 @@ obj = new oop.VarScopeCopyProbe();
 a = obj.viaStructAppend();
 assertTrue("StructAppend keeps public method member", a.pluralize);
 assertTrue("StructAppend keeps private method member", a.secret);
-assertFalse("StructAppend does not leak the 'this' self-ref", a.this_leak);
+// RustCFML-only: Lucee's variables scope carries `this`, so StructAppend copies
+// that key across; RustCFML leaves the self-reference out.
+if ( isRustCFML() ) {
+	assertFalse("StructAppend does not leak the 'this' self-ref", a.this_leak);
+}
 assertFalse("StructAppend does not leak the 'super' self-ref", a.super_leak);
 
 // --- StructCopy(variables) ---

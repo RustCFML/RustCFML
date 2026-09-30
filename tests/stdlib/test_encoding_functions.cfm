@@ -161,16 +161,20 @@ assert("canonicalize double-encoded", canon4, "<");
 // with chr() so the CFML source carries no ambiguous escape sequences.
 jsBS = chr(92);   // backslash
 jsQ  = chr(34);   // double quote
-assert("canonicalize JS escaped quote",   canonicalize("a" & jsBS & jsQ & "b", false, false), "a" & jsQ & "b");
-assert("canonicalize JS hex escape",      canonicalize(jsBS & "x41", false, false), "A");
-assert("canonicalize JS unicode escape",  canonicalize(jsBS & "u0041", false, false), "A");
-assert("canonicalize JS backslash-backslash", canonicalize(jsBS & jsBS, false, false), jsBS);
+// RustCFML follows ESAPI (Adobe) here. Lucee 7.0/7.1 do NOT apply the
+// JavaScriptCodec pass: the backslash escapes come back unchanged.
+lucee = !isRustCFML();
+assert("canonicalize JS escaped quote",   canonicalize("a" & jsBS & jsQ & "b", false, false), lucee ? "a" & jsBS & jsQ & "b" : "a" & jsQ & "b");
+assert("canonicalize JS hex escape",      canonicalize(jsBS & "x41", false, false), lucee ? jsBS & "x41" : "A");
+assert("canonicalize JS unicode escape",  canonicalize(jsBS & "u0041", false, false), lucee ? jsBS & "u0041" : "A");
+assert("canonicalize JS backslash-backslash", canonicalize(jsBS & jsBS, false, false), lucee ? jsBS & jsBS : jsBS);
 // HTML-entity + percent passes still match (regression guard).
 assert("canonicalize html+percent still works", canonicalize("a&##x20;b %41", false, false), "a b A");
 // The Wheels attribute pipeline shape: JVM engines produce &quot; (the un-decoded
 // backslash was previously entity-encoded to &##x5c;&quot;).
 assert("attr pipeline EncodeForHTMLAttribute(Canonicalize())",
-       encodeForHTMLAttribute(canonicalize("btn" & jsBS & jsQ & "x", false, false)), "btn&quot;x");
+       encodeForHTMLAttribute(canonicalize("btn" & jsBS & jsQ & "x", false, false)),
+       lucee ? "btn" & jsBS & "&##34;x" : "btn&quot;x");
 
 suiteEnd();
 </cfscript>

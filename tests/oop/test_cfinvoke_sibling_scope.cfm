@@ -10,9 +10,15 @@ obj.fireViaAttrCollection();
 assertTrue("this.X set by no-component cfinvoke sibling propagates", structKeyExists(obj, "calledFlag") && obj.calledFlag);
 
 // onMissingMethod fallback for a no-component cfinvoke to an undefined method.
-obj2 = new oop.CfinvokeSiblingFixture();
-obj2.fireMissingViaAttrCollection();
-assertTrue("no-component cfinvoke routes missing method to onMissingMethod on live instance", structKeyExists(obj2, "ommName") && obj2.ommName == "noSuchMethod");
+// RustCFML-only: Lucee 7.0/7.1 throw "variable [noSuchMethod] doesn't exist"
+// here instead of routing to onMissingMethod.
+if ( isRustCFML() ) {
+	obj2 = new oop.CfinvokeSiblingFixture();
+	obj2.fireMissingViaAttrCollection();
+	assertTrue("no-component cfinvoke routes missing method to onMissingMethod on live instance", structKeyExists(obj2, "ommName") && obj2.ommName == "noSuchMethod");
+} else {
+	assertThrows("no-component cfinvoke of a missing method throws", function() { new oop.CfinvokeSiblingFixture().fireMissingViaAttrCollection(); });
+}
 
 suiteEnd();
 </cfscript>

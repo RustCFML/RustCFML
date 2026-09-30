@@ -22,9 +22,11 @@ function probe() {
 
     // 1. Control: default (query) returntype — metadata correct.
     var r0 = QueryExecute("SELECT * FROM q", [], {dbtype: "query", result: "local.meta0"});
+    // Case-folded: Lucee upper-cases some of these keys (COLUMNLIST, RECORDCOUNT,
+    // SQL). executionTimeNano is Lucee's too.
     assert("default returntype result keys",
-           listSort(structKeyList(local.meta0), "textnocase"),
-           "cached,columnList,executionTime,recordCount,sql");
+           listSort(lcase(structKeyList(local.meta0)), "text"),
+           "cached,columnlist,executiontime,executiontimenano,recordcount,sql");
 
     // 2. returnType="array": metadata struct (not the array), now WITH columnList.
     var r1 = QueryExecute("SELECT * FROM q", [], {dbtype: "query", returnType: "array", result: "local.meta1"});

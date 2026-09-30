@@ -80,8 +80,15 @@ fn signal(child: &Child, sig: &str) {
 /// run OUTSIDE a container, because the default action for an unhandled SIGTERM
 /// kills the process anyway. It pins the contract, not the regression. The test
 /// below is the one that fails without the fix (verified).
+/// The tests each pick a port with free_port() (bind :0, release) and start a
+/// server on it; run concurrently they can be handed the same port, one server
+/// fails to bind, and the other test's signals reach the wrong process. They are
+/// short, so run them one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn sigterm_stops_an_idle_server_promptly() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let port = free_port();
     let mut child = start(port);
     let t0 = Instant::now();
@@ -117,6 +124,7 @@ fn sigterm_stops_an_idle_server_promptly() {
 /// gets a truncated read instead of its response.
 #[test]
 fn a_request_in_flight_survives_sigterm() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let port = free_port();
     let mut child = start(port);
 

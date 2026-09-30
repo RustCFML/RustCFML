@@ -56,6 +56,13 @@ assert( "DateFormat.LONG", df.LONG, 1 );
 assert( "DateFormat.MEDIUM", df.MEDIUM, 2 );
 assert( "DateFormat.SHORT", df.SHORT, 3 );
 
+// A formatter with no setTimeZone() formats in the JVM default zone (the host's),
+// and `d` is an instant in the REQUEST zone, so the expected text below holds
+// only when the two agree. The test config pins the request zone
+// (Europe/London) while CI hosts run UTC: pin the request zone to the host's
+// for this block, and restore it at the end.
+dfPriorTz = getTimezone();
+setTimezone( timeZone.getDefault().getID() );
 d = createDateTime( 2024, 6, 10, 14, 5, 9 );
 enGB = aLocale.init( "en", "GB" );
 
@@ -84,11 +91,23 @@ assert( "style by-name lookup df['SHORT']", df[ "SHORT" ], 3 );
 // Time styles WITH a timezone field (LONG=z short abbrev, FULL=zzzz long name),
 // now backed by the IANA tz database (chrono-tz) + a Lucee-verified name table.
 // June 10 is summer in New York -> EDT. Byte-identical to the JVM/Lucee.
+// `d` is an instant in the REQUEST timezone, and a formatter bound to another
+// zone converts it (Lucee 7.0/7.1). Pin the request zone to New York for these
+// two so the expected text holds on any machine, then put it back.
+priorTz = getTimezone();
+setTimezone( "America/New_York" );
+dNy = createDateTime( 2024, 6, 10, 14, 5, 9 );
 nyTZ = timeZone.getTimeZone( "America/New_York" );
 fLong = df.getTimeInstance( df.LONG, enus ); fLong.setTimeZone( nyTZ );
 fFull = df.getTimeInstance( df.FULL, enus ); fFull.setTimeZone( nyTZ );
-assert( "time en_US LONG (z abbrev)", fLong.format( d ), "2:05:09" & nnbsp & "PM EDT" );
-assert( "time en_US FULL (zzzz long name)", fFull.format( d ), "2:05:09" & nnbsp & "PM Eastern Daylight Time" );
+assert( "time en_US LONG (z abbrev)", fLong.format( dNy ), "2:05:09" & nnbsp & "PM EDT" );
+assert( "time en_US FULL (zzzz long name)", fFull.format( dNy ), "2:05:09" & nnbsp & "PM Eastern Daylight Time" );
+// The same instant seen from UTC is converted, not relabelled.
+setTimezone( "UTC" );
+dUtc = createDateTime( 2024, 6, 10, 14, 5, 9 );
+assert( "a UTC instant formatted in New York is converted", fLong.format( dUtc ), "10:05:09" & nnbsp & "AM EDT" );
+setTimezone( priorTz );
+setTimezone( dfPriorTz );
 
 // RustCFML-specific: rather than emit a guessed string, the shim still throws
 // for what it can't reproduce faithfully — an unverified locale (CLDR pattern

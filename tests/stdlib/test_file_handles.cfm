@@ -5,10 +5,12 @@ dir = getTempDirectory() & "rcfml_fh_" & createUUID();
 directoryCreate( dir );
 f = dir & "/lines.txt";
 
-// write mode creates the file at open time (known-issues #49), before any write
+// Lucee 7.0/7.1: a write-mode open does not touch the file; the FIRST write
+// creates (or truncates) it. fileExists sees it as soon as that write happens.
 h = fileOpen( f, "write" );
-assertTrue( "write-mode fileOpen creates the file immediately", fileExists( f ) );
+assertFalse( "write-mode fileOpen does not create the file yet", fileExists( f ) );
 fileWriteLine( h, "first" );
+assertTrue( "the first write creates the file", fileExists( f ) );
 fileWriteLine( h, "second" );
 fileWrite( h, "third" );
 fileClose( h );
@@ -31,6 +33,17 @@ while ( !fileIsEof( h ) ) { fileReadLine( h ); n++; }
 fileClose( h );
 assert( "line loop visits each line once", n, 3 );
 
+// opening for write and closing without writing leaves an existing file intact
+keep = dir & "/keep.txt";
+fileWrite( keep, "old" );
+h = fileOpen( keep, "write" );
+assert( "a write-mode open does not truncate", fileRead( keep ), "old" );
+fileClose( h );
+assert( "closing an unwritten handle keeps the contents", fileRead( keep ), "old" );
+h = fileOpen( dir & "/never.txt", "write" );
+fileClose( h );
+assertFalse( "an unwritten write handle creates nothing", fileExists( dir & "/never.txt" ) );
+
 // append mode adds to the end
 h = fileOpen( f, "append" );
 fileWriteLine( h, "" );
@@ -38,8 +51,12 @@ fileWriteLine( h, "fourth" );
 fileClose( h );
 assert( "append mode", listLast( fileRead( f ), chr(10) ), "fourth" );
 
-// fileRead on a handle: n bytes, then the rest; fileSeek / fileSkipBytes reposition
+// fileRead on a handle: n bytes, then the rest; fileSeek / fileSkipBytes
+// reposition. fileSeek needs fileOpen( …, seekable=true ), as on Lucee.
 h = fileOpen( f, "read" );
+assertThrows( "fileSeek on a non-seekable handle throws", function() { fileSeek( h, 0 ); } );
+fileClose( h );
+h = fileOpen( f, "read", "utf-8", true );
 assert( "fileRead(handle, n) reads n chars", fileRead( h, 5 ), "first" );
 fileSkipBytes( h, 1 );
 assert( "fileSkipBytes then read", fileRead( h, 6 ), "second" );
@@ -47,12 +64,17 @@ fileSeek( h, 0 );
 assert( "fileSeek(0) rewinds", fileReadLine( h ), "first" );
 fileClose( h );
 
-// the handle struct keeps the keys code inspects
+// the handle struct carries Lucee's keys: `path` is the DIRECTORY, `name` the
+// file, plus mode/status/size/lastmodified; `status` becomes "close" on close
 h = fileOpen( f, "read" );
 assert( "handle.mode", h.mode, "read" );
-assert( "handle.filename", h.filename, "lines.txt" );
-assertTrue( "handle.filepath ends with the file", right( h.filepath, 9 ) == "lines.txt" );
+assert( "handle.name", h.name, "lines.txt" );
+assert( "handle.path is the directory", h.path & "/" & h.name, f );
+assert( "handle.status while open", h.status, "open" );
+assert( "handle.size", h.size, len( fileRead( f ) ) );
+assertTrue( "handle.lastmodified is a date", isDate( h.lastmodified ) );
 fileClose( h );
+assert( "handle.status after close", h.status, "close" );
 
 // opening a missing file for reading throws
 assertThrows( "fileOpen read on a missing file throws", function() { fileOpen( dir & "/nope.txt", "read" ); } );

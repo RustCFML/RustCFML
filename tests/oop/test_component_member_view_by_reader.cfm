@@ -26,12 +26,13 @@ assert("every declared function re-homed by this[ name ]", moved, 6);
 assertTrue("the PRIVATE one re-homed too", structKeyExists( target, "priv" ));
 assert("re-homed private method runs", target.priv(), "priv");
 
-// `private` is class-level, not instance-level: a sibling of the same class is
-// readable from inside (same rule the method-access gate already applies).
+// `private` is class-level, not instance-level: a sibling's PRIVATE METHOD is
+// reachable from inside (same rule the method-access gate applies). Its
+// `variables` DATA is not: Lucee 7.0/7.1 answer null for sibling[ "secret" ].
 other = new MemberViewFixture();
-assert("a sibling instance's private scope is readable from inside"
+assert("a sibling instance's private method is reachable from inside, its data is not"
       , o.readSibling( other )
-      , "fn/shh");
+      , "fn/NULL");
 
 // ---------------------------------------------------------------------------
 // OUTSIDE the component: the private scope is not part of the surface, in ANY
@@ -66,9 +67,10 @@ assert("a foreign class is an outsider"
 // Insider is a CLASS relationship, and it follows inheritance and closures.
 // ---------------------------------------------------------------------------
 child = new MemberViewChild();
-assert("a subclass reaches an inherited private member"
+// this[ "secret" ] does not reach `variables` data, even on the same instance.
+assert("a subclass reaches an inherited private method, not private data"
       , child.readInheritedPrivate()
-      , "bracket=fn data=shh");
+      , "bracket=fn data=NULL");
 assert("a closure minted inside a method reads as an insider"
       , child.readFromClosure()
       , "fn");

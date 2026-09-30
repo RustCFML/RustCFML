@@ -26,6 +26,10 @@ component {
     // there and the suite aborts mid-file.
     this.mappings["/compat_engine"] = getDirectoryFromPath(getCurrentTemplatePath()) & "compat_engine/";
 
+    // Map "gc" so `new gc.ClosureHolder(...)` / `new gc.SweepModel(...)` resolve
+    // on Lucee too (same reason as /compat_engine above).
+    this.mappings["/gc"] = getDirectoryFromPath(getCurrentTemplatePath()) & "gc/";
+
     // Map "java_shims" so `new java_shims.ConcurrentPoolTask(...)` resolves on
     // Lucee too (same reason as /compat_engine above).
     this.mappings["/java_shims"] = getDirectoryFromPath(getCurrentTemplatePath()) & "java_shims/";
@@ -58,15 +62,15 @@ component {
     // one subdirectory down (nested/ctpath_deep.cfm). Lucee searches custom
     // tag paths recursively when the engine's customTagDeepSearch flag is on
     // (server-level; the per-app this.customTagDeepSearch spelling is inert on
-    // Lucee 7), so cross-engine runs of that suite need customTagDeepSearch
-    // enabled in the Lucee config. String form, as Lucee also accepts.
+    // Lucee 7), so the Lucee harness turns it on: server.json loads
+    // .cfconfig-lucee-tests.json (customTagSearchSubdirectories=true) into the
+    // CommandBox server. String form, as Lucee also accepts.
     this.customtagpaths = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/ctpathroot/";
 
     // Deep search is OFF by default in RustCFML too (stock-Lucee parity: a stray
     // .cfm under a tag path must not become invocable). RustCFML honours this
-    // per-application spelling as a superset; on Lucee it is inert, so a
-    // cross-engine run of that suite still needs server-level
-    // customTagDeepSearch=true in .CFConfig.json.
+    // per-application spelling as a superset; on Lucee it is inert, and the
+    // server-level flag comes from .cfconfig-lucee-tests.json (see above).
     this.customTagDeepSearch = true;
 
     // Per-application S3 settings (Lucee parity, GitHub #334). Deliberately a

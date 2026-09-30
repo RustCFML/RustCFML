@@ -206,8 +206,13 @@ suiteEnd();
 suiteBegin("GH ##273: date-aware comparison");
 plain = "1990-01-01 00:00:00";
 odbc  = "{ts '1990-01-01 00:00:00'}";
-assertTrue(  "plain EQ odbc-literal",           plain EQ odbc );
-assertTrue(  "odbc-literal EQ plain",           odbc EQ plain );
+// RustCFML-only: its date values ARE strings, so two date-shaped strings have to
+// compare as instants. On Lucee a DB temporal column is a date object (which
+// does compare this way) while two plain strings compare as text: false.
+if ( isRustCFML() ) {
+	assertTrue(  "plain EQ odbc-literal",           plain EQ odbc );
+	assertTrue(  "odbc-literal EQ plain",           odbc EQ plain );
+}
 assertTrue(  "createODBCDateTime EQ plain date-only-promoted",
              createODBCDateTime( createDateTime(1990,1,1,0,0,0) ) EQ plain );
 assertFalse( "different instants are NOT equal", plain EQ "{ts '1990-01-02 00:00:00'}" );

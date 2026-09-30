@@ -40,7 +40,11 @@ assertTrue("Serialize() self-ref output is bounded", len(ser) LT 200);
 // --- writeDump path (both the recursion + the recursion marker) ---
 savecontent variable="dmp" { writeDump(a); }
 assertTrue("writeDump of a self-referential instance completes", len(dmp) GT 0);
-assertTrue("writeDump marks the recursion instead of overflowing", findNoCase("recursive", dmp) GT 0);
+// RustCFML's dump names the recursion; Lucee's collapses the nested instance
+// without a marker.
+if ( isRustCFML() ) {
+	assertTrue("writeDump marks the recursion instead of overflowing", findNoCase("recursive", dmp) GT 0);
+}
 
 // Non-cyclic instances still serialize their data normally (guard is inert).
 plain = new oop.CycleNode();

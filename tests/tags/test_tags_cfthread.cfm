@@ -84,7 +84,11 @@ assert("cfthread thread scope number", cfthread.t5.count, 42);
 <cfthread action="join" name="t6" timeout="5000"/>
 
 <cfscript>
-assert("pre-seeded thread scope visible inside thread", cfthread.t6.echo, "HELLO-FROM-OUTSIDE");
+// RustCFML-only: Lucee 7.1 does NOT carry a pre-seeded thread.* value into the
+// thread (it reads as null there, at page level and inside a function alike).
+if ( isRustCFML() ) {
+	assert("pre-seeded thread scope visible inside thread", cfthread.t6.echo, "HELLO-FROM-OUTSIDE");
+}
 
 suiteEnd();
 </cfscript>

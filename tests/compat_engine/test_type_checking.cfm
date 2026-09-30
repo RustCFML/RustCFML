@@ -161,7 +161,10 @@ assertFalse("isCustomFunction on struct", isCustomFunction({}));
 // non-functions. Regression guard for Sticker's Bundle.addAssets() match
 // closure (Preside admin asset bundling depends on this).
 assertTrue("isClosure on closure", isClosure(myClosure));
-assertTrue("isClosure on arrow function", isClosure(myArrow));
+// Lucee 7.0/7.1: an arrow function is a lambda, not a closure, but it is still
+// a custom function.
+assertFalse("isClosure on arrow function", isClosure(myArrow));
+assertTrue("isCustomFunction on arrow function", isCustomFunction(myArrow));
 assertFalse("isClosure on named UDF", isClosure(myNamedUdf));
 assertFalse("isClosure on string", isClosure("hello"));
 assertFalse("isClosure on number", isClosure(42));
@@ -258,7 +261,10 @@ assertTrue("isValid variableName simple", isValid("variableName", "abc"));
 assertTrue("isValid variableName underscore", isValid("variableName", "my_var2"));
 assertTrue("isValid variableName leading underscore", isValid("variableName", "_x"));
 assertFalse("isValid variableName leading digit", isValid("variableName", "1abc"));
-assertFalse("isValid variableName dotted", isValid("variableName", "a.b"));
+// Lucee 7.0/7.1 accept a dotted name whose segments are each identifiers.
+assertTrue("isValid variableName dotted", isValid("variableName", "a.b"));
+assertFalse("isValid variableName empty segment", isValid("variableName", "a..b"));
+assertFalse("isValid variableName digit segment", isValid("variableName", "a.1"));
 assertFalse("isValid variableName empty", isValid("variableName", ""));
 
 suiteEnd();

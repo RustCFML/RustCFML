@@ -104,8 +104,10 @@ dumped = wide.toString();
 assertTrue("shared-DAG dump completes and is non-empty", len(dumped) > 0);
 // Every reference rendered the same child content (k1's entry "k1: 7" appears
 // once per ref) — memoization reuses the child's string, it doesn't drop refs.
+// Counted with a pattern both renderings match: RustCFML writes `k1: 7`, Lucee
+// `K1={7}` (its Java-map form, with literal keys upper-cased).
 assert("shared child rendered under every ref (memo consistency)",
-       countOccur(dumped, "k1: 7"), 40);
+       arrayLen(reMatchNoCase("k1[:=\s{]+7\b", dumped)), 40);
 
 // Deep shared DAG completes without exponential blow-up in TIME.
 deep = { leaf: "x" };

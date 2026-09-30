@@ -3631,6 +3631,9 @@ fn fn_get_tag_data(args: Vec<CfmlValue>) -> CfmlResult {
     let mut attributes = ValueMap::default();
     for (name, ty, required) in attrs {
         let mut entry = ValueMap::default();
+        // Lucee names an attribute entry by `nameWithCase` (it has no `name`
+        // key); `name` is kept for code written against earlier RustCFML.
+        entry.insert("nameWithCase", CfmlValue::string((*name).to_string()));
         entry.insert("name", CfmlValue::string((*name).to_string()));
         entry.insert("type", CfmlValue::string((*ty).to_string()));
         entry.insert("required", CfmlValue::Bool(*required));
@@ -4284,6 +4287,43 @@ fn fn_struct_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// A structSort("numeric") sort key, cast the way Lucee casts it.
+fn struct_sort_number(v: &CfmlValue) -> Result<f64, CfmlError> {
+    match v {
+        CfmlValue::Int(i) => Ok(*i as f64),
+        CfmlValue::Double(d) => Ok(*d),
+        CfmlValue::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        CfmlValue::Null => Ok(0.0),
+        CfmlValue::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(0.0);
+            }
+            if let Ok(n) = t.parse::<f64>() {
+                return Ok(n);
+            }
+            match t.to_ascii_lowercase().as_str() {
+                "true" | "yes" => Ok(1.0),
+                "false" | "no" => Ok(0.0),
+                _ => Err(CfmlError::expression(format!(
+                    "can't cast [{}] string to a number value",
+                    s.as_str()
+                ))),
+            }
+        }
+        other => Err(CfmlError::expression(format!(
+            "can't cast Complex Object Type [{}] to a number value",
+            match other {
+                CfmlValue::Array(_) => "Array",
+                CfmlValue::Query(_) => "Query",
+                CfmlValue::Binary(_) => "Binary",
+                CfmlValue::Function(_) | CfmlValue::Closure(_) => "Function",
+                _ => "Struct",
+            }
+        ))),
+    }
+}
+
 fn fn_struct_sort(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_sort(a); }
     if let Some(CfmlValue::Struct(s)) = args.first() {
@@ -4312,16 +4352,19 @@ fn fn_struct_sort(args: Vec<CfmlValue>) -> CfmlResult {
         // as it was.
         let mut keys: Vec<String> = match sort_type.as_str() {
             "numeric" => {
+                // Lucee casts every value to a number and throws when it
+                // cannot (a struct, a non-numeric string); "" reads as 0 and a
+                // boolean as 1/0. Silently tying them hid the error.
                 let mut decorated: Vec<(f64, String)> = keys
                     .into_iter()
                     .map(|k| {
-                        let n = s
-                            .get(&k)
-                            .map(|v| v.as_string().parse::<f64>().unwrap_or(0.0))
-                            .unwrap_or(0.0);
-                        (n, k)
+                        let n = match s.get(&k) {
+                            Some(v) => struct_sort_number(&v)?,
+                            None => 0.0,
+                        };
+                        Ok((n, k))
                     })
-                    .collect();
+                    .collect::<Result<_, CfmlError>>()?;
                 decorated
                     .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 decorated.into_iter().map(|(_, k)| k).collect()
@@ -4888,9 +4931,10 @@ fn fn_is_custom_function(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_closure(args: Vec<CfmlValue>) -> CfmlResult {
-    // Lucee parity: `isClosure()` is true for a closure/arrow-function
-    // expression (`function(){}` / `()=>{}`) but false for a plain named UDF
-    // or component method. At runtime an anonymous function expression is a
+    // Lucee parity: `isClosure()` is true for a closure expression
+    // (`function(){}`) but false for an arrow function (`()=>{}`, a lambda on
+    // Lucee 7.0/7.1, where isCustomFunction() is still true), a plain named UDF
+    // or a component method. At runtime an anonymous function expression is a
     // `CfmlValue::Function` (like every UDF) whose `captured_scope` is `Some`
     // — but so is every named UDF's, so that flag can't distinguish them. The
     // reliable signal is the compiler-synthesized name: closures compile to
@@ -4908,7 +4952,7 @@ fn fn_is_closure(args: Vec<CfmlValue>) -> CfmlResult {
     let is = match args.first() {
         Some(CfmlValue::Closure(_)) => true,
         Some(CfmlValue::Function(f)) => {
-            f.name.starts_with("__closure_") || f.name.starts_with("__arrow_")
+            f.name.starts_with("__closure_")
         }
         _ => false,
     };
@@ -4972,7 +5016,15 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             "array" => fn_is_array(vec![value.clone()]),
             "struct" => fn_is_struct(vec![value.clone()]),
             "binary" => fn_is_binary(vec![value.clone()]),
-            "component" | "object" | "class" => fn_is_object(vec![value.clone()]),
+            // Lucee: `object` is anything isObject() accepts (Java objects
+            // included); `component`/`class` are CFC instances only.
+            "object" => fn_is_object(vec![value.clone()]),
+            "component" | "class" => Ok(CfmlValue::Bool(match value {
+                CfmlValue::Component(_) => true,
+                CfmlValue::Struct(s) => s.contains_key("__name") && !s.contains_key("__java_shim"),
+                CfmlValue::NativeObject(_) => false,
+                other => other.is_component(),
+            })),
             "email" => {
                 let s = value.as_string();
                 Ok(CfmlValue::Bool(EMAIL_REGEX.is_match(&s)))
@@ -5002,11 +5054,15 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 // this the type fell through to `false`, flipping setupComplete to
                 // true on a fresh DB and skipping the setup wizard (which Lucee
                 // shows) — booting straight into an unbuilt schema instead.
+                // Lucee also accepts a dotted name (`a.b.c`) when every segment is
+                // itself an identifier; `a..b`, `.a`, `a.` and `a.1` are not.
                 let s = value.as_string();
-                let mut chars = s.chars();
-                let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-                Ok(CfmlValue::Bool(ok))
+                let ident = |seg: &str| {
+                    let mut chars = seg.chars();
+                    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                };
+                Ok(CfmlValue::Bool(s.split('.').all(ident)))
             }
             "range" => {
                 // isValid("range", value, min, max)

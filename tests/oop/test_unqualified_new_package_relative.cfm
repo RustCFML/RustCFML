@@ -25,12 +25,19 @@ assert("isInstanceOf still matches bare name",
 // getMetadata().name and isInstanceOf(FQN) diverged from Lucee (this broke
 // Preside's AdapterFactory, loaded as preside.system...AdapterFactory, doing
 // `new MySqlAdapter()`). Verified vs Lucee 7.0.4.
-makerMapped = new dotdotprobe.pkg229.Maker();
-wMapped = makerMapped.make();
-assert("mapping-loaded caller: metadata.name keeps the mapping prefix",
-    getMetadata(wMapped).name, "dotdotprobe.pkg229.Widget229");
-assert("mapping-loaded caller: isInstanceOf matches mapping-qualified FQN",
-    isInstanceOf(wMapped, "dotdotprobe.pkg229.Widget229"), true);
+// RustCFML-only: /dotdotprobe and /oop both map to the oop/ directory here.
+// Lucee 7.0/7.1 name a component from the FIRST mapping covering its physical
+// path (/oop, declared first), giving "oop.pkg229.Widget229"; RustCFML uses the
+// mapping the caller was loaded under. With one mapping per directory (Preside's
+// /preside) the two agree.
+if ( isRustCFML() ) {
+	makerMapped = new dotdotprobe.pkg229.Maker();
+	wMapped = makerMapped.make();
+	assert("mapping-loaded caller: metadata.name keeps the mapping prefix",
+	    getMetadata(wMapped).name, "dotdotprobe.pkg229.Widget229");
+	assert("mapping-loaded caller: isInstanceOf matches mapping-qualified FQN",
+	    isInstanceOf(wMapped, "dotdotprobe.pkg229.Widget229"), true);
+}
 
 suiteEnd();
 </cfscript>

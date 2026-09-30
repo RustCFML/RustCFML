@@ -13,7 +13,10 @@ assert("GetDirectoryFromPath keeps //", getDirectoryFromPath("/a/b/models//Photo
 assert("GetDirectoryFromPath single", getDirectoryFromPath("/a/b/x.cfc"), "/a/b/");
 
 // --- isValid component / binary ---
-assertTrue("isValid component on java obj", isValid("component", createObject("java", "java.lang.StringBuilder")));
+// Lucee 7.0/7.1: `component` (and `class`) accept CFC instances only; a Java
+// object is an `object`.
+assertFalse("isValid component on java obj", isValid("component", createObject("java", "java.lang.StringBuilder")));
+assertTrue("isValid object on java obj", isValid("object", createObject("java", "java.lang.StringBuilder")));
 assertFalse("isValid component on query", isValid("component", queryNew("id")));
 assertTrue("isValid binary", isValid("binary", toBinary(toBase64("hi"))));
 
@@ -51,7 +54,10 @@ assert("getRequestTimeout ms", getPageContext().getRequestTimeout(), 666000);
 omm = new compat_engine.fixtures.OnMissingSetter();
 assert("set unknown routes to onMissingMethod", omm.setWidget("x"), "OMM:setWidget");
 omm.setColor("red"); // declared property -> implicit setter
-assert("set known uses implicit setter", omm.color, "red");
+// Read back through the getter: on Lucee an accessor property is private
+// (`omm.color` throws "has no accessible Member"), which RustCFML does not yet
+// enforce for a value written by the generated setter.
+assert("set known uses implicit setter", omm.getColor(), "red");
 
 // --- closure captures the enclosing function's Function-valued PARAMETER ---
 makeMatcher = function(body) {

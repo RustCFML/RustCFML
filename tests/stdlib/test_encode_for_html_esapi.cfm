@@ -10,7 +10,9 @@ suiteBegin("EncodeForHTML full ESAPI codec");
 // Engine-agnostic truths (hold on Lucee too): named entities + immune passthrough.
 assert("ampersand", EncodeForHTML("a&b"), "a&amp;b");
 assert("angle brackets", EncodeForHTML("<x>"), "&lt;x&gt;");
-assert("double quote", EncodeForHTML("a""b"), "a&quot;b");
+// ESAPI (RustCFML, Adobe) names the quote; Lucee 7.0/7.1 use the OWASP Java
+// Encoder, which writes it as a decimal reference.
+assert("double quote", EncodeForHTML("a""b"), isRustCFML() ? "a&quot;b" : "a&##34;b");
 assert("alnum untouched", EncodeForHTML("abcXYZ123"), "abcXYZ123");
 assert("immune chars + space untouched", EncodeForHTML("a, b.c-d_e"), "a, b.c-d_e");
 

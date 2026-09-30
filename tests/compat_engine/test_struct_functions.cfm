@@ -211,15 +211,12 @@ if (isRustCFML()) {
     assert("structSort numeric ties keep insertion order", arrayToList(sortedTies), "B,A,C");
 }
 
-// Struct values have no numeric reading, so they all tie — this is the path
-// that used to clone the whole backing map once per comparison.
+// A value with no numeric reading (a struct, a non-numeric string) is an error
+// on Lucee 7.0/7.1 ("can't cast ... to a number value"); "" reads as 0.
 ssNested = {b:{x:1}, a:{y:2}, c:{z:3}};
-sortedNested = structSort(ssNested, "numeric");
-assert("structSort numeric over struct values count", arrayLen(sortedNested), 3);
-assertTrue("structSort numeric over struct values has A", arrayFindNoCase(sortedNested, "A") GT 0);
-if (isRustCFML()) {
-    assert("structSort numeric over struct values order", arrayToList(sortedNested), "B,A,C");
-}
+assertThrows("structSort numeric over struct values throws", function() { structSort(ssNested, "numeric"); });
+assertThrows("structSort numeric over a non-numeric string throws", function() { structSort({b:"x", a:1}, "numeric"); });
+assert("structSort numeric reads an empty string as 0", arrayToList(structSort({b:"", a:1}, "numeric")), "b,a");
 
 ssNoCase = {b:"banana", a:"apple", c:"cherry"};
 sortedNoCase = structSort(ssNoCase, "textnocase");

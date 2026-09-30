@@ -7039,8 +7039,10 @@ impl CfmlVirtualMachine {
         // a secondary "Variable X is undefined" (post-v0.408), masking the real
         // error and aborting sibling TestBox specs (GitHub #250). Centralised here
         // alongside stackTrace so every exception struct carries the full set.
+        // An exception without `errorCode` here was raised by the engine
+        // (throw() always sets one, "" when unset): Lucee reports "0" for those.
         if !exc.contains_key("errorcode") {
-            exc.insert("errorCode".to_string(), CfmlValue::string(String::new()));
+            exc.insert("errorCode".to_string(), CfmlValue::string("0".to_string()));
         }
         if !exc.contains_key("extendedinfo") {
             exc.insert("extendedInfo".to_string(), CfmlValue::string(String::new()));
@@ -18308,7 +18310,7 @@ impl CfmlVirtualMachine {
                     // the requested charset (identity for utf-8; byte→codepoint for
                     // latin1/windows-1252). Mura/Masa call
                     // setEncoding("url","utf-8")/setEncoding("form","utf-8") in
-                    // onRequestStart. Void return, like the BIF.
+                    // onRequestStart.
                     let scope = args.get(0).map(|v| v.as_string()).unwrap_or_default().to_lowercase();
                     let charset = args.get(1).map(|v| v.as_string()).unwrap_or_default();
                     // Normalise charset id (strip separators/case): utf-8 → utf8.
@@ -18317,8 +18319,16 @@ impl CfmlVirtualMachine {
                         .chars()
                         .filter(|c| c.is_ascii_alphanumeric())
                         .collect();
-                    // Only URL and FORM are settable per the BIF contract.
-                    if scope == "url" || scope == "form" {
+                    // Only URL and FORM are settable; Lucee rejects anything else.
+                    if scope != "url" && scope != "form" {
+                        let raw = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                        return Err(CfmlError::expression(format!(
+                            "Invalid call of the function [setEncoding], first Argument [scope] is invalid, \
+                             scope must have the one of the following values [url,form] not [{}]",
+                            raw
+                        )));
+                    }
+                    {
                         // The scope is a nested struct in globals (web scopes live
                         // there). Re-decode its string leaves in place.
                         if let Some(CfmlValue::Struct(s)) = self.globals.get(&scope).cloned() {
@@ -18333,7 +18343,8 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    return Ok(CfmlValue::Null);
+                    // Lucee returns an empty string, not null.
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "__cfparam" => {
                     // Runtime fallback for `param name="<dynamic>" default=<v>`
@@ -20474,6 +20485,12 @@ impl CfmlVirtualMachine {
                     let exec_ms = __query_start.elapsed().as_millis() as i64;
                     #[cfg(target_arch = "wasm32")]
                     let exec_ms = 0i64;
+                    // Lucee also reports `executionTimeNano` (a Double) in every
+                    // `result=` struct.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let exec_nanos = __query_start.elapsed().as_nanos() as f64;
+                    #[cfg(target_arch = "wasm32")]
+                    let exec_nanos = 0f64;
                     // Microsecond precision for the debug footer (Lucee stores
                     // query times in µs); measured at the same point as exec_ms.
                     #[cfg(all(feature = "observability", not(target_arch = "wasm32")))]
@@ -20545,6 +20562,7 @@ impl CfmlVirtualMachine {
                                     ),
                                 );
                                 m.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
+                                m.insert("executionTimeNano".to_string(), CfmlValue::Double(exec_nanos));
                                 CfmlValue::strukt(m)
                             }
                             // Mutation metadata struct from the driver
@@ -20586,6 +20604,7 @@ impl CfmlVirtualMachine {
                                 );
                                 m.insert("sql".to_string(), CfmlValue::string(sql_text.clone()));
                                 m.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
+                                m.insert("executionTimeNano".to_string(), CfmlValue::Double(exec_nanos));
                                 CfmlValue::strukt(m)
                             }
                         };
@@ -25032,7 +25051,7 @@ impl CfmlVirtualMachine {
                 }
                 let format = java_shims::detect_image_format(&sniff_bytes);
                 Ok(java_shims::make_commons_imaging_info(
-                    width, height, format, bpp, transparent, grayscale,
+                    width, height, format, bpp, transparent, grayscale, &sniff_bytes,
                 ))
             }
             "getbufferedimage" => self.call_named_builtin("imageRead", vec![builtin_source]),
@@ -33257,7 +33276,7 @@ impl CfmlVirtualMachine {
         ) {
             return None;
         }
-        inst.read().get_member(name)
+        inst.read().get_insider_member(name)
     }
 
     /// The caller half of [`instance_method_accessible`]: is the code making this
@@ -38172,6 +38191,19 @@ impl CfmlVirtualMachine {
     }
 
     fn file_write_targets(name_lower: &str, args: &[CfmlValue]) -> Vec<String> {
+        // A write through a file handle: the file comes into being on the
+        // handle's FIRST write (fileOpen defers it, as Lucee does), so only that
+        // write is a creation. Later writes change nothing the caches track.
+        if matches!(name_lower, "filewrite" | "filewriteline") {
+            if let Some(CfmlValue::Struct(h)) = args.first() {
+                if h.data_contains_key("__handle_id") {
+                    return match (h.data_get("__pending_write"), h.data_get("filepath")) {
+                        (Some(CfmlValue::Bool(true)), Some(CfmlValue::String(p))) => vec![p.to_string()],
+                        _ => Vec::new(),
+                    };
+                }
+            }
+        }
         // Index of the path arg(s) that get written/created/removed. For copy the
         // destination (1) is written; for move/rename both the source (0, now
         // gone) and destination (1) change. Delete/write/append target arg 0.
@@ -38183,7 +38215,9 @@ impl CfmlVirtualMachine {
             // (`fileOpen` alone did that 835 times on one Preside boot).
             "filewrite" | "fileappend" | "filewriteline" | "filedelete"
             | "directorycreate" => &[0],
-            // `fileOpen` creates or truncates its target only in a write mode.
+            // `fileOpen` in a write mode no longer touches the file (it is
+            // created on the first handle write, handled above); it stays a
+            // target so a negative cached before the open is retired.
             // A read-mode open changes nothing, yet it was treated as a writer:
             // two `realpath()`s (before and after the call) plus a scan of every
             // validated template, per open. Preside's boot opens every view file

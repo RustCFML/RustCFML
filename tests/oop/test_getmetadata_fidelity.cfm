@@ -19,7 +19,10 @@ suiteBegin("getMetadata fidelity (ctor-time self name + ancestor functions/path)
 
 // (A) ctor-time self name
 ctorObj = createObject("component", "GmaCtorFixture");
-assert("GetMetadata(this).name in the pseudo-constructor is the class name, not Anonymous", ctorObj.getNameAtCtor(), "GmaCtorFixture");
+// Lucee names a component found by RELATIVE lookup by its webroot-relative
+// dotted path ("tests.oop.GmaCtorFixture"); RustCFML uses the name as written.
+// Either way it is the class name, not "Anonymous" (the bug this pins).
+assert("GetMetadata(this).name in the pseudo-constructor is the class name, not Anonymous", ctorObj.getNameAtCtor(), isRustCFML() ? "GmaCtorFixture" : "tests.oop.GmaCtorFixture");
 
 // (B) ancestor node carries functions[] and path
 md = getMetadata(createObject("component", "GmaSubFixture"));

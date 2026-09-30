@@ -1128,8 +1128,12 @@ buffered reader for `read`/`readBinary`, a buffered writer for `write`/
 `filename`/`filepath`/`mode`/`status` keys; `fileReadLine`/`fileIsEof`/
 `fileRead(handle[,n])`/`fileReadBinary(handle[,n])`/`fileWrite(handle,…)`/
 `fileWriteLine(handle,…)`/`fileSeek`/`fileSkipBytes` operate on it and
-`fileClose` drops it (flushing). A write-mode open creates or truncates the
-file immediately, as Lucee does.
+`fileClose` drops it (flushing). As on Lucee 7.0/7.1, a write/append open does
+not touch the file: the FIRST write creates (write: truncates) it, so opening and
+closing without writing leaves an existing file intact. `fileSeek` needs
+`fileOpen( …, seekable=true )`. The handle carries Lucee's keys (`path` is the
+directory, `name` the file, `mode`, `status`, `size`, `lastmodified`) plus the
+v0.697 extras `filepath`, `filename` and `isOpen`.
 
 Before this, the handle was a struct holding the path and a line counter:
 `fileReadLine` re-read and re-split the WHOLE file on every call and
