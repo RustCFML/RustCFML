@@ -156,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Needed so LICENSE / THIRD-PARTY.txt can be attached as release assets.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
