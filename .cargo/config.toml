@@ -1,21 +1,21 @@
 #Windows security hardening 
 #this is an open source project, the clients code still should have baseline security out of the gate
-[target.x86_64-pc-windows-msvc]
-rustflags = [
-    "-Ccontrol-flow-guard",     # Enables Control Flow Guard (CFG)
-    "-Clink-arg=/DYNAMICBASE",   # Enables ASLR
-    "-Clink-arg=/NXCOMPAT",      # Enables DEP / NX
-    "-Clink-arg=/HIGHENTROPYVA", # High-entropy 64-bit ASLR
-    "-Clink-arg=/CETCOMPAT",     # Control-flow Enforcement Technology
-    "-Clink-arg=/DEBUG:NONE"    # Disables/strips debug symbol generation
-]
+#[target.x86_64-pc-windows-msvc]
+#rustflags = [
+#    "-Ccontrol-flow-guard",     # Enables Control Flow Guard (CFG)
+#    "-Clink-arg=/DYNAMICBASE",   # Enables ASLR
+#    "-Clink-arg=/NXCOMPAT",      # Enables DEP / NX
+#    "-Clink-arg=/HIGHENTROPYVA", # High-entropy 64-bit ASLR
+#    "-Clink-arg=/CETCOMPAT",     # Control-flow Enforcement Technology
+#    "-Clink-arg=/DEBUG:NONE"    # Disables/strips debug symbol generation
+#]
 
 # RHEL 9/10 x86_64 Linux Build Configuration
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-    "-Crelocation-model=pic",          # Position Independent Code (required for ASLR/PIE)
-    "-Clink-arg=-Wl,-z,relro",         # Read-Only Relocations (RELRO)
-    "-Clink-arg=-Wl,-z,now",           # Full RELRO (binds GOT at startup, prevents memory exploits)
-    "-Clink-arg=-Wl,-z,noexecstack",    # Non-executable stack (NX/DEP)
-    "-Cdebuginfo=0"                   # Strip debug symbols for slim production binary
-]
+#[target.x86_64-unknown-linux-gnu]
+#rustflags = [
+#    "-Crelocation-model=pic",          # Position Independent Code (required for ASLR/PIE)
+#    "-Clink-arg=-Wl,-z,relro",         # Read-Only Relocations (RELRO)
+#    "-Clink-arg=-Wl,-z,now",           # Full RELRO (binds GOT at startup, prevents memory exploits)
+#    "-Clink-arg=-Wl,-z,noexecstack",    # Non-executable stack (NX/DEP)
+#    "-Cdebuginfo=0"                   # Strip debug symbols for slim production binary
+#]
