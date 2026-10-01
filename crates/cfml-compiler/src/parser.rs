@@ -1337,13 +1337,22 @@ impl Parser {
                             )
                         })
                         .collect();
+                    let priority = attrs
+                        .iter()
+                        .find(|(k, _)| k == "priority")
+                        .map(|(_, v)| v.clone());
                     let mut arguments = vec![thread_name, closure];
-                    if !attr_pairs.is_empty() {
+                    // `priority` is the 4th argument; an empty struct holds the
+                    // attributes slot (the VM reads it as "no attributes").
+                    if !attr_pairs.is_empty() || priority.is_some() {
                         arguments.push(Expression::Struct(Struct {
                             pairs: attr_pairs,
                             ordered: false,
                             location: stmt_loc.clone(),
                         }));
+                    }
+                    if let Some(p) = priority {
+                        arguments.push(p);
                     }
                     let call = Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {

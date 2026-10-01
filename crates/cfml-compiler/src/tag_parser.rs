@@ -2640,10 +2640,17 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                                 )
                             })
                             .collect();
-                        let attrs_arg = if attr_entries.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {{ {} }}", attr_entries.join(", "))
+                        // `priority` is the 4th argument (it ends up in
+                        // cfthread.NAME.priority); `{}` holds the attributes
+                        // slot, and the VM reads an empty struct as "none".
+                        let priority = attrs
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("priority"))
+                            .map(|(k, v)| format_attr_value(v, quoted.contains(k.as_str())));
+                        let attrs_arg = match (attr_entries.is_empty(), priority) {
+                            (true, None) => String::new(),
+                            (false, None) => format!(", {{ {} }}", attr_entries.join(", ")),
+                            (_, Some(p)) => format!(", {{ {} }}, {}", attr_entries.join(", "), p),
                         };
                         (format!(
                             "__cfthread_run({}, function() {{\n{}\n}}{});\n",

@@ -663,6 +663,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfstoredproc_runtime_body.cfm">
 <cf_runtest file="tags/test_tags_cfimport.cfm">
 <cf_runtest file="tags/test_tags_cfthread.cfm">
+<cf_runtest file="tags/test_cfthread_metadata.cfm">
 <cf_runtest file="tags/test_tags_cfthread_concurrency.cfm">
 <cf_runtest file="tags/test_cfthread_shared_component.cfm">
 <cf_runtest file="functions/test_extends_missing_parent.cfm">

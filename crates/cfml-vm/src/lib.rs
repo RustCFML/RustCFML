@@ -3233,6 +3233,9 @@ pub struct ThreadResult {
     pub output: String,
     /// Stringified error if the body threw, else empty.
     pub error: String,
+    /// The error as a catch struct (`message`, `type`, `tagContext`, …) — what
+    /// `cfthread.NAME.error` holds. `None` when the body completed.
+    pub error_struct: Option<CfmlValue>,
     /// Wall-clock duration of the body in milliseconds.
     pub elapsed: i64,
     /// The body's `thread` scope (thread.x = ...), surfaced as cfthread.NAME.x.
@@ -5941,9 +5944,9 @@ impl CfmlVirtualMachine {
         let elapsed = start_time.elapsed().as_millis() as i64;
         let output = std::mem::take(&mut self.output_buffer);
         self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
-        let (error, return_value) = match &result {
-            Err(e) => (format!("{}", e), None),
-            Ok(v) => (String::new(), Some(v.clone())),
+        let (error, error_struct, return_value) = match &result {
+            Err(e) => (format!("{}", e), Some(self.resolve_catch_error_val(e)), None),
+            Ok(v) => (String::new(), None, Some(v.clone())),
         };
         let thread_vars = match self.globals.shift_remove("thread") {
             Some(CfmlValue::Struct(ts)) => ts.snapshot(),
@@ -5958,6 +5961,7 @@ impl CfmlVirtualMachine {
             status: status.to_string(),
             output,
             error,
+            error_struct,
             elapsed,
             thread_vars,
             return_value,
@@ -6194,24 +6198,81 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Store a completed `ThreadResult` into the `cfthread` scope as
-    /// `cfthread.NAME = { status, name, output, error, elapsedtime, ...vars }`.
-    pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
+    /// The `cfthread.NAME` entry while the thread runs, with Lucee's keys:
+    /// `childThreads`, `elapsedTime`, `interrupted`, `name`, `output`,
+    /// `priority`, `stackTrace`, `startTime`, `status`. (`stackTrace` is
+    /// Lucee's Java stack of the running thread; there is none here.)
+    pub fn store_cfthread_running(&mut self, thread_name: &str, priority: &str) {
         let mut meta = ValueMap::default();
-        meta.insert("status".to_string(), CfmlValue::string(r.status));
+        meta.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
+        meta.insert("elapsedtime".to_string(), CfmlValue::Int(0));
+        meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
+        meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        meta.insert("output".to_string(), CfmlValue::string(String::new()));
+        meta.insert("priority".to_string(), CfmlValue::string(priority.to_string()));
+        meta.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
         meta.insert(
-            "name".to_string(),
-            CfmlValue::string(thread_name.to_string()),
+            "starttime".to_string(),
+            CfmlValue::string(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
         );
-        meta.insert("output".to_string(), CfmlValue::string(r.output));
-        meta.insert("error".to_string(), CfmlValue::string(r.error));
+        meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+        let cf = self.get_or_create_cfthread_scope();
+        if let Some(ts) = cf.as_cfml_struct() {
+            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+        }
+    }
+
+    /// Store a completed `ThreadResult` into the `cfthread` scope: the running
+    /// entry's keys (see `store_cfthread_running`) with the outcome filled in,
+    /// plus the body's `thread.*` values. `error` is there only when the body
+    /// threw, as on Lucee — code tests `structKeyExists( t, "error" )`.
+    pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
+        let key = thread_name.to_lowercase();
+        let thread_struct = self.get_or_create_cfthread_scope();
+        let running = thread_struct
+            .as_cfml_struct()
+            .and_then(|ts| match ts.get(&key) {
+                Some(CfmlValue::Struct(m)) => Some(m.snapshot()),
+                _ => None,
+            });
+        let mut meta = ValueMap::default();
+        let carried = |k: &str, default: CfmlValue| {
+            running.as_ref().and_then(|m| m.get(k).cloned()).unwrap_or(default)
+        };
+        meta.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
         meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
+        meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
+        meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        meta.insert("output".to_string(), CfmlValue::string(r.output));
+        meta.insert(
+            "priority".to_string(),
+            carried("priority", CfmlValue::string("NORMAL".to_string())),
+        );
+        meta.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
+        meta.insert(
+            "starttime".to_string(),
+            carried(
+                "starttime",
+                CfmlValue::string(
+                    (chrono::Local::now() - chrono::Duration::milliseconds(r.elapsed))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                ),
+            ),
+        );
+        meta.insert("status".to_string(), CfmlValue::string(r.status));
+        if let Some(e) = r.error_struct {
+            meta.insert("error".to_string(), e);
+        } else if !r.error.is_empty() {
+            let mut e = ValueMap::default();
+            e.insert("message".to_string(), CfmlValue::string(r.error));
+            meta.insert("error".to_string(), CfmlValue::strukt(e));
+        }
         for (k, v) in r.thread_vars {
             meta.insert(k, v);
         }
-        let thread_struct = self.get_or_create_cfthread_scope();
         if let Some(ts) = thread_struct.as_cfml_struct() {
-            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+            ts.insert(key, CfmlValue::strukt(meta));
         }
     }
 
@@ -22314,7 +22375,16 @@ impl CfmlVirtualMachine {
                         Some(c) => c.clone(),
                         None => return Ok(CfmlValue::Null),
                     };
-                    let attributes = args.get(2).cloned();
+                    // An empty struct only holds the slot for `priority` (see the
+                    // tag/script compilers): it means "no attributes".
+                    let attributes = args.get(2).cloned().filter(|a| {
+                        !matches!(a, CfmlValue::Struct(s) if s.len() == 0)
+                    });
+                    let priority = args
+                        .get(3)
+                        .map(|p| p.as_string().trim().to_uppercase())
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(|| "NORMAL".to_string());
 
                     // Real OS thread when a spawner is injected AND the feature
                     // is on; otherwise run synchronously inline (wasm / off).
@@ -22330,21 +22400,10 @@ impl CfmlVirtualMachine {
                         self.live_threads.insert(thread_name.to_lowercase(), handle);
                         // Pre-seed cfthread.NAME as RUNNING so reads before join
                         // see a live status rather than a missing key.
-                        let mut meta = ValueMap::default();
-                        meta.insert(
-                            "status".to_string(),
-                            CfmlValue::string("RUNNING".to_string()),
-                        );
-                        meta.insert(
-                            "name".to_string(),
-                            CfmlValue::string(thread_name.clone()),
-                        );
-                        let cf = self.get_or_create_cfthread_scope();
-                        if let Some(ts) = cf.as_cfml_struct() {
-                            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
-                        }
+                        self.store_cfthread_running(&thread_name, &priority);
                         return Ok(CfmlValue::Null);
                     }
+                    self.store_cfthread_running(&thread_name, &priority);
 
                     // Inline fallback: run now on this VM and store immediately.
                     let r = self.run_thread_body(&callback, attributes, parent_locals);
