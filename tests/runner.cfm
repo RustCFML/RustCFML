@@ -1048,6 +1048,7 @@ include "harness.cfm";
 <!--- - lock_finally_semantics: try/finally + lock { } must run the finally on a --->
 <!--- `return` (release the lock) and re-propagate exceptions thrown inside. --->
 <cf_runtest file="core/test_lock_finally_semantics.cfm">
+<cf_runtest file="core/test_finally_return_concurrency.cfm">
 <cf_runtest file="core/test_finally_on_break_continue.cfm">
 <!--- - hof_member_writeback: a higher-order struct member fn (some/every/...) --->
 <!--- run inside a CFC method must not leak the closure's captured `this` onto --->
