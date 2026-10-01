@@ -2987,6 +2987,13 @@ pub struct CfmlVirtualMachine {
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// `Thread.currentThread().interrupt()` — the running thread's Java
+    /// interrupt flag, cleared by static `Thread.interrupted()`. Only a flag:
+    /// unlike `cancel_flag` it never stops the code (Java semantics). A VM runs
+    /// one request or one task, so the flag cannot outlive the thread's work.
+    pub thread_interrupted: bool,
+    /// `Thread.currentThread().setContextClassLoader(cl)`; `None` until set.
+    pub thread_context_class_loader: Option<CfmlValue>,
     /// Shared `static` scope per component type, keyed by the component's source
     /// file path. Populated lazily on first instantiation (running the
     /// component's `static { ... }` block) and reused for every later instance,
@@ -4744,6 +4751,8 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             cancel_flag: None,
+            thread_interrupted: false,
+            thread_context_class_loader: None,
             static_stores: FxHashMap::default(),
             static_ctor_types: FxHashSet::default(),
             static_holders: HashMap::new(),
@@ -26204,6 +26213,60 @@ impl CfmlVirtualMachine {
         seed
     }
 
+    /// The `java.lang.Thread` methods that need VM state. The running thread's
+    /// interrupt flag is `thread_interrupted`, plus the task's `cancel_flag`:
+    /// cancelling a scheduled task's future interrupts the thread running it,
+    /// so a `while ( !isInterrupted() )` loop sees the cancel. A ThreadFactory
+    /// thread (never started) keeps its flag on its own shim.
+    fn dispatch_thread_interrupt(
+        &mut self,
+        method: &str,
+        args: Vec<CfmlValue>,
+        object: &CfmlValue,
+    ) -> CfmlResult {
+        let current = java_shims::is_current_thread(object);
+        let cancelled = || {
+            self.cancel_flag
+                .as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false)
+        };
+        match method {
+            // Static: the CURRENT thread's flag, which it then clears.
+            "interrupted" => {
+                let was = self.thread_interrupted || cancelled();
+                self.thread_interrupted = false;
+                Ok(CfmlValue::Bool(was))
+            }
+            "isinterrupted" if current => {
+                Ok(CfmlValue::Bool(self.thread_interrupted || cancelled()))
+            }
+            "isinterrupted" => Ok(CfmlValue::Bool(matches!(object, CfmlValue::Struct(s)
+                if s.get("__interrupted").map(|v| v.is_true()).unwrap_or(false)))),
+            "interrupt" if current => {
+                self.thread_interrupted = true;
+                Ok(CfmlValue::Null)
+            }
+            "interrupt" => {
+                if let CfmlValue::Struct(s) = object {
+                    let mut m = s.snapshot();
+                    m.insert("__interrupted".to_string(), CfmlValue::Bool(true));
+                    self.method_this_writeback = Some(CfmlValue::strukt(m));
+                }
+                Ok(CfmlValue::Null)
+            }
+            "getcontextclassloader" => Ok(self
+                .thread_context_class_loader
+                .clone()
+                .unwrap_or_else(|| java_shims::make_deferred_java("java.lang.ClassLoader"))),
+            _ => {
+                // setContextClassLoader( cl ): getContextClassLoader returns it.
+                self.thread_context_class_loader = args.into_iter().next();
+                Ok(CfmlValue::Null)
+            }
+        }
+    }
+
     /// Spawn one executor task. `thread_name` is the name
     /// `Thread.currentThread().getName()` reports inside the body (the
     /// ThreadFactory pattern); the hostname rides on the proxy itself.
@@ -27851,7 +27914,20 @@ impl CfmlVirtualMachine {
                     }
                     "java.util.uuid" => handle_java_uuid(&m, all_args, object),
                     "java.util.date" => handle_java_date(&m, all_args, object),
-                    "java.lang.thread" | "java.lang.threadgroup" => {
+                    "java.lang.thread" if matches!(
+                        m.as_str(),
+                        "isinterrupted"
+                            | "interrupt"
+                            | "interrupted"
+                            | "getcontextclassloader"
+                            | "setcontextclassloader"
+                    ) =>
+                    {
+                        self.dispatch_thread_interrupt(&m, all_args, object)
+                    }
+                    "java.lang.thread"
+                    | "java.lang.threadgroup"
+                    | java_shims::THREAD_STATE_CLASS => {
                         let r = handle_java_thread(&m, all_args, object);
                         // setName() mutates the shim; write the renamed struct
                         // back so `theThread.getName()` reflects it afterwards
