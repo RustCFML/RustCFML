@@ -167,6 +167,29 @@ fn request_body_content(content_type: &str, body: &[u8]) -> CfmlValue {
     }
 }
 
+/// `cgi.server_port` the way Lucee reports it: the servlet's `getServerPort()`,
+/// which is the port in the `Host` header, or the scheme's default when the
+/// header has none. Behind a proxy or gateway the port the engine listens on is
+/// internal, and apps that build absolute URLs from `cgi.server_port` (Preside's
+/// `getSiteUrl`, ColdBox's SES base URL) would put it in every link and redirect.
+/// The listening port is used only when there is no `Host` header.
+fn server_port_from_host(host_header: &str, is_https: bool, listen_port: u16) -> u16 {
+    let host = host_header.trim();
+    if host.is_empty() {
+        return listen_port;
+    }
+    // `[::1]:8500` — the port follows the closing bracket of an IPv6 literal.
+    let after_host = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map(|(_, tail)| tail).unwrap_or(""),
+        None => host,
+    };
+    let explicit = after_host
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .filter(|_| host.starts_with('[') || host.matches(':').count() == 1);
+    explicit.unwrap_or(if is_https { 443 } else { 80 })
+}
+
 /// Build CGI, URL, Form, and Cookie scopes from extracted HTTP request data.
 ///
 /// Returns `(globals, http_request_data)` — globals contains the four scopes
@@ -195,7 +218,6 @@ pub fn build_web_scopes(
     cgi.insert("path_info".to_string(), CfmlValue::string(path_info.to_string()));
     cgi.insert("script_name".to_string(), CfmlValue::string(script_name.to_string()));
     cgi.insert("query_string".to_string(), CfmlValue::string(query_string.to_string()));
-    cgi.insert("server_port".to_string(), CfmlValue::string(port.to_string()));
     cgi.insert("remote_addr".to_string(), CfmlValue::string(remote_addr.to_string()));
     cgi.insert("remote_host".to_string(), CfmlValue::string(remote_addr.to_string()));
 
@@ -222,6 +244,10 @@ pub fn build_web_scopes(
         cgi.insert(cgi_key, CfmlValue::string(value.clone()));
     }
     cgi.insert("server_name".to_string(), CfmlValue::string(server_name.clone()));
+    cgi.insert(
+        "server_port".to_string(),
+        CfmlValue::string(server_port_from_host(&host_header, is_https, port).to_string()),
+    );
     // Mirror the secure-transport view into the standard CGI variable
     // (`on`/`off`), matching CFML convention. Previously absent entirely.
     cgi.insert(
@@ -727,6 +753,20 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn server_port_comes_from_the_host_header_like_lucee() {
+        // Behind a gateway the Host has no port: report the scheme default,
+        // never the engine's internal listening port.
+        assert_eq!(server_port_from_host("example.test", false, 8500), 80);
+        assert_eq!(server_port_from_host("example.test", true, 8500), 443);
+        assert_eq!(server_port_from_host("example.test:8443", true, 8500), 8443);
+        assert_eq!(server_port_from_host("127.0.0.1:8500", false, 8500), 8500);
+        assert_eq!(server_port_from_host("[::1]:9000", false, 8500), 9000);
+        assert_eq!(server_port_from_host("[::1]", false, 8500), 80);
+        // No Host header at all (HTTP/1.0): fall back to the listening port.
+        assert_eq!(server_port_from_host("", false, 8500), 8500);
     }
 
     #[test]
