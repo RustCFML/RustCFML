@@ -22,6 +22,21 @@ pub trait ApplicationStore: Send + Sync + 'static {
     /// Insert or overwrite an entire application state.
     fn insert(&self, name: &str, state: ApplicationState);
 
+    /// Insert `state` only if the named application is absent, and return the
+    /// state now stored, whichever request created it. A separate `contains`
+    /// then `insert` lets two cold requests each create the application, and
+    /// the second insert orphans the scope the first request is already writing
+    /// to, so a guard-once idiom (Preside's reload lock and re-check) runs twice.
+    ///
+    /// The default is not atomic; in-process stores override it.
+    fn get_or_insert(&self, name: &str, state: ApplicationState) -> ApplicationState {
+        if let Some(existing) = self.get(name) {
+            return existing;
+        }
+        self.insert(name, state.clone());
+        self.get(name).unwrap_or(state)
+    }
+
     /// Returns `true` if the named application exists.
     fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
@@ -104,6 +119,13 @@ impl ApplicationStore for MemoryApplicationStore {
     fn insert(&self, name: &str, state: ApplicationState) {
         if let Ok(mut m) = self.inner.lock() {
             m.insert(name.to_string(), state);
+        }
+    }
+
+    fn get_or_insert(&self, name: &str, state: ApplicationState) -> ApplicationState {
+        match self.inner.lock() {
+            Ok(mut m) => m.entry(name.to_string()).or_insert(state).clone(),
+            Err(_) => state,
         }
     }
 
