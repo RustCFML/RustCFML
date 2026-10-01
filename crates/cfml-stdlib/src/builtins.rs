@@ -11857,30 +11857,39 @@ impl r2d2::ManageConnection for MssqlConnectionManager {
     type Connection = MssqlConn;
     type Error = MssqlConnError;
 
-    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+fn connect(&self) -> Result<Self::Connection, Self::Error> {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
-        let config = self.config.clone();
+        let mut config = self.config.clone();
         let addr = self.addr.clone();
+
+        // Check if Entra ID / Azure SQL token authentication is requested
+        let addr_lower = addr.to_lowercase();
+        if addr_lower.contains("entra") || addr_lower.contains("activedirectory") || addr_lower.contains("azure") {
+            use azure_identity::DefaultAzureCredential;
+            use azure_core::credentials::TokenCredential;
+
+            let creds = DefaultAzureCredential::default();
+            let token_resp = mssql_runtime().block_on(async move {
+                creds.get_token("https://database.windows.net/.default")
+                    .await
+                    .map_err(|e| MssqlConnError(format!("Entra ID token acquisition failed: {}", e)))
+            })?;
+
+            config.authentication(tiberius::AuthMethod::Token(token_resp.token.secret().to_string()));
+        }
+
         let client = mssql_runtime().block_on(async move {
-            let tcp = tokio::net::TcpStream::connect(&addr).await
+            let tcp = tokio::net::TcpStream::connect(&addr)
+                .await
                 .map_err(|e| MssqlConnError(format!("MSSQL connection error: {}", e)))?;
             tcp.set_nodelay(true).ok();
-            tiberius::Client::connect(config, tcp.compat_write()).await
+            tiberius::Client::connect(config, tcp.compat_write())
+                .await
                 .map_err(|e| MssqlConnError(format!("MSSQL connection error: {}", e)))
         })?;
         Ok(MssqlConn { client, broken: false })
+        }
     }
-
-    fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        // Pool does not validate on checkout (test_on_check_out(false)).
-        Ok(())
-    }
-
-    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
-        conn.broken
-    }
-}
-
 /// Parse an `mssql://`/`sqlserver://` URL into a tiberius `Config` plus the
 /// `host:port` to dial. Extracted from the old inline `execute_mssql` body so
 /// the pool manager can re-establish connections without re-parsing per query.

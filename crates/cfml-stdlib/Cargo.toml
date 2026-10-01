@@ -49,7 +49,8 @@ database = ["sqlite"]
 sqlite = ["rusqlite"]
 mysql_db = ["dep:mysql"]
 postgres_db = ["dep:postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:rust_decimal", "dep:uuid"]
-mssql_db = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread"]
+#mssql_db = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread"]
+mssql_db = [ "dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thread", "dep:rust_decimal", "dep:uuid", "dep:azure_identity", "dep:azure_core" ]
 all-databases = ["sqlite", "mysql_db", "postgres_db", "mssql_db"]
 xml = ["quick-xml"]
 html = ["scraper", "ego-tree", "dep:html5ever"]
@@ -87,7 +88,10 @@ uuid = { version = "1", optional = true }
 # tiberius 0.12.3 is the latest and has no rustls-0.23 path. native-tls uses the
 # OS TLS stack / vendored openssl (already vendored globally via the cli's
 # memcache openssl dep). MSSQL is not built for the wasm targets.
-tiberius = { version = "0.12", default-features = false, features = ["native-tls", "chrono", "tds73"], optional = true }
+tiberius = { version = "0.12.3", default-features = false, features = [ "native-tls", "chrono", "time", "bigdecimal", "rust_decimal", "tds73", "sql-browser-tokio" ], optional = true }
+# Azure AD token fetching for Azure SQL authentication
+azure_identity = { version = "0.21", optional = true }
+azure_core = { version = "0.21", optional = true }
 tokio = { version = "1", features = ["rt", "net"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 r2d2 = "0.8"
