@@ -20,7 +20,9 @@ component {
 		if ( len( variables.logFile ) ) {
 			fileAppend( variables.logFile, ( len( found ) ? "found" : "clean" ) & "," & ( kept ? "kept" : "lost" ) & chr( 10 ) );
 		}
-		return { found = found, kept = kept };
+		var sawSession = false;
+		try { sawSession = structKeyExists( session, "__rsMark" ); } catch ( any e ) {}
+		return { found = found, kept = kept, sawSession = sawSession };
 	}
 
 	function run() {

@@ -83,7 +83,7 @@ Unless noted as *(indirect)*, each class is constructible via `createObject("jav
 | Class (and aliases) | Supported methods |
 |---|---|
 | `java.util.concurrent.Executors` | static `newFixedThreadPool()`, `newCachedThreadPool()`, `newSingleThreadExecutor()`, `newWorkStealingPool()`, `newScheduledThreadPool()`, `newSingleThreadScheduledExecutor()`, `defaultThreadFactory()` |
-| `ThreadPoolExecutor` / `ScheduledThreadPoolExecutor` / `AbstractExecutorService` | `submit`, `execute`, `invokeAll`, `invokeAny`, `schedule`/`scheduleAtFixedRate`/`scheduleWithFixedDelay` (**fire once**); `shutdown`, `shutdownNow`, `isShutdown`, `isTerminated`, `awaitTermination` (→ true), `getActiveCount`/`getPoolSize`/`getTaskCount`/… (→ 0), `getQueue` (empty) |
+| `ThreadPoolExecutor` / `ScheduledThreadPoolExecutor` / `AbstractExecutorService` | `submit`, `execute`, `invokeAll`, `invokeAny`, `schedule`/`scheduleAtFixedRate`/`scheduleWithFixedDelay` (periodic until the future is cancelled or the pool shut down); each task run gets its **own empty `request` scope and no session**, as on Lucee (application scope and mappings are the submitter's); `shutdown`, `shutdownNow`, `isShutdown`, `isTerminated`, `awaitTermination` (→ true), `getActiveCount`/`getPoolSize`/`getTaskCount`/… (→ 0), `getQueue` (empty) |
 | `java.util.concurrent.ExecutorCompletionService` | `init(executor)`, `submit(task)`, `poll()`/`take()` (FIFO completed futures) |
 | `java.util.concurrent.TimeUnit` | constant fields `NANOSECONDS`…`DAYS`; `toString()`/`name()` |
 | `java.util.concurrent.ThreadFactory` | `newThread(runnable)` |

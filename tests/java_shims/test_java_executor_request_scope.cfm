@@ -12,6 +12,7 @@ function rsTask( required string id, string logFile="" ) {
 }
 
 request.__rsTask = "creator";
+try { session.__rsMark = true; } catch ( any e ) {}
 
 // submit(): 12 tasks across 4 threads.
 pool = createObject( "java", "java.util.concurrent.Executors" ).newFixedThreadPool( 4 );
@@ -21,15 +22,18 @@ for ( i = 1; i <= 12; i++ ) {
 }
 foundOther  = 0;
 overwritten = 0;
+sawSession  = 0;
 for ( f in futs ) {
 	r = f.get();
 	if ( len( r.found ) ) { foundOther++; }
 	if ( !r.kept ) { overwritten++; }
+	if ( r.sawSession ) { sawSession++; }
 }
 pool.shutdown();
 assert( "no task sees another task's or the submitter's request values", foundOther, 0 );
 assert( "no task has its request values overwritten mid-run", overwritten, 0 );
 assert( "the submitting request's scope is untouched", request.__rsTask, "creator" );
+assert( "no task sees the submitter's session", sawSession, 0 );
 
 // scheduleAtFixedRate(): each tick starts clean.
 logFile = getTempDirectory() & "/rustcfml_rs_" & createUUID() & ".log";

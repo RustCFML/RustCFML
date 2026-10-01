@@ -26277,6 +26277,11 @@ impl CfmlVirtualMachine {
             // Don't keep the submitting request's scope alive for the life of
             // a schedule either.
             seed.request_scope = CfmlStruct::new(ValueMap::default());
+            // Nor its session: on Lucee the task's page context has a session
+            // of its own, never the submitter's. Here it starts empty and is
+            // never stored (no session id), as for a cluster delivery.
+            seed.session_scope = None;
+            seed.session_id = None;
         }
         if let Some(h) = hostname {
             let mut cgi = match seed.variables_snapshot.get("cgi") {
