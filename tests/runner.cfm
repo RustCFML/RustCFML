@@ -709,6 +709,7 @@ include "harness.cfm";
 
 <!--- --- Lifecycle / server request fixtures --- --->
 <cf_runtest file="lifecycle/test_session_app_namespace.cfm">
+<cf_runtest file="lifecycle/test_session_builtin_keys.cfm">
 <cf_runtest file="lifecycle/test_application_mapping_coverage.cfm">
 
 <!--- Application.cfc this.timezone / this.locale (docs/known-issues.md §1). --->

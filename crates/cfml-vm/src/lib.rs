@@ -33175,6 +33175,13 @@ impl CfmlVirtualMachine {
         }
         self.session_record_created = true;
         self.session_lazy_pending = false;
+        // The session exists now: give an already-attached scope its built-in
+        // keys, as a freshly attached one gets them.
+        if let (Some(ss), Some(rec)) = (self.session_scope.clone(), self.session_record()) {
+            for (k, v) in self.session_builtin_keys(&rec) {
+                ss.insert(k, v);
+            }
+        }
 
         // Fire onSessionStart using the stashed Application.cfc
         // template. Any writes inside the lifecycle hook re-enter this
@@ -33269,12 +33276,41 @@ impl CfmlVirtualMachine {
         // empty struct and writes through the "scope pointer" pattern
         // (`var p = session; p[k]=v; … session[k]`) vanished — WireBox
         // session-scoped singletons never cached.
-        let vars = self
-            .session_record()
-            .map(|s| s.variables)
-            .unwrap_or_default();
+        let record = self.session_record();
+        let builtins = record.as_ref().map(|r| self.session_builtin_keys(r));
+        let mut vars = record.map(|s| s.variables).unwrap_or_default();
+        for (k, v) in builtins.into_iter().flatten() {
+            vars.insert(k, v);
+        }
         self.session_scope = Some(CfmlStruct::new(vars));
     }
+
+    /// The keys Lucee puts in every session scope: `cfid`, `cftoken` (always
+    /// "0"), `sessionid` (`<app>_<cfid>_0`), `urltoken`, `timecreated` and
+    /// `lastvisit`. Rebuilt from the record each request and stripped before
+    /// the scope is saved, so `structClear( session )` removes them for the rest
+    /// of the request only, as on Lucee. Only for an existing session: adding
+    /// them to an empty scope would mint one, and creation is lazy (§12b).
+    fn session_builtin_keys(&self, rec: &SessionData) -> Vec<(String, CfmlValue)> {
+        let cfid = self.session_id.clone().unwrap_or_default();
+        let app = self.current_application_name.clone().unwrap_or_default();
+        let date = |secs: u64| {
+            let utc = chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
+            let local: chrono::DateTime<chrono::Local> = utc.into();
+            CfmlValue::string(local.format("%Y-%m-%d %H:%M:%S").to_string())
+        };
+        vec![
+            ("cfid".to_string(), CfmlValue::string(cfid.clone())),
+            ("cftoken".to_string(), CfmlValue::string("0".to_string())),
+            ("sessionid".to_string(), CfmlValue::string(format!("{}_{}_0", app, cfid))),
+            ("urltoken".to_string(), CfmlValue::string(format!("CFID={}&CFTOKEN=0", cfid))),
+            ("timecreated".to_string(), date(rec.created_secs)),
+            ("lastvisit".to_string(), date(rec.last_accessed_secs)),
+        ]
+    }
+
+    const SESSION_BUILTIN_KEYS: [&'static str; 6] =
+        ["cfid", "cftoken", "sessionid", "urltoken", "timecreated", "lastvisit"];
 
     /// Persist the live session scope back to the session store. Called at the
     /// end of the request (after user code) so scope-pointer writes that bypass
@@ -33291,10 +33327,15 @@ impl CfmlVirtualMachine {
     }
 
     fn sync_session_scope_to_store(&mut self) -> Result<(), CfmlError> {
-        let snap = match &self.session_scope {
+        let mut snap = match &self.session_scope {
             Some(ss) => ss.snapshot(),
             None => return Ok(()),
         };
+        // Lucee's built-in keys are derived, never stored (see
+        // `session_builtin_keys`).
+        snap.retain(|k, _| {
+            !Self::SESSION_BUILTIN_KEYS.iter().any(|b| k.eq_ignore_ascii_case(b))
+        });
         // Airtight data-only gate: catches values smuggled in via reference
         // mutation (`local.x = {}; session.cart = local.x; local.x.p = new C()`),
         // which no assignment-time check can see. Only for SERIALIZING stores —
