@@ -666,6 +666,11 @@ conscious, privacy-friendly divergence. `onSessionStart` timing also shifts for
 existing apps: first write, not first hit. Opt back into the historical eager
 behaviour with `this.lazySessionCreation = false` (alias `this.lazySessions`).
 
+The same goes for Lucee's built-in session keys (`cfid`, `cftoken`, `sessionid`,
+`urltoken`, `timecreated`, `lastvisit`): they appear as soon as the session
+exists, so a request that reads `session.sessionid` before anything has written
+to `session` finds no key.
+
 ### 12c. Session scope: live objects in memory, data-only on serializing stores 🛑 *(partial divergence)*
 
 The **default in-memory store keeps live object references**, so a component,

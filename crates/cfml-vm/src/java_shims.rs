@@ -340,9 +340,10 @@ pub const LUCEE_CALLABLE_CLASS: &str = "org.pixl8.cfconcurrent.luceecallable";
 /// 4.7KB helper jar (`system/externals/cfconcurrent/luceelib/`). On Lucee it
 /// wraps a CFC in a java Runnable/Callable that rebuilds a PageContext on the
 /// worker thread. RustCFML's thread seed already carries the application
-/// context, so the ctor's contextRoot/appContext/host arguments are not needed
-/// — the shim collapses to the same wrapper `createDynamicProxy` produces, and
-/// the executor shims unwrap it identically. This is what lets UNMODIFIED
+/// context, so the ctor's contextRoot/appContext arguments are not needed; the
+/// host is kept (see `lucee_proxy_init`). The shim collapses to the same
+/// wrapper `createDynamicProxy` produces, and the executor shims unwrap it
+/// identically. This is what lets UNMODIFIED
 /// upstream cfconcurrent run: its `_isLucee5()` gate sends RustCFML down the
 /// jar path (server.lucee.version is "7.x"), not the createDynamicProxy path.
 pub fn make_lucee_proxy_class(class: &str) -> CfmlValue {
@@ -1333,6 +1334,49 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
     }
 }
 
+pub const THREAD_STATE_CLASS: &str = "java.lang.thread$state";
+pub const STACK_TRACE_ELEMENT_CLASS: &str = "java.lang.stacktraceelement";
+
+/// A `java.lang.StackTraceElement` (from `Thread.getStackTrace()`). Its string
+/// form is Java's `class.method(file:line)`.
+pub fn make_stack_trace_element(class: &str, method: &str, file: &str, line: i64) -> CfmlValue {
+    let mut m = java_shim_map(STACK_TRACE_ELEMENT_CLASS);
+    m.insert("__ste_class".to_string(), CfmlValue::string(class.to_string()));
+    m.insert("__ste_method".to_string(), CfmlValue::string(method.to_string()));
+    m.insert("__ste_file".to_string(), CfmlValue::string(file.to_string()));
+    m.insert("__ste_line".to_string(), CfmlValue::Int(line));
+    m.insert(
+        "__value".to_string(),
+        CfmlValue::string(format!("{}.{}({}:{})", class, method, file, line)),
+    );
+    CfmlValue::strukt(m)
+}
+
+pub fn handle_java_stack_trace_element(method: &str, object: &CfmlValue) -> CfmlResult {
+    let get = |k: &str| match object {
+        CfmlValue::Struct(s) => s.get(k).unwrap_or(CfmlValue::Null),
+        _ => CfmlValue::Null,
+    };
+    match method {
+        "getclassname" => Ok(get("__ste_class")),
+        "getmethodname" => Ok(get("__ste_method")),
+        "getfilename" => Ok(get("__ste_file")),
+        "getlinenumber" => Ok(get("__ste_line")),
+        "tostring" => Ok(get("__value")),
+        "isnativemethod" => Ok(CfmlValue::Bool(false)),
+        _ => Err(CfmlError::shim_unhandled(method)),
+    }
+}
+const THREAD_STATES: [&str; 6] =
+    ["NEW", "RUNNABLE", "BLOCKED", "WAITING", "TIMED_WAITING", "TERMINATED"];
+
+/// Is this Thread shim the running thread (`currentThread()`, or the class
+/// object itself), rather than one a ThreadFactory handed out?
+pub fn is_current_thread(object: &CfmlValue) -> bool {
+    matches!(object, CfmlValue::Struct(s)
+        if s.get("__current_thread").map(|v| v.is_true()).unwrap_or(false))
+}
+
 pub fn handle_java_thread(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     // "threadgroup" is a nested shim for java.lang.ThreadGroup accessed via
     // Thread.getThreadGroup(). We route its own methods here too.
@@ -1350,6 +1394,22 @@ pub fn handle_java_thread(method: &str, args: Vec<CfmlValue>, object: &CfmlValue
                 _ => Ok(CfmlValue::Null),
             };
         }
+        // java.lang.Thread$State, from getState(): an enum constant.
+        if shim.get("__java_class").map(|v| v.as_string()).unwrap_or_default()
+            == THREAD_STATE_CLASS
+        {
+            let name = shim.get("__value").map(|v| v.as_string()).unwrap_or_default();
+            return match method {
+                "name" | "tostring" => Ok(CfmlValue::string(name)),
+                "ordinal" => Ok(CfmlValue::Int(
+                    THREAD_STATES.iter().position(|s| *s == name).unwrap_or(0) as i64,
+                )),
+                "equals" => Ok(CfmlValue::Bool(
+                    args.first().map(|a| a.as_string() == name).unwrap_or(false),
+                )),
+                _ => Err(CfmlError::shim_unhandled(method)),
+            };
+        }
     }
     match method {
         "init" | "currentthread" => {
@@ -1363,7 +1423,23 @@ pub fn handle_java_thread(method: &str, args: Vec<CfmlValue>, object: &CfmlValue
                 "__name".to_string(),
                 CfmlValue::string(current_thread_name()),
             );
+            // The thread running this code, as opposed to one a ThreadFactory
+            // made: its interrupt flag and context class loader live on the VM.
+            shim.insert("__current_thread".to_string(), CfmlValue::Bool(true));
             Ok(CfmlValue::strukt(shim))
+        }
+        // The current thread is running; a ThreadFactory thread is never
+        // started (the executor shims run tasks directly), so it is still NEW.
+        "getstate" => {
+            let state = if is_current_thread(object) { "RUNNABLE" } else { "NEW" };
+            let mut m = ValueMap::default();
+            m.insert(
+                "__java_class".to_string(),
+                CfmlValue::string(THREAD_STATE_CLASS.to_string()),
+            );
+            m.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            m.insert("__value".to_string(), CfmlValue::string(state.to_string()));
+            Ok(CfmlValue::strukt(m))
         }
         // Thread.setName(x) — ThreadFactory.cfc renames the thread it just got
         // from the default factory, then hands it to the pool. The name must
@@ -1400,7 +1476,6 @@ pub fn handle_java_thread(method: &str, args: Vec<CfmlValue>, object: &CfmlValue
         }
         "getpriority" => Ok(CfmlValue::Int(5)),
         "isdaemon" => Ok(CfmlValue::Bool(false)),
-        "sleep" => Ok(CfmlValue::Null),
         _ => Err(CfmlError::shim_unhandled(method)),
     }
 }

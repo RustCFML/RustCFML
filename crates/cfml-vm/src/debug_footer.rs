@@ -429,62 +429,107 @@ fn fmt_params_html(params: &[QueryParam]) -> String {
 // query's SQL, a whole scope dump — works the same way: the collapsible
 // elements carry a group class and `display:none`, and a `+`/`−` link flips
 // them. One inline script serves the lot; no external assets.
+//
+// The footer renders inside a shadow root (GH #437), so the page's CSS can't
+// restyle it and its own styles and class names can't leak out. Controls are
+// marked with data attributes rather than `onclick`, because an inline handler
+// runs in the page's global scope: the script below adds ONE click listener to
+// the shadow root and defines nothing on `window`.
 
-/// The single inline script backing every toggle and every sortable column.
-/// Emitted once per footer, guarded so a page carrying two footers doesn't
-/// redefine it.
+/// Attaches the shadow root and wires every control. Emitted right after the
+/// host element, which it finds as `document.currentScript`'s previous sibling.
 ///
-/// * `rcfmlTog(a, cls)` — flip everything in one group.
-/// * `rcfmlTogAll(a, rowCls, togCls)` — flip every group at once and re-sync
-///   the individual toggles so their icons can't disagree with the screen.
-/// * `rcfmlSort(th, col)` — sort the table on a numeric column, toggling
-///   descending → ascending → descending. Rows move as BLOCKS: a file row drags
-///   its (collapsed) per-method sub-rows with it, and those sub-rows are sorted
-///   the same way inside the block, so the method breakdown always agrees with
-///   the direction shown in the header. Cells with no number (the query column
-///   on a method sub-row) sort last in both directions, and ties keep their
-///   original order.
-const TOGGLE_SCRIPT: &str = "<script>if(!window.rcfmlTog){\
-window.rcfmlSetTog=function(a,open){a.setAttribute('data-open',open?'1':'0');a.textContent=open?'\u{2212}':'+';};\
-window.rcfmlTog=function(a,c){\
-var els=document.getElementsByClassName(c),open=a.getAttribute('data-open')!=='1',i;\
-for(i=0;i<els.length;i++){els[i].style.display=open?'':'none';}\
-window.rcfmlSetTog(a,open);return false;};\
-window.rcfmlTogAll=function(a,rc,tc){\
-var open=a.getAttribute('data-open')!=='1',\
-rows=document.getElementsByClassName(rc),togs=document.getElementsByClassName(tc),i;\
+/// Browsers with declarative shadow DOM (Chrome/Edge 111+, Safari 16.4+,
+/// Firefox 123+) have already attached it from the `<template
+/// shadowrootmode>`. Older ones see a plain `<template>`, so the script
+/// attaches the root itself, or, with no `attachShadow` at all, falls back to
+/// rendering the content in the page.
+///
+/// * `data-rcfml-tog="cls"` — flip everything in one group; the control's
+///   `+`/`−` indicator is the control itself when it is a link, else its
+///   first link (a section heading).
+/// * `data-rcfml-togall="rowCls togCls"` — flip every group at once and
+///   re-sync the individual toggles so their icons can't disagree with the
+///   screen.
+/// * `data-rcfml-sort="col"` — sort the table on a numeric column, toggling
+///   descending → ascending → descending. Rows move as BLOCKS: a file row
+///   drags its (collapsed) per-method sub-rows with it, and those sub-rows are
+///   sorted the same way inside the block, so the method breakdown always
+///   agrees with the direction shown in the header. Cells with no number (the
+///   query column on a method sub-row) sort last in both directions, and ties
+///   keep their original order.
+const FOOTER_SCRIPT: &str = "<script>(function(s){\
+var h=s&&s.previousElementSibling;if(!h)return;var r=h.shadowRoot;\
+if(!r){var t=h.querySelector('template');if(!t)return;\
+if(h.attachShadow){r=h.attachShadow({mode:'open'});r.appendChild(t.content);}\
+else{h.appendChild(t.content);r=h;}t.parentNode.removeChild(t);}\
+function all(c){return r.querySelectorAll('.'+c);}\
+function setTog(a,open){if(!a)return;a.setAttribute('data-open',open?'1':'0');a.textContent=open?'\u{2212}':'+';}\
+function ind(el){return el.tagName==='A'?el:el.getElementsByTagName('a')[0];}\
+function tog(el,c){var a=ind(el),open=!a||a.getAttribute('data-open')!=='1',els=all(c),i;\
+for(i=0;i<els.length;i++){els[i].style.display=open?'':'none';}setTog(a,open);}\
+function togAll(el,rc,tc){var a=ind(el),open=!a||a.getAttribute('data-open')!=='1',rows=all(rc),togs=all(tc),i;\
 for(i=0;i<rows.length;i++){rows[i].style.display=open?'':'none';}\
-for(i=0;i<togs.length;i++){window.rcfmlSetTog(togs[i],open);}\
-window.rcfmlSetTog(a,open);return false;};\
-window.rcfmlKey=function(r,c){\
-var td=r.cells[c];if(!td)return null;\
+for(i=0;i<togs.length;i++){setTog(togs[i],open);}setTog(a,open);}\
+function key(row,c){var td=row.cells[c];if(!td)return null;\
 var t=td.textContent.replace(/,/g,'');if(t==='')return null;\
-var n=parseFloat(t);return isNaN(n)?null:n;};\
-window.rcfmlCmp=function(c,desc){return function(a,b){\
-var x=window.rcfmlKey(a.r,c),y=window.rcfmlKey(b.r,c);\
+var n=parseFloat(t);return isNaN(n)?null:n;}\
+function cmp(c,desc){return function(a,b){\
+var x=key(a.r,c),y=key(b.r,c);\
 if(x===null&&y===null)return a.i-b.i;\
 if(x===null)return 1;if(y===null)return -1;\
-if(x===y)return a.i-b.i;return desc?y-x:x-y;};};\
-window.rcfmlSort=function(th,c){\
-var t=th;while(t&&t.tagName!=='TABLE'){t=t.parentNode;}if(!t)return false;\
-var hdr=th.parentNode,ths=hdr.getElementsByTagName('th'),i,j,ind;\
+if(x===y)return a.i-b.i;return desc?y-x:x-y;};}\
+function sort(th,c){\
+var t=th;while(t&&t.tagName!=='TABLE'){t=t.parentNode;}if(!t)return;\
+var hdr=th.parentNode,ths=hdr.getElementsByTagName('th'),i,j,ix;\
 var desc=th.getAttribute('data-dir')!=='desc';\
 for(i=0;i<ths.length;i++){ths[i].removeAttribute('data-dir');\
-ind=ths[i].getElementsByClassName('rcfml-ind')[0];\
-if(ind){ind.textContent='\u{21C5}';ind.style.color='#999';}}\
+ix=ths[i].getElementsByClassName('rcfml-ind')[0];\
+if(ix){ix.textContent='\u{21C5}';ix.style.color='#999';}}\
 th.setAttribute('data-dir',desc?'desc':'asc');\
-ind=th.getElementsByClassName('rcfml-ind')[0];\
-if(ind){ind.textContent=desc?'\u{25BC}':'\u{25B2}';ind.style.color='';}\
-var body=t.tBodies[0]||t,rows=[],groups=[],g=null,r;\
+ix=th.getElementsByClassName('rcfml-ind')[0];\
+if(ix){ix.textContent=desc?'\u{25BC}':'\u{25B2}';ix.style.color='';}\
+var body=t.tBodies[0]||t,rows=[],groups=[],g=null,row;\
 for(i=0;i<body.rows.length;i++){rows.push(body.rows[i]);}\
-for(i=0;i<rows.length;i++){r=rows[i];\
-if(r.cells.length&&r.cells[0].tagName==='TH')continue;\
-if(/(^|\\s)rcfml-sub(\\s|$)/.test(r.className)&&g){g.k.push({r:r,i:g.k.length});}\
-else{g={r:r,i:groups.length,k:[]};groups.push(g);}}\
-groups.sort(window.rcfmlCmp(c,desc));\
-for(i=0;i<groups.length;i++){g=groups[i];g.k.sort(window.rcfmlCmp(c,desc));\
-body.appendChild(g.r);for(j=0;j<g.k.length;j++){body.appendChild(g.k[j].r);}}\
-return false;};}</script>\n";
+for(i=0;i<rows.length;i++){row=rows[i];\
+if(row.cells.length&&row.cells[0].tagName==='TH')continue;\
+if(/(^|\\s)rcfml-sub(\\s|$)/.test(row.className)&&g){g.k.push({r:row,i:g.k.length});}\
+else{g={r:row,i:groups.length,k:[]};groups.push(g);}}\
+groups.sort(cmp(c,desc));\
+for(i=0;i<groups.length;i++){g=groups[i];g.k.sort(cmp(c,desc));\
+body.appendChild(g.r);for(j=0;j<g.k.length;j++){body.appendChild(g.k[j].r);}}}\
+r.addEventListener('click',function(e){\
+var el=e.target;while(el&&el!==r&&el.nodeType===1&&!el.hasAttribute('data-rcfml-tog')\
+&&!el.hasAttribute('data-rcfml-togall')&&!el.hasAttribute('data-rcfml-sort')){el=el.parentNode;}\
+if(!el||el===r||el.nodeType!==1)return;e.preventDefault();var v;\
+if((v=el.getAttribute('data-rcfml-tog'))!==null){tog(el,v);}\
+else if((v=el.getAttribute('data-rcfml-togall'))!==null){v=v.split(' ');togAll(el,v[0],v[1]);}\
+else{sort(el,parseInt(el.getAttribute('data-rcfml-sort'),10));}});\
+})(document.currentScript);</script>\n";
+
+/// The footer's own styles, scoped to its shadow root. `:host` resets every
+/// property, inherited ones included (`font`, `color`, `line-height` cross a
+/// shadow boundary), so the footer starts from the same clean slate on every
+/// page. `!important` because a page's `!important` rule on the host element
+/// (`* { font: 30px serif !important }`) beats a normal `:host` rule, while
+/// an `!important` one from inside the shadow tree beats the page's.
+const FOOTER_STYLE: &str = "<style>\
+:host{all:initial !important;display:block !important;box-sizing:border-box !important;\
+width:100% !important;flex:1 1 100% !important;grid-column:1/-1 !important;clear:both !important}\
+.rustcfml-debug{font-family:monospace;font-size:12px;font-weight:normal;font-style:normal;\
+line-height:1.35;color:#222;text-align:left;letter-spacing:normal;word-spacing:normal;\
+text-transform:none;white-space:normal}\
+.rustcfml-debug *{font-family:inherit;font-size:inherit;line-height:inherit;letter-spacing:inherit}\
+h3,h4{font-weight:bold;color:inherit;padding:0;border:0;background:none;text-transform:none}\
+.rustcfml-debug h3{font-size:13px}\
+table{border-collapse:collapse;border:1px solid #999;margin:0 0 4px;background:transparent;width:auto}\
+th,td{border:1px solid #999;padding:3px;vertical-align:top;text-align:left;color:inherit;background:transparent}\
+th{font-weight:bold}\
+.txt-r{text-align:right}\
+a{color:#333;text-decoration:none;cursor:pointer}\
+pre,code{font-family:monospace;white-space:pre-wrap}\
+small{font-size:11px}\
+</style>\n";
 
 const TOG_STYLE: &str =
     "text-decoration:none;color:#333;font-weight:bold;cursor:pointer;margin-right:4px";
@@ -493,7 +538,7 @@ const TOG_STYLE: &str =
 /// section's expand-all (empty when it has none).
 fn tog_link(group: &str, class_attr: &str, title: &str) -> String {
     format!(
-        "<a href=\"#\"{} data-open=\"0\" onclick=\"return window.rcfmlTog(this,'{}')\" title=\"{}\" style=\"{}\">+</a>",
+        "<a href=\"#\"{} data-open=\"0\" data-rcfml-tog=\"{}\" title=\"{}\" style=\"{}\">+</a>",
         class_attr, group, title, TOG_STYLE
     )
 }
@@ -501,7 +546,7 @@ fn tog_link(group: &str, class_attr: &str, title: &str) -> String {
 /// A `+` link that flips every group in a section at once.
 fn tog_all_link(row_class: &str, tog_class: &str, title: &str) -> String {
     format!(
-        "<a href=\"#\" data-open=\"0\" onclick=\"return window.rcfmlTogAll(this,'{}','{}')\" title=\"{}\" style=\"{}\">+</a>",
+        "<a href=\"#\" data-open=\"0\" data-rcfml-togall=\"{} {}\" title=\"{}\" style=\"{}\">+</a>",
         row_class, tog_class, title, TOG_STYLE
     )
 }
@@ -512,7 +557,7 @@ fn tog_all_link(row_class: &str, tog_class: &str, title: &str) -> String {
 /// `⇅` idle, `▼` descending, `▲` ascending.
 fn sort_th(label: &str, col: usize) -> String {
     format!(
-        "<th onclick=\"return window.rcfmlSort(this,{})\" title=\"sort by {}\" style=\"cursor:pointer;user-select:none\">{} <span class=\"rcfml-ind\" style=\"color:#999\">\u{21c5}</span></th>",
+        "<th data-rcfml-sort=\"{}\" title=\"sort by {}\" style=\"cursor:pointer;user-select:none\">{} <span class=\"rcfml-ind\" style=\"color:#999\">\u{21c5}</span></th>",
         col, label, label
     )
 }
@@ -521,12 +566,10 @@ fn sort_th(label: &str, col: usize) -> String {
 /// tagged with `group` (which the caller must render `display:none`).
 ///
 /// The WHOLE heading is the click target, not just the `+` — the anchor is
-/// only the state indicator. Its own onclick merely suppresses the `#`
-/// navigation; the click bubbles to the h4, so either way the toggle fires
-/// exactly once.
+/// only the state indicator, and a click on it bubbles to the heading.
 fn collapsible_heading(s: &mut String, group: &str, title: &str) {
     s.push_str(&format!(
-        "<h4 style=\"margin:6px 0 2px;cursor:pointer;user-select:none\" title=\"show/hide this block\" onclick=\"return window.rcfmlTog(this.getElementsByTagName('a')[0],'{}')\"><a href=\"#\" data-open=\"0\" onclick=\"return false\" style=\"{}\">+</a>{}</h4>\n",
+        "<h4 style=\"margin:6px 0 2px;cursor:pointer;user-select:none\" title=\"show/hide this block\" data-rcfml-tog=\"{}\"><a href=\"#\" data-open=\"0\" style=\"{}\">+</a>{}</h4>\n",
         group, TOG_STYLE, title
     ));
 }
@@ -538,6 +581,21 @@ fn short_val(v: &CfmlValue) -> String {
         format!("{}…", &s[..200])
     } else {
         s
+    }
+}
+
+/// Put the rendered footer into the page: just before the last `</body>` when
+/// there is one (inside the document, where the browser parses it as part of
+/// the page, shadow root and all), else at the end, as it always was.
+pub fn insert_footer(page: &mut String, footer: &str) {
+    let bytes = page.as_bytes();
+    let needle = b"</body";
+    let at = (0..bytes.len().saturating_sub(needle.len() - 1))
+        .rev()
+        .find(|&i| bytes[i..i + needle.len()].eq_ignore_ascii_case(needle));
+    match at {
+        Some(i) => page.insert_str(i, footer),
+        None => page.push_str(footer),
     }
 }
 
@@ -681,8 +739,12 @@ fn render_html(
     } else {
         "font-family:monospace;font-size:12px"
     };
+    // A shadow root isolates the footer from the page's CSS (GH #437); see
+    // FOOTER_STYLE and FOOTER_SCRIPT.
+    s.push_str("\n<div class=\"rustcfml-debug-host\"><template shadowrootmode=\"open\">\n");
+    s.push_str(FOOTER_STYLE);
     s.push_str(&format!(
-        "\n<div class=\"rustcfml-debug\" style=\"{}\">\n",
+        "<div class=\"rustcfml-debug\" style=\"{}\">\n",
         style
     ));
     s.push_str(&format!(
@@ -690,7 +752,6 @@ fn render_html(
         env!("CARGO_PKG_VERSION"),
         fmt_us(total_us)
     ));
-    s.push_str(TOGGLE_SCRIPT);
 
     // Execution Time summary (Lucee's breakdown): Total, time spent in Query,
     // and Application (= total − query). Load/compilation is not yet tracked
@@ -804,7 +865,7 @@ fn render_html(
                 let m_avg = if m.count > 0 { m.total / m.count } else { 0 };
                 // `rcfml-sub` marks the row as belonging to the file row above
                 // it, so a header-click sort moves the pair together and orders
-                // the methods the same way (see `rcfmlSort`).
+                // the methods the same way (see `FOOTER_SCRIPT`).
                 s.push_str(&format!(
                     "<tr class=\"{} rcfml-mrow rcfml-sub\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td style=\"padding-left:22px\">&#8627; {}()</td></tr>\n",
                     grp,
@@ -974,7 +1035,8 @@ fn render_html(
         render_env_and_flags(&mut s);
     }
 
-    s.push_str("</div>\n");
+    s.push_str("</div>\n</template></div>\n");
+    s.push_str(FOOTER_SCRIPT);
     s
 }
 
@@ -1335,7 +1397,7 @@ mod tests {
         // getUser + GETUSER folded into one row with count 2
         assert!(!html.contains("GETUSER()"));
         // collapsed by default, with a `+` toggle on the CFC row only
-        assert!(html.contains("window.rcfmlTog=function"));
+        assert!(html.contains("r.addEventListener('click'"));
         assert!(html.contains("style=\"display:none;color:#555\""));
         assert_eq!(
             html.matches("class=\"rcfml-mtog\"").count(),
@@ -1344,20 +1406,20 @@ mod tests {
         );
         // plus the expand-all toggle in the column header
         assert_eq!(
-            html.matches("window.rcfmlTogAll(this,'rcfml-mrow','rcfml-mtog')")
+            html.matches("data-rcfml-togall=\"rcfml-mrow rcfml-mtog\"")
                 .count(),
             1
         );
         assert_eq!(
             html.matches("rcfml-mrow").count(),
             3,
-            "2 sub-rows + the expand-all onclick"
+            "2 sub-rows + the expand-all control"
         );
         // queries: SQL/params moved into a collapsed sub-row, one toggle each
         // plus the section-wide one in the header cell
         assert_eq!(html.matches("class=\"rcfml-qtog\"").count(), 2);
         assert_eq!(
-            html.matches("window.rcfmlTogAll(this,'rcfml-qrow','rcfml-qtog')")
+            html.matches("data-rcfml-togall=\"rcfml-qrow rcfml-qtog\"")
                 .count(),
             1
         );
@@ -1382,8 +1444,8 @@ mod tests {
         );
         // Files and Queries collapse behind their headings and start CLOSED,
         // same as the scope dumps — and the whole heading is the click target.
-        assert!(html.contains("window.rcfmlTog(this.getElementsByTagName('a')[0],'rcfml-files')"));
-        assert!(html.contains("window.rcfmlTog(this.getElementsByTagName('a')[0],'rcfml-queries')"));
+        assert!(html.contains("title=\"show/hide this block\" data-rcfml-tog=\"rcfml-files\""));
+        assert!(html.contains("title=\"show/hide this block\" data-rcfml-tog=\"rcfml-queries\""));
         assert!(html.contains("<div class=\"rcfml-files\" style=\"display:none\">"));
         assert!(html.contains("<div class=\"rcfml-queries\" style=\"display:none\">"));
     }
@@ -1399,7 +1461,7 @@ mod tests {
         for (label, col) in [("total ms", 1), ("query ms", 2), ("count", 3), ("avg ms", 4)] {
             assert!(
                 html.contains(&format!(
-                    "<th onclick=\"return window.rcfmlSort(this,{col})\" title=\"sort by {label}\""
+                    "<th data-rcfml-sort=\"{col}\" title=\"sort by {label}\""
                 )),
                 "{label} header is not sortable"
             );
@@ -1409,7 +1471,7 @@ mod tests {
             4,
             "one direction indicator per sortable column"
         );
-        assert!(html.contains("window.rcfmlSort=function"));
+        assert!(html.contains("function sort(th,c)"));
         // Method rows are tagged as sub-rows so a sort drags them along with
         // their file row instead of stranding them under a stranger.
         assert_eq!(html.matches("rcfml-mrow rcfml-sub").count(), 2);
@@ -1479,7 +1541,7 @@ mod tests {
         for grp in ["rcfml-s0", "rcfml-s1", "rcfml-cfg", "rcfml-env", "rcfml-flags"] {
             assert!(
                 html.contains(&format!(
-                    "window.rcfmlTog(this.getElementsByTagName('a')[0],'{grp}')"
+                    "title=\"show/hide this block\" data-rcfml-tog=\"{grp}\""
                 )),
                 "{grp} has no heading toggle"
             );
@@ -1568,6 +1630,44 @@ mod tests {
         assert!(out.contains(&format!("<!-- RustCFML v{} Debug", env!("CARGO_PKG_VERSION"))));
         assert!(out.contains("Queries: 1"));
         assert!(!out.contains("<table"));
+    }
+
+    #[test]
+    fn footer_renders_inside_a_shadow_root_with_scoped_styles() {
+        let html = sample_collector().render(&[], Some("/index.cfm"), &[]);
+        let host = html
+            .find("<div class=\"rustcfml-debug-host\"><template shadowrootmode=\"open\">")
+            .expect("shadow-root host");
+        let style = html.find("<style>:host{all:initial !important").expect("scoped style");
+        let panel = html.find("<div class=\"rustcfml-debug\"").expect("panel");
+        let close = html.find("</template></div>").expect("template closed");
+        let script = html.find("<script>(function(s){").expect("script");
+        assert!(host < style && style < panel && panel < close && close < script);
+        // The style and the panel are inside the template; the script, which
+        // must run, is after it.
+        assert!(!html[..host].contains("<style>"));
+        // Nothing reaches the page's global scope: no window.* helpers and no
+        // inline handlers.
+        assert!(!html.contains("window."));
+        assert!(!html.contains("onclick"));
+    }
+
+    #[test]
+    fn footer_goes_before_the_closing_body_tag() {
+        let mut page = "<html><body><p>hi</p></BODY>\n</html>".to_string();
+        insert_footer(&mut page, "[F]");
+        assert_eq!(page, "<html><body><p>hi</p>[F]</BODY>\n</html>");
+        // Only the last one counts (an earlier "</body>" can be inside a
+        // string or a code sample).
+        let mut page = "<pre>&lt;/body&gt; </body></pre></body>".to_string();
+        insert_footer(&mut page, "[F]");
+        assert_eq!(page, "<pre>&lt;/body&gt; </body></pre>[F]</body>");
+        let mut page = "no body tag".to_string();
+        insert_footer(&mut page, "[F]");
+        assert_eq!(page, "no body tag[F]");
+        let mut page = String::new();
+        insert_footer(&mut page, "[F]");
+        assert_eq!(page, "[F]");
     }
 
     #[test]

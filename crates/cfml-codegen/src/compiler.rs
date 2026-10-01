@@ -3242,6 +3242,11 @@ impl CfmlCompiler {
                 // net-zero relative to an extra value sitting beneath them); the
                 // `__`-prefix keeps the temp out of the variables-scope writeback.
                 if !self.finally_stack.is_empty() {
+                    // Declare the temp as a function local first. Undeclared, the
+                    // store landed in the component's shared `variables` scope, so
+                    // concurrent calls on one instance (a singleton service) could
+                    // return each other's values.
+                    instructions.push(BytecodeOp::DeclareLocal(Name::intern("__cf_finally_retval")));
                     instructions.push(BytecodeOp::StoreLocal(Name::intern("__cf_finally_retval")));
                     // Take the whole stack while emitting the finallys inline, so a
                     // `return`/`rethrow` that appears INSIDE a finally body does not

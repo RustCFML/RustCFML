@@ -240,8 +240,9 @@ See **[Getting Started → Building from source](docs/getting-started.md#buildin
 
 ## Contributing
 
-Contributions are welcome.
+Contributions are welcome. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** before opening a pull request.
 
+- **One feature or fix per PR.** Development moves fast, so a broad PR conflicts sooner, is harder to review, and is less likely to be merged. Keep it focused.
 - **New here?** If you haven't contributed before, please **[open an Issue](https://github.com/RustCFML/RustCFML/issues)** with detail (a minimal reproducible CFML snippet, expected vs actual behaviour) before opening a PR.
 - **Pull requests are the preferred way to contribute a fix.** A great place to start is a **CFML-based test** that demonstrates the behaviour (see **[Testing](docs/testing.md)**).
 - **Lucee is the reference for compatibility.** Your test **must pass on Lucee** — if it doesn't, we won't accept it. RustCFML targets [cfdocs.org](https://cfdocs.org) with Lucee as the primary implementation target. (By rare exception, where Lucee allows something genuinely unreasonable, we may choose not to match it.)

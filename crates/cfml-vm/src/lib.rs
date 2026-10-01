@@ -28,6 +28,7 @@ type AppFnVisitedSet = HashSet<(u8, usize), ValueBuildHasher>;
 mod intercepts_admin;
 mod cluster_shims;
 mod ehcache_shim;
+mod s3storageprovider_shim;
 mod lucee_config_shim;
 mod intercepts_common;
 mod intercepts_extensions;
@@ -2986,6 +2987,13 @@ pub struct CfmlVirtualMachine {
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// `Thread.currentThread().interrupt()` — the running thread's Java
+    /// interrupt flag, cleared by static `Thread.interrupted()`. Only a flag:
+    /// unlike `cancel_flag` it never stops the code (Java semantics). A VM runs
+    /// one request or one task, so the flag cannot outlive the thread's work.
+    pub thread_interrupted: bool,
+    /// `Thread.currentThread().setContextClassLoader(cl)`; `None` until set.
+    pub thread_context_class_loader: Option<CfmlValue>,
     /// Shared `static` scope per component type, keyed by the component's source
     /// file path. Populated lazily on first instantiation (running the
     /// component's `static { ... }` block) and reused for every later instance,
@@ -3225,6 +3233,9 @@ pub struct ThreadResult {
     pub output: String,
     /// Stringified error if the body threw, else empty.
     pub error: String,
+    /// The error as a catch struct (`message`, `type`, `tagContext`, …) — what
+    /// `cfthread.NAME.error` holds. `None` when the body completed.
+    pub error_struct: Option<CfmlValue>,
     /// Wall-clock duration of the body in milliseconds.
     pub elapsed: i64,
     /// The body's `thread` scope (thread.x = ...), surfaced as cfthread.NAME.x.
@@ -3764,8 +3775,14 @@ pub struct ThreadSeed {
     pub server_state: Option<ServerState>,
     /// Shared live with the parent (handle clone) — see VM `application_scope`.
     pub application_scope: Option<CfmlStruct>,
-    /// Shared live with the parent (CFML request scope is shared across threads).
+    /// Shared live with the parent (CFML request scope is shared across threads)
+    /// — unless `own_request_scope` is set.
     pub request_scope: CfmlStruct,
+    /// Give every run of this seed a FRESH, empty `request` scope instead of the
+    /// parent's (set for java.util.concurrent executor tasks). A periodic
+    /// schedule clones one seed per tick, so the fresh scope is made in
+    /// `apply_thread_seed`, once per run.
+    pub own_request_scope: bool,
     /// Shared live with the parent (handle clone) — see VM `session_scope`.
     pub session_scope: Option<CfmlStruct>,
     pub session_id: Option<String>,
@@ -4743,6 +4760,8 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             cancel_flag: None,
+            thread_interrupted: false,
+            thread_context_class_loader: None,
             static_stores: FxHashMap::default(),
             static_ctor_types: FxHashSet::default(),
             static_holders: HashMap::new(),
@@ -5547,7 +5566,7 @@ impl CfmlVirtualMachine {
         let cfconfig_rows = self.cfconfig_debug_rows();
         let footer = collector.render(&scopes, main.as_deref(), &cfconfig_rows);
         if !footer.is_empty() {
-            self.output_buffer.push_str(&footer);
+            debug_footer::insert_footer(&mut self.output_buffer, &footer);
         }
     }
 
@@ -5751,6 +5770,7 @@ impl CfmlVirtualMachine {
             server_state: self.server_state.clone(),
             application_scope: self.application_scope.clone(),
             request_scope: self.request_scope.clone(),
+            own_request_scope: false,
             session_scope: self.session_scope.clone(),
             session_id: self.session_id.clone(),
             current_application_name: self.current_application_name.clone(),
@@ -5801,7 +5821,11 @@ impl CfmlVirtualMachine {
             self.cache = ss.object_cache.clone();
         }
         self.application_scope = seed.application_scope;
-        self.request_scope = seed.request_scope;
+        self.request_scope = if seed.own_request_scope {
+            CfmlStruct::new(ValueMap::default())
+        } else {
+            seed.request_scope
+        };
         self.session_scope = seed.session_scope;
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
@@ -5920,9 +5944,9 @@ impl CfmlVirtualMachine {
         let elapsed = start_time.elapsed().as_millis() as i64;
         let output = std::mem::take(&mut self.output_buffer);
         self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
-        let (error, return_value) = match &result {
-            Err(e) => (format!("{}", e), None),
-            Ok(v) => (String::new(), Some(v.clone())),
+        let (error, error_struct, return_value) = match &result {
+            Err(e) => (format!("{}", e), Some(self.resolve_catch_error_val(e)), None),
+            Ok(v) => (String::new(), None, Some(v.clone())),
         };
         let thread_vars = match self.globals.shift_remove("thread") {
             Some(CfmlValue::Struct(ts)) => ts.snapshot(),
@@ -5937,6 +5961,7 @@ impl CfmlVirtualMachine {
             status: status.to_string(),
             output,
             error,
+            error_struct,
             elapsed,
             thread_vars,
             return_value,
@@ -6173,24 +6198,81 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Store a completed `ThreadResult` into the `cfthread` scope as
-    /// `cfthread.NAME = { status, name, output, error, elapsedtime, ...vars }`.
-    pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
+    /// The `cfthread.NAME` entry while the thread runs, with Lucee's keys:
+    /// `childThreads`, `elapsedTime`, `interrupted`, `name`, `output`,
+    /// `priority`, `stackTrace`, `startTime`, `status`. (`stackTrace` is
+    /// Lucee's Java stack of the running thread; there is none here.)
+    pub fn store_cfthread_running(&mut self, thread_name: &str, priority: &str) {
         let mut meta = ValueMap::default();
-        meta.insert("status".to_string(), CfmlValue::string(r.status));
+        meta.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
+        meta.insert("elapsedtime".to_string(), CfmlValue::Int(0));
+        meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
+        meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        meta.insert("output".to_string(), CfmlValue::string(String::new()));
+        meta.insert("priority".to_string(), CfmlValue::string(priority.to_string()));
+        meta.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
         meta.insert(
-            "name".to_string(),
-            CfmlValue::string(thread_name.to_string()),
+            "starttime".to_string(),
+            CfmlValue::string(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
         );
-        meta.insert("output".to_string(), CfmlValue::string(r.output));
-        meta.insert("error".to_string(), CfmlValue::string(r.error));
+        meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+        let cf = self.get_or_create_cfthread_scope();
+        if let Some(ts) = cf.as_cfml_struct() {
+            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+        }
+    }
+
+    /// Store a completed `ThreadResult` into the `cfthread` scope: the running
+    /// entry's keys (see `store_cfthread_running`) with the outcome filled in,
+    /// plus the body's `thread.*` values. `error` is there only when the body
+    /// threw, as on Lucee — code tests `structKeyExists( t, "error" )`.
+    pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
+        let key = thread_name.to_lowercase();
+        let thread_struct = self.get_or_create_cfthread_scope();
+        let running = thread_struct
+            .as_cfml_struct()
+            .and_then(|ts| match ts.get(&key) {
+                Some(CfmlValue::Struct(m)) => Some(m.snapshot()),
+                _ => None,
+            });
+        let mut meta = ValueMap::default();
+        let carried = |k: &str, default: CfmlValue| {
+            running.as_ref().and_then(|m| m.get(k).cloned()).unwrap_or(default)
+        };
+        meta.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
         meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
+        meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
+        meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        meta.insert("output".to_string(), CfmlValue::string(r.output));
+        meta.insert(
+            "priority".to_string(),
+            carried("priority", CfmlValue::string("NORMAL".to_string())),
+        );
+        meta.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
+        meta.insert(
+            "starttime".to_string(),
+            carried(
+                "starttime",
+                CfmlValue::string(
+                    (chrono::Local::now() - chrono::Duration::milliseconds(r.elapsed))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                ),
+            ),
+        );
+        meta.insert("status".to_string(), CfmlValue::string(r.status));
+        if let Some(e) = r.error_struct {
+            meta.insert("error".to_string(), e);
+        } else if !r.error.is_empty() {
+            let mut e = ValueMap::default();
+            e.insert("message".to_string(), CfmlValue::string(r.error));
+            meta.insert("error".to_string(), CfmlValue::strukt(e));
+        }
         for (k, v) in r.thread_vars {
             meta.insert(k, v);
         }
-        let thread_struct = self.get_or_create_cfthread_scope();
         if let Some(ts) = thread_struct.as_cfml_struct() {
-            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+            ts.insert(key, CfmlValue::strukt(meta));
         }
     }
 
@@ -19392,6 +19474,11 @@ impl CfmlVirtualMachine {
                             if ehcache_shim::constructs(&class_name) {
                                 return self.construct_ehcache_shim();
                             }
+                            // The third (bundle-name) argument is ignored: there
+                            // is no OSGi container to load it from.
+                            if s3storageprovider_shim::constructs(&class_name) {
+                                return self.construct_s3storageprovider_shim();
+                            }
                             return match class_name.as_str() {
                                 "java.security.messagedigest" => {
                                     handle_java_messagedigest("init", empty_args, &CfmlValue::Null)
@@ -22288,7 +22375,16 @@ impl CfmlVirtualMachine {
                         Some(c) => c.clone(),
                         None => return Ok(CfmlValue::Null),
                     };
-                    let attributes = args.get(2).cloned();
+                    // An empty struct only holds the slot for `priority` (see the
+                    // tag/script compilers): it means "no attributes".
+                    let attributes = args.get(2).cloned().filter(|a| {
+                        !matches!(a, CfmlValue::Struct(s) if s.len() == 0)
+                    });
+                    let priority = args
+                        .get(3)
+                        .map(|p| p.as_string().trim().to_uppercase())
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(|| "NORMAL".to_string());
 
                     // Real OS thread when a spawner is injected AND the feature
                     // is on; otherwise run synchronously inline (wasm / off).
@@ -22304,21 +22400,10 @@ impl CfmlVirtualMachine {
                         self.live_threads.insert(thread_name.to_lowercase(), handle);
                         // Pre-seed cfthread.NAME as RUNNING so reads before join
                         // see a live status rather than a missing key.
-                        let mut meta = ValueMap::default();
-                        meta.insert(
-                            "status".to_string(),
-                            CfmlValue::string("RUNNING".to_string()),
-                        );
-                        meta.insert(
-                            "name".to_string(),
-                            CfmlValue::string(thread_name.clone()),
-                        );
-                        let cf = self.get_or_create_cfthread_scope();
-                        if let Some(ts) = cf.as_cfml_struct() {
-                            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
-                        }
+                        self.store_cfthread_running(&thread_name, &priority);
                         return Ok(CfmlValue::Null);
                     }
+                    self.store_cfthread_running(&thread_name, &priority);
 
                     // Inline fallback: run now on this VM and store immediately.
                     let r = self.run_thread_body(&callback, attributes, parent_locals);
@@ -26171,13 +26256,33 @@ impl CfmlVirtualMachine {
     /// the task will see. cgi lives in `globals`, which the seed snapshots, so the
     /// override is a targeted edit of that snapshot — it never touches the parent
     /// request's own cgi scope.
+    ///
+    /// `own_request_scope`: a java.util.concurrent executor task is not part of
+    /// the request that submitted it. On Lucee each run gets its own page
+    /// context, so its `request` scope starts empty and is gone when the run
+    /// ends; sharing the submitter's let concurrent runs overwrite each other's
+    /// values and leave them behind in it. (Preside keeps its ColdBox request
+    /// context there, so a heartbeat read the id of an ad hoc task that had
+    /// already finished, took it as cancelled, and stopped working.)
     fn build_task_seed(
         &self,
         body: CfmlValue,
         hostname: Option<String>,
         thread_name: Option<String>,
+        own_request_scope: bool,
     ) -> ThreadSeed {
         let mut seed = self.build_thread_seed(body, None);
+        if own_request_scope {
+            seed.own_request_scope = true;
+            // Don't keep the submitting request's scope alive for the life of
+            // a schedule either.
+            seed.request_scope = CfmlStruct::new(ValueMap::default());
+            // Nor its session: on Lucee the task's page context has a session
+            // of its own, never the submitter's. Here it starts empty and is
+            // never stored (no session id), as for a cluster delivery.
+            seed.session_scope = None;
+            seed.session_id = None;
+        }
         if let Some(h) = hostname {
             let mut cgi = match seed.variables_snapshot.get("cgi") {
                 Some(CfmlValue::Struct(s)) => s.snapshot(),
@@ -26198,12 +26303,125 @@ impl CfmlVirtualMachine {
         seed
     }
 
+    /// The `java.lang.Thread` methods that need VM state. The running thread's
+    /// interrupt flag is `thread_interrupted`, plus the task's `cancel_flag`:
+    /// cancelling a scheduled task's future interrupts the thread running it,
+    /// so a `while ( !isInterrupted() )` loop sees the cancel. A ThreadFactory
+    /// thread (never started) keeps its flag on its own shim.
+    fn dispatch_thread_interrupt(
+        &mut self,
+        method: &str,
+        args: Vec<CfmlValue>,
+        object: &CfmlValue,
+    ) -> CfmlResult {
+        let current = java_shims::is_current_thread(object);
+        let cancelled = || {
+            self.cancel_flag
+                .as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false)
+        };
+        match method {
+            // Static: the CURRENT thread's flag, which it then clears.
+            "interrupted" => {
+                let was = self.thread_interrupted || cancelled();
+                self.thread_interrupted = false;
+                Ok(CfmlValue::Bool(was))
+            }
+            "isinterrupted" if current => {
+                Ok(CfmlValue::Bool(self.thread_interrupted || cancelled()))
+            }
+            "isinterrupted" => Ok(CfmlValue::Bool(matches!(object, CfmlValue::Struct(s)
+                if s.get("__interrupted").map(|v| v.is_true()).unwrap_or(false)))),
+            "interrupt" if current => {
+                self.thread_interrupted = true;
+                Ok(CfmlValue::Null)
+            }
+            "interrupt" => {
+                if let CfmlValue::Struct(s) = object {
+                    let mut m = s.snapshot();
+                    m.insert("__interrupted".to_string(), CfmlValue::Bool(true));
+                    self.method_this_writeback = Some(CfmlValue::strukt(m));
+                }
+                Ok(CfmlValue::Null)
+            }
+            // Static Thread.sleep( ms ): the CURRENT thread. Interrupted
+            // before or during the sleep, it throws InterruptedException and
+            // clears the flag, as Java does.
+            "sleep" => {
+                let interrupted = |vm: &mut Self| -> CfmlResult {
+                    vm.thread_interrupted = false;
+                    Err(CfmlError::new(
+                        "sleep interrupted".to_string(),
+                        CfmlErrorType::Custom("java.lang.InterruptedException".to_string()),
+                    ))
+                };
+                if self.thread_interrupted || cancelled() {
+                    return interrupted(self);
+                }
+                let ms = args
+                    .first()
+                    .map(|v| v.as_string().trim().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                if ms < 0.0 {
+                    return Err(CfmlError::new(
+                        "timeout value is negative".to_string(),
+                        CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
+                    ));
+                }
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(ms as u64);
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(CfmlValue::Null);
+                    }
+                    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+                    if cancelled() {
+                        return interrupted(self);
+                    }
+                }
+            }
+            // The running thread's stack is the CFML call stack, innermost
+            // first, under the getStackTrace frame Java puts on top. A
+            // ThreadFactory thread was never started: Java gives an empty array.
+            "getstacktrace" if current => {
+                let mut frames = vec![java_shims::make_stack_trace_element(
+                    "java.lang.Thread",
+                    "getStackTrace",
+                    "Thread.java",
+                    0,
+                )];
+                for f in self.build_stack_trace() {
+                    frames.push(java_shims::make_stack_trace_element(
+                        &f.template,
+                        if f.function.is_empty() || f.function == "__main__" { "call" } else { &f.function },
+                        &f.template,
+                        f.line as i64,
+                    ));
+                }
+                Ok(CfmlValue::array(frames))
+            }
+            "getstacktrace" => Ok(CfmlValue::array(vec![])),
+            "getcontextclassloader" => Ok(self
+                .thread_context_class_loader
+                .clone()
+                .unwrap_or_else(|| java_shims::make_deferred_java("java.lang.ClassLoader"))),
+            _ => {
+                // setContextClassLoader( cl ): getContextClassLoader returns it.
+                self.thread_context_class_loader = args.into_iter().next();
+                Ok(CfmlValue::Null)
+            }
+        }
+    }
+
     /// Spawn one executor task. `thread_name` is the name
     /// `Thread.currentThread().getName()` reports inside the body (the
     /// ThreadFactory pattern); the hostname rides on the proxy itself.
     fn spawn_task(&mut self, arg: CfmlValue, thread_name: Option<String>) -> CfmlResult {
         let hostname = java_shims::proxy_hostname(&arg);
         let body = Self::to_async_body(arg);
+        let own_request_scope = true;
         #[cfg(feature = "real-threads")]
         let spawn = self.thread_spawn_fn;
         #[cfg(not(feature = "real-threads"))]
@@ -26211,14 +26429,20 @@ impl CfmlVirtualMachine {
 
         #[cfg(feature = "real-threads")]
         if let Some(spawn_fn) = spawn {
-            let seed = self.build_task_seed(body, hostname, thread_name);
+            let seed = self.build_task_seed(body, hostname, thread_name, own_request_scope);
             let handle = spawn_fn(seed);
             let fut = async_kernel::FutureNative::from_handle_strict(handle);
             return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
         }
 
-        let _ = spawn;
+        let _ = (spawn, hostname, thread_name, own_request_scope);
+        // Inline (no real threads): still run under a request scope of its own.
+        let parent_request = std::mem::replace(
+            &mut self.request_scope,
+            CfmlStruct::new(ValueMap::default()),
+        );
         let r = self.run_thread_body(&body, None, &ValueMap::default());
+        self.request_scope = parent_request;
         let fut = async_kernel::FutureNative::resolved_strict(r);
         Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))))
     }
@@ -26262,6 +26486,7 @@ impl CfmlVirtualMachine {
             hostname,
             thread_name,
             None,
+            false,
         )
     }
 
@@ -26276,6 +26501,7 @@ impl CfmlVirtualMachine {
         hostname: Option<String>,
         thread_name: Option<String>,
         pool: Option<CfmlValue>,
+        own_request_scope: bool,
     ) -> CfmlResult {
         // DIAGNOSTIC kill-switch: RUSTCFML_NO_PERIODIC=1 makes every periodic
         // schedule a one-shot, so a memory question can be A/B'd against "are
@@ -26309,7 +26535,7 @@ impl CfmlVirtualMachine {
 
                 #[cfg(feature = "real-threads")]
                 if let Some(spawn_fn) = spawn {
-                    let seed = self.build_task_seed(body, hostname, thread_name);
+                    let seed = self.build_task_seed(body, hostname, thread_name, own_request_scope);
                     let outer_cancel = seed.cancel_flag.clone();
                     // Let the owning executor stop this schedule on shutdown();
                     // otherwise the relay outlives it and keeps a whole
@@ -26508,7 +26734,13 @@ impl CfmlVirtualMachine {
                 // be honoured here (documented in docs/known-issues.md).
                 let _ = spawn;
                 let _ = (delay_ms, period);
+                let parent_request = own_request_scope.then(|| {
+                    std::mem::replace(&mut self.request_scope, CfmlStruct::new(ValueMap::default()))
+                });
                 let r = self.run_thread_body(&body, None, parent_locals);
+                if let Some(p) = parent_request {
+                    self.request_scope = p;
+                }
                 let fut = async_kernel::FutureNative::resolved(r);
                 return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
     }
@@ -26603,7 +26835,7 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let hostname = java_shims::proxy_hostname(&arg);
         let body = Self::to_async_body(arg);
-        let seed = self.build_task_seed(body, hostname, thread_name);
+        let seed = self.build_task_seed(body, hostname, thread_name, true);
         match Self::with_pool(pool, |p| p.submit(seed)) {
             Some(Ok(handle)) => {
                 let fut = async_kernel::FutureNative::from_handle_strict(handle);
@@ -26875,6 +27107,7 @@ impl CfmlVirtualMachine {
                     hostname,
                     name,
                     pool,
+                    true,
                 )
             }
             // invokeAll( tasks [, timeout, unit] ) — JVM contract: BLOCK until
@@ -27656,6 +27889,9 @@ impl CfmlVirtualMachine {
                     c if ehcache_shim::handles(c) => {
                         return self.dispatch_ehcache_shim(c, &m, all_args, object);
                     }
+                    c if s3storageprovider_shim::handles(c) => {
+                        return self.dispatch_s3storageprovider_shim(&m, all_args, object);
+                    }
                     c if lucee_config_shim::handles(c) => {
                         return self.dispatch_lucee_config(c, &m, all_args, object);
                     }
@@ -27842,7 +28078,25 @@ impl CfmlVirtualMachine {
                     }
                     "java.util.uuid" => handle_java_uuid(&m, all_args, object),
                     "java.util.date" => handle_java_date(&m, all_args, object),
-                    "java.lang.thread" | "java.lang.threadgroup" => {
+                    "java.lang.thread" if matches!(
+                        m.as_str(),
+                        "isinterrupted"
+                            | "interrupt"
+                            | "interrupted"
+                            | "getcontextclassloader"
+                            | "setcontextclassloader"
+                            | "sleep"
+                            | "getstacktrace"
+                    ) =>
+                    {
+                        self.dispatch_thread_interrupt(&m, all_args, object)
+                    }
+                    java_shims::STACK_TRACE_ELEMENT_CLASS => {
+                        java_shims::handle_java_stack_trace_element(&m, object)
+                    }
+                    "java.lang.thread"
+                    | "java.lang.threadgroup"
+                    | java_shims::THREAD_STATE_CLASS => {
                         let r = handle_java_thread(&m, all_args, object);
                         // setName() mutates the shim; write the renamed struct
                         // back so `theThread.getName()` reflects it afterwards
@@ -30216,7 +30470,12 @@ impl CfmlVirtualMachine {
         // "Component [x] has no function with name [y]". (Non-component receivers
         // keep the lenient Null return; tightening those is a separate concern.)
         if let CfmlValue::Struct(ref s) = object {
-            if s.contains_key(&*cfml_common::key::well_known::VARIABLES) || s.contains_key("__name") {
+            // A java shim is not a component, even one with a `__name` (the
+            // Thread shim keeps the thread's name there): it falls through to
+            // the shim rule below, which names the Java class and method.
+            if (s.contains_key(&*cfml_common::key::well_known::VARIABLES) || s.contains_key("__name"))
+                && !s.contains_key("__java_shim")
+            {
                 // Lucee parity: every component inherits java.lang.Object, so
                 // hashCode()/equals()/identityHashCode() resolve even when the CFC
                 // declares no such method. ColdBox's async BaseProxy calls
@@ -30481,6 +30740,31 @@ impl CfmlVirtualMachine {
                         CfmlErrorType::Expression,
                     );
                     err.stack_trace = self.build_stack_trace();
+                    // Framework code routinely wraps background work in
+                    // `catch (any)`, so a missing shim method can fail quietly
+                    // for ever (Preside's heartbeats did, on isInterrupted()).
+                    // Say so on stderr the first time each one is called,
+                    // whether or not the CFML catches it.
+                    static WARNED: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::HashSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let id = format!("{}.{}", cls, method.to_lowercase());
+                    let first = WARNED
+                        .get_or_init(Default::default)
+                        .lock()
+                        .map(|mut w| w.insert(id))
+                        .unwrap_or(false);
+                    if first {
+                        let at = err
+                            .stack_trace
+                            .first()
+                            .map(|f| format!(" at {}:{}", f.template, f.line))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[java-shim] {}.{}() is not supported{} (logged once per method)",
+                            cls, method, at
+                        );
+                    }
                     return Err(err);
                 }
             }
@@ -32891,6 +33175,13 @@ impl CfmlVirtualMachine {
         }
         self.session_record_created = true;
         self.session_lazy_pending = false;
+        // The session exists now: give an already-attached scope its built-in
+        // keys, as a freshly attached one gets them.
+        if let (Some(ss), Some(rec)) = (self.session_scope.clone(), self.session_record()) {
+            for (k, v) in self.session_builtin_keys(&rec) {
+                ss.insert(k, v);
+            }
+        }
 
         // Fire onSessionStart using the stashed Application.cfc
         // template. Any writes inside the lifecycle hook re-enter this
@@ -32985,12 +33276,41 @@ impl CfmlVirtualMachine {
         // empty struct and writes through the "scope pointer" pattern
         // (`var p = session; p[k]=v; … session[k]`) vanished — WireBox
         // session-scoped singletons never cached.
-        let vars = self
-            .session_record()
-            .map(|s| s.variables)
-            .unwrap_or_default();
+        let record = self.session_record();
+        let builtins = record.as_ref().map(|r| self.session_builtin_keys(r));
+        let mut vars = record.map(|s| s.variables).unwrap_or_default();
+        for (k, v) in builtins.into_iter().flatten() {
+            vars.insert(k, v);
+        }
         self.session_scope = Some(CfmlStruct::new(vars));
     }
+
+    /// The keys Lucee puts in every session scope: `cfid`, `cftoken` (always
+    /// "0"), `sessionid` (`<app>_<cfid>_0`), `urltoken`, `timecreated` and
+    /// `lastvisit`. Rebuilt from the record each request and stripped before
+    /// the scope is saved, so `structClear( session )` removes them for the rest
+    /// of the request only, as on Lucee. Only for an existing session: adding
+    /// them to an empty scope would mint one, and creation is lazy (§12b).
+    fn session_builtin_keys(&self, rec: &SessionData) -> Vec<(String, CfmlValue)> {
+        let cfid = self.session_id.clone().unwrap_or_default();
+        let app = self.current_application_name.clone().unwrap_or_default();
+        let date = |secs: u64| {
+            let utc = chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
+            let local: chrono::DateTime<chrono::Local> = utc.into();
+            CfmlValue::string(local.format("%Y-%m-%d %H:%M:%S").to_string())
+        };
+        vec![
+            ("cfid".to_string(), CfmlValue::string(cfid.clone())),
+            ("cftoken".to_string(), CfmlValue::string("0".to_string())),
+            ("sessionid".to_string(), CfmlValue::string(format!("{}_{}_0", app, cfid))),
+            ("urltoken".to_string(), CfmlValue::string(format!("CFID={}&CFTOKEN=0", cfid))),
+            ("timecreated".to_string(), date(rec.created_secs)),
+            ("lastvisit".to_string(), date(rec.last_accessed_secs)),
+        ]
+    }
+
+    const SESSION_BUILTIN_KEYS: [&'static str; 6] =
+        ["cfid", "cftoken", "sessionid", "urltoken", "timecreated", "lastvisit"];
 
     /// Persist the live session scope back to the session store. Called at the
     /// end of the request (after user code) so scope-pointer writes that bypass
@@ -33007,10 +33327,15 @@ impl CfmlVirtualMachine {
     }
 
     fn sync_session_scope_to_store(&mut self) -> Result<(), CfmlError> {
-        let snap = match &self.session_scope {
+        let mut snap = match &self.session_scope {
             Some(ss) => ss.snapshot(),
             None => return Ok(()),
         };
+        // Lucee's built-in keys are derived, never stored (see
+        // `session_builtin_keys`).
+        snap.retain(|k, _| {
+            !Self::SESSION_BUILTIN_KEYS.iter().any(|b| k.eq_ignore_ascii_case(b))
+        });
         // Airtight data-only gate: catches values smuggled in via reference
         // mutation (`local.x = {}; session.cart = local.x; local.x.p = new C()`),
         // which no assignment-time check can see. Only for SERIALIZING stores —

@@ -28,9 +28,12 @@ The script BIFs **`threadJoin([name][, timeout])`** and **`threadTerminate(name)
 are equivalent to the `join` / `terminate` actions (e.g. `threadJoin("t", 5000)`,
 or `threadJoin()` to join all).
 
-After a thread completes and is joined, its metadata is available at `cfthread.NAME`:
-`status` (`COMPLETED` / `TERMINATED` / `RUNNING`), `name`, `output`, `error`,
-`elapsedtime` (ms), plus every key the body wrote to its `thread` scope.
+A thread's metadata is available at `cfthread.NAME`, with Lucee's keys: `status`
+(`RUNNING`, then `COMPLETED` or `TERMINATED`), `name`, `output`, `elapsedTime` (ms),
+`startTime`, `priority` (the tag's `priority`, default `NORMAL`), `interrupted`,
+`stackTrace` (always empty: Lucee's is the running thread's Java stack) and
+`childThreads`, plus every key the body wrote to its `thread` scope. `error` is
+there only when the body threw.
 
 ```cfml
 <cfthread name="t">
@@ -66,13 +69,14 @@ relying on `variables`, since `variables` is a copy.
 ## Errors
 
 An error inside a thread body does **not** abort the parent request. The thread's
-status becomes `TERMINATED` and the message is captured in `cfthread.NAME.error`:
+status becomes `TERMINATED` and `cfthread.NAME.error` holds the error, as the same
+struct a `catch` would get (`message`, `type`, `detail`, `tagContext`, …):
 
 ```cfml
 <cfthread name="risky"><cfthrow message="boom"></cfthread>
 <cfthread action="join" name="risky"/>
-<cfif cfthread.risky.status eq "TERMINATED">
-    <cfoutput>failed: #cfthread.risky.error#</cfoutput>
+<cfif structKeyExists( cfthread.risky, "error" )>
+    <cfoutput>failed: #cfthread.risky.error.message#</cfoutput>
 </cfif>
 ```
 

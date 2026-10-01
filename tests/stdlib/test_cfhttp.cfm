@@ -29,13 +29,14 @@ http url="#echoBase#/request.cfm" method="GET" result="probeResult" timeout="20"
 echoReachable = isStruct(probeResult) && (probeResult.status_code ?: 0) == 200;
 </cfscript>
 
+<!--- Not <cfabort>: inside the runner that ends the WHOLE run, silently
+      dropping every later file and the summary line on an offline machine. --->
 <cfif NOT echoReachable>
 <cfscript>
     assertTrue("cfhttp echo server unreachable — network tests skipped", true);
     suiteEnd();
 </cfscript>
-<cfabort>
-</cfif>
+<cfelse>
 
 <!--- Basic GET request (tag form, via the tag preprocessor) --->
 <cfhttp url="#echoBase#/request.cfm" method="GET" result="getResult">
@@ -205,3 +206,4 @@ assertTrue("status endpoint returns 404", statusResult.status_code == 404);
 
 suiteEnd();
 </cfscript>
+</cfif>

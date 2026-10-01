@@ -189,7 +189,7 @@ impl CfmlVirtualMachine {
                         );
                     });
                 }
-                let seed = self.build_task_seed(CfmlValue::Null, None, None);
+                let seed = self.build_task_seed(CfmlValue::Null, None, None, false);
                 let id = cluster_bus::subscribe(listener, seed, spawn, discard_own);
                 if let CfmlValue::Struct(s) = object {
                     s.insert("__cluster_sub".to_string(), CfmlValue::Int(id as i64));
