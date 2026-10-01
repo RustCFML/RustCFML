@@ -5566,7 +5566,7 @@ impl CfmlVirtualMachine {
         let cfconfig_rows = self.cfconfig_debug_rows();
         let footer = collector.render(&scopes, main.as_deref(), &cfconfig_rows);
         if !footer.is_empty() {
-            self.output_buffer.push_str(&footer);
+            debug_footer::insert_footer(&mut self.output_buffer, &footer);
         }
     }
 

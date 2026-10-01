@@ -29,7 +29,12 @@ Enable it for local development by adding a `debugging` block to your
 
 With just `enabled: true`, the footer renders for requests from `127.0.0.1` /
 `::1` (the default `showFromIPs` whitelist). Hit any `.cfm` page and scroll past
-the content — the panel is appended below it.
+the content — the panel is added at the end of the page, just before `</body>`.
+
+The panel renders inside a shadow root, so the page's own CSS can't restyle it
+and nothing it adds (styles, class names, scripts) reaches the page. It needs
+declarative shadow DOM (Chrome/Edge 111+, Safari 16.4+, Firefox 123+) or, on
+older browsers, JavaScript to attach the root.
 
 ## Activation — the four gates
 
