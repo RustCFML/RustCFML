@@ -32,9 +32,11 @@ cur.setContextClassLoader( cl );
 assertFalse( "setContextClassLoader() accepts it back", isNull( cur.getContextClassLoader() ) );
 
 // Thread.sleep() really sleeps; interrupted, it throws and clears the flag.
-t0 = getTickCount();
+// Nanosecond ticks are monotonic; millisecond ones follow the wall clock.
+t0 = getTickCount( "nano" );
 jThread.sleep( 150 );
-assertTrue( "Thread.sleep() waits", getTickCount() - t0 >= 140 );
+sleptFor = int( ( getTickCount( "nano" ) - t0 ) / 1000000 );
+assertTrue( "Thread.sleep() waits (slept " & sleptFor & "ms)", sleptFor >= 140 );
 cur.interrupt();
 sleepErr = "";
 try {
