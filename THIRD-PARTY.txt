@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 581 crate(s)
+  MIT License (MIT) — 614 crate(s)
   Apache License 2.0 (Apache-2.0) — 47 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -172,6 +172,7 @@ Dependencies
   url 2.5.8 — https://github.com/servo/rust-url
 [MIT]
   cfg-if 1.0.4 — https://github.com/rust-lang/cfg-if
+  oauth2 4.4.2 — https://github.com/ramosbugs/oauth2-rs
   openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
   openssl-sys 0.9.117 — https://github.com/rust-openssl/rust-openssl
   socket2 0.5.10 — https://github.com/rust-lang/socket2
@@ -299,6 +300,8 @@ Dependencies
 [MIT]
   serde_urlencoded 0.7.1 — https://github.com/nox/serde_urlencoded
 [MIT]
+  serde_qs 0.8.5 — https://github.com/samscott89/serde_qs
+[MIT]
   utf8parse 0.2.2 — https://github.com/alacritty/vte
 [MIT]
   hyper-rustls 0.27.9 — https://github.com/rustls/hyper-rustls
@@ -328,6 +331,8 @@ Dependencies
   cipher 0.4.4 — https://github.com/RustCrypto/traits
 [MIT]
   cipher 0.5.2 — https://github.com/RustCrypto/traits
+[MIT]
+  reqwest 0.12.28 — https://github.com/seanmonstar/reqwest
 [MIT]
   reqwest 0.13.4 — https://github.com/seanmonstar/reqwest
 [MIT]
@@ -359,6 +364,10 @@ Dependencies
   enumflags2_derive 0.7.12 — https://github.com/meithecatte/enumflags2
 [MIT]
   stable_deref_trait 1.2.1 — https://github.com/storyyeller/stable_deref_trait
+[MIT]
+  hyper-tls 0.6.0 — https://github.com/hyperium/hyper-tls
+[MIT]
+  bigdecimal 0.3.1 — https://github.com/akubera/bigdecimal-rs
 [MIT]
   bytecount 0.6.9 — https://github.com/llogiq/bytecount
 [MIT]
@@ -460,6 +469,7 @@ Dependencies
 [MIT]
   ppv-lite86 0.2.21 — https://github.com/cryptocorrosion/cryptocorrosion
 [MIT]
+  tokio-native-tls 0.3.1 — https://github.com/tokio-rs/tls
   tracing-attributes 0.1.31 — https://github.com/tokio-rs/tracing
   tracing-core 0.1.36 — https://github.com/tokio-rs/tracing
   tracing 0.1.44 — https://github.com/tokio-rs/tracing
@@ -505,6 +515,8 @@ Dependencies
   cpufeatures 0.3.0 — https://github.com/RustCrypto/utils
 [MIT]
   const-oid 0.10.2 — https://github.com/RustCrypto/formats
+[MIT]
+  num_threads 0.1.7 — https://github.com/jhpratt/num_threads
 [MIT]
   html5gum 0.8.4 — https://github.com/untitaker/html5gum
 [MIT]
@@ -580,6 +592,7 @@ Dependencies
   num-conv 0.2.2 — https://github.com/jhpratt/num-conv
 [MIT]
   time-core 0.1.9 — https://github.com/time-rs/time
+  time-macros 0.2.31 — https://github.com/time-rs/time
   time 0.3.53 — https://github.com/time-rs/time
 [MIT]
   hayro-ccitt 0.3.0 — https://github.com/LaurenzV/hayro
@@ -606,11 +619,15 @@ Dependencies
 [MIT]
   rand_distr 0.6.0 — https://github.com/rust-random/rand_distr
 [MIT]
+  getrandom 0.1.16 — https://github.com/rust-random/getrandom
   rand 0.10.1 — https://github.com/rust-random/rand
+  rand 0.7.3 — https://github.com/rust-random/rand
   rand 0.8.6 — https://github.com/rust-random/rand
   rand 0.9.4 — https://github.com/rust-random/rand
+  rand_chacha 0.2.2 — https://github.com/rust-random/rand
   rand_chacha 0.3.1 — https://github.com/rust-random/rand
   rand_chacha 0.9.0 — https://github.com/rust-random/rand
+  rand_core 0.5.1 — https://github.com/rust-random/rand
   rand_core 0.6.4 — https://github.com/rust-random/rand
   rand_core 0.9.5 — https://github.com/rust-random/rand
 [MIT]
@@ -664,6 +681,8 @@ Dependencies
 [MIT]
   enum_dispatch 0.3.13 — https://gitlab.com/antonok/enum_dispatch
 [MIT]
+  infer 0.2.3 — https://github.com/bojand/infer
+[MIT]
   saturating 0.1.0 — https://github.com/breeswish/saturating-rs
 [MIT]
   bytemuck 1.25.0 — https://github.com/Lokathor/bytemuck
@@ -708,6 +727,8 @@ Dependencies
 [MIT]
   aligned-vec 0.6.4 — https://github.com/sarah-ek/aligned-vec/
 [MIT]
+  tz-rs 0.6.14 — https://github.com/x-hgg-x/tz-rs
+[MIT]
   safe_arch 1.0.0 — https://github.com/Lokathor/safe_arch
 [MIT]
   manyhow 0.11.4 — https://github.com/ModProg/manyhow
@@ -727,6 +748,8 @@ Dependencies
   agnostic-net 0.3.1 — https://github.com/al8n/agnostic
   agnostic 0.9.0 — https://github.com/al8n/agnostic
   automerge 0.9.0 — https://github.com/automerge/automerge
+  azure_core 0.21.0 — https://github.com/azure/azure-sdk-for-rust
+  azure_identity 0.21.0 — https://github.com/azure/azure-sdk-for-rust
   base64-simd 0.8.0 — https://github.com/Nugine/simd
   brotli-decompressor 5.0.3 — https://github.com/dropbox/rust-brotli-decompressor
   chrono-tz 0.10.4 — https://github.com/chronotope/chrono-tz
@@ -807,20 +830,32 @@ Dependencies
 [MIT]
   adler2 2.0.1 — https://github.com/oyvindln/adler2
   anyhow 1.0.103 — https://github.com/dtolnay/anyhow
+  async-channel 1.9.0 — https://github.com/smol-rs/async-channel
   async-channel 2.5.0 — https://github.com/smol-rs/async-channel
+  async-io 2.6.0 — https://github.com/smol-rs/async-io
   async-lock 3.4.2 — https://github.com/smol-rs/async-lock
   async-native-tls 0.4.0 — https://github.com/async-email/async-native-tls
+  async-process 2.5.0 — https://github.com/smol-rs/async-process
+  async-signal 0.2.14 — https://github.com/smol-rs/async-signal
+  async-task 4.7.1 — https://github.com/smol-rs/async-task
   async-trait 0.1.89 — https://github.com/dtolnay/async-trait
   atomic-waker 1.1.2 — https://github.com/smol-rs/atomic-waker
   auto_enums 0.8.9 — https://github.com/taiki-e/auto_enums
+  blocking 1.6.2 — https://github.com/smol-rs/blocking
   concurrent-queue 2.5.0 — https://github.com/smol-rs/concurrent-queue
+  const_fn 0.4.12 — https://github.com/taiki-e/const_fn
   derive_utils 0.15.1 — https://github.com/taiki-e/derive_utils
   displaydoc 0.2.6 — https://github.com/yaahc/displaydoc
   dtoa 1.0.11 — https://github.com/dtolnay/dtoa
+  dyn-clone 1.0.20 — https://github.com/dtolnay/dyn-clone
   event-listener-strategy 0.5.4 — https://github.com/smol-rs/event-listener-strategy
+  event-listener 2.5.3 — https://github.com/smol-rs/event-listener
   event-listener 5.4.1 — https://github.com/smol-rs/event-listener
   fast-float2 0.2.3 — https://github.com/Alexhuszagh/fast-float-rust
+  fastrand 1.9.0 — https://github.com/smol-rs/fastrand
   fastrand 2.4.1 — https://github.com/smol-rs/fastrand
+  futures-lite 1.13.0 — https://github.com/smol-rs/futures-lite
+  futures-lite 2.6.1 — https://github.com/smol-rs/futures-lite
   group 0.13.0 — https://github.com/zkcrypto/group
   io-enum 1.2.1 — https://github.com/taiki-e/io-enum
   itoa 1.0.18 — https://github.com/dtolnay/itoa
@@ -832,6 +867,8 @@ Dependencies
   pin-project-internal 1.1.13 — https://github.com/taiki-e/pin-project
   pin-project-lite 0.2.17 — https://github.com/taiki-e/pin-project-lite
   pin-project 1.1.13 — https://github.com/taiki-e/pin-project
+  piper 0.2.5 — https://github.com/smol-rs/piper
+  polling 3.11.0 — https://github.com/smol-rs/polling
   portable-atomic 1.13.1 — https://github.com/taiki-e/portable-atomic
   prettyplease 0.1.25 — https://github.com/dtolnay/prettyplease
   proc-macro-crate 3.5.0 — https://github.com/bkchr/proc-macro-crate
@@ -862,6 +899,7 @@ Dependencies
   unicode-ident 1.0.24 — https://github.com/dtolnay/unicode-ident
   unsafe-libyaml 0.2.11 — https://github.com/dtolnay/unsafe-libyaml
   utf-8 0.7.6 — https://github.com/SimonSapin/rust-utf8
+  waker-fn 1.2.0 — https://github.com/smol-rs/waker-fn
   zmij 1.0.21 — https://github.com/dtolnay/zmij
 [MIT]
   allocator-api2 0.2.21 — https://github.com/zakarumych/allocator-api2
@@ -903,6 +941,7 @@ Dependencies
   phf_shared 0.13.1 — https://github.com/rust-phf/rust-phf
   phf_shared 0.14.0 — https://github.com/rust-phf/rust-phf
 [MIT]
+  base64 0.13.1 — https://github.com/marshallpierce/rust-base64
   base64 0.22.1 — https://github.com/marshallpierce/rust-base64
 [MIT]
   aho-corasick 1.1.4 — https://github.com/BurntSushi/aho-corasick
@@ -969,6 +1008,8 @@ Dependencies
   crossbeam-queue 0.3.12 — https://github.com/crossbeam-rs/crossbeam
   crossbeam-skiplist 0.1.3 — https://github.com/crossbeam-rs/crossbeam
   crossbeam-utils 0.8.21 — https://github.com/crossbeam-rs/crossbeam
+[MIT]
+  http-types 2.12.0 — https://github.com/http-rs/http-types
 [MIT]
   bcrypt 0.15.1 — https://github.com/Keats/rust-bcrypt
 [MIT]
@@ -4443,6 +4484,7 @@ MIT License (MIT)
 
 Applies to:
   - cfg-if 1.0.4
+  - oauth2 4.4.2
   - openssl-probe 0.2.1
   - openssl-sys 0.9.117
   - socket2 0.5.10
@@ -5557,6 +5599,41 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - serde_qs 0.8.5
+================================================================================
+
+Copyright (c) 2016 Anthony Ramine
+Copyright (c) 2017 Sam Scott
+Copyright (c) 2017 Google Inc.
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - utf8parse 0.2.2
 ================================================================================
 
@@ -5965,6 +6042,33 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - reqwest 0.12.28
+================================================================================
+
+Copyright (c) 2016-2025 Sean McArthur
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - reqwest 0.13.4
 ================================================================================
 
@@ -6327,6 +6431,66 @@ Applies to:
 ================================================================================
 
 Copyright (c) 2017 Robert Grosse
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - hyper-tls 0.6.0
+================================================================================
+
+Copyright (c) 2017 Sean McArthur
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - bigdecimal 0.3.1
+================================================================================
+
+Copyright (c) 2017 The BigDecimal-rs Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -7723,6 +7887,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - tokio-native-tls 0.3.1
   - tracing-attributes 0.1.31
   - tracing-core 0.1.36
   - tracing 0.1.44
@@ -8311,6 +8476,33 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - num_threads 0.1.7
+================================================================================
+
+Copyright (c) 2021 Jacob Pratt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
@@ -9144,6 +9336,7 @@ MIT License (MIT)
 
 Applies to:
   - time-core 0.1.9
+  - time-macros 0.2.31
   - time 0.3.53
 ================================================================================
 
@@ -9389,11 +9582,15 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - getrandom 0.1.16
   - rand 0.10.1
+  - rand 0.7.3
   - rand 0.8.6
   - rand 0.9.4
+  - rand_chacha 0.2.2
   - rand_chacha 0.3.1
   - rand_chacha 0.9.0
+  - rand_core 0.5.1
   - rand_core 0.6.4
   - rand_core 0.9.5
 ================================================================================
@@ -9997,6 +10194,35 @@ Applies to:
 MIT License
 
 Copyright (c) 2019 Anton Lazarev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - infer 0.2.3
+================================================================================
+
+MIT License
+
+Copyright (c) 2019 Bojan
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -10632,6 +10858,35 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - tz-rs 0.6.14
+================================================================================
+
+MIT License
+
+Copyright (c) 2022 x-hgg-x
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - safe_arch 1.0.0
 ================================================================================
 
@@ -10801,6 +11056,8 @@ Applies to:
   - agnostic-net 0.3.1
   - agnostic 0.9.0
   - automerge 0.9.0
+  - azure_core 0.21.0
+  - azure_identity 0.21.0
   - base64-simd 0.8.0
   - brotli-decompressor 5.0.3
   - chrono-tz 0.10.4
@@ -11267,20 +11524,32 @@ MIT License (MIT)
 Applies to:
   - adler2 2.0.1
   - anyhow 1.0.103
+  - async-channel 1.9.0
   - async-channel 2.5.0
+  - async-io 2.6.0
   - async-lock 3.4.2
   - async-native-tls 0.4.0
+  - async-process 2.5.0
+  - async-signal 0.2.14
+  - async-task 4.7.1
   - async-trait 0.1.89
   - atomic-waker 1.1.2
   - auto_enums 0.8.9
+  - blocking 1.6.2
   - concurrent-queue 2.5.0
+  - const_fn 0.4.12
   - derive_utils 0.15.1
   - displaydoc 0.2.6
   - dtoa 1.0.11
+  - dyn-clone 1.0.20
   - event-listener-strategy 0.5.4
+  - event-listener 2.5.3
   - event-listener 5.4.1
   - fast-float2 0.2.3
+  - fastrand 1.9.0
   - fastrand 2.4.1
+  - futures-lite 1.13.0
+  - futures-lite 2.6.1
   - group 0.13.0
   - io-enum 1.2.1
   - itoa 1.0.18
@@ -11292,6 +11561,8 @@ Applies to:
   - pin-project-internal 1.1.13
   - pin-project-lite 0.2.17
   - pin-project 1.1.13
+  - piper 0.2.5
+  - polling 3.11.0
   - portable-atomic 1.13.1
   - prettyplease 0.1.25
   - proc-macro-crate 3.5.0
@@ -11322,6 +11593,7 @@ Applies to:
   - unicode-ident 1.0.24
   - unsafe-libyaml 0.2.11
   - utf-8 0.7.6
+  - waker-fn 1.2.0
   - zmij 1.0.21
 ================================================================================
 
@@ -11701,6 +11973,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - base64 0.13.1
   - base64 0.22.1
 ================================================================================
 
@@ -12420,6 +12693,38 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - http-types 2.12.0
+================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2019 Yoshua Wuyts
+Copyright (c) 2017 http-rs authors
+Copyright (c) 2020 Jacob Brown
+Copyright (c) 2016-2018 Michael Tilli (Pyfisch) & `httpdate` contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
