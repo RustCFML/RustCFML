@@ -3772,8 +3772,14 @@ pub struct ThreadSeed {
     pub server_state: Option<ServerState>,
     /// Shared live with the parent (handle clone) — see VM `application_scope`.
     pub application_scope: Option<CfmlStruct>,
-    /// Shared live with the parent (CFML request scope is shared across threads).
+    /// Shared live with the parent (CFML request scope is shared across threads)
+    /// — unless `own_request_scope` is set.
     pub request_scope: CfmlStruct,
+    /// Give every run of this seed a FRESH, empty `request` scope instead of the
+    /// parent's (set for java.util.concurrent executor tasks). A periodic
+    /// schedule clones one seed per tick, so the fresh scope is made in
+    /// `apply_thread_seed`, once per run.
+    pub own_request_scope: bool,
     /// Shared live with the parent (handle clone) — see VM `session_scope`.
     pub session_scope: Option<CfmlStruct>,
     pub session_id: Option<String>,
@@ -5761,6 +5767,7 @@ impl CfmlVirtualMachine {
             server_state: self.server_state.clone(),
             application_scope: self.application_scope.clone(),
             request_scope: self.request_scope.clone(),
+            own_request_scope: false,
             session_scope: self.session_scope.clone(),
             session_id: self.session_id.clone(),
             current_application_name: self.current_application_name.clone(),
@@ -5811,7 +5818,11 @@ impl CfmlVirtualMachine {
             self.cache = ss.object_cache.clone();
         }
         self.application_scope = seed.application_scope;
-        self.request_scope = seed.request_scope;
+        self.request_scope = if seed.own_request_scope {
+            CfmlStruct::new(ValueMap::default())
+        } else {
+            seed.request_scope
+        };
         self.session_scope = seed.session_scope;
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
@@ -26186,13 +26197,28 @@ impl CfmlVirtualMachine {
     /// the task will see. cgi lives in `globals`, which the seed snapshots, so the
     /// override is a targeted edit of that snapshot — it never touches the parent
     /// request's own cgi scope.
+    ///
+    /// `own_request_scope`: a java.util.concurrent executor task is not part of
+    /// the request that submitted it. On Lucee each run gets its own page
+    /// context, so its `request` scope starts empty and is gone when the run
+    /// ends; sharing the submitter's let concurrent runs overwrite each other's
+    /// values and leave them behind in it. (Preside keeps its ColdBox request
+    /// context there, so a heartbeat read the id of an ad hoc task that had
+    /// already finished, took it as cancelled, and stopped working.)
     fn build_task_seed(
         &self,
         body: CfmlValue,
         hostname: Option<String>,
         thread_name: Option<String>,
+        own_request_scope: bool,
     ) -> ThreadSeed {
         let mut seed = self.build_thread_seed(body, None);
+        if own_request_scope {
+            seed.own_request_scope = true;
+            // Don't keep the submitting request's scope alive for the life of
+            // a schedule either.
+            seed.request_scope = CfmlStruct::new(ValueMap::default());
+        }
         if let Some(h) = hostname {
             let mut cgi = match seed.variables_snapshot.get("cgi") {
                 Some(CfmlValue::Struct(s)) => s.snapshot(),
@@ -26273,6 +26299,7 @@ impl CfmlVirtualMachine {
     fn spawn_task(&mut self, arg: CfmlValue, thread_name: Option<String>) -> CfmlResult {
         let hostname = java_shims::proxy_hostname(&arg);
         let body = Self::to_async_body(arg);
+        let own_request_scope = true;
         #[cfg(feature = "real-threads")]
         let spawn = self.thread_spawn_fn;
         #[cfg(not(feature = "real-threads"))]
@@ -26280,14 +26307,20 @@ impl CfmlVirtualMachine {
 
         #[cfg(feature = "real-threads")]
         if let Some(spawn_fn) = spawn {
-            let seed = self.build_task_seed(body, hostname, thread_name);
+            let seed = self.build_task_seed(body, hostname, thread_name, own_request_scope);
             let handle = spawn_fn(seed);
             let fut = async_kernel::FutureNative::from_handle_strict(handle);
             return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
         }
 
-        let _ = spawn;
+        let _ = (spawn, hostname, thread_name, own_request_scope);
+        // Inline (no real threads): still run under a request scope of its own.
+        let parent_request = std::mem::replace(
+            &mut self.request_scope,
+            CfmlStruct::new(ValueMap::default()),
+        );
         let r = self.run_thread_body(&body, None, &ValueMap::default());
+        self.request_scope = parent_request;
         let fut = async_kernel::FutureNative::resolved_strict(r);
         Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))))
     }
@@ -26331,6 +26364,7 @@ impl CfmlVirtualMachine {
             hostname,
             thread_name,
             None,
+            false,
         )
     }
 
@@ -26345,6 +26379,7 @@ impl CfmlVirtualMachine {
         hostname: Option<String>,
         thread_name: Option<String>,
         pool: Option<CfmlValue>,
+        own_request_scope: bool,
     ) -> CfmlResult {
         // DIAGNOSTIC kill-switch: RUSTCFML_NO_PERIODIC=1 makes every periodic
         // schedule a one-shot, so a memory question can be A/B'd against "are
@@ -26378,7 +26413,7 @@ impl CfmlVirtualMachine {
 
                 #[cfg(feature = "real-threads")]
                 if let Some(spawn_fn) = spawn {
-                    let seed = self.build_task_seed(body, hostname, thread_name);
+                    let seed = self.build_task_seed(body, hostname, thread_name, own_request_scope);
                     let outer_cancel = seed.cancel_flag.clone();
                     // Let the owning executor stop this schedule on shutdown();
                     // otherwise the relay outlives it and keeps a whole
@@ -26577,7 +26612,13 @@ impl CfmlVirtualMachine {
                 // be honoured here (documented in docs/known-issues.md).
                 let _ = spawn;
                 let _ = (delay_ms, period);
+                let parent_request = own_request_scope.then(|| {
+                    std::mem::replace(&mut self.request_scope, CfmlStruct::new(ValueMap::default()))
+                });
                 let r = self.run_thread_body(&body, None, parent_locals);
+                if let Some(p) = parent_request {
+                    self.request_scope = p;
+                }
                 let fut = async_kernel::FutureNative::resolved(r);
                 return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
     }
@@ -26672,7 +26713,7 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let hostname = java_shims::proxy_hostname(&arg);
         let body = Self::to_async_body(arg);
-        let seed = self.build_task_seed(body, hostname, thread_name);
+        let seed = self.build_task_seed(body, hostname, thread_name, true);
         match Self::with_pool(pool, |p| p.submit(seed)) {
             Some(Ok(handle)) => {
                 let fut = async_kernel::FutureNative::from_handle_strict(handle);
@@ -26944,6 +26985,7 @@ impl CfmlVirtualMachine {
                     hostname,
                     name,
                     pool,
+                    true,
                 )
             }
             // invokeAll( tasks [, timeout, unit] ) — JVM contract: BLOCK until

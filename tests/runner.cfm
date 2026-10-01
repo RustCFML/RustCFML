@@ -741,6 +741,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_s3storageprovider_shim.cfm">
 <cf_runtest file="java_shims/test_java_util_concurrent_pool.cfm">
 <cf_runtest file="java_shims/test_java_thread.cfm">
+<cf_runtest file="java_shims/test_java_executor_request_scope.cfm">
 <cf_runtest file="java_shims/test_java_regex_quote_and_replacement.cfm">
 <cf_runtest file="java_shims/test_java_date_shim_date_bifs.cfm">
 <cf_runtest file="java_shims/test_java_util_base64.cfm">
