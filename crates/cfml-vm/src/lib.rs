@@ -40361,8 +40361,9 @@ impl CfmlVirtualMachine {
             && self.current_application_name.as_deref() != Some(app_name.as_str())
         {
             if let Some(server_state) = self.server_state.clone() {
-                if !server_state.applications.contains(&app_name) {
-                    server_state.applications.insert(
+                {
+                    // Atomic get-or-create: see `ApplicationStore::get_or_insert`.
+                    server_state.applications.get_or_insert(
                         &app_name,
                         ApplicationState {
                             name: app_name.clone(),
@@ -41802,9 +41803,12 @@ impl CfmlVirtualMachine {
 
         // 4. Wire up application scope
         if let Some(ref server_state) = self.server_state.clone() {
-            if !server_state.applications.contains(&app_name) {
-                // New application
-                let app_state = ApplicationState {
+            // Get or create the application in one step. Checking `contains` and
+            // then inserting let concurrent cold requests each create it, and
+            // the last insert orphaned the scope the others were writing to.
+            let app_snapshot = server_state.applications.get_or_insert(
+                &app_name,
+                ApplicationState {
                     name: app_name.clone(),
                     variables: CfmlStruct::empty(),
                     started: false,
@@ -41813,10 +41817,8 @@ impl CfmlVirtualMachine {
                     app_fn_prune_at: 0,
                     session_storage: app_session_storage.clone(),
                     app_caches: app_caches.clone(),
-                };
-                server_state.applications.insert(&app_name, app_state);
-            }
-            let app_snapshot = server_state.applications.get(&app_name).unwrap();
+                },
+            );
             self.current_application_name = Some(app_name.clone());
             // HANDLE clone (an Arc bump), NOT a copy: this request now shares the
             // one live application scope with every other in-flight request, so an
