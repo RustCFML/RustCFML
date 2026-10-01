@@ -1335,6 +1335,38 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
 }
 
 pub const THREAD_STATE_CLASS: &str = "java.lang.thread$state";
+pub const STACK_TRACE_ELEMENT_CLASS: &str = "java.lang.stacktraceelement";
+
+/// A `java.lang.StackTraceElement` (from `Thread.getStackTrace()`). Its string
+/// form is Java's `class.method(file:line)`.
+pub fn make_stack_trace_element(class: &str, method: &str, file: &str, line: i64) -> CfmlValue {
+    let mut m = java_shim_map(STACK_TRACE_ELEMENT_CLASS);
+    m.insert("__ste_class".to_string(), CfmlValue::string(class.to_string()));
+    m.insert("__ste_method".to_string(), CfmlValue::string(method.to_string()));
+    m.insert("__ste_file".to_string(), CfmlValue::string(file.to_string()));
+    m.insert("__ste_line".to_string(), CfmlValue::Int(line));
+    m.insert(
+        "__value".to_string(),
+        CfmlValue::string(format!("{}.{}({}:{})", class, method, file, line)),
+    );
+    CfmlValue::strukt(m)
+}
+
+pub fn handle_java_stack_trace_element(method: &str, object: &CfmlValue) -> CfmlResult {
+    let get = |k: &str| match object {
+        CfmlValue::Struct(s) => s.get(k).unwrap_or(CfmlValue::Null),
+        _ => CfmlValue::Null,
+    };
+    match method {
+        "getclassname" => Ok(get("__ste_class")),
+        "getmethodname" => Ok(get("__ste_method")),
+        "getfilename" => Ok(get("__ste_file")),
+        "getlinenumber" => Ok(get("__ste_line")),
+        "tostring" => Ok(get("__value")),
+        "isnativemethod" => Ok(CfmlValue::Bool(false)),
+        _ => Err(CfmlError::shim_unhandled(method)),
+    }
+}
 const THREAD_STATES: [&str; 6] =
     ["NEW", "RUNNABLE", "BLOCKED", "WAITING", "TIMED_WAITING", "TERMINATED"];
 
@@ -1444,7 +1476,6 @@ pub fn handle_java_thread(method: &str, args: Vec<CfmlValue>, object: &CfmlValue
         }
         "getpriority" => Ok(CfmlValue::Int(5)),
         "isdaemon" => Ok(CfmlValue::Bool(false)),
-        "sleep" => Ok(CfmlValue::Null),
         _ => Err(CfmlError::shim_unhandled(method)),
     }
 }

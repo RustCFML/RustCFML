@@ -26340,6 +26340,64 @@ impl CfmlVirtualMachine {
                 }
                 Ok(CfmlValue::Null)
             }
+            // Static Thread.sleep( ms ): the CURRENT thread. Interrupted
+            // before or during the sleep, it throws InterruptedException and
+            // clears the flag, as Java does.
+            "sleep" => {
+                let interrupted = |vm: &mut Self| -> CfmlResult {
+                    vm.thread_interrupted = false;
+                    Err(CfmlError::new(
+                        "sleep interrupted".to_string(),
+                        CfmlErrorType::Custom("java.lang.InterruptedException".to_string()),
+                    ))
+                };
+                if self.thread_interrupted || cancelled() {
+                    return interrupted(self);
+                }
+                let ms = args
+                    .first()
+                    .map(|v| v.as_string().trim().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                if ms < 0.0 {
+                    return Err(CfmlError::new(
+                        "timeout value is negative".to_string(),
+                        CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
+                    ));
+                }
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(ms as u64);
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(CfmlValue::Null);
+                    }
+                    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+                    if cancelled() {
+                        return interrupted(self);
+                    }
+                }
+            }
+            // The running thread's stack is the CFML call stack, innermost
+            // first, under the getStackTrace frame Java puts on top. A
+            // ThreadFactory thread was never started: Java gives an empty array.
+            "getstacktrace" if current => {
+                let mut frames = vec![java_shims::make_stack_trace_element(
+                    "java.lang.Thread",
+                    "getStackTrace",
+                    "Thread.java",
+                    0,
+                )];
+                for f in self.build_stack_trace() {
+                    frames.push(java_shims::make_stack_trace_element(
+                        &f.template,
+                        if f.function.is_empty() || f.function == "__main__" { "call" } else { &f.function },
+                        &f.template,
+                        f.line as i64,
+                    ));
+                }
+                Ok(CfmlValue::array(frames))
+            }
+            "getstacktrace" => Ok(CfmlValue::array(vec![])),
             "getcontextclassloader" => Ok(self
                 .thread_context_class_loader
                 .clone()
@@ -28022,9 +28080,14 @@ impl CfmlVirtualMachine {
                             | "interrupted"
                             | "getcontextclassloader"
                             | "setcontextclassloader"
+                            | "sleep"
+                            | "getstacktrace"
                     ) =>
                     {
                         self.dispatch_thread_interrupt(&m, all_args, object)
+                    }
+                    java_shims::STACK_TRACE_ELEMENT_CLASS => {
+                        java_shims::handle_java_stack_trace_element(&m, object)
                     }
                     "java.lang.thread"
                     | "java.lang.threadgroup"
@@ -30402,7 +30465,12 @@ impl CfmlVirtualMachine {
         // "Component [x] has no function with name [y]". (Non-component receivers
         // keep the lenient Null return; tightening those is a separate concern.)
         if let CfmlValue::Struct(ref s) = object {
-            if s.contains_key(&*cfml_common::key::well_known::VARIABLES) || s.contains_key("__name") {
+            // A java shim is not a component, even one with a `__name` (the
+            // Thread shim keeps the thread's name there): it falls through to
+            // the shim rule below, which names the Java class and method.
+            if (s.contains_key(&*cfml_common::key::well_known::VARIABLES) || s.contains_key("__name"))
+                && !s.contains_key("__java_shim")
+            {
                 // Lucee parity: every component inherits java.lang.Object, so
                 // hashCode()/equals()/identityHashCode() resolve even when the CFC
                 // declares no such method. ColdBox's async BaseProxy calls
@@ -30667,6 +30735,31 @@ impl CfmlVirtualMachine {
                         CfmlErrorType::Expression,
                     );
                     err.stack_trace = self.build_stack_trace();
+                    // Framework code routinely wraps background work in
+                    // `catch (any)`, so a missing shim method can fail quietly
+                    // for ever (Preside's heartbeats did, on isInterrupted()).
+                    // Say so on stderr the first time each one is called,
+                    // whether or not the CFML catches it.
+                    static WARNED: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::HashSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let id = format!("{}.{}", cls, method.to_lowercase());
+                    let first = WARNED
+                        .get_or_init(Default::default)
+                        .lock()
+                        .map(|mut w| w.insert(id))
+                        .unwrap_or(false);
+                    if first {
+                        let at = err
+                            .stack_trace
+                            .first()
+                            .map(|f| format!(" at {}:{}", f.template, f.line))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[java-shim] {}.{}() is not supported{} (logged once per method)",
+                            cls, method, at
+                        );
+                    }
                     return Err(err);
                 }
             }

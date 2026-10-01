@@ -31,6 +31,42 @@ assertFalse( "getContextClassLoader() returns an object", isNull( cl ) );
 cur.setContextClassLoader( cl );
 assertFalse( "setContextClassLoader() accepts it back", isNull( cur.getContextClassLoader() ) );
 
+// Thread.sleep() really sleeps; interrupted, it throws and clears the flag.
+t0 = getTickCount();
+jThread.sleep( 150 );
+assertTrue( "Thread.sleep() waits", getTickCount() - t0 >= 140 );
+cur.interrupt();
+sleepErr = "";
+try {
+	jThread.sleep( 2000 );
+} catch ( any e ) {
+	sleepErr = e.type & "|" & e.message;
+}
+assert( "an interrupted sleep throws InterruptedException", sleepErr, "java.lang.InterruptedException|sleep interrupted" );
+assertFalse( "the interrupted sleep cleared the flag", cur.isInterrupted() );
+
+// getStackTrace(): Java puts its own frame on top; the CFML frames follow.
+function stackOfInner() {
+	return createObject( "java", "java.lang.Thread" ).currentThread().getStackTrace();
+}
+st = stackOfInner();
+assertTrue( "getStackTrace() returns frames", arrayLen( st ) > 1 );
+assert( "the top frame is getStackTrace", st[ 1 ].getMethodName(), "getStackTrace" );
+inThisFile = 0;
+for ( el in st ) {
+	if ( ( el.getFileName() ?: "" ) contains "test_java_thread.cfm" && el.getLineNumber() > 0 ) { inThisFile++; }
+}
+assertTrue( "the CFML frames name this template and a line", inThisFile >= 1 );
+
+// A method the shim does not have throws, naming the Java method.
+missErr = "";
+try {
+	cur.noSuchThreadMethod();
+} catch ( any e ) {
+	missErr = e.message;
+}
+assertTrue( "an unsupported Thread method throws naming it", missErr contains "noSuchThreadMethod" );
+
 // Each task starts with a clear flag, and a task's interrupt never reaches the
 // request that submitted it (ThreadPoolExecutor clears it between tasks).
 pool  = createObject( "java", "java.util.concurrent.Executors" ).newFixedThreadPool( 1 );
