@@ -2373,6 +2373,26 @@ fn url_encode_impl(s: &str, encoding: UrlEncoding) -> String {
     result
 }
 
+/// One `name=value` pair of a cfhttpparam `type="url"` or `type="formfield"`
+/// (urlencoded body), encoded the way Lucee sends them: name and value
+/// form-encoded (Java's URLEncoder: space as `+`), unless the param says
+/// `encoded="false"`. Raw, a value containing `&`, `=`, `+` or `%` split into
+/// extra fields or decoded to something else on the receiving end.
+fn cfhttp_encoded_pair(param: &cfml_common::dynamic::CfmlStruct, name: &str, value: &str) -> String {
+    let encode = param
+        .data_get("encoded")
+        .map(|v| match v {
+            CfmlValue::Bool(b) => b,
+            other => !matches!(other.as_string().trim().to_lowercase().as_str(), "false" | "no" | "0"),
+        })
+        .unwrap_or(true);
+    if encode {
+        format!("{}={}", url_encode_impl(name, UrlEncoding::Form), url_encode_impl(value, UrlEncoding::Form))
+    } else {
+        format!("{}={}", name, value)
+    }
+}
+
 /// `urlEncodedFormat` — alphanumerics only, space as `%20`.
 fn fn_url_encoded_format(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(url_encode_impl(&get_str(&args, 0), UrlEncoding::Strict)))
@@ -10187,7 +10207,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                             "cookie" => { hdrs.entry("Cookie".to_string()).and_modify(|v| { v.push_str(&format!("; {}={}", pname, pvalue)); }).or_insert(format!("{}={}", pname, pvalue)); }
                             "url" => {
                                 let sep = if url.contains('?') { "&" } else { "?" };
-                                url = format!("{}{}{}={}", url, sep, pname, pvalue);
+                                url = format!("{}{}{}", url, sep, cfhttp_encoded_pair(&p, &pname, &pvalue));
                             }
                             _ => {} // formfield, body, xml, file handled below
                         }
@@ -10307,7 +10327,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                 let pname = p.data_get("name").map(|v| v.as_string()).unwrap_or_default();
                                 let pvalue = p.data_get("value").map(|v| v.as_string()).unwrap_or_default();
                                 match ptype.as_str() {
-                                    "formfield" => form_parts.push(format!("{}={}", pname, pvalue)),
+                                    "formfield" => form_parts.push(cfhttp_encoded_pair(&p, &pname, &pvalue)),
                                     "body" => xml_body = Some(pvalue),
                                     "xml" => xml_body = Some(pvalue),
                                     _ => {}

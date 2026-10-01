@@ -656,6 +656,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfdirectory_attrcoll_name.cfm">
 <cf_runtest file="tags/test_cffile_script_form.cfm">
 <cf_runtest file="tags/test_cfhttpparam_runtime_body.cfm">
+<cf_runtest file="tags/test_http_script_body_runtime.cfm">
 <cf_runtest file="tags/test_cfmail_runtime_body.cfm">
 <cf_runtest file="tags/test_cfmailpart_script_form.cfm">
 <!--- cfhtmlhead exists as a tag (v0.186) but must ALSO be script-callable (cfhtmlhead(text=)); RustCFML threw "undefined". --->

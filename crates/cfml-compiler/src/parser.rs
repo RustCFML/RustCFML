@@ -738,6 +738,7 @@ impl Parser {
             && self.is_identifier_like_at(1)
             && matches!(self.peek(2), Token::Equal)
         {
+            let http_start = self.current;
             self.advance(); // consume 'http'
 
             // Parse attributes: key=value pairs
@@ -753,181 +754,112 @@ impl Parser {
                 }
             }
 
-            // Parse httpparam statements if block body present.
-            // KNOWN LIMITATION (issue #55): only literal `httpparam` statements are
-            // collected here — control flow in the body (e.g. `for (x in coll) {
-            // cfhttpparam(...); }`) is not supported and needs runtime param
-            // collection, like cfquery got in 28af97d.
-            let mut params: Vec<Expression> = Vec::new();
-            if self.check(&Token::LBrace) {
-                self.advance(); // consume {
-                // Track nested-block depth so the body does NOT terminate at a
-                // nested `}` — e.g. `http … { if (…) { httpparam …; } }` (Preside
-                // elasticsearch ElasticSearchApiWrapper). httpparam statements are
-                // still collected flat regardless of nesting (issue #55 limitation:
-                // control flow around them isn't honoured), but the block bounds
-                // must be matched correctly or the parser desyncs past the tag.
-                let mut depth = 0i32;
-                loop {
-                    if self.is_at_end() {
-                        break;
-                    }
-                    if self.check(&Token::RBrace) {
-                        if depth == 0 {
-                            break; // closes the http body
-                        }
-                        depth -= 1;
-                        self.advance();
-                        continue;
-                    }
-                    if self.check(&Token::LBrace) {
-                        depth += 1;
-                        self.advance();
-                        continue;
-                    }
-                    // Expect httpparam statements (at any depth)
-                    if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "httpparam") {
-                        self.advance(); // consume 'httpparam'
-                        let mut param_pairs: Vec<(Expression, Expression)> = Vec::new();
-                        while !self.check(&Token::Semicolon) && !self.check(&Token::RBrace) && !self.is_at_end() {
-                            if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
-                                let pname = self.extract_identifier()?;
-                                self.advance(); // consume =
-                                let pvalue = self.parse_expression()?;
-                                param_pairs.push((
-                                    Expression::Literal(Literal {
-                                        value: LiteralValue::String(pname.to_lowercase()),
-                                        location: stmt_loc.clone(),
-                                    }),
-                                    pvalue,
-                                ));
-                            } else {
-                                break;
+            // A body block goes to the generic body-tag path further down
+            // (`lower_script_body_tag("cfhttp", …)`), which parses it as ordinary
+            // statements and collects each `httpparam` at RUNTIME. Scanning the
+            // body here kept only the httpparam statements and skipped every other
+            // token, so a `var`, loop or `if` around them never ran and a param
+            // built from a loop variable threw "variable [KEY] doesn't exist"
+            // (issue #55). Only the bodiless `http url=…;` form is handled here.
+            if !self.check(&Token::LBrace) {
+                self.match_token(&Token::Semicolon);
+
+                // Build the struct argument for cfhttp({ url: ..., method: ... })
+                let mut struct_pairs: Vec<(Expression, Expression)> = Vec::new();
+
+                // Extract result var (default "cfhttp") and add remaining attrs
+                let mut result_var = "cfhttp".to_string();
+                for (name, value) in &attrs {
+                    if name == "result" {
+                        // Extract the string value for the result variable name
+                        if let Expression::Literal(ref lit) = value {
+                            if let LiteralValue::String(ref s) = lit.value {
+                                result_var = s.clone();
                             }
+                        } else if let Expression::Identifier(ref id) = value {
+                            result_var = id.name.clone();
                         }
-                        self.match_token(&Token::Semicolon);
-                        params.push(Expression::Struct(Struct {
-                            pairs: param_pairs,
-                            ordered: false,
-                            location: stmt_loc.clone(),
-                        }));
                     } else {
-                        // Skip unknown tokens inside http block
-                        self.advance();
+                        struct_pairs.push((
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(name.clone()),
+                                location: stmt_loc.clone(),
+                            }),
+                            value.clone(),
+                        ));
                     }
                 }
-                self.consume(&Token::RBrace)?; // consume }
-            } else {
-                self.match_token(&Token::Semicolon);
-            }
 
-            // Build the struct argument for cfhttp({ url: ..., method: ..., params: [...] })
-            let mut struct_pairs: Vec<(Expression, Expression)> = Vec::new();
-
-            // Extract result var (default "cfhttp") and add remaining attrs
-            let mut result_var = "cfhttp".to_string();
-            for (name, value) in &attrs {
-                if name == "result" {
-                    // Extract the string value for the result variable name
-                    if let Expression::Literal(ref lit) = value {
-                        if let LiteralValue::String(ref s) = lit.value {
-                            result_var = s.clone();
-                        }
-                    } else if let Expression::Identifier(ref id) = value {
-                        result_var = id.name.clone();
-                    }
-                } else {
+                // Add default method if not specified
+                let has_method = attrs.iter().any(|(n, _)| n == "method");
+                if !has_method {
                     struct_pairs.push((
                         Expression::Literal(Literal {
-                            value: LiteralValue::String(name.clone()),
+                            value: LiteralValue::String("method".to_string()),
                             location: stmt_loc.clone(),
                         }),
-                        value.clone(),
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String("GET".to_string()),
+                            location: stmt_loc.clone(),
+                        }),
                     ));
                 }
-            }
 
-            // Add default method if not specified
-            let has_method = attrs.iter().any(|(n, _)| n == "method");
-            if !has_method {
-                struct_pairs.push((
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String("method".to_string()),
-                        location: stmt_loc.clone(),
-                    }),
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String("GET".to_string()),
-                        location: stmt_loc.clone(),
-                    }),
-                ));
-            }
 
-            // Add params array if any httpparam statements were found
-            if !params.is_empty() {
-                struct_pairs.push((
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String("params".to_string()),
+                // Build: result_var = cfhttp({ ... });
+                let cfhttp_call = Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier {
+                        name: "cfhttp".to_string(),
                         location: stmt_loc.clone(),
-                    }),
-                    Expression::Array(Array {
-                        elements: params,
+                    })),
+                    arguments: vec![Expression::Struct(Struct {
+                        pairs: struct_pairs,
+                        ordered: false,
                         location: stmt_loc.clone(),
-                    }),
-                ));
-            }
-
-            // Build: result_var = cfhttp({ ... });
-            let cfhttp_call = Expression::FunctionCall(Box::new(FunctionCall {
-                name: Box::new(Expression::Identifier(Identifier {
-                    name: "cfhttp".to_string(),
+                    })],
                     location: stmt_loc.clone(),
-                })),
-                arguments: vec![Expression::Struct(Struct {
-                    pairs: struct_pairs,
-                    ordered: false,
-                    location: stmt_loc.clone(),
-                })],
-                location: stmt_loc.clone(),
-            }));
+                }));
 
-            // `result="local.r"` names a SCOPED target. As a bare
-            // AssignTarget::Variable the whole dotted string became one
-            // identifier, so the struct was written to a variable literally
-            // called "local.r" and `local.r` read back undefined — while the
-            // function form `cfhttp(result="local.r")`, which resolves the
-            // target at runtime, worked. Split it into struct accesses so both
-            // spellings land in the same place (GH #341 census).
-            let mut target = AssignTarget::Variable(result_var.clone());
-            if result_var.contains('.') {
-                let mut parts = result_var.split('.');
-                let root = parts.next().unwrap_or_default().to_string();
-                let mut expr = Expression::Identifier(Identifier {
-                    name: root,
-                    location: stmt_loc.clone(),
-                });
-                let rest: Vec<&str> = parts.collect();
-                for (i, part) in rest.iter().enumerate() {
-                    if i + 1 == rest.len() {
-                        target = AssignTarget::StructAccess(
-                            Box::new(expr.clone()),
-                            part.to_string(),
-                        );
-                    } else {
-                        expr = Expression::MemberAccess(Box::new(MemberAccess {
-                            object: Box::new(expr),
-                            member: part.to_string(),
-                            null_safe: false,
-                            location: stmt_loc.clone(),
-                        }));
+                // `result="local.r"` names a SCOPED target. As a bare
+                // AssignTarget::Variable the whole dotted string became one
+                // identifier, so the struct was written to a variable literally
+                // called "local.r" and `local.r` read back undefined — while the
+                // function form `cfhttp(result="local.r")`, which resolves the
+                // target at runtime, worked. Split it into struct accesses so both
+                // spellings land in the same place (GH #341 census).
+                let mut target = AssignTarget::Variable(result_var.clone());
+                if result_var.contains('.') {
+                    let mut parts = result_var.split('.');
+                    let root = parts.next().unwrap_or_default().to_string();
+                    let mut expr = Expression::Identifier(Identifier {
+                        name: root,
+                        location: stmt_loc.clone(),
+                    });
+                    let rest: Vec<&str> = parts.collect();
+                    for (i, part) in rest.iter().enumerate() {
+                        if i + 1 == rest.len() {
+                            target = AssignTarget::StructAccess(
+                                Box::new(expr.clone()),
+                                part.to_string(),
+                            );
+                        } else {
+                            expr = Expression::MemberAccess(Box::new(MemberAccess {
+                                object: Box::new(expr),
+                                member: part.to_string(),
+                                null_safe: false,
+                                location: stmt_loc.clone(),
+                            }));
+                        }
                     }
                 }
+                return Ok(CfmlNode::Statement(Statement::Assignment(Assignment {
+                    target,
+                    value: cfhttp_call,
+                    operator: AssignOp::Equal,
+                    location: stmt_loc,
+                })));
             }
-            return Ok(CfmlNode::Statement(Statement::Assignment(Assignment {
-                target,
-                value: cfhttp_call,
-                operator: AssignOp::Equal,
-                location: stmt_loc,
-            })));
+            self.current = http_start;
         }
 
         // Handle 'cfinvoke'/'invoke' as a CFScript STATEMENT (the tag-in-script
@@ -1733,6 +1665,51 @@ impl Parser {
                     })));
                 }
                 self.current = saved;
+            }
+            // Bare-attribute `httpparam type="header" name=… value=…;` (or
+            // `cfhttpparam …;`) in a script `http … { }` body: the same runtime
+            // append as the parenthesised form above, so it runs in statement
+            // order, inside for/if, and sees the body's own `var`s.
+            if (nlow == "httpparam" || nlow == "cfhttpparam")
+                && self.is_identifier_like_at(1)
+                && matches!(self.peek(2), Token::Equal)
+            {
+                self.advance(); // httpparam
+                let mut pairs: Vec<(Expression, Expression)> = Vec::new();
+                while !self.check(&Token::Semicolon) && !self.check(&Token::RBrace) && !self.is_at_end() {
+                    if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                        let pname = self.extract_identifier()?;
+                        self.advance(); // =
+                        let pvalue = self.parse_expression()?;
+                        pairs.push((
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(pname.to_lowercase()),
+                                location: stmt_loc,
+                            }),
+                            pvalue,
+                        ));
+                    } else {
+                        break;
+                    }
+                }
+                self.match_token(&Token::Semicolon);
+                return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "arrayAppend".to_string(),
+                            location: stmt_loc,
+                        })),
+                        arguments: vec![
+                            Expression::Identifier(Identifier {
+                                name: "__cfhttp_params".to_string(),
+                                location: stmt_loc,
+                            }),
+                            Expression::Struct(Struct { pairs, ordered: false, location: stmt_loc }),
+                        ],
+                        location: stmt_loc,
+                    })),
+                    location: stmt_loc,
+                })));
             }
             // cfzipparam(source=…, prefix=…, …) → appends to the runtime array
             // that the surrounding script `cfzip(){ }` (or the <cfzip> tag body)
