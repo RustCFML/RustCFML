@@ -2831,8 +2831,10 @@ async fn stream_multipart_form(
                 // Plain form fields are small by construction and are the whole
                 // point of the form scope, so these DO stay in memory — Lucee
                 // reads them the same way (`IOUtil.toBytes` per field).
+                // Repeated names (a checkbox group) merge as the urlencoded
+                // path does; insert() kept only the last value.
                 let text = field.text().await?;
-                form.insert(field_name.to_lowercase(), CfmlValue::string(text));
+                cfml_vm::web::insert_query_value(&mut form, field_name.to_lowercase(), text);
             }
         }
     }

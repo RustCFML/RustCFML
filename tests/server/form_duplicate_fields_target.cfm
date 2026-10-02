@@ -5,4 +5,4 @@
     duplicate keys were merged (comma-join, Lucee semantics) rather than
     last-one-wins.
 --->
-<cfoutput>form=[#form.dup ?: "(missing)"#];url=[#url.dup ?: "(missing)"#]</cfoutput>
+<cfoutput>form=[#form.dup ?: "(missing)"#];url=[#url.dup ?: "(missing)"#];fieldnames=[#form.fieldnames ?: "(missing)"#]</cfoutput>

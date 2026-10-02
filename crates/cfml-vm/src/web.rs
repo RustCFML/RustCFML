@@ -331,6 +331,8 @@ pub fn build_web_scopes(
             }
         }
     };
+    let mut form_scope = form_scope;
+    add_form_fieldnames(&mut form_scope);
     globals.insert("form".to_string(), CfmlValue::strukt(form_scope));
 
     let cookie_scope = {
@@ -385,7 +387,24 @@ pub fn parse_query_string(qs: &str) -> ValueMap {
     map
 }
 
-fn insert_query_value(map: &mut ValueMap, key: String, value: String) {
+/// `form.fieldnames`: the submitted field names, upper-cased, each once, in the
+/// order they first appeared, file fields included. Lucee and ACF set it on
+/// every request whose form scope has fields, and older CFML loops over it to
+/// process a post. Left alone when the form posted a field of that name itself.
+fn add_form_fieldnames(form: &mut ValueMap) {
+    if form.is_empty() || form.contains_key("fieldnames") {
+        return;
+    }
+    let names: Vec<String> = form.keys().map(|k| k.to_string().to_uppercase()).collect();
+    form.insert("fieldnames".to_string(), CfmlValue::string(names.join(",")));
+}
+
+/// Add one submitted field to a url or form scope. A repeated name merges into
+/// a comma-separated list in submission order, with empty values dropped from
+/// the merge (`a=1&a=&a=3` gives "1,3"), as on Lucee/ACF. Shared by the
+/// urlencoded and both multipart parsers, so a group of same-name checkboxes
+/// comes out the same whichever encoding the form posted with.
+pub fn insert_query_value(map: &mut ValueMap, key: String, value: String) {
     if value.is_empty() {
         // An empty value never contributes to a merge, but the key must still
         // exist (a lone `dup=` yields an empty string).
@@ -585,9 +604,10 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
                 )),
             );
         } else {
-            form.insert(
+            insert_query_value(
+                &mut form,
                 field_name.to_lowercase(),
-                CfmlValue::string(String::from_utf8_lossy(part_body).into_owned()),
+                String::from_utf8_lossy(part_body).into_owned(),
             );
         }
     }
@@ -767,6 +787,41 @@ mod tests {
         assert_eq!(server_port_from_host("[::1]", false, 8500), 80);
         // No Host header at all (HTTP/1.0): fall back to the listening port.
         assert_eq!(server_port_from_host("", false, 8500), 8500);
+    }
+
+    #[test]
+    fn form_fieldnames_lists_each_field_once_in_order() {
+        let mut form = parse_query_string("b=1&a=2&b=3&c=");
+        add_form_fieldnames(&mut form);
+        assert_eq!(form.get("fieldnames").map(|v| v.as_string()), Some("B,A,C".to_string()));
+
+        // No fields: no fieldnames key (a GET, or an empty body)
+        let mut empty = ValueMap::default();
+        add_form_fieldnames(&mut empty);
+        assert!(empty.get("fieldnames").is_none());
+
+        // A field the form itself posted as "fieldnames" is left alone
+        let mut own = parse_query_string("fieldnames=mine&x=1");
+        add_form_fieldnames(&mut own);
+        assert_eq!(own.get("fieldnames").map(|v| v.as_string()), Some("mine".to_string()));
+    }
+
+    #[test]
+    fn multipart_duplicate_fields_join_with_commas() {
+        // A checkbox group posts one part per ticked box under the same name.
+        // Same merge as the urlencoded path: comma-joined, empties dropped.
+        let boundary = "----RustCFMLBoundary";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body = String::new();
+        for value in ["value1", "", "value2"] {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"cb\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+
+        let form = parse_multipart_sync(&ct, body.as_bytes());
+        assert_eq!(form.get("cb").map(|v| v.as_string()), Some("value1,value2".to_string()));
     }
 
     #[test]

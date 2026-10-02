@@ -42,6 +42,18 @@ if (skip) {
         <cfcatch type="any"><cfset postError = cfcatch.message></cfcatch>
     </cftry>
 
+    <!--- form scope, multipart: what a browser posts for a checkbox group in an
+          enctype="multipart/form-data" form (every Preside admin form) --->
+    <cfset multipartError = "">
+    <cftry>
+        <cfhttp url="#baseUrl##target#" method="POST" result="multipartResult" multipart="true">
+            <cfhttpparam type="formfield" name="dup" value="first" />
+            <cfhttpparam type="formfield" name="dup" value="" />
+            <cfhttpparam type="formfield" name="dup" value="third" />
+        </cfhttp>
+        <cfcatch type="any"><cfset multipartError = cfcatch.message></cfcatch>
+    </cftry>
+
     <!--- url scope: same duplicate keys on the query string --->
     <cftry>
         <cfhttp url="#baseUrl##target#?dup=first&dup=&dup=third" method="GET" result="getResult">
@@ -55,13 +67,29 @@ if (skip) {
             assert("form scope: duplicate keys comma-join, empties dropped",
                 listFirst(trim(postResult.fileContent), ";"),
                 "form=[first,third]");
+            assert("form.fieldnames (urlencoded): each field once, upper-cased",
+                listGetAt(trim(postResult.fileContent), 3, ";"),
+                "fieldnames=[DUP]");
+        }
+
+        assertTrue("duplicate-key multipart POST round-trip completed", multipartError == "");
+        if (multipartError == "") {
+            assert("form scope (multipart): duplicate keys comma-join, empties dropped",
+                listFirst(trim(multipartResult.fileContent), ";"),
+                "form=[first,third]");
+            assert("form.fieldnames (multipart): each field once, upper-cased",
+                listGetAt(trim(multipartResult.fileContent), 3, ";"),
+                "fieldnames=[DUP]");
         }
 
         assertTrue("duplicate-key GET round-trip completed", getError == "");
         if (getError == "") {
             assert("url scope: duplicate keys comma-join, empties dropped",
-                listLast(trim(getResult.fileContent), ";"),
+                listGetAt(trim(getResult.fileContent), 2, ";"),
                 "url=[first,third]");
+            assert("GET: no form fields, so no form.fieldnames",
+                listGetAt(trim(getResult.fileContent), 3, ";"),
+                "fieldnames=[(missing)]");
         }
     </cfscript>
 </cfif>
