@@ -36,8 +36,8 @@ static FROM_START: AtomicBool = AtomicBool::new(false);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 
 /// How far a thread's unflushed net change may drift before it is added to
-/// [`LIVE`]. Bounds the live-heap error to this much per thread.
-pub const FLUSH_BYTES: i64 = 256 * 1024;
+/// [`LIVE`]. Bounds the live-heap error to this much per running thread.
+pub const FLUSH_BYTES: i64 = 64 * 1024;
 
 thread_local! {
     /// Bytes this thread has allocated since accounting started.
@@ -50,6 +50,40 @@ thread_local! {
     static PEAK: Cell<i64> = const { Cell::new(i64::MIN) };
     /// Net change not yet added to [`LIVE`].
     static PENDING: Cell<i64> = const { Cell::new(0) };
+    /// Set once this thread's [`ExitFlush`] has run: from then on every change
+    /// goes straight to [`LIVE`], since nothing will flush it later.
+    static DIRECT: Cell<bool> = const { Cell::new(false) };
+    /// Flushes [`PENDING`] when the thread exits (see [`arm_thread`]).
+    static EXIT_FLUSH: ExitFlush = const { ExitFlush };
+}
+
+/// A thread's unflushed change is lost when the thread exits, and the loss is
+/// not random: a thread that runs a background task (a `cfthread`, a scheduled
+/// task tick) frees data another thread allocated for it, so it exits with
+/// frees not yet subtracted. On a Preside site, whose heartbeats run a fresh
+/// thread per tick, that pushed the live heap past the footprint within an
+/// hour. Dropped at thread exit, this adds what is left.
+struct ExitFlush;
+
+impl Drop for ExitFlush {
+    fn drop(&mut self) {
+        let _ = DIRECT.try_with(|d| d.set(true));
+        let _ = PENDING.try_with(|p| {
+            LIVE.fetch_add(p.get(), Ordering::Relaxed);
+            p.set(0);
+        });
+    }
+}
+
+/// Make sure this thread's unflushed change reaches the process total when
+/// the thread exits. Registering a thread-local destructor may allocate, so
+/// the allocator itself cannot do it; it is done here, at the points every
+/// request and `cfthread` body pass through (request start, collector start).
+/// Cheap after the first call on a thread.
+pub fn arm_thread() {
+    if is_enabled() {
+        let _ = EXIT_FLUSH.try_with(|_| {});
+    }
 }
 
 #[inline]
@@ -59,6 +93,10 @@ fn net() -> i64 {
 
 #[inline]
 fn flush_if_due(delta: i64) {
+    if DIRECT.try_with(|d| d.get()).unwrap_or(true) {
+        LIVE.fetch_add(delta, Ordering::Relaxed);
+        return;
+    }
     PENDING.with(|p| {
         let v = p.get() + delta;
         if v >= FLUSH_BYTES || v <= -FLUSH_BYTES {
@@ -121,6 +159,7 @@ pub fn enable_at_startup() {
     if !ENABLED.swap(true, Ordering::Relaxed) {
         FROM_START.store(true, Ordering::Relaxed);
     }
+    arm_thread();
 }
 
 /// Start counting, from now (when a request's own configuration enables
@@ -185,6 +224,7 @@ impl RequestMeter {
         if !is_enabled() {
             return None;
         }
+        arm_thread();
         let start = thread_totals();
         PEAK.with(|p| p.set(start.allocated as i64 - start.freed as i64));
         Some(Self { start })
@@ -240,6 +280,24 @@ pub fn limit_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread that frees what another allocated, then exits with the change
+    /// still below the flush threshold, must not lose it.
+    #[test]
+    fn a_thread_exit_flushes_what_it_had_not_added() {
+        enable_at_startup();
+        // Other tests move LIVE too; this one only needs its own delta, so it
+        // runs its two threads alone and compares across them.
+        let before = LIVE.load(Ordering::Relaxed);
+        std::thread::spawn(|| {
+            arm_thread();
+            note_free(10_000); // well under FLUSH_BYTES
+        })
+        .join()
+        .unwrap();
+        let after = LIVE.load(Ordering::Relaxed);
+        assert_eq!(after - before, -10_000, "the exiting thread's frees reach the total");
+    }
 
     // The real allocator is not wired up in unit tests, so these drive the
     // hooks by hand. Each test runs on its own thread (fresh thread-locals).

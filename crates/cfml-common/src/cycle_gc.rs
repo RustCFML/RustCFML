@@ -311,6 +311,9 @@ fn log_cap() -> usize {
 /// Begin logging allocations for a request. Call at the very top of a top-level
 /// request execution (serve mode only).
 pub fn enable() {
+    // Every request and cfthread body starts here, so this is where a thread's
+    // allocation totals get their exit flush (see `mem_account::arm_thread`).
+    crate::mem_account::arm_thread();
     ALLOC_LOG.with(|c| *c.borrow_mut() = Some(fresh_log()));
     ALLOC_TOTAL.with(|n| n.set(0));
     OLD_LOG.with(|c| c.borrow_mut().clear());

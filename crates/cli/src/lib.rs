@@ -739,6 +739,12 @@ fn real_main() {
                 }
             }
         };
+        // Start allocation accounting as soon as the config says debugging is
+        // on, before the server builds its state, so the live-heap figure
+        // includes what the server keeps from startup (see `mem_account`).
+        if cfconfig.debugging.enabled {
+            cfml_common::mem_account::enable_at_startup();
+        }
 
         // Logging: --verbose and RUST_LOG keep priority. Otherwise apply
         // logging.level from cfconfig (default "warn"). logsDirectory and
