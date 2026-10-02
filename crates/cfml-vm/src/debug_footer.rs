@@ -1250,6 +1250,28 @@ fn render_process_memory(s: &mut String, m: &MemoryPanel) {
             title, v, label
         ));
     };
+    // The live heap's breakdown, indented under the row it breaks down.
+    let breakdown = |s: &mut String| {
+        if m.pots.is_empty() {
+            return;
+        }
+        // In the label column, so the value column stays as narrow as its
+        // numbers.
+        s.push_str("<tr><td style=\"border:0\"></td><td style=\"padding:2px 0 4px 12px;border:0\">\n");
+        s.push_str(&format!(
+            "<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n<tr><th>est. size</th><th>what</th><th>estimated from the data structures, refreshed at most every 30 s ({} s old)</th></tr>\n",
+            m.pots_age_secs
+        ));
+        for p in &m.pots {
+            s.push_str(&format!(
+                "<tr><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td></tr>\n",
+                fmt_bytes(p.bytes),
+                esc(&p.name),
+                esc(&p.detail)
+            ));
+        }
+        s.push_str("</table>\n</td></tr>\n");
+    };
     if m.footprint.is_some() || m.live_heap.is_some() || !m.pots.is_empty() {
         collapsible_heading(s, "rcfml-memproc", "Memory");
         s.push_str("<div class=\"rcfml-memproc\" style=\"display:none\">\n");
@@ -1261,29 +1283,19 @@ fn render_process_memory(s: &mut String, m: &MemoryPanel) {
             };
             row(s, fmt_bytes(f), &format!("Footprint{}", lim), "physical memory the OS charges this process: what --max-memory and the OOM killer act on");
         }
-        if let Some(l) = m.live_heap {
-            row(s, fmt_bytes(l), "Live heap", "bytes allocated and not yet freed, across every thread");
-            if let Some(f) = m.footprint {
-                row(s, fmt_bytes(f.saturating_sub(l)), "Outside the live heap", "footprint minus live heap: the engine's own code and thread stacks, and memory the allocator keeps for reuse rather than returning to the OS");
+        match m.live_heap {
+            Some(l) => {
+                row(s, fmt_bytes(l), "Live heap", "bytes allocated and not yet freed, across every thread");
+                breakdown(s);
+                if let Some(f) = m.footprint {
+                    row(s, fmt_bytes(f.saturating_sub(l)), "Outside the live heap", "footprint minus live heap: memory the allocator keeps for reuse rather than returning to the OS, thread stacks, and memory C libraries allocate themselves");
+                }
             }
+            // No live-heap figure (debugging was switched on after startup):
+            // the estimates still stand on their own.
+            None => breakdown(s),
         }
         s.push_str("</table>\n");
-        if !m.pots.is_empty() {
-            s.push_str(&format!(
-                "<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse;margin-top:4px\">\n<tr><th>est. size</th><th>what</th><th>detail</th></tr>\n"
-            ));
-            for p in &m.pots {
-                s.push_str(&format!(
-                    "<tr><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td></tr>\n",
-                    fmt_bytes(p.bytes), esc(&p.name), esc(&p.detail)
-                ));
-            }
-            s.push_str("</table>\n");
-        }
-        s.push_str(&format!(
-            "<div style=\"color:#555;margin:2px 0 4px\">Breakdown estimated from the data structures, refreshed at most every 30 s ({} s old). \"Other\" is the rest of the live heap: requests in flight, the engine itself, database driver buffers.</div>\n",
-            m.pots_age_secs
-        ));
         s.push_str("</div>\n");
     }
 }
@@ -1949,6 +1961,14 @@ mod tests {
         ] {
             assert!(html.contains(needle), "missing {needle:?}");
         }
+        // The breakdown sits indented under the Live heap row it breaks
+        // down, before Outside the live heap; no separate note under it.
+        let live = html.find("<td>Live heap</td>").unwrap();
+        let pots = html.find("<td>Compiled code</td>").unwrap();
+        let outside = html.find("<td>Outside the live heap</td>").unwrap();
+        assert!(live < pots && pots < outside);
+        assert!(html.contains("refreshed at most every 30 s"));
+        assert!(!html.contains("Breakdown estimated"));
         // The panel sits between Execution Time and Files.
         let mem = html.find("Allocated by this request").unwrap();
         assert!(html.find("Execution Time").unwrap() < mem);
