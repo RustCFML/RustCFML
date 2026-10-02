@@ -281,10 +281,19 @@ pub fn limit_bytes() -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// These tests drive the process-wide counter, so they run one at a time:
+    /// a parallel test's thread exit would move `LIVE` mid-assertion.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A thread that frees what another allocated, then exits with the change
     /// still below the flush threshold, must not lose it.
     #[test]
     fn a_thread_exit_flushes_what_it_had_not_added() {
+        let _serial = serial();
         enable_at_startup();
         // Other tests move LIVE too; this one only needs its own delta, so it
         // runs its two threads alone and compares across them.
@@ -303,6 +312,7 @@ mod tests {
     // hooks by hand. Each test runs on its own thread (fresh thread-locals).
     #[test]
     fn meter_reads_allocated_freed_peak_and_retained() {
+        let _serial = serial();
         std::thread::spawn(|| {
             enable();
             let m = RequestMeter::start().expect("enabled");
@@ -322,6 +332,7 @@ mod tests {
 
     #[test]
     fn freeing_more_than_allocated_retains_nothing() {
+        let _serial = serial();
         std::thread::spawn(|| {
             enable();
             let m = RequestMeter::start().unwrap();
@@ -335,6 +346,7 @@ mod tests {
 
     #[test]
     fn a_new_meter_resets_the_peak() {
+        let _serial = serial();
         std::thread::spawn(|| {
             enable();
             let m = RequestMeter::start().unwrap();
