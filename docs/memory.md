@@ -237,33 +237,98 @@ All of these are sized by the application's code, not its traffic, except the
 
 ## Monitoring
 
+### Per-request memory
+
+With debugging enabled (`"debugging": { "enabled": true }` in `.cfconfig.json`,
+see [Debugging & observability](debugging.md)), the engine counts the bytes
+every request allocates and frees, whether or not that page shows the debug
+footer. This is the figure FusionReactor shows per request, measured the same
+way: by the allocator, on the thread running the request.
+
+The debug footer then shows a **Request Memory** panel:
+
+| Row | Meaning |
+|---|---|
+| Allocated by this request | every byte it allocated, including what it has since freed |
+| Peak in use | the most it held at any one time |
+| Still in use as the page ends | allocated minus freed, before the request-end cleanup frees the page's own variables |
+| Freed so far | what it freed while running, and how much of that the cycle collector freed |
+| Allocated by joined cfthreads | what the threads it started and joined allocated on their own threads |
+
+Under it, **Objects created** counts the structs, arrays, queries, closure
+scopes and component instances the request created, how many are still alive
+as the page ends, and their estimated size. The component instances row opens
+to list them by class. The **Files** table gains an **alloc KB** column: the
+bytes each file allocated itself, with the same per-method rows as the timings.
+
+The byte counts are exact. The sizes in Objects created are estimates: the
+allocator knows sizes but not types, and a struct's size changes after it is
+created, so they are worked out from the objects still alive.
+
+Under **Runtime › Memory** the footer shows the process: its footprint (against
+the limit, if one is set), the live heap (every byte allocated and not yet
+freed), what is outside the live heap (the engine's code, thread stacks and the
+allocator's reserve), and an estimated breakdown of the live heap: compiled
+code, application scopes, the server scope, sessions, the `cachePut` cache,
+component classes, the engine's lookup caches, and the remainder. The breakdown
+walks those structures, so it is refreshed at most every 30 seconds.
+
+**What it costs.** Counting adds a few operations to every allocation while
+debugging is enabled. With debugging off, every allocation still makes one
+check: about 0.9% on a benchmark that does nothing but allocate, and less on a
+real page.
+
+**The live heap needs debugging at startup.** It is reported only when the
+server-level configuration enabled debugging when the server started. If
+debugging is switched on later (by an application's own `.cfconfig.json`), the
+per-request figures still work, but the live heap and the breakdown's
+remainder are not shown, because memory allocated before counting began can't
+be accounted for.
+
 ### Prometheus
 
 With `observability.metrics` enabled (see
-[Debugging & observability](debugging.md#prometheus-metrics-only)), turning on
-`jvmCompatibility` adds the engine's memory and collector figures under the
-names a Lucee container's JMX exporter uses, so existing JVM dashboards keep
-working:
+[Debugging & observability](debugging.md#prometheus-metrics-only)), the
+endpoint reports:
 
-```json
-{
-  "observability": {
-    "enabled": true,
-    "metrics": { "enabled": true, "jvmCompatibility": true }
-  }
-}
-```
+| Metric | Type | Value |
+|---|---|---|
+| `rustcfml_memory_footprint_bytes` | gauge | the process footprint, measured as `--max-memory` measures it (the table above), whether or not a limit is set |
+| `rustcfml_memory_limit_bytes` | gauge | the `--max-memory` limit, when set |
+| `rustcfml_memory_heap_live_bytes` | gauge | bytes allocated and not yet freed (debugging enabled at startup) |
+| `rustcfml_memory_outside_heap_bytes` | gauge | footprint minus live heap |
+| `rustcfml_request_memory_allocated_bytes` | histogram, by `route` | what each request allocated (debugging enabled) |
+| `rustcfml_request_memory_peak_bytes` | histogram, by `route` | each request's peak (debugging enabled) |
+| `rustcfml_request_memory_retained_bytes` | histogram, by `route` | what each request left in use after its own cleanup (debugging enabled) |
+| `rustcfml_gc_sweeps_total` | counter | cycle-collector sweeps |
+| `rustcfml_gc_collection_seconds_total` | counter | time spent sweeping |
+| `rustcfml_gc_reclaimed_objects_total` | counter | containers the collector freed |
+| `rustcfml_gc_reclaimed_bytes_total` | counter | bytes the collector freed (debugging enabled) |
+| `rustcfml_gc_last_sweep_reclaimed_bytes` | gauge | bytes the latest sweep freed (debugging enabled) |
+| `rustcfml_memory_limit_refused_total` | counter | requests refused with 503 over the soft limit |
+| `rustcfml_memory_limit_aborted_total` | counter | requests aborted over the hard limit |
 
-| Metric | Value |
-|---|---|
-| `java_lang_Memory_HeapMemoryUsage_used` | the process footprint in bytes, measured exactly as `--max-memory` measures it (the table above), whether or not a limit is set |
-| `java_lang_GarbageCollector_CollectionTime` | cumulative time spent in cycle-collector sweeps, in milliseconds; `rate(java_lang_GarbageCollector_CollectionTime[3m]) / 180` is the share of time spent collecting, as for a JVM |
-| `java_lang_OperatingSystem_ProcessCpuLoad` | process CPU since the previous scrape, 0–1 across the available cores |
+The histograms give the average per request
+(`rate(…_sum[5m]) / rate(…_count[5m])`) and its distribution by route
+(`histogram_quantile(0.99, …)`). The buckets run from 4 KiB to 1 GiB.
 
 The footprint gauge is the one to alert on: it is the number the limit and the
 OOM killer act on. Graph it against request rate. A plateau after reloads is the
 allocator; a line that keeps climbing is worth investigating with the
 diagnostics below.
+
+#### JVM metric names
+
+For a dashboard built for a Lucee container that you can't easily change,
+`"jvmCompatibility": true` in `observability.metrics` adds the nearest
+equivalents under the names the JMX exporter uses. Prefer the metrics above
+otherwise.
+
+| Metric | Value |
+|---|---|
+| `java_lang_Memory_HeapMemoryUsage_used` | the process footprint in bytes |
+| `java_lang_GarbageCollector_CollectionTime` | cumulative sweep time in milliseconds; `rate(java_lang_GarbageCollector_CollectionTime[3m]) / 180` is the share of time spent collecting, as for a JVM |
+| `java_lang_OperatingSystem_ProcessCpuLoad` | process CPU since the previous scrape, 0–1 across the available cores |
 
 ### Logs
 
@@ -271,15 +336,11 @@ With a limit set, the server logs when it starts and stops refusing requests,
 and every abort, with the messages shown in [The two tiers](#the-two-tiers).
 Nothing is logged in normal operation.
 
-### What isn't exposed
+### From CFML
 
-The engine keeps internal counts of nodes collected, survivors carried across
-requests, requests refused and requests aborted, but none of them is published
-as a metric yet.
-
-From CFML, `createObject("java", "java.lang.Runtime")` exists for code that
-expects it, but `freeMemory()`, `totalMemory()` and `maxMemory()` return fixed
-values and `gc()` does nothing, so don't build monitoring on them.
+`createObject("java", "java.lang.Runtime")` exists for code that expects it,
+but `freeMemory()`, `totalMemory()` and `maxMemory()` return fixed values and
+`gc()` does nothing, so don't build monitoring on them.
 
 ## Diagnosing a footprint
 
@@ -287,7 +348,9 @@ Work through these in order on a test instance; the diagnostics cost real time
 and are not meant for production.
 
 1. **Is it a leak?** Graph the footprint across several reloads. A plateau is
-   allocator retention. A climb with no plateau is a leak.
+   allocator retention. A climb with no plateau is a leak. With debugging on,
+   the retained-bytes histogram names the routes that leave memory behind, and
+   a page's footer shows what it created and still holds.
 2. **Is the engine still tracking more each time?** Run with
    `RUSTCFML_GC_DEBUG=1` and compare the `live=` counts after each reload. If
    they return to the same number while the footprint climbs, the memory is in

@@ -1042,6 +1042,9 @@ impl CfmlValue {
         if !crate::cycle_gc::is_armed() {
             return;
         }
+        // Re-entering a displaced graph is not creating it: keep it out of the
+        // per-request "created" counts.
+        let _relog = crate::cycle_gc::RelogGuard::new();
         // Diagnostic: RUSTCFML_RELOG_DEBUG=1 reports how often the hook fires
         // and how much graph it enters, so "is this path even taken?" is a
         // measurement rather than a guess.

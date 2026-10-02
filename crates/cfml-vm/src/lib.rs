@@ -49,6 +49,8 @@ pub mod dump;
 pub mod observe;
 #[cfg(feature = "observability")]
 pub mod debug_footer;
+#[cfg(feature = "observability")]
+mod memory_panel;
 /// Threshold-gated cooperative sampling profiler (Phase 2 of the observability
 /// plan). Behind the `observability` feature; the watchdog thread lives in the
 /// CLI so nothing thread-related reaches wasm.
@@ -782,6 +784,31 @@ impl BytecodeCache {
     /// alongside `len`; the census only reads `len`.
     pub fn is_empty(&self) -> bool {
         self.entries.read().is_empty()
+    }
+
+    /// Estimated memory held by the cached programs: each function's
+    /// instruction array, name, parameter lists and source path, counted once
+    /// per function however many programs share it. Constants an instruction
+    /// owns out of line (strings) are not followed. For the debug footer's
+    /// memory panel.
+    pub fn approx_bytes(&self) -> (usize, u64) {
+        let entries = self.entries.read();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut bytes: u64 = 0;
+        for (path, e) in entries.iter() {
+            bytes += 64 + path.len() as u64;
+            for f in &e.program.functions {
+                if !seen.insert(Arc::as_ptr(f) as usize) {
+                    continue;
+                }
+                bytes += std::mem::size_of::<BytecodeFunction>() as u64
+                    + (f.instructions.capacity() * std::mem::size_of::<BytecodeOp>()) as u64
+                    + f.name.len() as u64
+                    + f.params.iter().map(|p| 24 + p.len() as u64).sum::<u64>()
+                    + f.source_file.as_ref().map(|p| p.len() as u64).unwrap_or(0);
+            }
+        }
+        (entries.len(), bytes)
     }
 
     /// Return a cached program if present. In trusted (production) mode the
@@ -3198,6 +3225,18 @@ pub struct CfmlVirtualMachine {
     /// balloon far past the real request time.
     #[cfg(feature = "observability")]
     tmpl_child_us_stack: Vec<i64>,
+    /// The same bookkeeping in allocated bytes, while the request's memory is
+    /// metered: per frame, the thread's allocation total at entry and the
+    /// bytes allocated by nested timed calls. Empty when it isn't.
+    #[cfg(feature = "observability")]
+    tmpl_alloc_stack: Vec<(u64, u64)>,
+    /// This request's memory meter (allocation accounting on, i.e. debugging
+    /// enabled). Read by the debug footer's memory panel and, at request end,
+    /// by the per-request memory metrics.
+    pub mem_meter: Option<cfml_common::mem_account::RequestMeter>,
+    /// Bytes allocated by `cfthread`s this request joined (they run on their
+    /// own threads, outside `mem_meter`).
+    pub thread_mem_allocated: u64,
     /// Typed handle to the footer collector (also stored as `observer`), kept so
     /// the render/`getDebugData()` paths can read it back without downcasting.
     #[cfg(feature = "observability")]
@@ -3233,6 +3272,9 @@ pub struct ThreadResult {
     pub output: String,
     /// Stringified error if the body threw, else empty.
     pub error: String,
+    /// Bytes the body allocated on its own thread, when allocation accounting
+    /// is on (a spawned thread only; an inline body is the caller's own).
+    pub mem_allocated: u64,
     /// The error as a catch struct (`message`, `type`, `tagContext`, …) — what
     /// `cfthread.NAME.error` holds. `None` when the body completed.
     pub error_struct: Option<CfmlValue>,
@@ -4795,6 +4837,10 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "observability")]
             tmpl_child_us_stack: Vec::new(),
             #[cfg(feature = "observability")]
+            tmpl_alloc_stack: Vec::new(),
+            mem_meter: None,
+            thread_mem_allocated: 0,
+            #[cfg(feature = "observability")]
             debug_collector: None,
             #[cfg(feature = "observability")]
             debug_config: cfml_config::DebuggingCfg::default(),
@@ -5302,6 +5348,11 @@ impl CfmlVirtualMachine {
         ip_ok || self.url_trigger_matches()
     }
 
+    /// Without the `observability` feature there is no debug footer and no
+    /// per-request memory meter.
+    #[cfg(not(feature = "observability"))]
+    pub fn begin_memory_metering(&mut self) {}
+
     /// Evaluate gates 1 & 2 and, when they pass, install a fresh per-request
     /// debug-footer collector as the hook-bus observer. A request that won't
     /// show debug output collects nothing and allocates nothing. Called once,
@@ -5564,7 +5615,9 @@ impl CfmlVirtualMachine {
         let scopes = self.gather_debug_scopes();
         let main = self.base_template_path.clone();
         let cfconfig_rows = self.cfconfig_debug_rows();
-        let footer = collector.render(&scopes, main.as_deref(), &cfconfig_rows);
+        let memory = self.build_memory_panel();
+        let footer =
+            collector.render_with_memory(&scopes, main.as_deref(), &cfconfig_rows, memory.as_ref());
         if !footer.is_empty() {
             debug_footer::insert_footer(&mut self.output_buffer, &footer);
         }
@@ -5605,12 +5658,13 @@ impl CfmlVirtualMachine {
     /// Fire the `template` hook (guarded by `TEMPLATE` interest at the call
     /// site). `elapsed_us` is microseconds.
     #[cfg(feature = "observability")]
-    fn fire_template(&self, path: &str, method: Option<&str>, elapsed_us: i64) {
+    fn fire_template(&self, path: &str, method: Option<&str>, elapsed_us: i64, alloc_bytes: u64) {
         if let Some(o) = &self.observer {
             o.on_template(&observe::TemplateEvent {
                 path,
                 method,
                 elapsed_us,
+                alloc_bytes,
             });
         }
     }
@@ -5621,6 +5675,37 @@ impl CfmlVirtualMachine {
     #[inline]
     fn template_frame_begin(&mut self) {
         self.tmpl_child_us_stack.push(0);
+        if self.mem_meter.is_some() {
+            self.tmpl_alloc_stack
+                .push((cfml_common::mem_account::thread_totals().allocated, 0));
+        }
+    }
+
+    /// Exclusive bytes allocated by the frame ending now (0 when the request
+    /// isn't metered), crediting its inclusive bytes to the parent frame.
+    #[cfg(feature = "observability")]
+    fn template_frame_alloc_end(&mut self) -> u64 {
+        if self.mem_meter.is_none() {
+            return 0;
+        }
+        let Some((start, child)) = self.tmpl_alloc_stack.pop() else {
+            return 0;
+        };
+        let inclusive = cfml_common::mem_account::thread_totals()
+            .allocated
+            .saturating_sub(start);
+        if let Some(parent) = self.tmpl_alloc_stack.last_mut() {
+            parent.1 += inclusive;
+        }
+        inclusive.saturating_sub(child)
+    }
+
+    /// End a timed frame that has nothing to name: keep both stacks balanced
+    /// and credit its time and bytes to the caller.
+    #[cfg(feature = "observability")]
+    fn template_frame_discard(&mut self, inclusive_us: i64) {
+        let _ = frame_exclusive_us(&mut self.tmpl_child_us_stack, inclusive_us);
+        let _ = self.template_frame_alloc_end();
     }
 
     /// End a timed frame and fire its `template` hook with EXCLUSIVE (self) time.
@@ -5633,7 +5718,8 @@ impl CfmlVirtualMachine {
     #[cfg(feature = "observability")]
     fn template_frame_end(&mut self, path: &str, method: Option<&str>, inclusive_us: i64) {
         let self_us = frame_exclusive_us(&mut self.tmpl_child_us_stack, inclusive_us);
-        self.fire_template(path, method, self_us);
+        let self_bytes = self.template_frame_alloc_end();
+        self.fire_template(path, method, self_us, self_bytes);
     }
 
     /// Flatten a queryExecute params argument into the debug footer's param
@@ -5913,6 +5999,10 @@ impl CfmlVirtualMachine {
         self.saved_output_buffers
             .push(std::mem::take(&mut self.output_buffer));
         let start_time = cfml_common::clock::Monotonic::now();
+        // A spawned child VM (it has a cancel flag) runs on its own thread, so
+        // its allocations are counted here and handed to the joining request.
+        let alloc_start = (self.cancel_flag.is_some() && cfml_common::mem_account::is_enabled())
+            .then(|| cfml_common::mem_account::thread_totals().allocated);
         // Mark thread context so isInThread() reports true inside the body.
         self.in_thread_body = self.in_thread_body.saturating_add(1);
         // The async body is normally a closure (`function(){…}`), but the
@@ -5962,6 +6052,9 @@ impl CfmlVirtualMachine {
             output,
             error,
             error_struct,
+            mem_allocated: alloc_start
+                .map(|a| cfml_common::mem_account::thread_totals().allocated.saturating_sub(a))
+                .unwrap_or(0),
             elapsed,
             thread_vars,
             return_value,
@@ -6227,6 +6320,7 @@ impl CfmlVirtualMachine {
     /// plus the body's `thread.*` values. `error` is there only when the body
     /// threw, as on Lucee — code tests `structKeyExists( t, "error" )`.
     pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
+        self.thread_mem_allocated += r.mem_allocated;
         let key = thread_name.to_lowercase();
         let thread_struct = self.get_or_create_cfthread_scope();
         let running = thread_struct
@@ -34619,9 +34713,7 @@ impl CfmlVirtualMachine {
                     // Nothing to name (unresolved path, or a non-struct template):
                     // still pop the frame so the child-time stack stays balanced,
                     // and credit the time to the caller rather than losing it.
-                    None => {
-                        let _ = frame_exclusive_us(&mut self.tmpl_child_us_stack, us);
-                    }
+                    None => self.template_frame_discard(us),
                 }
                 return r;
             }

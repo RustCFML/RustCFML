@@ -44,6 +44,8 @@ pub struct TemplateHit {
     /// execution (include, custom tag, `<cfmodule>`).
     pub method: String,
     pub time: i64,
+    /// Bytes this execution allocated itself, when the request is metered.
+    pub alloc: u64,
 }
 
 /// A row in the `exceptions` section.
@@ -172,8 +174,20 @@ impl DebugCollector {
         main_page: Option<&str>,
         cfconfig: &[(String, String)],
     ) -> String {
+        self.render_with_memory(scopes, main_page, cfconfig, None)
+    }
+
+    /// [`render`](Self::render), plus the memory panel when the request's
+    /// memory was metered.
+    pub fn render_with_memory(
+        &self,
+        scopes: &[(String, ValueMap)],
+        main_page: Option<&str>,
+        cfconfig: &[(String, String)],
+        memory: Option<&MemoryPanel>,
+    ) -> String {
         if let Ok(d) = self.inner.lock() {
-            render_footer(&self.cfg, &d, scopes, self.total_us(), main_page, cfconfig)
+            render_footer(&self.cfg, &d, scopes, self.total_us(), main_page, cfconfig, memory)
         } else {
             String::new()
         }
@@ -238,6 +252,7 @@ impl VmObserver for DebugCollector {
                 path: t.path.to_string(),
                 method: t.method.unwrap_or_default().to_string(),
                 time: t.elapsed_us,
+                alloc: t.alloc_bytes,
             });
         }
     }
@@ -275,6 +290,8 @@ struct PageAgg {
     min: i64,
     max: i64,
     total: i64,
+    /// Bytes allocated (exclusive), when the request is metered.
+    alloc: u64,
     /// Per-method breakdown, in first-call order. A file whose hits carry no
     /// method name (a plain include / custom tag) has an empty vec, so the row
     /// renders exactly as before.
@@ -287,6 +304,7 @@ struct MethodAgg {
     name: String,
     count: i64,
     total: i64,
+    alloc: u64,
 }
 
 /// Aggregate template hits into `pages` rows, optionally leading with the main
@@ -312,6 +330,7 @@ fn aggregate_pages_with_main(
     templates: &[TemplateHit],
     main_page: Option<&str>,
     total_us: i64,
+    total_alloc: u64,
 ) -> Vec<PageAgg> {
     let mut hits: Vec<TemplateHit> = Vec::new();
     if let Some(p) = main_page {
@@ -319,10 +338,14 @@ fn aggregate_pages_with_main(
         // `max_records`), so this subtraction can't silently over-credit the
         // page. `max(0)` guards only against per-frame microsecond truncation.
         let frames_us: i64 = templates.iter().map(|t| t.time).sum();
+        // The same residual in bytes: what the request allocated outside every
+        // timed frame is the page's own.
+        let frames_alloc: u64 = templates.iter().map(|t| t.alloc).sum();
         hits.push(TemplateHit {
             path: p.to_string(),
             method: String::new(),
             time: (total_us - frames_us).max(0),
+            alloc: total_alloc.saturating_sub(frames_alloc),
         });
     }
     hits.extend_from_slice(templates);
@@ -337,6 +360,7 @@ fn aggregate_pages(templates: &[TemplateHit]) -> Vec<PageAgg> {
                 let p = &mut out[i];
                 p.count += 1;
                 p.total += t.time;
+                p.alloc += t.alloc;
                 p.min = p.min.min(t.time);
                 p.max = p.max.max(t.time);
                 p
@@ -348,6 +372,7 @@ fn aggregate_pages(templates: &[TemplateHit]) -> Vec<PageAgg> {
                     min: t.time,
                     max: t.time,
                     total: t.time,
+                    alloc: t.alloc,
                     methods: Vec::new(),
                 });
                 out.last_mut().expect("just pushed")
@@ -365,11 +390,13 @@ fn aggregate_pages(templates: &[TemplateHit]) -> Vec<PageAgg> {
         {
             m.count += 1;
             m.total += t.time;
+            m.alloc += t.alloc;
         } else {
             page.methods.push(MethodAgg {
                 name: t.method.clone(),
                 count: 1,
                 total: t.time,
+                alloc: t.alloc,
             });
         }
     }
@@ -607,15 +634,148 @@ pub fn render_footer(
     total_us: i64,
     main_page: Option<&str>,
     cfconfig: &[(String, String)],
+    memory: Option<&MemoryPanel>,
 ) -> String {
     match cfg.template.to_ascii_lowercase().as_str() {
         "none" => String::new(),
         "comment" => render_comment(data, total_us),
-        "simple" => render_html(cfg, data, scopes, total_us, main_page, cfconfig, false),
-        "classic" => render_html(cfg, data, scopes, total_us, main_page, cfconfig, false),
+        "simple" => render_html(cfg, data, scopes, total_us, main_page, cfconfig, memory, false),
+        "classic" => render_html(cfg, data, scopes, total_us, main_page, cfconfig, memory, false),
         // "modern" (default) and any unknown template fall back to the rich panel.
-        _ => render_html(cfg, data, scopes, total_us, main_page, cfconfig, true),
+        _ => render_html(cfg, data, scopes, total_us, main_page, cfconfig, memory, true),
     }
+}
+
+// ── Memory panel ─────────────────────────────────────────────────────────────
+
+/// What the memory panel shows. Built by the VM when the request's memory was
+/// metered (allocation accounting on, i.e. debugging enabled).
+#[derive(Debug, Clone, Default)]
+pub struct MemoryPanel {
+    /// This request, on the thread that ran it, up to the moment the footer
+    /// renders (before the request-end cleanup).
+    pub request: cfml_common::mem_account::RequestMemory,
+    /// Bytes allocated by the `cfthread`s it joined.
+    pub threads_allocated: u64,
+    /// The containers it created, by kind, and what of them is still alive.
+    pub census: Option<cfml_common::cycle_gc::RequestCensus>,
+    /// Process: physical footprint, `--max-memory` limit, live heap.
+    pub footprint: Option<u64>,
+    pub limit: Option<u64>,
+    pub live_heap: Option<u64>,
+    /// Where the live heap is, estimated (see [`MemoryPot`]).
+    pub pots: Vec<MemoryPot>,
+    /// How old the pot estimates are, in seconds (they are cached).
+    pub pots_age_secs: u64,
+}
+
+/// One estimated share of the live heap.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryPot {
+    pub name: String,
+    pub bytes: u64,
+    /// Entry counts and the like.
+    pub detail: String,
+}
+
+/// Bytes as `1.23 MB` / `456.7 KB` / `89 B`.
+pub fn fmt_bytes(b: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = b as f64;
+    if f >= K * K * K {
+        format!("{:.2} GB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.2} MB", f / (K * K))
+    } else if f >= K {
+        format!("{:.1} KB", f / K)
+    } else {
+        format!("{} B", b)
+    }
+}
+
+/// Bytes as a plain KB number for a sortable column.
+fn fmt_kb(b: u64) -> String {
+    format!("{:.1}", b as f64 / 1024.0)
+}
+
+fn render_memory(s: &mut String, m: &MemoryPanel) {
+    let r = &m.request;
+    s.push_str("<h4 style=\"margin:6px 0 2px\">Request Memory</h4>\n");
+    s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+    let row = |s: &mut String, v: String, label: &str, title: &str| {
+        s.push_str(&format!(
+            "<tr title=\"{}\"><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+            title, v, label
+        ));
+    };
+    row(s, fmt_bytes(r.allocated), "Allocated by this request", "every byte this request allocated, including what it has since freed");
+    row(s, fmt_bytes(r.peak), "Peak in use", "the most memory this request held at any one time");
+    row(s, fmt_bytes(r.retained), "Still in use as the page ends", "allocated minus freed, before the request-end cleanup frees the page's own variables");
+    if let Some(c) = &m.census {
+        let swept = if c.sweeps == 0 {
+            "no collector sweeps yet".to_string()
+        } else {
+            format!("{} of it by {} collector sweep{}", fmt_bytes(c.swept_bytes), c.sweeps, if c.sweeps == 1 { "" } else { "s" })
+        };
+        row(s, fmt_bytes(r.freed), &format!("Freed so far ({})", swept), "bytes freed while the request ran, by reference counting and the cycle collector; the request-end cleanup comes after this panel");
+    } else {
+        row(s, fmt_bytes(r.freed), "Freed", "bytes freed while the request ran");
+    }
+    if m.threads_allocated > 0 {
+        row(s, fmt_bytes(m.threads_allocated), "Allocated by joined cfthreads", "allocated on the threads this request started and joined");
+    }
+    s.push_str("</table>\n");
+
+    // Objects by type: what the request created and still holds, with the
+    // component instances broken down by class under their row.
+    if let Some(c) = &m.census {
+        let kinds: [(&str, &cfml_common::cycle_gc::KindCensus); 5] = [
+            ("Structs", &c.structs),
+            ("Arrays", &c.arrays),
+            ("Queries", &c.queries),
+            ("Closure scopes", &c.scopes),
+            ("Component instances", &c.instances),
+        ];
+        let created: u64 = kinds.iter().map(|(_, k)| k.created).sum();
+        collapsible_heading(s, "rcfml-memobj", &format!("Objects created ({})", created));
+        s.push_str("<div class=\"rcfml-memobj\" style=\"display:none\">\n");
+        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        let any_classes = !c.classes.is_empty();
+        s.push_str(&format!(
+            "<tr><th style=\"text-align:center;width:1em\">{}</th>{}{}{}<th>type</th></tr>\n",
+            "",
+            sort_th("created", 1),
+            sort_th("alive", 2),
+            sort_th("alive KB (est.)", 3),
+        ));
+        for (name, k) in kinds {
+            let is_inst = name == "Component instances";
+            let toggle = if is_inst && any_classes {
+                tog_link("rcfml-memcls", "", "show the instances by component")
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "<tr><td style=\"text-align:center;width:1em\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+                toggle, k.created, k.alive, fmt_kb(k.alive_bytes), name
+            ));
+            if is_inst {
+                for (cls, ck) in &c.classes {
+                    s.push_str(&format!(
+                        "<tr class=\"rcfml-memcls rcfml-sub\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td style=\"padding-left:22px\">&#8627; {}</td></tr>\n",
+                        ck.created, ck.alive, fmt_kb(ck.alive_bytes), esc(cls)
+                    ));
+                }
+            }
+        }
+        s.push_str("</table>\n");
+        s.push_str("<div style=\"color:#555;margin:2px 0 4px\">Alive = still referenced as the page ends; the request-end cleanup frees what only the page held. Sizes are estimates, each object without the objects it holds (those count under their own type); strings and other values are included in the object that holds them.");
+        if c.incomplete {
+            s.push_str(" This request created more objects than the collector logs, so the alive figures are a lower bound.");
+        }
+        s.push_str("</div>\n</div>\n");
+    }
+
 }
 
 /// Flatten the difference between the EFFECTIVE cfconfig (server baseline +
@@ -724,6 +884,7 @@ fn render_comment(data: &DebugData, total_us: i64) -> String {
     s
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_html(
     cfg: &FooterCfg,
     data: &DebugData,
@@ -731,6 +892,7 @@ fn render_html(
     total_us: i64,
     main_page: Option<&str>,
     cfconfig: &[(String, String)],
+    memory: Option<&MemoryPanel>,
     modern: bool,
 ) -> String {
     let mut s = String::new();
@@ -784,7 +946,19 @@ fn render_html(
     // The whole section collapses behind its heading and starts CLOSED — on a
     // framework request it is hundreds of rows, and the summary above already
     // answers "where did the time go" at a glance.
-    let pages = aggregate_pages_with_main(&data.templates, main_page, total_us);
+    if let Some(m) = memory {
+        render_memory(&mut s, m);
+    }
+
+    let pages = aggregate_pages_with_main(
+        &data.templates,
+        main_page,
+        total_us,
+        memory.map(|m| m.request.allocated).unwrap_or(0),
+    );
+    // The per-file allocation column appears only when the request was
+    // metered; otherwise the table is exactly as it always was.
+    let mem_col = memory.is_some();
     if !pages.is_empty() {
         collapsible_heading(
             &mut s,
@@ -812,12 +986,13 @@ fn render_html(
         // and on the (common) query-free row it duplicated total exactly — so
         // the column carried no information the eye couldn't do itself.
         s.push_str(&format!(
-            "<tr><th style=\"text-align:center;width:1em\">{}</th>{}{}{}{}<th>file</th></tr>\n",
+            "<tr><th style=\"text-align:center;width:1em\">{}</th>{}{}{}{}{}<th>file</th></tr>\n",
             all_toggle,
             sort_th("total ms", 1),
             sort_th("query ms", 2),
             sort_th("count", 3),
             sort_th("avg ms", 4),
+            if mem_col { sort_th("alloc KB", 5) } else { String::new() },
         ));
         for (idx, p) in pages.iter().enumerate() {
             let avg = if p.count > 0 { p.total / p.count } else { 0 };
@@ -847,13 +1022,19 @@ fn render_html(
                     "show the per-method breakdown",
                 )
             };
+            let alloc_cell = if mem_col {
+                format!("<td class=\"txt-r\">{}</td>", fmt_kb(p.alloc))
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
-                "<tr><td style=\"text-align:center;width:1em\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+                "<tr><td style=\"text-align:center;width:1em\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td>{}<td>{}</td></tr>\n",
                 toggle,
                 fmt_us(p.total),
                 fmt_us(q_us),
                 p.count,
                 fmt_us(avg),
+                alloc_cell,
                 esc(&p.id),
             ));
             // A CFC row aggregates every method called on that file, so the file
@@ -866,12 +1047,18 @@ fn render_html(
                 // `rcfml-sub` marks the row as belonging to the file row above
                 // it, so a header-click sort moves the pair together and orders
                 // the methods the same way (see `FOOTER_SCRIPT`).
+                let m_alloc = if mem_col {
+                    format!("<td class=\"txt-r\">{}</td>", fmt_kb(m.alloc))
+                } else {
+                    String::new()
+                };
                 s.push_str(&format!(
-                    "<tr class=\"{} rcfml-mrow rcfml-sub\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td style=\"padding-left:22px\">&#8627; {}()</td></tr>\n",
+                    "<tr class=\"{} rcfml-mrow rcfml-sub\" style=\"display:none;color:#555\"><td></td><td class=\"txt-r\">{}</td><td></td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td>{}<td style=\"padding-left:22px\">&#8627; {}()</td></tr>\n",
                     grp,
                     fmt_us(m.total),
                     m.count,
                     fmt_us(m_avg),
+                    m_alloc,
                     esc(&m.name),
                 ));
             }
@@ -1003,7 +1190,8 @@ fn render_html(
     // cgi. The deploy-level blocks (cfconfig overrides, then the engine
     // environment: process env vars + CLI flags) render directly under the cgi
     // scope — the natural place to look for "what was this engine started with"
-    // while reading request context. Order: CFConfig, Environment, Runtime flags.
+    // while reading request context: one Runtime section holding CFConfig,
+    // Environment, Flags and the process memory.
     //
     // These are bulk dumps — a cgi scope alone is ~30 rows and the environment
     // block can be hundreds — so each one collapses behind its heading and
@@ -1025,14 +1213,12 @@ fn render_html(
         }
         s.push_str("</table>\n");
         if name.eq_ignore_ascii_case("cgi") {
-            render_cfconfig(&mut s, cfconfig);
-            render_env_and_flags(&mut s);
+            render_runtime(&mut s, cfconfig, memory);
             env_rendered = true;
         }
     }
     if !env_rendered {
-        render_cfconfig(&mut s, cfconfig);
-        render_env_and_flags(&mut s);
+        render_runtime(&mut s, cfconfig, memory);
     }
 
     s.push_str("</div>\n</template></div>\n");
@@ -1040,8 +1226,70 @@ fn render_html(
     s
 }
 
-/// Render the engine's process environment variables and the runtime flags
-/// (CLI arguments) it was started with.
+/// Runtime: how this engine is running. One collapsed section holding the
+/// deploy's cfconfig overrides, the process environment, the flags it was
+/// started with and (when the request was metered) the process's memory, each
+/// a collapsed block of its own.
+fn render_runtime(s: &mut String, cfconfig: &[(String, String)], memory: Option<&MemoryPanel>) {
+    collapsible_heading(s, "rcfml-runtime", "Runtime");
+    s.push_str("<div class=\"rcfml-runtime\" style=\"display:none;padding-left:16px\">\n");
+    render_cfconfig(s, cfconfig);
+    render_env_and_flags(s);
+    if let Some(m) = memory {
+        render_process_memory(s, m);
+    }
+    s.push_str("</div>\n");
+}
+
+/// The process's memory (Runtime > Memory): what the OS sees, and where the
+/// live heap is.
+fn render_process_memory(s: &mut String, m: &MemoryPanel) {
+    let row = |s: &mut String, v: String, label: &str, title: &str| {
+        s.push_str(&format!(
+            "<tr title=\"{}\"><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+            title, v, label
+        ));
+    };
+    if m.footprint.is_some() || m.live_heap.is_some() || !m.pots.is_empty() {
+        collapsible_heading(s, "rcfml-memproc", "Memory");
+        s.push_str("<div class=\"rcfml-memproc\" style=\"display:none\">\n");
+        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        if let Some(f) = m.footprint {
+            let lim = match m.limit {
+                Some(l) => format!(" of the {} limit", fmt_bytes(l)),
+                None => String::new(),
+            };
+            row(s, fmt_bytes(f), &format!("Footprint{}", lim), "physical memory the OS charges this process: what --max-memory and the OOM killer act on");
+        }
+        if let Some(l) = m.live_heap {
+            row(s, fmt_bytes(l), "Live heap", "bytes allocated and not yet freed, across every thread");
+            if let Some(f) = m.footprint {
+                row(s, fmt_bytes(f.saturating_sub(l)), "Outside the live heap", "footprint minus live heap: the engine's own code and thread stacks, and memory the allocator keeps for reuse rather than returning to the OS");
+            }
+        }
+        s.push_str("</table>\n");
+        if !m.pots.is_empty() {
+            s.push_str(&format!(
+                "<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse;margin-top:4px\">\n<tr><th>est. size</th><th>what</th><th>detail</th></tr>\n"
+            ));
+            for p in &m.pots {
+                s.push_str(&format!(
+                    "<tr><td class=\"txt-r\">{}</td><td>{}</td><td>{}</td></tr>\n",
+                    fmt_bytes(p.bytes), esc(&p.name), esc(&p.detail)
+                ));
+            }
+            s.push_str("</table>\n");
+        }
+        s.push_str(&format!(
+            "<div style=\"color:#555;margin:2px 0 4px\">Breakdown estimated from the data structures, refreshed at most every 30 s ({} s old). \"Other\" is the rest of the live heap: requests in flight, the engine itself, database driver buffers.</div>\n",
+            m.pots_age_secs
+        ));
+        s.push_str("</div>\n");
+    }
+}
+
+/// The engine's process environment variables and the flags (CLI arguments)
+/// it was started with.
 fn render_env_and_flags(s: &mut String) {
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
     envs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1074,7 +1322,7 @@ fn render_env_and_flags(s: &mut String) {
     }
 
     let flags: Vec<String> = std::env::args().skip(1).collect();
-    collapsible_heading(s, "rcfml-flags", &format!("Runtime flags ({})", flags.len()));
+    collapsible_heading(s, "rcfml-flags", &format!("Flags ({})", flags.len()));
     if flags.is_empty() {
         s.push_str("<div class=\"rcfml-flags\" style=\"display:none\">(none)</div>\n");
     } else {
@@ -1152,7 +1400,7 @@ fn to_cfml_struct(
     root.insert("queries", CfmlValue::array(queries));
 
     // pages
-    let pages: Vec<CfmlValue> = aggregate_pages_with_main(&data.templates, main_page, total_us)
+    let pages: Vec<CfmlValue> = aggregate_pages_with_main(&data.templates, main_page, total_us, 0)
         .into_iter()
         .map(|p| {
             let mut m = ValueMap::default();
@@ -1286,6 +1534,7 @@ mod tests {
             path: "/header.cfm",
             method: None,
             elapsed_us: 2_000,
+            alloc_bytes: 0,
         });
         // Two different methods on one CFC — the per-file row must break down
         // into per-method sub-rows rather than showing a bare count of 3.
@@ -1293,16 +1542,19 @@ mod tests {
             path: "/services/UserService.cfc",
             method: Some("getUser"),
             elapsed_us: 1_000,
+            alloc_bytes: 0,
         });
         c.on_template(&TemplateEvent {
             path: "/services/UserService.cfc",
             method: Some("GETUSER"),
             elapsed_us: 3_000,
+            alloc_bytes: 0,
         });
         c.on_template(&TemplateEvent {
             path: "/services/UserService.cfc",
             method: Some("saveUser"),
             elapsed_us: 500,
+            alloc_bytes: 0,
         });
         c.on_error(&ErrorEvent {
             etype: "Custom.Boom",
@@ -1321,12 +1573,12 @@ mod tests {
     fn main_page_row_is_self_time_not_the_request_total() {
         // Four frames totalling 6,500us of self time inside a 10,000us request.
         let hits = vec![
-            TemplateHit { path: "/header.cfm".into(), method: String::new(), time: 2_000 },
-            TemplateHit { path: "/svc.cfc".into(), method: "a".into(), time: 1_000 },
-            TemplateHit { path: "/svc.cfc".into(), method: "b".into(), time: 3_000 },
-            TemplateHit { path: "/svc.cfc".into(), method: "c".into(), time: 500 },
+            TemplateHit { path: "/header.cfm".into(), method: String::new(), time: 2_000, alloc: 0 },
+            TemplateHit { path: "/svc.cfc".into(), method: "a".into(), time: 1_000, alloc: 0 },
+            TemplateHit { path: "/svc.cfc".into(), method: "b".into(), time: 3_000, alloc: 0 },
+            TemplateHit { path: "/svc.cfc".into(), method: "c".into(), time: 500, alloc: 0 },
         ];
-        let pages = aggregate_pages_with_main(&hits, Some("/index.cfm"), 10_000);
+        let pages = aggregate_pages_with_main(&hits, Some("/index.cfm"), 10_000, 0);
 
         // The requested page reports what it spent in its OWN body, not the
         // request total — booking the total here double-counted every frame
@@ -1345,7 +1597,7 @@ mod tests {
 
         // A page that did all its work inside frames reports zero rather than
         // going negative on per-frame microsecond truncation.
-        let all_in_frames = aggregate_pages_with_main(&hits, Some("/index.cfm"), 6_000);
+        let all_in_frames = aggregate_pages_with_main(&hits, Some("/index.cfm"), 6_000, 0);
         assert_eq!(all_in_frames.iter().find(|p| p.id == "/index.cfm").unwrap().total, 0);
     }
 
@@ -1376,7 +1628,8 @@ mod tests {
         assert!(html.contains(&format!("RustCFML v{} Debug", env!("CARGO_PKG_VERSION"))));
         // engine environment renders even without a cgi scope in the snapshot
         assert!(html.contains("Environment variables ("));
-        assert!(html.contains("Runtime flags ("));
+        assert!(html.contains("Flags ("));
+        assert!(html.contains(">Runtime</h4>"));
         assert!(html.contains("Queries (2)"));
         assert!(html.contains("SELECT * FROM users"));
         // bound parameters are shown under the SQL (Lucee parity)
@@ -1511,13 +1764,14 @@ mod tests {
             at("url scope"),
             at("form scope"),
             at("cgi scope"),
+            at("Runtime</h4>"),
             at("CFConfig ("),
             at("Environment variables ("),
-            at("Runtime flags ("),
+            at("Flags ("),
         ];
         assert!(
             order.windows(2).all(|w| w[0] < w[1]),
-            "expected URL, FORM, CGI, CFConfig, Environment, Runtime flags — got offsets {order:?}"
+            "expected URL, FORM, CGI, Runtime, CFConfig, Environment, Flags — got offsets {order:?}"
         );
     }
 
@@ -1650,6 +1904,66 @@ mod tests {
         // inline handlers.
         assert!(!html.contains("window."));
         assert!(!html.contains("onclick"));
+    }
+
+    #[test]
+    fn memory_panel_renders_only_when_metered() {
+        use cfml_common::cycle_gc::{KindCensus, RequestCensus};
+        let c = sample_collector();
+        let plain = c.render(&[], Some("/index.cfm"), &[]);
+        assert!(!plain.contains("Allocated by this request"));
+        assert!(!plain.contains("alloc KB"), "no allocation column without metering");
+
+        let panel = MemoryPanel {
+            request: cfml_common::mem_account::RequestMemory {
+                allocated: 3 * 1024 * 1024,
+                freed: 1024 * 1024,
+                peak: 2 * 1024 * 1024,
+                retained: 2 * 1024 * 1024,
+            },
+            census: Some(RequestCensus {
+                structs: KindCensus { created: 40, alive: 7, alive_bytes: 2048 },
+                instances: KindCensus { created: 3, alive: 3, alive_bytes: 900 },
+                classes: vec![("models.User".to_string(), KindCensus { created: 3, alive: 3, alive_bytes: 900 })],
+                sweeps: 2,
+                swept_bytes: 512 * 1024,
+                ..Default::default()
+            }),
+            footprint: Some(200 * 1024 * 1024),
+            limit: Some(1024 * 1024 * 1024),
+            live_heap: Some(50 * 1024 * 1024),
+            pots: vec![MemoryPot { name: "Compiled code".into(), bytes: 4096, detail: "3 files".into() }],
+            ..Default::default()
+        };
+        let html = c.render_with_memory(&[], Some("/index.cfm"), &[], Some(&panel));
+        for needle in [
+            "<td class=\"txt-r\">3.00 MB</td><td>Allocated by this request</td>",
+            "<td class=\"txt-r\">2.00 MB</td><td>Peak in use</td>",
+            "Freed so far (512.0 KB of it by 2 collector sweeps)",
+            "Objects created (43)",
+            "&#8627; models.User",
+            "Footprint of the 1.00 GB limit",
+            "<td class=\"txt-r\">150.00 MB</td><td>Outside the live heap</td>",
+            "Compiled code",
+            "data-rcfml-sort=\"5\" title=\"sort by alloc KB\"",
+        ] {
+            assert!(html.contains(needle), "missing {needle:?}");
+        }
+        // The panel sits between Execution Time and Files.
+        let mem = html.find("Allocated by this request").unwrap();
+        assert!(html.find("Execution Time").unwrap() < mem);
+        assert!(mem < html.find("Files (Templates/Tags/CFCs)").unwrap());
+    }
+
+    #[test]
+    fn main_page_allocation_is_the_residual_of_the_frames() {
+        let hits = vec![
+            TemplateHit { path: "/a.cfm".into(), method: String::new(), time: 10, alloc: 300 },
+            TemplateHit { path: "/svc.cfc".into(), method: "go".into(), time: 10, alloc: 200 },
+        ];
+        let pages = aggregate_pages_with_main(&hits, Some("/index.cfm"), 100, 1000);
+        assert_eq!(pages[0].alloc, 500, "1000 allocated, 500 of it in frames");
+        assert_eq!(pages[2].methods[0].alloc, 200);
     }
 
     #[test]

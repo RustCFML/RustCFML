@@ -1,0 +1,4 @@
+{
+	"debugging": { "enabled": true },
+	"observability": { "enabled": true, "metrics": { "enabled": true } }
+}

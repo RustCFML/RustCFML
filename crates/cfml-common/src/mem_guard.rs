@@ -44,6 +44,11 @@ static PRESSURE: AtomicBool = AtomicBool::new(false);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static ABORTED: AtomicUsize = AtomicUsize::new(0);
 
+/// Requests aborted by the hard tier so far.
+pub fn aborted_total() -> u64 {
+    ABORTED.load(Ordering::Relaxed) as u64
+}
+
 /// One in-flight request. Shared between its own thread (which publishes its
 /// odometer and polls `abort`) and the watchdog (which reads odometers and sets
 /// `abort` on exactly one of them).

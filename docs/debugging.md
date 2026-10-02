@@ -88,11 +88,13 @@ client IP rather than the proxy's (see the config reference below).
 |---|---|
 | **Queries** | Each `queryExecute` / `<cfquery>`: name, execution time, recordcount, datasource and issuing `template:line` on one line, with the SQL and the **bound parameters** (value + cfsqltype) in a collapsed sub-row behind that row's `+`. |
 | **Execution Time** | The request total, split into **Application** and **Query** time. |
-| **Files (Templates/Tags/CFCs)** | Every file executed — the requested page, each `<cfinclude>`, every custom tag and `<cfmodule>` body, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg. A CFC row is followed by indented `↳ method()` sub-rows giving the total / count / avg **per method**, so a file with 321 executions shows which methods those were. Same scope as Lucee's Execution Time section ("templates, includes, modules, custom tags, and component method calls"); a body tag's start and end phases count as two executions, as they do on Lucee. |
+| **Request Memory** | What this request allocated, its peak, what it still holds as the page ends, and what it has freed so far (and how much of that the cycle collector freed). Under it, **Objects created**: structs, arrays, queries, closure scopes and component instances, each with how many were created, how many are still alive and their estimated size, and component instances broken down by class. See [Memory management](memory.md#per-request-memory). |
+| **Files (Templates/Tags/CFCs)** | Every file executed — the requested page, each `<cfinclude>`, every custom tag and `<cfmodule>` body, `Application.cfc` lifecycle methods, and CFC method calls — aggregated per file with total / app / query / count / avg, and, when the request's memory is measured, the bytes each file allocated (**alloc KB**). A CFC row is followed by indented `↳ method()` sub-rows giving the total / count / avg **per method**, so a file with 321 executions shows which methods those were. Same scope as Lucee's Execution Time section ("templates, includes, modules, custom tags, and component method calls"); a body tag's start and end phases count as two executions, as they do on Lucee. |
 | **Exceptions** | Exceptions raised during the request (including ones caught by `try`/`catch`), with type, message and tag context. |
 | **Trace / Log** | `writeLog` / `<cflog>` and `trace` / `<cftrace>` entries. |
 | **Generic data** | App- and framework-injected panels (see `debugAdd` below). |
-| **Scopes** | The configured request scopes (`cgi`, `url`, `form`, … — never `variables`/`local`), plus the deploy blocks (CFConfig overrides, environment variables, runtime flags). Each is collapsed behind its heading. |
+| **Scopes** | The configured request scopes (`cgi`, `url`, `form`, … — never `variables`/`local`). Each is collapsed behind its heading. |
+| **Runtime** | How the engine is running, each block collapsed behind its own heading: **CFConfig** (the settings this deploy changes from the defaults), **Environment variables**, **Flags** (the command line), and **Memory** (the process footprint, live heap and an estimated breakdown of where it is). |
 
 ### Expanding and collapsing
 
@@ -103,8 +105,9 @@ and open on a `+` you click:
   column header opens every query at once.
 - **Files** — the `+` on a CFC row reveals its per-method breakdown; the `+` in
   the column header opens every file at once.
-- **Scopes, CFConfig, Environment variables, Runtime flags** — the `+` on the
-  heading reveals that block.
+- **Objects created, Scopes, Runtime and each block inside it** — the `+` on the
+  heading reveals that block. In Objects created, the `+` on the component
+  instances row lists them by class.
 
 It is one small inline script and inline styles — no external assets, and
 nothing is fetched. The `comment` template has no toggles (it is plain text).
@@ -250,11 +253,16 @@ Then point Prometheus at `http://<host>:<port>/__rustcfml/metrics`:
 | `rustcfml_http_request_duration_seconds` (histogram) | `route` |
 | `rustcfml_db_queries_total` | `datasource` |
 | `rustcfml_db_query_duration_seconds` (histogram) | `datasource` |
+| `rustcfml_request_memory_allocated_bytes`, `_peak_bytes`, `_retained_bytes` (histograms) | `route` — recorded only while debugging is enabled |
+| `rustcfml_memory_*`, `rustcfml_gc_*` (gauges and counters) | — footprint, live heap, collector sweeps and what they freed; listed in [Memory management](memory.md#prometheus) |
 
 The endpoint is served by the engine, so anyone who can reach the server can read
 it; restrict it at your proxy if the route names are sensitive.
 
 #### Dashboards built for a Lucee container (`jvmCompatibility`)
+
+Use the `rustcfml_*` metrics above where you can. This option is for a dashboard
+you can't easily change.
 
 A Lucee container usually runs the Prometheus JMX exporter, and its dashboards query
 JVM metric names. With `"jvmCompatibility": true` in `observability.metrics`, the

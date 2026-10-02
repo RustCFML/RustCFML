@@ -27,10 +27,11 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[global_allocator]
 static ALLOC: rustcfml_cli::memprofile::SamplingAlloc = rustcfml_cli::memprofile::SamplingAlloc;
 
-// mimalloc (feature `mimalloc`). Sizing/perf lever: allocator work is ~27% of a
-// warm Preside request, and the default build inherits the platform malloc. The
-// two profiler allocators above take precedence, since a build that asked for a
-// heap profile must keep getting one.
+// mimalloc (feature `mimalloc`), wrapped for allocation accounting (see
+// `rustcfml_cli::AccountingAlloc`). Sizing/perf lever: allocator work is ~27% of
+// a warm Preside request, and the default build inherits the platform malloc.
+// The two profiler allocators above take precedence, since a build that asked
+// for a heap profile must keep getting one.
 #[cfg(all(
     feature = "mimalloc",
     not(feature = "frame-census"),
@@ -38,7 +39,7 @@ static ALLOC: rustcfml_cli::memprofile::SamplingAlloc = rustcfml_cli::memprofile
     not(all(feature = "memprofile", unix))
 ))]
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: rustcfml_cli::AccountingAlloc = rustcfml_cli::AccountingAlloc;
 
 // Counting allocator (feature `frame-census`). Wraps mimalloc and tallies every
 // allocation into a thread-local the per-frame census reads, so allocations can

@@ -411,6 +411,7 @@ pub fn install(limit: MemoryLimit) {
     if ENFORCER.set(Enforcer::new(limit)).is_err() {
         return;
     }
+    cfml_common::mem_account::set_limit_bytes(limit.max);
     cfml_common::mem_guard::enable();
     start_watchdog(limit);
 }

@@ -108,12 +108,57 @@ pub fn collection_time_ms() -> u64 {
     COLLECTION_NANOS.load(Ordering::Relaxed) / 1_000_000
 }
 
-/// Adds its lifetime to [`COLLECTION_NANOS`], on every exit path.
-struct CollectionTimer(std::time::Instant);
+/// Sweeps run, process-wide.
+static SWEEPS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes freed by sweeps, process-wide, and by the most recent one. Measured by
+/// the allocation accounting (`mem_account`), so zero while it is off.
+static FREED_BYTES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FREED_BYTES_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of sweeps run so far.
+pub fn sweeps_total() -> u64 {
+    SWEEPS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Cycle nodes reclaimed so far.
+pub fn reclaimed_nodes_total() -> u64 {
+    COLLECTED_TOTAL.load(Ordering::Relaxed) as u64
+}
+
+/// Bytes freed by sweeps so far, and by the latest sweep, when allocation
+/// accounting is on.
+pub fn freed_bytes() -> Option<(u64, u64)> {
+    crate::mem_account::is_enabled().then(|| {
+        (
+            FREED_BYTES_TOTAL.load(Ordering::Relaxed),
+            FREED_BYTES_LAST.load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// Adds its lifetime to [`COLLECTION_NANOS`], and the bytes the pass freed on
+/// this thread to the freed-bytes totals, on every exit path.
+struct CollectionTimer(std::time::Instant, u64);
+
+impl CollectionTimer {
+    fn start() -> Self {
+        Self(std::time::Instant::now(), crate::mem_account::thread_totals().freed)
+    }
+}
 
 impl Drop for CollectionTimer {
     fn drop(&mut self) {
         COLLECTION_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SWEEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if crate::mem_account::is_enabled() {
+            let freed = crate::mem_account::thread_totals().freed.saturating_sub(self.1);
+            FREED_BYTES_TOTAL.fetch_add(freed, Ordering::Relaxed);
+            FREED_BYTES_LAST.store(freed, Ordering::Relaxed);
+            let _ = REQUEST_GC.try_with(|g| {
+                let (n, b) = g.get();
+                g.set((n + 1, b + freed));
+            });
+        }
     }
 }
 
@@ -274,6 +319,7 @@ pub fn enable() {
     NEXT_MAJOR.with(|c| c.set(incremental_threshold()));
     LOG_PAUSED.with(|c| c.set(false));
     RELOG_SEEN.with(|c| c.borrow_mut().clear());
+    reset_request_census();
 }
 
 thread_local! {
@@ -618,6 +664,7 @@ pub fn track_all() -> bool {
 pub fn log_struct(arc: &Arc<PlRwLock<StructInner>>) {
     if is_armed() {
         log_push(TrackedAlloc::Struct(Arc::downgrade(arc)));
+        count_created(KIND_STRUCT);
         maybe_sample();
     }
 }
@@ -626,6 +673,7 @@ pub fn log_struct(arc: &Arc<PlRwLock<StructInner>>) {
 pub fn log_array(arc: &Arc<PlRwLock<Vec<CfmlValue>>>) {
     if is_armed() {
         log_push(TrackedAlloc::Array(Arc::downgrade(arc)));
+        count_created(KIND_ARRAY);
         maybe_sample();
     }
 }
@@ -634,6 +682,7 @@ pub fn log_array(arc: &Arc<PlRwLock<Vec<CfmlValue>>>) {
 pub fn log_query(arc: &Arc<PlRwLock<CfmlQueryData>>) {
     if is_armed() {
         log_push(TrackedAlloc::Query(Arc::downgrade(arc)));
+        count_created(KIND_QUERY);
     }
 }
 
@@ -646,6 +695,12 @@ pub fn log_query(arc: &Arc<PlRwLock<CfmlQueryData>>) {
 pub fn log_instance(arc: &Arc<PlRwLock<Instance>>) {
     if is_armed() {
         log_push(TrackedAlloc::Instance(Arc::downgrade(arc)));
+        if count_created(KIND_INSTANCE) {
+            if let Some(i) = arc.try_read() {
+                let name = i.class.name.clone();
+                let _ = CLASS_CREATED.try_with(|m| *m.borrow_mut().entry(name).or_insert(0) += 1);
+            }
+        }
     }
 }
 
@@ -671,8 +726,246 @@ pub fn tracked_scope(map: ValueMap) -> Arc<RwLock<ValueMap>> {
     let arc = Arc::new(RwLock::new(map));
     if is_armed() {
         log_push(TrackedAlloc::Scope(Arc::downgrade(&arc)));
+        count_created(KIND_SCOPE);
     }
     arc
+}
+
+// ── Per-request object census (debug mode) ──────────────────────────────────
+//
+// While allocation accounting is on (`mem_account`, i.e. debugging is
+// enabled), each request counts the containers it creates by kind, and
+// component instances by class. [`request_census`] adds what of that is still
+// alive, from the request's own allocation log, for the debug footer's memory
+// panel. Counting is off when accounting is, and a relog (a displaced graph
+// re-entered into the log) is not a creation.
+
+const KIND_STRUCT: usize = 0;
+const KIND_ARRAY: usize = 1;
+const KIND_QUERY: usize = 2;
+const KIND_SCOPE: usize = 3;
+const KIND_INSTANCE: usize = 4;
+
+thread_local! {
+    static CREATED: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    static CLASS_CREATED: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+    static IN_RELOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Sweeps this request ran and the bytes they freed.
+    static REQUEST_GC: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Count one creation; true when counted.
+#[inline]
+fn count_created(kind: usize) -> bool {
+    if !crate::mem_account::is_enabled() || IN_RELOG.with(|r| r.get()) {
+        return false;
+    }
+    CREATED.with(|c| {
+        let mut v = c.get();
+        v[kind] += 1;
+        c.set(v);
+    });
+    true
+}
+
+/// Mark this thread as relogging (re-entering a displaced graph) for the
+/// guard's lifetime, so those entries are not counted as creations.
+pub(crate) struct RelogGuard(bool);
+
+impl RelogGuard {
+    pub(crate) fn new() -> Self {
+        Self(IN_RELOG.with(|r| r.replace(true)))
+    }
+}
+
+impl Drop for RelogGuard {
+    fn drop(&mut self) {
+        IN_RELOG.with(|r| r.set(self.0));
+    }
+}
+
+fn reset_request_census() {
+    CREATED.with(|c| c.set([0; 5]));
+    CLASS_CREATED.with(|m| m.borrow_mut().clear());
+    REQUEST_GC.with(|g| g.set((0, 0)));
+}
+
+/// One kind of container in [`RequestCensus`].
+#[derive(Debug, Clone, Default)]
+pub struct KindCensus {
+    /// Created by this request.
+    pub created: u64,
+    /// Still alive (of those it logged) when the census was taken.
+    pub alive: u64,
+    /// Estimated size of the alive ones, each counted without the containers
+    /// it holds (those are counted under their own kind).
+    pub alive_bytes: u64,
+}
+
+/// What one request created and still holds, by kind of container.
+#[derive(Debug, Clone, Default)]
+pub struct RequestCensus {
+    pub structs: KindCensus,
+    pub arrays: KindCensus,
+    pub queries: KindCensus,
+    pub scopes: KindCensus,
+    pub instances: KindCensus,
+    /// Component instances by class: `(class, census)`, most alive bytes first.
+    pub classes: Vec<(String, KindCensus)>,
+    /// Sweeps this request ran, and the bytes they freed.
+    pub sweeps: u64,
+    pub swept_bytes: u64,
+    /// The log hit its cap and stopped recording, so the alive figures are a
+    /// lower bound.
+    pub incomplete: bool,
+}
+
+fn scalar_bytes(v: &CfmlValue, strings: &mut PtrSet) -> u64 {
+    match v {
+        CfmlValue::String(st) => {
+            if strings.insert(Arc::as_ptr(st) as *const () as usize) {
+                24 + st.len() as u64
+            } else {
+                0
+            }
+        }
+        CfmlValue::Binary(b) => b.len() as u64,
+        CfmlValue::Function(_) => 96,
+        _ => 0,
+    }
+}
+
+fn map_bytes<'a>(entries: impl Iterator<Item = (&'a str, &'a CfmlValue)>, strings: &mut PtrSet) -> u64 {
+    let mut n = 32;
+    for (k, v) in entries {
+        n += 40 + k.len() as u64 + scalar_bytes(v, strings);
+    }
+    n
+}
+
+/// This thread's census: what the running request created, and what of it is
+/// still alive. Walks the request's allocation log (young and old generation),
+/// so call it while the request runs; it is empty once the log has been
+/// collected. Sizes are estimates.
+pub fn request_census() -> RequestCensus {
+    let created = CREATED.with(|c| c.get());
+    let mut out = RequestCensus {
+        structs: KindCensus { created: created[KIND_STRUCT], ..Default::default() },
+        arrays: KindCensus { created: created[KIND_ARRAY], ..Default::default() },
+        queries: KindCensus { created: created[KIND_QUERY], ..Default::default() },
+        scopes: KindCensus { created: created[KIND_SCOPE], ..Default::default() },
+        instances: KindCensus { created: created[KIND_INSTANCE], ..Default::default() },
+        ..Default::default()
+    };
+    let (sweeps, swept) = REQUEST_GC.with(|g| g.get());
+    out.sweeps = sweeps;
+    out.swept_bytes = swept;
+    out.incomplete = LOG_PAUSED.with(|p| p.get());
+    let mut classes: HashMap<String, KindCensus> = HashMap::new();
+    CLASS_CREATED.with(|m| {
+        for (k, n) in m.borrow().iter() {
+            classes.entry(k.clone()).or_default().created = *n;
+        }
+    });
+    let mut entries: Vec<TrackedAlloc> = Vec::new();
+    ALLOC_LOG.with(|l| {
+        if let Ok(l) = l.try_borrow() {
+            if let Some(v) = l.as_ref() {
+                entries.extend(v.iter().cloned());
+            }
+        }
+    });
+    OLD_LOG.with(|l| {
+        if let Ok(l) = l.try_borrow() {
+            entries.extend(l.iter().cloned());
+        }
+    });
+    let mut seen = PtrSet::default();
+    let mut strings = PtrSet::default();
+    for e in &entries {
+        match e {
+            TrackedAlloc::Struct(w) => {
+                let Some(a) = w.upgrade() else { continue };
+                if !seen.insert(Arc::as_ptr(&a) as *const () as usize) {
+                    continue;
+                }
+                let b = a
+                    .try_read()
+                    .map(|g| map_bytes(g.map.iter().map(|(k, v)| (k.as_str(), v)), &mut strings))
+                    .unwrap_or(32);
+                out.structs.alive += 1;
+                out.structs.alive_bytes += b;
+            }
+            TrackedAlloc::Array(w) => {
+                let Some(a) = w.upgrade() else { continue };
+                if !seen.insert(Arc::as_ptr(&a) as *const () as usize) {
+                    continue;
+                }
+                let b = a
+                    .try_read()
+                    .map(|v| 32 + v.len() as u64 * 24 + v.iter().map(|x| scalar_bytes(x, &mut strings)).sum::<u64>())
+                    .unwrap_or(32);
+                out.arrays.alive += 1;
+                out.arrays.alive_bytes += b;
+            }
+            TrackedAlloc::Query(w) => {
+                let Some(a) = w.upgrade() else { continue };
+                if !seen.insert(Arc::as_ptr(&a) as *const () as usize) {
+                    continue;
+                }
+                let b = a
+                    .try_read()
+                    .map(|d| {
+                        32 + d.columns.iter().map(|c| c.len() as u64 + 24).sum::<u64>()
+                            + d.data
+                                .iter()
+                                .map(|col| col.len() as u64 * 24 + col.iter().map(|x| scalar_bytes(x, &mut strings)).sum::<u64>())
+                                .sum::<u64>()
+                    })
+                    .unwrap_or(32);
+                out.queries.alive += 1;
+                out.queries.alive_bytes += b;
+            }
+            TrackedAlloc::Scope(w) => {
+                let Some(a) = w.upgrade() else { continue };
+                if !seen.insert(Arc::as_ptr(&a) as *const () as usize) {
+                    continue;
+                }
+                let b = a
+                    .try_read()
+                    .map(|m| map_bytes(m.iter().map(|(k, v)| (k.as_str(), v)), &mut strings))
+                    .unwrap_or(32);
+                out.scopes.alive += 1;
+                out.scopes.alive_bytes += b;
+            }
+            #[cfg(feature = "component-instance")]
+            TrackedAlloc::Instance(w) => {
+                let Some(a) = w.upgrade() else { continue };
+                if !seen.insert(Arc::as_ptr(&a) as *const () as usize) {
+                    continue;
+                }
+                let Some(i) = a.try_read() else { continue };
+                let mut b = 64;
+                for m in [&i.this_members, &i.variables_members] {
+                    b += m.with_read(|g| map_bytes(g.iter().map(|(k, v)| (k.as_str(), v)), &mut strings));
+                }
+                out.instances.alive += 1;
+                out.instances.alive_bytes += b;
+                let c = classes.entry(i.class.name.clone()).or_default();
+                c.alive += 1;
+                c.alive_bytes += b;
+            }
+        }
+    }
+    let mut classes: Vec<(String, KindCensus)> = classes.into_iter().collect();
+    classes.sort_by(|a, b| {
+        b.1.alive_bytes
+            .cmp(&a.1.alive_bytes)
+            .then(b.1.created.cmp(&a.1.created))
+            .then(a.0.cmp(&b.0))
+    });
+    out.classes = classes;
+    out
 }
 
 // --- The collection pass -----------------------------------------------------
@@ -1667,7 +1960,7 @@ fn collect_from_log_carrying(
     mut log: Vec<TrackedAlloc>,
     carry: Option<&mut Vec<(usize, TrackedAlloc)>>,
 ) -> usize {
-    let _timer = CollectionTimer(std::time::Instant::now());
+    let _timer = CollectionTimer::start();
     if log.is_empty() {
         recycle_log(log);
         return 0;
@@ -2539,6 +2832,36 @@ mod incremental_tests {
         a.insert("b".to_string(), CfmlValue::Struct(b.clone()));
         b.insert("a".to_string(), CfmlValue::Struct(a.clone()));
         (a, b)
+    }
+
+    /// The request census counts what was created by kind and what is still
+    /// alive, and a relog is not a creation.
+    #[test]
+    fn request_census_counts_created_and_alive() {
+        std::thread::spawn(|| {
+            crate::mem_account::enable();
+            arm();
+            enable();
+            let keep = CfmlStruct::new(ValueMap::default());
+            keep.insert("s".to_string(), CfmlValue::string("x".repeat(100)));
+            for _ in 0..9 {
+                drop(CfmlStruct::new(ValueMap::default()));
+            }
+            let arr = CfmlValue::array(vec![CfmlValue::Int(1)]);
+            let c = request_census();
+            assert_eq!(c.structs.created, 10);
+            assert_eq!(c.structs.alive, 1, "nine were dropped");
+            assert!(c.structs.alive_bytes >= 100, "the kept struct holds a 100-char string");
+            assert_eq!(c.arrays.created, 1);
+            assert_eq!(c.arrays.alive, 1);
+            // Re-entering a graph into the log is not creating it.
+            CfmlValue::Struct(keep.clone()).relog_cycle_nodes();
+            assert_eq!(request_census().structs.created, 10);
+            drop((keep, arr));
+            disable_and_clear();
+        })
+        .join()
+        .unwrap();
     }
 
     /// A mid-request sweep must reclaim unreachable cycles WITHOUT waiting for

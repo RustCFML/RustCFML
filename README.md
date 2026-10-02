@@ -119,7 +119,7 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 | **[Observability ops](docs/observability-ops.md)** | Tail sampling at an OTel Collector (keep slow/errored traces off the app host) + a one-command Collector → Tempo → Grafana stack |
 | **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
 | **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
-| **[Memory management](docs/memory.md)** | How memory is freed (reference counting + a cycle collector, no JVM heap), `--max-memory`, what memory is used for, the metrics available, diagnostics and tuning |
+| **[Memory management](docs/memory.md)** | How memory is freed (reference counting + a cycle collector, no JVM heap), `--max-memory`, what memory is used for, per-request memory in the debug footer and Prometheus, diagnostics and tuning |
 
 ### Concurrency & realtime
 

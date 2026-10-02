@@ -39,13 +39,58 @@ pub mod memory_limit;
     not(feature = "dhat-heap"),
     not(all(feature = "memprofile", unix))
 ))]
-pub type DefaultAlloc = mimalloc::MiMalloc;
+pub type DefaultAlloc = AccountingAlloc;
 #[cfg(all(
     feature = "mimalloc",
     not(feature = "dhat-heap"),
     not(all(feature = "memprofile", unix))
 ))]
-pub const DEFAULT_ALLOC: DefaultAlloc = mimalloc::MiMalloc;
+pub const DEFAULT_ALLOC: DefaultAlloc = AccountingAlloc;
+
+/// The release binary's global allocator: mimalloc, plus the per-thread byte
+/// counts behind the debug footer's memory panel and the per-request memory
+/// metrics (`cfml_common::mem_account`). Counting is on only while debugging is
+/// enabled; otherwise each call adds one relaxed load and a predictable branch.
+#[cfg(all(
+    feature = "mimalloc",
+    not(feature = "dhat-heap"),
+    not(all(feature = "memprofile", unix))
+))]
+pub struct AccountingAlloc;
+
+#[cfg(all(
+    feature = "mimalloc",
+    not(feature = "dhat-heap"),
+    not(all(feature = "memprofile", unix))
+))]
+unsafe impl std::alloc::GlobalAlloc for AccountingAlloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        cfml_common::mem_account::note_alloc(layout.size());
+        std::alloc::GlobalAlloc::alloc(&mimalloc::MiMalloc, layout)
+    }
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        cfml_common::mem_account::note_free(layout.size());
+        std::alloc::GlobalAlloc::dealloc(&mimalloc::MiMalloc, ptr, layout)
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        cfml_common::mem_account::note_alloc(layout.size());
+        std::alloc::GlobalAlloc::alloc_zeroed(&mimalloc::MiMalloc, layout)
+    }
+    #[inline]
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        cfml_common::mem_account::note_free(layout.size());
+        cfml_common::mem_account::note_alloc(new_size);
+        std::alloc::GlobalAlloc::realloc(&mimalloc::MiMalloc, ptr, layout, new_size)
+    }
+}
 
 /// Counting global allocator for `frame-census` probe builds: forwards every
 /// request to mimalloc and bumps a thread-local allocation tally that
@@ -1367,6 +1412,10 @@ fn compile_and_run(
     if cfml_common::cycle_gc::is_armed() {
         cfml_common::cycle_gc::enable();
     }
+    // Meter this request's memory when debugging is enabled for it (whether or
+    // not it shows the footer): the footer's memory panel and the per-request
+    // memory metrics read it.
+    vm.begin_memory_metering();
     // `--max-memory` hard tier: publish this request so the watchdog can compare
     // its allocation odometer with the other in-flight requests and abort the
     // largest if the process reaches its ceiling. RAII — deregisters on every
@@ -1492,6 +1541,10 @@ fn compile_and_run(
     // so `strong_count` reads would race. Dropping the VM first means the only
     // remaining strong refs into the request's graph are from persistent scopes
     // (live roots) or genuine garbage cycles, which `collect` then reclaims.
+    // This request's memory meter. Read after the request-end sweep below, so
+    // "retained" is what the request left behind once its own garbage is gone.
+    let mem_meter = vm.mem_meter.take();
+    let thread_mem = vm.thread_mem_allocated;
     if cfml_common::cycle_gc::is_armed() {
         // Pull out the join handles of any `cfthread` still GENUINELY RUNNING
         // (not merely lingering-but-finished). A finished thread has returned
@@ -1618,6 +1671,30 @@ fn compile_and_run(
         cfml_common::cycle_gc::collect_ready_deferred();
     }
 
+    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+    if let (Some(m), Some((_, route))) = (mem_meter, otel_req.as_ref()) {
+        let r = m.read();
+        // The response is still held here, on its way to the client: it isn't
+        // memory the request left behind.
+        let in_flight = match &response {
+            Ok(resp) => resp.output.capacity() as u64
+                + match &resp.response_body {
+                    Some(cfml_common::dynamic::CfmlValue::Binary(b)) => b.len() as u64,
+                    Some(v) => v.as_string().len() as u64,
+                    None => 0,
+                },
+            Err(_) => 0,
+        };
+        otel::record_request_memory(
+            route,
+            r.allocated + thread_mem,
+            r.peak,
+            r.retained.saturating_sub(in_flight),
+        );
+    }
+    #[cfg(not(all(feature = "obs-otel", not(target_arch = "wasm32"))))]
+    let _ = (mem_meter, thread_mem);
+
     response
 }
 
@@ -1694,6 +1771,16 @@ fn run_server(
         log::info!("cycle collector disabled via RUSTCFML_NO_CYCLE_GC");
     } else {
         cfml_common::cycle_gc::arm();
+    }
+
+    // The debug footer's memory panel and the memory metrics read the same
+    // footprint `--max-memory` acts on. With debugging enabled in the server
+    // config, allocation accounting starts now, before anything is allocated
+    // for requests, so the process-wide live-heap figure covers everything
+    // (see `cfml_common::mem_account`).
+    cfml_common::mem_account::set_footprint_fn(memory_limit::footprint_bytes);
+    if cfconfig.debugging.enabled {
+        cfml_common::mem_account::enable_at_startup();
     }
 
     let rt = if single_threaded {

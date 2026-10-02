@@ -122,6 +122,9 @@ pub struct TemplateEvent<'a> {
     pub method: Option<&'a str>,
     /// Execution time in **microseconds**.
     pub elapsed_us: i64,
+    /// Bytes this execution allocated itself (excluding nested timed calls),
+    /// when the request's memory is metered; 0 otherwise.
+    pub alloc_bytes: u64,
 }
 
 /// A CFML exception was raised. `uncaught` distinguishes a genuinely unhandled

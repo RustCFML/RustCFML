@@ -161,10 +161,105 @@ pub fn render_metrics() -> Option<String> {
     let rt = OTEL_RT.get()?;
     let m = rt.metrics.as_ref()?;
     let mut text = m.render();
+    text.push_str(&memory_text());
     if rt.jvm_compat {
         text.push_str(&jvm_compat_text());
     }
     Some(text)
+}
+
+/// Record one request's memory (allocated, peak, retained after its own
+/// cleanup), when its memory was metered. A no-op when metrics are off.
+pub fn record_request_memory(route: &str, allocated: u64, peak: u64, retained: u64) {
+    if let Some(m) = OTEL_RT.get().and_then(|rt| rt.metrics.as_ref()) {
+        m.mem_allocated.with_label_values(&[route]).observe(allocated as f64);
+        m.mem_peak.with_label_values(&[route]).observe(peak as f64);
+        m.mem_retained.with_label_values(&[route]).observe(retained as f64);
+    }
+}
+
+/// The engine's own memory and collector figures, read at scrape time. See
+/// docs/memory.md#monitoring.
+fn memory_text() -> String {
+    let mut out = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, value: String| {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"));
+    };
+    let footprint = crate::memory_limit::footprint_bytes();
+    if let Some(f) = footprint {
+        metric(
+            "rustcfml_memory_footprint_bytes",
+            "gauge",
+            "Physical memory the OS charges the process (what --max-memory acts on).",
+            f.to_string(),
+        );
+    }
+    if let Some(l) = cfml_common::mem_account::limit_bytes() {
+        metric("rustcfml_memory_limit_bytes", "gauge", "The --max-memory limit.", l.to_string());
+    }
+    if let Some(live) = cfml_common::mem_account::live_heap_bytes() {
+        metric(
+            "rustcfml_memory_heap_live_bytes",
+            "gauge",
+            "Bytes allocated and not yet freed, across every thread (needs debugging enabled at startup).",
+            live.to_string(),
+        );
+        if let Some(f) = footprint {
+            metric(
+                "rustcfml_memory_outside_heap_bytes",
+                "gauge",
+                "Footprint minus live heap: the engine's code and stacks, and memory the allocator keeps for reuse.",
+                f.saturating_sub(live).to_string(),
+            );
+        }
+    }
+    metric(
+        "rustcfml_gc_collection_seconds_total",
+        "counter",
+        "Time spent in cycle-collector sweeps.",
+        format!("{:.3}", cfml_common::cycle_gc::collection_time_ms() as f64 / 1000.0),
+    );
+    metric(
+        "rustcfml_gc_sweeps_total",
+        "counter",
+        "Cycle-collector sweeps run.",
+        cfml_common::cycle_gc::sweeps_total().to_string(),
+    );
+    metric(
+        "rustcfml_gc_reclaimed_objects_total",
+        "counter",
+        "Containers (structs, arrays, queries, closure scopes, component instances) the cycle collector freed.",
+        cfml_common::cycle_gc::reclaimed_nodes_total().to_string(),
+    );
+    if let Some((total, last)) = cfml_common::cycle_gc::freed_bytes() {
+        metric(
+            "rustcfml_gc_reclaimed_bytes_total",
+            "counter",
+            "Bytes freed by cycle-collector sweeps (needs debugging enabled).",
+            total.to_string(),
+        );
+        metric(
+            "rustcfml_gc_last_sweep_reclaimed_bytes",
+            "gauge",
+            "Bytes freed by the most recent cycle-collector sweep (needs debugging enabled).",
+            last.to_string(),
+        );
+    }
+    if let Some(e) = crate::memory_limit::enforcer() {
+        metric(
+            "rustcfml_memory_limit_refused_total",
+            "counter",
+            "Requests refused with 503 over the --max-memory soft limit.",
+            e.refused().to_string(),
+        );
+        metric(
+            "rustcfml_memory_limit_aborted_total",
+            "counter",
+            "Requests aborted over the --max-memory hard limit.",
+            cfml_common::mem_guard::aborted_total().to_string(),
+        );
+    }
+    out
 }
 
 /// The engine's memory, collector time and CPU load under the names the
@@ -595,6 +690,9 @@ pub struct Metrics {
     duration: prometheus::HistogramVec,
     db_queries: prometheus::IntCounterVec,
     db_duration: prometheus::HistogramVec,
+    mem_allocated: prometheus::HistogramVec,
+    mem_peak: prometheus::HistogramVec,
+    mem_retained: prometheus::HistogramVec,
 }
 
 impl Metrics {
@@ -636,6 +734,31 @@ impl Metrics {
         registry.register(Box::new(duration.clone())).ok();
         registry.register(Box::new(db_queries.clone())).ok();
         registry.register(Box::new(db_duration.clone())).ok();
+        // Per-request memory, observed only for metered requests (debugging
+        // enabled). 4 KiB to 1 GiB in powers of four.
+        let mem_buckets: Vec<f64> = (0..10).map(|i| 4096.0 * 4f64.powi(i)).collect();
+        let mem_hist = |name: &str, help: &str| {
+            prometheus::HistogramVec::new(
+                prometheus::HistogramOpts::new(name, help).buckets(mem_buckets.clone()),
+                &["route"],
+            )
+            .unwrap()
+        };
+        let mem_allocated = mem_hist(
+            "rustcfml_request_memory_allocated_bytes",
+            "Bytes a request allocated, including what it freed (debugging enabled)",
+        );
+        let mem_peak = mem_hist(
+            "rustcfml_request_memory_peak_bytes",
+            "The most memory a request held at once (debugging enabled)",
+        );
+        let mem_retained = mem_hist(
+            "rustcfml_request_memory_retained_bytes",
+            "Memory a request left in use after its own cleanup (debugging enabled)",
+        );
+        registry.register(Box::new(mem_allocated.clone())).ok();
+        registry.register(Box::new(mem_peak.clone())).ok();
+        registry.register(Box::new(mem_retained.clone())).ok();
         Self {
             registry,
             requests,
@@ -643,6 +766,9 @@ impl Metrics {
             duration,
             db_queries,
             db_duration,
+            mem_allocated,
+            mem_peak,
+            mem_retained,
         }
     }
 

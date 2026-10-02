@@ -15,6 +15,7 @@ pub mod encodings;
 pub mod introspection;
 pub mod key;
 pub mod locale;
+pub mod mem_account;
 pub mod mem_guard;
 pub mod logging;
 pub mod name;
