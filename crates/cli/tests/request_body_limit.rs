@@ -192,7 +192,8 @@ fn over_limit_body_returns_413_and_under_limit_body_arrives_intact() {
         "under-limit upload should succeed; got:\n{ok}"
     );
     assert!(
-        ok.contains("formKeys=[uuid,chunknumber,chunkdata]"),
+        // `fieldnames` too: a multipart form sets it, as Lucee does (v0.707.0).
+        ok.contains("formKeys=[uuid,chunknumber,chunkdata,fieldnames]"),
         "under-limit upload should deliver ALL form fields; got:\n{ok}"
     );
 
