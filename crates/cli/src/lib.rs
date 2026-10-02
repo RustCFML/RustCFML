@@ -2252,8 +2252,8 @@ fn print_ready_banner(what: &str, mode: &str, doc_root: &Path) {
                 memory_limit::human(fp)
             ),
             None => println!(
-                "warning: --max-memory {} cannot be enforced: this build has no \
-                 mimalloc process statistics",
+                "warning: --max-memory {} cannot be enforced: the process's memory \
+                 footprint can't be measured on this platform",
                 memory_limit::human(e.limit().max)
             ),
         }

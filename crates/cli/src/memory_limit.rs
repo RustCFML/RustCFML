@@ -8,9 +8,11 @@
 //! and it fails better than `-Xmx`, which throws `OutOfMemoryError` into
 //! whichever thread allocated last after minutes of GC thrash.
 //!
-//! What it measures: the **real physical footprint**, from mimalloc's process
-//! statistics — the number the container's OOM killer uses — not our own
-//! tracked-node count.
+//! What it measures: the **real physical footprint** — the number the
+//! container's OOM killer uses — not our own tracked-node count. That is the
+//! cgroup's `memory.current` in a limited container, otherwise the resident set
+//! on Linux and `phys_footprint` on macOS, with mimalloc's process statistics as
+//! the fallback elsewhere (`footprint_bytes`).
 //!
 //! The soft tier (this module). Above `soft` (default 85% of the limit) the
 //! server stops ADMITTING new requests — **503 + `Retry-After`**, so a load

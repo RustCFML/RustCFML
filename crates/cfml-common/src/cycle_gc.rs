@@ -1,39 +1,53 @@
-//! Request-boundary cycle collector.
+//! Cycle collector.
 //!
-//! RustCFML's reference-typed containers (`CfmlStruct`, `CfmlArray`, `CfmlQuery`)
-//! and closure capture scopes (`Arc<RwLock<ValueMap>>`) are `Arc`-refcounted, so
-//! a reference *cycle* (`a.other = b; b.other = a`, or a closure stored into the
-//! scope it captures) is never reclaimed by refcounting alone — its internal
-//! refs keep `strong_count > 0` even after every external root is gone. In a
-//! long-lived `--serve` process that builds cyclic per-request graphs (Preside,
-//! ColdBox, WireBox), this leaks a little on every request and RSS climbs without
-//! bound.
+//! RustCFML's reference-typed containers (`CfmlStruct`, `CfmlArray`, `CfmlQuery`),
+//! closure capture scopes (`Arc<RwLock<ValueMap>>`) and flyweight component
+//! instances are `Arc`-refcounted, so a reference *cycle* (`a.other = b;
+//! b.other = a`, a closure stored into the scope it captures, every component's
+//! `this → variables → this`) is never reclaimed by refcounting alone — its
+//! internal refs keep `strong_count > 0` even after every external root is gone.
+//! In a long-lived `--serve` process that builds cyclic graphs (Preside, ColdBox,
+//! WireBox), this leaks on every request and RSS climbs without bound.
 //!
-//! This module reclaims those cycles with a **request-scoped trial-deletion**
-//! pass (Bacon–Rajan, bounded to one request's allocations). It does NOT replace
-//! refcounting: the ~99% acyclic garbage is still freed eagerly, on-thread, with
-//! zero pause. The collector only ever processes the small set of containers a
-//! request allocated that are *still alive* at request end — never the whole
-//! heap, never the resident persistent scopes — so there is no global
-//! stop-the-world pause.
+//! This module reclaims those cycles with **trial deletion** (Bacon–Rajan) over
+//! a log of the containers a request allocated. It does NOT replace refcounting:
+//! the acyclic garbage is still freed eagerly, on-thread, with zero pause. It
+//! never walks the whole heap and never stops other requests. User-facing
+//! description: `docs/memory.md`.
+//!
+//! ## When it runs
+//! * **Mid-request** — `collect_incremental`, from component construction, once
+//!   the young log reaches its budget: a MINOR sweep over the young entries
+//!   promotes survivors to an OLD generation; a MAJOR sweep covers both once the
+//!   old generation has doubled.
+//! * **Request end / `cfthread` body end** — `collect` over everything logged,
+//!   deferred (`defer_current_log`) while a thread the request started is still
+//!   running, because the two share scopes.
+//! * **Across requests** — `collect` carries live survivors into a
+//!   process-wide, `Weak`-held set, swept once it has doubled. This frees what
+//!   became garbage AFTER the request that made it.
+//! * **On displacement** — overwriting or deleting a key in a `persistent_scope`
+//!   struct (the application scope, static scopes, class structs) re-enters the
+//!   displaced graph into the log (`relog_cycle_nodes`); a large one schedules a
+//!   cross-request sweep (`sweep_if_displaced`). This is what frees a framework
+//!   reload's old generation.
 //!
 //! ## How it stays correct without tracing the persistent scopes
-//! The `Arc::strong_count` itself is the oracle. After the request's transient
-//! roots (page `variables`, request scope, thread scope) are cleared, a survivor
-//! that is still referenced from a *persistent* root (application/session/server
-//! scope — which Arc-share the objects that escaped into them) has a strong count
-//! greater than the number of references it gets from inside the survivor set; a
-//! pure cycle does not. So we compute, per survivor `n`:
+//! The `Arc::strong_count` itself is the oracle. A survivor that is still
+//! referenced from outside the set being swept (application/session/server
+//! scope, a live frame, a seed) has a strong count greater than the number of
+//! references it gets from inside the set; a pure cycle does not. So we compute,
+//! per node `n`:
 //!
 //! ```text
 //! external(n) = strong_count(n) − 1 (our own probe handle) − internal_in(n)
 //! ```
 //!
-//! `external(n) > 0` ⟺ `n` has an owner outside the request's cyclic garbage ⟹
-//! `n` is a live root. We mark the transitive closure of the roots live, and
-//! everything else in the survivor set is an unreachable cycle: we clear its
-//! backing (dropping its outgoing refs) so the whole subgraph's counts fall to
-//! zero and it frees.
+//! `external(n) > 0` ⟺ `n` has an owner outside the set ⟹ `n` is a live root.
+//! We mark the transitive closure of the roots live, and everything else is an
+//! unreachable cycle: we clear its backing (dropping its outgoing refs) so the
+//! whole subgraph's counts fall to zero and it frees. A node whose lock can't be
+//! taken without waiting has its edges skipped, which can only under-collect.
 //!
 //! ## Safety w.r.t. threads
 //! Reading `strong_count` is only stable if no other thread is concurrently
@@ -41,8 +55,8 @@
 //! ever collect) is unreachable from any other request's thread by construction;
 //! anything shared across threads escaped to a shared scope and thus reads as a
 //! live root. The one case to guard is *this* request's own `cfthread`s, which
-//! share `application`/`request` scope by Arc — the VM caller MUST skip
-//! collection while `live_threads` is non-empty. See `CYCLE_GC_PLAN.md`.
+//! share `application`/`request` scope by Arc — so a request or thread body that
+//! still has a running thread defers its log instead of collecting it.
 
 use crate::dynamic::{
     CfmlClosureBody, CfmlFunction, CfmlQueryData, CfmlStatement, CfmlValue, StructInner, ValueMap,
@@ -138,11 +152,11 @@ impl NodeHandle {
 }
 
 thread_local! {
-    /// Per-request allocation log. `Some` only while a TOP-LEVEL request body is
-    /// executing on this worker thread; `None` everywhere else (CLI, between
-    /// requests, and inside `cfthread` child threads — so child-thread allocs are
-    /// never logged and never accumulate). Taking the log out (`collect`) also
-    /// leaves it `None`, so the collector's own allocations are never logged.
+    /// Per-request allocation log. `Some` only while a request body or a
+    /// `cfthread` body is executing on this thread (`enable` is called for both);
+    /// `None` everywhere else (CLI, between requests). Taking the log out
+    /// (`collect`) also leaves it `None`, so the collector's own allocations are
+    /// never logged.
     static ALLOC_LOG: RefCell<Option<Vec<TrackedAlloc>>> = const { RefCell::new(None) };
     /// Monotonic count of tracked containers this REQUEST has allocated, unlike
     /// the log itself (which sweeps drain) and unaffected by the log cap. Read by
@@ -1075,12 +1089,6 @@ pub fn collect() -> usize {
     reclaimed + carry_survivors(live)
 }
 
-/// The collection pass over an explicit allocation log (the live request's,
-/// drained by `collect`, or a previously-deferred one). Identical algorithm
-/// either way; factored out so deferred logs can be collected after their
-/// spawning request's threads finish. Safe to run concurrently with unrelated
-/// requests: the cycles it touches are internal to one finished request and
-/// unreachable from anywhere else, so their `strong_count`s are stable.
 /// Number of tracked allocations after which a MID-REQUEST sweep is allowed.
 /// `0` disables incremental sweeping (end-of-request only, the historical
 /// behaviour). Override with `RUSTCFML_GC_INCREMENTAL`.
@@ -1172,15 +1180,15 @@ thread_local! {
 /// cyclic garbage later in the same request — so still-alive handles are
 /// re-registered before returning.
 ///
-/// **Why the budget is adaptive, not a fixed count.** Re-registering survivors
-/// means each pass rescans everything still alive, so a fixed threshold is
+/// **Why it is generational.** Re-walking every survivor on every pass is
 /// quadratic in the live set: a request holding 60k live components went from
-/// 3.4 s (sweeping off) to over TEN MINUTES at a flat 10k threshold. The budget
-/// is therefore raised to twice the surviving live set after every pass — the
-/// classic "collect again when the heap has doubled" rule. A churn workload
-/// (nothing survives) keeps sweeping at the base threshold and stays flat; a
-/// workload that genuinely holds N objects live sweeps O(log N) times, so the
-/// total rescan work stays linear-ish instead of quadratic.
+/// 3.4 s (sweeping off) to over TEN MINUTES at a flat 10k threshold. So a MINOR
+/// sweep walks only the young entries and promotes their survivors to the old
+/// generation, and the young budget stays at the fixed base. The old generation
+/// is re-walked only by a MAJOR sweep, due once it has doubled since the last
+/// one (`NEXT_MAJOR`, the classic "collect again when the heap has doubled"
+/// rule). A churn workload (nothing survives) runs only minors; a workload that
+/// holds N objects live runs O(log N) majors, so total work stays linear-ish.
 ///
 /// Must not be called while an `ALLOC_LOG` borrow is held.
 pub fn collect_incremental() -> usize {
@@ -1645,6 +1653,12 @@ fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
     reclaimed
 }
 
+/// The collection pass over an explicit allocation log (the live request's,
+/// drained by `collect`, or a previously-deferred one). Identical algorithm
+/// either way; factored out so deferred logs can be collected after their
+/// spawning request's threads finish. Safe to run concurrently with unrelated
+/// requests: the cycles it touches are internal to one finished request and
+/// unreachable from anywhere else, so their `strong_count`s are stable.
 fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
     collect_from_log_carrying(log, None)
 }

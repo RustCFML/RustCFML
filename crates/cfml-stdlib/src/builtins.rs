@@ -9255,9 +9255,10 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // `translate_cfml_regex`, whose CFML/Java rewrites would change their meaning.
     static GLOB_RX_CACHE: Lazy<std::sync::RwLock<HashMap<String, std::sync::Arc<Regex>>>> =
         Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
-    // Same bound and wholesale-clear policy as REGEX_CACHE: globs come from
-    // application code, so the set is small in practice, but it must not be
-    // unbounded.
+    // Bounded and cleared wholesale when full (REGEX_CACHE, which can see
+    // request-supplied patterns, evicts least-recently-used instead): globs come
+    // from application code, so the set is small in practice, but it must not
+    // be unbounded.
     const GLOB_RX_CACHE_CAP: usize = 1024;
 
     enum PatMatcher {
