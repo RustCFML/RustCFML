@@ -268,7 +268,8 @@ dashboard keeps working unchanged:
 | `java_lang_OperatingSystem_ProcessCpuLoad` | process CPU since the previous scrape, 0–1 across the available cores (container CPU quota honoured) |
 
 The rest of what the JMX exporter emits (per-pool, per-thread and class-loading MBeans)
-has no RustCFML equivalent and is not emitted.
+has no RustCFML equivalent and is not emitted. [Memory management](memory.md) explains
+what the footprint and collection-time figures measure.
 
 ### Traces and metrics
 
