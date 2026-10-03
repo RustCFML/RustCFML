@@ -1004,6 +1004,8 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     // Buffered `<cflog>` lines must reach disk before we return or `exit(1)`
     // — the error path below never unwinds, so no Drop guard would run.
     logging::flush_all();
+    // Same reasoning for any upload temp file this run created (GH #386).
+    cfml_vm::upload_temp::remove_outstanding_upload_temp_files();
     // Op census for a plain script run (probe builds only). Must happen here:
     // the error arm below `exit(1)`s, and `run()`'s worker thread never rejoins
     // on that path.
@@ -2505,6 +2507,7 @@ async fn async_run_server(
     // deliveries per application; the hooks themselves fire on the next request
     // for the owning application. Disabled when reapIntervalSecs = 0.
     spawn_session_reaper(server_state.clone(), &cfconfig);
+    spawn_upload_reaper(&cfconfig);
 
     // Spawn the deferred cycle-GC sweep (serve mode only, when the collector is
     // armed). Request boundaries already drain deferred logs under load; this
@@ -2631,6 +2634,7 @@ async fn async_run_server(
                     .with_graceful_shutdown(shutdown_signal())
                     .await
                     .unwrap();
+                cfml_vm::upload_temp::remove_outstanding_upload_temp_files();
                 #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
                 otel::shutdown();
                 let _ = std::fs::remove_file(&cleanup_path);
@@ -2679,6 +2683,9 @@ async fn async_run_server(
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .unwrap();
+            // Nothing can be reading this process's upload temp files once it
+            // is gone (GH #386).
+            cfml_vm::upload_temp::remove_outstanding_upload_temp_files();
             #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
             otel::shutdown();
         }
@@ -2863,6 +2870,7 @@ async fn stream_multipart_form(
     body: axum::body::Body,
     content_type: &str,
     limit: usize,
+    uploads: &mut cfml_vm::upload_temp::UploadTempFiles,
 ) -> Result<cfml_common::dynamic::ValueMap, multer::Error> {
     use cfml_common::dynamic::{CfmlValue, ValueMap};
     use tokio::io::AsyncWriteExt;
@@ -2893,6 +2901,9 @@ async fn stream_multipart_form(
             Some(raw_name) => {
                 let client_file = cfml_vm::web::sanitize_upload_filename(&raw_name);
                 let (path, server_dir, temp_path) = cfml_vm::web::next_upload_temp_path();
+                // Owned by the request from here on, so a parse that fails
+                // part-way still deletes what it already wrote (GH #386).
+                uploads.push(path.clone());
                 let mut file = match tokio::fs::File::create(&path).await {
                     Ok(f) => f,
                     Err(e) => {
@@ -2948,6 +2959,81 @@ async fn stream_multipart_form(
     }
 
     Ok(form)
+}
+
+/// Run one request on the current (blocking) thread, then settle the upload
+/// temp files it owns: deleted now, unless the request handed CFML work to
+/// another thread (`cfthread`, `runAsync`, an executor task) that may still be
+/// reading `tempFilePath` — those are left for the age reaper (GH #386).
+///
+/// Lucee deletes at request end too, but skips the deletion entirely for any
+/// request that used `cfthread`, leaking those files for good.
+fn with_request_uploads<R>(
+    mut uploads: cfml_vm::upload_temp::UploadTempFiles,
+    run: impl FnOnce() -> R,
+) -> R {
+    // Clear a mark an earlier request left on this pooled thread.
+    let _ = cfml_vm::upload_temp::take_background_body_spawned();
+    let result = run();
+    if cfml_vm::upload_temp::take_background_body_spawned() {
+        uploads.keep();
+    }
+    drop(uploads);
+    result
+}
+
+/// Sweep stale upload temp files on a fixed tick (GH #386). Same shape as
+/// [`spawn_session_reaper`]: a `tokio` task, the filesystem work kept off the
+/// async workers, `0` disables. One sweep also runs at startup, which is what
+/// clears files a previous, crashed run of the server left behind.
+fn spawn_upload_reaper(cfconfig: &RustCfmlConfig) {
+    let cfg = cfconfig.uploads.clone();
+    if cfg.reap_interval_secs == 0 {
+        log::info!("[uploads] temp-file reaper disabled (reapIntervalSecs = 0)");
+        return;
+    }
+    let interval = std::time::Duration::from_secs(cfg.reap_interval_secs);
+    let max_age = std::time::Duration::from_secs(cfg.max_age_secs);
+    tokio::spawn(async move {
+        loop {
+            let removed = tokio::task::spawn_blocking(move || {
+                cfml_vm::upload_temp::reap_stale_upload_temp_files(
+                    &std::env::temp_dir(),
+                    max_age,
+                    std::time::SystemTime::now(),
+                    &process_is_alive,
+                )
+            })
+            .await
+            .unwrap_or(0);
+            if removed > 0 {
+                log::info!("[uploads] reaper removed {removed} stale upload temp file(s)");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// Is a process with this pid still running? Used only to decide whether
+/// another process's upload temp files can be reaped early, so an answer of
+/// "alive" when unsure is the safe one.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // Signal 0 checks for existence without sending anything. EPERM means the
+    // process exists but belongs to someone else.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Turn a streaming-multipart failure into the same 413/400 split the buffered
@@ -3051,9 +3137,15 @@ async fn handle_request_inner(
         .map(|ct| ct.to_string());
 
     let mut streamed_form: Option<cfml_common::dynamic::ValueMap> = None;
+    // The upload temp files this request creates. Dropping the guard deletes
+    // them, so every return below — a 404, a blocked path, a static file, a
+    // parse error — cleans up; the template-running branches move it onto the
+    // request thread instead and keep the files if the request started
+    // background work (GH #386).
+    let mut uploads = cfml_vm::upload_temp::UploadTempFiles::new();
     let mut body = body;
     if let Some(ct) = multipart_ct {
-        match stream_multipart_form(body, &ct, body_limit).await {
+        match stream_multipart_form(body, &ct, body_limit, &mut uploads).await {
             Ok(form) => {
                 streamed_form = Some(form);
                 body = axum::body::Body::empty();
@@ -3408,18 +3500,20 @@ async fn handle_request_inner(
                 Box::new(ChannelFlushSink { tx: flush_tx });
 
             let handle = tokio::task::spawn_blocking(move || {
-                compile_and_run_with_session(
-                    &source,
-                    debug,
-                    Some(file_path),
-                    extra_globals,
-                    Some(&server_state),
-                    Some(http_request_data),
-                    session_id_clone,
-                    vfs,
-                    sandbox,
-                    Some(sink),
-                )
+                with_request_uploads(uploads, || {
+                    compile_and_run_with_session(
+                        &source,
+                        debug,
+                        Some(file_path),
+                        extra_globals,
+                        Some(&server_state),
+                        Some(http_request_data),
+                        session_id_clone,
+                        vfs,
+                        sandbox,
+                        Some(sink),
+                    )
+                })
             });
 
             // The request thread owns the only sender, so `None` here means it
@@ -3559,16 +3653,18 @@ async fn handle_request_inner(
                 let sandbox = state.sandbox;
                 let session_id_clone = existing_sid.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    run_missing_template(
-                        would_be_path,
-                        target_page,
-                        extra_globals,
-                        Some(&server_state),
-                        Some(http_request_data),
-                        session_id_clone,
-                        vfs,
-                        sandbox,
-                    )
+                    with_request_uploads(uploads, || {
+                        run_missing_template(
+                            would_be_path,
+                            target_page,
+                            extra_globals,
+                            Some(&server_state),
+                            Some(http_request_data),
+                            session_id_clone,
+                            vfs,
+                            sandbox,
+                        )
+                    })
                 }).await.unwrap();
 
                 match result {

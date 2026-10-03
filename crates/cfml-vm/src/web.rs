@@ -737,6 +737,9 @@ pub fn next_upload_temp_path() -> (std::path::PathBuf, String, String) {
     let temp_dir = std::env::temp_dir();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_path = temp_dir.join(format!("cfupload_{}_{}.upload", std::process::id(), n));
+    // Owned by the process until a request guard, the age reaper or process
+    // exit deletes it — see `upload_temp` (GH #386).
+    crate::upload_temp::register(&temp_path);
     (
         temp_path.clone(),
         temp_dir.to_string_lossy().to_string(),

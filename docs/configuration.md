@@ -194,6 +194,20 @@ fires opportunistically on the next request for the owning application
 > Note: `sessionTimeout` (under `runtime`, or `this.sessionTimeout`) is clamped
 > to a 60-second floor — sub-minute session timeouts are raised to 60s.
 
+### `uploads`
+
+Cleanup of uploaded-file temp files (serve mode only). A request's upload temp
+files (`form.<field>.tempFilePath`) are deleted when the request ends. A request
+that started background work — `cfthread`, `runAsync`, an executor task — may
+still be reading them, so it keeps them, and this reaper removes them once they
+are old enough. It also removes files left by a process that is no longer
+running (a crash or a previous run) on its first tick.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `reapIntervalSecs` | int | `300` | Reaper tick in seconds. `0` disables the reaper (request-end deletion and exit cleanup still apply) |
+| `maxAgeSecs` | int | `3600` | Age at which a kept upload temp file is deleted. Set it longer than any thread that processes an upload runs for. `0` disables the age rule; files from dead processes are still removed |
+
 ### `datasources`
 
 Map of name → driver config. The name becomes the value used in

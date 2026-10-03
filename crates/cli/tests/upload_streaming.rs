@@ -10,6 +10,10 @@
 //!   (`filename="../../x"` used to be interpolated straight into the path);
 //! * two requests uploading the same filename get their own temp files, rather
 //!   than sharing one `cfupload_<name>` and clobbering each other.
+//!
+//! And their temp files must not outlive the request (GH #386): deleted when it
+//! ends, unless it handed work to a `cfthread`, in which case they are kept for
+//! the age reaper — which also sweeps files a dead process left behind.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -50,15 +54,18 @@ impl Drop for Server {
 static START: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn start_server() -> Server {
+    start_server_in(fixtures_dir(), None)
+}
+
+fn start_server_in(root: PathBuf, cfconfig: Option<PathBuf>) -> Server {
     let _serialised = START.lock().unwrap_or_else(|e| e.into_inner());
     let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
-        .arg("--serve")
-        .arg(fixtures_dir())
-        .arg("--port")
-        .arg(port.to_string())
-        .spawn()
-        .expect("spawn rustcfml --serve");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rustcfml"));
+    cmd.arg("--serve").arg(root).arg("--port").arg(port.to_string());
+    if let Some(cfg) = cfconfig {
+        cmd.arg("--cfconfig").arg(cfg);
+    }
+    let child = cmd.spawn().expect("spawn rustcfml --serve");
     let mut server = Server { child, port };
     for _ in 0..600 {
         // A socket whose local and peer addresses match connected to ITSELF (Linux
@@ -78,6 +85,10 @@ fn start_server() -> Server {
 
 /// POST one file part (plus a plain field) and return the response body.
 fn post_upload(port: u16, filename: &str, payload: &[u8]) -> String {
+    post_upload_to(port, "/up.cfm", filename, payload)
+}
+
+fn post_upload_to(port: u16, page: &str, filename: &str, payload: &[u8]) -> String {
     let boundary = "----------------------------rustcfmluploadboundary";
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(
@@ -99,7 +110,7 @@ fn post_upload(port: u16, filename: &str, payload: &[u8]) -> String {
         .set_read_timeout(Some(Duration::from_secs(120)))
         .unwrap();
     let head = format!(
-        "POST /up.cfm HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+        "POST {page} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
          Content-Type: multipart/form-data; boundary={boundary}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -150,13 +161,98 @@ fn streamed_upload_arrives_intact_and_exposes_no_raw_body() {
         "a multipart request must not materialise its raw envelope"
     );
 
-    let temp_path = field(&resp, "tempFilePath").to_string();
-    let written = std::fs::read(&temp_path).expect("temp file should exist");
-    let _ = std::fs::remove_file(&temp_path);
+    // The template hashed the temp file while it existed.
     assert_eq!(
-        written, payload,
+        field(&resp, "sha256"),
+        sha256_hex(&payload),
         "the streamed bytes must reach disk unchanged"
     );
+
+    // ...and the request's end removed it (GH #386).
+    let temp_path = field(&resp, "tempFilePath").to_string();
+    assert!(
+        !std::path::Path::new(&temp_path).exists(),
+        "the upload temp file must be deleted when the request ends: {temp_path}"
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn wait_until_gone(path: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !std::path::Path::new(path).exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !std::path::Path::new(path).exists()
+}
+
+#[test]
+fn a_request_that_started_a_cfthread_keeps_its_upload_temp_file() {
+    let server = start_server();
+    let resp = post_upload_to(server.port, "/thread.cfm", "doc.txt", b"for the thread");
+    assert!(resp.contains("200 OK"), "upload should succeed; got:\n{resp}");
+    let temp_path = field(&resp, "tempFilePath").to_string();
+    // The thread may still be reading it; Lucee keeps it for good, we keep it
+    // until the age reaper (default maxAgeSecs 3600) or process exit.
+    assert!(
+        std::path::Path::new(&temp_path).exists(),
+        "a cfthread may still be reading the upload: it must survive request end"
+    );
+    // Graceful shutdown would remove it; a kill does not, so tidy up here.
+    drop(server);
+    let _ = std::fs::remove_file(&temp_path);
+}
+
+#[test]
+fn the_reaper_sweeps_aged_files_and_files_from_dead_processes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/upload_reaper");
+
+    // A file left behind by a process that no longer exists: swept on the
+    // first tick, whatever its age.
+    let mut gone = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn short-lived process");
+    let dead_pid = gone.id();
+    gone.wait().unwrap();
+    let orphan = std::env::temp_dir().join(format!("cfupload_{dead_pid}_0.upload"));
+    std::fs::write(&orphan, b"left by a crashed run").unwrap();
+    // A name that is not ours must never be touched.
+    let bystander = std::env::temp_dir().join(format!("cfupload_{dead_pid}_bystander.txt"));
+    std::fs::write(&bystander, b"not ours").unwrap();
+
+    let server = start_server_in(root.clone(), Some(root.join(".cfconfig.json")));
+
+    #[cfg(unix)]
+    assert!(
+        wait_until_gone(&orphan.to_string_lossy(), Duration::from_secs(10)),
+        "a dead process's upload temp file must be reaped"
+    );
+    #[cfg(not(unix))]
+    let _ = std::fs::remove_file(&orphan);
+
+    // Kept past request end (it started a cfthread), then aged out by the
+    // reaper (maxAgeSecs 1, reapIntervalSecs 1).
+    let resp = post_upload_to(server.port, "/thread.cfm", "doc.txt", b"for the thread");
+    assert!(resp.contains("200 OK"), "upload should succeed; got:\n{resp}");
+    let temp_path = field(&resp, "tempFilePath").to_string();
+    assert!(
+        wait_until_gone(&temp_path, Duration::from_secs(15)),
+        "the age reaper must remove a kept upload temp file: {temp_path}"
+    );
+
+    assert!(bystander.exists(), "the reaper must only touch cfupload_<pid>_<n>.upload");
+    let _ = std::fs::remove_file(&bystander);
 }
 
 #[test]
@@ -206,16 +302,14 @@ fn concurrent_uploads_of_one_filename_do_not_clobber_each_other() {
         "two uploads named avatar.png must not share one temp file"
     );
 
-    let bytes_a = std::fs::read(&path_a).expect("temp file A");
-    let bytes_b = std::fs::read(&path_b).expect("temp file B");
-    let _ = std::fs::remove_file(&path_a);
-    let _ = std::fs::remove_file(&path_b);
-    assert!(
-        bytes_a.iter().all(|&c| c == b'A'),
+    assert_eq!(
+        field(&resp_a, "sha256"),
+        sha256_hex(&vec![b'A'; 512 * 1024]),
         "upload A was overwritten by B"
     );
-    assert!(
-        bytes_b.iter().all(|&c| c == b'B'),
+    assert_eq!(
+        field(&resp_b, "sha256"),
+        sha256_hex(&vec![b'B'; 512 * 1024]),
         "upload B was overwritten by A"
     );
 }

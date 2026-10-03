@@ -168,6 +168,7 @@ pub mod fuse_counters {
 pub mod socketio_compat;
 pub mod cluster_bus;
 pub mod web;
+pub mod upload_temp;
 pub mod websocket;
 pub mod mcp;
 pub mod flush;
@@ -5779,6 +5780,10 @@ impl CfmlVirtualMachine {
         closure: CfmlValue,
         attributes: Option<CfmlValue>,
     ) -> ThreadSeed {
+        // This body may outlive the request, and may read an upload's
+        // `tempFilePath`: tell the host not to delete the request's upload
+        // temp files at request end (GH #386).
+        crate::upload_temp::note_background_body_spawned();
         let mut body = closure;
         // The component `variables` scope the body was written in, if any (see
         // the `__variables` flatten below). Overlaid onto the child VM's page

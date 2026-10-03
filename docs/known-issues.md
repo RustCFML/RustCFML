@@ -1807,20 +1807,36 @@ counts anything containing `xml`, `json`, `rss`, `atom` or `text`), and
 matching Lucee's `FormImpl.getInputStream()` — and a streamed upload never had
 the bytes to expose in any case.
 
-> **Not yet done: temp files are never cleaned up** — GH
-> [#386](https://github.com/RustCFML/RustCFML/issues/386). They accumulate in
-> the system temp directory for the life of the host. Deliberately left out of
-> this change rather than bundled into it, because the fix is a design decision
-> rather than a detail: Lucee deletes them when the form scope is released
-> (`FormImpl.release`), but skips that entirely for any request that used
-> `cfthread` (`PageContextImpl.release` only calls `urlForm.release` in its
-> non-`hasFamily` branch), so one thread anywhere in a request leaks its
-> uploads permanently. That hole is the conservative answer to a real hazard —
-> a `cfthread` can outlive its request and may have been handed
-> `tempFilePath` — and our threads have the same shape. The plan in #386 is
-> request-end deletion for requests that spawned no thread, plus an age-based
-> reaper for the rest, which also covers what request-end deletion structurally
-> cannot: crashes, `kill -9`, and files left by a previous run.
+**Temp files are cleaned up** — GH
+[#386](https://github.com/RustCFML/RustCFML/issues/386). They used to
+accumulate in the system temp directory for the life of the host. Three layers
+now remove them (`cfml_vm::upload_temp`):
+
+1. **At request end**, for a request that started no background CFML work.
+   Lucee does the same (`FormImpl.release`), but skips it entirely for any
+   request that used `cfthread` (`PageContextImpl.release` only calls
+   `urlForm.release` in its non-`hasFamily` branch), so one thread anywhere in
+   a request leaks its uploads permanently. That hole is the conservative answer
+   to a real hazard — a thread can outlive its request and may have been handed
+   `tempFilePath` — so a request that started a `cfthread`, `runAsync` or an
+   executor task still **keeps** its files at request end; they are left to
+   layer 2 rather than leaked. Every early return (404, blocked path, a parse
+   that failed part-way) deletes too.
+2. **An age reaper** (`uploads.reapIntervalSecs`, default 300; `uploads.maxAgeSecs`,
+   default 3600 — see `docs/configuration.md`) deletes this process's upload
+   temp files older than the max age, and files left by a process that is no
+   longer running (the pid is in the name) whatever their age. That covers
+   what request-end deletion structurally cannot: crashes, `kill -9`, and files
+   from a previous run, swept on the first tick at startup. A live process's
+   files are left to its own reaper. Only exact `cfupload_<pid>_<counter>.upload`
+   names are touched.
+3. **At process exit** (graceful serve shutdown, end of a CLI run) every file
+   the process still owns is deleted.
+
+Pick `maxAgeSecs` longer than any `cfthread` that processes an upload runs for:
+the reaper cannot tell a finished thread from a slow one. The buffered
+multipart path (hosts with no streaming parser) has no request owner; its files
+are still covered by layers 2 and 3.
 
 ## 75. Template lookup is case-insensitive; file I/O is not — a deliberate superset *(GH [#387](https://github.com/RustCFML/RustCFML/issues/387))*
 

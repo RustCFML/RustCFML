@@ -127,6 +127,8 @@ pub struct RustCfmlConfig {
     #[serde(rename = "sessionStorage")]
     pub session_storage: String,
     pub session: SessionCfg,
+    /// Upload temp-file reaper (serve mode) — see [`UploadsCfg`].
+    pub uploads: UploadsCfg,
     pub logging: LoggingCfg,
     /// Dynamic native extensions (`.rcx`) — see `docs/extensions.md`.
     ///
@@ -457,6 +459,41 @@ impl Default for SessionCfg {
             reap_interval_secs: 60,
             reap_adaptive: false,
             reap_batch_max: 1000,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// Upload temp-file reaper
+// ─────────────────────────────────────────────
+
+/// Background sweep of uploaded-file temp files (serve mode only, GH #386).
+///
+/// A request's upload temp files are deleted when it ends. The exception is a
+/// request that started background work (`cfthread`, `runAsync`, an executor
+/// task), which may still be reading `tempFilePath`: its files are left for
+/// this reaper, which deletes this process's files older than `maxAgeSecs`,
+/// and files left by a process that is no longer running whatever their age.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct UploadsCfg {
+    /// Reaper tick in seconds. `0` disables the reaper (request-end deletion
+    /// and exit cleanup still apply).
+    #[serde(rename = "reapIntervalSecs")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub reap_interval_secs: u64,
+    /// Age in seconds after which one of this process's upload temp files is
+    /// deleted. `0` disables the age rule; dead-process files are still swept.
+    #[serde(rename = "maxAgeSecs")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub max_age_secs: u64,
+}
+
+impl Default for UploadsCfg {
+    fn default() -> Self {
+        Self {
+            reap_interval_secs: 300,
+            max_age_secs: 3600,
         }
     }
 }
