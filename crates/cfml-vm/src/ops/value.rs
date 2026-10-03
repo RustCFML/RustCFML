@@ -15,7 +15,7 @@
 //! LLVM's judgement, which declined for good reason on the big handlers.
 
 use crate::{
-    arith_binary_op, arith_numeric_op, arith_operand, binary_op, cfml_compare, cfml_equal,
+    arith_binary_op, arith_numeric_op, arith_operand, cfml_compare, cfml_equal,
     cfml_strict_equal, compare_op, to_number, CfmlVirtualMachine,
 };
 use cfml_common::dynamic::{CfmlValue, ValueMap};
@@ -237,30 +237,43 @@ pub(crate) fn op_does_not_contain(stack: &mut Vec<CfmlValue>) {
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn op_or(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| CfmlValue::Bool(a.is_true() || b.is_true()));
+pub(crate) fn op_or(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+        stack.push(CfmlValue::Bool(a.to_condition()? || b.to_condition()?));
+    }
+    Ok(())
 }
 
 #[inline(always)]
-pub(crate) fn op_not(stack: &mut Vec<CfmlValue>) {
+pub(crate) fn op_not(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
     if let Some(a) = stack.pop() {
-        stack.push(CfmlValue::Bool(!a.is_true()));
+        stack.push(CfmlValue::Bool(!a.to_condition()?));
     }
+    Ok(())
 }
 
 #[inline]
-pub(crate) fn op_xor(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| CfmlValue::Bool(a.is_true() ^ b.is_true()));
+pub(crate) fn op_xor(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+        stack.push(CfmlValue::Bool(a.to_condition()? ^ b.to_condition()?));
+    }
+    Ok(())
 }
 
 #[inline]
-pub(crate) fn op_eqv(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| CfmlValue::Bool(a.is_true() == b.is_true()));
+pub(crate) fn op_eqv(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+        stack.push(CfmlValue::Bool(a.to_condition()? == b.to_condition()?));
+    }
+    Ok(())
 }
 
 #[inline]
-pub(crate) fn op_imp(stack: &mut Vec<CfmlValue>) {
-    binary_op(stack, |a, b| CfmlValue::Bool(!a.is_true() || b.is_true()));
+pub(crate) fn op_imp(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
+    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+        stack.push(CfmlValue::Bool(!a.to_condition()? || b.to_condition()?));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

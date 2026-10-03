@@ -11545,11 +11545,11 @@ impl CfmlVirtualMachine {
                 BytecodeOp::DoesNotContain => ops::value::op_does_not_contain(&mut stack),
 
                 // Logical
-                BytecodeOp::Or => ops::value::op_or(&mut stack),
-                BytecodeOp::Not => ops::value::op_not(&mut stack),
-                BytecodeOp::Xor => ops::value::op_xor(&mut stack),
-                BytecodeOp::Eqv => ops::value::op_eqv(&mut stack),
-                BytecodeOp::Imp => ops::value::op_imp(&mut stack),
+                BytecodeOp::Or => catch_op!(ops::value::op_or(&mut stack)),
+                BytecodeOp::Not => catch_op!(ops::value::op_not(&mut stack)),
+                BytecodeOp::Xor => catch_op!(ops::value::op_xor(&mut stack)),
+                BytecodeOp::Eqv => catch_op!(ops::value::op_eqv(&mut stack)),
+                BytecodeOp::Imp => catch_op!(ops::value::op_imp(&mut stack)),
 
                 // Control flow
                 BytecodeOp::Jump(target) => {
@@ -11574,7 +11574,19 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::JumpIfFalse(target) => {
                     if let Some(cond) = stack.pop() {
-                        if !cond.is_true() {
+                        // Lucee's condition coercion: a non-boolean string or a
+                        // complex value throws (GH #451 follow-up).
+                        let truth = match cond {
+                            CfmlValue::Bool(b) => b,
+                            other => match other.to_condition() {
+                                Ok(b) => b,
+                                Err(err) => {
+                                    ip = self.catch_op_error(&mut stack, err)?;
+                                    continue;
+                                }
+                            },
+                        };
+                        if !truth {
                             ip = *target;
                         }
                     }
@@ -11724,7 +11736,19 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::JumpIfTrue(target) => {
                     if let Some(cond) = stack.pop() {
-                        if cond.is_true() {
+                        // Lucee's condition coercion: a non-boolean string or a
+                        // complex value throws (GH #451 follow-up).
+                        let truth = match cond {
+                            CfmlValue::Bool(b) => b,
+                            other => match other.to_condition() {
+                                Ok(b) => b,
+                                Err(err) => {
+                                    ip = self.catch_op_error(&mut stack, err)?;
+                                    continue;
+                                }
+                            },
+                        };
+                        if truth {
                             ip = *target;
                         }
                     }
@@ -42829,14 +42853,6 @@ pub(crate) fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
     m.shift_remove(key).is_some()
 }
 
-pub(crate) fn binary_op<F>(stack: &mut Vec<CfmlValue>, op: F)
-where
-    F: FnOnce(CfmlValue, CfmlValue) -> CfmlValue,
-{
-    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-        stack.push(op(a, b));
-    }
-}
 
 /// `binary_op` for the arithmetic ops, which can now throw. The boolean ops
 /// keep the infallible `binary_op`.

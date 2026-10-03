@@ -1317,25 +1317,6 @@ fn cfml_list_split_keep_empty<'a>(list: &'a str, delimiters: &str) -> Vec<&'a st
     list.split(|c: char| delimiters.contains(c)).collect()
 }
 
-/// Map a 1-based CFML list element index (which counts only NON-EMPTY fields, like
-/// ListLen) to a position in the empty-preserving field vector. ListSetAt/InsertAt/
-/// DeleteAt index by non-empty element but keep all empty fields in the output.
-fn nth_nonempty_field_pos(fields: &[&str], index_1based: usize) -> Option<usize> {
-    if index_1based == 0 {
-        return None;
-    }
-    let mut seen = 0usize;
-    for (pos, f) in fields.iter().enumerate() {
-        if !f.is_empty() {
-            seen += 1;
-            if seen == index_1based {
-                return Some(pos);
-            }
-        }
-    }
-    None
-}
-
 // Thread-local xorshift64 PRNG state for deterministic randomize()/rand() support
 thread_local! {
     static PRNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(0);
@@ -5607,8 +5588,21 @@ fn fn_min(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Double(a.min(b)))
 }
 
+/// A number as Lucee prints it in an argument error: `-1`, `-1.5`.
+fn math_arg_text(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 { format!("{}", n as i64) } else { format!("{}", n) }
+}
+
+// sqr/log/log10/asin/acos throw for an argument outside their domain, as on
+// Lucee, instead of answering NaN or -inf (GH #451 follow-up).
 fn fn_sqr(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Double(get_float(&args, 0).sqrt()))
+    let n = get_float(&args, 0);
+    if n < 0.0 {
+        return Err(CfmlError::expression(
+            "invalid argument, function argument must be a positive number".to_string(),
+        ));
+    }
+    Ok(CfmlValue::Double(n.sqrt()))
 }
 
 fn fn_exp(args: Vec<CfmlValue>) -> CfmlResult {
@@ -5616,11 +5610,25 @@ fn fn_exp(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_log(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Double(get_float(&args, 0).ln()))
+    let n = get_float(&args, 0);
+    if !(n > 0.0) {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [log], first Argument [number] is invalid, value must be a positive number, now {}",
+            math_arg_text(n)
+        )));
+    }
+    Ok(CfmlValue::Double(n.ln()))
 }
 
 fn fn_log10(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Double(get_float(&args, 0).log10()))
+    let n = get_float(&args, 0);
+    if !(n > 0.0) {
+        return Err(CfmlError::expression(format!(
+            "invalid argument at function log10, value must be a positive number, now {}",
+            math_arg_text(n)
+        )));
+    }
+    Ok(CfmlValue::Double(n.log10()))
 }
 
 fn fn_sin(args: Vec<CfmlValue>) -> CfmlResult {
@@ -5635,12 +5643,24 @@ fn fn_tan(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Double(get_float(&args, 0).tan()))
 }
 
+fn unit_range_arg(args: &[CfmlValue], fn_name: &str) -> Result<f64, CfmlError> {
+    let n = get_float(args, 0);
+    if !(-1.0..=1.0).contains(&n) {
+        return Err(CfmlError::expression(format!(
+            "invalid range of argument for function {}, argument range must be between -1 and 1, now is [{}]",
+            fn_name,
+            math_arg_text(n)
+        )));
+    }
+    Ok(n)
+}
+
 fn fn_asin(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Double(get_float(&args, 0).asin()))
+    Ok(CfmlValue::Double(unit_range_arg(&args, "aSin")?.asin()))
 }
 
 fn fn_acos(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Double(get_float(&args, 0).acos()))
+    Ok(CfmlValue::Double(unit_range_arg(&args, "aCos")?.acos()))
 }
 
 fn fn_atan(args: Vec<CfmlValue>) -> CfmlResult {
@@ -6785,61 +6805,132 @@ fn fn_list_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// Byte spans of a list's elements. Without `include_empty` an empty field
+/// (two delimiters in a row, or one at either end) is not an element; with it
+/// every field counts. An empty list has no elements either way.
+fn list_element_spans(list: &str, delims: &str, include_empty: bool) -> Vec<(usize, usize)> {
+    if list.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (i, c) in list.char_indices() {
+        if delims.contains(c) {
+            spans.push((start, i));
+            start = i + c.len_utf8();
+        }
+    }
+    spans.push((start, list.len()));
+    if !include_empty {
+        spans.retain(|(a, b)| a < b);
+    }
+    spans
+}
+
+/// The 1-based `position` argument of a list*At function as an element index,
+/// with Lucee's errors for one that is out of range (GH #451 follow-up: these
+/// used to return the list unchanged, or "", instead of throwing).
+fn list_position(
+    pos: i64,
+    len: usize,
+    zero_msg: impl Fn(i64) -> String,
+    range_msg: impl Fn(i64, usize) -> String,
+) -> Result<usize, CfmlError> {
+    if pos < 1 {
+        return Err(CfmlError::expression(zero_msg(pos)));
+    }
+    if pos as usize > len {
+        return Err(CfmlError::expression(range_msg(pos, len)));
+    }
+    Ok(pos as usize - 1)
+}
+
+fn list_include_empty(args: &[CfmlValue], idx: usize) -> bool {
+    args.get(idx).map(|v| v.is_true()).unwrap_or(false)
+}
+
 fn fn_list_get_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = (get_int(&args, 1) as usize).saturating_sub(1);
     let delimiter = get_delimiter(&args, 2);
-    let items = cfml_list_split(&list, &delimiter);
-    Ok(CfmlValue::string(items.get(index).unwrap_or(&"").to_string()))
+    let spans = list_element_spans(&list, &delimiter, list_include_empty(&args, 3));
+    let msg = |p: i64| {
+        format!(
+            "Invalid call of the function [listGetAt], second Argument [posNumber] is invalid, invalid string list index [{}]",
+            p
+        )
+    };
+    let i = list_position(get_int(&args, 1), spans.len(), msg, |p, _| msg(p))?;
+    let (a, b) = spans[i];
+    Ok(CfmlValue::string(list[a..b].to_string()))
 }
 
 fn fn_list_set_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = get_int(&args, 1) as usize;
     let value = get_str(&args, 2);
     let delimiter = get_delimiter(&args, 3);
-    let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    // CFML indexes by NON-EMPTY element (like ListLen) but PRESERVES empty fields.
-    let mut items: Vec<String> =
-        cfml_list_split_keep_empty(&list, &delimiter).iter().map(|s| s.to_string()).collect();
-    if let Some(pos) = nth_nonempty_field_pos(
-        &items.iter().map(|s| s.as_str()).collect::<Vec<_>>(), index,
-    ) {
-        items[pos] = value;
+    if list.is_empty() {
+        return Err(CfmlError::expression(
+            "Invalid call of the function [listSetAt], first Argument [list] is invalid, can't be empty".to_string(),
+        ));
     }
-    Ok(CfmlValue::string(items.join(&first_delim)))
+    // CFML indexes by NON-EMPTY element (like ListLen) but PRESERVES empty fields.
+    let spans = list_element_spans(&list, &delimiter, list_include_empty(&args, 4));
+    let head = "Invalid call of the function [listSetAt], second Argument [position] is invalid, invalid string list index";
+    let i = list_position(
+        get_int(&args, 1),
+        spans.len(),
+        |p| format!("{} [{}]", head, p),
+        |p, n| format!("{} [{}], indexes go from 1 to {}", head, p, n),
+    )?;
+    let (a, b) = spans[i];
+    Ok(CfmlValue::string(format!("{}{}{}", &list[..a], value, &list[b..])))
 }
 
 fn fn_list_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = get_int(&args, 1) as usize;
     let value = get_str(&args, 2);
     let delimiter = get_delimiter(&args, 3);
-    let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    let mut items: Vec<String> =
-        cfml_list_split_keep_empty(&list, &delimiter).iter().map(|s| s.to_string()).collect();
-    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-    // Insert BEFORE the Nth non-empty element; if N is past the last element,
-    // append at the end (matches Lucee's append-on-overflow behavior).
-    let pos = nth_nonempty_field_pos(&refs, index).unwrap_or(items.len());
-    if pos <= items.len() {
-        items.insert(pos, value);
+    let first_delim = delimiter.chars().next().unwrap_or(',');
+    let spans = list_element_spans(&list, &delimiter, list_include_empty(&args, 4));
+    let pos = get_int(&args, 1);
+    if spans.is_empty() && pos == 1 {
+        return Ok(CfmlValue::string(value));
     }
-    Ok(CfmlValue::string(items.join(&first_delim)))
+    // Insert BEFORE the Nth element.
+    let i = list_position(
+        pos,
+        spans.len(),
+        |p| format!("invalid string list index [{}]", p),
+        |p, n| format!("invalid string list index [{}], indexes go from 1 to {}", p, n),
+    )?;
+    let at = spans[i].0;
+    Ok(CfmlValue::string(format!("{}{}{}{}", &list[..at], value, first_delim, &list[at..])))
 }
 
 fn fn_list_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = get_int(&args, 1) as usize;
     let delimiter = get_delimiter(&args, 2);
-    let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    let mut items: Vec<String> =
-        cfml_list_split_keep_empty(&list, &delimiter).iter().map(|s| s.to_string()).collect();
-    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-    if let Some(pos) = nth_nonempty_field_pos(&refs, index) {
-        items.remove(pos);
+    let spans = list_element_spans(&list, &delimiter, list_include_empty(&args, 3));
+    if spans.is_empty() {
+        return Ok(CfmlValue::string(list));
     }
-    Ok(CfmlValue::string(items.join(&first_delim)))
+    let head = "Invalid call of the function [ListDeleteAt], second Argument [index] is invalid,";
+    let i = list_position(
+        get_int(&args, 1),
+        spans.len(),
+        |_| format!("{} index must be greater than 0", head),
+        |_, n| format!("{} index must be an integer between 1 and {}", head, n),
+    )?;
+    // Lucee removes the element with the delimiters after it — or, for the
+    // last element, the delimiters before it, so no trailing delimiter is left.
+    let (from, to) = if i + 1 < spans.len() {
+        (spans[i].0, spans[i + 1].0)
+    } else if i > 0 {
+        (spans[i - 1].1, spans[i].1)
+    } else {
+        spans[i]
+    };
+    Ok(CfmlValue::string(format!("{}{}", &list[..from], &list[to..])))
 }
 
 fn fn_list_find(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8456,7 +8547,7 @@ fn fn_iif(args: Vec<CfmlValue>) -> CfmlResult {
         v.clone()
     }
     if args.len() >= 3 {
-        if args[0].is_true() { Ok(eval_branch(&args[1])) } else { Ok(eval_branch(&args[2])) }
+        if args[0].to_condition()? { Ok(eval_branch(&args[1])) } else { Ok(eval_branch(&args[2])) }
     } else {
         Ok(CfmlValue::Null)
     }
@@ -18662,38 +18753,25 @@ fn fn_create_time_span(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::TimeSpan(total_days))
 }
 
+// Both convert their argument the way a condition does: a non-boolean string
+// or a complex value throws (Lucee), and "0.0" is false. An empty string is
+// "No"/false rather than an error, which a condition would raise.
+fn format_bool_arg(args: &[CfmlValue]) -> Result<bool, CfmlError> {
+    match args.get(0) {
+        None => Ok(false),
+        Some(CfmlValue::String(s)) if s.is_empty() => Ok(false),
+        Some(v) => v.to_condition(),
+    }
+}
+
 fn fn_yes_no_format(args: Vec<CfmlValue>) -> CfmlResult {
-    let val = args.get(0).unwrap_or(&CfmlValue::Bool(false));
-    let result = match val {
-        CfmlValue::Bool(b) => if *b { "Yes" } else { "No" },
-        CfmlValue::Int(i) => if *i != 0 { "Yes" } else { "No" },
-        CfmlValue::Double(d) => if *d != 0.0 { "Yes" } else { "No" },
-        CfmlValue::String(s) => {
-            let lower = s.to_lowercase();
-            if lower == "yes" || lower == "true" || s.parse::<f64>().map(|n| n != 0.0).unwrap_or(false) {
-                "Yes"
-            } else {
-                "No"
-            }
-        }
-        _ => "No",
-    };
-    Ok(CfmlValue::string(result.to_string()))
+    let truth = format_bool_arg(&args)?;
+    Ok(CfmlValue::string(if truth { "Yes" } else { "No" }.to_string()))
 }
 
 fn fn_true_false_format(args: Vec<CfmlValue>) -> CfmlResult {
-    let val = args.get(0).unwrap_or(&CfmlValue::Bool(false));
-    let result = match val {
-        CfmlValue::Bool(b) => *b,
-        CfmlValue::Int(i) => *i != 0,
-        CfmlValue::Double(d) => *d != 0.0,
-        CfmlValue::String(s) => {
-            let lower = s.to_lowercase();
-            lower == "yes" || lower == "true" || s.parse::<f64>().map(|n| n != 0.0).unwrap_or(false)
-        }
-        _ => false,
-    };
-    Ok(CfmlValue::string(if result { "true" } else { "false" }.to_string()))
+    let truth = format_bool_arg(&args)?;
+    Ok(CfmlValue::string(if truth { "true" } else { "false" }.to_string()))
 }
 
 fn fn_null_value(_args: Vec<CfmlValue>) -> CfmlResult {

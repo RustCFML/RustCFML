@@ -1551,7 +1551,7 @@ fn list_get_at_in_udf_matches_closed_form() {
         out = "";
         for (k = 1; k <= 30; k++) {
             out = out & at("a,b,c,d", 1) & "|" & at("a,b,c,d", 3)
-                & "|" & at("a,b,c,d", 99) & ";";
+                & "|" & at("a,b,c,d", 4) & ";";
         }
         writeOutput(out);
     "##;

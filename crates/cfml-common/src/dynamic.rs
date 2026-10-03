@@ -2319,6 +2319,55 @@ impl CfmlValue {
         }
     }
 
+    /// A value used as a CONDITION (`if`, `while`, `!`, `&&`, `?:`), with
+    /// Lucee's rules: booleans, numbers, numeric strings and the boolean words
+    /// (`yes`/`no`/`true`/`false`) convert; any other string, and any complex
+    /// value, throws a catchable `expression` error. [`Self::is_true`] guesses
+    /// instead (`"abc"` was true) and stays for the engine's own internal
+    /// truthiness checks (GH #451 follow-up).
+    pub fn to_condition(&self) -> Result<bool, CfmlError> {
+        match self {
+            CfmlValue::Bool(b) => Ok(*b),
+            CfmlValue::Int(i) => Ok(*i != 0),
+            CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Ok(*d != 0.0),
+            CfmlValue::Null => Ok(false),
+            CfmlValue::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes") {
+                    return Ok(true);
+                }
+                if trimmed.eq_ignore_ascii_case("false") || trimmed.eq_ignore_ascii_case("no") {
+                    return Ok(false);
+                }
+                match crate::numeric::numeric_string_value(trimmed) {
+                    Some(n) if !trimmed.is_empty() => Ok(n != 0.0),
+                    _ => Err(CfmlError::expression(format!(
+                        "Can't cast String [{}] to a boolean",
+                        s
+                    ))),
+                }
+            }
+            CfmlValue::QueryColumn(a, row) => a
+                .get(*row)
+                .or_else(|| a.first())
+                .map(|v| v.to_condition())
+                .unwrap_or(Ok(false)),
+            other => Err(CfmlError::expression(format!(
+                "can't cast Complex Object Type [{}] to a boolean value",
+                match other {
+                    CfmlValue::Array(_) => "Array",
+                    CfmlValue::Query(_) => "Query",
+                    CfmlValue::Binary(_) => "Binary",
+                    CfmlValue::Function(_) | CfmlValue::Closure(_) => "Function",
+                    CfmlValue::Component(_) | CfmlValue::NativeObject(_) => "Component",
+                    #[cfg(feature = "component-instance")]
+                    CfmlValue::Instance(_) => "Component",
+                    _ => "Struct",
+                }
+            ))),
+        }
+    }
+
     pub fn is_true(&self) -> bool {
         match self {
             CfmlValue::Null => false,
@@ -2333,7 +2382,8 @@ impl CfmlValue {
                 }
                 match trimmed.to_lowercase().as_str() {
                     "false" | "no" | "0" => false,
-                    _ => true,
+                    // A numeric string is its number: "0.0" is false.
+                    _ => crate::numeric::numeric_string_value(trimmed).map_or(true, |n| n != 0.0),
                 }
             }
             CfmlValue::Array(a) => !a.is_empty(),
