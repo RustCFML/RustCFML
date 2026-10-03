@@ -7615,6 +7615,12 @@ pub fn java_equals(a: &CfmlValue, b: &CfmlValue) -> bool {
         (CfmlValue::Bool(x), CfmlValue::Bool(y)) => x == y,
         (CfmlValue::String(x), CfmlValue::String(y)) => x == y,
         (CfmlValue::Binary(x), CfmlValue::Binary(y)) => x == y, // §20: by value
+        // Identity first, as `cfml_deep_equal` does: the same backing handle is
+        // equal without walking it, which is what keeps a self-referential graph
+        // from recursing forever — a function's live `local` scope holds the
+        // variable that holds it (`var s = local; s.equals(s)`, GH #465).
+        (CfmlValue::Array(x), CfmlValue::Array(y)) if x.backing_ptr() == y.backing_ptr() => true,
+        (CfmlValue::Struct(x), CfmlValue::Struct(y)) if x.backing_ptr() == y.backing_ptr() => true,
         (CfmlValue::Array(x), CfmlValue::Array(y)) => {
             let (xs, ys) = (x.snapshot(), y.snapshot());
             xs.len() == ys.len()

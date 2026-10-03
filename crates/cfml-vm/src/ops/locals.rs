@@ -574,13 +574,16 @@ pub(crate) fn op_try_load_local(
     // for `local.x = v`'s TryLoadLocal base it handed back a map that already
     // contained the `local` key itself, nesting it one level deeper per write.
     let val = if name_lower == "local" && vm.current_frame_has_local_scope() {
-        // PR #93: per-frame `local` — only keys established here.
-        CfmlValue::strukt(CfmlVirtualMachine::build_local_scope_view(
-            &locals,
-            &inherited_or_param_keys,
-            &func.slot_names,
-            &slots,
-        ))
+        // PR #93: per-frame `local` — only keys established here. GH #465:
+        // the live handle, not a copy (see `escaped_local_handle`).
+        CfmlValue::Struct(vm.escaped_local_handle(|| {
+            CfmlVirtualMachine::build_local_scope_view(
+                &locals,
+                &inherited_or_param_keys,
+                &func.slot_names,
+                &slots,
+            )
+        }))
     } else if name_lower == "variables" {
         if let Some(CfmlValue::Struct(vars)) = locals.get(&*cfml_common::key::well_known::VARIABLES) {
             CfmlValue::Struct(vars.clone())

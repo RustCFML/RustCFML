@@ -2338,6 +2338,13 @@ pub struct CfmlVirtualMachine {
     /// `frame_ctx.last()` is not guaranteed to describe the frame that is actually
     /// running — and a wrong answer here silently changes what `local` means.
     frame_has_local_scope: bool,
+    /// The live `local` scope handle of the CURRENT frame, once `local` has
+    /// been read as a value in it (`var s = local`, `getVariable("local")`,
+    /// `evaluate("local")`, passing `local` to a helper). `None` in every
+    /// frame where it has not — the overwhelmingly common case, which pays one
+    /// `is_some()` test per op and nothing else. Saved and restored around
+    /// each call like `frame_has_local_scope`. See [`EscapedLocal`] (GH #465).
+    escaped_local: Option<EscapedLocal>,
     /// Call-dispatch Lever D1 (scope pooling) — free-list of emptied per-call
     /// `locals` maps. `execute_function_body` pops one at entry (pre-sized) and
     /// pushes it back (cleared) at a non-escaping success exit, so warm calls
@@ -3974,6 +3981,20 @@ struct FusedParentPlan {
     env_first: bool,
 }
 
+/// A frame's `local` scope after it escaped as a value (GH #465): the shared
+/// handle user code holds, plus the two mutation counters `sync_escaped_local`
+/// uses to tell which side changed since the last op boundary.
+pub(crate) struct EscapedLocal {
+    handle: CfmlStruct,
+    /// `handle`'s map version as of the last sync.
+    handle_ver: u32,
+    /// The frame's `locals.version()` as of the last sync.
+    locals_ver: u32,
+    /// Set on creation: the first sync spills the slots and rebuilds the handle
+    /// under the frame's visibility rules before anything else runs.
+    pending_resync: bool,
+}
+
 /// The set of keys a frame inherited from its parent scope, split by kind
 /// (perf plan 3.2 stage 2). Counters on warm Preside showed 92–94% of all
 /// seeded parent keys are the STRUCTURAL scope keys a CFC method dispatch
@@ -4666,6 +4687,7 @@ impl CfmlVirtualMachine {
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
             frame_has_local_scope: false,
+            escaped_local: None,
             #[cfg(feature = "scope-pool")]
             locals_pool: Vec::new(),
             stack_pool: Vec::new(),
@@ -8330,6 +8352,9 @@ impl CfmlVirtualMachine {
         // own template-ness, plus a pending shared-`local` hand-off from an
         // enclosing `<cfinclude>` (which the body `take()`s after this).
         let frame_has_local_scope_before = self.frame_has_local_scope;
+        // The callee starts with no escaped `local`; the caller's handle (if
+        // any) is restored with its frame below.
+        let escaped_local_before = self.escaped_local.take();
         self.frame_has_local_scope =
             !func.is_template_frame || self.include_share_local_keys.is_some();
         let try_depth_before = self.try_stack.len();
@@ -8391,6 +8416,7 @@ impl CfmlVirtualMachine {
         self.call_stack.truncate(call_depth_before);
         self.frame_ctx.truncate(frame_ctx_before);
         self.frame_has_local_scope = frame_has_local_scope_before;
+        self.escaped_local = escaped_local_before;
         self.try_stack.truncate(try_depth_before);
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
@@ -8632,6 +8658,27 @@ impl CfmlVirtualMachine {
         *func
             .rebinds_param
             .get_or_init(|| Self::function_rebinds_param(func))
+    }
+
+    /// Can this body read `local` as a value (GH #465)? Memoised per function,
+    /// same pattern as [`Self::arguments_scope_needed`]. Conservative: any
+    /// reflective call whose path is computed at runtime counts, because
+    /// `getVariable(p)` / `evaluate(e)` may name `local` in a string this scan
+    /// cannot see. `local.x` reads/writes are NOT escapes — they lower to the
+    /// fused key ops and never hand the scope out.
+    fn local_may_escape(func: &BytecodeFunction) -> bool {
+        *func.local_may_escape.get_or_init(|| {
+            func.instructions.iter().any(|op| match op {
+                BytecodeOp::LoadLocal(s)
+                | BytecodeOp::TryLoadLocal(s)
+                | BytecodeOp::LoadSlot(_, s)
+                | BytecodeOp::TryLoadSlot(_, s) => s.eq_ignore_ascii_case("local"),
+                BytecodeOp::LoadGlobal(s) => ["evaluate", "getvariable", "structget", "setvariable"]
+                    .iter()
+                    .any(|f| s.eq_ignore_ascii_case(f)),
+                _ => false,
+            })
+        })
     }
 
     /// Memoized wrapper over [`function_needs_arguments_scope`], keyed by the
@@ -9735,6 +9782,10 @@ impl CfmlVirtualMachine {
             let _ = _cp_t; // last mark: the dispatch loop follows
         }
 
+        // GH #465: only a body that can hand `local` out as a value pays the
+        // per-op reconciliation check (a register-resident bool everywhere else).
+        let watch_local_escape = Self::local_may_escape(func);
+
         // An op's error goes to this frame's open `try`, if any (GH #451).
         macro_rules! catch_op {
             ($e:expr) => {
@@ -9759,6 +9810,27 @@ impl CfmlVirtualMachine {
             }
             let op = &func.instructions[ip];
             ip += 1;
+
+            // GH #465: once `local` has escaped as a value in this frame, the
+            // escaped handle and the frame's own storage are reconciled at
+            // every op boundary (writes made through the handle become locals;
+            // locals written since become visible through the handle). One
+            // `is_some()` test in every other frame.
+            if watch_local_escape {
+                if let Some(esc) = self.escaped_local.as_mut() {
+                    Self::sync_escaped_local(
+                    esc,
+                    func,
+                    &mut locals,
+                    &mut declared_locals,
+                    &mut inherited_or_param_keys,
+                    &mut slots,
+                    &mut slot_blocked,
+                    arguments_supplied_bits,
+                    &arguments_supplied,
+                    );
+                }
+            }
 
             // Dynamic op census (probe builds only — `--features op-census`).
             // One relaxed add per executed op; sizes op-level work against the
@@ -9886,12 +9958,16 @@ impl CfmlVirtualMachine {
                         // ordinary lookup below: `local` is then just a variable
                         // name, undefined until something assigns it (Lucee
                         // stores `local.foo = 1` as `variables.local.foo`).
-                        CfmlValue::strukt(Self::build_local_scope_view(
-                            &locals,
-                            &inherited_or_param_keys,
-                            &func.slot_names,
-                            &slots,
-                        ))
+                        // GH #465: the value IS the scope (Lucee), not a copy —
+                        // see `escaped_local_handle`.
+                        CfmlValue::Struct(self.escaped_local_handle(|| {
+                            Self::build_local_scope_view(
+                                &locals,
+                                &inherited_or_param_keys,
+                                &func.slot_names,
+                                &slots,
+                            )
+                        }))
                     } else if reserved && name_lower == "variables"
                     {
                         // Return a struct representing the variables scope.
@@ -16157,7 +16233,7 @@ impl CfmlVirtualMachine {
     /// Exposed rather than duplicated so an unqualified read from an extension
     /// and from CFML answer identically by construction.
     pub(crate) fn resolve_path_root_public(
-        &self,
+        &mut self,
         root: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
@@ -23681,7 +23757,7 @@ impl CfmlVirtualMachine {
     }
 
     fn scope_aware_load(
-        &self,
+        &mut self,
         name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
@@ -23693,9 +23769,13 @@ impl CfmlVirtualMachine {
             // `local` is always the function-local scope. Strip the internal
             // bridge keys (`__variables`, the `arguments` scope under
             // ARGUMENTS_SCOPE_KEY, …) — they are not local variables.
-            let mut scope = locals.clone();
-            scope.retain(|k, _| !k.starts_with("__"));
-            return Some(CfmlValue::strukt(scope));
+            // GH #465: the live handle; the frame's next op boundary rebuilds
+            // it under the full visibility rules (`pending_resync`).
+            return Some(CfmlValue::Struct(self.escaped_local_handle(|| {
+                let mut scope = locals.clone();
+                scope.retain(|k, _| !k.starts_with("__"));
+                scope
+            })));
         }
         if name_lower == "arguments" {
             // The arguments scope lives under the reserved key; a literal
@@ -26172,6 +26252,178 @@ impl CfmlVirtualMachine {
     /// `arguments`, not `local`). The CFC bridge keys (`this`, `super`,
     /// `__variables`, `__*` internals) and the `arguments` scope are also
     /// excluded.
+    /// The current frame's live `local` handle, creating it from `view` on the
+    /// first escape (GH #465). On Lucee `local` read as a value IS the scope:
+    /// a write through the handle creates/changes/deletes a local, a local
+    /// declared afterwards shows up in the handle, and a handle key named
+    /// like a parameter shadows the parameter. The frame keeps its own fast
+    /// storage; `sync_escaped_local` reconciles the two at every op boundary
+    /// from then on. A brand-new handle is flagged `pending_resync` so the
+    /// first boundary spills the slots and rebuilds it with the frame's full
+    /// visibility rules — which lets a site WITHOUT those rules to hand
+    /// (`getVariable("local")`, `evaluate("local")`) hand out the same handle.
+    pub(crate) fn escaped_local_handle(&mut self, view: impl FnOnce() -> ValueMap) -> CfmlStruct {
+        if let Some(esc) = self.escaped_local.as_ref() {
+            return esc.handle.clone();
+        }
+        let handle = CfmlStruct::new(view());
+        self.escaped_local = Some(EscapedLocal {
+            handle: handle.clone(),
+            handle_ver: handle.with_map(|m| m.version()),
+            locals_ver: 0,
+            pending_resync: true,
+        });
+        handle
+    }
+
+    /// A key the `local` view shows (the same rule as `build_local_scope_view`).
+    #[inline]
+    fn local_view_visible(k: &cfml_common::key::Key, inherited: &InheritedKeys) -> bool {
+        !inherited.contains_key(k) && k != "this" && k != "super" && !k.starts_with("__")
+    }
+
+    /// Reconcile an escaped `local` handle with its frame (GH #465). Runs at
+    /// every op boundary of a frame whose `local` has escaped, nowhere else.
+    ///
+    /// Direction is decided by two mutation counters: the handle's map version
+    /// (bumped by every write through the handle, from any frame) and
+    /// `locals.version()` (bumped by every write the frame makes itself). A
+    /// handle change is pulled into the frame — inserts, updates, and deletions
+    /// (a visible local missing from the handle was `structDelete`d through it;
+    /// deletions are only inferred when the frame itself did not change, so a
+    /// local added in the same op is never mistaken for one). A frame change is
+    /// pushed into the handle. Both counters are re-read afterwards so a sync
+    /// never triggers itself on the next op. Slots are spilled on the first sync
+    /// (the map is then the frame's single source of truth, as the
+    /// `local.x = v` write-back path already requires).
+    fn sync_escaped_local(
+        esc: &mut EscapedLocal,
+        func: &BytecodeFunction,
+        locals: &mut ValueMap,
+        declared_locals: &mut DeclaredLocals,
+        inherited: &mut InheritedKeys,
+        slots: &mut [Option<CfmlValue>],
+        slot_blocked: &mut u64,
+        arguments_supplied_bits: u64,
+        arguments_supplied: &Option<
+            std::collections::HashSet<cfml_common::key::Key, cfml_common::key::KeyBuildHasher>,
+        >,
+    ) {
+        if esc.pending_resync {
+            esc.pending_resync = false;
+            if !slots.is_empty() {
+                Self::spill_slots_for_writeback(locals, &func.slot_names, slots, slot_blocked);
+            }
+            Self::push_escaped_local(esc, locals, inherited);
+            return;
+        }
+        let handle_ver = esc.handle.with_map(|m| m.version());
+        let handle_changed = handle_ver != esc.handle_ver;
+        let frame_changed = locals.version() != esc.locals_ver;
+        if !handle_changed && !frame_changed {
+            return;
+        }
+        if handle_changed {
+            let entries: Vec<(cfml_common::key::Key, CfmlValue)> =
+                esc.handle.with_map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+            if !frame_changed {
+                let gone: Vec<cfml_common::key::Key> = locals
+                    .keys()
+                    .filter(|k| {
+                        Self::local_view_visible(k, inherited)
+                            && !entries.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(k))
+                    })
+                    .cloned()
+                    .collect();
+                for k in gone {
+                    locals.shift_remove(&k);
+                }
+            }
+            for (k, v) in entries {
+                // Bridge keys are the engine's, never the user's to inject.
+                if k == "this" || k == "super" || k.starts_with("__") {
+                    continue;
+                }
+                // Lucee: a handle key named like a parameter shadows the
+                // parameter — `local.p` reads it, `arguments.p` keeps the
+                // caller's value. A lazy frame holds a parameter in ONE place
+                // (`locals[p]`, read back by `LoadArgKey`), so before the local
+                // takes that slot the `arguments` scope is materialised the way
+                // an eager frame builds it: supplied params by value, omitted
+                // ones null (§105), plus the two engine markers.
+                let is_param = func.param_keys().iter().any(|pk| pk.eq_ignore_ascii_case(&k));
+                if is_param && !locals.contains_key(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+                    let mut m = ValueMap::default();
+                    for (i, pk) in func.param_keys().iter().enumerate() {
+                        let supplied = if i < 64 {
+                            arguments_supplied_bits & (1u64 << i) != 0
+                        } else {
+                            arguments_supplied.as_ref().is_some_and(|s| s.contains(pk))
+                        };
+                        let value = if supplied {
+                            locals.get(pk).cloned().unwrap_or(CfmlValue::Null)
+                        } else {
+                            CfmlValue::Null
+                        };
+                        m.insert(pk.clone(), value);
+                    }
+                    m.insert(&*cfml_common::key::well_known::ARGUMENTS_MARKER, CfmlValue::Bool(true));
+                    if !func.params.is_empty() {
+                        let params_marker = func
+                            .params_marker
+                            .get_or_init(|| {
+                                CfmlValue::array(
+                                    func.params.iter().map(|p| CfmlValue::string(p.clone())).collect(),
+                                )
+                            })
+                            .clone();
+                        m.insert(&*cfml_common::key::well_known::ARGUMENTS_PARAMS, params_marker);
+                    }
+                    locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), CfmlValue::strukt(m));
+                }
+                if is_param || inherited.contains_key(&k) {
+                    // The same declaration `var p` / `local.p = v` performs.
+                    ops::locals::op_declare_local(
+                        declared_locals,
+                        inherited,
+                        &cfml_common::name::Name::from(k.as_str()),
+                    );
+                }
+                locals.insert(k, v);
+            }
+        }
+        if frame_changed {
+            Self::push_escaped_local(esc, locals, inherited);
+        } else {
+            esc.handle_ver = esc.handle.with_map(|m| m.version());
+            esc.locals_ver = locals.version();
+        }
+    }
+
+    /// Frame → handle: make the handle hold exactly the frame's visible locals.
+    fn push_escaped_local(esc: &mut EscapedLocal, locals: &ValueMap, inherited: &InheritedKeys) {
+        let visible: Vec<(cfml_common::key::Key, CfmlValue)> = locals
+            .iter()
+            .filter(|(k, _)| Self::local_view_visible(k, inherited))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        esc.handle.with_write(|m| {
+            let stale: Vec<cfml_common::key::Key> = m
+                .keys()
+                .filter(|hk| !visible.iter().any(|(k, _)| k.eq_ignore_ascii_case(hk)))
+                .cloned()
+                .collect();
+            for k in stale {
+                m.shift_remove(&k);
+            }
+            for (k, v) in visible {
+                m.insert(k, v);
+            }
+        });
+        esc.handle_ver = esc.handle.with_map(|m| m.version());
+        esc.locals_ver = locals.version();
+    }
+
     fn build_local_scope_view(
         locals: &ValueMap,
         inherited_or_param_keys: &InheritedKeys,
@@ -31493,7 +31745,7 @@ impl CfmlVirtualMachine {
     /// two answer the same question ("where does this name start?") and a
     /// divergence between them would make `isDefined(p)` and `getVariable(p)`
     /// disagree about the same string.
-    fn resolve_path_root(&self, root: &str, locals: &ValueMap) -> Option<CfmlValue> {
+    fn resolve_path_root(&mut self, root: &str, locals: &ValueMap) -> Option<CfmlValue> {
         let root_lower = root.to_lowercase();
         match root_lower.as_str() {
             // GH #351: only a real function frame has a `local` scope. At page
@@ -31503,21 +31755,25 @@ impl CfmlVirtualMachine {
             "local" if self.current_frame_has_local_scope() => {
                 // The frame map also carries the engine's bridge keys and the
                 // parameters (those belong to `arguments`); `local` shows
-                // neither, as a direct `local` read does not.
-                let args = locals
-                    .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
-                    .and_then(|v| v.as_cfml_struct());
-                let mut view = ValueMap::default();
-                for (k, v) in locals {
-                    if k.starts_with("__") || k == "this" || k == "super" {
-                        continue;
+                // neither, as a direct `local` read does not. GH #465: the
+                // live handle (`getVariable("local")`, `evaluate("local")`);
+                // the frame's next op boundary rebuilds it exactly.
+                Some(CfmlValue::Struct(self.escaped_local_handle(|| {
+                    let args = locals
+                        .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                        .and_then(|v| v.as_cfml_struct());
+                    let mut view = ValueMap::default();
+                    for (k, v) in locals {
+                        if k.starts_with("__") || k == "this" || k == "super" {
+                            continue;
+                        }
+                        if args.is_some_and(|a| a.contains_key_ci(k)) {
+                            continue;
+                        }
+                        view.insert(k.clone(), v.clone());
                     }
-                    if args.is_some_and(|a| a.contains_key_ci(k)) {
-                        continue;
-                    }
-                    view.insert(k.clone(), v.clone());
-                }
-                Some(CfmlValue::strukt(view))
+                    view
+                })))
             }
             "variables" => match locals.get(&*cfml_common::key::well_known::VARIABLES) {
                 Some(v) => Some(v.clone()),
@@ -31567,7 +31823,7 @@ impl CfmlVirtualMachine {
     /// `Err` is reserved for a path that is not a legal variable name at all
     /// (Lucee throws for those rather than reporting "not found").
     fn resolve_variable_path(
-        &self,
+        &mut self,
         path: &str,
         locals: &ValueMap,
     ) -> Result<Option<CfmlValue>, CfmlError> {

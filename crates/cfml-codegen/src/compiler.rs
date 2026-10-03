@@ -269,6 +269,13 @@ pub struct BytecodeFunction {
     /// `arguments` struct exists — hence such a frame opts out of the lazy path.
     /// Same once-per-process pattern as `args_needed`.
     pub rebinds_param: std::sync::OnceLock<bool>,
+    /// Whether the body can read `local` AS A VALUE (`var s = local`, `local`
+    /// passed to a call, or a reflective `getVariable`/`evaluate`/`structGet`/
+    /// `setVariable` whose path is computed at runtime). Only such a frame
+    /// keeps the escaped-`local` handle in sync at every op boundary (GH #465);
+    /// every other frame skips the check entirely. Same once-per-process
+    /// pattern as `args_needed`.
+    pub local_may_escape: std::sync::OnceLock<bool>,
     /// The `__arguments_params` positional-marker array (declared param names
     /// as a CfmlArray), built once per process on first eager call. Previously
     /// a per-VM `HashMap<global_id, CfmlValue>` — one more SipHash probe per
@@ -1837,6 +1844,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
@@ -4868,6 +4876,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
@@ -5156,6 +5165,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
@@ -5229,6 +5239,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
@@ -5425,6 +5436,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
@@ -6531,6 +6543,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
@@ -6633,6 +6646,7 @@ impl CfmlCompiler {
                     args_needed: Default::default(),
                     rebinds_param: Default::default(),
                     args_never_escapes: Default::default(),
+                    local_may_escape: Default::default(),
                     params_marker: Default::default(),
                     cfc_body: Default::default(),
                     source_file_value: Default::default(),
