@@ -1,0 +1,1 @@
+<cfscript>t0=getTickCount("nano"); for (i=0;i<2000;i++) { md = getComponentMetaData("many.S#i#"); } writeOutput("us/call=" & numberFormat((getTickCount("nano")-t0)/1000/2000,"0.0"));</cfscript>

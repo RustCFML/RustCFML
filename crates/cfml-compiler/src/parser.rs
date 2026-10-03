@@ -152,15 +152,18 @@ impl Parser {
         }
     }
 
-    fn advance(&mut self) -> TokenWithLoc {
+    // Both return a REFERENCE. They used to clone the token — its String
+    // payload and `raw` spelling — on every call, and 163 of the 168 call sites
+    // discard the result: ~40% of a large CFC's parse allocations.
+    fn advance(&mut self) -> &TokenWithLoc {
         if !self.is_at_end() {
             self.current += 1;
         }
         self.previous()
     }
 
-    fn previous(&self) -> TokenWithLoc {
-        self.tokens[self.current - 1].clone()
+    fn previous(&self) -> &TokenWithLoc {
+        &self.tokens[self.current - 1]
     }
 
     fn check(&self, token: &Token) -> bool {
@@ -5708,7 +5711,7 @@ impl Parser {
     fn extract_identifier(&mut self) -> Result<String, ParseError> {
         match self.peek(0) {
             Token::Identifier(_) => {
-                if let Token::Identifier(id) = self.advance().token {
+                if let Token::Identifier(id) = self.advance().token.clone() {
                     Ok(id)
                 } else {
                     unreachable!()

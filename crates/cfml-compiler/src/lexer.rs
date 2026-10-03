@@ -43,12 +43,18 @@ pub struct TokenWithLoc {
 
 impl Lexer {
     pub fn new(source: String) -> Self {
+        // Pre-size the token vector: real CFML runs ~6 source bytes per token
+        // (Preside's 211 KB DataManager.cfc lexes to 33,664 tokens). At 80 B per
+        // token, growing by doubling from empty allocated ~2x the final vector
+        // and copied it log2(n) times — the largest single item in a big
+        // component's compile.
+        let tokens = Vec::with_capacity(source.len() / 6 + 16);
         Self {
             source: source.chars().collect(),
             pos: 0,
             line: 1,
             column: 1,
-            tokens: Vec::new(),
+            tokens,
             token_start_line: 1,
             token_start_column: 1,
             doc_comments: Vec::new(),
@@ -73,7 +79,9 @@ impl Lexer {
                 Position::new(self.line, self.column),
             ),
         });
-        self.tokens.clone()
+        // Moved out, not cloned: the clone deep-copied every token's String a
+        // second time and the originals were dropped with the lexer.
+        std::mem::take(&mut self.tokens)
     }
 
     fn is_at_end(&self) -> bool {

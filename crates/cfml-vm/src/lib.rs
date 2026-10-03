@@ -497,12 +497,24 @@ pub(crate) fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool 
 /// maps an object by `md.path`). Serve mode already resolves absolutely; a CLI
 /// run resolves against the process directory, so join it back on. Deliberately
 /// NOT `canonicalize`: that resolves symlinks, which expandPath must not do.
+/// The process working directory, read once. Nothing in the engine changes it,
+/// and `std::env::current_dir()` is a real syscall on macOS (`getcwd` opens the
+/// directory): metadata derivation called it twice per class and it was ~40%
+/// of a cold `getComponentMetaData` after the collector (sampled on 2,000
+/// classes). Same `io::Result<PathBuf>` shape as the std call it replaces.
+fn process_cwd() -> std::io::Result<std::path::PathBuf> {
+    static CWD: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    CWD.get_or_init(|| std::env::current_dir().ok())
+        .clone()
+        .ok_or_else(|| std::io::Error::other("current directory unavailable"))
+}
+
 fn absolute_metadata_path(src: &str) -> String {
     let p = std::path::Path::new(src);
     if p.is_absolute() {
         return src.to_string();
     }
-    match std::env::current_dir() {
+    match process_cwd() {
         Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
         Err(_) => src.to_string(),
     }
@@ -3158,6 +3170,13 @@ pub struct CfmlVirtualMachine {
     /// Depth of the current metadata derivation; `> 0` enables the cache above.
     /// A counter rather than a bool because the builder recurses into parents.
     meta_template_depth: u32,
+    /// Set by a caller that only READS the template it resolves (the
+    /// inheritance metadata builder snapshots it): the executed-template cache
+    /// then hands out and banks the value SHARED instead of deep-copying it.
+    /// The deep copies — about four per `getComponentMetaData` miss — were most
+    /// of a miss's allocation, and feeding them to the cycle collector's log
+    /// triggered mid-request sweeps that were 57% of the call (sampled).
+    meta_template_readonly: bool,
     /// Phase C.3 (feature `component-instance`): per-`__source_file` cache of the
     /// class-invariant [`cfml_common::component::ClassBlueprint`], `Arc`-shared
     /// across every instance the producer builds. Request-scoped (rebuilt next
@@ -4876,6 +4895,7 @@ impl CfmlVirtualMachine {
             resolved_template_keys_seen: FxHashSet::default(),
             component_meta_template_cache: FxHashMap::default(),
             meta_template_depth: 0,
+            meta_template_readonly: false,
             #[cfg(feature = "component-instance")]
             component_blueprints: FxHashMap::default(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -18647,7 +18667,7 @@ impl CfmlVirtualMachine {
                         return Ok(CfmlValue::string(source.to_string()));
                     }
                     // Fallback to CWD
-                    if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(cwd) = process_cwd() {
                         return Ok(CfmlValue::string(cwd.to_string_lossy().to_string()));
                     }
                     return Ok(CfmlValue::string(String::new()));
@@ -18766,7 +18786,7 @@ impl CfmlVirtualMachine {
                     // paths). Anchor a still-relative result to the CWD.
                     let resolved = if resolved.is_absolute() {
                         resolved
-                    } else if let Ok(cwd) = std::env::current_dir() {
+                    } else if let Ok(cwd) = process_cwd() {
                         cwd.join(&resolved)
                     } else {
                         resolved
@@ -34911,11 +34931,11 @@ impl CfmlVirtualMachine {
         let abs = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir().ok()?.join(path)
+            process_cwd().ok()?.join(path)
         };
         let root = match self.server_state.as_ref().and_then(|s| s.webroot.clone()) {
             Some(w) => w,
-            None => std::env::current_dir().ok()?,
+            None => process_cwd().ok()?,
         };
         let rel = abs.strip_prefix(&root).ok()?;
         let rel = rel.to_string_lossy();
@@ -35936,6 +35956,11 @@ impl CfmlVirtualMachine {
         class_name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
+        // Read-only sharing applies to THIS resolution only: taken (and reset to
+        // false) here, so a `new X()` inside the pseudo-constructor this runs —
+        // which resolve_inheritance will mutate — never receives a shared entry.
+        // The caller that set it restores its own value afterwards.
+        let meta_ro = std::mem::take(&mut self.meta_template_readonly);
         cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_CALLS);
         cfml_common::perf_counters::ctor_phases::bump_calls();
         let mut _ct = cfml_common::perf_counters::ctor_phases::Stopwatch::start();
@@ -36081,6 +36106,9 @@ impl CfmlVirtualMachine {
                 cfml_common::perf_counters::bump(
                     &cfml_common::perf_counters::META_TEMPLATE_CACHE_HITS,
                 );
+                if meta_ro {
+                    return Some(hit.clone());
+                }
                 return Some(hit.deep_copy());
             }
         }
@@ -37224,8 +37252,8 @@ impl CfmlVirtualMachine {
             // value handed back is mutated in place by inheritance merging.
             if self.meta_template_depth > 0 {
                 if let Some(ref v) = result {
-                    self.component_meta_template_cache
-                        .insert(cache_key, v.deep_copy());
+                    let banked = if meta_ro { v.clone() } else { v.deep_copy() };
+                    self.component_meta_template_cache.insert(cache_key, banked);
                 }
             }
             // Bound mid-request cycle retention.
@@ -37246,7 +37274,14 @@ impl CfmlVirtualMachine {
             // until the request's tracked-allocation log passes its threshold,
             // so an ordinary request (which never gets near it) pays one
             // thread-local length read per `new`.
-            cfml_common::cycle_gc::collect_incremental();
+            // Not while deriving metadata: every template executed there is
+            // banked in the request's executed-template cache (alive by
+            // construction), so a sweep walks the young log and frees nothing.
+            // The next ordinary construction picks the log up, by which time
+            // the frame temporaries in it are dead and cheap to skip.
+            if self.meta_template_depth == 0 {
+                cfml_common::cycle_gc::collect_incremental();
+            }
             // First construction of this class under this key in the request:
             // record what every later construction can take from one probe.
             // Only for a file-resolved class (a warm path-cache key fully
@@ -37469,7 +37504,9 @@ impl CfmlVirtualMachine {
         if let Some(src) = source_context {
             self_.source_file = Some(Arc::from(src));
         }
+        let prev_ro = std::mem::replace(&mut self_.meta_template_readonly, true);
         let template = self_.resolve_component_template(name, locals);
+        self_.meta_template_readonly = prev_ro;
         self_.source_file = prev_source;
 
         // Table-aware: on a replayed construction the template's own methods
@@ -40332,7 +40369,7 @@ impl CfmlVirtualMachine {
                 .map_or(true, |p| p.as_os_str().is_empty())
         });
         let cwd = if needs_cwd {
-            std::env::current_dir().unwrap_or_default()
+            process_cwd().unwrap_or_default()
         } else {
             std::path::PathBuf::new()
         };
@@ -42813,7 +42850,7 @@ impl CfmlVirtualMachine {
                     .to_string_lossy()
                     .to_string()
             } else {
-                std::env::current_dir()
+                process_cwd()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string()

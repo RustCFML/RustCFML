@@ -1,0 +1,1 @@
+<cfscript>for (i=0;i<2000;i++) { o = createObject("component","many.S#i#"); } writeOutput("compiled");</cfscript>
