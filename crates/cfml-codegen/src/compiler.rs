@@ -451,7 +451,7 @@ impl BytecodeFunction {
                 | BytecodeOp::ArrayAppendLocal(_)
                 | BytecodeOp::LoadVariablesKey(_)
                 | BytecodeOp::StoreVariablesKey(_) => return 0,
-                BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n) => {
+                BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n) | BytecodeOp::TakeLocal(n) => {
                     if matches!(
                         n.lower(),
                         "variables" | "static" | "thread" | "attributes" | "caller"
@@ -624,7 +624,7 @@ impl BytecodeFunction {
                 // not a `LoadGlobal` call. The higher-order function then calls
                 // it against this frame by name, which slot storage cannot
                 // serve (GH #449).
-                BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n)
+                BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n) | BytecodeOp::TakeLocal(n)
                     if REFLECTIVE_BUILTINS.contains(&n.lower()) =>
                 {
                     self.count_slot_class(SlotClass::DisqOther(DisqReason::Reflective), Some(i));
@@ -756,6 +756,9 @@ impl BytecodeFunction {
                 }
                 BytecodeOp::ArrayAppendLocal(n) => {
                     slot(n).map(|i| BytecodeOp::ArrayAppendSlot(i, n.clone()))
+                }
+                BytecodeOp::TakeLocal(n) => {
+                    slot(n).map(|i| BytecodeOp::TakeSlot(i, n.clone()))
                 }
                 _ => None,
             };
@@ -1492,6 +1495,17 @@ pub enum BytecodeOp {
     StoreSlotProperty(u16, Name, Name),
     ArrayAppendSlot(u16, Name),
 
+    // `x &= <rhs>` on a plain variable: a LoadLocal/LoadSlot that MOVES a String
+    // out of the frame's own local/slot when the right operand is simple, so the
+    // Concat that follows appends to a uniquely-owned buffer instead of copying
+    // the whole string (the variable still held a reference, so `try_unwrap`
+    // always failed: an 11-step `&=` loop ran 2.5x slower than Lucee). The
+    // StoreLocal/StoreSlot that follows writes the result back. Anywhere the
+    // fast path does not apply (name not in the frame, non-String value, complex
+    // right operand that could make Concat throw) it is exactly LoadLocal.
+    TakeLocal(Name),
+    TakeSlot(u16, Name),
+
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
     CallNamed(Box<Vec<String>>, usize),
@@ -1642,11 +1656,13 @@ impl BytecodeOp {
             Self::ForInPrepare => 129,
             Self::ForInElement => 130,
             Self::ForInExit => 131,
+            Self::TakeLocal(..) => 132,
+            Self::TakeSlot(..) => 133,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 132] = [
+    pub const CENSUS_NAMES: [&'static str; 134] = [
         "Null",
         "True",
         "False",
@@ -1779,6 +1795,8 @@ impl BytecodeOp {
         "ForInPrepare",
         "ForInElement",
         "ForInExit",
+        "TakeLocal",
+        "TakeSlot",
     ];
 }
 
@@ -3097,7 +3115,14 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::Mod);
                     }
                     AssignOp::ConcatEqual => {
-                        self.emit_load_current_target(&assign.target, instructions);
+                        // A plain variable target takes the move-out load so the
+                        // Concat below appends in place (see `TakeLocal`).
+                        match &assign.target {
+                            AssignTarget::Variable(name) if !Self::is_reserved_scope_name(name) => {
+                                instructions.push(BytecodeOp::TakeLocal(Name::from(&name)));
+                            }
+                            _ => self.emit_load_current_target(&assign.target, instructions),
+                        }
                         instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Concat);
                     }

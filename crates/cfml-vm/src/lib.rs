@@ -1207,10 +1207,21 @@ pub fn compile_file_cached(
     cache: Option<&BytecodeCache>,
     vfs: &dyn Vfs,
 ) -> Result<BytecodeProgram, CfmlError> {
+    compile_file_cached_flagged(path, cache, vfs).map(|(p, _)| p)
+}
+
+/// [`compile_file_cached`] that also says whether it COMPILED (`true`) or served
+/// the bytecode cache (`false`), so the caller can meter a real parse+codegen
+/// separately from the frame that happened to trigger it.
+pub fn compile_file_cached_flagged(
+    path: &str,
+    cache: Option<&BytecodeCache>,
+    vfs: &dyn Vfs,
+) -> Result<(BytecodeProgram, bool), CfmlError> {
     // Check cache first
     if let Some(c) = cache {
         if let Some(program) = c.get(path, vfs) {
-            return Ok(program);
+            return Ok((program, false));
         }
     }
 
@@ -1280,7 +1291,7 @@ pub fn compile_file_cached(
         }
     }
 
-    Ok(program)
+    Ok((program, true))
 }
 
 /// The lock behind a `<cflock name=…>` / `scope=` entry in `named_locks`.
@@ -3158,6 +3169,9 @@ pub struct CfmlVirtualMachine {
     /// Request-lifetime sibling of `ServerState::canonicalize_cache`; safe in all
     /// modes for the same reason. `RwLock` because `canonicalize_cached` is `&self`.
     pub request_canon_cache: parking_lot::RwLock<HashMap<String, Option<String>>>,
+    /// Request-scoped memo of `page_relative_package` (caller page + component
+    /// dir → qualifying package). See that function for the measurement.
+    page_pkg_memo: parking_lot::RwLock<HashMap<String, Option<String>>>,
     /// Request-scoped memo of the `server.cfconfig` CFML tree. Building it goes
     /// through `serde_json::to_value` + a recursive CFML conversion of the whole
     /// config, and `live_server_scope()` runs on EVERY `server` scope read — the
@@ -4865,6 +4879,7 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             component_blueprints: FxHashMap::default(),
             request_canon_cache: parking_lot::RwLock::new(HashMap::new()),
+            page_pkg_memo: parking_lot::RwLock::new(HashMap::new()),
             request_cfconfig_scope_memo: parking_lot::RwLock::new(None),
             resolved_fn_memo: HashMap::new(),
             arg_sources_memo: HashMap::new(),
@@ -8685,7 +8700,9 @@ impl CfmlVirtualMachine {
             func.instructions.iter().any(|op| match op {
                 BytecodeOp::LoadLocal(s)
                 | BytecodeOp::TryLoadLocal(s)
+                | BytecodeOp::TakeLocal(s)
                 | BytecodeOp::LoadSlot(_, s)
+                | BytecodeOp::TakeSlot(_, s)
                 | BytecodeOp::TryLoadSlot(_, s) => s.eq_ignore_ascii_case("local"),
                 BytecodeOp::LoadGlobal(s) => ["evaluate", "getvariable", "structget", "setvariable"]
                     .iter()
@@ -9862,12 +9879,53 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Double(d) => ops::value::op_double(&mut stack, *d),
                 BytecodeOp::String(s) => ops::value::op_string(&mut stack, s),
 
-                BytecodeOp::LoadLocal(name) | BytecodeOp::LoadSlot(_, name) => {
+                BytecodeOp::LoadLocal(name)
+                | BytecodeOp::LoadSlot(_, name)
+                | BytecodeOp::TakeLocal(name)
+                | BytecodeOp::TakeSlot(_, name) => {
+                    // `x &= <simple>` (see `BytecodeOp::TakeLocal`): move the
+                    // String out of the frame's own slot/local so the Concat
+                    // that follows appends in place; the store that follows
+                    // puts it back. Only when the right operand (already on the
+                    // stack) is simple — Concat cannot throw then, so the
+                    // variable is never left holding the placeholder.
+                    if matches!(op, BytecodeOp::TakeLocal(_) | BytecodeOp::TakeSlot(..))
+                        && matches!(
+                            stack.last(),
+                            Some(CfmlValue::String(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::Bool(_))
+                        )
+                    {
+                        if let BytecodeOp::TakeSlot(i, _) = op {
+                            let idx = *i as usize;
+                            if matches!(slots[idx], Some(CfmlValue::String(_))) {
+                                let taken = slots[idx].replace(CfmlValue::Null).unwrap_or(CfmlValue::Null);
+                                stack.push(taken);
+                                continue;
+                            }
+                        } else if matches!(locals.get(name), Some(CfmlValue::String(_))) {
+                            // Probe by shared read first: `get_mut` on a page frame's
+                            // shared variables map would clone the whole map.
+                            if let Some(v) = locals.get_mut(name) {
+                                let taken = std::mem::replace(v, CfmlValue::Null);
+                                stack.push(taken);
+                                continue;
+                            }
+                        } else if !name.is_reserved_word() && direct_frame {
+                            // A page / component frame: the variable lives in the
+                            // shared `variables` struct — take it from there.
+                            if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
+                                if let Some(taken) = vars.take_if_string(name) {
+                                    stack.push(taken);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // Slot fast path (T3.1): a declared slot always wins — the
                     // name is never a scope name or param, and `local` is first
                     // in the resolution chain. `None` (not yet declared /
                     // deleted) falls through to the generic named path below.
-                    if let BytecodeOp::LoadSlot(i, _) = op {
+                    if let BytecodeOp::LoadSlot(i, _) | BytecodeOp::TakeSlot(i, _) = op {
                         if let Some(v) = slots[*i as usize].as_ref() {
                             stack.push(v.clone());
                             continue;
@@ -35238,16 +35296,15 @@ impl CfmlVirtualMachine {
     /// validated load we skip that stat on repeat loads of the same path (the
     /// memo is dropped at request end, so dev re-checks next request). Production
     /// already trusts the cache, so this adds no cost there.
-    fn compile_file_cached_req(&self, path: &str) -> Result<BytecodeProgram, CfmlError> {
-        let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
+    fn compile_file_cached_req(&mut self, path: &str) -> Result<BytecodeProgram, CfmlError> {
         if self.request_validated_files.read().contains(path) {
-            if let Some(c) = cache {
+            if let Some(c) = self.server_state.as_ref().map(|s| &s.bytecode_cache) {
                 if let Some(program) = c.get_no_check(path) {
                     return Ok(program);
                 }
             }
         }
-        let program = match compile_file_cached(path, cache, self.vfs.as_ref()) {
+        let program = match self.compile_file_metered(path) {
             Ok(program) => program,
             // GH #387: on a case-sensitive filesystem the only thing wrong with
             // the path may be its spelling. Retry once against the on-disk
@@ -35265,7 +35322,7 @@ impl CfmlVirtualMachine {
                     .filter(|f| f != path);
                 match folded {
                     Some(f) => {
-                        let program = compile_file_cached(&f, cache, self.vfs.as_ref())?;
+                        let program = self.compile_file_metered(&f)?;
                         self.request_validated_files.write().insert(f);
                         return Ok(program);
                     }
@@ -35274,6 +35331,54 @@ impl CfmlVirtualMachine {
             }
         };
         self.request_validated_files.write().insert(path.to_string());
+        Ok(program)
+    }
+
+    /// `compile_file_cached` with a real parse+codegen metered as its own
+    /// `<compile>` row in the debug footer. Compile used to be charged as SELF
+    /// time and bytes to whatever frame triggered the load — a Preside reload
+    /// showed `index.cfm` with 371 ms self and a 150-method handler's
+    /// `<constructor>` at 11 MB, both of which were this. The compile's time and
+    /// bytes are credited to the enclosing frame as a child (so its self figure
+    /// excludes them) and reported under the compiled file's own row.
+    fn compile_file_metered(&mut self, path: &str) -> Result<BytecodeProgram, CfmlError> {
+        #[cfg(feature = "observability")]
+        let metering = self.observer.is_some();
+        #[cfg(not(feature = "observability"))]
+        let metering = false;
+        if !metering {
+            let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
+            return compile_file_cached(path, cache, self.vfs.as_ref());
+        }
+        let t0 = std::time::Instant::now();
+        let a0 = if self.mem_meter.is_some() {
+            cfml_common::mem_account::thread_totals().allocated
+        } else {
+            0
+        };
+        let result = {
+            let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
+            compile_file_cached_flagged(path, cache, self.vfs.as_ref())
+        };
+        let (program, compiled) = result?;
+        #[cfg(feature = "observability")]
+        if compiled {
+            let us = t0.elapsed().as_micros() as i64;
+            let bytes = if self.mem_meter.is_some() {
+                cfml_common::mem_account::thread_totals()
+                    .allocated
+                    .saturating_sub(a0)
+            } else {
+                0
+            };
+            if let Some(child) = self.tmpl_child_us_stack.last_mut() {
+                *child += us;
+            }
+            if let Some(parent) = self.tmpl_alloc_stack.last_mut() {
+                parent.1 += bytes;
+            }
+            self.fire_template(path, Some("<compile>"), us, bytes);
+        }
         Ok(program)
     }
 
@@ -35760,6 +35865,22 @@ impl CfmlVirtualMachine {
     /// caller, a page outside the webroot, or one at the webroot itself.
     fn page_relative_package(&self, cfc_path: &str, caller_source: Option<&str>) -> Option<String> {
         let caller = caller_source?;
+        // Memoised per (caller page, component dir): the answer depends only on
+        // the two paths and the webroot. Unmemoised this made a page-level
+        // `createObject("component", "X")` cost 48.6 µs against 1.9 µs for the
+        // same call with a dotted name or from inside a CFC (Lucee: 1.9 µs for
+        // all of them) — the GH #452 qualification ran its path work on every
+        // construction.
+        let memo_key = format!("{}\0{}", caller, cfc_path);
+        if let Some(hit) = self.page_pkg_memo.read().get(&memo_key) {
+            return hit.clone();
+        }
+        let out = self.page_relative_package_uncached(cfc_path, caller);
+        self.page_pkg_memo.write().insert(memo_key, out.clone());
+        out
+    }
+
+    fn page_relative_package_uncached(&self, cfc_path: &str, caller: &str) -> Option<String> {
         if caller.to_ascii_lowercase().ends_with(".cfc") {
             return None;
         }
@@ -43938,7 +44059,9 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         | BytecodeOp::LoadVariablesKey(_)
         | BytecodeOp::LoadSuper
         | BytecodeOp::TryLoadLocal(_)
+        | BytecodeOp::TakeLocal(_)
         | BytecodeOp::LoadSlot(..)
+        | BytecodeOp::TakeSlot(..)
         | BytecodeOp::TryLoadSlot(..) => (1, 0),
         // Variable stores: push 0, pop 1
         BytecodeOp::StoreVariablesKey(_) => (0, 1),
@@ -44092,9 +44215,11 @@ fn find_arg_sources(ops: &[BytecodeOp], call_ip: usize, arg_count: usize) -> Vec
                 arg_idx -= 1;
                 if let BytecodeOp::LoadLocal(name)
                 | BytecodeOp::TryLoadLocal(name)
+                | BytecodeOp::TakeLocal(name)
                 | BytecodeOp::LoadGlobal(name)
                 | BytecodeOp::LoadVariablesKey(name)
                 | BytecodeOp::LoadSlot(_, name)
+                | BytecodeOp::TakeSlot(_, name)
                 | BytecodeOp::TryLoadSlot(_, name) = op
                 {
                     sources[arg_idx] = Some(name.to_string());
