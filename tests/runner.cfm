@@ -162,6 +162,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_isdefined_variables_scope.cfm">
 <cf_runtest file="core/test_isdefined_path_walk.cfm">
 <cf_runtest file="core/test_isdefined_reserved_scope.cfm">
+<cf_runtest file="core/test_evaluate_scopes_and_reflective_callbacks.cfm">
 <cf_runtest file="core/test_nested_index_assign_autoviv.cfm">
 <cf_runtest file="core/test_index_write_out_of_range.cfm">
 <cf_runtest file="core/test_numeric_subscript_vivifies_struct.cfm">

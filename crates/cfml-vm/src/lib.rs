@@ -7866,6 +7866,21 @@ impl CfmlVirtualMachine {
         Ok(w.entry(key).or_insert(program).clone())
     }
 
+    /// `a`, `local.x`, `arguments.rc.y`: dotted plain identifiers, not a literal
+    /// word (`true`, `null`, …) and not an expression.
+    fn is_plain_variable_path(text: &str) -> bool {
+        let text = text.trim();
+        let ident = |p: &str| {
+            let mut cs = p.chars();
+            matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        };
+        let first = text.split('.').next().unwrap_or("");
+        !text.is_empty()
+            && text.split('.').all(ident)
+            && !["true", "false", "null", "yes", "no"].iter().any(|w| first.eq_ignore_ascii_case(w))
+    }
+
     fn eval_expression_string(
         &mut self,
         expr: &str,
@@ -8470,6 +8485,27 @@ impl CfmlVirtualMachine {
                 _ => false,
             })
         };
+        // A reflective call whose path is computed at runtime
+        // (`evaluate(e)`, `getVariable(p)`, …) may name the arguments scope in a
+        // string this scan cannot see. A literal path is already covered: its
+        // `String` op is checked below, and codegen lowers a literal
+        // `evaluate("arguments")` to a direct read.
+        let reflective_dynamic = instructions.iter().enumerate().any(|(i, op)| {
+            let BytecodeOp::LoadGlobal(s) = op else { return false };
+            if !["evaluate", "getvariable", "structget", "setvariable"]
+                .iter()
+                .any(|f| s.eq_ignore_ascii_case(f))
+            {
+                return false;
+            }
+            !matches!(
+                (instructions.get(i + 1), instructions.get(i + 2)),
+                (Some(BytecodeOp::String(_)), Some(BytecodeOp::Call(1)))
+            )
+        });
+        if reflective_dynamic {
+            return true;
+        }
         instructions.iter().any(|op| match op {
             BytecodeOp::LoadArgKey(n) | BytecodeOp::TryLoadArgKey(n) => declares_local_named(n),
             BytecodeOp::LoadLocal(s) | BytecodeOp::TryLoadLocal(s) => {
@@ -22902,6 +22938,17 @@ impl CfmlVirtualMachine {
                     let mut result = CfmlValue::Null;
                     for arg in &args {
                         let expr = arg.as_string();
+                        // A plain variable path resolves in the CALLER's frame,
+                        // like getVariable(): the evaluator's own frame has its
+                        // own empty `local`, and handed back copies of scopes
+                        // (GH #370/#371). A literal argument never gets here —
+                        // codegen lowers it to a direct read.
+                        if Self::is_plain_variable_path(&expr) {
+                            if let Some(v) = self.resolve_variable_path(expr.trim(), parent_locals)? {
+                                result = v;
+                                continue;
+                            }
+                        }
                         result = self.eval_expression_string(&expr, parent_locals)?;
                     }
                     return Ok(result);
@@ -27816,6 +27863,32 @@ impl CfmlVirtualMachine {
         Ok(slots.into_iter().map(|s| s.unwrap_or(CfmlValue::Null)).collect())
     }
 
+    /// The scope a member-form higher-order function (`arr.map(cb)`, …) hands
+    /// its callback. A closure or UDF brings its own captured scope and gets
+    /// an empty map, as before. A BUILTIN callback has no scope of its own, so
+    /// it gets the caller's: `["s.a.b"].map(structGet)` resolves `s` where the
+    /// call was written, instead of in nothing and returning `{}` (GH #449).
+    fn callback_scope<'a>(
+        &self,
+        callback: &CfmlValue,
+        caller_locals: &'a ValueMap,
+    ) -> std::borrow::Cow<'a, ValueMap> {
+        let is_builtin = match callback {
+            CfmlValue::Function(f) => {
+                matches!(f.body, cfml_common::dynamic::CfmlClosureBody::Expression(_))
+                    && f.captured_scope.is_none()
+                    && !self.user_functions.contains_key(&f.name)
+                    && self.is_builtin_name_ci(&f.name, &f.name.to_lowercase())
+            }
+            _ => false,
+        };
+        if is_builtin {
+            std::borrow::Cow::Borrowed(caller_locals)
+        } else {
+            std::borrow::Cow::Owned(ValueMap::default())
+        }
+    }
+
     fn call_member_function_impl(
         &mut self,
         object: &CfmlValue,
@@ -29224,7 +29297,7 @@ impl CfmlVirtualMachine {
                             vec![item.clone(), CfmlValue::Int((i + 1) as i64), object.clone()];
                         self.closure_parent_writeback = None;
                         self.closure_parent_deletes = None;
-                        let r = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                        let r = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                         if let Some(ref wb) = self.closure_parent_writeback {
                             Self::write_back_to_captured_scope(&callback, wb);
                         }
@@ -29246,7 +29319,7 @@ impl CfmlVirtualMachine {
                             vec![item.clone(), CfmlValue::Int((i + 1) as i64), object.clone()];
                         self.closure_parent_writeback = None;
                         self.closure_parent_deletes = None;
-                        let r = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                        let r = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                         if let Some(ref wb) = self.closure_parent_writeback {
                             Self::write_back_to_captured_scope(&callback, wb);
                         }
@@ -29289,7 +29362,7 @@ impl CfmlVirtualMachine {
                                 self.closure_parent_writeback = None;
                                 self.closure_parent_deletes = None;
                                 let r =
-                                    self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                    self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                                 if let Some(ref wb) = self.closure_parent_writeback {
                                     Self::write_back_to_captured_scope(&callback, wb);
                                 }
@@ -29343,7 +29416,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let mapped =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29364,7 +29437,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            let keep = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            let keep = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29388,7 +29461,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            acc = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            acc = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29407,7 +29480,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29428,7 +29501,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let result =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29450,7 +29523,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let result =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29642,7 +29715,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29666,7 +29739,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let mapped =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29688,7 +29761,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            let keep = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            let keep = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29711,7 +29784,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let result =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29734,7 +29807,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let result =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29763,7 +29836,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            acc = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            acc = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29852,7 +29925,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29872,7 +29945,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let mapped =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29896,7 +29969,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            let keep = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            let keep = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29919,7 +29992,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
-                            acc = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                            acc = self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -29948,7 +30021,7 @@ impl CfmlVirtualMachine {
                                 self.closure_parent_writeback = None;
                                 self.closure_parent_deletes = None;
                                 let cmp =
-                                    self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                    self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                                 if let Some(ref wb) = self.closure_parent_writeback {
                                     Self::write_back_to_captured_scope(&callback, wb);
                                 }
@@ -29981,7 +30054,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let result =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -30003,7 +30076,7 @@ impl CfmlVirtualMachine {
                             self.closure_parent_writeback = None;
                             self.closure_parent_deletes = None;
                             let result =
-                                self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                self.call_function(&callback, cb_args, &self.callback_scope(&callback, caller_locals))?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -31367,7 +31440,23 @@ impl CfmlVirtualMachine {
             // unscoped resolution so `getVariable("local")` and
             // `isDefined("local")` keep agreeing (the contract this fn documents).
             "local" if self.current_frame_has_local_scope() => {
-                Some(CfmlValue::strukt(locals.clone()))
+                // The frame map also carries the engine's bridge keys and the
+                // parameters (those belong to `arguments`); `local` shows
+                // neither, as a direct `local` read does not.
+                let args = locals
+                    .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                    .and_then(|v| v.as_cfml_struct());
+                let mut view = ValueMap::default();
+                for (k, v) in locals {
+                    if k.starts_with("__") || k == "this" || k == "super" {
+                        continue;
+                    }
+                    if args.is_some_and(|a| a.contains_key_ci(k)) {
+                        continue;
+                    }
+                    view.insert(k.clone(), v.clone());
+                }
+                Some(CfmlValue::strukt(view))
             }
             "variables" => match locals.get(&*cfml_common::key::well_known::VARIABLES) {
                 Some(v) => Some(v.clone()),

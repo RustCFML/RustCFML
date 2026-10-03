@@ -612,6 +612,17 @@ impl BytecodeFunction {
                     }
                     excluded.insert(n.lower().to_string());
                 }
+                // A reflective builtin passed as a VALUE (`arr.map(structGet)`,
+                // `arrayMap(a, getVariable)`) reads the name as a plain variable,
+                // not a `LoadGlobal` call. The higher-order function then calls
+                // it against this frame by name, which slot storage cannot
+                // serve (GH #449).
+                BytecodeOp::LoadLocal(n) | BytecodeOp::TryLoadLocal(n)
+                    if REFLECTIVE_BUILTINS.contains(&n.lower()) =>
+                {
+                    self.count_slot_class(SlotClass::DisqOther(DisqReason::Reflective), Some(i));
+                    return;
+                }
                 BytecodeOp::StoreGlobal(n)
                 | BytecodeOp::SetLastExceptionFromLocal(n)
                 | BytecodeOp::JumpIfArgPresent(n, _)
@@ -6033,6 +6044,22 @@ impl CfmlCompiler {
                     instructions.push(BytecodeOp::CallRustSuperCtor(n));
                     return;
                 }
+                // Special-case: evaluate("<plain variable path>") with a literal
+                // string is that path, read in THIS frame — exactly what Lucee
+                // returns. Running it through the runtime evaluator instead put
+                // it in a fresh frame, where `local` was that frame's own empty
+                // scope (`evaluate("local")` threw, GH #370) and `arguments`
+                // came back as a copy, so writes through it were lost (GH #371).
+                if let Expression::Identifier(ident) = &*call.name {
+                    if ident.name.eq_ignore_ascii_case("evaluate") && call.arguments.len() == 1 {
+                        if let Expression::Literal(Literal { value: LiteralValue::String(ref text), ref location }) = call.arguments[0] {
+                            if let Some(expr) = plain_variable_path_expr(text, location) {
+                                self.compile_expression(&expr, instructions);
+                                return;
+                            }
+                        }
+                    }
+                }
                 // Special-case: isDefined("varName") -> IsDefined bytecode
                 if let Expression::Identifier(ident) = &*call.name {
                     if ident.name.to_lowercase() == "isdefined" && call.arguments.len() == 1 {
@@ -6748,6 +6775,41 @@ impl Default for CfmlCompiler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `a`, `local.x`, `arguments.rc.y`: a dotted path of plain identifiers, as the
+/// AST a direct read of it would produce. `None` for anything else (an
+/// expression, a bracket subscript, a literal word such as `true`).
+fn plain_variable_path_expr(text: &str, location: &cfml_common::position::SourceLocation) -> Option<Expression> {
+    let text = text.trim();
+    let mut parts = text.split('.');
+    let is_ident = |p: &str| {
+        let mut cs = p.chars();
+        matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+            && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let first = parts.next()?;
+    if !is_ident(first)
+        || ["true", "false", "null", "yes", "no"].iter().any(|w| first.eq_ignore_ascii_case(w))
+    {
+        return None;
+    }
+    let mut expr = Expression::Identifier(Identifier {
+        name: first.to_string(),
+        location: location.clone(),
+    });
+    for part in parts {
+        if !is_ident(part) {
+            return None;
+        }
+        expr = Expression::MemberAccess(Box::new(MemberAccess {
+            object: Box::new(expr),
+            member: part.to_string(),
+            null_safe: false,
+            location: location.clone(),
+        }));
+    }
+    Some(expr)
 }
 
 #[cfg(test)]
