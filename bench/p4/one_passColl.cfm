@@ -1,0 +1,1 @@
+<cfscript>s = new Shapes(); o = new Shapes(); for (i=1;i<=5000;i++) { s.passColl(1,2,3,4,5); } writeOutput("ok");</cfscript>

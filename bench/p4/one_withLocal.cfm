@@ -1,0 +1,1 @@
+<cfscript>s = new Shapes(); o = new Shapes(); for (i=1;i<=5000;i++) { s.withLocal(); } writeOutput("ok");</cfscript>

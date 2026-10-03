@@ -1723,6 +1723,20 @@ pub struct ClassCacheEntry {
     /// finished first instance — 56% of a first-in-request construction.
     #[cfg(feature = "component-instance")]
     pub blueprints: Vec<(String, std::sync::Arc<cfml_common::component::ClassBlueprint>)>,
+    /// The built `getComponentMetaData("a.b.C")` result for this class, shared
+    /// by reference with every caller (Lucee hands out one cached struct per
+    /// class and a caller's mutation is visible to the next caller, so sharing
+    /// is the reference behaviour, not a shortcut). Before this slot the path
+    /// form was memoised per REQUEST and every hit was `deep_copy`'d: a Preside
+    /// reload spent 312 ms / 210 MB in 470 `getInheritedMetaData` calls.
+    ///
+    /// One entry per dotted name the class was asked for (as written): `name`/
+    /// `fullname` echo the caller's spelling, so two spellings must not share.
+    pub metadata_path: Vec<(String, CfmlValue)>,
+    /// Same for `getMetaData(instance)`, per class name. Kept apart from
+    /// `metadata_path` only because the path form carries RustCFML's extra
+    /// `fullExtends` key.
+    pub metadata_instance: Vec<(String, CfmlValue)>,
 }
 
 /// Counts one in-flight request on [`ServerState::active_requests`] for as
@@ -12269,6 +12283,33 @@ impl CfmlVirtualMachine {
                             }
                             continue;
                         }
+                        // Fast path — the common case: a user function or method
+                        // called with named args and/or `argumentCollection`, and
+                        // none of the builtin shapes below that need the expanded
+                        // name list (dump/ws stashes, tag-call bundling, zero-param
+                        // BIF stubs). Bind straight from the op's borrowed names via
+                        // the hashed reorder the method-call path already uses.
+                        // The expansion it replaces cloned every name, lowercased
+                        // every collection key into a `HashSet<String>` and
+                        // lowercased the callee name: ~1 KB and ~1 µs per 5-arg
+                        // named call, ~3 KB per `argumentCollection=arguments`
+                        // (ColdBox's dispatch idiom; measured on bench/p4).
+                        let fast_bind: Option<(Vec<CfmlValue>, Vec<(usize, String)>)> =
+                            match &func_ref {
+                                CfmlValue::Function(f)
+                                    if !Self::named_call_needs_expansion(
+                                        &f.name,
+                                        f.params.is_empty(),
+                                    ) =>
+                                {
+                                    Some(Self::reorder_named_args_with_extras(
+                                        &func_ref,
+                                        Some(names),
+                                        std::mem::take(&mut named_values),
+                                    ))
+                                }
+                                _ => None,
+                            };
                         // Expand argumentCollection: unpack struct keys as named args.
                         // Explicit named arguments take precedence over keys supplied
                         // through `argumentCollection`, REGARDLESS of their order at the
@@ -12279,6 +12320,9 @@ impl CfmlVirtualMachine {
                         // `resource(name=local.names[i], argumentCollection=arguments)`
                         // relies on this: `arguments.name` is the original comma-list, so
                         // letting it win leaves `name` a list forever → infinite recursion.
+                        let mut expanded_names: Vec<String> = Vec::new();
+                        let mut expanded_values: Vec<CfmlValue> = Vec::new();
+                        if fast_bind.is_none() {
                         let explicit_named: std::collections::HashSet<String> = names
                             .iter()
                             .filter(|n| {
@@ -12286,8 +12330,6 @@ impl CfmlVirtualMachine {
                             })
                             .map(|n| n.to_lowercase())
                             .collect();
-                        let mut expanded_names = Vec::new();
-                        let mut expanded_values = Vec::new();
                         for (i, name) in names.iter().enumerate() {
                             if name.eq_ignore_ascii_case("argumentcollection") {
                                 if let Some(CfmlValue::Struct(s)) = named_values.get(i) {
@@ -12334,6 +12376,7 @@ impl CfmlVirtualMachine {
                             expanded_names.push(name.clone());
                             expanded_values
                                 .push(named_values.get(i).cloned().unwrap_or(CfmlValue::Null));
+                        }
                         }
 
                         // writeDump/dump: builtins drop arg names downstream, so
@@ -12538,7 +12581,10 @@ impl CfmlVirtualMachine {
                         // Track overflow (named args with no matching param) so the
                         // callee's `arguments` scope keeps their names.
                         let mut extras: Vec<(usize, String)> = Vec::new();
-                        let args = if let CfmlValue::Function(ref f) = func_ref {
+                        let args = if let Some((args, fast_extras)) = fast_bind {
+                            extras = fast_extras;
+                            args
+                        } else if let CfmlValue::Function(ref f) = func_ref {
                             let f_name_lc = f.name.to_lowercase();
                             // Intercepted BIF with a known signature, called with
                             // named args (zero-param stub → generic reorder can't
@@ -19661,7 +19707,10 @@ impl CfmlVirtualMachine {
                                 let _t = cfml_common::perf_counters::ScopedNanos::new(
                                     &cfml_common::perf_counters::META_PATH_HIT_NANOS,
                                 );
-                                return Ok(hit.deep_copy());
+                                // Shared, not copied: Lucee returns the same
+                                // cached struct to every caller (a mutation made
+                                // by one caller is visible to the next).
+                                return Ok(hit.clone());
                             }
                         }
                         let _miss_timer = cfml_common::perf_counters::ScopedNanos::new(
@@ -19678,6 +19727,29 @@ impl CfmlVirtualMachine {
                         let resolved_tmpl =
                             self_.resolve_component_template(&comp_name, parent_locals);
                         drop(_t_resolve);
+                        // The class's source file, for the cross-request slot. Known
+                        // as soon as the template resolves (which also registers
+                        // the chain generation), so a class whose metadata an
+                        // earlier request built skips inheritance + build entirely.
+                        let tmpl_src: Option<String> = match resolved_tmpl {
+                            Some(CfmlValue::Struct(ref t)) => match t.get("__source_file") {
+                                Some(CfmlValue::String(p)) => Some((*p).to_string()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(src) = tmpl_src.as_deref() {
+                            if let Some(shared) =
+                                self_.cross_request_metadata(src, &comp_name, false)
+                            {
+                                cfml_common::perf_counters::META_PATH_HITS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(key) = meta_key.clone() {
+                                    self_.component_path_meta_cache.insert(key, shared.clone());
+                                }
+                                return Ok(shared);
+                            }
+                        }
                         if let Some(template) = resolved_tmpl {
                             let _t_inh = cfml_common::perf_counters::ScopedNanos::new(
                                 &cfml_common::perf_counters::META_MISS_INHERIT_NANOS,
@@ -19701,7 +19773,7 @@ impl CfmlVirtualMachine {
                                         parent_locals,
                                         &mut visited,
                                     );
-                                    return Ok(self_.memo_path_metadata(meta_key, out));
+                                    return Ok(self_.memo_path_metadata(meta_key, tmpl_src.as_deref(), out));
                                 }
                                 // Inheriting component (looked up by path): build the
                                 // RICH recursive metadata so `.extends` is a struct
@@ -19736,13 +19808,13 @@ impl CfmlVirtualMachine {
                                             meta.insert("fullExtends".to_string(), chain);
                                         }
                                         let out = CfmlValue::strukt(meta);
-                                        return Ok(self_.memo_path_metadata(meta_key, out));
+                                        return Ok(self_.memo_path_metadata(meta_key, tmpl_src.as_deref(), out));
                                     }
                                 }
                                 let out = extract_component_meta(&snap, &comp_name);
-                                return Ok(self_.memo_path_metadata(meta_key, out));
+                                return Ok(self_.memo_path_metadata(meta_key, tmpl_src.as_deref(), out));
                             }
-                            return Ok(self_.memo_path_metadata(meta_key, resolved));
+                            return Ok(self_.memo_path_metadata(meta_key, tmpl_src.as_deref(), resolved));
                         }
                         // The named component could not be loaded. Lucee THROWS
                         // here; returning an empty struct is what turned a syntax
@@ -25405,6 +25477,38 @@ impl CfmlVirtualMachine {
     }
 
     /// Whether `builtin_named_arg_index` knows a signature for this BIF.
+    /// True when a named-argument call to `name` must go through the
+    /// expanded-name path in the `CallNamed` op (the dump/ws stashes, tag-call
+    /// bundling, cfinvoke marshalling, zero-param BIF stubs with a known
+    /// signature). Everything else — every user function and method — binds
+    /// directly via `reorder_named_args_with_extras`. Allocation-free unless
+    /// the callee is a zero-param stub spelled with uppercase letters.
+    fn named_call_needs_expansion(name: &str, params_empty: bool) -> bool {
+        if name.eq_ignore_ascii_case("__cfinvoke")
+            || name.eq_ignore_ascii_case("writedump")
+            || name.eq_ignore_ascii_case("dump")
+            || name.eq_ignore_ascii_case("cfdump")
+            || name.eq_ignore_ascii_case("wspublish")
+            || name.eq_ignore_ascii_case("io")
+            || name.eq_ignore_ascii_case("mcpnotify")
+            || name.eq_ignore_ascii_case("mcpconnect")
+            || Self::is_tag_call_builtin(name)
+        {
+            return true;
+        }
+        if params_empty {
+            let lower_owned: String;
+            let lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                lower_owned = name.to_lowercase();
+                &lower_owned
+            } else {
+                name
+            };
+            return Self::builtin_has_named_sig(lower);
+        }
+        false
+    }
+
     fn builtin_has_named_sig(builtin_lc: &str) -> bool {
         matches!(builtin_lc, "directorylist" | "s3generatepresignedurl")
     }
@@ -25989,18 +26093,45 @@ impl CfmlVirtualMachine {
         // one `String` clone per expanded name, a `HashSet<String>` of the
         // explicit names, and a quadratic case-insensitive string scan to map
         // each name to its parameter (35 params: ~600 compares). Names now
-        // travel as pre-hashed `Key`s, parameters are matched by folded hash
-        // with a "next parameter in order" guess first (a collection built
-        // from an `arguments` scope is in declaration order), and the explicit
-        // names — usually none — are a short slice compared directly.
+        // travel pre-hashed, parameters are matched by folded hash with a
+        // "next parameter in order" guess first (a collection built from an
+        // `arguments` scope is in declaration order), and the explicit names —
+        // usually none — are a short slice compared directly.
+        //
+        // A name written at the call site is BORROWED from the bytecode and
+        // hashed in place; a collection key is the map's own `Key` (a refcount
+        // bump). Building a fresh `Key` (an `Arc<str>`) per explicit name was
+        // ~40% of the bytes a 5-arg named call allocated.
+        enum Name<'a> {
+            Positional,
+            Borrowed(&'a str, u64),
+            Owned(Key),
+        }
+        impl Name<'_> {
+            #[inline]
+            fn hash(&self) -> u64 {
+                match self {
+                    Name::Positional => 0,
+                    Name::Borrowed(_, h) => *h,
+                    Name::Owned(k) => k.hash_value(),
+                }
+            }
+            #[inline]
+            fn as_str(&self) -> &str {
+                match self {
+                    Name::Positional => "",
+                    Name::Borrowed(s, _) => s,
+                    Name::Owned(k) => k.as_str(),
+                }
+            }
+        }
         let explicit_named: Vec<&str> = arg_names
             .iter()
             .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("argumentcollection"))
             .map(String::as_str)
             .collect();
         let is_explicit = |k: &str| explicit_named.iter().any(|n| n.eq_ignore_ascii_case(k));
-        // `None` name = positional (an unnamed argument in a mixed call).
-        let mut expanded: Vec<(Option<Key>, CfmlValue)> = Vec::with_capacity(arg_names.len());
+        let mut expanded: Vec<(Name<'_>, CfmlValue)> = Vec::with_capacity(arg_names.len());
         let mut numeric_positional: Vec<(usize, CfmlValue)> = Vec::new();
         let mut arg_values = arg_values;
         for (i, name) in arg_names.iter().enumerate() {
@@ -26019,7 +26150,7 @@ impl CfmlVirtualMachine {
                             if !explicit_named.is_empty() && is_explicit(k.as_str()) {
                                 continue; // explicit named arg wins
                             }
-                            expanded.push((Some(k.clone()), v.clone()));
+                            expanded.push((Name::Owned(k.clone()), v.clone()));
                         }
                     });
                     continue;
@@ -26031,7 +26162,11 @@ impl CfmlVirtualMachine {
                     continue;
                 }
             }
-            let key = if name.is_empty() { None } else { Some(Key::new(name)) };
+            let key = if name.is_empty() {
+                Name::Positional
+            } else {
+                Name::Borrowed(name.as_str(), fold_hash(name))
+            };
             expanded.push((key, value));
         }
         let mut positional = vec![CfmlValue::Null; func.params.len()];
@@ -26049,11 +26184,9 @@ impl CfmlVirtualMachine {
         // Folded hashes of the declared parameter names, computed once per
         // call; a hit is confirmed with a case-insensitive compare.
         let param_hashes: Vec<u64> = func.params.iter().map(|p| fold_hash(&p.name)).collect();
-        let find_param = |key: &Key, guess: usize| -> Option<usize> {
-            let h = key.hash_value();
-            let matches = |i: usize| {
-                param_hashes[i] == h && func.params[i].name.eq_ignore_ascii_case(key.as_str())
-            };
+        let find_param = |h: u64, name: &str, guess: usize| -> Option<usize> {
+            let matches =
+                |i: usize| param_hashes[i] == h && func.params[i].name.eq_ignore_ascii_case(name);
             if guess < param_hashes.len() && matches(guess) {
                 return Some(guess);
             }
@@ -26061,15 +26194,15 @@ impl CfmlVirtualMachine {
         };
         let mut next_guess = 0usize;
         for (i, (name, value)) in expanded.into_iter().enumerate() {
-            let Some(name) = name else {
+            if matches!(name, Name::Positional) {
                 if i < positional.len() {
                     positional[i] = value;
                 } else {
                     positional.push(value);
                 }
                 continue;
-            };
-            match find_param(&name, next_guess) {
+            }
+            match find_param(name.hash(), name.as_str(), next_guess) {
                 Some(param_index) => {
                     next_guess = param_index + 1;
                     if param_index < positional.len() {
@@ -34749,6 +34882,15 @@ impl CfmlVirtualMachine {
             let s = g.class.source_file.clone();
             (g.class.name.clone(), if s.is_empty() { None } else { Some(s) })
         };
+        // A blueprint is per request; the class cache is not. An earlier
+        // request's build for this exact compile of the chain is the same
+        // struct Lucee would hand back, so adopt it onto this blueprint too.
+        if let Some(file) = src.as_deref() {
+            if let Some(shared) = self.cross_request_metadata(file, &name, true) {
+                *inst.read().class.metadata_cache.write() = Some(shared.clone());
+                return shared;
+            }
+        }
         let mut meta_map = if name.is_empty() {
             ValueMap::default()
         } else {
@@ -34801,6 +34943,9 @@ impl CfmlVirtualMachine {
         // stick on the shared blueprint.
         if !name.is_empty() {
             *inst.read().class.metadata_cache.write() = Some(meta.clone());
+            if let Some(file) = src.as_deref() {
+                self.publish_metadata(file, &name, true, &meta);
+            }
         }
         meta
     }
@@ -35857,6 +36002,19 @@ impl CfmlVirtualMachine {
                 } else {
                     resolved
                 }
+            };
+            // A mapping root that ends in `/` joined to a `/`-leading remainder
+            // yields `.../system//handlers/X.cfc`. The file resolves either way,
+            // but this string is the class's identity everywhere downstream —
+            // `__source_file`, the bytecode and class caches, the profile — so
+            // one CFC reached by two spellings was compiled, class-built and
+            // profiled twice (a Preside reload showed every handler under both
+            // `system/handlers/` and `system//handlers/`). Collapse it once here,
+            // on the miss path only; a clean path is left byte-identical.
+            let resolved = if resolved.contains("//") || resolved.contains("/./") {
+                normalize_path(&resolved)
+            } else {
+                resolved
             };
             let resolved: Arc<str> = Arc::from(resolved);
             // Entry-with-parts, built once here on the miss path (the only place
@@ -37172,7 +37330,10 @@ impl CfmlVirtualMachine {
         let self_ = &mut *mvm;
         if let Some(ref key) = memo_key {
             if let Some(hit) = self_.component_inherit_meta_cache.get(key) {
-                if let CfmlValue::Struct(s) = hit.deep_copy() {
+                // Shared values (one map clone, Arc bumps underneath): a parent's
+                // metadata is reached once per child, and Lucee shares the
+                // parent struct between children's `extends` too.
+                if let CfmlValue::Struct(s) = hit {
                     cfml_common::perf_counters::META_INHERIT_HITS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Some(s.snapshot());
@@ -37251,12 +37412,12 @@ impl CfmlVirtualMachine {
                 CfmlValue::strukt(cfml_common::component::base_component_metadata()),
             );
         }
-        // Store a DEEP COPY so a caller mutating the map we hand back (ColdBox's
-        // `getInheritedMetaData` edits the struct it is given) cannot corrupt the
-        // memo. Never cached when the walk had to break an `extends` cycle.
+        // Stored shared (Lucee semantics: callers see one struct per class, and a
+        // mutation is visible to the next caller). Never cached when the walk had
+        // to break an `extends` cycle.
         if let (Some(key), false) = (memo_key, *cycle_hit) {
             self_.component_inherit_meta_cache
-                .insert(key, CfmlValue::strukt(meta.clone()).deep_copy());
+                .insert(key, CfmlValue::strukt(meta.clone()));
         }
         Some(meta)
     }
@@ -37303,15 +37464,57 @@ impl CfmlVirtualMachine {
         Some(self.meta_memo_key(comp_name, self.source_file.as_deref().unwrap_or_default().to_string()))
     }
 
-    /// Record a path-string `getComponentMetaData()` result under `key` (a deep
-    /// copy, so a caller mutating the returned struct cannot poison the memo) and
-    /// hand the original back.
-    fn memo_path_metadata(&mut self, key: Option<MetaMemoKey>, out: CfmlValue) -> CfmlValue {
+    /// Record a path-string `getComponentMetaData()` result under `key` for this
+    /// request and, when the class's source file is known, in the cross-request
+    /// class cache. Stored and returned SHARED: Lucee hands every caller the same
+    /// cached metadata struct (a mutation by one caller is visible to the next —
+    /// verified against 7.1), so a copy here was both slower and a divergence.
+    fn memo_path_metadata(
+        &mut self,
+        key: Option<MetaMemoKey>,
+        src: Option<&str>,
+        out: CfmlValue,
+    ) -> CfmlValue {
+        let key_name = key.clone();
         if let Some(key) = key {
-            let copy = out.deep_copy();
-            self.component_path_meta_cache.insert(key, copy);
+            self.component_path_meta_cache.insert(key, out.clone());
+        }
+        if let (Some(src), Some((name, _, _, _))) = (src, key_name.as_ref()) {
+            self.publish_metadata(src, name, false, &out);
         }
         out
+    }
+
+    /// Cross-request class cache, read side for metadata: the struct an earlier
+    /// request built for `src` at this request's chain generation. `None` on the
+    /// CLI (no server), for a class this request has not resolved yet, or after
+    /// a recompile anywhere in the `extends` chain.
+    fn cross_request_metadata(
+        &self,
+        src: &str,
+        name: &str,
+        instance_form: bool,
+    ) -> Option<CfmlValue> {
+        let ss = self.server_state.as_ref()?;
+        let generation = *self.class_generations.get(src)?;
+        let r = ss.class_caches.read();
+        let e = r.get(src).filter(|e| e.generation == generation)?;
+        let slot = if instance_form { &e.metadata_instance } else { &e.metadata_path };
+        slot.iter().find(|(k, _)| k == name).map(|(_, m)| m.clone())
+    }
+
+    /// Cross-request class cache, write side for metadata (see
+    /// `cross_request_metadata`).
+    fn publish_metadata(&self, src: &str, name: &str, instance_form: bool, meta: &CfmlValue) {
+        let m = meta.clone();
+        let name = name.to_string();
+        self.publish_class_cache(src, |e| {
+            let slot = if instance_form { &mut e.metadata_instance } else { &mut e.metadata_path };
+            match slot.iter_mut().find(|(k, _)| *k == name) {
+                Some(entry) => entry.1 = m,
+                None => slot.push((name, m)),
+            }
+        });
     }
 
     /// Build `getComponentMetadata()`-shape metadata for an INTERFACE struct

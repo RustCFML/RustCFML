@@ -36,18 +36,18 @@ assert("ChildB has ownB", hasFn(mdB, "ownB"), true);
 assertFalse("ChildA lacks ownB", hasFn(mdA, "ownB"));
 assertFalse("ChildB lacks ownA", hasFn(mdB, "ownA"));
 
-// --- 2. a mutating caller must not poison the memo -------------------------
-// ColdBox's getInheritedMetaData edits the struct it is given; entries are
-// stored and returned as deep copies precisely so this cannot propagate.
-// RustCFML-only guarantee: Lucee 7.0/7.1 hand back their shared cached struct,
-// so a caller's edit IS visible to the next caller there.
-if ( isRustCFML() ) {
-	mdA.name = "MUTATED";
-	mdA.extends.name = "MUTATED_PARENT";
-	mdA2 = getComponentMetaData("oop.metacache.ChildA");
-	assert("re-read name unpoisoned", listLast(mdA2.name, "."), "ChildA");
-	assert("re-read parent unpoisoned", listLast(mdA2.extends.name, "."), "SharedBase");
-}
+// --- 2. the cached struct is SHARED between callers (Lucee parity) --------
+// Lucee 7.0/7.1 hand every caller the same cached metadata struct, so a
+// caller's edit IS visible to the next caller. RustCFML used to deep-copy on
+// every hit (33 µs and ~450 KB per call on a 35-method class) and diverged.
+// The struct outlives the request on a server, so the probe restores it.
+mdA.probeAdded = "seen";
+mdA.extends.probeAddedNested = "seen";
+mdA2 = getComponentMetaData("oop.metacache.ChildA");
+assertTrue("a key added by one caller is visible to the next", structKeyExists(mdA2, "probeAdded"));
+assertTrue("a key added at the parent level is visible to the next", structKeyExists(mdA2.extends, "probeAddedNested"));
+structDelete(mdA, "probeAdded");
+structDelete(mdA.extends, "probeAddedNested");
 
 // --- 3. THE INVARIANT: instantiation still runs the pseudo-constructor ------
 // SharedBase increments a request-scoped counter in its body. Reading metadata

@@ -7,9 +7,9 @@
 // Mapping.cfc calls this form with its own metadata cache disabled.)
 //
 // These assertions pin the OBSERVABLE contract the memo must not change:
-// repeated calls are identical, they agree with getMetadata(instance), and a
-// caller that MUTATES the struct it is handed cannot corrupt what the next
-// caller sees (ColdBox's Util.getInheritedMetaData edits the struct in place).
+// repeated calls are identical, they agree with getMetadata(instance), and —
+// as on Lucee — every caller is handed the SAME cached struct, so a mutation
+// made by one caller is visible to the next (verified on Lucee 7.1.0.204).
 suiteBegin("getComponentMetaData path-form metadata cache");
 
 function fnNames( required array functions ) {
@@ -42,28 +42,6 @@ assert( "2nd call same parent functions",
 	fnNames( second.extends.functions ), fnNames( first.extends.functions ) );
 assert( "2nd call same grandparent functions",
 	fnNames( second.extends.extends.functions ), fnNames( first.extends.extends.functions ) );
-
-// --- each call hands back an INDEPENDENT struct (callers mutate it) ---
-// RustCFML-only guarantee: Lucee 7.0/7.1 return their shared cached struct, so
-// a caller's edits (and deletions) ARE visible to the next caller there.
-if ( isRustCFML() ) {
-	second.injectedByCaller = "mutated";
-	second.functions = [];
-	structDelete( second, "extends" );
-	third = getComponentMetaData( "oop.GcmCacheL1" );
-	assertFalse( "caller mutation does not leak into the next call",
-		structKeyExists( third, "injectedByCaller" ) );
-	assert( "functions survive a caller emptying its own copy",
-		fnNames( third.functions ), "init,l1One,l1Two" );
-	assertTrue( "extends survives a caller deleting it from its own copy",
-		structKeyExists( third, "extends" ) );
-	assert( "extends still resolves the chain", third.extends.extends.name, "oop.GcmCacheL3" );
-
-	// mutating a NESTED level must not leak either
-	third.extends.name = "clobbered";
-	fourth = getComponentMetaData( "oop.GcmCacheL1" );
-	assert( "nested mutation does not leak", fourth.extends.name, "oop.GcmCacheL2" );
-}
 
 // --- the instance form (blueprint-cached) still agrees with the path form ---
 inst = createObject( "component", "oop.GcmCacheL1" );
@@ -102,6 +80,21 @@ function shadowedLookup() {
 	return getComponentMetaData( "oop.GcmCacheL1" ).name;
 }
 assert( "dotted lookup inside a function", shadowedLookup(), "oop.GcmCacheL1" );
+
+// --- the cached struct is SHARED between callers (Lucee parity) ---
+// Lucee caches one metadata struct per class and returns it by reference: a
+// key a caller adds is seen by the next caller, at the top level and inside
+// nested levels. The struct outlives the request on a server, so each probe
+// cleans up after itself.
+sharedA = getComponentMetaData( "oop.GcmCacheL1" );
+sharedA.addedByCaller = "seen";
+sharedA.extends.addedNested = "seen";
+sharedB = getComponentMetaData( "oop.GcmCacheL1" );
+assertTrue( "a key added by one caller is visible to the next", structKeyExists( sharedB, "addedByCaller" ) );
+assertTrue( "a key added at a nested level is visible too", structKeyExists( sharedB.extends, "addedNested" ) );
+structDelete( sharedA, "addedByCaller" );
+structDelete( sharedA.extends, "addedNested" );
+assertFalse( "cleanup", structKeyExists( getComponentMetaData( "oop.GcmCacheL1" ), "addedByCaller" ) );
 
 suiteEnd();
 </cfscript>
