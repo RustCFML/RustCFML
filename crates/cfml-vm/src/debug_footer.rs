@@ -601,6 +601,20 @@ fn collapsible_heading(s: &mut String, group: &str, title: &str) {
     ));
 }
 
+/// [`collapsible_heading`] whose title carries an explanation as a hover
+/// tooltip (marked with a small ⓘ), instead of a paragraph under the block.
+fn collapsible_heading_with_tip(s: &mut String, group: &str, title: &str, tip: &str) {
+    collapsible_heading(
+        s,
+        group,
+        &format!(
+            "<span title=\"{}\" style=\"cursor:help\">{} <span style=\"color:#999;font-weight:normal\">&#9432;</span></span>",
+            esc(tip),
+            title
+        ),
+    );
+}
+
 /// Truncate a scope value's string form so a giant struct can't balloon the page.
 fn short_val(v: &CfmlValue) -> String {
     let s = v.as_string();
@@ -737,7 +751,14 @@ fn render_memory(s: &mut String, m: &MemoryPanel) {
             ("Component instances", &c.instances),
         ];
         let created: u64 = kinds.iter().map(|(_, k)| k.created).sum();
-        collapsible_heading(s, "rcfml-memobj", &format!("Objects created ({})", created));
+        collapsible_heading_with_tip(
+            s,
+            "rcfml-memobj",
+            &format!("Objects created ({})", created),
+            "Alive = still referenced as the page ends; the request-end cleanup frees what only the page held. \
+             Sizes are estimates, each object without the objects it holds (those count under their own type); \
+             strings and other values are included in the object that holds them.",
+        );
         s.push_str("<div class=\"rcfml-memobj\" style=\"display:none\">\n");
         s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
         let any_classes = !c.classes.is_empty();
@@ -769,11 +790,12 @@ fn render_memory(s: &mut String, m: &MemoryPanel) {
             }
         }
         s.push_str("</table>\n");
-        s.push_str("<div style=\"color:#555;margin:2px 0 4px\">Alive = still referenced as the page ends; the request-end cleanup frees what only the page held. Sizes are estimates, each object without the objects it holds (those count under their own type); strings and other values are included in the object that holds them.");
+        // The explanation lives in the heading's tooltip; only this caveat,
+        // which changes how to read the numbers, stays on the page.
         if c.incomplete {
-            s.push_str(" This request created more objects than the collector logs, so the alive figures are a lower bound.");
+            s.push_str("<div style=\"color:#555;margin:2px 0 4px\">This request created more objects than the collector logs, so the alive figures are a lower bound.</div>\n");
         }
-        s.push_str("</div>\n</div>\n");
+        s.push_str("</div>\n");
     }
 
 }
@@ -1952,7 +1974,7 @@ mod tests {
             "<td class=\"txt-r\">3.00 MB</td><td>Allocated by this request</td>",
             "<td class=\"txt-r\">2.00 MB</td><td>Peak in use</td>",
             "Freed so far (512.0 KB of it by 2 collector sweeps)",
-            "Objects created (43)",
+            "Objects created (43) <span",
             "&#8627; models.User",
             "Footprint of the 1.00 GB limit",
             "<td class=\"txt-r\">150.00 MB</td><td>Outside the live heap</td>",
@@ -1969,6 +1991,10 @@ mod tests {
         assert!(live < pots && pots < outside);
         assert!(html.contains("refreshed at most every 30 s"));
         assert!(!html.contains("Breakdown estimated"));
+        // The Objects created explanation is a tooltip on its heading, not a
+        // paragraph under the table.
+        assert!(html.contains("title=\"Alive = still referenced as the page ends;"));
+        assert!(!html.contains("\">Alive = still referenced"));
         // The panel sits between Execution Time and Files.
         let mem = html.find("Allocated by this request").unwrap();
         assert!(html.find("Execution Time").unwrap() < mem);
