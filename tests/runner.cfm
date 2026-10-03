@@ -105,6 +105,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_isdefined_component_scope.cfm">
 <cf_runtest file="core/test_returnvar_local_leak.cfm">
 <cf_runtest file="core/test_error_handling.cfm">
+<cf_runtest file="core/test_exception_type_names.cfm">
 <cf_runtest file="core/test_catchable_undefined.cfm">
 <cf_runtest file="core/test_builtin_shadowing.cfm">
 <!--- - builtin_data_shadow: a plain DATA variable named like a builtin --->
@@ -159,6 +160,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_variables_this_live_alias.cfm">
 <cf_runtest file="core/test_isdefined_variables_scope.cfm">
 <cf_runtest file="core/test_isdefined_path_walk.cfm">
+<cf_runtest file="core/test_isdefined_reserved_scope.cfm">
 <cf_runtest file="core/test_nested_index_assign_autoviv.cfm">
 <cf_runtest file="core/test_index_write_out_of_range.cfm">
 <cf_runtest file="core/test_numeric_subscript_vivifies_struct.cfm">

@@ -114,6 +114,15 @@ impl CfmlError {
         Self::new(message, CfmlErrorType::Expression)
     }
 
+    /// Java's `ArithmeticException`, which Lucee lets escape for an integer
+    /// division or modulus by zero (`1 / 0`, `5 mod 0`, `5 \ 0`).
+    pub fn arithmetic(message: &str) -> Self {
+        Self::new(
+            message.to_string(),
+            CfmlErrorType::Custom("java.lang.ArithmeticException".to_string()),
+        )
+    }
+
     /// A missing-file exception whose `type` matches Java's
     /// `java.io.FileNotFoundException`, the way Lucee/ACF surface a missing file
     /// from `fileRead*`. CFML code branches on it — e.g. Preside's
@@ -183,15 +192,21 @@ impl CfmlErrorType {
     /// and the value the VM's in-handler (same-frame) undefined-read paths
     /// already hardcode. Without this, an undefined read that propagated across
     /// a call frame surfaced as `Expression` (Display-cased) while the same read
-    /// at page scope surfaced as `expression` (GH #282). Other categories keep
-    /// their existing casing — notably `Application`, which the default `throw`
-    /// type and tests depend on being capitalized.
+    /// at page scope surfaced as `expression` (GH #282).
+    ///
+    /// `Runtime` is the engine's generic category and has no Lucee equivalent:
+    /// what we raise as a runtime error (a failed cast, a missing component, a
+    /// bad argument) Lucee raises as an `ExpressionException`, so it reports
+    /// `expression` and `catch (expression e)` must catch it (GH #451).
+    /// `Application` is lowercase on Lucee too (`throw(message="m")`).
     pub fn type_name(&self) -> String {
         match self {
-            CfmlErrorType::Expression => "expression".to_string(),
+            CfmlErrorType::Expression | CfmlErrorType::Runtime => "expression".to_string(),
+            CfmlErrorType::Application => "application".to_string(),
             other => other.to_string(),
         }
     }
+
 }
 
 impl std::fmt::Display for CfmlErrorType {

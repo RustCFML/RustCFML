@@ -4610,14 +4610,14 @@ impl FrameScopeCache {
 fn page_numeric_delta(
     vars: &CfmlStruct,
     name: &cfml_common::name::Name,
-    op: impl Fn(&CfmlValue) -> CfmlValue,
-) -> bool {
+    op: impl Fn(&CfmlValue) -> Result<CfmlValue, CfmlError>,
+) -> Result<bool, CfmlError> {
     vars.with_write(|m| match m.get_mut(name) {
         Some(v) => {
-            *v = op(v);
-            true
+            *v = op(v)?;
+            Ok(true)
         }
-        None => false,
+        None => Ok(false),
     })
 }
 
@@ -8132,6 +8132,32 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Route an error returned by an inline op to this frame's open `try`
+    /// handler, like a thrown exception: unwind the operand stack into it and
+    /// return `Ok(catch_ip)`, or hand the error back when no handler is open.
+    ///
+    /// Ops dispatched with a bare `?` skipped this entirely, so a failed cast
+    /// in arithmetic (`"abc" + 1`) could only be caught by a try in a CALLER
+    /// frame — never by one around the expression itself, and never at page
+    /// level (GH #451). The try stack is frame-local (calls swap it out), so a
+    /// popped handler always belongs to this frame.
+    pub(crate) fn catch_op_error(
+        &mut self,
+        stack: &mut Vec<CfmlValue>,
+        err: CfmlError,
+    ) -> Result<usize, CfmlError> {
+        let err = self.wrap_error(err);
+        let Some(handler) = self.try_stack.pop() else {
+            return Err(err);
+        };
+        let exc = Self::build_error_struct(&err, self.build_tag_context_for_error(&err));
+        stack.truncate(handler.stack_depth);
+        self.restore_capture_state(&handler);
+        self.last_exception = Some(exc.clone());
+        stack.push(exc);
+        Ok(handler.catch_ip)
+    }
+
     /// Raise a catchable CFML runtime exception from an inline VM op. If a `try`
     /// handler is active, unwind the operand stack into it and return
     /// `Ok(catch_ip)` (the caller sets `ip = catch_ip; continue;`); otherwise
@@ -8189,10 +8215,10 @@ impl CfmlVirtualMachine {
         locals: &mut ValueMap,
         closure_env: Option<&Arc<std::sync::RwLock<ValueMap>>>,
         name: &cfml_common::name::Name,
-        op: impl Fn(&CfmlValue) -> CfmlValue,
-    ) {
+        op: impl Fn(&CfmlValue) -> Result<CfmlValue, CfmlError>,
+    ) -> Result<(), CfmlError> {
         if let Some(val) = locals.get(name) {
-            let new_val = op(val);
+            let new_val = op(val)?;
             locals.insert(name, new_val.clone());
             // Sync to the shared closure env so sibling closures see the update
             // (only when the key already lives there — don't pollute with new keys).
@@ -8202,16 +8228,16 @@ impl CfmlVirtualMachine {
                     m.insert(name, new_val);
                 }
             }
-            return;
+            return Ok(());
         }
         // A captured name in a lexical closure frame: update it where it lives.
         if let Some(owner) = Self::closure_chain_owner(locals, name) {
             if let Ok(mut g) = owner.write() {
                 if let Some(cur) = g.get(name).cloned() {
-                    g.insert(name, op(&cur));
+                    g.insert(name, op(&cur)?);
                 }
             }
-            return;
+            return Ok(());
         }
         // Fallback: unscoped var in the CFC component scope (`__variables`).
         // CfmlStruct mutates through `&self` (interior RwLock), so an immutable
@@ -8221,9 +8247,10 @@ impl CfmlVirtualMachine {
             // read nor the write hashes or allocates (a page loop counter lives
             // here — see `page_main_frame`).
             if let Some(cur) = vars.get(name) {
-                vars.insert(name.key().clone(), op(&cur));
+                vars.insert(name.key().clone(), op(&cur)?);
             }
         }
+        Ok(())
     }
 
     /// Run a function body, guaranteeing the call-stack depth is restored on EVERY
@@ -9646,6 +9673,16 @@ impl CfmlVirtualMachine {
                 5, _n.duration_since(_cp_t).as_nanos() as u64);
             _cp_t = _n;
             let _ = _cp_t; // last mark: the dispatch loop follows
+        }
+
+        // An op's error goes to this frame's open `try`, if any (GH #451).
+        macro_rules! catch_op {
+            ($e:expr) => {
+                if let Err(err) = $e {
+                    ip = self.catch_op_error(&mut stack, err)?;
+                    continue;
+                }
+            };
         }
 
         loop {
@@ -11467,13 +11504,13 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Swap => ops::value::op_swap(&mut stack),
 
                 // Arithmetic
-                BytecodeOp::Add => ops::value::op_add(&mut stack)?,
-                BytecodeOp::Sub => ops::value::op_sub(&mut stack)?,
-                BytecodeOp::Mul => ops::value::op_mul(&mut stack)?,
-                BytecodeOp::Div => { ops::effect::op_div(self, &mut stack, &mut ip)?; }
-                BytecodeOp::Mod => ops::value::op_mod(&mut stack)?,
-                BytecodeOp::Pow => ops::value::op_pow(&mut stack)?,
-                BytecodeOp::IntDiv => ops::value::op_int_div(&mut stack)?,
+                BytecodeOp::Add => catch_op!(ops::value::op_add(&mut stack)),
+                BytecodeOp::Sub => catch_op!(ops::value::op_sub(&mut stack)),
+                BytecodeOp::Mul => catch_op!(ops::value::op_mul(&mut stack)),
+                BytecodeOp::Div => catch_op!(ops::effect::op_div(self, &mut stack, &mut ip)),
+                BytecodeOp::Mod => catch_op!(ops::value::op_mod(&mut stack)),
+                BytecodeOp::Pow => catch_op!(ops::value::op_pow(&mut stack)),
+                BytecodeOp::IntDiv => catch_op!(ops::value::op_int_div(&mut stack)),
                 BytecodeOp::Negate => ops::value::op_negate(&mut stack),
 
                 // String concatenation
@@ -13761,14 +13798,17 @@ impl CfmlVirtualMachine {
                     // lock instead of probe-miss → closure chain → get + insert.
                     if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
-                            if page_numeric_delta(vars, name, |v| match v {
-                                CfmlValue::Int(i) => CfmlValue::Int(i + 1),
-                                CfmlValue::Double(d) => CfmlValue::Double(d + 1.0),
-                                _ => CfmlValue::Int(1),
-                            }) { continue; }
+                            match page_numeric_delta(vars, name, |v| ops::locals::numeric_step(v, 1, false)) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(err) => {
+                                    ip = self.catch_op_error(&mut stack, err)?;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                    ops::locals::op_increment(&mut locals, &mut slots, &closure_env, op, name)?;
+                    catch_op!(ops::locals::op_increment(&mut locals, &mut slots, &closure_env, op, name));
                 }
                 BytecodeOp::AddLocalConst(name, k) | BytecodeOp::AddSlotConst(_, name, k) => {
                     // §109/§102: in modern localmode a bare compound write claims
@@ -13781,14 +13821,17 @@ impl CfmlVirtualMachine {
                     if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             let k = *k;
-                            if page_numeric_delta(vars, name, |v| match v {
-                                CfmlValue::Int(i) => CfmlValue::Int(i + k),
-                                CfmlValue::Double(d) => CfmlValue::Double(d + k as f64),
-                                _ => CfmlValue::Int(k),
-                            }) { continue; }
+                            match page_numeric_delta(vars, name, |v| ops::locals::numeric_step(v, k, false)) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(err) => {
+                                    ip = self.catch_op_error(&mut stack, err)?;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                    ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?;
+                    catch_op!(ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, op, name, *k));
                 }
                 BytecodeOp::MulLocalConst(name, k) | BytecodeOp::MulSlotConst(_, name, k) => {
                     // §109/§102: in modern localmode a bare compound write claims
@@ -13801,14 +13844,17 @@ impl CfmlVirtualMachine {
                     if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
                             let k = *k;
-                            if page_numeric_delta(vars, name, |v| match v {
-                                CfmlValue::Int(i) => CfmlValue::Int(i * k),
-                                CfmlValue::Double(d) => CfmlValue::Double(d * k as f64),
-                                _ => CfmlValue::Int(k),
-                            }) { continue; }
+                            match page_numeric_delta(vars, name, |v| ops::locals::numeric_step(v, k, true)) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(err) => {
+                                    ip = self.catch_op_error(&mut stack, err)?;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                    ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, op, name, *k)?;
+                    catch_op!(ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, op, name, *k));
                 }
                 BytecodeOp::Decrement(name) | BytecodeOp::DecrementSlot(_, name) => {
                     // §109/§102: in modern localmode a bare compound write claims
@@ -13820,14 +13866,17 @@ impl CfmlVirtualMachine {
                     }
                     if direct_frame && !effective_local_mode_modern && !name.is_reserved_word() && !declared_locals.contains_key(name.key()) && (locals.len() <= 1 || !locals.contains_key(name)) && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name) {
                         if let Some(vars) = scope_cache.direct_vars(&locals, &func.params) {
-                            if page_numeric_delta(vars, name, |v| match v {
-                                CfmlValue::Int(i) => CfmlValue::Int(i - 1),
-                                CfmlValue::Double(d) => CfmlValue::Double(d - 1.0),
-                                _ => CfmlValue::Int(-1),
-                            }) { continue; }
+                            match page_numeric_delta(vars, name, |v| ops::locals::numeric_step(v, -1, false)) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(err) => {
+                                    ip = self.catch_op_error(&mut stack, err)?;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                    ops::locals::op_decrement(&mut locals, &mut slots, &closure_env, op, name)?;
+                    catch_op!(ops::locals::op_decrement(&mut locals, &mut slots, &closure_env, op, name));
                 }
 
                 // Exception handling
@@ -21941,7 +21990,7 @@ impl CfmlVirtualMachine {
                         }
                     };
                     apply(&mut exception, "message", args.get(0), "");
-                    apply(&mut exception, "type", args.get(1), "Application");
+                    apply(&mut exception, "type", args.get(1), "application");
                     apply(&mut exception, "detail", args.get(2), "");
                     apply(&mut exception, "errorcode", args.get(3), "");
                     apply(&mut exception, "extendedinfo", args.get(4), "");
@@ -30989,6 +31038,17 @@ impl CfmlVirtualMachine {
                 .or(Some(CfmlValue::strukt(ValueMap::default())))
         } else if root == "server" {
             Some(CfmlValue::Struct(self.live_server_scope()))
+        } else if matches!(root.as_str(), "cgi" | "url" | "form") {
+            // Reserved scope names address the built-in scope, never a
+            // same-named key further up the chain: Wheels stores a CGI copy at
+            // `request.cgi`, and the generic chain below reached it before the
+            // real scope, so `isDefined("cgi.http_x_…")` went false (GH #458).
+            self.globals.get(root.as_str()).cloned().or_else(|| {
+                self.globals
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&root))
+                    .map(|(_, v)| v.clone())
+            })
         } else {
             // Check locals (exact then CI)
             locals

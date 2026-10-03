@@ -345,6 +345,27 @@ pub(crate) fn op_load_arg_key(
     true
 }
 
+/// The value after a fused `++` / `--` / `+= k` / `*= k` (`mul` picks `*`).
+/// Int and Double stay on the fast path; anything else is coerced exactly as
+/// the binary operator would coerce it. The fused ops used to replace any
+/// non-number with the bare step, so `x = "5"; x += 1` gave 1 and `"abc"++`
+/// gave 1 instead of throwing (GH #451).
+#[inline]
+pub(crate) fn numeric_step(v: &CfmlValue, k: i64, mul: bool) -> Result<CfmlValue, CfmlError> {
+    match v {
+        CfmlValue::Int(i) => Ok(CfmlValue::Int(if mul { i * k } else { i + k })),
+        CfmlValue::Double(d) => Ok(CfmlValue::Double(if mul { d * k as f64 } else { d + k as f64 })),
+        other => {
+            let k = CfmlValue::Int(k);
+            if mul {
+                crate::arith_numeric_op(other, &k, |x, y| x * y)
+            } else {
+                crate::arith_numeric_op(other, &k, |x, y| x + y)
+            }
+        }
+    }
+}
+
 /// `Increment`
 #[inline]
 pub(crate) fn op_increment(
@@ -357,22 +378,13 @@ pub(crate) fn op_increment(
     // Slot fast path (T3.1): mutate the active slot in place.
     if let BytecodeOp::IncrementSlot(i, _) = op {
         if let Some(v) = slots[*i as usize].as_mut() {
-            *v = match v {
-                CfmlValue::Int(i) => CfmlValue::Int(*i + 1),
-                CfmlValue::Double(d) => CfmlValue::Double(*d + 1.0),
-                _ => CfmlValue::Int(1),
-            };
+            *v = numeric_step(v, 1, false)?;
             return Ok(());
         }
     }
     CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
-        match val {
-            CfmlValue::Int(i) => CfmlValue::Int(i + 1),
-            CfmlValue::Double(d) => CfmlValue::Double(d + 1.0),
-            _ => CfmlValue::Int(1),
-        }
-    });
-    Ok(())
+        numeric_step(val, 1, false)
+    })
 }
 
 /// `Decrement`
@@ -386,22 +398,13 @@ pub(crate) fn op_decrement(
 ) -> Result<(), CfmlError> {
     if let BytecodeOp::DecrementSlot(i, _) = op {
         if let Some(v) = slots[*i as usize].as_mut() {
-            *v = match v {
-                CfmlValue::Int(i) => CfmlValue::Int(*i - 1),
-                CfmlValue::Double(d) => CfmlValue::Double(*d - 1.0),
-                _ => CfmlValue::Int(-1),
-            };
+            *v = numeric_step(v, -1, false)?;
             return Ok(());
         }
     }
     CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
-        match val {
-            CfmlValue::Int(i) => CfmlValue::Int(i - 1),
-            CfmlValue::Double(d) => CfmlValue::Double(d - 1.0),
-            _ => CfmlValue::Int(-1),
-        }
-    });
-    Ok(())
+        numeric_step(val, -1, false)
+    })
 }
 
 /// `AddLocalConst`
@@ -416,22 +419,13 @@ pub(crate) fn op_add_local_const(
 ) -> Result<(), CfmlError> {
     if let BytecodeOp::AddSlotConst(i, _, _) = op {
         if let Some(v) = slots[*i as usize].as_mut() {
-            *v = match v {
-                CfmlValue::Int(i) => CfmlValue::Int(*i + k),
-                CfmlValue::Double(d) => CfmlValue::Double(*d + k as f64),
-                _ => CfmlValue::Int(k),
-            };
+            *v = numeric_step(v, k, false)?;
             return Ok(());
         }
     }
     CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
-        match val {
-            CfmlValue::Int(i) => CfmlValue::Int(i + k),
-            CfmlValue::Double(d) => CfmlValue::Double(d + k as f64),
-            _ => CfmlValue::Int(k),
-        }
-    });
-    Ok(())
+        numeric_step(val, k, false)
+    })
 }
 
 /// `MulLocalConst`
@@ -446,22 +440,13 @@ pub(crate) fn op_mul_local_const(
 ) -> Result<(), CfmlError> {
     if let BytecodeOp::MulSlotConst(i, _, _) = op {
         if let Some(v) = slots[*i as usize].as_mut() {
-            *v = match v {
-                CfmlValue::Int(i) => CfmlValue::Int(*i * k),
-                CfmlValue::Double(d) => CfmlValue::Double(*d * k as f64),
-                _ => CfmlValue::Int(k),
-            };
+            *v = numeric_step(v, k, true)?;
             return Ok(());
         }
     }
     CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
-        match val {
-            CfmlValue::Int(i) => CfmlValue::Int(i * k),
-            CfmlValue::Double(d) => CfmlValue::Double(d * k as f64),
-            _ => CfmlValue::Int(k),
-        }
-    });
-    Ok(())
+        numeric_step(val, k, true)
+    })
 }
 
 /// `JumpIfLocalCmpConstFalse`

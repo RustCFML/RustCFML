@@ -116,7 +116,15 @@ pub(crate) fn op_mod(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
     arith_binary_op(stack, |a, b| {
         Ok(match (&a, &b) {
             (CfmlValue::Int(i), CfmlValue::Int(j)) if *j != 0 => CfmlValue::Int(i % j),
-            _ => CfmlValue::Double(arith_operand(&a)? % arith_operand(&b)?),
+            _ => {
+                let y = arith_operand(&b)?;
+                let x = arith_operand(&a)?;
+                // Lucee throws rather than answering NaN (GH #451).
+                if y == 0.0 {
+                    return Err(CfmlError::arithmetic(super::effect::DIVISION_BY_ZERO));
+                }
+                CfmlValue::Double(x % y)
+            }
         })
     })
 }
@@ -133,11 +141,11 @@ pub(crate) fn op_int_div(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
     arith_binary_op(stack, |a, b| {
         let x = arith_operand(&a)? as i64;
         let y = arith_operand(&b)? as i64;
-        Ok(if y == 0 {
-            CfmlValue::Int(0)
-        } else {
-            CfmlValue::Int(x / y)
-        })
+        // Java's integer division message, which Lucee lets through (GH #451).
+        if y == 0 {
+            return Err(CfmlError::arithmetic("/ by zero"));
+        }
+        Ok(CfmlValue::Int(x.wrapping_div(y)))
     })
 }
 

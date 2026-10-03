@@ -23,7 +23,12 @@ use crate::CfmlVirtualMachine;
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::CfmlError;
 
-/// `/` — CFML throws a catchable `Expression` error on division by zero.
+/// Lucee's message for `x / 0` and `x mod 0`.
+pub(crate) const DIVISION_BY_ZERO: &str = "Division by zero is not possible";
+
+/// `/` — division by zero throws `java.lang.ArithmeticException`, as on Lucee
+/// (GH #451: it was `Expression`, so `catch (expression e)` caught what Lucee
+/// lets through).
 #[inline]
 pub(crate) fn op_div(
     vm: &mut CfmlVirtualMachine,
@@ -43,11 +48,11 @@ pub(crate) fn op_div(
             let mut exception = ValueMap::default();
             exception.insert(
                 "message".to_string(),
-                CfmlValue::string("Division by zero is not allowed.".to_string()),
+                CfmlValue::string(DIVISION_BY_ZERO.to_string()),
             );
             exception.insert(
                 "type".to_string(),
-                CfmlValue::string("Expression".to_string()),
+                CfmlValue::string("java.lang.ArithmeticException".to_string()),
             );
             exception.insert("detail".to_string(), CfmlValue::string(String::new()));
             exception.insert("tagcontext".to_string(), vm.build_tag_context());
@@ -63,9 +68,7 @@ pub(crate) fn op_div(
                 *ip = handler.catch_ip;
                 return Ok(());
             } else {
-                return Err(CfmlError::runtime(
-                    "Division by zero is not allowed.".to_string(),
-                ));
+                return Err(CfmlError::arithmetic(DIVISION_BY_ZERO));
             }
         } else {
             stack.push(CfmlValue::Double(x / y));
@@ -158,7 +161,7 @@ pub(crate) fn op_throw(
             m.insert("message".to_string(), CfmlValue::string(other.as_string()));
             m.insert(
                 "type".to_string(),
-                CfmlValue::string("Application".to_string()),
+                CfmlValue::string("application".to_string()),
             );
             m.insert("detail".to_string(), CfmlValue::string(String::new()));
             m.insert("tagcontext".to_string(), vm.build_tag_context());

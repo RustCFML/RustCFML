@@ -1169,7 +1169,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // an explicitly supplied attribute still overrides.
             let has_object = attrs.contains_key("object");
             let dflt_msg = if has_object { "" } else { "An error occurred" };
-            let dflt_type = if has_object { "" } else { "Application" };
+            let dflt_type = if has_object { "" } else { "application" };
             let message = attr_expr("message", dflt_msg);
             let type_ = attr_expr("type", dflt_type);
             let detail = attr_expr("detail", "");
