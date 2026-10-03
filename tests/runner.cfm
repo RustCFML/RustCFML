@@ -283,6 +283,8 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_struct_higher_order.cfm">
 <cf_runtest file="stdlib/test_duplicate_deepcopy_flag.cfm">
 <cf_runtest file="stdlib/test_math_functions.cfm">
+<cf_runtest file="stdlib/test_rand_algorithms.cfm">
+<cf_runtest file="stdlib/test_string_index_scans.cfm">
 <cf_runtest file="stdlib/test_date_functions.cfm">
 <cf_runtest file="stdlib/test_dotted_dates.cfm">
 <cf_runtest file="stdlib/test_timezone.cfm">

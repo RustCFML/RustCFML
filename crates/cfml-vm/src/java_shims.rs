@@ -1043,7 +1043,7 @@ fn message_digest_hash(algorithm: &str, data: &[u8]) -> CfmlResult {
 pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     match method {
         "init" | "randomuuid" => {
-            let uuid = format!("{:032x}", rand_u128());
+            let uuid = format!("{:032x}", random_v4_uuid());
             let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
@@ -2707,11 +2707,6 @@ pub fn handle_java_stringbuilder(
         }
         "append" => {
             if let CfmlValue::Struct(ref shim) = object {
-                let cur = shim
-                    .get("__buffer")
-                    .map(|b| b.as_string())
-                    .unwrap_or_default();
-                let app = args.first().map(|a| a.as_string()).unwrap_or_default();
                 // Mutate the buffer IN PLACE through the shared handle and return
                 // the same builder (Java's `append` returns `this`). A snapshot +
                 // new-struct return only survived reassignment writeback
@@ -2719,10 +2714,26 @@ pub fn handle_java_stringbuilder(
                 // function (`fn(sb){ sb.append(x); }`, e.g. MockBox's
                 // generateMethodsFromMD) the caller's instance never saw the
                 // append, so generated stubs came out empty.
-                shim.insert(
-                    "__buffer".to_string(),
-                    CfmlValue::string(format!("{}{}", cur, app)),
-                );
+                //
+                // The buffer is taken OUT of the struct and appended to as an
+                // owned `String`: when nothing else holds it (the usual case)
+                // `try_unwrap` hands the allocation over, so an append is
+                // amortised O(appended) like Java's, not a copy of the whole
+                // buffer every call (GH #461). A `toString()` result still
+                // sharing it costs one copy, then appends are cheap again.
+                let mut buf = match shim.insert("__buffer", CfmlValue::Null) {
+                    Some(CfmlValue::String(arc)) => {
+                        std::sync::Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+                    }
+                    Some(CfmlValue::Null) | None => String::new(),
+                    Some(other) => other.as_string(),
+                };
+                match args.first() {
+                    Some(CfmlValue::String(a)) => buf.push_str(a),
+                    Some(a) => buf.push_str(&a.as_string()),
+                    None => {}
+                }
+                shim.insert("__buffer", CfmlValue::string(buf));
                 Ok(object.clone())
             } else {
                 Ok(CfmlValue::Null)
@@ -5060,13 +5071,21 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
     }
 }
 
-fn rand_u128() -> u128 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    cfml_common::clock::now_unix_nanos().hash(&mut h);
-    0x12345678u64.hash(&mut h);
-    h.finish() as u128
+/// A random RFC 4122 version 4 UUID as 128 bits, from the OS CSPRNG — what
+/// `java.util.UUID.randomUUID()` returns. The old body hashed the clock into a
+/// single `u64`, so the top 64 bits were always zero and the version/variant
+/// bits were never set (GH #459).
+fn random_v4_uuid() -> u128 {
+    #[cfg(not(target_arch = "wasm32"))]
+    let bits = {
+        use rand_core::RngCore;
+        let mut b = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut b);
+        u128::from_be_bytes(b)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let bits = uuid::Uuid::new_v4().as_u128();
+    (bits & !(0xF000u128 << 64) & !(0xC000u128 << 48)) | (0x4000u128 << 64) | (0x8000u128 << 48)
 }
 
 /// Shim for `java.util.regex.Pattern` and the `Matcher` it produces — used by

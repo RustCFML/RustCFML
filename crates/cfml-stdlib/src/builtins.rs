@@ -17,6 +17,7 @@
 use cfml_common::dynamic::{build_implements_meta, CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use std::collections::HashMap;
+use std::sync::Arc;
 use regex::Regex;
 use once_cell::sync::Lazy;
 use serde_json;
@@ -1609,18 +1610,126 @@ fn byte_to_char_index(s: &str, byte_idx: usize) -> usize {
     s[..byte_idx.min(s.len())].chars().count()
 }
 
+/// Argument `idx` as a shared string handle: the caller's own `Arc` when it is
+/// already a string (no copy), otherwise its string coercion.
+fn arc_str_arg(args: &[CfmlValue], idx: usize) -> Arc<String> {
+    match args.get(idx) {
+        Some(CfmlValue::String(a)) => a.clone(),
+        Some(v) => Arc::new(v.as_string()),
+        None => Arc::new(String::new()),
+    }
+}
+
+/// Per-thread memo of the last long string a positional string BIF indexed:
+/// whether it is ASCII, and the last (character index, byte offset) pair it
+/// resolved. CFML positions are character indexes, so without it every
+/// `Find(x, s, i)` / `Mid(s, i, n)` walked from the start of `s` to `i`, and a
+/// forward scan over a string was quadratic (GH #460).
+///
+/// Keyed by a `Weak`, so it never keeps a string's contents alive, and the
+/// allocation it pins cannot be reused by another string while it is cached —
+/// pointer equality is identity. A string mutated in place is moved out of its
+/// `Arc` first (`try_unwrap`), so it comes back under a new pointer and misses.
+struct CharIndexMemo {
+    string: std::sync::Weak<String>,
+    ascii: bool,
+    char_idx: usize,
+    byte_off: usize,
+}
+
+thread_local! {
+    static CHAR_INDEX_MEMO: std::cell::RefCell<Option<CharIndexMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Strings shorter than this are cheaper to walk than to memoise.
+const CHAR_INDEX_MEMO_MIN_LEN: usize = 256;
+
+/// Byte offset of the 0-based character `char_idx` of `s`; `Some(s.len())` when
+/// `char_idx` is exactly the character count, `None` past that.
+fn char_to_byte_memo(s: &Arc<String>, char_idx: usize) -> Option<usize> {
+    let text: &str = s.as_str();
+    if text.len() < CHAR_INDEX_MEMO_MIN_LEN {
+        if char_idx > text.len() {
+            return None;
+        }
+        return match text.char_indices().nth(char_idx) {
+            Some((b, _)) => Some(b),
+            None if text.chars().count() == char_idx => Some(text.len()),
+            None => None,
+        };
+    }
+    CHAR_INDEX_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let hit = matches!(&*memo, Some(m) if std::ptr::eq(m.string.as_ptr(), Arc::as_ptr(s)));
+        if !hit {
+            *memo = Some(CharIndexMemo {
+                string: Arc::downgrade(s),
+                ascii: text.is_ascii(),
+                char_idx: 0,
+                byte_off: 0,
+            });
+        }
+        let m = memo.as_mut().expect("memo set above");
+        if m.ascii {
+            return if char_idx <= text.len() { Some(char_idx) } else { None };
+        }
+        // Walk forward from the memoised position when the target is at or
+        // after it, otherwise from the start.
+        let (from_ci, from_bo) = if char_idx >= m.char_idx { (m.char_idx, m.byte_off) } else { (0, 0) };
+        let need = char_idx - from_ci;
+        let bo = if need == 0 {
+            from_bo
+        } else {
+            let tail = &text[from_bo..];
+            match tail.char_indices().nth(need) {
+                Some((o, _)) => from_bo + o,
+                None if tail.chars().count() == need => text.len(),
+                None => return None,
+            }
+        };
+        let ci = char_idx;
+        m.char_idx = ci;
+        m.byte_off = bo;
+        Some(bo)
+    })
+}
+
+/// Whether the memo (filled by [`char_to_byte_memo`]) knows `s` to be ASCII.
+fn memo_is_ascii(s: &Arc<String>) -> bool {
+    CHAR_INDEX_MEMO.with(|memo| {
+        matches!(&*memo.borrow(), Some(m) if std::ptr::eq(m.string.as_ptr(), Arc::as_ptr(s)) && m.ascii)
+    })
+}
+
+/// Character index of byte offset `byte_off` in `s`, given a known
+/// (character, byte) position at or before it. Records the result in the memo.
+fn byte_to_char_memo(s: &Arc<String>, from_char: usize, from_byte: usize, byte_off: usize) -> usize {
+    let text: &str = s.as_str();
+    let ci = from_char + text[from_byte..byte_off].chars().count();
+    if text.len() >= CHAR_INDEX_MEMO_MIN_LEN {
+        CHAR_INDEX_MEMO.with(|memo| {
+            if let Some(m) = memo.borrow_mut().as_mut() {
+                if std::ptr::eq(m.string.as_ptr(), Arc::as_ptr(s)) && !m.ascii {
+                    m.char_idx = ci;
+                    m.byte_off = byte_off;
+                }
+            }
+        });
+    }
+    ci
+}
+
 /// Char-based substring search. `start_char` is a 0-based character index.
 /// Returns a 1-based CHARACTER position, or 0 if not found. CFML positions are
 /// all character-based (Len/Mid/Left/Right are already char-based here), so
 /// Find must be too — a byte-based position desynced with Mid on any non-ASCII
 /// string (GitHub #248).
-fn find_substr_char(haystack: &str, needle: &str, start_char: usize) -> i64 {
-    if start_char > haystack.chars().count() {
+fn find_substr_char(haystack: &Arc<String>, needle: &str, start_char: usize) -> i64 {
+    let Some(byte_start) = char_to_byte_memo(haystack, start_char) else {
         return 0;
-    }
-    let byte_start = char_index_to_byte(haystack, start_char);
+    };
     match haystack[byte_start..].find(needle) {
-        Some(bpos) => (byte_to_char_index(haystack, byte_start + bpos) + 1) as i64,
+        Some(bpos) => (byte_to_char_memo(haystack, start_char, byte_start, byte_start + bpos) + 1) as i64,
         None => 0,
     }
 }
@@ -1628,7 +1737,7 @@ fn find_substr_char(haystack: &str, needle: &str, start_char: usize) -> i64 {
 fn fn_find(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let substring = get_str(&args, 0);
-        let string = get_str(&args, 1);
+        let string = arc_str_arg(&args, 1);
         let start = if args.len() >= 3 { get_int(&args, 2).max(1) as usize - 1 } else { 0 };
         Ok(CfmlValue::Int(find_substr_char(&string, &substring, start)))
     } else {
@@ -1638,9 +1747,36 @@ fn fn_find(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        let substring = get_str(&args, 0).to_lowercase();
-        let string = get_str(&args, 1).to_lowercase();
+        let substring = get_str(&args, 0);
+        let string = arc_str_arg(&args, 1);
         let start = if args.len() >= 3 { get_int(&args, 2).max(1) as usize - 1 } else { 0 };
+        // ASCII on both sides: fold bytes in place of lowercasing two whole
+        // copies per call (offsets are unchanged by ASCII folding).
+        if substring.is_ascii() && string.len() >= CHAR_INDEX_MEMO_MIN_LEN {
+            let Some(byte_start) = char_to_byte_memo(&string, start) else {
+                return Ok(CfmlValue::Int(0));
+            };
+            if !memo_is_ascii(&string) {
+                // Unicode case folding can match a non-ASCII haystack char to
+                // an ASCII needle (the Kelvin sign); keep the general path.
+                let string = Arc::new(string.to_lowercase());
+                return Ok(CfmlValue::Int(find_substr_char(&string, &substring.to_lowercase(), start)));
+            }
+            let hay = &string.as_bytes()[byte_start..];
+            let pat = substring.as_bytes();
+            if pat.is_empty() {
+                return Ok(CfmlValue::Int(
+                    (byte_to_char_memo(&string, start, byte_start, byte_start) + 1) as i64,
+                ));
+            }
+            let found = hay.windows(pat.len()).position(|w| w.eq_ignore_ascii_case(pat));
+            return Ok(CfmlValue::Int(match found {
+                Some(bpos) => (byte_to_char_memo(&string, start, byte_start, byte_start + bpos) + 1) as i64,
+                None => 0,
+            }));
+        }
+        let substring = substring.to_lowercase();
+        let string = Arc::new(string.to_lowercase());
         Ok(CfmlValue::Int(find_substr_char(&string, &substring, start)))
     } else {
         Ok(CfmlValue::Int(0))
@@ -1691,9 +1827,9 @@ fn char_offset_from_end(s: &str, n: usize) -> usize {
 
 fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        let string = get_str(&args, 0);
+        let string = arc_str_arg(&args, 0);
         let start = (get_int(&args, 1).max(1) as usize).saturating_sub(1);
-        let from = char_offset(&string, start);
+        let from = char_to_byte_memo(&string, start).unwrap_or(string.len());
         let rest = &string[from..];
         let slice = if args.len() >= 3 {
             let length = get_int(&args, 2).max(0) as usize;
@@ -1708,13 +1844,13 @@ fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_left(args: Vec<CfmlValue>) -> CfmlResult {
-    let string = get_str(&args, 0);
+    let string = arc_str_arg(&args, 0);
     let count = get_int(&args, 1).max(0) as usize;
     Ok(CfmlValue::string(string[..char_offset(&string, count)].to_string()))
 }
 
 fn fn_right(args: Vec<CfmlValue>) -> CfmlResult {
-    let string = get_str(&args, 0);
+    let string = arc_str_arg(&args, 0);
     let count = get_int(&args, 1).max(0) as usize;
     Ok(CfmlValue::string(string[char_offset_from_end(&string, count)..].to_string()))
 }
@@ -3234,29 +3370,53 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        // Pure: produces a new array.
-        let snap = arr.snapshot();
-        let offset = get_int(&args, 1);
-        let length = if args.len() >= 3 { Some(get_int(&args, 2) as usize) } else { None };
-
-        let start = if offset >= 0 {
-            (offset as usize).saturating_sub(1) // 1-based to 0-based
-        } else {
-            // Negative: count from end
-            let from_end = (-offset) as usize;
-            if from_end > snap.len() { 0 } else { snap.len() - from_end }
-        };
-
-        if start >= snap.len() {
-            return Ok(CfmlValue::array(Vec::new()));
-        }
-
-        let end = match length {
-            Some(len) => (start + len).min(snap.len()),
-            None => snap.len(),
-        };
-
-        Ok(CfmlValue::array(snap[start..end].to_vec()))
+        // Pure: produces a new array. Copies only the slice, under the read
+        // lock — a whole-array snapshot made every call O(array length), so
+        // slicing short spans out of a long array was quadratic (GH #461).
+        //
+        // Bounds follow Lucee's ArraySlice exactly: an offset <= 0 counts back
+        // from the end (`len + offset`, repeatedly, so -2 of 5 starts at 3); a
+        // length <= 0 stops that many elements before the end; an offset or
+        // offset+length past the end throws rather than clamping.
+        let mut offset = get_int(&args, 1);
+        let length = if args.len() >= 3 { get_int(&args, 2) } else { 0 };
+        let sliced = arr.with_read(|items| -> Result<Vec<CfmlValue>, CfmlError> {
+            let n = items.len() as i64;
+            if n == 0 {
+                return Err(CfmlError::expression(
+                    "Invalid call of the function [arraySlice], first Argument [array] is invalid, \
+                     Array cannot be empty"
+                        .to_string(),
+                ));
+            }
+            while offset <= 0 {
+                offset += n;
+            }
+            if n < offset {
+                return Err(CfmlError::expression(
+                    "Invalid call of the function [arraySlice], second Argument [offset] is invalid, \
+                     Offset cannot be greater than size of the array"
+                        .to_string(),
+                ));
+            }
+            let mut to = if length > 0 { offset + length - 1 } else { n + length };
+            // A negative length reaching past the start means "to the end".
+            if to < 1 {
+                to = n;
+            }
+            if n < to {
+                return Err(CfmlError::expression(
+                    "Invalid call of the function [arraySlice], third Argument [length] is invalid, \
+                     Offset+length cannot be greater than size of the array"
+                        .to_string(),
+                ));
+            }
+            if to < offset {
+                return Ok(Vec::new());
+            }
+            Ok(items[(offset - 1) as usize..to as usize].to_vec())
+        })?;
+        Ok(CfmlValue::array(sliced))
     } else {
         Ok(CfmlValue::array(Vec::new()))
     }
@@ -5339,25 +5499,108 @@ fn fn_round(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-fn fn_rand(_args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Double(cfml_random()))
+/// Which generator a `rand`/`randRange`/`randomize` `algorithm` argument names.
+/// `CFMX_COMPAT` (the default) is the seedable PRNG; every other accepted name
+/// is a `SecureRandom` algorithm on Lucee/ACF and maps to the OS CSPRNG here,
+/// which `randomize()` never affects (GH #459). Names follow Lucee 7.1's list,
+/// plus Adobe's `IBMSecureRandom`.
+#[derive(Clone, Copy, PartialEq)]
+enum RandAlgorithm {
+    Compat,
+    Secure,
+}
+
+fn rand_algorithm(fn_name: &str, args: &[CfmlValue], idx: usize) -> Result<RandAlgorithm, CfmlError> {
+    let Some(v) = args.get(idx) else {
+        return Ok(RandAlgorithm::Compat);
+    };
+    let raw = v.as_string();
+    let name = raw.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "" | "cfmx_compat" => Ok(RandAlgorithm::Compat),
+        "sha1prng" | "nativeprng" | "nativeprngblocking" | "nativeprngnonblocking" | "drbg"
+        | "ibmsecurerandom" => Ok(RandAlgorithm::Secure),
+        _ => Err(CfmlError::expression(format!(
+            "Invalid call of the function [{}], argument [algorithm] is invalid, The random algorithm [{}] is not supported. \
+             Supported algorithms are [ SHA1PRNG, NativePRNGBlocking, NativePRNG, NativePRNGNonBlocking, DRBG, IBMSecureRandom, cfmx_compat ]",
+            fn_name, raw
+        ))),
+    }
+}
+
+/// 64 bits from the operating system CSPRNG. Never touched by `randomize()`.
+#[cfg(feature = "security")]
+pub fn secure_random_u64() -> u64 {
+    use rand::RngCore;
+    rand::rngs::OsRng.next_u64()
+}
+
+/// Without the `security` feature there is no OS entropy source linked in. Fall
+/// back to a generator of its own — independent of the `randomize()` stream, so
+/// seeding still cannot make these values predictable from CFML.
+#[cfg(not(feature = "security"))]
+pub fn secure_random_u64() -> u64 {
+    thread_local! {
+        static STATE: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    }
+    STATE.with(|state| {
+        let mut cur = state.get();
+        if cur == 0 {
+            let tag = state as *const _ as u64;
+            cur = splitmix64((cfml_common::clock::now_unix_nanos() as u64) ^ splitmix64(tag) ^ 0x5EC0_4E5E);
+            if cur == 0 {
+                cur = 0x9E37_79B9_7F4A_7C15;
+            }
+        }
+        let next = xorshift64(cur);
+        state.set(next);
+        splitmix64(next)
+    })
+}
+
+fn random_unit(alg: RandAlgorithm) -> f64 {
+    let bits = match alg {
+        RandAlgorithm::Compat => cfml_random_bits(),
+        RandAlgorithm::Secure => secure_random_u64(),
+    };
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn fn_rand(args: Vec<CfmlValue>) -> CfmlResult {
+    let alg = rand_algorithm("Rand", &args, 0)?;
+    Ok(CfmlValue::Double(random_unit(alg)))
 }
 
 fn fn_rand_range(args: Vec<CfmlValue>) -> CfmlResult {
+    let alg = rand_algorithm("RandRange", &args, 2)?;
     let min = get_int(&args, 0);
     let max = get_int(&args, 1);
     let range = (max - min + 1) as f64;
-    let result = min + (cfml_random() * range).floor() as i64;
+    let result = min + (random_unit(alg) * range).floor() as i64;
     Ok(CfmlValue::Int(result.min(max)))
 }
 
+/// `randomize(seed [, algorithm])`. Like Lucee, it returns the first number of
+/// the freshly seeded sequence (and consumes it). Seeding a secure algorithm
+/// does not make the shared secure stream predictable: the return value comes
+/// from a one-off generator seeded with `seed`, and later `rand("SHA1PRNG")`
+/// calls still draw from the OS.
 fn fn_randomize(args: Vec<CfmlValue>) -> CfmlResult {
+    let alg = rand_algorithm("Randomize", &args, 1)?;
     let seed = get_float(&args, 0);
-    // Seed the thread-local PRNG for deterministic rand() output
     let seed_bits = (seed.to_bits()).max(1); // ensure non-zero
-    PRNG_STATE.with(|state| state.set(seed_bits));
-    PRNG_SEEDED.with(|seeded| seeded.set(true));
-    Ok(CfmlValue::Double(0.0))
+    match alg {
+        RandAlgorithm::Compat => {
+            // Seed the thread-local PRNG for deterministic rand() output
+            PRNG_STATE.with(|state| state.set(seed_bits));
+            PRNG_SEEDED.with(|seeded| seeded.set(true));
+            Ok(CfmlValue::Double(cfml_random()))
+        }
+        RandAlgorithm::Secure => {
+            let one_off = xorshift64(splitmix64(seed_bits).max(1));
+            Ok(CfmlValue::Double((one_off >> 11) as f64 / (1u64 << 53) as f64))
+        }
+    }
 }
 
 fn fn_max(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8650,7 +8893,9 @@ fn fn_create_object(args: Vec<CfmlValue>) -> CfmlResult {
 /// inspecting the version nibble saw a v4 UUID (§34). Returned in CFML's 8-4-4-16
 /// grouping, which is the standard 8-4-4-4-12 with the last two groups joined.
 fn v4_uuid_bytes() -> [u8; 16] {
-    let (hi, lo) = (cfml_random_bits(), cfml_random_bits());
+    // Off the `randomize()` stream: Lucee's createUUID() is SecureRandom-backed,
+    // so reseeding must not make two calls collide (GH #459).
+    let (hi, lo) = (secure_random_u64(), secure_random_u64());
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&hi.to_be_bytes());
     bytes[8..].copy_from_slice(&lo.to_be_bytes());
@@ -8716,19 +8961,16 @@ fn fn_create_unique_id(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_create_guid(_args: Vec<CfmlValue>) -> CfmlResult {
-    let nanos = cfml_common::clock::now_unix_nanos() as u64;
-    let random_bits = ((cfml_random() * u32::MAX as f64) as u64) << 32
-                    | (cfml_random() * u32::MAX as f64) as u64;
-    let mixed = nanos ^ random_bits;
-    let extra = nanos.wrapping_mul(6364136223846793005).wrapping_add(random_bits);
+    let b = v4_uuid_bytes();
+    let hex = |s: &[u8]| s.iter().map(|x| format!("{:02X}", x)).collect::<String>();
     // Standard GUID format: 8-4-4-4-12
     Ok(CfmlValue::string(format!(
-        "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
-        (mixed >> 32) as u32,
-        (mixed >> 16) as u16,
-        ((mixed as u16) & 0x0FFF) | 0x4000,
-        ((extra >> 48) as u16 & 0x3FFF) | 0x8000,
-        extra & 0xFFFFFFFFFFFF,
+        "{}-{}-{}-{}-{}",
+        hex(&b[0..4]),
+        hex(&b[4..6]),
+        hex(&b[6..8]),
+        hex(&b[8..10]),
+        hex(&b[10..16]),
     )))
 }
 
