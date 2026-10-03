@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<urlrewrite>
+    <!-- Refuse the engine's admin endpoints when the request came through a proxy. -->
+    <rule>
+        <condition type="header" name="X-Forwarded-For" operator="equal">.+</condition>
+        <from>^/__rustcfml/.*$</from>
+        <set type="status">404</set>
+        <to last="true">/missing.html</to>
+    </rule>
+    <!-- A page a rule marks as gone; the forwarded page renders with the rule's status. -->
+    <rule>
+        <from>^/gone$</from>
+        <set type="status">410</set>
+        <to last="true">/page.cfm</to>
+    </rule>
+    <!-- Preside/Wheels-style catch-all onto the front controller. -->
+    <rule>
+        <condition type="request-uri" operator="notequal">^/(index\.cfm|page\.cfm)</condition>
+        <from>^/(.*)$</from>
+        <to>/index.cfm/$1</to>
+    </rule>
+</urlrewrite>

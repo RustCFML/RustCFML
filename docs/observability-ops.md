@@ -97,5 +97,7 @@ collector can't keep up.
   Honeycomb, …) in production; RustCFML just needs an OTLP/HTTP endpoint.
 - The debug footer and `/__rustcfml/profiler` / `/__rustcfml/metrics` endpoints
   can leak SQL, file paths and timing — keep them behind your ingress/authn in
-  production (the footer already gates on an IP whitelist; the admin endpoints do
-  not, so restrict them at the proxy).
+  production. The footer already gates on an IP whitelist. The admin endpoints
+  obey `security.blockedPaths` and `urlrewrite.xml` rules, so you can refuse
+  them through your ingress while a scraper still reaches them on the container
+  directly; see [Keeping the admin endpoints internal](web-server.md#keeping-the-admin-endpoints-internal).

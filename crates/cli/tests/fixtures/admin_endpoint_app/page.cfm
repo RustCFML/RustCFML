@@ -1,0 +1,1 @@
+<cfoutput>plain page</cfoutput>

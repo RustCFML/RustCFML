@@ -148,5 +148,32 @@ Supported features:
 
 - **Regex and wildcard patterns** with backreference substitution (`$1`, `$2`)
 - **Forward**, **redirect** (302), and **permanent-redirect** (301) actions
-- **Conditions** on HTTP method, port, and headers
+- **Conditions** on `header`, `method`, `port`, `query-string`, `remote-addr`
+  and `request-uri`. As on tuckey, a condition's value is a regular expression:
+  `equal` (the default) means the pattern is found, `notequal` that it is not.
+  `port` compares numerically. A condition with no `type` is a `header`
+  condition. A rule's conditions are ANDed, or ORed with the next one when a
+  condition has `next="or"`. A condition type this engine does not support
+  makes its rule never match, and is logged as a warning at startup.
+- **`<set type="status">`** sets the response status for a matching rule. The
+  forwarded page still renders; a page that sets its own status keeps it.
 - **Rule chaining** with `last="true"` to stop processing
+
+### Keeping the admin endpoints internal
+
+`/__rustcfml/metrics` and `/__rustcfml/profiler` (when enabled) obey
+`security.blockedPaths` and the rewrite rules like any other path. A rule that
+sets an error status refuses them; a plain forward, such as a front-controller
+catch-all, does not. To serve metrics to a scraper that calls the container
+directly but refuse them through your ingress:
+
+```xml
+<rule>
+    <condition type="header" name="X-Forwarded-For">.+</condition>
+    <from>^/__rustcfml/.*$</from>
+    <set type="status">404</set>
+    <to last="true">/404.html</to>
+</rule>
+```
+
+To refuse them everywhere, add `"/__rustcfml/*"` to `security.blockedPaths`.

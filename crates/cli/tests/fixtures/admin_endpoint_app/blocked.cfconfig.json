@@ -1,0 +1,4 @@
+{
+    "observability": { "enabled": true, "metrics": { "enabled": true } },
+    "security": { "blockedPaths": [ "/__rustcfml/*" ] }
+}

@@ -2792,12 +2792,33 @@ async fn handle_request_for_mcp(
     handle_request(state, addr, req).await
 }
 
+tokio::task_local! {
+    /// The status a matching urlrewrite rule set with `<set type="status">`,
+    /// applied as the response leaves `handle_request`.
+    static REWRITE_STATUS: std::cell::Cell<Option<u16>>;
+}
+
 async fn handle_request(
     state: axum::extract::State<Arc<AppState>>,
     addr: axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: axum::extract::Request,
 ) -> axum::response::Response {
-    let response = handle_request_inner(state, addr, req).await;
+    let (mut response, rewrite_status) = REWRITE_STATUS
+        .scope(std::cell::Cell::new(None), async {
+            let r = handle_request_inner(state, addr, req).await;
+            (r, REWRITE_STATUS.with(|c| c.get()))
+        })
+        .await;
+    // Like tuckey, the rule sets the status before the forwarded page runs, so
+    // a page that sets its own status (cfheader) keeps it: only a plain 200 is
+    // replaced.
+    if let Some(code) = rewrite_status {
+        if response.status() == axum::http::StatusCode::OK {
+            if let Ok(sc) = axum::http::StatusCode::from_u16(code) {
+                *response.status_mut() = sc;
+            }
+        }
+    }
     logging::flush_all();
     // Counter-first lever sizing: cumulative totals after every request, so a
     // boot request and warm requests can be separated by diffing consecutive
@@ -3232,30 +3253,6 @@ async fn handle_request_inner(
         None => (url.as_str(), ""),
     };
 
-    // Sampling-profiler admin endpoint (Phase 2). Returns the recent profiled
-    // requests (slow requests the watchdog sampled) as JSON. Only served when
-    // the profiler is actually armed, so it 404s exactly like any other unknown
-    // path when the feature is off.
-    if raw_path == "/__rustcfml/profiler" {
-        if let Some(resp) = profiler_endpoint(&state) {
-            return resp;
-        }
-    }
-
-    // OpenTelemetry RED metrics scrape endpoint (Phase 3). Prometheus text
-    // exposition; 404s (falls through) when metrics are off.
-    #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
-    if otel::metrics_path() == Some(raw_path) {
-        if let Some(text) = otel::render_metrics() {
-            use axum::response::IntoResponse;
-            return (
-                [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-                text,
-            )
-                .into_response();
-        }
-    }
-
     // Block direct access to config and meta files. 404 (not 403) so the
     // existence of the file is not confirmed to a probing client. Always
     // applies regardless of any rewrite rules.
@@ -3280,6 +3277,8 @@ async fn handle_request_inner(
     // the forwarded path is lost — `cgi.path_info` becomes "/" — and every deep
     // URL (the whole admin) mis-routes to the site homepage.
     let mut forward_original_uri: Option<String> = None;
+    // `<set type="status">` from a matching rule.
+    let mut rewrite_status: Option<u16> = None;
     if !state.rewrite_rules.is_empty() {
         let mut header_map = HashMap::new();
         for (name, value) in &headers {
@@ -3287,6 +3286,7 @@ async fn handle_request_inner(
         }
 
         if let Some(result) = rewrite::apply_rewrite_rules(&state.rewrite_rules, &path, &method, state.port, &header_map, original_qs, &remote_addr) {
+            rewrite_status = result.status;
             match result.rewrite_type {
                 rewrite::RewriteType::PermanentRedirect => {
                     log::debug!("  -> 301 redirect to {}", result.new_path);
@@ -3336,6 +3336,58 @@ async fn handle_request_inner(
                 }
             }
         }
+    }
+
+    // The engine's own admin endpoints are answered on the ORIGINAL path, but
+    // only after `security.blockedPaths` (above) and the rewrite rules have had
+    // their say, so an app can keep them internal like any other path: a
+    // blocked path 404s, a redirect has already been sent, and a rule that sets
+    // an error status (e.g. 404 when `X-Forwarded-For` is present) refuses
+    // them. A plain forward does not — Preside/Wheels catch-all rules forward
+    // every request to /index.cfm and must not hide the metrics. (GH #456:
+    // these used to be answered before any of that ran.)
+    let is_admin_endpoint = raw_path == "/__rustcfml/profiler" || {
+        #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+        {
+            otel::metrics_path() == Some(raw_path)
+        }
+        #[cfg(not(all(feature = "obs-otel", not(target_arch = "wasm32"))))]
+        {
+            false
+        }
+    };
+    if is_admin_endpoint {
+        if let Some(code) = rewrite_status.filter(|c| *c >= 400) {
+            log::debug!("  -> {} (admin endpoint refused by a rewrite rule)", code);
+            return axum::response::Response::builder()
+                .status(code)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(axum::body::Body::from("Not found"))
+                .unwrap();
+        }
+        // Sampling-profiler admin endpoint (Phase 2): recent profiled requests
+        // as JSON, only while the profiler is armed.
+        if raw_path == "/__rustcfml/profiler" {
+            if let Some(resp) = profiler_endpoint(&state) {
+                return resp;
+            }
+        }
+        // OpenTelemetry RED metrics scrape endpoint (Phase 3), Prometheus text
+        // exposition, only while metrics are on.
+        #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
+        if otel::metrics_path() == Some(raw_path) {
+            if let Some(text) = otel::render_metrics() {
+                use axum::response::IntoResponse;
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                    text,
+                )
+                    .into_response();
+            }
+        }
+    }
+    if let Some(code) = rewrite_status {
+        let _ = REWRITE_STATUS.try_with(|c| c.set(Some(code)));
     }
 
     // Surface the pre-rewrite URI as `X-Original-URL` (see note above). Replace

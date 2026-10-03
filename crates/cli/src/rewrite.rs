@@ -95,6 +95,9 @@ struct RewriteCondition {
     operator: ConditionOp,
     value: String,
     case_sensitive: bool,
+    /// `next="or"`: OR this condition's result with the next one instead of
+    /// ANDing (tuckey evaluates a rule's conditions left to right).
+    next_or: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,11 +112,16 @@ pub struct RewriteRule {
     to_type: RewriteType,
     to_last: bool,
     conditions: Vec<RewriteCondition>,
+    /// `<set type="status">N</set>`: the response status for a request this
+    /// rule matches.
+    set_status: Option<u16>,
 }
 
 pub struct RewriteResult {
     pub new_path: String,
     pub rewrite_type: RewriteType,
+    /// The status set by the last matching rule with `<set type="status">`.
+    pub status: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +215,16 @@ fn parse_rule_block(block: &str) -> Option<RewriteRule> {
 
     // Parse <condition> elements
     let conditions = parse_conditions(block);
+    for c in &conditions {
+        if let ConditionType::Unsupported = c.cond_type {
+            log::warn!(
+                "urlrewrite: rule {} has a condition type this engine does not support; the rule will never match",
+                name.as_deref().map(|n| format!("'{}'", n)).unwrap_or_else(|| format!("from '{}'", from))
+            );
+        }
+    }
+
+    let set_status = parse_set_status(block);
 
     Some(RewriteRule {
         name,
@@ -218,7 +236,28 @@ fn parse_rule_block(block: &str) -> Option<RewriteRule> {
         to_type,
         to_last,
         conditions,
+        set_status,
     })
+}
+
+/// The status of a `<set type="status">N</set>` element, if the rule has one.
+/// Other `<set>` types (cookie, request attributes, …) are not modelled.
+fn parse_set_status(block: &str) -> Option<u16> {
+    let mut from = 0;
+    while let Some(i) = block[from..].find("<set") {
+        let start = from + i;
+        let tag_end = start + block[start..].find('>')?;
+        let tag = &block[start..=tag_end];
+        from = tag_end + 1;
+        if get_xml_attr(tag, "type").as_deref() != Some("status") || tag.ends_with("/>") {
+            continue;
+        }
+        let close = block[from..].find("</set>")?;
+        if let Ok(n) = block[from..from + close].trim().parse::<u16>() {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// Extract an XML attribute value from an opening tag string.
@@ -308,10 +347,11 @@ fn parse_conditions(block: &str) -> Vec<RewriteCondition> {
         };
         let tag = &block[abs_start..tag_end + 1];
 
+        // tuckey defaults a condition with no `type` to `header`.
         let cond_type = match get_xml_attr(tag, "type").as_deref() {
             Some("method") => ConditionType::Method,
             Some("port") => ConditionType::Port,
-            Some("header") => {
+            Some("header") | None => {
                 let header_name = get_xml_attr(tag, "name").unwrap_or_default();
                 ConditionType::Header(header_name)
             }
@@ -333,6 +373,7 @@ fn parse_conditions(block: &str) -> Vec<RewriteCondition> {
 
         let case_sensitive =
             get_xml_attr(tag, "casesensitive").map_or(false, |v| v == "true");
+        let next_or = get_xml_attr(tag, "next").map_or(false, |v| v.eq_ignore_ascii_case("or"));
 
         let is_self_closing = tag.ends_with("/>");
         let value = if is_self_closing {
@@ -349,6 +390,7 @@ fn parse_conditions(block: &str) -> Vec<RewriteCondition> {
             operator,
             value,
             case_sensitive,
+            next_or,
         });
 
         search_from = tag_end + 1;
@@ -402,59 +444,81 @@ fn check_condition(
     remote_addr: &str,
     request_uri: &str,
 ) -> bool {
-    let actual = match &cond.cond_type {
-        ConditionType::Method => method.to_string(),
-        ConditionType::Port => port.to_string(),
-        ConditionType::Header(name) => {
-            let name_lower = name.to_lowercase();
-            headers
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == name_lower)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default()
-        }
-        // tuckey treats these condition values as regex patterns matched
-        // against the actual value: `equal` => the pattern is found,
-        // `notequal` => it is not. This is NOT plain string equality.
-        ConditionType::QueryString
-        | ConditionType::RemoteAddr
-        | ConditionType::RequestUri => {
-            let actual = match cond.cond_type {
-                ConditionType::QueryString => query_string,
-                ConditionType::RemoteAddr => remote_addr,
-                _ => request_uri,
+    let actual: String = match &cond.cond_type {
+        // A port compares numerically, so `greater 9000` is not a string
+        // comparison ("9000" > "10000" lexicographically).
+        ConditionType::Port => {
+            let want = match cond.value.trim().parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => return false,
             };
-            let pattern = if cond.case_sensitive {
-                cached_rule_regex(&cond.value)
-            } else {
-                cached_rule_regex(&format!("(?i){}", cond.value))
-            };
-            let found = pattern.map(|re| re.is_match(actual)).unwrap_or(false);
+            let have = port as i64;
             return match cond.operator {
-                ConditionOp::NotEqual => !found,
-                // equal (and any other operator we don't model for regex
-                // conditions) means "the pattern matched".
-                _ => found,
+                ConditionOp::Equal => have == want,
+                ConditionOp::NotEqual => have != want,
+                ConditionOp::Greater => have > want,
+                ConditionOp::Less => have < want,
+                ConditionOp::GreaterOrEqual => have >= want,
+                ConditionOp::LessOrEqual => have <= want,
             };
         }
+        ConditionType::Method => method.to_string(),
+        ConditionType::Header(name) => headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default(),
+        ConditionType::QueryString => query_string.to_string(),
+        ConditionType::RemoteAddr => remote_addr.to_string(),
+        ConditionType::RequestUri => request_uri.to_string(),
         // Never match — see ConditionType::Unsupported.
         ConditionType::Unsupported => return false,
     };
 
-    let (actual_cmp, value_cmp) = if cond.case_sensitive {
-        (actual.clone(), cond.value.clone())
+    // Every other type follows tuckey: the value is a regular expression
+    // matched against the actual value. `equal` means the pattern is found,
+    // `notequal` that it is not. (header and method used to compare as plain
+    // strings, so `.+` never matched a header value.)
+    let pattern = if cond.case_sensitive {
+        cached_rule_regex(&cond.value)
     } else {
-        (actual.to_lowercase(), cond.value.to_lowercase())
+        cached_rule_regex(&format!("(?i){}", cond.value))
     };
-
+    let found = pattern.map(|re| re.is_match(&actual)).unwrap_or(false);
     match cond.operator {
-        ConditionOp::Equal => actual_cmp == value_cmp,
-        ConditionOp::NotEqual => actual_cmp != value_cmp,
-        ConditionOp::Greater => actual_cmp > value_cmp,
-        ConditionOp::Less => actual_cmp < value_cmp,
-        ConditionOp::GreaterOrEqual => actual_cmp >= value_cmp,
-        ConditionOp::LessOrEqual => actual_cmp <= value_cmp,
+        ConditionOp::NotEqual => !found,
+        // equal (and any ordering operator, which tuckey does not define for
+        // regex conditions) means "the pattern matched".
+        _ => found,
     }
+}
+
+/// Combine a rule's conditions as tuckey does: left to right, each result
+/// ANDed into the running total, or ORed when the PREVIOUS condition carried
+/// `next="or"`. No conditions means the rule applies.
+fn conditions_pass(
+    conditions: &[RewriteCondition],
+    method: &str,
+    port: u16,
+    headers: &HashMap<String, String>,
+    query_string: &str,
+    remote_addr: &str,
+    request_uri: &str,
+) -> bool {
+    let mut passing = true;
+    let mut or_with_next = false;
+    for (i, c) in conditions.iter().enumerate() {
+        let hit = check_condition(c, method, port, headers, query_string, remote_addr, request_uri);
+        passing = if i == 0 {
+            hit
+        } else if or_with_next {
+            passing || hit
+        } else {
+            passing && hit
+        };
+        or_with_next = c.next_or;
+    }
+    passing
 }
 
 // ---------------------------------------------------------------------------
@@ -473,28 +537,22 @@ pub fn apply_rewrite_rules(
 ) -> Option<RewriteResult> {
     let mut current_path = url_path.to_string();
     let mut last_result: Option<RewriteResult> = None;
+    let mut status: Option<u16> = None;
 
     for rule in rules {
         if !rule.enabled {
             continue;
         }
 
-        // All conditions must pass
-        let conditions_pass = rule
-            .conditions
-            .iter()
-            .all(|c| {
-                check_condition(
-                    c,
-                    method,
-                    port,
-                    headers,
-                    query_string,
-                    remote_addr,
-                    &current_path,
-                )
-            });
-        if !conditions_pass {
+        if !conditions_pass(
+            &rule.conditions,
+            method,
+            port,
+            headers,
+            query_string,
+            remote_addr,
+            &current_path,
+        ) {
             continue;
         }
 
@@ -522,6 +580,9 @@ pub fn apply_rewrite_rules(
         };
 
         if let Some(captures) = regex.captures(&current_path) {
+            if rule.set_status.is_some() {
+                status = rule.set_status;
+            }
             if let Some(ref to) = rule.to {
                 // Substitute backreferences $1, $2, etc.
                 let mut new_path = to.clone();
@@ -540,6 +601,7 @@ pub fn apply_rewrite_rules(
                 last_result = Some(RewriteResult {
                     new_path: new_path.clone(),
                     rewrite_type: rule.to_type.clone(),
+                    status: None,
                 });
                 current_path = new_path;
             } else {
@@ -547,6 +609,7 @@ pub fn apply_rewrite_rules(
                 last_result = Some(RewriteResult {
                     new_path: current_path.clone(),
                     rewrite_type: RewriteType::Forward,
+                    status: None,
                 });
             }
 
@@ -556,6 +619,9 @@ pub fn apply_rewrite_rules(
         }
     }
 
+    if let Some(r) = last_result.as_mut() {
+        r.status = status;
+    }
     last_result
 }
 
@@ -612,5 +678,105 @@ mod tests {
         let miss =
             apply_rewrite_rules(&rules, "/index.cfm/posts", "GET", 8500, &headers, "", "127.0.0.1");
         assert!(miss.is_none(), "excluded path must not be rewritten");
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn rules(body: &str) -> Vec<RewriteRule> {
+        parse_urlrewrite_xml_content(&format!("<urlrewrite>{}</urlrewrite>", body))
+    }
+
+    fn hit(rules: &[RewriteRule], path: &str, method: &str, port: u16, h: &HashMap<String, String>, addr: &str) -> Option<RewriteResult> {
+        apply_rewrite_rules(rules, path, method, port, h, "", addr)
+    }
+
+    // GH #456: header and method values are regular expressions, as on tuckey.
+    #[test]
+    fn header_condition_is_a_regex() {
+        let r = rules(r#"<rule>
+            <condition type="header" name="X-Forwarded-For" operator="equal">.+</condition>
+            <from>^/internal/.*$</from>
+            <set type="status">404</set>
+            <to last="true">/404.html</to>
+        </rule>"#);
+        let via_proxy = hit(&r, "/internal/x", "GET", 8500, &headers(&[("x-forwarded-for", "203.0.113.9")]), "10.0.0.1")
+            .expect("header present: rule fires");
+        assert_eq!(via_proxy.status, Some(404));
+        assert_eq!(via_proxy.new_path, "/404.html");
+        assert!(hit(&r, "/internal/x", "GET", 8500, &headers(&[]), "10.0.0.1").is_none(), "header absent: rule skipped");
+
+        let r = rules(r#"<rule>
+            <condition type="header" name="X-Forwarded-For">^10\.</condition>
+            <from>^/a$</from><to>/b</to>
+        </rule>"#);
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[("X-Forwarded-For", "10.1.2.3")]), "").is_some());
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[("X-Forwarded-For", "110.1.2.3")]), "").is_none());
+    }
+
+    #[test]
+    fn method_condition_is_a_regex() {
+        let r = rules(r#"<rule>
+            <condition type="method">^(POST|PUT)$</condition>
+            <from>^/a$</from><to>/b</to>
+        </rule>"#);
+        assert!(hit(&r, "/a", "PUT", 8500, &headers(&[]), "").is_some());
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[]), "").is_none());
+    }
+
+    #[test]
+    fn port_compares_numerically() {
+        let r = rules(r#"<rule>
+            <condition type="port" operator="greater">9000</condition>
+            <from>^/a$</from><to>/b</to>
+        </rule>"#);
+        assert!(hit(&r, "/a", "GET", 10000, &headers(&[]), "").is_some(), "10000 > 9000");
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[]), "").is_none());
+    }
+
+    #[test]
+    fn missing_type_is_header() {
+        let r = rules(r#"<rule>
+            <condition name="X-Probe">yes</condition>
+            <from>^/a$</from><to>/b</to>
+        </rule>"#);
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[("X-Probe", "yes")]), "").is_some());
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[]), "").is_none());
+    }
+
+    #[test]
+    fn next_or_combines_left_to_right() {
+        // Block /admin unless BOTH the client address and Host are local.
+        let r = rules(r#"<rule>
+            <condition type="remote-addr" operator="notequal" next="or">^127\.0\.0\.1$</condition>
+            <condition type="header" name="host" operator="notequal">^127\.0\.0\.1</condition>
+            <from>^/admin.*$</from>
+            <set type="status">404</set>
+            <to last="true">/404.html</to>
+        </rule>"#);
+        let local = headers(&[("host", "127.0.0.1:8500")]);
+        let spoofed = headers(&[("host", "127.0.0.1")]);
+        let public = headers(&[("host", "example.com")]);
+        assert!(hit(&r, "/admin", "GET", 8500, &local, "127.0.0.1").is_none(), "local client, local host: allowed");
+        assert!(hit(&r, "/admin", "GET", 8500, &spoofed, "203.0.113.9").is_some(), "remote client spoofing Host: refused");
+        assert!(hit(&r, "/admin", "GET", 8500, &public, "127.0.0.1").is_some(), "public host: refused");
+    }
+
+    #[test]
+    fn unknown_condition_type_never_matches() {
+        let r = rules(r#"<rule>
+            <condition type="session-attribute" name="x">.*</condition>
+            <from>^/a$</from><to>/b</to>
+        </rule>"#);
+        assert!(hit(&r, "/a", "GET", 8500, &headers(&[]), "").is_none());
+    }
+
+    #[test]
+    fn set_status_without_to_passes_through() {
+        let r = rules(r#"<rule><from>^/gone$</from><set type="status">410</set></rule>"#);
+        let res = hit(&r, "/gone", "GET", 8500, &headers(&[]), "").expect("matches");
+        assert_eq!(res.status, Some(410));
+        assert_eq!(res.new_path, "/gone");
     }
 }
