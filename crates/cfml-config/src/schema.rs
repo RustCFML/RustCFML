@@ -381,6 +381,16 @@ pub struct RuntimeCfg {
     /// request. Application-lifetime caching was closed in v0.598.0.
     #[serde(rename = "existenceCacheScope")]
     pub existence_cache_scope: String,
+    /// How many distinct compiled regex patterns the engine keeps hot
+    /// (**default 1024**). Every regex BIF (`reFind`, `reReplace`, `reMatch`,
+    /// …) compiles its pattern once and reuses it from this cache; a pattern
+    /// set larger than the cache recompiles on every call (~60 µs instead of
+    /// ~0.6 µs). Raise it for an application whose working set is bigger — a
+    /// router that tests every route pattern in order needs one entry per
+    /// route (GH #462). Each entry can hold a few hundred KB in the worst
+    /// case, so this is a memory ceiling as much as a speed knob.
+    #[serde(rename = "regexCacheSize")]
+    pub regex_cache_size: usize,
     #[serde(rename = "applicationTimeout")]
     pub application_timeout: String,
     #[serde(rename = "sessionTimeout")]
@@ -401,6 +411,7 @@ impl Default for RuntimeCfg {
             // Report as Lucee by default (opt out with `reportAsLucee: false`).
             report_as_lucee: true,
             existence_cache_scope: "application".into(),
+            regex_cache_size: 1024,
             application_timeout: "1,0,0,0".into(),
             session_timeout: "0,0,30,0".into(),
             client_timeout: "7,0,0,0".into(),

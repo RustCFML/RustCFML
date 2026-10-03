@@ -714,6 +714,7 @@ include "harness.cfm";
 <cf_runtest file="includes/test_variables_scope_includes.cfm">
 <cf_runtest file="includes/test_named_args_includes.cfm">
 <cf_runtest file="includes/test_closure_in_swapped_program.cfm">
+<cf_runtest file="includes/test_cfc_include_methods.cfm">
 
 <!--- --- Lifecycle / server request fixtures --- --->
 <cf_runtest file="lifecycle/test_session_app_namespace.cfm">

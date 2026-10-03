@@ -2623,6 +2623,15 @@ pub struct CfmlVirtualMachine {
     /// `cfinclude` runs in the SAME function-local scope as its caller, so
     /// `local.foo` set before the include is visible in the included file.
     include_share_local_keys: Option<std::collections::HashSet<String>>,
+    /// Depth of `include`s running inside a component pseudo-constructor
+    /// (`__cfc_body__`), nested includes counted. While non-zero, a named
+    /// function an included template declares is a METHOD of the component
+    /// under construction (Lucee: `include "parts/x.cfm"` in a CFC body is how
+    /// a large component is split across files): `DefineFunction` hands out
+    /// the class-invariant `method_arc_cache` value instead of rebuilding a
+    /// closure-carrying `CfmlFunction` per instance, and does NOT register it
+    /// as a bare page function (GH #463).
+    cfc_body_include_depth: u32,
     /// The calling frame's `__variables` scope, captured at each `CallMethod`
     /// dispatch. Used as a FALLBACK when a `this.method()` receiver carries no
     /// `__variables` of its own — which happens while a component is still
@@ -4716,6 +4725,7 @@ impl CfmlVirtualMachine {
             mappings_fingerprint: FNV_OFFSET,
             captured_locals: None,
             include_share_local_keys: None,
+            cfc_body_include_depth: 0,
             dispatch_caller_variables: None,
             dispatch_caller_this: None,
             transaction_conn: None,
@@ -13725,6 +13735,27 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
+                    // A named function declared by a template an `include` ran
+                    // from the CFC pseudo-constructor is a method of the class
+                    // under construction (GH #463). Hand out the memoised
+                    // class-invariant value, exactly as the hoist does for an
+                    // inline method: no closure env (the "env" would be the
+                    // body's own `variables`, which the method reaches through
+                    // the instance anyway — and the first instance's env was
+                    // what every later instance inherited through the shared
+                    // method table), and no `user_functions` entry — Lucee
+                    // does not expose such a function as a bare page call.
+                    // Synthesised names (`__closure_…`, `__arrow_…`) keep the
+                    // closure path below.
+                    if !bc_func_arc.is_component_method
+                        && self.cfc_body_include_depth > 0
+                        && func.is_template_frame
+                        && !bc_func_arc.name.starts_with("__")
+                    {
+                        let shared = self.method_arc_for(&bc_func_arc);
+                        stack.push(CfmlValue::Function(shared));
+                        continue;
+                    }
                     let func_name = bc_func_arc.name.clone();
                     // Lucee parity: a named function declaration that collides
                     // with a built-in function is a compile/parse-time error in
@@ -15381,11 +15412,26 @@ impl CfmlVirtualMachine {
                                         .map(|k| k.as_str().to_string()).collect(),
                                 );
                             }
+                            // An include from a CFC pseudo-constructor (or from an
+                            // include already running in one) declares methods —
+                            // see `cfc_body_include_depth`. An include from a
+                            // METHOD body is left alone: its functions stay
+                            // ordinary template-defined UDFs.
+                            let declares_methods = func.name == "__cfc_body__"
+                                || (self.cfc_body_include_depth > 0
+                                    && func.is_template_frame
+                                    && func.name == "__main__");
+                            if declares_methods {
+                                self.cfc_body_include_depth += 1;
+                            }
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
                                 Some(&locals),
                             );
+                            if declares_methods {
+                                self.cfc_body_include_depth -= 1;
+                            }
                             self.try_stack = saved_try_stack;
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
@@ -15551,11 +15597,26 @@ impl CfmlVirtualMachine {
                                         .map(|k| k.as_str().to_string()).collect(),
                                 );
                             }
+                            // An include from a CFC pseudo-constructor (or from an
+                            // include already running in one) declares methods —
+                            // see `cfc_body_include_depth`. An include from a
+                            // METHOD body is left alone: its functions stay
+                            // ordinary template-defined UDFs.
+                            let declares_methods = func.name == "__cfc_body__"
+                                || (self.cfc_body_include_depth > 0
+                                    && func.is_template_frame
+                                    && func.name == "__main__");
+                            if declares_methods {
+                                self.cfc_body_include_depth += 1;
+                            }
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
                                 Some(&locals),
                             );
+                            if declares_methods {
+                                self.cfc_body_include_depth -= 1;
+                            }
                             self.try_stack = saved_try_stack;
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
@@ -40475,6 +40536,18 @@ impl CfmlVirtualMachine {
                 // the include-defined case (method truly absent from map AND table)
                 // should fall through to the user_functions attach.
                 if app_struct.contains_key_ci(name) {
+                    continue;
+                }
+                // An include-declared handler is a METHOD of the class (GH
+                // #463): `DefineFunction` hands out the class-invariant value
+                // and the include's template frame stores it on the body's
+                // shared `variables` handle — it is no longer a bare
+                // `user_functions` entry. Attach that value as-is.
+                if let Some(v @ CfmlValue::Function(_)) = body_vars.get_ci(name) {
+                    let declared = body_vars
+                        .with_map(|m| m.keys().find(|k| k.as_str().eq_ignore_ascii_case(name)).map(|k| k.as_str().to_string()))
+                        .unwrap_or_else(|| name.to_string());
+                    app_struct.insert(declared, v);
                     continue;
                 }
                 let bf = match self

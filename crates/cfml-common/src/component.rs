@@ -1104,6 +1104,36 @@ impl<'a> CompRef<'a> {
     // MUST enumerate — FW/1 AOP's `___doReverse` is the whole reason C.3 exists
     // (§5.2). Returns empty for a marker view; callers gate on `is_instance_backed`.
 
+    /// `structKeyExists(instance, key)`: whether `key` is a public member — a
+    /// non-null public DATA entry, or a public/remote class method while the
+    /// shared method table is still attached. Two case-insensitive probes;
+    /// never enumerates. `instance_public_keys` built every key as a `String`
+    /// and scanned the list, so one check on a 600-method CFC cost ~17 µs
+    /// against ~0.15 µs to read the same key (GH #464).
+    pub fn instance_has_public_key(&self, key: &str) -> bool {
+        #[cfg(feature = "component-instance")]
+        if let CompRef::Instance(inst) = self {
+            let g = inst.read();
+            // Lucee parity: a null-valued key "is the same as not existing".
+            if let Some(present) = g
+                .this_members
+                .with_map(|m| m.get(key).map(|v| !matches!(v, CfmlValue::Null)))
+            {
+                return present;
+            }
+            if g.this_members.method_table().is_none() {
+                return false;
+            }
+            return matches!(
+                g.class.method_access.get(&key.to_ascii_lowercase()),
+                Some(crate::dynamic::CfmlAccess::Public) | Some(crate::dynamic::CfmlAccess::Remote)
+            );
+        }
+        #[cfg(not(feature = "component-instance"))]
+        let _ = key;
+        false
+    }
+
     /// Public-scope keys for user-facing enumeration (`structKeyList`/`structCount`/
     /// `structKeyArray`/`structKeyExists`, `for … in`): public DATA keys first,
     /// then public/remote method names not shadowed by a data key.

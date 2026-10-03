@@ -981,6 +981,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     let cfconfig = Arc::new(cfconfig_owned);
     populate_datasource_registry(&cfconfig);
     populate_default_mail_server(&cfconfig);
+    cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
     cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
         csrf_enabled: cfconfig.security.csrf_enabled,
         secure_json: cfconfig.security.secure_json,
@@ -2447,6 +2448,7 @@ async fn async_run_server(
     // process; replaying with new values is idempotent for tests.
     populate_datasource_registry(&cfconfig);
     populate_default_mail_server(&cfconfig);
+    cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
     cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
         csrf_enabled: cfconfig.security.csrf_enabled,
         secure_json: cfconfig.security.secure_json,
@@ -5241,6 +5243,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             let cfconfig = Arc::new(load_embedded_cfconfig(vfs.as_ref(), base_dir));
             populate_datasource_registry(&cfconfig);
             populate_default_mail_server(&cfconfig);
+            cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
             cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
                 csrf_enabled: cfconfig.security.csrf_enabled,
                 secure_json: cfconfig.security.secure_json,
@@ -5266,6 +5269,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             let cfconfig = Arc::new(load_embedded_cfconfig(vfs.as_ref(), base_dir));
             populate_datasource_registry(&cfconfig);
             populate_default_mail_server(&cfconfig);
+            cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
             cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
                 csrf_enabled: cfconfig.security.csrf_enabled,
                 secure_json: cfconfig.security.secure_json,

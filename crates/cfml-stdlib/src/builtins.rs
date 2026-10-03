@@ -63,42 +63,68 @@ static SSN_REGEX: Lazy<Regex> = Lazy::new(|| {
 // `Pool::new`). Sharing one `Arc` keeps the warm pool alive across calls.
 static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, RegexEntry>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
-/// Monotonic "clock" for LRU stamps (a counter, not time: cheap and total).
-static REGEX_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// A cached compiled pattern with the tick it was last used. The stamp is an
-/// atomic so a cache HIT can refresh it under the shared read lock — no writer
-/// contention on the hot path.
+/// A cached compiled pattern with its use count since the last eviction.
+/// The counter is an atomic so a cache HIT can bump it under the shared read
+/// lock — no writer contention on the hot path.
 struct RegexEntry {
     re: std::sync::Arc<CfRegex>,
-    last_used: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU32,
 }
 
-/// Evict the least-recently-used quarter of a full cache. Clearing everything
-/// (the previous policy) also dropped the handful of patterns a real application
-/// reuses on every request, so a workload that mints unique patterns (a test
-/// suite interpolating values) made every hot pattern recompile once per cycle.
-/// Sizing by REUSE is the point: what stays is what was used.
-fn evict_lru_quarter(cache: &mut HashMap<String, RegexEntry>) {
-    let mut stamps: Vec<u64> = cache
-        .values()
-        .map(|e| e.last_used.load(std::sync::atomic::Ordering::Relaxed))
-        .collect();
-    stamps.sort_unstable();
-    let cutoff = stamps[stamps.len() / 4];
-    cache.retain(|_, e| e.last_used.load(std::sync::atomic::Ordering::Relaxed) > cutoff);
+/// Evict the least-USED quarter of a full cache, then halve every survivor's
+/// count so an old favourite cannot squat forever. Ties are broken by a hash
+/// of the pattern, never by recency.
+///
+/// Why not LRU: an ordered pass over MORE patterns than the cache holds (a
+/// router testing every route in declaration order) is LRU's worst case —
+/// each pattern is evicted just before its next use, so every call recompiles
+/// (~60 µs instead of ~0.6 µs; a 900-route app spent 40 ms/request here, GH
+/// #462). Equal counts broken by a hash keep a stable random-looking subset
+/// of a cycling working set hot instead of none of it; counts keep the handful
+/// of patterns a real application reuses on every request alive through a
+/// workload that mints unique patterns (a test suite interpolating values),
+/// which clearing everything — the policy before LRU — did not.
+fn evict_lfu_quarter(cache: &mut HashMap<String, RegexEntry>) {
+    use std::hash::{Hash, Hasher};
+    let victims: Vec<String> = {
+        let mut ranked: Vec<(u32, u64, &String)> = cache
+            .iter()
+            .map(|(k, e)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                k.hash(&mut h);
+                (e.hits.load(std::sync::atomic::Ordering::Relaxed), h.finish(), k)
+            })
+            .collect();
+        ranked.sort_unstable();
+        ranked[..ranked.len() / 4].iter().map(|t| t.2.clone()).collect()
+    };
+    for k in victims {
+        cache.remove(&k);
+    }
+    for e in cache.values() {
+        let n = e.hits.load(std::sync::atomic::Ordering::Relaxed);
+        e.hits.store(n / 2, std::sync::atomic::Ordering::Relaxed);
+    }
 }
-// Entry cap, not a byte cap — and the entries are BIG. A compiled `regex::Regex`
-// carries a one-pass DFA of up to 1 MB (not configurable through this crate's
-// builder) plus a lazy-DFA cache of 2 MB by default, so the old 4,096-entry cap
-// was a ~13 GB ceiling. A Wheels test-suite request mints ~1,100 distinct
-// patterns (interpolated values make each unique) and 1.3 GB of the request's
-// 2 GB live peak was these two regex caches. 256 entries keeps every pattern a
-// real application uses hot (a Preside render needs well under 100) while
-// bounding the worst case to a few hundred MB together with the size limits set
-// in `cached_regex`. Reclaiming the one-pass megabyte itself means building on
-// `regex_automata::meta::Regex` with `onepass_size_limit`; not done here.
-const REGEX_CACHE_CAP: usize = 256;
+// Entry cap, not a byte cap — and the entries can be BIG. A compiled
+// `regex::Regex` carries a one-pass DFA of up to 1 MB (not configurable through
+// this crate's builder) plus the lazy-DFA cache capped below, so the old
+// 4,096-entry cap was a ~13 GB ceiling. A Wheels test-suite request mints
+// ~1,100 distinct patterns (interpolated values make each unique) and 1.3 GB of
+// the request's 2 GB live peak was these two regex caches. 1,024 entries keeps
+// a large router's whole route table hot (GH #462: ~900 routes) while bounding
+// the worst case to a few hundred MB together with the size limits set in
+// `cached_regex`; `runtime.regexCacheSize` in `.cfconfig.json` overrides it
+// (`set_regex_cache_cap`). Reclaiming the one-pass megabyte itself means
+// building on `regex_automata::meta::Regex` with `onepass_size_limit`; not done
+// here.
+static REGEX_CACHE_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+
+/// Set the compiled-regex cache's entry cap (`runtime.regexCacheSize`). A cap
+/// below 16 is raised to 16 so the eviction quarter is never empty.
+pub fn set_regex_cache_cap(cap: usize) {
+    REGEX_CACHE_CAP.store(cap.max(16), std::sync::atomic::Ordering::Relaxed);
+}
 /// Lazy-DFA cache per compiled pattern (the `regex` crate default is 2 MB). The
 /// lazy DFA is the main speed engine and 256 KB is ample for the patterns CFML
 /// code writes; a pattern that would need more transparently falls back to the
@@ -201,8 +227,8 @@ impl CfRegex {
 /// Compile `pat`, returning a clone of the cached `Regex` on hit. On a compile
 /// error returns `Err` (callers fall back to their no-match behavior). The
 /// cache is bounded: if inserting would exceed `REGEX_CACHE_CAP` distinct
-/// patterns (e.g. an adversarial workload generating unique patterns) the cache
-/// is cleared first, trading a rare cold rebuild for a hard memory ceiling.
+/// patterns (e.g. an adversarial workload generating unique patterns) the
+/// least-used quarter is evicted first (`evict_lfu_quarter`).
 /// Translate CFML/Java regex syntax that the Rust `regex` crate rejects into an
 /// equivalent it accepts, before compilation. Currently handles one construct
 /// that appears in real framework code (Wheels `autoLink`'s `[^\s\b]+`): a `\b`
@@ -314,11 +340,8 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
 fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
     if let Some(e) = REGEX_CACHE.read().unwrap().get(pat) {
         // Refcount bump only — see REGEX_CACHE's note on why this must not be a
-        // deep clone. Refresh the LRU stamp under the read lock.
-        e.last_used.store(
-            REGEX_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // deep clone. Count the use under the read lock.
+        e.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(std::sync::Arc::clone(&e.re));
     }
     let translated = translate_cfml_regex(pat);
@@ -337,16 +360,15 @@ fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
     };
     let re = std::sync::Arc::new(re);
     let mut cache = REGEX_CACHE.write().unwrap();
-    if cache.len() >= REGEX_CACHE_CAP {
-        evict_lru_quarter(&mut cache);
+    if cache.len() >= REGEX_CACHE_CAP.load(std::sync::atomic::Ordering::Relaxed) {
+        evict_lfu_quarter(&mut cache);
     }
     // Return the entry actually stored, not our local one: a racing thread may
     // have inserted first, and both callers should end up sharing that single
     // warm pool rather than each holding a private cold one.
-    let now = REGEX_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stored = cache.entry(pat.to_string()).or_insert_with(|| RegexEntry {
         re: std::sync::Arc::clone(&re),
-        last_used: std::sync::atomic::AtomicU64::new(now),
+        hits: std::sync::atomic::AtomicU32::new(1),
     });
     Ok(std::sync::Arc::clone(&stored.re))
 }
@@ -3923,11 +3945,7 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
         // Phase C.3 — Slice 4: flyweight instance — check public members directly.
         if let Some(comp) = args[0].as_component() {
             if comp.is_instance_backed() {
-                let exists = comp
-                    .instance_public_keys()
-                    .iter()
-                    .any(|k| k.eq_ignore_ascii_case(&key));
-                return Ok(CfmlValue::Bool(exists));
+                return Ok(CfmlValue::Bool(comp.instance_has_public_key(&key)));
             }
         }
         match &args[0] {
@@ -3964,8 +3982,11 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
                 }
                 // A CFC instance exposes only public members; its engine
                 // internals (__name/__variables/...) and private methods are
-                // not keys (Lucee/ACF parity). Defer to visible_struct_keys so
-                // StructKeyExists never disagrees with StructKeyList/for-in.
+                // not keys (Lucee/ACF parity). The per-key test is the same
+                // predicate `visible_struct_keys` applies to a component, so
+                // StructKeyExists never disagrees with StructKeyList/for-in —
+                // applied to THIS key only, not by enumerating every key into
+                // a `Vec<String>` and scanning it (GH #464).
                 if found {
                     // Engine-internal marker keys are always stored lowercase,
                     // so probe them with the O(1) exact `contains_key` rather
@@ -3974,12 +3995,20 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
                     let is_component = s.contains_key(&*cfml_common::key::well_known::VARIABLES)
                         && (s.contains_key(&*cfml_common::key::well_known::NAME_MARKER)
                             || s.contains_key_ci("this"));
-                    if is_component
-                        && !visible_struct_keys(s)
-                            .iter()
-                            .any(|k| k.eq_ignore_ascii_case(&key))
-                    {
-                        return Ok(CfmlValue::Bool(false));
+                    if is_component {
+                        if cfml_common::component::is_reserved_component_key(&key)
+                            || key.eq_ignore_ascii_case("this")
+                        {
+                            return Ok(CfmlValue::Bool(false));
+                        }
+                        if let Some(CfmlValue::Function(f)) = s.get(&key) {
+                            let public = matches!(
+                                f.access,
+                                cfml_common::dynamic::CfmlAccess::Public
+                                    | cfml_common::dynamic::CfmlAccess::Remote
+                            );
+                            return Ok(CfmlValue::Bool(public));
+                        }
                     }
                 }
                 return Ok(CfmlValue::Bool(found));
