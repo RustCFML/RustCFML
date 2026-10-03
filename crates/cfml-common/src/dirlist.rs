@@ -24,10 +24,20 @@ pub fn sort_listing_query(q: &CfmlQuery, spec: &str) {
         return;
     }
     q.with_write(|d| {
+        // One sort key per (key column, row), built once. The comparator used
+        // to call `as_string()` on BOTH cells per comparison: sorting the 6,164
+        // rows of a recursive `directoryList(..., "DateLastModified")` over
+        // Preside's assets tree ran ~78k comparisons = ~156k String
+        // allocations, ~40 ms against Lucee's ~12 ms for the same listing
+        // (Sticker's addAssets does this once per bundle on every reload).
+        let key_cols: Vec<Vec<SortKey>> = keys
+            .iter()
+            .map(|&(ci, _)| d.data[ci].iter().map(SortKey::of).collect())
+            .collect();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| {
-            for &(ci, asc) in &keys {
-                let ord = compare_cells(&d.data[ci][a], &d.data[ci][b]);
+            for (k, &(_, asc)) in key_cols.iter().zip(keys.iter()) {
+                let ord = k[a].cmp(&k[b]);
                 let ord = if asc { ord } else { ord.reverse() };
                 if ord != Ordering::Equal {
                     return ord;
@@ -40,6 +50,31 @@ pub fn sort_listing_query(q: &CfmlQuery, spec: &str) {
             *col = std::sync::Arc::new(sorted);
         }
     });
+}
+
+/// A listing cell reduced to something `Ord` once per row (see
+/// [`sort_listing_query`]). Two integers compare numerically, everything else
+/// as its string form — the same rule the per-comparison version applied.
+enum SortKey {
+    Int(i64),
+    Str(String),
+}
+
+impl SortKey {
+    fn of(v: &CfmlValue) -> Self {
+        match v {
+            CfmlValue::Int(x) => SortKey::Int(*x),
+            other => SortKey::Str(other.as_string()),
+        }
+    }
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (SortKey::Int(x), SortKey::Int(y)) => x.cmp(y),
+            (SortKey::Int(x), SortKey::Str(y)) => x.to_string().as_str().cmp(y.as_str()),
+            (SortKey::Str(x), SortKey::Int(y)) => x.as_str().cmp(y.to_string().as_str()),
+            (SortKey::Str(x), SortKey::Str(y)) => x.cmp(y),
+        }
+    }
 }
 
 /// `(column index, ascending)` per key, or `None` when the spec is empty or
@@ -68,13 +103,6 @@ fn parse_sort_spec(q: &CfmlQuery, spec: &str) -> Option<Vec<(usize, bool)>> {
         None
     } else {
         Some(keys)
-    }
-}
-
-fn compare_cells(a: &CfmlValue, b: &CfmlValue) -> Ordering {
-    match (a, b) {
-        (CfmlValue::Int(x), CfmlValue::Int(y)) => x.cmp(y),
-        _ => a.as_string().cmp(&b.as_string()),
     }
 }
 
