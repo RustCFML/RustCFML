@@ -813,17 +813,6 @@ pub(crate) fn op_get_keys(
                 // public-method enumeration to mix in a base
                 // class's methods — `toVirtualInheritance`.)
                 let is_cfc = is_component_struct(&s);
-                // Accessor-private property names (set via implicit
-                // ctor / generated setX) — hidden from for-in to
-                // match Lucee's private `variables` storage.
-                let accessor_private = if is_cfc {
-                    match s.get(cfml_common::dynamic::ACCESSOR_PRIVATE_MARKER) {
-                        Some(CfmlValue::Struct(m)) => Some(m.clone()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
                 // A Java-collection shim (LinkedHashMap etc.) is a
                 // transparent map — hide its `__java_*` markers.
                 let is_java_shim = s.contains_key("__java_shim");
@@ -876,14 +865,8 @@ pub(crate) fn op_get_keys(
                                 cfml_common::dynamic::CfmlAccess::Public
                                     | cfml_common::dynamic::CfmlAccess::Remote
                             ),
-                            // Non-function data member: visible
-                            // UNLESS it is an accessor-private
-                            // property (Lucee stores it in the
-                            // private `variables` scope). A genuine
-                            // public `this.x = …` is never marked.
-                            _ => !accessor_private
-                                .as_ref()
-                                .is_some_and(|m| m.contains_key_ci(k)),
+                            // Non-function data member: visible.
+                            _ => true,
                         }
                     })
                     // Lucee ENUMERATES a null-valued key in struct

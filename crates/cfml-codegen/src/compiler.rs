@@ -1215,14 +1215,6 @@ pub enum BytecodeOp {
     /// of `local.` sites in `.cfm` templates. It cost 75 spec errors there.
     StoreLocalScopeKey(Name),
     SetProperty(Name), // Set object.property = value
-    /// Mark a property name as accessor-private on the current frame's `this`
-    /// component: its value was written by a generated `setX()` accessor, so
-    /// Lucee keeps it in the private `variables` scope and it must be hidden from
-    /// `structKeyList`/`structCount`/`structKeyExists`/for-in (but stays readable
-    /// via `getX()`/`serializeJSON`). Records into the `ACCESSOR_PRIVATE_MARKER`
-    /// set on `this`. No stack effect. The implicit accessor constructor does the
-    /// equivalent from Rust (`mark_accessor_private`).
-    MarkAccessorPrivate(Name),
     /// Dynamic/quoted-string LHS assignment: `"#scope#.#prop#" = v` or
     /// `"variables.x" = v`. Stack: [pathString, value]. The path is resolved at
     /// runtime and the value stored scope-aware into the current frame (so
@@ -1561,83 +1553,82 @@ impl BytecodeOp {
             Self::TryLoadLocalProperty(..) => 58,
             Self::TryLoadLocalKey(..) => 59,
             Self::SetProperty(..) => 60,
-            Self::MarkAccessorPrivate(..) => 61,
-            Self::SetDynamicVar => 62,
-            Self::UnsetPath(..) => 63,
-            Self::DeleteScopeKey(..) => 64,
-            Self::NewObject(..) => 65,
-            Self::NewObjectNamed(..) => 66,
-            Self::DefineFunction(..) => 67,
-            Self::Increment(..) => 68,
-            Self::Decrement(..) => 69,
-            Self::AddLocalConst(..) => 70,
-            Self::MulLocalConst(..) => 71,
-            Self::TryStart(..) => 72,
-            Self::TryEnd => 73,
-            Self::Throw => 74,
-            Self::Rethrow => 75,
-            Self::SaveException => 76,
-            Self::RestoreException => 77,
-            Self::SetLastExceptionFromLocal(..) => 78,
-            Self::CatchMatch(..) => 79,
-            Self::CallMethod(..) => 80,
-            Self::CallMethodNamed(..) => 81,
-            Self::CallComputedMethod(..) => 82,
-            Self::CallComputedMethodNamed(..) => 83,
-            Self::Include(..) => 84,
-            Self::IncludeDynamic => 85,
-            Self::IsNull => 86,
-            Self::JumpIfNotNull(..) => 87,
-            Self::JumpIfArgPresent(..) => 88,
-            Self::ValidateParamType(..) => 89,
-            Self::Halt => 90,
-            Self::IsDefined(..) => 91,
-            Self::ConcatArrays => 92,
-            Self::MergeStructs => 93,
-            Self::CallSpread => 94,
-            Self::LineInfo(..) => 95,
-            Self::TagLoopBack(..) => 96,
-            Self::AbandonTagPairs(..) => 97,
-            Self::TryLoadLocal(..) => 98,
-            Self::DeclareLocal(..) => 99,
-            Self::DeclareSlot(..) => 100,
-            Self::LoadSlot(..) => 101,
-            Self::TryLoadSlot(..) => 102,
-            Self::StoreSlot(..) => 103,
-            Self::IncrementSlot(..) => 104,
-            Self::DecrementSlot(..) => 105,
-            Self::AddSlotConst(..) => 106,
-            Self::MulSlotConst(..) => 107,
-            Self::JumpIfSlotCmpConstFalse(..) => 108,
-            Self::ForSlotStep(..) => 109,
-            Self::LoadSlotKey(..) => 110,
-            Self::TryLoadSlotKey(..) => 111,
-            Self::LoadSlotProperty(..) => 112,
-            Self::TryLoadSlotProperty(..) => 113,
-            Self::StoreSlotProperty(..) => 114,
-            Self::ArrayAppendSlot(..) => 115,
-            Self::CallNamed(..) => 116,
-            Self::CallRustSuperCtor(..) => 117,
-            Self::CallBuiltin(..) => 118,
-            Self::SeedArgumentKey(..) => 119,
-            Self::StoreLocalScopeKey(..) => 120,
-            Self::DefineComponentMethods(..) => 121,
-            Self::StoreVariablesKey(..) => 122,
-            Self::BuildStructStatic(..) => 123,
-            Self::LoadArgKey(..) => 124,
-            Self::TryLoadArgKey(..) => 125,
-            Self::SetScopePath(..) => 126,
-            Self::TryGetIndex => 127,
-            Self::IterLen => 128,
-            Self::ArgConcatWriteThrough(..) => 129,
-            Self::ForInPrepare => 130,
-            Self::ForInElement => 131,
-            Self::ForInExit => 132,
+            Self::SetDynamicVar => 61,
+            Self::UnsetPath(..) => 62,
+            Self::DeleteScopeKey(..) => 63,
+            Self::NewObject(..) => 64,
+            Self::NewObjectNamed(..) => 65,
+            Self::DefineFunction(..) => 66,
+            Self::Increment(..) => 67,
+            Self::Decrement(..) => 68,
+            Self::AddLocalConst(..) => 69,
+            Self::MulLocalConst(..) => 70,
+            Self::TryStart(..) => 71,
+            Self::TryEnd => 72,
+            Self::Throw => 73,
+            Self::Rethrow => 74,
+            Self::SaveException => 75,
+            Self::RestoreException => 76,
+            Self::SetLastExceptionFromLocal(..) => 77,
+            Self::CatchMatch(..) => 78,
+            Self::CallMethod(..) => 79,
+            Self::CallMethodNamed(..) => 80,
+            Self::CallComputedMethod(..) => 81,
+            Self::CallComputedMethodNamed(..) => 82,
+            Self::Include(..) => 83,
+            Self::IncludeDynamic => 84,
+            Self::IsNull => 85,
+            Self::JumpIfNotNull(..) => 86,
+            Self::JumpIfArgPresent(..) => 87,
+            Self::ValidateParamType(..) => 88,
+            Self::Halt => 89,
+            Self::IsDefined(..) => 90,
+            Self::ConcatArrays => 91,
+            Self::MergeStructs => 92,
+            Self::CallSpread => 93,
+            Self::LineInfo(..) => 94,
+            Self::TagLoopBack(..) => 95,
+            Self::AbandonTagPairs(..) => 96,
+            Self::TryLoadLocal(..) => 97,
+            Self::DeclareLocal(..) => 98,
+            Self::DeclareSlot(..) => 99,
+            Self::LoadSlot(..) => 100,
+            Self::TryLoadSlot(..) => 101,
+            Self::StoreSlot(..) => 102,
+            Self::IncrementSlot(..) => 103,
+            Self::DecrementSlot(..) => 104,
+            Self::AddSlotConst(..) => 105,
+            Self::MulSlotConst(..) => 106,
+            Self::JumpIfSlotCmpConstFalse(..) => 107,
+            Self::ForSlotStep(..) => 108,
+            Self::LoadSlotKey(..) => 109,
+            Self::TryLoadSlotKey(..) => 110,
+            Self::LoadSlotProperty(..) => 111,
+            Self::TryLoadSlotProperty(..) => 112,
+            Self::StoreSlotProperty(..) => 113,
+            Self::ArrayAppendSlot(..) => 114,
+            Self::CallNamed(..) => 115,
+            Self::CallRustSuperCtor(..) => 116,
+            Self::CallBuiltin(..) => 117,
+            Self::SeedArgumentKey(..) => 118,
+            Self::StoreLocalScopeKey(..) => 119,
+            Self::DefineComponentMethods(..) => 120,
+            Self::StoreVariablesKey(..) => 121,
+            Self::BuildStructStatic(..) => 122,
+            Self::LoadArgKey(..) => 123,
+            Self::TryLoadArgKey(..) => 124,
+            Self::SetScopePath(..) => 125,
+            Self::TryGetIndex => 126,
+            Self::IterLen => 127,
+            Self::ArgConcatWriteThrough(..) => 128,
+            Self::ForInPrepare => 129,
+            Self::ForInElement => 130,
+            Self::ForInExit => 131,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 133] = [
+    pub const CENSUS_NAMES: [&'static str; 132] = [
         "Null",
         "True",
         "False",
@@ -1699,7 +1690,6 @@ impl BytecodeOp {
         "TryLoadLocalProperty",
         "TryLoadLocalKey",
         "SetProperty",
-        "MarkAccessorPrivate",
         "SetDynamicVar",
         "UnsetPath",
         "DeleteScopeKey",
@@ -5199,54 +5189,26 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
 
                 // Generate setter: setPropertyName(value)
-                // Set the property directly on this struct and __variables
+                //
+                // It writes ONLY the `variables` backing the generated getter reads:
+                // Lucee keeps an accessor property private, so `o.color` throws even
+                // after `o.setColor("red")` (GH #452). The setter used to copy the
+                // value onto `this` as well and mark the copy private, which hid it
+                // from introspection but left the external read answering it.
+                // This is also what keeps a same-named method `x()` callable when a
+                // CFC declares `property name="x"` too.
                 let setter_name = format!("set{}", capitalize_first(&prop.name));
-                // Collision: a CFC may declare both `property name="x"` and a method
-                // `x()`. The method occupies the top-level `this.x` key; writing the
-                // property value to `this.x` would clobber it, making x() uncallable.
-                // Lucee/ACF keep the method callable (getX/setX operate on the
-                // `variables` backing). So when a same-named method exists, the setter
-                // writes ONLY the `__variables` backing and leaves `this.x` (the method)
-                // untouched. The getter already reads from `variables` (see above).
-                let collides_with_method = component
-                    .functions
-                    .iter()
-                    .any(|f| f.name.eq_ignore_ascii_case(&prop.name));
-                let setter_instructions = if collides_with_method {
-                    vec![
-                        // Set on __variables only: this.__variables.name = value
-                        BytecodeOp::LoadLocal(Name::intern("this")),
-                        BytecodeOp::TryGetProperty(Name::intern("__variables")),
-                        BytecodeOp::LoadLocal(Name::from(&prop.name)),
-                        BytecodeOp::SetProperty(Name::from(&prop.name)),
-                        BytecodeOp::StoreLocal(Name::intern("__variables")),
-                        // Return this (unmodified — method preserved on this.name)
-                        BytecodeOp::LoadLocal(Name::intern("this")),
-                        BytecodeOp::Return,
-                    ]
-                } else {
-                    vec![
-                        // Set on this: this.name = value; store modified this back
-                        BytecodeOp::LoadLocal(Name::intern("this")),
-                        BytecodeOp::LoadLocal(Name::from(&prop.name)),
-                        BytecodeOp::SetProperty(Name::from(&prop.name)),
-                        BytecodeOp::StoreLocal(Name::intern("this")),
-                        // Set on __variables: this.__variables.name = value
-                        BytecodeOp::LoadLocal(Name::intern("this")),
-                        BytecodeOp::TryGetProperty(Name::intern("__variables")),
-                        BytecodeOp::LoadLocal(Name::from(&prop.name)),
-                        BytecodeOp::SetProperty(Name::from(&prop.name)),
-                        BytecodeOp::StoreLocal(Name::intern("__variables")),
-                        // The value now sits on the top-level `this` scope (public),
-                        // but Lucee keeps an accessor property PRIVATE (variables
-                        // only). Mark it so introspection/for-in hide it while
-                        // getX()/serializeJSON still surface it.
-                        BytecodeOp::MarkAccessorPrivate(Name::from(&prop.name)),
-                        // Return this
-                        BytecodeOp::LoadLocal(Name::intern("this")),
-                        BytecodeOp::Return,
-                    ]
-                };
+                let setter_instructions = vec![
+                    // this.__variables.name = value
+                    BytecodeOp::LoadLocal(Name::intern("this")),
+                    BytecodeOp::TryGetProperty(Name::intern("__variables")),
+                    BytecodeOp::LoadLocal(Name::from(&prop.name)),
+                    BytecodeOp::SetProperty(Name::from(&prop.name)),
+                    BytecodeOp::StoreLocal(Name::intern("__variables")),
+                    // Return this
+                    BytecodeOp::LoadLocal(Name::intern("this")),
+                    BytecodeOp::Return,
+                ];
                 let setter_func = BytecodeFunction {
                     name: setter_name.clone(),
                     params: vec![prop.name.clone()],

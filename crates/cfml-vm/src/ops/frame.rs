@@ -137,32 +137,6 @@ pub(crate) fn op_set_dynamic_var(
     Ok(())
 }
 
-/// `MarkAccessorPrivate`
-#[inline]
-pub(crate) fn op_mark_accessor_private(
-    locals: &ValueMap,
-    name: &Name,
-) {
-    // Emitted at the tail of a generated `setX()` accessor. Record
-    // the property on the frame's `this` so introspection/for-in
-    // hide it (Lucee keeps accessor values private in `variables`);
-    // getX()/serializeJSON still read the top-level value. Persists
-    // to the receiver the same way the setter's value write does.
-    if let Some(CfmlValue::Struct(this_s)) = locals.get(&*cfml_common::key::well_known::THIS) {
-        CfmlVirtualMachine::mark_accessor_private(this_s, name);
-    }
-    // Flyweight instance: record on the instance's accessor-private set
-    // (the marker's `__cfml_accessor_private__` analogue) so a runtime
-    // `setX()` after construction hides the property from introspection.
-    #[cfg(feature = "component-instance")]
-    if let Some(CfmlValue::Instance(inst)) = locals.get(&*cfml_common::key::well_known::THIS) {
-        inst.read()
-            .accessor_private
-            .write()
-            .insert(name.to_ascii_lowercase());
-    }
-}
-
 
 /// Lucee's numeric cast for a bracket subscript that addresses a 1-based
 /// position (an array element, a query row, a binary byte).

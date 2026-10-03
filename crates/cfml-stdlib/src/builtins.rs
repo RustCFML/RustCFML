@@ -3870,14 +3870,6 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
         || (keys.iter().any(|k| k.eq_ignore_ascii_case("__variables"))
             && keys.iter().any(|k| k.eq_ignore_ascii_case("this")));
     if is_component {
-        // Accessor-private property names (values written by the implicit accessor
-        // ctor or a generated setX) — Lucee keeps these in the private `variables`
-        // scope, so structKeyList/Count/Exists/for-in must not surface them (only
-        // getX()/serializeJSON do). See ACCESSOR_PRIVATE_MARKER.
-        let accessor_private = match s.get(cfml_common::dynamic::ACCESSOR_PRIVATE_MARKER) {
-            Some(CfmlValue::Struct(m)) => Some(m),
-            _ => None,
-        };
         return keys
             .into_iter()
             .filter(|k| {
@@ -3897,7 +3889,7 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
                         cfml_common::dynamic::CfmlAccess::Public
                             | cfml_common::dynamic::CfmlAccess::Remote
                     ),
-                    _ => !accessor_private.as_ref().is_some_and(|m| m.contains_key_ci(k)),
+                    _ => true,
                 }
             })
             .collect();
@@ -4068,7 +4060,7 @@ fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 /// Component flyweight: if `v` is an instance-backed component, project its PUBLIC
-/// scope (data + public methods, accessor-private hidden) into a plain struct so the
+/// scope (data + public methods) into a plain struct so the
 /// struct-family BIFs (read/search/copy) can reuse their existing `CfmlValue::Struct`
 /// logic on it. Returns None for a marker component, a plain struct, or any
 /// non-component — those already flow through the existing `Struct` arms. NOTE: the
@@ -8556,6 +8548,17 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                     }
                     meta.insert("fullExtends".to_string(), CfmlValue::Array(chain.clone()));
                 }
+                // A component with no parent extends Lucee's implicit base
+                // component (GH #452). Interfaces do not.
+                if !meta.contains_key("extends")
+                    && s.get("__name").is_some()
+                    && !matches!(s.get("__is_interface"), Some(CfmlValue::Bool(true)))
+                {
+                    meta.insert(
+                        "extends".to_string(),
+                        CfmlValue::strukt(cfml_common::component::base_component_metadata()),
+                    );
+                }
 
                 // `implements`: a struct keyed by each implemented interface's
                 // declared FQN -> a minimal interface metadata stub. Lucee/ACF
@@ -8714,6 +8717,12 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
                 l == type_lower
                     || l.rsplit('.').next().map(|seg| seg == type_lower).unwrap_or(false)
             });
+            // Lucee also accepts the name the instance was created under: a
+            // relative `createObject("component", "acc.AccX")` is named
+            // `tests.x.acc.AccX`, yet `isInstanceOf(o, "acc.AccX")` is true
+            // (GH #452).
+            let matched = matched
+                || comp.call_name().is_some_and(|c| c.eq_ignore_ascii_case(type_name.trim()));
             return Ok(CfmlValue::Bool(matched));
         }
     }

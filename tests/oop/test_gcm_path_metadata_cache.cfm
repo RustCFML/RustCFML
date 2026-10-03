@@ -29,13 +29,9 @@ assert( "L2 name via extends", first.extends.name, "oop.GcmCacheL2" );
 assert( "L2 own functions", fnNames( first.extends.functions ), "l2One,l2Two" );
 assert( "L3 name via extends.extends", first.extends.extends.name, "oop.GcmCacheL3" );
 assert( "L3 own functions", fnNames( first.extends.extends.functions ), "l3One,l3Two" );
-// Lucee 7.0/7.1 give the top of every chain an `extends` for its base component
-// (org.lucee.cfml.Component); RustCFML stops at the last user component.
-if ( isRustCFML() ) {
-	assertFalse( "L3 is the top of the chain", structKeyExists( first.extends.extends, "extends" ) );
-} else {
-	assert( "L3 extends the Lucee base component", first.extends.extends.extends.name, "org.lucee.cfml.Component" );
-}
+// The top of every chain is the implicit base component (GH #452).
+assert( "L3 extends the Lucee base component", first.extends.extends.extends.name, "org.lucee.cfml.Component" );
+assertFalse( "the base is the top of the chain", structKeyExists( first.extends.extends.extends, "extends" ) );
 
 // --- repeated calls are identical ---
 second = getComponentMetaData( "oop.GcmCacheL1" );

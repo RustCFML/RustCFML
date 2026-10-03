@@ -453,6 +453,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_implements_unqualified_sibling.cfm">
 <cf_runtest file="oop/test_inherited_relative_implements.cfm">
 <cf_runtest file="oop/test_unqualified_new_package_relative.cfm">
+<cf_runtest file="oop/test_component_identity.cfm">
 <cf_runtest file="oop/test_unqualified_new_inherited_package.cfm">
 <cf_runtest file="oop/test_inherited_new_mapping_qualified_fqn.cfm">
 <cf_runtest file="oop/test_component_ctor_method_hoist.cfm">

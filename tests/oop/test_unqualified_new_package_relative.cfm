@@ -25,11 +25,11 @@ assert("isInstanceOf still matches bare name",
 // getMetadata().name and isInstanceOf(FQN) diverged from Lucee (this broke
 // Preside's AdapterFactory, loaded as preside.system...AdapterFactory, doing
 // `new MySqlAdapter()`). Verified vs Lucee 7.0.4.
-// RustCFML-only: /dotdotprobe and /oop both map to the oop/ directory here.
-// Lucee 7.0/7.1 name a component from the FIRST mapping covering its physical
-// path (/oop, declared first), giving "oop.pkg229.Widget229"; RustCFML uses the
-// mapping the caller was loaded under. With one mapping per directory (Preside's
-// /preside) the two agree.
+// RustCFML-only, but NOT because the engines disagree. On a clean load Lucee
+// 7.1 also names it from the mapping the caller was loaded under (re-probed for
+// GH #452 on a freshly started Lucee). Here, though, Maker and Widget229 were
+// already loaded through /oop above, and in the same run Lucee reuses what it
+// cached from that load and reports the earlier "oop.pkg229..." name.
 if ( isRustCFML() ) {
 	makerMapped = new dotdotprobe.pkg229.Maker();
 	wMapped = makerMapped.make();

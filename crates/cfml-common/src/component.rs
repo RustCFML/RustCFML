@@ -215,13 +215,6 @@ pub struct Instance {
     pub(crate) variables_members: CfmlStruct,
     /// Logical identity for `duplicate()` disambiguation / fluent-chain guards.
     pub instance_id: u64,
-    /// Accessor-`property` names whose VALUES live in `this_members` but must stay
-    /// HIDDEN from user introspection (`structKeyExists`/`structKeyList`/`for … in`)
-    /// — Lucee keeps accessor values in the private `variables` scope; getX() and
-    /// `serializeJSON` still read them. Lowercased. Interior-mutable because a
-    /// runtime `setX()` marks the property after construction (see the
-    /// `MarkAccessorPrivate` opcode). Mirrors the marker `__cfml_accessor_private__`.
-    pub accessor_private: parking_lot::RwLock<std::collections::HashSet<String>>,
     /// Per-instance native (Rust-class) parent for a CFC `extends="rust:Name"` —
     /// the live `NativeObject` holding THIS instance's parent state (marker
     /// `__super`). Per-instance (NOT on the shared blueprint) so each instance has
@@ -230,6 +223,11 @@ pub struct Instance {
     /// class. Interior mutability via the outer `RwLock<Instance>` lets an
     /// in-`init()` `super(args)` (`CallRustSuperCtor`) replace it.
     pub native_parent: Option<CfmlValue>,
+    /// The component name AS WRITTEN where this instance was created (`new X()`
+    /// / `createObject("component", "X")`), when it differs from the class's
+    /// full name. Lucee reports it in "Component [X] has no accessible Member"
+    /// and `isInstanceOf(obj, "X")` accepts it (GH #452). `None` ⇒ the class name.
+    pub call_name: Option<std::sync::Arc<str>>,
 }
 
 // `CfmlStruct` has no `Debug` impl (the outer `CfmlValue` Debug is hand-rolled),
@@ -506,10 +504,9 @@ impl Instance {
         instance_id: u64,
     ) -> Instance {
         // ONE pass over the marker under one read lock: the data partition,
-        // the `__variables` handle, the accessor-private set and a native
+        // the `__variables` handle and a native
         // parent are all read from the same map, and separate probes for each
         // took four extra locks per construction (GH #425).
-        let mut accessor_private = std::collections::HashSet::new();
         let mut native_parent: Option<CfmlValue> = None;
         let mut vars_struct: Option<CfmlStruct> = None;
         let this_data = marker.with_read(|m| {
@@ -525,14 +522,6 @@ impl Instance {
                     if ks == "__variables" {
                         if let CfmlValue::Struct(vs) = v {
                             vars_struct = Some(vs.clone());
-                        }
-                    } else if ks == crate::dynamic::ACCESSOR_PRIVATE_MARKER {
-                        if let CfmlValue::Struct(am) = v {
-                            am.with_read(|mm| {
-                                for (ak, _) in mm.iter() {
-                                    accessor_private.insert(ak.to_ascii_lowercase());
-                                }
-                            });
                         }
                     } else if ks == "__super" {
                         // A `rust:` extends yields a NativeObject under `__super`
@@ -587,9 +576,14 @@ impl Instance {
             this_members,
             variables_members,
             instance_id,
-            accessor_private: parking_lot::RwLock::new(accessor_private),
             native_parent,
+            call_name: None,
         }
+    }
+
+    /// The name this instance was created under (see [`Instance::call_name`]).
+    pub fn call_name(&self) -> &str {
+        self.call_name.as_deref().unwrap_or(&self.class.name)
     }
 
     // ================= 3B stage 0 — member-access encapsulation =================
@@ -987,7 +981,6 @@ pub fn is_reserved_component_key(k: &str) -> bool {
         "__static",
         "__cfc_body__",
         "__cfc_static_init__",
-        "__cfml_accessor_private__",
         "__java_shim",
         "__java_class",
         "__dynamic_proxy",
@@ -1057,6 +1050,16 @@ impl<'a> CompRef<'a> {
         }
     }
 
+    /// The name an instance was created under, when it differs from its class
+    /// name (see [`Instance::call_name`]). `None` for a marker.
+    pub fn call_name(&self) -> Option<String> {
+        match self {
+            CompRef::Marker(_) => None,
+            #[cfg(feature = "component-instance")]
+            CompRef::Instance(inst) => inst.read().call_name.as_deref().map(str::to_string),
+        }
+    }
+
     /// True iff this view is backed by the flyweight [`Instance`] (vs the legacy
     /// marker struct). Always callable: in a default build the `Instance` arm does
     /// not exist so this is a const `false`, which lets an introspection caller
@@ -1108,14 +1111,9 @@ impl<'a> CompRef<'a> {
         #[cfg(feature = "component-instance")]
         if let CompRef::Instance(inst) = self {
             let g = inst.read();
-            let ap = g.accessor_private.read();
-            // Own public entries: read under the struct lock, no map copy; the
-            // accessor-private lowercase probe only when there is such a set.
+            // Own public entries: read under the struct lock, no map copy.
             let mut keys: Vec<String> = g.this_members.with_map(|m| {
-                m.keys()
-                    .filter(|k| ap.is_empty() || !ap.contains(&k.to_ascii_lowercase()))
-                    .map(|k| k.as_str().to_string())
-                    .collect()
+                m.keys().map(|k| k.as_str().to_string()).collect()
             });
             // Methods enumerate only while the shared table is still attached —
             // `structClear(instance)` drops it (MockBox `clearMethods`), after which
@@ -1136,10 +1134,8 @@ impl<'a> CompRef<'a> {
                 // on an 86-method class; `structAppend` had the same, GH #402).
                 // Probe the OWN map only — `CfmlStruct::contains_key` falls
                 // through to the class method table, which would report every
-                // class method as "shadowed". An own entry hidden as
-                // accessor-private does not shadow the method either.
-                let shadowed = g.this_members.with_map(|m| m.contains_key(name.as_str()))
-                    && (ap.is_empty() || !ap.contains(&name.to_ascii_lowercase()));
+                // class method as "shadowed".
+                let shadowed = g.this_members.with_map(|m| m.contains_key(name.as_str()));
                 if is_public && !shadowed {
                     keys.push(name.clone());
                 }
@@ -1159,11 +1155,7 @@ impl<'a> CompRef<'a> {
         #[cfg(feature = "component-instance")]
         if let CompRef::Instance(inst) = self {
             let g = inst.read();
-            let ap = g.accessor_private.read();
             for (k, v) in g.this_members.snapshot() {
-                if !ap.is_empty() && ap.contains(&k.to_ascii_lowercase()) {
-                    continue; // accessor-private: hidden from for-in / member iteration
-                }
                 out.insert(k, v);
             }
             if g.this_members.method_table().is_none() {
@@ -1331,6 +1323,33 @@ pub fn type_identifiers(s: &CfmlStruct) -> Vec<String> {
         }
     }
     ids
+}
+
+/// Lucee's name for the implicit base of every component.
+pub const BASE_COMPONENT_NAME: &str = "org.lucee.cfml.Component";
+
+/// The metadata Lucee reports for the implicit base component at the top of
+/// every `extends` chain (GH #452). It has no `extends` of its own, so a
+/// `while (structKeyExists(md, "extends"))` walk still terminates, and its
+/// `functions`/`properties` are empty arrays so inherited-member collectors
+/// add nothing. Lucee also reports `path`/`hashCode`/`remoteAddress`, which
+/// point into its own archive; they are left out because no file backs them
+/// here.
+pub fn base_component_metadata() -> crate::dynamic::ValueMap {
+    let mut m = crate::dynamic::ValueMap::default();
+    let s = |v: &str| CfmlValue::string(v.to_string());
+    m.insert("name".to_string(), s(BASE_COMPONENT_NAME));
+    m.insert("fullname".to_string(), s(BASE_COMPONENT_NAME));
+    m.insert("type".to_string(), s("component"));
+    m.insert("displayname".to_string(), s("Component"));
+    m.insert("hint".to_string(), s("This is the Base Component"));
+    m.insert("subname".to_string(), s(""));
+    for k in ["accessors", "persistent", "synchronized", "sub", "inline"] {
+        m.insert(k.to_string(), CfmlValue::Bool(false));
+    }
+    m.insert("functions".to_string(), CfmlValue::array(Vec::new()));
+    m.insert("properties".to_string(), CfmlValue::array(Vec::new()));
+    m
 }
 
 impl CfmlValue {

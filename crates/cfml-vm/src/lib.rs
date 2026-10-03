@@ -8040,6 +8040,15 @@ impl CfmlVirtualMachine {
         if let Some(CfmlValue::Query(_)) = obj {
             return format!("Column [{}] not found in query", shown);
         }
+        // Lucee names the component by the name it was created under (GH #452).
+        #[cfg(feature = "component-instance")]
+        if let Some(CfmlValue::Instance(inst)) = obj {
+            return format!(
+                "Component [{}] has no accessible Member with name [{}]",
+                inst.read().call_name(),
+                shown
+            );
+        }
         if let Some(CfmlValue::Struct(s)) = obj {
             if s.get("__arguments_scope").is_some() {
                 let keys = s.with_map(|m| {
@@ -13162,7 +13171,6 @@ impl CfmlVirtualMachine {
                 BytecodeOp::GetProperty(name) | BytecodeOp::TryGetProperty(name) => { ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, matches!(op, BytecodeOp::GetProperty(_)))?; }
                 BytecodeOp::LoadStaticHolder(name) => { ops::frame::op_load_static_holder(self, &mut stack, &locals, name); }
                 BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
-                BytecodeOp::MarkAccessorPrivate(name) => { ops::frame::op_mark_accessor_private(&locals, name); }
                 BytecodeOp::SetProperty(name) => {
                     // Routed through the try handler rather than `?`-propagated:
                     // a member-store failure must be catchable, which is what
@@ -13191,6 +13199,13 @@ impl CfmlVirtualMachine {
                         .collect();
 
                     if let Some(class_ref) = stack.pop() {
+                        // The name as written, for the instance's call name (a
+                        // refcount bump of the operand, not a copy).
+                        #[allow(unused_variables)]
+                        let call_name: Option<Arc<String>> = match &class_ref {
+                            CfmlValue::String(s) => Some(s.clone()),
+                            _ => None,
+                        };
                         // Resolve the component template
                         let template = if let CfmlValue::Struct(s) = &class_ref {
                             CfmlValue::Struct(s.clone())
@@ -13272,7 +13287,7 @@ impl CfmlVirtualMachine {
                                 .is_some_and(|f| matches!(f, CfmlValue::Function(_))));
                         #[cfg(feature = "component-instance")]
                         let instance = if has_user_init {
-                            self.to_instance_value(instance)
+                            self.to_instance_value(instance, call_name.as_deref().map(String::as_str))
                         } else {
                             instance
                         };
@@ -13480,7 +13495,10 @@ impl CfmlVirtualMachine {
                         // no-op when `final_instance` is ALREADY an Instance (the
                         // has_user_init pre-init conversion above).
                         #[cfg(feature = "component-instance")]
-                        let final_instance = self.to_instance_value(final_instance);
+                        let final_instance = self.to_instance_value(
+                            final_instance,
+                            call_name.as_deref().map(String::as_str),
+                        );
                         stack.push(final_instance);
                     } else {
                         stack.push(CfmlValue::Null);
@@ -19180,6 +19198,17 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
                 "getcomponentmetadata" => {
+                    // The implicit base component at the top of every chain
+                    // resolves by name, so a walker that re-reads
+                    // `getComponentMetadata(md.extends.name)` terminates there
+                    // as it does on Lucee (GH #452).
+                    if let Some(CfmlValue::String(n)) = args.first() {
+                        if n.eq_ignore_ascii_case(cfml_common::component::BASE_COMPONENT_NAME) {
+                            return Ok(CfmlValue::strukt(
+                                cfml_common::component::base_component_metadata(),
+                            ));
+                        }
+                    }
                     // Phase C.3 — Slice 5: flyweight instance — reuse the shared
                     // inheritance-aware builder (same output as getMetadata / the
                     // marker path), cached on the blueprint.
@@ -19248,6 +19277,16 @@ impl CfmlVirtualMachine {
                                     meta.insert("extends".to_string(), first.clone());
                                 }
                             }
+                        }
+                        // A component with no parent extends Lucee's implicit
+                        // base component (GH #452). Interfaces do not.
+                        if !meta.contains_key("extends")
+                            && !matches!(s.get("__is_interface"), Some(CfmlValue::Bool(true)))
+                        {
+                            meta.insert(
+                                "extends".to_string(),
+                                CfmlValue::strukt(cfml_common::component::base_component_metadata()),
+                            );
                         }
                         // `implements`: a struct keyed by each implemented
                         // interface's declared FQN -> a minimal interface
@@ -19588,7 +19627,7 @@ impl CfmlVirtualMachine {
                                 // marker into the flyweight Instance, mirroring new X().
                                 // Feature-gated OFF by default.
                                 #[cfg(feature = "component-instance")]
-                                let instance = self.to_instance_value(instance);
+                                let instance = self.to_instance_value(instance, Some(&comp_name));
                                 _co.lap(15);
                                 return Ok(instance);
                             }
@@ -25642,24 +25681,6 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Record `prop` on `s` as accessor-private: its value was written by the
-    /// implicit accessor constructor or a generated `setX()`, so Lucee would keep
-    /// it in the private `variables` scope. See `ACCESSOR_PRIVATE_MARKER`. The
-    /// marker is a nested `Struct` used as a case-insensitive set (key = lowercased
-    /// property name). Iteration/introspection consults it to hide the key; the
-    /// value stays readable via `getX()`/`serializeJSON` (top-level, unchanged).
-    fn mark_accessor_private(s: &cfml_common::dynamic::CfmlStruct, prop: &str) {
-        let key = cfml_common::dynamic::ACCESSOR_PRIVATE_MARKER;
-        let plc = prop.to_lowercase();
-        if let Some(CfmlValue::Struct(m)) = s.get(key) {
-            m.insert(plc, CfmlValue::Bool(true));
-        } else {
-            let mut m = ValueMap::default();
-            m.insert(plc, CfmlValue::Bool(true));
-            s.insert(key.to_string(), CfmlValue::strukt(m));
-        }
-    }
-
     /// Lucee/ACF implicit accessor constructor. A component declared with
     /// `accessors=true` and NO explicit `init()` gets a generated constructor
     /// that maps NAMED constructor arguments (and an `argumentCollection`
@@ -25730,23 +25751,11 @@ impl CfmlVirtualMachine {
         };
         for (pname, pval) in provided {
             if let Some(actual) = prop_names.iter().find(|p| p.eq_ignore_ascii_case(&pname)) {
-                // The `__variables` backing is what the generated getter reads.
+                // Only the `__variables` backing the generated getter reads, like
+                // the generated setter: an accessor property is private on Lucee,
+                // so it never lands on `this` (GH #452).
                 if let Some(ref vars) = vars {
-                    vars.insert(actual.clone(), pval.clone());
-                }
-                // Mirror the setter's top-level `this.<prop>` write, BUT never
-                // clobber a same-named method: a CFC may declare both `property
-                // name="x"` and a method `x()`, and Lucee keeps the method
-                // callable while the getter still returns the property value.
-                let collides_with_method =
-                    matches!(s.get_ci(actual), Some(CfmlValue::Function(_)));
-                if !collides_with_method {
-                    s.insert(actual.clone(), pval);
-                    // Accessor-set value: private in Lucee's `variables` scope,
-                    // so hide it from introspection/for-in (kept readable via
-                    // getX()/serializeJSON). Matches Lucee; breaks the TestBox
-                    // `equalize` cycle through cfflow mock instances.
-                    Self::mark_accessor_private(s, actual);
+                    vars.insert(actual.clone(), pval);
                 }
             }
         }
@@ -30435,6 +30444,17 @@ impl CfmlVirtualMachine {
                 let route_to_on_missing = !has_accessors;
                 if !route_to_on_missing && method_lower.starts_with("get") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
+                    // The `variables` backing first: that is where the setter
+                    // below (and the generated one) keeps the value (GH #452).
+                    let backing = match s.get(&*cfml_common::key::well_known::VARIABLES) {
+                        Some(CfmlValue::Struct(vars)) => vars.get_ci(prop_name),
+                        _ => None,
+                    };
+                    if let Some(v) = backing {
+                        if !matches!(v, CfmlValue::Function(_)) {
+                            return Ok(v);
+                        }
+                    }
                     let val = s.data_get(&prop_name);
                     if let Some(v) = val {
                         // Collision: `this.<prop>` holds a same-named METHOD — a CFC may
@@ -30484,18 +30504,14 @@ impl CfmlVirtualMachine {
                             // backing (which getX reads). Lucee keeps x() callable while
                             // getX/setX operate on the value. (Matches the ctor path in
                             // apply_implicit_accessor_ctor.)
-                            let collides_with_method =
-                                matches!(ms.get_ci(&actual_key), Some(CfmlValue::Function(_)));
-                            if collides_with_method {
-                                if let Some(CfmlValue::Struct(vars)) = ms.get(&*cfml_common::key::well_known::VARIABLES) {
-                                    vars.insert(actual_key, value.clone());
-                                }
-                            } else {
-                                ms.insert(actual_key.clone(), value.clone());
-                                // Generated setter write → accessor-private (Lucee
-                                // keeps it in `variables`). Hide from introspection/
-                                // for-in; getX()/serializeJSON still see it.
-                                Self::mark_accessor_private(ms, &actual_key);
+                            //
+                            // An accessor property is private on Lucee, so the value
+                            // goes to the `variables` backing only, never `this`
+                            // (GH #452) — like the generated setter.
+                            if let Some(CfmlValue::Struct(vars)) = ms.get(&*cfml_common::key::well_known::VARIABLES) {
+                                vars.insert(actual_key, value.clone());
+                            } else if !matches!(ms.get_ci(&actual_key), Some(CfmlValue::Function(_))) {
+                                ms.insert(actual_key, value.clone());
                             }
                         }
                         return Ok(modified);
@@ -33634,7 +33650,7 @@ impl CfmlVirtualMachine {
     /// landmine: routing is by the EXACT reserved set, never by `__` prefix — see
     /// [`cfml_common::component::make_instance_value`].
     #[cfg(feature = "component-instance")]
-    fn to_instance_value(&mut self, marker: CfmlValue) -> CfmlValue {
+    fn to_instance_value(&mut self, marker: CfmlValue, call_name: Option<&str>) -> CfmlValue {
         let mut _ti = cfml_common::perf_counters::ctor_phases::Stopwatch::start();
         let s = match &marker {
             CfmlValue::Struct(s) => s.clone(),
@@ -33736,7 +33752,15 @@ impl CfmlVirtualMachine {
             }
         };
         _ti.lap(16);
-        cfml_common::component::make_instance_value(&s, blueprint, instance_id)
+        let value = cfml_common::component::make_instance_value(&s, blueprint, instance_id);
+        // The name as written at the creation site, kept only when it differs
+        // from the class's full name (GH #452) — an `Arc<str>` per such instance.
+        if let (Some(cn), CfmlValue::Instance(inst)) = (call_name, &value) {
+            if !cn.is_empty() && cn != bp_name.as_str() {
+                inst.write().call_name = Some(Arc::from(cn));
+            }
+        }
+        value
     }
 
     /// The defining source file of the component a call is coming from, for the
@@ -35137,9 +35161,78 @@ impl CfmlVirtualMachine {
                     if resolved_in_caller_dir {
                         dotted = format!("{}.{}", caller_pkg, dotted);
                     }
+                } else if anchor.is_none() {
+                    // A PAGE (no component `this`) resolving a name relative to
+                    // its own directory: Lucee qualifies it with the page's
+                    // package — its webroot-relative directory — so
+                    // `createObject("component", "X")` from `/a/b/page.cfm`
+                    // names `a.b.X` (GH #452).
+                    if let Some(pkg) = self.page_relative_package(cfc_path, caller_source) {
+                        dotted = format!("{}.{}", pkg, dotted);
+                    }
                 }
+            } else if let Some(q) =
+                self.relative_dotted_name(class_name, cfc_path, locals, caller_source, extends_anchor)
+            {
+                dotted = q;
             }
         dotted
+    }
+
+    /// The package a page caller's relative lookup is qualified with: the
+    /// webroot-relative directory of `caller_source` (a `.cfm`), when the
+    /// component was found in that same directory. `None` for a component
+    /// caller, a page outside the webroot, or one at the webroot itself.
+    fn page_relative_package(&self, cfc_path: &str, caller_source: Option<&str>) -> Option<String> {
+        let caller = caller_source?;
+        if caller.to_ascii_lowercase().ends_with(".cfc") {
+            return None;
+        }
+        let caller_dir = std::path::Path::new(caller).parent()?;
+        if std::path::Path::new(cfc_path).parent() != Some(caller_dir) {
+            return None;
+        }
+        // The directory named as if it were a component file in it: its dotted
+        // name is the package (the page's own name would keep its extension).
+        let probe = caller_dir.join("_.cfc");
+        let dotted = self.webroot_relative_component_name(probe.to_str()?)?;
+        dotted.strip_suffix("._").map(str::to_string).filter(|p| !p.is_empty())
+    }
+
+    /// A DOTTED name that resolved relative to the caller's directory
+    /// (`new sub.K()` finding `<caller dir>/sub/K.cfc`): Lucee qualifies it
+    /// with the caller's package exactly as it does an unqualified name, so a
+    /// component loaded as `m2.E` that does `new sub.K()` gets `m2.sub.K`
+    /// (GH #452). The caller's package is what the unqualified rules above give
+    /// a sibling of the caller, so this reuses them on that sibling path.
+    fn relative_dotted_name(
+        &self,
+        class_name: &str,
+        cfc_path: &str,
+        locals: &ValueMap,
+        caller_source: Option<&str>,
+        extends_anchor: Option<&(String, String)>,
+    ) -> Option<String> {
+        if class_name.contains(['/', '\\']) || !class_name.contains('.') {
+            return None;
+        }
+        let caller_dir = std::path::Path::new(caller_source?).parent()?;
+        let mut expected = caller_dir.to_path_buf();
+        for seg in class_name.split('.') {
+            if seg.is_empty() {
+                return None;
+            }
+            expected.push(seg);
+        }
+        let expected = format!("{}.cfc", expected.to_string_lossy());
+        if !expected.eq_ignore_ascii_case(cfc_path) {
+            return None;
+        }
+        let leaf = class_name.rsplit('.').next()?;
+        let sibling = caller_dir.join(format!("{}.cfc", leaf));
+        let q = self.qualified_template_name(leaf, sibling.to_str()?, locals, caller_source, extends_anchor);
+        let pkg = &q[..q.rfind('.')?];
+        Some(format!("{}.{}", pkg, Self::dotted_component_name(class_name)))
     }
 
     fn resolve_component_template_impl(
@@ -35513,8 +35606,14 @@ impl CfmlVirtualMachine {
                     extends_anchor.as_ref(),
                 ),
             };
-            let dotted_name_for_record: Option<String> =
-                (record.is_none() && class_name.contains(['.', '/', '\\'])).then(|| dotted_name.clone());
+            // Recorded per (name, caller dir) only when it did not depend on the
+            // caller: a relative name is qualified with the CALLER's package,
+            // which differs for two callers in one directory loaded under two
+            // mappings (GH #452).
+            let dotted_name_for_record: Option<String> = (record.is_none()
+                && class_name.contains(['.', '/', '\\'])
+                && dotted_name == Self::dotted_component_name(class_name))
+            .then(|| dotted_name.clone());
             _ct.lap(3);
             let mut resolved_parent_stash: Option<CfmlValue> = None;
             let mut parent_generation: u64 = 0;
@@ -36714,6 +36813,13 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
+        }
+        // The top of every chain is Lucee's implicit base component (GH #452).
+        if !meta.contains_key("extends") {
+            meta.insert(
+                "extends".to_string(),
+                CfmlValue::strukt(cfml_common::component::base_component_metadata()),
+            );
         }
         // Store a DEEP COPY so a caller mutating the map we hand back (ColdBox's
         // `getInheritedMetaData` edits the struct it is given) cannot corrupt the
@@ -43262,7 +43368,6 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::TryLoadLocalKey(_) | BytecodeOp::TryLoadSlotKey(..) => (1, 0), // Null-tolerant twin
         BytecodeOp::StoreLocalProperty(_, _) | BytecodeOp::StoreSlotProperty(..) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
-        BytecodeOp::MarkAccessorPrivate(_) => (0, 0), // no stack effect
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
         BytecodeOp::SetScopePath(_) => (0, 1), // value → (stored through the path)
         BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
