@@ -10,8 +10,9 @@ results, and speaks the protocol.
 
 > **Status: phase 6.** RustCFML works in both directions — a CFC is an MCP
 > server (tools, resources, prompts, SSE streaming, sampling), and CFML can
-> call out to remote MCP servers — with bearer-token authentication, address
-> rules and tool filtering. See [What's not here yet](#whats-not-here-yet)
+> call out to remote MCP servers — with bearer-token or application-defined
+> authentication, OAuth resource-server discovery, address rules and tool
+> filtering. See [What's not here yet](#whats-not-here-yet)
 > for the remainder.
 
 ## Quick start
@@ -250,6 +251,8 @@ function reindex( numeric batches = 10 ) tool="reindex" streaming=true {
 | `mcp().session()` / `.server()` | Identifiers for the conversation and the server. |
 | `mcp().client()` | The client's `initialize` details and its capabilities. |
 | `mcp().streaming()` | Whether this call actually has a stream. |
+| `mcp().identity()` | Who is calling — see [The caller's identity](#the-callers-identity-in-a-handler). |
+| `mcp().authorization()` / `.transport()` | The raw `Authorization` header (empty on stdio), and `"http"` or `"stdio"`. |
 | `mcp().toolsChanged()` | `notifications/tools/list_changed`, telling the client to re-read the tool list. |
 | `mcp().notify( method [, params] )` | Any other notification. |
 
@@ -455,6 +458,8 @@ are unreachable until tokens exist to authenticate against.
 | `includedTools` / `excludedTools` | `["*"]` / none | Globs (`*`, `?`). Exclusions apply after inclusions. A token's own filters replace the global ones. |
 | `corsAllowedOrigins` | none | Browser origins beyond localhost, which is always allowed. |
 | `stdioRoles` | none | Roles granted on the stdio transport. |
+| `authenticate` / `stdioTokenEnv` | none | An application CFC that resolves unknown tokens — see [Authenticating your own users](#authenticating-your-own-users). |
+| `scopes` / `oauth` | none | Per-scope tool filters and OAuth resource metadata — see [Scopes](#scopes). |
 
 ### How `secured` gets its identity
 
@@ -478,10 +483,133 @@ directly is refused as **unknown** rather than forbidden — a caller should not
 be able to map what it is not allowed to reach. Denials say only
 `Not authorized`, so a probe cannot tell a wrong token from a blocked address.
 
-> **These are static bearer tokens, not the spec's OAuth 2.1 flow.** A 401 is
-> answered with `WWW-Authenticate: Bearer`, and some clients read that as an
-> invitation to start an OAuth handshake; those need the header supplied
-> directly (`"headers": { "Authorization": "Bearer …" }` in their config).
+> A 401 is answered with `WWW-Authenticate: Bearer`. Some clients read that as
+> an invitation to start an OAuth handshake; with static tokens those need the
+> header supplied directly (`"headers": { "Authorization": "Bearer …" }` in
+> their config), or see [OAuth 2.1](#oauth-21-resource-server) below.
+
+### Authenticating your own users
+
+Static tokens suit a server you configure by hand. An application that already
+has users — with API keys in its own database, minted and revoked at runtime —
+names a CFC that the engine asks instead:
+
+```jsonc
+{ "mcp": { "authenticate": "auth.McpAuth" } }
+```
+
+```cfml
+// auth/McpAuth.cfc
+component {
+    // Return an identity struct, or null / throw to refuse.
+    function authenticate( required string token, struct headers, string transport ) {
+        var p = application.principals.byApiKey( arguments.token );
+        if ( isNull( p ) ) return;
+        return { roles = p.roles, principalId = p.id, tenantId = p.tenant };
+    }
+}
+```
+
+- `authenticate` is a dotted name relative to the web root (or a path).
+  It is called once per HTTP request with the bearer token, the request headers
+  (lower-case keys) and the transport.
+- **Static `authToken` entries are tried first**; the hook sees only tokens they
+  do not know. A request with no token at all is refused before the hook runs.
+- **Returning null, throwing, or `authenticated = false` refuses** with the same
+  terse 401 as a wrong token. A throw is logged on the server by its message,
+  and nothing about it reaches the caller.
+- **The struct you return is the identity.** `roles` (an array or a comma list)
+  is what `secured` checks; every other key travels with it to the handler.
+  `includedTools` / `excludedTools` on it replace the global filters for that
+  caller, as a token object's do.
+- The hook runs on a fresh VM, like a tool call, so cache lookups in
+  `application` scope rather than hitting the database on every request.
+
+On **stdio**, name an environment variable that carries the credential, and
+the launched process is resolved the same way — once, at startup:
+
+```jsonc
+{ "mcp": { "authenticate": "auth.McpAuth", "stdioTokenEnv": "MYAPP_MCP_TOKEN" } }
+```
+
+With the variable unset the process is the launcher under `stdioRoles`, as
+before. With it set and refused, the process exits rather than serving anyone.
+
+### The caller's identity in a handler
+
+`secured` is not the only place that needs to know who is calling. A tool that
+enforces per-record rules reads the identity directly:
+
+```cfml
+function search( required string query ) tool="search" secured {
+    var who = mcp().identity();     // the struct the hook returned
+    return searchService.run( arguments.query, tenant = who.tenantId );
+}
+```
+
+`mcp().identity()` is a copy, so editing it changes nothing; it is null for an
+unauthenticated caller. A static token's identity is `{ authenticated, roles }`.
+`mcp().authorization()` returns the raw header, for forwarding a downstream call
+on the caller's behalf.
+
+### Scopes
+
+When an identity carries `scopes` (an array, or a space/comma separated
+`scope` string as a JWT has it), tools can be granted per scope:
+
+```jsonc
+{
+  "mcp": {
+    "scopes": {
+      "read":  { "includedTools": ["get_*", "search*"] },
+      "write": { "includedTools": ["set_*", "delete_*"] }
+    }
+  }
+}
+```
+
+The caller sees the union of what its scopes include; a scope that is not
+listed grants nothing. The global `excludedTools` still apply on top. An
+identity without scopes keeps the global filters.
+
+### OAuth 2.1 resource server
+
+The engine does not implement an authorization server, and does not need to:
+OAuth for MCP is mostly application code once the endpoint behaves as a
+spec-compliant **resource server**. Configure where tokens come from:
+
+```jsonc
+{
+  "mcp": {
+    "authenticate": "auth.JwtAuth",
+    "oauth": {
+      "authorizationServers": ["https://auth.example.com"],
+      "scopesSupported": ["read", "write"],
+      "resource": "",                 // derived from the request when empty
+      "metadata": { "resource_name": "Docs" }
+    }
+  }
+}
+```
+
+With an authorization server listed:
+
+- `GET /.well-known/oauth-protected-resource/mcp/{name}` (and the bare
+  `/.well-known/oauth-protected-resource`) serve the protected resource
+  metadata (RFC 9728). Anything under `metadata` is included as written.
+- A 401 carries `WWW-Authenticate: Bearer resource_metadata="…"` pointing at
+  it, so a client can discover where to get a token. Behind a proxy the URL
+  follows `X-Forwarded-Proto` / `X-Forwarded-Host`, or set `resource`.
+- **Validating the access token is the `authenticate` hook's job** — check a
+  JWT's issuer, audience, expiry and signature, or call the introspection
+  endpoint — and return its scopes as `scopes` (and roles, if `secured` should
+  see them). Map scopes to tools as above.
+- `/.well-known/oauth-authorization-server`, `/authorize`, `/token` and
+  `/register` are not routed by the engine. Serve them from your application
+  if it is its own authorization server, or point `authorizationServers` at
+  one that is.
+
+Address and origin rules apply before any of this, as they always do.
 
 ## Execution model
 
@@ -542,9 +670,9 @@ and the client. Still to come:
 - **Client-side sampling** — this client declines a server's `sampling` or
   `elicitation` request. Answering one means giving CFML a way to reach a model,
   which is a larger design question than the transport.
-- **OAuth 2.1** — the spec's full authorization extension, with discovery and
-  token endpoints. Static bearer tokens cover a server you configure yourself;
-  OAuth is what a public multi-tenant endpoint would need.
+- **A built-in authorization server** — the engine is an OAuth resource
+  server (see [above](#oauth-21-resource-server)); the authorization server
+  itself, and token validation, are the application's or a provider's.
 - **The deprecated HTTP+SSE transport** (protocol 2024-11-05's `/sse` plus a
   POST-back endpoint) for clients that predate Streamable HTTP.
 - **A runnable `examples/mcp_demo/`.**

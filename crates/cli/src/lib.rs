@@ -2567,6 +2567,21 @@ async fn async_run_server(
                 .get(mcp::http::get)
                 .delete(mcp::http::delete),
         );
+        // OAuth protected-resource metadata, only when an authorization
+        // server is configured. Nothing else under `/.well-known/` is ours:
+        // `oauth-authorization-server`, `/authorize`, `/token` and the rest
+        // stay with the application.
+        if app_state.cfconfig.mcp.oauth.enabled() {
+            app = app
+                .route(
+                    "/.well-known/oauth-protected-resource",
+                    axum::routing::get(mcp::http::protected_resource_metadata),
+                )
+                .route(
+                    "/.well-known/oauth-protected-resource/{*resource}",
+                    axum::routing::get(mcp::http::protected_resource_metadata),
+                );
+        }
     }
     let app = app
         .fallback(handle_request)

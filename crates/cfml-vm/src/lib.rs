@@ -41305,6 +41305,26 @@ impl CfmlVirtualMachine {
         result
     }
 
+    /// Run an application's MCP `authenticate( token, headers, transport )`
+    /// hook (`mcp.authenticate` in `.cfconfig.json`) and return what it
+    /// returned. The caller decides what counts as a refusal; this only
+    /// resolves the component and invokes the method, the same way a tool
+    /// handler is invoked.
+    pub fn mcp_authenticate(
+        &mut self,
+        cfc: &str,
+        arguments: CfmlStruct,
+    ) -> Result<CfmlValue, CfmlError> {
+        let (template, view) = self.mcp_component_view(cfc)?;
+        let Some(CfmlValue::Function(func)) = view.get_ci("authenticate") else {
+            return Err(CfmlError::runtime(format!(
+                "MCP authenticate hook [{cfc}] has no authenticate() method"
+            )));
+        };
+        let args = Self::mcp_bind_args(&func, &arguments);
+        self.dispatch_mcp_invoke(&template, &view, &func, args)
+    }
+
     fn dispatch_mcp_invoke(
         &mut self,
         template: &CfmlValue,

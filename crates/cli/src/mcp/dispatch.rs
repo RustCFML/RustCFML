@@ -56,6 +56,77 @@ pub(crate) async fn manifest(
     .unwrap_or_else(|e| Err(format!("MCP manifest task panicked: {e}")))
 }
 
+/// Ask the application who presented `token`, through the CFC named by
+/// `mcp.authenticate`.
+///
+/// Runs on a fresh VM like a tool call, so the hook can lean on `application`
+/// scope caches. Returns the hook's result, or `None` when it threw — which
+/// is a refusal, logged by message only: the caller gets the same terse 401 as
+/// a wrong token, never the exception.
+pub(crate) async fn authenticate(
+    runtime: McpRuntime,
+    webroot: std::path::PathBuf,
+    token: String,
+    headers: ValueMap,
+    transport: &'static str,
+) -> Option<CfmlValue> {
+    let hook = runtime.server_state.cfconfig.mcp.authenticate.trim().to_string();
+    if hook.is_empty() {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let cfc = hook_path(&webroot, &hook, &runtime.vfs);
+        let mut vm = runtime.vm(&cfc);
+        let mut args = ValueMap::default();
+        args.insert("token".to_string(), CfmlValue::string(token));
+        args.insert("headers".to_string(), CfmlValue::strukt(headers));
+        args.insert("transport".to_string(), CfmlValue::string(transport.to_string()));
+        let args: CfmlStruct = match CfmlValue::strukt(args) {
+            CfmlValue::Struct(s) => s,
+            _ => unreachable!("strukt always yields a Struct"),
+        };
+        match vm.mcp_authenticate(&cfc, args) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                log::warn!("MCP: authenticate hook [{hook}] refused by throwing: {}", e.message);
+                None
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("MCP: authenticate hook panicked: {e}");
+        None
+    })
+}
+
+/// Resolve `mcp.authenticate` to a component file: a dotted name relative to
+/// the web root (`auth.McpAuth`), or a path (absolute, or relative to the web
+/// root). A dotted name with no file behind it is passed through as written,
+/// so a mapping can still resolve it.
+fn hook_path(
+    webroot: &std::path::Path,
+    hook: &str,
+    vfs: &Arc<dyn cfml_common::vfs::Vfs>,
+) -> String {
+    let as_path = if hook.ends_with(".cfc") || hook.contains('/') || hook.contains('\\') {
+        let p = std::path::Path::new(hook);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            webroot.join(hook.trim_start_matches('/'))
+        }
+    } else {
+        webroot.join(format!("{}.cfc", hook.replace('.', "/")))
+    };
+    let s = as_path.to_string_lossy().to_string();
+    if vfs.exists(&s) {
+        s
+    } else {
+        hook.to_string()
+    }
+}
+
 /// Why a handler call failed.
 ///
 /// The message is the exception's own text and **never** its stack trace:
@@ -79,7 +150,8 @@ pub(crate) async fn call(
 ) -> Result<CfmlValue, CallFailure> {
     tokio::task::spawn_blocking(move || {
         let mut vm = runtime.vm(&info.cfc_path);
-        vm.current_mcp_identity = identity;
+        vm.current_mcp_identity = identity.clone();
+        let ctx = CallContext { identity, ..ctx };
         let args: CfmlStruct = match CfmlValue::strukt(arguments) {
             CfmlValue::Struct(s) => s,
             _ => unreachable!("strukt always yields a Struct"),

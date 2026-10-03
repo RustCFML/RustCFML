@@ -1396,6 +1396,57 @@ pub struct McpCfg {
     /// deliberately rather than by virtue of running the binary.
     #[serde(rename = "stdioRoles")]
     pub stdio_roles: Vec<String>,
+    /// A CFC (dotted name relative to the web root, or a path) whose
+    /// `authenticate( token, headers, transport )` resolves a bearer
+    /// credential the static `authToken` list does not know. It returns the
+    /// caller's identity struct, or null / throws to refuse. Static tokens are
+    /// tried first.
+    pub authenticate: String,
+    /// stdio: the environment variable holding the credential this process
+    /// presents, so a launched subprocess can be *someone* rather than only
+    /// `stdioRoles`. Resolved once at startup, like an HTTP bearer token.
+    #[serde(rename = "stdioTokenEnv")]
+    pub stdio_token_env: String,
+    /// Tool filters keyed by OAuth scope. A caller whose identity carries
+    /// `scopes` sees the union of what its scopes include.
+    pub scopes: IndexMap<String, McpScope>,
+    /// OAuth 2.1 resource-server settings: when present, the engine serves
+    /// `/.well-known/oauth-protected-resource` and points 401 challenges at it.
+    pub oauth: McpOAuth,
+}
+
+/// Tool filters granted by one OAuth scope.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpScope {
+    #[serde(rename = "includedTools")]
+    pub included_tools: Vec<String>,
+    #[serde(rename = "excludedTools")]
+    pub excluded_tools: Vec<String>,
+}
+
+/// Protected-resource metadata (RFC 9728) for an MCP endpoint.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpOAuth {
+    /// The resource identifier. Derived from the request's host and path when
+    /// empty.
+    pub resource: String,
+    /// Authorization servers a client may obtain tokens from. Configuring at
+    /// least one is what switches the metadata endpoint on.
+    #[serde(rename = "authorizationServers", alias = "authorization_servers")]
+    pub authorization_servers: Vec<String>,
+    #[serde(rename = "scopesSupported", alias = "scopes_supported")]
+    pub scopes_supported: Vec<String>,
+    /// Any further metadata fields, served as written.
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+impl McpOAuth {
+    /// True when the resource-server seams are switched on.
+    pub fn enabled(&self) -> bool {
+        !self.authorization_servers.is_empty()
+    }
 }
 
 impl Default for McpCfg {
@@ -1408,6 +1459,10 @@ impl Default for McpCfg {
             included_tools: vec!["*".into()],
             excluded_tools: Vec::new(),
             stdio_roles: Vec::new(),
+            authenticate: String::new(),
+            stdio_token_env: String::new(),
+            scopes: IndexMap::new(),
+            oauth: McpOAuth::default(),
         }
     }
 }

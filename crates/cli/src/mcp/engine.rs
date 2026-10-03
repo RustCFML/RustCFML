@@ -165,16 +165,7 @@ async fn call_tool(ctx: &Ctx, id: RpcId, params: Value) -> Handled {
         }
     };
 
-    let call_ctx = CallContext {
-        server: ctx.info.id.clone(),
-        session: ctx.session.clone().unwrap_or_default(),
-        stream: ctx.stream,
-        progress_token: params
-            .get("_meta")
-            .and_then(|m| m.get("progressToken"))
-            .cloned(),
-        capabilities: ctx.capabilities.clone(),
-    };
+    let call_ctx = call_context(ctx, &params);
 
     match dispatch::call(
         ctx.runtime.clone(),
@@ -318,13 +309,7 @@ async fn invoke(
     // `id: null` is one the client cannot match to its request.
     id: &RpcId,
 ) -> Result<CfmlValue, Handled> {
-    let call_ctx = CallContext {
-        server: ctx.info.id.clone(),
-        session: ctx.session.clone().unwrap_or_default(),
-        stream: ctx.stream,
-        progress_token: params.get("_meta").and_then(|m| m.get("progressToken")).cloned(),
-        capabilities: ctx.capabilities.clone(),
-    };
+    let call_ctx = call_context(ctx, params);
     dispatch::call(
         ctx.runtime.clone(),
         ctx.info.clone(),
@@ -338,6 +323,21 @@ async fn invoke(
         let code = if f.denied { INVALID_REQUEST } else { INTERNAL_ERROR };
         fail(id.clone(), code, f.message)
     })
+}
+
+/// The context a handler sees through `mcp()`. The identity itself is
+/// attached by the dispatcher, alongside the one the `secured` gate reads.
+fn call_context(ctx: &Ctx, params: &Value) -> CallContext {
+    CallContext {
+        server: ctx.info.id.clone(),
+        session: ctx.session.clone().unwrap_or_default(),
+        stream: ctx.stream,
+        progress_token: params.get("_meta").and_then(|m| m.get("progressToken")).cloned(),
+        capabilities: ctx.capabilities.clone(),
+        identity: None,
+        authorization: ctx.caller.authorization.clone(),
+        transport: ctx.caller.transport.to_string(),
+    }
 }
 
 /// Turn the JSON `arguments` object into CFML values for binding.

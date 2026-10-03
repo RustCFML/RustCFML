@@ -1,0 +1,1 @@
+<cfoutput>hook fixture</cfoutput>

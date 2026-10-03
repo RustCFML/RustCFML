@@ -20,6 +20,23 @@ pub(crate) struct Caller {
     pub(crate) identity: Option<CfmlValue>,
     included: Vec<String>,
     excluded: Vec<String>,
+    /// Set when the caller's scopes map to no tools at all. Distinct from an
+    /// empty `included`, which means "no allow-list" (everything).
+    none_included: bool,
+    /// The raw `Authorization` header, for `mcp().authorization()`.
+    pub(crate) authorization: Option<String>,
+    /// `"http"` or `"stdio"`, for `mcp().transport()`.
+    pub(crate) transport: &'static str,
+}
+
+/// What [`decide`] concluded from the configuration alone.
+#[derive(Debug)]
+pub(crate) enum Decision {
+    /// Settled: the caller is this (a static token, or nobody needed one).
+    Done(Caller),
+    /// A bearer token no static entry knows, and an `authenticate` hook is
+    /// configured: the transport must ask the application.
+    Resolve(String),
 }
 
 /// Why a request was turned away.
@@ -58,11 +75,27 @@ impl Caller {
             identity: Some(identity(&cfg.stdio_roles)),
             included: cfg.included_tools.clone(),
             excluded: cfg.excluded_tools.clone(),
+            transport: "stdio",
+            ..Default::default()
+        }
+    }
+
+    /// An unauthenticated caller under the global filters.
+    fn anonymous(cfg: &McpCfg) -> Self {
+        Self {
+            identity: None,
+            included: cfg.included_tools.clone(),
+            excluded: cfg.excluded_tools.clone(),
+            transport: "http",
+            ..Default::default()
         }
     }
 
     /// May this caller use the named tool?
     pub(crate) fn may_call(&self, tool: &str) -> bool {
+        if self.none_included {
+            return false;
+        }
         let included = if self.included.is_empty() {
             true
         } else {
@@ -84,12 +117,30 @@ fn identity(roles: &[String]) -> CfmlValue {
     CfmlValue::strukt(map)
 }
 
-/// Decide whether an HTTP request may proceed, and as whom.
+/// Decide whether an HTTP request may proceed, and as whom, when no
+/// `authenticate` hook can be consulted. A token that only the hook could
+/// resolve is a refusal here.
+#[cfg(test)]
 pub(crate) fn authorize(
     cfg: &McpCfg,
     peer: IpAddr,
     headers: &HeaderMap,
 ) -> Result<Caller, Denied> {
+    match decide(cfg, peer, headers)? {
+        Decision::Done(caller) => Ok(caller),
+        Decision::Resolve(_) => Err(Denied::Token),
+    }
+}
+
+/// Everything that can be decided from configuration: is MCP on, is the
+/// address and origin allowed, and does the bearer token match a static
+/// entry. A token no static entry knows is handed back for the
+/// `authenticate` hook when one is configured.
+pub(crate) fn decide(
+    cfg: &McpCfg,
+    peer: IpAddr,
+    headers: &HeaderMap,
+) -> Result<Decision, Denied> {
     if !cfg.enabled {
         return Err(Denied::Disabled);
     }
@@ -101,26 +152,178 @@ pub(crate) fn authorize(
             return Err(Denied::Origin);
         }
     }
+    let authorization =
+        headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
 
-    // No tokens configured: the endpoint is open to whoever the address rules
+    // No tokens and no hook: the endpoint is open to whoever the address rules
     // let through, and nobody is authenticated — so `secured` handlers stay
     // unreachable, which is the honest outcome of having configured no way to
     // identify anyone.
-    if cfg.auth_tokens.is_empty() {
-        return Ok(Caller {
-            identity: None,
-            included: cfg.included_tools.clone(),
-            excluded: cfg.excluded_tools.clone(),
-        });
+    if cfg.auth_tokens.is_empty() && !has_hook(cfg) {
+        return Ok(Decision::Done(Caller { authorization, ..Caller::anonymous(cfg) }));
     }
 
     let presented = bearer(headers).ok_or(Denied::Token)?;
-    let token = cfg
-        .auth_tokens
+    match resolve_static(cfg, &presented) {
+        Some(mut caller) => {
+            caller.authorization = authorization;
+            Ok(Decision::Done(caller))
+        }
+        None if has_hook(cfg) => Ok(Decision::Resolve(presented)),
+        None => Err(Denied::Token),
+    }
+}
+
+/// Is an `authenticate` hook configured?
+pub(crate) fn has_hook(cfg: &McpCfg) -> bool {
+    !cfg.authenticate.trim().is_empty()
+}
+
+/// Match a credential against the static `authToken` list.
+pub(crate) fn resolve_static(cfg: &McpCfg, presented: &str) -> Option<Caller> {
+    cfg.auth_tokens
         .iter()
-        .find(|t| constant_time_eq(&t.token, &presented))
-        .ok_or(Denied::Token)?;
-    Ok(caller_for(cfg, token))
+        .find(|t| constant_time_eq(&t.token, presented))
+        .map(|t| caller_for(cfg, t))
+}
+
+/// Turn what an `authenticate` hook returned into a caller, or `None` for a
+/// refusal.
+///
+/// Null, anything that is not a struct, and a struct that says
+/// `authenticated = false` all refuse. Otherwise the struct *is* the identity:
+/// `authenticated` and `roles` are normalised for the `secured` gate, and every
+/// other key travels with it to `mcp().identity()` untouched. Tool filters
+/// come from, in order: `includedTools`/`excludedTools` on the struct (which
+/// replace the global ones, as a token object's do); the `scopes` mapping, when
+/// the identity carries scopes; the global filters.
+pub(crate) fn caller_from_identity(cfg: &McpCfg, value: CfmlValue) -> Option<Caller> {
+    let CfmlValue::Struct(id) = value else { return None };
+    if let Some(flag) = id.get_ci("authenticated") {
+        if !flag.is_true() {
+            return None;
+        }
+    }
+    // Work on a copy so normalising cannot reach back into whatever the
+    // application cached the struct in.
+    let CfmlValue::Struct(id) = CfmlValue::Struct(id).deep_copy() else { return None };
+    id.insert("authenticated".to_string(), CfmlValue::Bool(true));
+    let roles = string_list(id.get_ci("roles"));
+    id.insert(
+        "roles".to_string(),
+        CfmlValue::array(roles.into_iter().map(CfmlValue::string).collect()),
+    );
+
+    let own_included = string_list(id.get_ci("includedTools"));
+    let own_excluded = string_list(id.get_ci("excludedTools"));
+    let scopes = string_list(id.get_ci("scopes").or_else(|| id.get_ci("scope")));
+
+    let mut caller = Caller {
+        included: cfg.included_tools.clone(),
+        excluded: cfg.excluded_tools.clone(),
+        transport: "http",
+        ..Default::default()
+    };
+    if !cfg.scopes.is_empty() && !scopes.is_empty() {
+        // A scope narrows what is visible: the union of what the caller's
+        // scopes include. The global exclusions still apply on top.
+        let mut included = Vec::new();
+        let mut excluded = cfg.excluded_tools.clone();
+        for scope in &scopes {
+            if let Some((_, grant)) =
+                cfg.scopes.iter().find(|(name, _)| name.eq_ignore_ascii_case(scope))
+            {
+                included.extend(grant.included_tools.iter().cloned());
+                excluded.extend(grant.excluded_tools.iter().cloned());
+            }
+        }
+        caller.none_included = included.is_empty();
+        caller.included = included;
+        caller.excluded = excluded;
+    }
+    if !own_included.is_empty() {
+        caller.included = own_included;
+        caller.none_included = false;
+    }
+    if !own_excluded.is_empty() {
+        caller.excluded = own_excluded;
+    }
+    caller.identity = Some(CfmlValue::Struct(id));
+    Some(caller)
+}
+
+/// An array of strings, or a comma/space separated list — the two shapes an
+/// application is likely to hand back (`roles = ["a","b"]`, `scope = "read write"`).
+fn string_list(value: Option<CfmlValue>) -> Vec<String> {
+    match value {
+        Some(CfmlValue::Array(arr)) => arr
+            .iter()
+            .map(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(CfmlValue::Null) | None => Vec::new(),
+        Some(other) => other
+            .as_string()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    }
+}
+
+/// The `WWW-Authenticate` value for a 401. With OAuth configured it points
+/// the client at the protected-resource metadata (RFC 9728 §5.1), which is how
+/// a client discovers which authorization server to go to; without it, a bare
+/// `Bearer`.
+pub(crate) fn challenge(cfg: &McpCfg, headers: &HeaderMap, server: &str) -> String {
+    if !cfg.oauth.enabled() {
+        return "Bearer".to_string();
+    }
+    let url = metadata_url(cfg, headers, server);
+    format!("Bearer resource_metadata=\"{url}\"")
+}
+
+/// Where this server's protected-resource metadata lives: the well-known path
+/// inserted between the resource's origin and its path (RFC 9728 §3.1).
+pub(crate) fn metadata_url(cfg: &McpCfg, headers: &HeaderMap, server: &str) -> String {
+    let resource = resource_for(cfg, headers, &format!("/mcp/{server}"));
+    let (origin, path) = split_origin(&resource);
+    format!("{origin}/.well-known/oauth-protected-resource{path}")
+}
+
+/// The resource identifier: as configured, or derived from the request.
+pub(crate) fn resource_for(cfg: &McpCfg, headers: &HeaderMap, path: &str) -> String {
+    let configured = cfg.oauth.resource.trim();
+    if !configured.is_empty() {
+        return configured.trim_end_matches('/').to_string();
+    }
+    format!("{}{}", request_origin(headers), path)
+}
+
+/// `scheme://host` as the client addressed us. Behind a TLS-terminating proxy
+/// the scheme comes from `X-Forwarded-Proto`.
+pub(crate) fn request_origin(headers: &HeaderMap) -> String {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let scheme = get("x-forwarded-proto")
+        .and_then(|p| p.split(',').next())
+        .map(str::trim)
+        .filter(|p| *p == "http" || *p == "https")
+        .unwrap_or("http");
+    let host = get("x-forwarded-host")
+        .and_then(|h| h.split(',').next())
+        .map(str::trim)
+        .or_else(|| get("host"))
+        .filter(|h| !h.is_empty() && !h.contains(['"', ' ', '/']))
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}")
+}
+
+fn split_origin(url: &str) -> (&str, &str) {
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    match url[after_scheme..].find('/') {
+        Some(i) => url.split_at(after_scheme + i),
+        None => (url, ""),
+    }
 }
 
 fn caller_for(cfg: &McpCfg, token: &McpToken) -> Caller {
@@ -137,7 +340,13 @@ fn caller_for(cfg: &McpCfg, token: &McpToken) -> Caller {
     } else {
         token.excluded_tools.clone()
     };
-    Caller { identity: Some(identity(&token.roles)), included, excluded }
+    Caller {
+        identity: Some(identity(&token.roles)),
+        included,
+        excluded,
+        transport: "http",
+        ..Default::default()
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
@@ -468,6 +677,140 @@ mod tests {
             Denied::Origin
         );
         assert!(authorize(&cfg, local(), &headers(&[("origin", "http://localhost:1")])).is_ok());
+    }
+
+    fn with_hook() -> McpCfg {
+        let mut c = with_token("static", &["admin"]);
+        c.authenticate = "auth.McpAuth".into();
+        c
+    }
+
+    fn ident(pairs: &[(&str, CfmlValue)]) -> CfmlValue {
+        let mut m = ValueMap::default();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        CfmlValue::strukt(m)
+    }
+
+    fn strs(items: &[&str]) -> CfmlValue {
+        CfmlValue::array(items.iter().map(|s| CfmlValue::string(s.to_string())).collect())
+    }
+
+    #[test]
+    fn a_static_token_wins_before_the_hook_is_asked() {
+        let cfg = with_hook();
+        let h = headers(&[("authorization", "Bearer static")]);
+        assert!(matches!(decide(&cfg, local(), &h), Ok(Decision::Done(_))));
+        let h = headers(&[("authorization", "Bearer user-42")]);
+        match decide(&cfg, local(), &h) {
+            Ok(Decision::Resolve(t)) => assert_eq!(t, "user-42"),
+            other => panic!("expected the hook to be asked, got {other:?}"),
+        }
+        // No token at all is still a 401, hook or not.
+        assert_eq!(decide(&cfg, local(), &HeaderMap::new()).unwrap_err(), Denied::Token);
+    }
+
+    #[test]
+    fn a_hook_alone_turns_on_authentication() {
+        let mut cfg = cfg();
+        cfg.authenticate = "auth.McpAuth".into();
+        assert_eq!(decide(&cfg, local(), &HeaderMap::new()).unwrap_err(), Denied::Token);
+        assert!(matches!(
+            decide(&cfg, local(), &headers(&[("authorization", "Bearer x")])),
+            Ok(Decision::Resolve(_))
+        ));
+    }
+
+    #[test]
+    fn what_the_hook_returns_becomes_the_identity() {
+        let cfg = with_hook();
+        assert!(caller_from_identity(&cfg, CfmlValue::Null).is_none(), "null refuses");
+        assert!(caller_from_identity(&cfg, CfmlValue::string("yes")).is_none());
+        assert!(
+            caller_from_identity(&cfg, ident(&[("authenticated", CfmlValue::Bool(false))]))
+                .is_none(),
+            "an explicit authenticated=false refuses"
+        );
+
+        let caller = caller_from_identity(
+            &cfg,
+            ident(&[
+                ("roles", CfmlValue::string("member, editor")),
+                ("principalId", CfmlValue::Int(42)),
+            ]),
+        )
+        .expect("accepted");
+        let id = caller.identity.expect("identity");
+        let id = id.as_cfml_struct().unwrap();
+        assert!(matches!(id.get_ci("authenticated"), Some(CfmlValue::Bool(true))));
+        let CfmlValue::Array(roles) = id.get_ci("roles").unwrap() else { panic!("array") };
+        assert_eq!(roles.len(), 2, "a comma list is normalised to an array");
+        assert!(matches!(id.get_ci("principalId"), Some(CfmlValue::Int(42))), "extra keys travel");
+    }
+
+    #[test]
+    fn the_hook_may_narrow_the_tool_filters() {
+        let cfg = with_hook();
+        let caller =
+            caller_from_identity(&cfg, ident(&[("includedTools", strs(&["get_*"]))])).unwrap();
+        assert!(caller.may_call("get_status"));
+        assert!(!caller.may_call("restart"));
+    }
+
+    #[test]
+    fn scopes_map_to_tools() {
+        let mut cfg = with_hook();
+        cfg.excluded_tools = vec!["get_secret".into()];
+        cfg.scopes.insert(
+            "read".into(),
+            cfml_config::schema::McpScope { included_tools: vec!["get_*".into()], ..Default::default() },
+        );
+        cfg.scopes.insert(
+            "write".into(),
+            cfml_config::schema::McpScope { included_tools: vec!["set_*".into()], ..Default::default() },
+        );
+
+        let reader =
+            caller_from_identity(&cfg, ident(&[("scope", CfmlValue::string("read"))]))
+                .unwrap();
+        assert!(reader.may_call("get_status"));
+        assert!(!reader.may_call("set_status"));
+        assert!(!reader.may_call("get_secret"), "global exclusions still apply");
+
+        let both = caller_from_identity(&cfg, ident(&[("scopes", strs(&["read", "write"]))]))
+            .unwrap();
+        assert!(both.may_call("get_status") && both.may_call("set_status"));
+
+        // A scope the mapping does not know grants nothing — not everything.
+        let stranger =
+            caller_from_identity(&cfg, ident(&[("scopes", strs(&["admin"]))])).unwrap();
+        assert!(!stranger.may_call("get_status"));
+
+        // No scopes on the identity: the global filters, as before.
+        let plain = caller_from_identity(&cfg, ident(&[])).unwrap();
+        assert!(plain.may_call("set_status"));
+    }
+
+    #[test]
+    fn the_challenge_points_at_the_metadata_only_when_oauth_is_configured() {
+        let mut cfg = cfg();
+        let h = headers(&[("host", "api.example.com")]);
+        assert_eq!(challenge(&cfg, &h, "docs"), "Bearer");
+
+        cfg.oauth.authorization_servers = vec!["https://auth.example.com".into()];
+        assert_eq!(
+            challenge(&cfg, &h, "docs"),
+            "Bearer resource_metadata=\"http://api.example.com/.well-known/oauth-protected-resource/mcp/docs\""
+        );
+        let h = headers(&[("host", "internal:8500"), ("x-forwarded-proto", "https"),
+                          ("x-forwarded-host", "api.example.com")]);
+        assert!(challenge(&cfg, &h, "docs")
+            .contains("https://api.example.com/.well-known/oauth-protected-resource/mcp/docs"));
+
+        cfg.oauth.resource = "https://mcp.example.com/tools/".into();
+        assert!(challenge(&cfg, &h, "docs")
+            .contains("\"https://mcp.example.com/.well-known/oauth-protected-resource/tools\""));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "mcp": {
+    "allowedIPs": ["127.0.0.1", "::1"],
+    "authToken": [ { "token": "static-token", "roles": ["admin"] } ],
+    "authenticate": "auth.McpAuth",
+    "stdioTokenEnv": "MCP_HOOK_TEST_TOKEN",
+    "scopes": {
+      "read": { "includedTools": ["get_*", "whoami"] }
+    },
+    "oauth": {
+      "authorizationServers": ["https://auth.example.com"],
+      "scopesSupported": ["read", "write"],
+      "metadata": { "resource_name": "Hook fixture" }
+    }
+  }
+}

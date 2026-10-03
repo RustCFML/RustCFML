@@ -149,7 +149,7 @@ impl ServerManifest {
 /// duration of a dispatch so `mcp()` can reach the session and — once the
 /// streaming transport is in — write progress and log notifications onto the
 /// very stream the caller's request opened.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CallContext {
     /// Server id (`/mcp/<name>`), the key `mcpNotify` fans out on.
     pub server: String,
@@ -162,6 +162,14 @@ pub struct CallContext {
     pub progress_token: Option<Value>,
     /// What the client said it can do — gates sampling/elicitation.
     pub capabilities: ClientCapabilities,
+    /// Who is calling — the struct a static token or the `authenticate` hook
+    /// produced — for `mcp().identity()`. `None` when unauthenticated.
+    pub identity: Option<CfmlValue>,
+    /// The raw `Authorization` header, for a handler that forwards a
+    /// downstream call on the caller's behalf. `None` on stdio.
+    pub authorization: Option<String>,
+    /// `"http"` or `"stdio"`.
+    pub transport: String,
 }
 
 /// Read an annotation off a `__funcmeta_<name>` struct, case-insensitively.

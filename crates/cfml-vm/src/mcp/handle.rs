@@ -286,6 +286,11 @@ impl CfmlNative for McpHandle {
             "server" => Ok(CfmlValue::string(self.ctx.server.clone())),
             "client" => Ok(client_struct(&self.ctx, &self.registry)),
             "streaming" => Ok(CfmlValue::Bool(self.ctx.stream.is_some())),
+            "identity" => Ok(self.identity()),
+            "authorization" => Ok(CfmlValue::string(
+                self.ctx.authorization.clone().unwrap_or_default(),
+            )),
+            "transport" => Ok(CfmlValue::string(self.ctx.transport.clone())),
             // `notifications/tools/list_changed` — tell the client to re-read
             // the tool list, e.g. after an app reload changed what is exposed.
             "toolschanged" => Ok(CfmlValue::Bool(self.emit(Outgoing::Notification {
@@ -329,8 +334,19 @@ impl CfmlNative for McpHandle {
         match name.to_lowercase().as_str() {
             "session" => Some(CfmlValue::string(self.ctx.session.clone())),
             "server" => Some(CfmlValue::string(self.ctx.server.clone())),
+            "identity" => Some(self.identity()),
+            "transport" => Some(CfmlValue::string(self.ctx.transport.clone())),
             _ => None,
         }
+    }
+}
+
+impl McpHandle {
+    /// The caller's identity: a deep copy, so a handler that edits the struct
+    /// it was given cannot change who the engine thinks the caller is. Null
+    /// for an unauthenticated caller.
+    fn identity(&self) -> CfmlValue {
+        self.ctx.identity.as_ref().map(|v| v.deep_copy()).unwrap_or(CfmlValue::Null)
     }
 }
 
@@ -390,6 +406,7 @@ mod tests {
             stream: Some(ord),
             progress_token,
             capabilities: ClientCapabilities { sampling: true, ..Default::default() },
+            ..Default::default()
         };
         (McpHandle::new(ctx, registry), sink)
     }
@@ -497,6 +514,7 @@ mod tests {
             stream: Some(ord),
             progress_token: None,
             capabilities: caps,
+            ..Default::default()
         };
         (McpHandle::new(ctx, registry.clone()), registry, session, ord, sink)
     }
@@ -571,6 +589,7 @@ mod tests {
             stream: Some(ord),
             progress_token: None,
             capabilities: ClientCapabilities::default(),
+            ..Default::default()
         };
         let mut handle = McpHandle::new(ctx, registry);
 
@@ -603,6 +622,7 @@ mod tests {
             stream: None, // answered as plain JSON — nowhere to put a request
             progress_token: None,
             capabilities: caps,
+            ..Default::default()
         };
         let mut handle = McpHandle::new(ctx, registry);
         let err = handle.call_method("sample", vec![messages()]).unwrap_err();

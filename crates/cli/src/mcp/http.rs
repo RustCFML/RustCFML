@@ -70,7 +70,7 @@ pub(crate) async fn post(
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
 
-    let caller = match guard(&state, peer, &headers) {
+    let caller = match guard(&state, peer, &headers, &info.name).await {
         Ok(caller) => caller,
         Err(deny) => return deny,
     };
@@ -332,11 +332,11 @@ pub(crate) async fn get(
     addr: ConnectInfo<std::net::SocketAddr>,
     req: axum::extract::Request,
 ) -> Response {
-    if super::resolve_server(&state.doc_root, &state.vfs, &name).is_none() {
+    let Some(info) = super::resolve_server(&state.doc_root, &state.vfs, &name) else {
         return crate::handle_request_for_mcp(State(state), addr, req).await;
-    }
+    };
     let headers = req.headers().clone();
-    if let Err(deny) = guard(&state, addr.0.ip(), &headers) {
+    if let Err(deny) = guard(&state, addr.0.ip(), &headers, &info.name).await {
         return deny;
     }
     // A client that will not accept an event stream cannot be given one; 405 is
@@ -398,10 +398,10 @@ pub(crate) async fn delete(
     addr: ConnectInfo<std::net::SocketAddr>,
     req: axum::extract::Request,
 ) -> Response {
-    if super::resolve_server(&state.doc_root, &state.vfs, &name).is_none() {
+    let Some(info) = super::resolve_server(&state.doc_root, &state.vfs, &name) else {
         return crate::handle_request_for_mcp(State(state), addr, req).await;
-    }
-    if let Err(deny) = guard(&state, addr.0.ip(), req.headers()) {
+    };
+    if let Err(deny) = guard(&state, addr.0.ip(), req.headers(), &info.name).await {
         return deny;
     }
     match header_str(req.headers(), SESSION_HEADER) {
@@ -422,10 +422,17 @@ pub(crate) async fn delete(
 }
 
 /// The checks every method shares: is MCP on, is the address allowed, is the
-/// origin allowed, is there a valid token, and can we speak the version asked
+/// origin allowed, is there a valid token — static, or vouched for by the
+/// application's `authenticate` hook — and can we speak the version asked
 /// for. Returns the authorized caller, or the response to send instead.
-fn guard(state: &AppState, peer: std::net::IpAddr, headers: &HeaderMap) -> Result<Caller, Response> {
-    let caller = auth::authorize(&state.cfconfig.mcp, peer, headers).map_err(|denied| {
+async fn guard(
+    state: &Arc<AppState>,
+    peer: std::net::IpAddr,
+    headers: &HeaderMap,
+    server: &str,
+) -> Result<Caller, Response> {
+    let cfg = &state.cfconfig.mcp;
+    let deny = |denied: Denied| {
         let status = match denied {
             Denied::Disabled => StatusCode::NOT_FOUND,
             Denied::Origin => StatusCode::FORBIDDEN,
@@ -435,17 +442,101 @@ fn guard(state: &AppState, peer: std::net::IpAddr, headers: &HeaderMap) -> Resul
         };
         let mut response = rpc_error(status, protocol::INVALID_REQUEST, denied.message());
         if denied == Denied::Token {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Bearer"),
-            );
+            if let Ok(v) = auth::challenge(cfg, headers, server).parse() {
+                response.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+            }
         }
         response
-    })?;
+    };
+    let caller = match auth::decide(cfg, peer, headers).map_err(deny)? {
+        auth::Decision::Done(caller) => caller,
+        auth::Decision::Resolve(token) => {
+            let runtime = McpRuntime {
+                server_state: state.server_state.clone(),
+                vfs: state.vfs.clone(),
+                sandbox: state.sandbox,
+            };
+            let returned = super::dispatch::authenticate(
+                runtime,
+                state.doc_root.clone(),
+                token,
+                header_struct(headers),
+                "http",
+            )
+            .await;
+            let mut caller = returned
+                .and_then(|v| auth::caller_from_identity(cfg, v))
+                .ok_or_else(|| deny(Denied::Token))?;
+            caller.authorization = header_str(headers, "authorization");
+            caller
+        }
+    };
     if let Some(deny) = version_rejected(headers) {
         return Err(deny);
     }
     Ok(caller)
+}
+
+/// The request headers as a CFML struct for the `authenticate` hook, keyed
+/// by lower-case name. Repeated headers are joined with ", ".
+fn header_struct(headers: &HeaderMap) -> cfml_common::dynamic::ValueMap {
+    let mut map = cfml_common::dynamic::ValueMap::default();
+    for name in headers.keys() {
+        let joined = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        map.insert(name.as_str().to_string(), cfml_common::dynamic::CfmlValue::string(joined));
+    }
+    map
+}
+
+/// `GET /.well-known/oauth-protected-resource[/mcp/{name}]` — the protected
+/// resource metadata (RFC 9728) an OAuth client reads to find the
+/// authorization server. Only routed when `mcp.oauth` names one.
+pub(crate) async fn protected_resource_metadata(
+    State(state): State<Arc<AppState>>,
+    addr: ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    let cfg = &state.cfconfig.mcp;
+    let suffix = req
+        .uri()
+        .path()
+        .strip_prefix("/.well-known/oauth-protected-resource")
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    if !cfg.enabled || !cfg.oauth.enabled() || !auth::ip_allowed(&cfg.allowed_ips, addr.0.ip()) {
+        return crate::handle_request_for_mcp(State(state), addr, req).await;
+    }
+    let body = metadata_document(cfg, req.headers(), &suffix);
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "max-age=3600")],
+        axum::Json(body),
+    )
+        .into_response()
+}
+
+fn metadata_document(cfg: &cfml_config::schema::McpCfg, headers: &HeaderMap, suffix: &str) -> Value {
+    let mut doc = serde_json::Map::new();
+    // Extra fields first, so the ones the engine is responsible for win.
+    for (k, v) in &cfg.oauth.metadata {
+        doc.insert(k.clone(), v.clone());
+    }
+    doc.insert("resource".into(), Value::String(auth::resource_for(cfg, headers, suffix)));
+    doc.insert(
+        "authorization_servers".into(),
+        Value::from(cfg.oauth.authorization_servers.clone()),
+    );
+    if !cfg.oauth.scopes_supported.is_empty() {
+        doc.insert("scopes_supported".into(), Value::from(cfg.oauth.scopes_supported.clone()));
+    }
+    doc.insert("bearer_methods_supported".into(), serde_json::json!(["header"]));
+    Value::Object(doc)
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {

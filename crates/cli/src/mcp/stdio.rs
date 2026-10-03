@@ -94,9 +94,6 @@ fn main_with(
     let cfconfig = Arc::new(load_cfconfig(&webroot, embedded_vfs.as_ref()));
     let mut server_state = ServerState::with_config(false, cfconfig.clone());
     server_state.webroot = Some(webroot.clone());
-    // On stdio the caller IS whoever launched this process, so they are
-    // authenticated; their roles come from configuration.
-    let caller = super::auth::Caller::stdio(&cfconfig.mcp);
     let runtime = McpRuntime { server_state, vfs, sandbox: false };
 
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -105,6 +102,18 @@ fn main_with(
             eprintln!("rustcfml mcp: could not start the runtime: {e}");
             return 1;
         }
+    };
+
+    // On stdio the caller IS whoever launched this process, so they are
+    // authenticated; their roles come from configuration — unless the config
+    // names an environment variable carrying a credential, in which case the
+    // process is whoever that credential says, resolved once, here.
+    let Some(caller) = rt.block_on(stdio_caller(&runtime, &cfconfig.mcp, &webroot)) else {
+        eprintln!(
+            "rustcfml mcp: the credential in ${} was refused",
+            cfconfig.mcp.stdio_token_env.trim()
+        );
+        return 1;
     };
 
     let stdin = BufReader::new(std::io::stdin());
@@ -127,6 +136,45 @@ fn main_with(
         }
     }
     0
+}
+
+/// Who this stdio process is. Without `stdioTokenEnv`, or with the variable
+/// unset, that is the launcher under `stdioRoles` as it always was. With a
+/// credential present it is resolved exactly as an HTTP bearer token is —
+/// static entries first, then the `authenticate` hook — and `None` means it
+/// was refused, which ends the process rather than quietly serving it as
+/// somebody else.
+async fn stdio_caller(
+    runtime: &McpRuntime,
+    cfg: &cfml_config::schema::McpCfg,
+    webroot: &Path,
+) -> Option<super::auth::Caller> {
+    let var = cfg.stdio_token_env.trim();
+    let token = (!var.is_empty())
+        .then(|| std::env::var(var).ok())
+        .flatten()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let Some(token) = token else {
+        return Some(super::auth::Caller::stdio(cfg));
+    };
+    let mut caller = match super::auth::resolve_static(cfg, &token) {
+        Some(caller) => caller,
+        None if super::auth::has_hook(cfg) => {
+            let returned = super::dispatch::authenticate(
+                runtime.clone(),
+                webroot.to_path_buf(),
+                token,
+                Default::default(),
+                "stdio",
+            )
+            .await?;
+            super::auth::caller_from_identity(cfg, returned)?
+        }
+        None => return None,
+    };
+    caller.transport = "stdio";
+    Some(caller)
 }
 
 /// Decode one line and produce the messages to write back.
