@@ -62,6 +62,23 @@ assert("no-init class: independent", dpN2.getColor(), "red");
 dpN3 = new oop.DeclProtoNoInit(color = "green");
 assert("implicit accessor constructor", dpN3.getColor(), "green");
 
+// Literal assignments in the body (ColdBox-handler style) are per instance.
+dpH1 = new oop.DeclProtoHandler();
+dpH2 = new oop.DeclProtoHandler();
+dpH1.allowedMethods.extra = "GET";
+arrayAppend(dpH1.getCols(), "c");
+dpH1.setLimit(99);
+assert("this.* struct literal is public", dpH2.allowedMethods.save, "POST");
+assertFalse("this.* struct literal not shared", structKeyExists(dpH2.allowedMethods, "extra"));
+assert("variables.* array literal not shared", arrayLen(dpH2.getCols()), 2);
+assert("variables.* scalar not shared", dpH2.getLimit(), 10);
+assert("bare body assignment is a variables key", dpH2.getMode(), "bare");
+assertFalse("variables.* stays private", structKeyExists(dpH2, "limit"));
+assertFalse("bare body assignment stays private", structKeyExists(dpH2, "mode"));
+assert("this.* scalar", dpH2.prehandler_only, "index,edit");
+dpH3 = createObject("component", "oop.DeclProtoHandler");
+assert("a later instance starts clean", structCount(dpH3.allowedMethods) & arrayLen(dpH3.getCols()) & dpH3.getLimit(), "2210");
+
 // Many in a loop stay independent.
 dpList = [];
 for (dpI = 1; dpI <= 50; dpI++) {

@@ -5214,13 +5214,14 @@ impl CfmlCompiler {
             prop_count += 1;
         }
 
-        // Declaration-only body: no pseudo-constructor statements, and every
+        // Declaration-only body: every pseudo-constructor statement is a plain
+        // literal assignment to `variables.x` / `this.x` / a bare name, and every
         // property default is a literal. Executing such a body yields the same
         // per-instance data every time, so the VM may build later instances by
         // copying the first one instead of running the body again (see
         // `ctor_prototype_lookup`). Anything else — a statement, a default that
         // calls or reads something — keeps the marker off.
-        let declarative = component.body.is_empty()
+        let declarative = component.body.iter().all(is_literal_scope_assignment)
             && component
                 .properties
                 .iter()
@@ -7085,6 +7086,55 @@ fn is_literal_expression(e: &Expression) -> bool {
                 (is_literal_expression(k) || matches!(k, Expression::Identifier(_)))
                     && is_literal_expression(v)
             }),
+        _ => false,
+    }
+}
+
+/// A pseudo-constructor statement that only stores a constant: `variables.x =
+/// <literal>`, `this.x = <literal>` or a bare `x = <literal>` (a component-body
+/// bare name is a `variables` key). Running it again on a fresh instance stores
+/// an equal, fresh value — so it does not stop the body being declaration-only.
+fn is_literal_scope_assignment(st: &Statement) -> bool {
+    // A script-body `variables.a = 1;` parses as an expression statement holding
+    // an assignment `BinaryOp`; the `Statement::Assignment` form comes from tags.
+    if let Statement::Expression(es) = st {
+        let Expression::BinaryOp(b) = &es.expr else { return false };
+        if b.operator != BinaryOpType::Assign || !is_literal_expression(&b.right) {
+            return false;
+        }
+        return match b.left.as_ref() {
+            Expression::Identifier(id) => is_plain_bare_name(&id.name),
+            Expression::MemberAccess(m) => !m.null_safe && is_scope_root(&m.object),
+            _ => false,
+        };
+    }
+    let Statement::Assignment(a) = st else { return false };
+    if !matches!(a.operator, AssignOp::Equal) || !is_literal_expression(&a.value) {
+        return false;
+    }
+    match &a.target {
+        AssignTarget::Variable(name) => is_plain_bare_name(name),
+        AssignTarget::StructAccess(obj, _) => is_scope_root(obj),
+        AssignTarget::ArrayAccess(..) => false,
+    }
+}
+
+/// A bare variable name that stores a key: not dotted, and not a scope name
+/// (`variables = …`, `this = …` replace the scope rather than store into it).
+fn is_plain_bare_name(name: &str) -> bool {
+    !name.contains('.')
+        && !["variables", "this", "local", "arguments", "super", "static"]
+            .iter()
+            .any(|r| name.eq_ignore_ascii_case(r))
+}
+
+/// `variables` or `this` as the root of a one-level member store.
+fn is_scope_root(obj: &Expression) -> bool {
+    match obj {
+        Expression::This(_) => true,
+        Expression::Identifier(id) => {
+            id.name.eq_ignore_ascii_case("variables") || id.name.eq_ignore_ascii_case("this")
+        }
         _ => false,
     }
 }
