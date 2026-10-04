@@ -5762,6 +5762,15 @@ impl CfmlCompiler {
                                     instructions.push(BytecodeOp::SetScopePath(std::sync::Arc::new(
                                         ScopePath::new(format!("{}.{}", ident.name, access.member)),
                                     )));
+                                } else if ident.name.eq_ignore_ascii_case("variables") && !access.null_safe {
+                                    // `variables.x = v` at template level (a page, a
+                                    // component body): the same direct insert the
+                                    // `Statement::Assignment` twin emits, instead of
+                                    // loading the scope by name, `SetProperty` and
+                                    // storing the scope back (~94 ns per store on a
+                                    // page, ~200 in a component body; Lucee ~16).
+                                    // Not in value position (handled above).
+                                    instructions.push(BytecodeOp::StoreVariablesKey(Name::from(&access.member)));
                                 } else {
                                     // SetProperty needs [obj, value].
                                     self.compile_expression(&access.object, instructions);
