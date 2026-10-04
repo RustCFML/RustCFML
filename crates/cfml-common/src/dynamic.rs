@@ -3164,6 +3164,7 @@ impl CfmlValue {
                     sql,
                     execution_time: None,
                     current_row: 1,
+                    row_keys: Default::default(),
                 }))
             }
             #[cfg(feature = "component-instance")]
@@ -3271,7 +3272,7 @@ impl CfmlValue {
                         )
                     })
                     .collect();
-                let copy = CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None, current_row: 1 }));
+                let copy = CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None, current_row: 1, row_keys: Default::default() }));
                 seen.insert(ptr, copy.clone());
                 copy
             }
@@ -3529,13 +3530,19 @@ pub struct CfmlQueryData {
     /// see [`current_row`](Self::current_row) — so `#[derive(Default)]` and the
     /// pre-cursor struct literals keep working.
     pub current_row: usize,
+    /// Column names as prebuilt [`Key`]s for [`row_at`](Self::row_at), so a
+    /// row struct clones a key (an atomic increment) instead of allocating
+    /// one per column per row. Built on first use and checked against
+    /// `columns` every time, so code that edits `columns` directly never sees
+    /// a stale key; it just falls back to building keys.
+    pub row_keys: std::sync::OnceLock<Vec<Key>>,
 }
 
 impl CfmlQueryData {
     /// Empty data block with the given columns.
     pub fn new(columns: Vec<String>) -> Self {
         let n = columns.len();
-        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None, execution_time: None, current_row: 1 }
+        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None, execution_time: None, current_row: 1, row_keys: Default::default() }
     }
 
     /// The 1-based cursor row, normalising the `0` default to row 1.
@@ -3628,6 +3635,9 @@ impl CfmlQueryData {
             return None;
         }
         let mut m = ValueMap::with_capacity_and_hasher(self.columns.len(), Default::default());
+        let keys = self.row_keys.get_or_init(|| self.columns.iter().map(Key::new).collect());
+        let keys_current = keys.len() == self.columns.len()
+            && keys.iter().zip(&self.columns).all(|(k, c)| k.as_str() == c);
         for (ci, col) in self.columns.iter().enumerate() {
             // A SQL-NULL cell surfaces as an empty string, not `Null`. This is
             // the CFML default (`nullSupport = false`): every column of a query
@@ -3641,7 +3651,11 @@ impl CfmlQueryData {
                 CfmlValue::Null => CfmlValue::string(String::new()),
                 other => other.clone(),
             };
-            m.insert(col.clone(), cell);
+            if keys_current {
+                m.insert(keys[ci].clone(), cell);
+            } else {
+                m.insert(col.clone(), cell);
+            }
         }
         Some(m)
     }

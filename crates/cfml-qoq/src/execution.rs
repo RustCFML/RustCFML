@@ -2607,6 +2607,7 @@ fn build_query(
         sql: None,
         execution_time: None,
         current_row: 1,
+        row_keys: Default::default(),
     }
 }
 

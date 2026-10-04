@@ -547,23 +547,82 @@ pub struct DatasourceCfg {
     pub default: bool,
 }
 
+/// Percent-encode a URL userinfo component (user or password): everything but
+/// RFC 3986 unreserved characters.
+fn percent_encode_userinfo(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// Insert `creds` (`user:pass@`, already encoded, or empty) after the `://` of a
+/// connection URL whose authority has no credentials. URLs without `://` (a
+/// SQLite path, `jdbc:sqlite:`) and URLs that already name a user are returned
+/// unchanged.
+fn with_url_credentials(url: &str, creds: &str) -> String {
+    if creds.is_empty() || url.to_ascii_lowercase().contains("sqlite") {
+        return url.to_string();
+    }
+    let Some(i) = url.find("://") else { return url.to_string() };
+    let rest = &url[i + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') {
+        return url.to_string();
+    }
+    format!("{}{}{}", &url[..i + 3], creds, rest)
+}
+
 impl DatasourceCfg {
+    /// Build from a CFML datasource struct (`this.datasources` entry or an
+    /// inline `datasource={...}`), read through a case-insensitive `get` that
+    /// returns "" for a missing key. `driver` is RustCFML's own key; `type` and
+    /// `dbdriver` are the Lucee/ACF spellings.
+    pub fn from_cfml_struct(get: impl Fn(&str) -> String) -> Self {
+        let mut ds = DatasourceCfg::default();
+        ds.driver = [get("driver"), get("type"), get("dbdriver")]
+            .into_iter()
+            .find(|d| !d.is_empty())
+            .unwrap_or_default();
+        ds.class = get("class");
+        ds.host = get("host");
+        ds.port = get("port");
+        ds.database = get("database");
+        ds.username = get("username");
+        ds.password = get("password");
+        ds.connection_string = get("connectionString");
+        ds
+    }
+
     /// Build a connection string that the cfml-stdlib query driver layer can
     /// consume. Honors `connectionString` verbatim when provided; otherwise
     /// synthesises a URL from `driver` + host/port/database/credentials.
     /// Returns `None` for an unsupported / unrecognised driver.
     pub fn connection_url(&self) -> Option<String> {
-        if !self.connection_string.is_empty() {
-            return Some(self.connection_string.clone());
-        }
         let driver = self.canonical_driver();
+        // MySQL and PostgreSQL URLs are percent-decoded by their drivers, so a
+        // credential containing `@`, `:`, `/`, `#` or `%` must be encoded. The
+        // SQL Server URL is split as-is and is left raw.
+        let encode = matches!(driver.as_str(), "mysql" | "mariadb" | "postgresql" | "postgres");
+        let enc = |v: &str| if encode { percent_encode_userinfo(v) } else { v.to_string() };
         let creds = if self.username.is_empty() && self.password.is_empty() {
             String::new()
         } else if self.password.is_empty() {
-            format!("{}@", self.username)
+            format!("{}@", enc(&self.username))
         } else {
-            format!("{}:{}@", self.username, self.password)
+            format!("{}:{}@", enc(&self.username), enc(&self.password))
         };
+        if !self.connection_string.is_empty() {
+            // Lucee authenticates a JDBC `connectionString` with the separate
+            // `username`/`password` keys. Put them into a URL that carries no
+            // credentials of its own; one that does is left alone.
+            return Some(with_url_credentials(&self.connection_string, &creds));
+        }
         let port = if self.port.is_empty() {
             String::new()
         } else {
@@ -1583,6 +1642,42 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_string_takes_separate_credentials() {
+        let mut ds = DatasourceCfg::default();
+        ds.class = "com.mysql.cj.jdbc.Driver".into();
+        ds.connection_string = "jdbc:mysql://db:3306/app?useSSL=false".into();
+        ds.username = "root".into();
+        ds.password = "p@ss:w/rd#1".into();
+        assert_eq!(
+            ds.connection_url().unwrap(),
+            "jdbc:mysql://root:p%40ss%3Aw%2Frd%231@db:3306/app?useSSL=false"
+        );
+        // A URL that already names a user keeps its own credentials.
+        ds.connection_string = "mysql://other:x@db/app".into();
+        assert_eq!(ds.connection_url().unwrap(), "mysql://other:x@db/app");
+        // No separate credentials: unchanged.
+        ds.username.clear();
+        ds.password.clear();
+        ds.connection_string = "jdbc:mysql://db/app".into();
+        assert_eq!(ds.connection_url().unwrap(), "jdbc:mysql://db/app");
+        // SQLite paths never take credentials.
+        ds.username = "u".into();
+        ds.connection_string = "jdbc:sqlite:/tmp/a.db".into();
+        assert_eq!(ds.connection_url().unwrap(), "jdbc:sqlite:/tmp/a.db");
+    }
+
+    #[test]
+    fn synthesised_mysql_url_encodes_credentials() {
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "mysql".into();
+        ds.host = "h".into();
+        ds.database = "d".into();
+        ds.username = "u".into();
+        ds.password = "a@b".into();
+        assert_eq!(ds.connection_url().unwrap(), "mysql://u:a%40b@h/d");
+    }
+
     use super::*;
 
     #[test]

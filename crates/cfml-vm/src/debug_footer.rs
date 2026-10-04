@@ -1096,7 +1096,17 @@ fn render_html(
         collapsible_heading(
             &mut s,
             "rcfml-queries",
-            &format!("Queries ({})", data.queries.len()),
+            // The heading counts every statement; rows past maxRecords are
+            // clipped from the table but must not vanish from the count.
+            &if data.dropped_queries > 0 {
+                format!(
+                    "Queries ({}, {} shown)",
+                    data.queries.len() + data.dropped_queries,
+                    data.queries.len()
+                )
+            } else {
+                format!("Queries ({})", data.queries.len())
+            },
         );
         s.push_str("<div class=\"rcfml-queries\" style=\"display:none\">\n");
         if data.queries.is_empty() {
@@ -2058,7 +2068,8 @@ mod tests {
             });
         }
         let html = c.render(&[], None, &[]);
-        assert!(html.contains("Queries (2)"));
+        // The heading counts every statement run, not just the rows shown.
+        assert!(html.contains("Queries (5, 2 shown)"));
         assert!(html.contains("+3 more queries, 9.000 ms, clipped"));
         // The clip trims the display only — Execution Time still counts all 5
         // queries: kept 0+1 ms plus dropped 2+3+4 ms = 10 ms total.

@@ -1756,9 +1756,8 @@ pub struct ClassCacheEntry {
     /// One entry per dotted name the class was asked for (as written): `name`/
     /// `fullname` echo the caller's spelling, so two spellings must not share.
     pub metadata_path: Vec<(String, CfmlValue)>,
-    /// Same for `getMetaData(instance)`, per class name. Kept apart from
-    /// `metadata_path` only because the path form carries RustCFML's extra
-    /// `fullExtends` key.
+    /// Same for `getMetaData(instance)`, per class name. Either slot serves both
+    /// forms (`cross_request_metadata`): Lucee returns one struct for both.
     pub metadata_instance: Vec<(String, CfmlValue)>,
 }
 
@@ -3151,6 +3150,11 @@ pub struct CfmlVirtualMachine {
     /// under its declared SHORT name, so a dotted name can never be answered from
     /// `globals` and no later in-request definition can be shadowed by this cache.
     component_path_meta_cache: HashMap<MetaMemoKey, CfmlValue>,
+    /// Built class metadata by (source file, name) for a VM with NO server
+    /// state (the CLI): the stand-in for the cross-request class cache, so the
+    /// instance and path forms share one struct there too. A served VM never
+    /// reads it; the class cache is generation-checked and this is not.
+    local_class_metadata: HashMap<(String, String), CfmlValue>,
     /// Diagnostics only (`RUSTCFML_COUNTERS=1`): keys already resolved by
     /// `resolve_component_template` this request, to size how often a template
     /// EXECUTION is repeated rather than just its filename lookup.
@@ -4903,6 +4907,7 @@ impl CfmlVirtualMachine {
             class_records: FxHashMap::default(),
             component_inherit_meta_cache: HashMap::new(),
             component_path_meta_cache: HashMap::new(),
+            local_class_metadata: HashMap::new(),
             resolved_template_keys_seen: FxHashSet::default(),
             component_meta_template_cache: FxHashMap::default(),
             meta_template_depth: 0,
@@ -14605,6 +14610,21 @@ impl CfmlVirtualMachine {
                                             self.source_file = Some(src);
                                             prev
                                         });
+                                    // Debug footer: `super.m()` is a frame of its
+                                    // own, charged to the PARENT's file. Without
+                                    // it the parent's whole body showed up as the
+                                    // child method's self time (Preside's site
+                                    // Config.configure() carried the system
+                                    // Config.configure() it calls).
+                                    #[cfg(feature = "observability")]
+                                    let super_frame = if self.interest.contains(observe::Interest::TEMPLATE) {
+                                        parent_func.as_ref().and_then(|pf| pf.source_file_arc()).map(|src| {
+                                            self.template_frame_begin();
+                                            (src, std::time::Instant::now())
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     let call_result = if let Some(parent_func) = parent_func {
                                         self.execute_function_with_args(
                                             &parent_func,
@@ -14614,6 +14634,14 @@ impl CfmlVirtualMachine {
                                     } else {
                                         self.call_function(&prop, args, &method_locals)
                                     };
+                                    #[cfg(feature = "observability")]
+                                    if let Some((src, start)) = super_frame {
+                                        self.template_frame_end(
+                                            &src,
+                                            Some(method_name.as_str()),
+                                            start.elapsed().as_micros() as i64,
+                                        );
+                                    }
                                     if let Some(prev) = saved_super_source {
                                         self.source_file = prev;
                                     }
@@ -19546,21 +19574,14 @@ impl CfmlVirtualMachine {
                                 Some(CfmlValue::String(p)) => Some((*p).to_string()),
                                 _ => None,
                             };
-                            let chain = s.get_ci("__extends_chain");
                             if !name.is_empty() {
                                 let mut visited = std::collections::HashSet::new();
-                                if let Some(mut meta) = self.build_inheritance_metadata(
+                                if let Some(meta) = self.build_inheritance_metadata(
                                     &name,
                                     src,
                                     parent_locals,
                                     &mut visited,
                                 ) {
-                                    // Preserve RustCFML's flat `fullExtends` chain
-                                    // (carried on the instance) for callers that
-                                    // read it.
-                                    if let Some(chain @ CfmlValue::Array(_)) = chain {
-                                        meta.insert("fullExtends".to_string(), chain);
-                                    }
                                     return Ok(CfmlValue::strukt(meta));
                                 }
                             }
@@ -19807,18 +19828,14 @@ impl CfmlVirtualMachine {
                                     Some(CfmlValue::String(p)) => Some((**p).to_string()),
                                     _ => None,
                                 };
-                                let chain = snap.get("__extends_chain").cloned();
                                 if !name.is_empty() {
                                     let mut visited = std::collections::HashSet::new();
-                                    if let Some(mut meta) = self.build_inheritance_metadata(
+                                    if let Some(meta) = self.build_inheritance_metadata(
                                         &name,
                                         src,
                                         parent_locals,
                                         &mut visited,
                                     ) {
-                                        if let Some(chain @ CfmlValue::Array(_)) = chain {
-                                            meta.insert("fullExtends".to_string(), chain);
-                                        }
                                         return Ok(CfmlValue::strukt(meta));
                                     }
                                 }
@@ -19934,7 +19951,6 @@ impl CfmlVirtualMachine {
                                         Some(CfmlValue::String(p)) => Some((**p).to_string()),
                                         _ => None,
                                     };
-                                    let chain = snap.get("__extends_chain").cloned();
                                     let mut visited = std::collections::HashSet::new();
                                     let _t_build = cfml_common::perf_counters::ScopedNanos::new(
                                         &cfml_common::perf_counters::META_MISS_BUILD_NANOS,
@@ -19946,10 +19962,7 @@ impl CfmlVirtualMachine {
                                         &mut visited,
                                     );
                                     drop(_t_build);
-                                    if let Some(mut meta) = built {
-                                        if let Some(chain @ CfmlValue::Array(_)) = chain {
-                                            meta.insert("fullExtends".to_string(), chain);
-                                        }
+                                    if let Some(meta) = built {
                                         let out = CfmlValue::strukt(meta);
                                         return Ok(self_.memo_path_metadata(meta_key, tmpl_src.as_deref(), out));
                                     }
@@ -34875,14 +34888,29 @@ impl CfmlVirtualMachine {
         #[cfg(feature = "observability")]
         {
             if self.interest.contains(observe::Interest::TEMPLATE) {
-                let src = {
-                    let s = inst.read().class.source_file.clone();
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(s)
-                    }
+                // Charge the call to the file that DEFINES the method: an
+                // inherited method runs the parent's code, and charging it to
+                // the instance's own class hid the parent's cost in the child's
+                // row. Falls back to the class file for a method without a
+                // compiled body (injected closures, onMissingMethod, ...).
+                let method_fn = inst.read().lookup_method(method.probe());
+                let defining_src: Option<std::sync::Arc<str>> = match &method_fn {
+                    Some(CfmlValue::Function(f)) => match &f.body {
+                        cfml_common::dynamic::CfmlClosureBody::Expression(b) => match b.as_ref() {
+                            CfmlValue::Int(idx) => self
+                                .resolve_fn(*idx)
+                                .and_then(|bf| bf.source_file_arc())
+                                .filter(|p| !p.is_empty()),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
                 };
+                let src: Option<std::sync::Arc<str>> = defining_src.or_else(|| {
+                    let g = inst.read();
+                    (!g.class.source_file.is_empty()).then(|| std::sync::Arc::from(g.class.source_file.as_str()))
+                });
                 if let Some(src) = src {
                     let start = std::time::Instant::now();
                     self.template_frame_begin();
@@ -37919,17 +37947,35 @@ impl CfmlVirtualMachine {
         name: &str,
         instance_form: bool,
     ) -> Option<CfmlValue> {
-        let ss = self.server_state.as_ref()?;
+        let Some(ss) = self.server_state.as_ref() else {
+            return self.local_class_metadata.get(&(src.to_string(), name.to_string())).cloned();
+        };
         let generation = *self.class_generations.get(src)?;
         let r = ss.class_caches.read();
         let e = r.get(src).filter(|e| e.generation == generation)?;
-        let slot = if instance_form { &e.metadata_instance } else { &e.metadata_path };
-        slot.iter().find(|(k, _)| k == name).map(|(_, m)| m.clone())
+        // Lucee hands `getMetaData(instance)` and `getComponentMetaData(path)`
+        // the SAME struct for a class (a key added through one shows through
+        // the other — verified on 7.1), so either form's build serves both.
+        // Before, each form built and held its own copy (~20 MB of a booted
+        // Preside heap) and they diverged as soon as a caller mutated one.
+        let (own, other) = if instance_form {
+            (&e.metadata_instance, &e.metadata_path)
+        } else {
+            (&e.metadata_path, &e.metadata_instance)
+        };
+        own.iter()
+            .chain(other.iter())
+            .find(|(k, _)| k == name)
+            .map(|(_, m)| m.clone())
     }
 
     /// Cross-request class cache, write side for metadata (see
     /// `cross_request_metadata`).
-    fn publish_metadata(&self, src: &str, name: &str, instance_form: bool, meta: &CfmlValue) {
+    fn publish_metadata(&mut self, src: &str, name: &str, instance_form: bool, meta: &CfmlValue) {
+        if self.server_state.is_none() {
+            self.local_class_metadata.insert((src.to_string(), name.to_string()), meta.clone());
+            return;
+        }
         let m = meta.clone();
         let name = name.to_string();
         self.publish_class_cache(src, |e| {
@@ -40878,28 +40924,7 @@ impl CfmlVirtualMachine {
                     s.data_get(key).map(|v| v.as_string())
                         .unwrap_or_default()
                 };
-                let mut ds = cfml_config::DatasourceCfg::default();
-                // `driver` is RustCFML's native key; `type`/`dbdriver` are the
-                // Lucee/ACF aliases (Preside et al. declare `{ type:"MySQL" }`).
-                ds.driver = {
-                    let d = get("driver");
-                    if !d.is_empty() {
-                        d
-                    } else {
-                        let t = get("type");
-                        if t.is_empty() { get("dbdriver") } else { t }
-                    }
-                };
-                ds.class = get("class");
-                ds.host = get("host");
-                ds.port = get("port");
-                ds.database = get("database");
-                ds.username = get("username");
-                ds.password = get("password");
-                ds.connection_string = {
-                    let cs = get("connectionString");
-                    if cs.is_empty() { get("connectionstring") } else { cs }
-                };
+                let ds = cfml_config::DatasourceCfg::from_cfml_struct(&get);
                 // Optional per-datasource connection-acquire timeout (seconds);
                 // lets an app make an unreachable datasource fail fast. The
                 // `get` helper is case-insensitive so this matches any casing.

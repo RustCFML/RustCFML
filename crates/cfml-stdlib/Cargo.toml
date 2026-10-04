@@ -58,6 +58,7 @@ s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:tokio
 
 [dependencies]
 cfml-common = { workspace = true }
+cfml-config = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

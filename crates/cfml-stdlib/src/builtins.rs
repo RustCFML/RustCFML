@@ -8666,7 +8666,6 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                         extends_meta.insert("name".to_string(), first.clone());
                         meta.insert("extends".to_string(), CfmlValue::strukt(extends_meta));
                     }
-                    meta.insert("fullExtends".to_string(), CfmlValue::Array(chain.clone()));
                 }
                 // A component with no parent extends Lucee's implicit base
                 // component (GH #452). Interfaces do not.
@@ -11051,6 +11050,12 @@ pub(crate) enum DbDriver {
 pub(crate) fn datasource_attr_string(v: &CfmlValue) -> String {
     match v {
         CfmlValue::Struct(ds) => {
+            // The same struct-to-URL rules as `this.datasources` (driver from
+            // type/class, credentials merged into a connectionString, ...).
+            let get = |k: &str| ds.data_get(k).map(|v| v.as_string()).unwrap_or_default();
+            if let Some(url) = cfml_config::DatasourceCfg::from_cfml_struct(get).connection_url() {
+                return url;
+            }
             for key in ["connectionString", "url", "database"] {
                 if let Some(cs) = ds.data_get(key) {
                     let s = cs.as_string();
@@ -11492,6 +11497,16 @@ fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, Cf
 /// config. The `mysql` crate can't do libpq-style "try TLS then fall back", so
 /// any non-disabled mode requires a successful TLS handshake. Verification uses
 /// the platform trust store (native-tls) unless a root cert path is supplied.
+/// URL parameters `mysql::Opts::from_url` accepts (mysql 28).
+#[cfg(feature = "mysql_db")]
+const MYSQL_CRATE_URL_PARAMS: &[&str] = &[
+    "pool_min", "pool_max", "user", "password", "host", "port", "socket", "db_name",
+    "prefer_socket", "enable_cleartext_plugin", "secure_auth", "tcp_keepalive_time_ms",
+    "tcp_keepalive_probe_interval_secs", "tcp_keepalive_probe_count", "tcp_user_timeout_ms",
+    "compress", "tcp_connect_timeout_ms", "stmt_cache_size", "reset_connection",
+    "check_health", "max_allowed_packet",
+];
+
 #[cfg(feature = "mysql_db")]
 fn mysql_extract_ssl(url: &str) -> (String, Option<mysql::SslOpts>) {
     let (base, query) = match url.split_once('?') {
@@ -11522,7 +11537,14 @@ fn mysql_extract_ssl(url: &str) -> (String, Option<mysql::SslOpts>) {
                 verify_cert = Some(v.eq_ignore_ascii_case("true") || v == "1")
             }
             "ssl_ca" | "sslrootcert" | "ssl-ca" => root_cert = Some(v.to_string()),
-            _ => kept.push(pair),
+            // Parameters the `mysql` crate understands pass through.
+            _ if MYSQL_CRATE_URL_PARAMS.contains(&k) => kept.push(pair),
+            // Anything else is a Connector/J property (`useUnicode`,
+            // `characterEncoding`, `allowPublicKeyRetrieval`, `serverTimezone`,
+            // ...). Lucee hands those to the JDBC driver; the crate rejects an
+            // unknown parameter outright, which failed every query. They have no
+            // equivalent here (connections are always UTF-8), so drop them.
+            _ => {}
         }
     }
 
@@ -11614,6 +11636,11 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         mysql::PoolConstraints::new(1, 100).unwrap_or(mysql::PoolConstraints::DEFAULT);
     let pool_opts = mysql::PoolOpts::default()
         .with_reset_connection(true)
+        // Liveness is checked by `mysql_checkout` instead: the crate's built-in
+        // check PINGs on EVERY checkout, one extra round-trip (~300 us against a
+        // local Docker MySQL) on the first query of every request. Lucee does not
+        // validate on borrow by default; we ping only a connection that sat idle.
+        .with_check_health(false)
         .with_constraints(constraints);
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
@@ -11786,6 +11813,24 @@ mod mysql_session_risky_tests {
     }
 
     #[test]
+    fn only_reads_are_retryable() {
+        use super::mysql_sql_is_plain_read as read;
+        for sql in ["SELECT 1", " /* x */ select * from t", "SHOW TABLES", "describe t"] {
+            assert!(read(sql), "read: {sql}");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "WITH c AS (SELECT 1) DELETE FROM t",
+            "CALL p()",
+            "",
+        ] {
+            assert!(!read(sql), "not a read: {sql}");
+        }
+    }
+
+    #[test]
     fn unknown_or_empty_defaults_to_risky() {
         assert!(mysql_sql_is_session_risky(""));
         assert!(mysql_sql_is_session_risky("   "));
@@ -11801,12 +11846,67 @@ mod mysql_session_risky_tests {
 fn checkout_request_mysql_conn(
     url: &str,
     pool: &mysql::Pool,
-) -> Result<mysql::PooledConn, CfmlError> {
+) -> Result<(mysql::PooledConn, bool), CfmlError> {
     if let Some(conn) = REQUEST_MYSQL_CONNS.with(|c| c.borrow_mut().remove(url)) {
-        return Ok(conn);
+        return Ok((conn, false));
     }
-    pool.get_conn()
+    mysql_checkout(url, pool)
+        .map(|c| (c, true))
         .map_err(|e| CfmlError::database(format!("queryExecute: MySQL connection error: {}", e)))
+}
+
+/// A pooled connection used within this window is handed out without a PING.
+/// HikariCP's equivalent (`aliveBypassWindowMs`) is 500 ms; a connection that a
+/// busy server keeps cycling never pays the round-trip, while one that sat idle
+/// (where a server `wait_timeout`, a proxy or a restart may have closed it) is
+/// still validated before use.
+#[cfg(feature = "mysql_db")]
+const MYSQL_ALIVE_BYPASS: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// When each pooled connection was last returned in a known-good state, keyed by
+/// (pool URL, server connection id). Only `release_request_db_conns` stamps it,
+/// so a connection returned any other way (transaction, error unwind, watchdog)
+/// has no stamp and is pinged on its next checkout.
+#[cfg(feature = "mysql_db")]
+fn mysql_conn_stamps() -> &'static Mutex<HashMap<(String, u32), std::time::Instant>> {
+    static STAMPS: OnceLock<Mutex<HashMap<(String, u32), std::time::Instant>>> = OnceLock::new();
+    STAMPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "mysql_db")]
+fn stamp_mysql_conn(url: &str, conn_id: u32) {
+    if let Ok(mut m) = mysql_conn_stamps().lock() {
+        // Stamps of connections the pool has since closed are never taken; keep
+        // the map bounded (pools are capped at 100 connections each).
+        if m.len() > 4096 {
+            m.clear();
+        }
+        m.insert((url.to_string(), conn_id), std::time::Instant::now());
+    }
+}
+
+/// Check a connection out of `pool`, PINGing it first unless it was returned
+/// within `MYSQL_ALIVE_BYPASS`. A connection that fails the PING is dropped (its
+/// reset fails, so the pool discards it) and the next one is tried.
+#[cfg(feature = "mysql_db")]
+fn mysql_checkout(url: &str, pool: &mysql::Pool) -> Result<mysql::PooledConn, mysql::Error> {
+    let mut last_err = None;
+    for _ in 0..16 {
+        let mut conn = pool.get_conn()?;
+        let recent = mysql_conn_stamps()
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&(url.to_string(), conn.connection_id())))
+            .is_some_and(|t| t.elapsed() < MYSQL_ALIVE_BYPASS);
+        if recent {
+            return Ok(conn);
+        }
+        match conn.as_mut().ping() {
+            Ok(()) => return Ok(conn),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("loop ran"))
 }
 
 /// Return a MySQL connection to the request-scoped cache (held until request end).
@@ -11841,6 +11941,7 @@ pub fn release_request_db_conns() {
                     // on any other path — error unwind, transaction conn, watchdog
                     // conn — still gets the full reset.
                     conn.reset_connection(false);
+                    stamp_mysql_conn(&url, conn.connection_id());
                 }
                 // Dirty (or unknown) connections drop with the pool default:
                 // COM_RESET_CONNECTION wipes session state (GitHub #275).
@@ -13588,21 +13689,18 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
             .collect();
         let (columns, keep) = dedup_result_columns(raw_columns);
 
-        let rows_result: Result<Vec<ValueMap>, _> = stmt
-            .query_map(rusqlite::params_from_iter(bound_params.iter()), |row| {
-                let mut row_map = ValueMap::default();
-                for (out_i, &src_i) in keep.iter().enumerate() {
-                    let val: SqlValue = row.get_unwrap(src_i);
-                    row_map.insert(columns[out_i].clone(), sqlite_to_cfml(val));
-                }
-                Ok(row_map)
-            })
-            .map_err(|e| sqlite_db_error("query error", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| sqlite_db_error("row error", e));
-
-        let rows = rows_result?;
-        build_query_result(columns, rows, sql, return_type)
+        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::new()).collect();
+        let mut rows_iter = stmt
+            .query(rusqlite::params_from_iter(bound_params.iter()))
+            .map_err(|e| sqlite_db_error("query error", e))?;
+        while let Some(row) = rows_iter.next().map_err(|e| sqlite_db_error("row error", e))? {
+            for (out_i, &src_i) in keep.iter().enumerate() {
+                let val: SqlValue = row.get_unwrap(src_i);
+                data[out_i].push(sqlite_to_cfml(val));
+            }
+        }
+        drop(rows_iter);
+        build_query_result_columnar(columns, data, sql, return_type)
     } else {
         let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
             .map_err(|e| sqlite_db_error("SQL error", e))?;
@@ -14024,7 +14122,7 @@ impl MysqlQueryTimeout {
                 Err(RecvTimeoutError::Timeout) => {
                     fired_thread.store(true, std::sync::atomic::Ordering::SeqCst);
                     if let Ok(pool) = get_mysql_pool(&url) {
-                        if let Ok(mut kc) = pool.get_conn() {
+                        if let Ok(mut kc) = mysql_checkout(&url, &pool) {
                             use mysql::prelude::Queryable;
                             let _ = kc.query_drop(format!("KILL QUERY {}", conn_id));
                         }
@@ -14064,16 +14162,47 @@ fn execute_mysql(
     // connection on BOTH the ok and error paths keeps it available (a query error
     // does not break the connection) and ensures it is eventually reset.
     let pool = get_mysql_pool(url)?;
-    let mut conn = checkout_request_mysql_conn(url, &pool)?;
+    let (mut conn, fresh) = checkout_request_mysql_conn(url, &pool)?;
     // Session-state-risky SQL (SET, USE, @vars, locks, DDL, ...) taints the held
     // connection: it will be reset at the request boundary instead of returning
     // to the pool with its prepared-statement cache intact.
-    if mysql_sql_is_session_risky(sql) {
+    let risky = mysql_sql_is_session_risky(sql);
+    if risky {
         mark_request_mysql_dirty(url);
     }
     let result = execute_mysql_on_conn(&mut conn, url, sql, params_arg, return_type, timeout_secs);
-    return_request_mysql_conn(url, conn);
+    if result.is_ok() || conn.as_mut().ping().is_ok() {
+        return_request_mysql_conn(url, conn);
+        return result;
+    }
+    // The connection is dead (the server, a proxy or a restart closed it). Drop
+    // it: its reset fails, so the pool discards it instead of handing it to the
+    // next request. A connection that came straight from the pool may have died
+    // while idle there, before this statement reached the server, so a READ is
+    // retried once on another connection. Writes are never retried: a connection
+    // lost mid-statement could already have applied them.
+    drop(conn);
+    if fresh && !risky && mysql_sql_is_plain_read(sql) {
+        let (mut conn, _) = checkout_request_mysql_conn(url, &pool)?;
+        let retry = execute_mysql_on_conn(&mut conn, url, sql, params_arg, return_type, timeout_secs);
+        return_request_mysql_conn(url, conn);
+        return retry;
+    }
     result
+}
+
+/// True for a statement that only reads (`SELECT`/`SHOW`/...), so running it a
+/// second time cannot change data. `WITH` is excluded: MySQL allows a CTE in front
+/// of UPDATE and DELETE. `SELECT ... FOR UPDATE` takes locks but
+/// changes nothing, and outside a transaction the lock ends with the statement.
+#[cfg(feature = "mysql_db")]
+fn mysql_sql_is_plain_read(sql: &str) -> bool {
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed.as_bytes().iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    matches!(
+        trimmed[..kw_len].to_ascii_uppercase().as_str(),
+        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"
+    )
 }
 
 #[cfg(feature = "mysql_db")]
@@ -14168,18 +14297,19 @@ fn execute_mysql_on_conn(
             .collect();
         let (columns, keep) = dedup_result_columns(raw_columns);
 
-        let mut rows: Vec<ValueMap> = Vec::new();
+        // Column-major straight from the wire: one Vec per column, no per-row
+        // struct (whose keys were allocated per cell and then looked up again by
+        // name to store the cell column-major).
+        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::new()).collect();
         for row_result in result.by_ref() {
-            let row = row_result.map_err(|e| map_err(e, "query error"))?;
-            let mut row_map = ValueMap::default();
+            let mut row = row_result.map_err(|e| map_err(e, "query error"))?;
             for (out_i, &src_i) in keep.iter().enumerate() {
-                let val: mysql::Value = row.get(src_i).unwrap_or(mysql::Value::NULL);
-                row_map.insert(columns[out_i].clone(), mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
+                let val: mysql::Value = row.take(src_i).unwrap_or(mysql::Value::NULL);
+                data[out_i].push(mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
             }
-            rows.push(row_map);
         }
 
-        build_query_result(columns, rows, sql, return_type)
+        build_query_result_columnar(columns, data, sql, return_type)
     } else {
         mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
             MysqlMutationError::Server(e) => map_err(e, "error"),
@@ -14459,15 +14589,11 @@ fn run_postgres_statements(
         let raw_columns: Vec<String> = prepared.columns().iter().map(|c| c.name().to_string()).collect();
         let (columns, keep) = dedup_result_columns(raw_columns);
 
-        let mut result_rows: Vec<ValueMap> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut row_map = ValueMap::default();
-            for (out_i, &src_i) in keep.iter().enumerate() {
-                row_map.insert(columns[out_i].clone(), postgres_row_to_cfml(row, src_i));
-            }
-            result_rows.push(row_map);
-        }
-        build_query_result(columns, result_rows, sql, return_type).map_err(PgRunError::from_cfml)
+        let data: Vec<Vec<CfmlValue>> = keep
+            .iter()
+            .map(|&src_i| rows.iter().map(|row| postgres_row_to_cfml(row, src_i)).collect())
+            .collect();
+        build_query_result_columnar(columns, data, sql, return_type).map_err(PgRunError::from_cfml)
     } else {
         let mut total: i64 = 0;
         let mut executed_any = false;
@@ -15262,17 +15388,12 @@ fn run_mssql_statement(
             };
             let (columns, keep) = dedup_result_columns(raw_columns);
 
-            let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
-            for row in &result {
-                let mut row_map = ValueMap::default();
-                for (out_i, &src_i) in keep.iter().enumerate() {
-                    let val = mssql_column_to_cfml(row, src_i);
-                    row_map.insert(columns[out_i].clone(), val);
-                }
-                rows.push(row_map);
-            }
+            let data: Vec<Vec<CfmlValue>> = keep
+                .iter()
+                .map(|&src_i| result.iter().map(|row| mssql_column_to_cfml(row, src_i)).collect())
+                .collect();
 
-            build_query_result(columns, rows, sql, return_type).map_err(MssqlRunError::from_cfml)
+            build_query_result_columnar(columns, data, sql, return_type).map_err(MssqlRunError::from_cfml)
         } else {
             // execute() returns the real rows-affected total (the previous
             // simple_query path mis-reported INSERT/UPDATE as 0 rows).
@@ -15589,7 +15710,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
         #[cfg(feature = "mysql_db")]
         DbDriver::Mysql(url) => {
             let pool = get_mysql_pool(&url)?;
-            let mut conn = pool.get_conn()
+            let mut conn = mysql_checkout(&url, &pool)
                 .map_err(|e| CfmlError::database(format!("cftransaction: MySQL pool error: {}", e)))?;
             use mysql::prelude::Queryable;
             conn.query_drop("BEGIN")
@@ -15878,20 +15999,18 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
         let (columns, keep) = dedup_result_columns(raw_columns);
-        let rows_result: Result<Vec<ValueMap>, _> = stmt
-            .query_map(rusqlite::params_from_iter(bound_params.iter()), |row| {
-                let mut row_map = ValueMap::default();
-                for (out_i, &src_i) in keep.iter().enumerate() {
-                    let val: SqlValue = row.get_unwrap(src_i);
-                    row_map.insert(columns[out_i].clone(), sqlite_to_cfml(val));
-                }
-                Ok(row_map)
-            })
-            .map_err(|e| sqlite_db_error("query error", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| sqlite_db_error("row error", e));
-        let rows = rows_result?;
-        build_query_result(columns, rows, sql, return_type)
+        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::new()).collect();
+        let mut rows_iter = stmt
+            .query(rusqlite::params_from_iter(bound_params.iter()))
+            .map_err(|e| sqlite_db_error("query error", e))?;
+        while let Some(row) = rows_iter.next().map_err(|e| sqlite_db_error("row error", e))? {
+            for (out_i, &src_i) in keep.iter().enumerate() {
+                let val: SqlValue = row.get_unwrap(src_i);
+                data[out_i].push(sqlite_to_cfml(val));
+            }
+        }
+        drop(rows_iter);
+        build_query_result_columnar(columns, data, sql, return_type)
     } else {
         let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
             .map_err(|e| sqlite_db_error("SQL error", e))?;
@@ -15942,16 +16061,14 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
                 (vec![], vec![])
             };
         let (columns, keep) = dedup_result_columns(raw_columns);
-        let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
-        for row in &result {
-            let mut row_map = ValueMap::default();
+        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::with_capacity(result.len())).collect();
+        for mut row in result {
             for (out_i, &src_i) in keep.iter().enumerate() {
-                let val: mysql::Value = row.get(src_i).unwrap_or(mysql::Value::NULL);
-                row_map.insert(columns[out_i].clone(), mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
+                let val: mysql::Value = row.take(src_i).unwrap_or(mysql::Value::NULL);
+                data[out_i].push(mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
             }
-            rows.push(row_map);
         }
-        build_query_result(columns, rows, sql, return_type)
+        build_query_result_columnar(columns, data, sql, return_type)
     } else {
         mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
             MysqlMutationError::Server(e) => {
@@ -16002,6 +16119,43 @@ fn dedup_result_columns(raw: Vec<String>) -> (Vec<String>, Vec<usize>) {
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+/// [`build_query_result`] for column-major cells (`data[col][row]`, every
+/// column the same length). The default query return type adopts the columns as
+/// they are; the row-shaped return types build each row struct from keys made
+/// once per column.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn build_query_result_columnar(
+    columns: Vec<String>,
+    data: Vec<Vec<CfmlValue>>,
+    sql: &str,
+    return_type: &str,
+) -> CfmlResult {
+    if return_type == "array" || return_type == "struct" || return_type.starts_with("struct:") {
+        let keys: Vec<cfml_common::key::Key> = columns.iter().map(cfml_common::key::Key::new).collect();
+        let nrows = data.first().map_or(0, |c| c.len());
+        let mut cols: Vec<std::vec::IntoIter<CfmlValue>> = data.into_iter().map(|c| c.into_iter()).collect();
+        let rows: Vec<ValueMap> = (0..nrows)
+            .map(|_| {
+                let mut m = ValueMap::with_capacity_and_hasher(keys.len(), Default::default());
+                for (k, col) in keys.iter().zip(cols.iter_mut()) {
+                    m.insert(k.clone(), col.next().unwrap_or(CfmlValue::Null));
+                }
+                m
+            })
+            .collect();
+        return build_query_result(columns, rows, sql, return_type);
+    }
+    let qd = CfmlQueryData {
+        columns,
+        data: data.into_iter().map(Arc::new).collect(),
+        sql: Some(sql.to_string()),
+        execution_time: None,
+        current_row: 1,
+        row_keys: Default::default(),
+    };
+    Ok(CfmlValue::Query(CfmlQuery::from_data(qd)))
+}
+
 fn build_query_result(columns: Vec<String>, rows: Vec<ValueMap>, sql: &str, return_type: &str) -> CfmlResult {
     if return_type == "array" {
         let arr: Vec<CfmlValue> = rows.into_iter()
@@ -18897,7 +19051,7 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
                 } else {
                     d.columns.iter().map(|_| std::sync::Arc::new(Vec::new())).collect()
                 };
-                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None, current_row: 1 }
+                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None, current_row: 1, row_keys: Default::default() }
             });
             Ok(CfmlValue::Query(CfmlQuery::from_data(sliced)))
         }

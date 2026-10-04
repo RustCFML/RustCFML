@@ -1640,6 +1640,7 @@ dependencies = [
  "calamine",
  "cbc 0.1.2",
  "cfml-common",
+ "cfml-config",
  "chrono",
  "chrono-tz",
  "des",

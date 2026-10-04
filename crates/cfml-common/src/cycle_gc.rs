@@ -227,9 +227,33 @@ thread_local! {
     static SPARE_LOG: RefCell<Vec<TrackedAlloc>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Largest buffer `SPARE_LOG` keeps between requests (entries, 16 bytes each):
-/// a pathological request must not pin its log's memory on the worker forever.
-const SPARE_CAP: usize = 1 << 20;
+/// Largest buffer `SPARE_LOG` keeps between requests (entries, 16 bytes each),
+/// and the largest capacity the old-generation log and the pointer sets keep
+/// across `enable()`. A warm Preside render logs ~8k entries, so 64k covers the
+/// steady state with room to spare. It was 1M (16 MB): the BOOT request filled
+/// it, and every worker thread that ever served a boot-sized request then held
+/// its 16 MB spare (plus the old log's and sets' boot-sized capacity, which
+/// `clear()` keeps) for the life of the process — ~13 MB of a booted Preside
+/// heap. A larger request simply regrows its buffers.
+const SPARE_CAP: usize = 1 << 16;
+
+/// Drop a thread-local buffer whose capacity grew past `SPARE_CAP` (a big
+/// request) so the next request starts small; otherwise just clear it.
+fn trim_vec<T>(v: &mut Vec<T>) {
+    if v.capacity() > SPARE_CAP {
+        *v = Vec::new();
+    } else {
+        v.clear();
+    }
+}
+
+fn trim_set(set: &mut PtrSet) {
+    if set.capacity() > SPARE_CAP {
+        *set = PtrSet::default();
+    } else {
+        set.clear();
+    }
+}
 
 /// A cleared buffer for a new log: the thread's spare if it has one, else empty.
 #[inline]
@@ -257,7 +281,7 @@ fn recycle_log(mut v: Vec<TrackedAlloc>) {
 fn take_full_log() -> Option<Vec<TrackedAlloc>> {
     let young = ALLOC_LOG.with(|c| c.borrow_mut().take())?;
     let mut old = OLD_LOG.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    OLD_SET.with(|c| c.borrow_mut().clear());
+    OLD_SET.with(|c| trim_set(&mut c.borrow_mut()));
     if old.is_empty() {
         return Some(young);
     }
@@ -316,12 +340,12 @@ pub fn enable() {
     crate::mem_account::arm_thread();
     ALLOC_LOG.with(|c| *c.borrow_mut() = Some(fresh_log()));
     ALLOC_TOTAL.with(|n| n.set(0));
-    OLD_LOG.with(|c| c.borrow_mut().clear());
-    OLD_SET.with(|c| c.borrow_mut().clear());
+    OLD_LOG.with(|c| trim_vec(&mut c.borrow_mut()));
+    OLD_SET.with(|c| trim_set(&mut c.borrow_mut()));
     NEXT_SWEEP.with(|c| c.set(incremental_threshold()));
     NEXT_MAJOR.with(|c| c.set(incremental_threshold()));
     LOG_PAUSED.with(|c| c.set(false));
-    RELOG_SEEN.with(|c| c.borrow_mut().clear());
+    RELOG_SEEN.with(|c| trim_set(&mut c.borrow_mut()));
     reset_request_census();
 }
 
@@ -354,8 +378,8 @@ pub fn relog_first_sight(ptr: usize) -> bool {
 /// Stop logging and drop the log without collecting.
 pub fn disable_and_clear() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = None);
-    OLD_LOG.with(|c| c.borrow_mut().clear());
-    OLD_SET.with(|c| c.borrow_mut().clear());
+    OLD_LOG.with(|c| trim_vec(&mut c.borrow_mut()));
+    OLD_SET.with(|c| trim_set(&mut c.borrow_mut()));
 }
 
 /// Current length of this thread's allocation log (`None` if not logging). For
@@ -1381,7 +1405,7 @@ pub fn collect() -> usize {
     // tracking, and for the sweep's cost and correctness argument.
     let mut live: Vec<(usize, TrackedAlloc)> = Vec::new();
     let reclaimed = collect_from_log_carrying(log, Some(&mut live));
-    RELOG_SEEN.with(|c| c.borrow_mut().clear());
+    RELOG_SEEN.with(|c| trim_set(&mut c.borrow_mut()));
     reclaimed + carry_survivors(live)
 }
 
