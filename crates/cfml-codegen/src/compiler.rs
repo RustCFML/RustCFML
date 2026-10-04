@@ -159,6 +159,8 @@ pub struct CfmlCompiler {
     /// DefineFunction op skips the builtin-collision guard for methods. Lucee
     /// allows `obj.canonicalize()` etc.
     in_component_method: bool,
+    /// Compiling a component's pseudo-constructor body (where `this` always exists).
+    in_component_body: bool,
     /// True while compiling an assignment that appears in VALUE position — i.e.
     /// the RHS of an enclosing assignment (`a = b = c`), so the assignment must
     /// leave its assigned value on the stack for the outer store to consume. A
@@ -1931,6 +1933,7 @@ impl CfmlCompiler {
             local_scope_depth: 0,
             current_fn_local_mode: None,
             in_component_method: false,
+            in_component_body: false,
             need_assign_value: false,
             source_file: None,
         }
@@ -2571,6 +2574,16 @@ impl CfmlCompiler {
             // as Null when nothing exists yet. The leaf SetIndex then
             // auto-vivifies the entire chain (Lucee/ACF/BoxLang), instead of the
             // generic compile path throwing "Variable '<root>' is undefined".
+            // `this.x = v` on a plain page: there is no component, and Lucee
+            // creates `variables.this` as a struct on the first write (reading
+            // `this` before that is undefined there too). Read it Null-tolerant
+            // so the store builds it. Never in a function or a component body,
+            // where `this` is the component.
+            Expression::This(_)
+                if !self.local_is_scope() && !self.in_component_body && !self.in_component_method =>
+            {
+                instructions.push(BytecodeOp::TryLoadLocal(Name::intern("this")));
+            }
             Expression::ArrayAccess(access) => {
                 self.compile_index_assign_base(&access.array, instructions);
                 self.compile_expression(&access.index, instructions);
@@ -5489,9 +5502,11 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
             instructions.push(BytecodeOp::StoreLocal(Name::intern("this")));
 
+            let prev_in_body = std::mem::replace(&mut self.in_component_body, true);
             for stmt in &component.body {
                 self.compile_statement(stmt, instructions);
             }
+            self.in_component_body = prev_in_body;
 
             // Copy modified `this` back to component name and global
             instructions.push(BytecodeOp::LoadLocal(Name::intern("this")));
