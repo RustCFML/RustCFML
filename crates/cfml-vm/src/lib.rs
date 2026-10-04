@@ -13027,8 +13027,8 @@ impl CfmlVirtualMachine {
                                 if kl == "this"
                                     || kl == "arguments"
                                     || k.starts_with("__")
-                                    || func.params.iter().any(|p| p == k.as_str())
-                                    || declared_locals.contains(k.as_str() as &str)
+                                    || func.has_param_key(k)
+                                    || declared_locals.contains_key(k)
                                 {
                                     continue;
                                 }
@@ -13118,8 +13118,8 @@ impl CfmlVirtualMachine {
                                 if k == "arguments"
                                     || k == "this"
                                     || k.starts_with("__")
-                                    || func.params.iter().any(|p| p == k.as_str())
-                                    || declared_locals.contains(k.as_str() as &str)
+                                    || func.has_param_key(k)
+                                    || declared_locals.contains_key(k)
                                 {
                                     continue;
                                 }
@@ -15627,7 +15627,48 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::JumpIfNotNull(target) => { ops::effect::op_jump_if_not_null(&stack, &mut ip, *target); }
 
-                BytecodeOp::JumpIfArgPresent(name, target) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, func, arguments_supplied_bits, &arguments_supplied, name, *target); }
+                BytecodeOp::JumpIfArgPresent(name, target, idx) => { ops::locals::op_jump_if_arg_present(&mut ip, &locals, func, arguments_supplied_bits, &arguments_supplied, name, *target, *idx as usize); }
+                BytecodeOp::ApplyParamDefault(name, idx) => {
+                    // Bind the default exactly as the call path binds a supplied
+                    // argument (see the param-binding loop): the param's local
+                    // under its interned key, then the `arguments` scope — the
+                    // eager struct, or the lazy frame's supplied bit so
+                    // `LoadArgKey` reads it back.
+                    let value = stack.pop().unwrap_or(CfmlValue::Null);
+                    let i = *idx as usize;
+                    let key = func
+                        .param_keys()
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| name.key().clone());
+                    // A default can itself define a closure (`cb = function(){…}`),
+                    // and that closure's env must see the parameter like any
+                    // other local the frame binds after capture.
+                    if let Some(ref env) = closure_env {
+                        if let Some(cv) = Self::closure_env_capture_value(
+                            key.as_str(),
+                            &value,
+                            &declared_locals,
+                            &func.params,
+                        ) {
+                            let mut m = env.write().unwrap();
+                            Self::env_own_write(&mut m, &mut env_reconciled_version, |m| {
+                                m.insert(key.clone(), cv)
+                            });
+                        }
+                    }
+                    locals.insert(key.clone(), value.clone());
+                    if let Some(args) = locals
+                        .get_mut(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                        .and_then(|v| v.as_cfml_struct())
+                    {
+                        args.insert(key, value);
+                    } else if i < 64 {
+                        arguments_supplied_bits |= 1u64 << i;
+                    } else {
+                        arguments_supplied.get_or_insert_with(Default::default).insert(key);
+                    }
+                }
                 BytecodeOp::SeedArgumentKey(name) => {
                     // On a lazy frame the applied default must be recorded as
                     // supplied so `LoadArgKey` can read it back (see that op).
@@ -16115,8 +16156,8 @@ impl CfmlVirtualMachine {
                     if kl == "this"
                         || kl == "arguments"
                         || k.starts_with("__")
-                        || func.params.iter().any(|p| p == k.as_str())
-                        || declared_locals.contains(k.as_str() as &str)
+                        || func.has_param_key(k)
+                        || declared_locals.contains_key(k)
                     {
                         continue;
                     }
@@ -16171,8 +16212,8 @@ impl CfmlVirtualMachine {
                     if k == "arguments"
                         || k == "this"
                         || k.starts_with("__")
-                        || func.params.iter().any(|p| p == k.as_str())
-                        || declared_locals.contains(k.as_str() as &str)
+                        || func.has_param_key(k)
+                        || declared_locals.contains_key(k)
                         || Self::arguments_scope_has_key(arg_scope, k)
                     {
                         continue;
@@ -44576,8 +44617,9 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         // Null
         BytecodeOp::IsNull => (1, 1),
         BytecodeOp::JumpIfNotNull(_) => (1, 1), // pops, pushes back if not null
-        BytecodeOp::JumpIfArgPresent(_, _) => (0, 0), // pure control flow, no stack traffic
+        BytecodeOp::JumpIfArgPresent(..) => (0, 0), // pure control flow, no stack traffic
         BytecodeOp::SeedArgumentKey(_) => (1, 0), // pops the applied default value
+        BytecodeOp::ApplyParamDefault(..) => (1, 0), // pops the default value
         BytecodeOp::LoadArgKey(_) | BytecodeOp::TryLoadArgKey(_) => (1, 0), // pushes value, reads nothing
         BytecodeOp::StoreLocalScopeKey(_) => (0, 1), // pops the value, pushes nothing
         BytecodeOp::ValidateParamType(_) => (0, 0),   // reads a local, throws or nothing

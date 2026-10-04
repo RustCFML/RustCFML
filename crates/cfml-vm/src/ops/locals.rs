@@ -191,6 +191,7 @@ pub(crate) fn op_jump_if_arg_present(
     >,
     name: &Name,
     target: usize,
+    param_idx: usize,
 ) {
     // Default-argument preamble: skip the default when the caller
     // actually supplied this param — i.e. its key already lives in
@@ -213,7 +214,14 @@ pub(crate) fn op_jump_if_arg_present(
         _ => {
             // Bit per declared-param index (see `arguments_supplied_bits` in
             // the prologue); the set only holds indices 64 and up.
-            let idx = func.param_keys().iter().position(|k| k == name.key());
+            // The compiler hands us the declared index; confirm it names this
+            // param (cheap: one key compare) and fall back to the search only if
+            // it does not (bytecode built by an older compiler).
+            let idx = if func.param_keys().get(param_idx).is_some_and(|k| k == name.key()) {
+                Some(param_idx)
+            } else {
+                func.param_keys().iter().position(|k| k == name.key())
+            };
             match idx {
                 Some(i) if i < 64 => arguments_supplied_bits & (1u64 << i) != 0,
                 _ => arguments_supplied

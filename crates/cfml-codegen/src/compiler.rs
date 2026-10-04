@@ -632,8 +632,9 @@ impl BytecodeFunction {
                 }
                 BytecodeOp::StoreGlobal(n)
                 | BytecodeOp::SetLastExceptionFromLocal(n)
-                | BytecodeOp::JumpIfArgPresent(n, _)
+                | BytecodeOp::JumpIfArgPresent(n, _, _)
                 | BytecodeOp::SeedArgumentKey(n)
+                | BytecodeOp::ApplyParamDefault(n, _)
                 | BytecodeOp::LoadVariablesKey(n)
                 | BytecodeOp::StoreVariablesKey(n) => {
                     excluded.insert(n.lower().to_string());
@@ -1389,7 +1390,10 @@ pub enum BytecodeOp {
     // this never consults the enclosing scope, so an omitted param whose default
     // expression reads a same-named outer variable (`function f(x = x)`) is not
     // shadowed by its own not-yet-initialized slot (GitHub #240). No stack traffic.
-    JumpIfArgPresent(Name, usize),
+    /// `(param name, jump target, param index)` — the index lets the VM test
+    /// the lazy frame's supplied bit directly instead of searching the
+    /// parameter list for the name on every default.
+    JumpIfArgPresent(Name, usize, u32),
     /// Seed the frame's own `arguments` scope with an applied default parameter
     /// value (popped from the stack). Replaces the four-op round-trip
     /// `LoadLocal("arguments"); Swap; SetProperty(n); StoreLocal("arguments")`
@@ -1522,6 +1526,16 @@ pub enum BytecodeOp {
     // LoadLocal iter; LoadLocal idx; ForInElement` — six dispatches and a
     // second clone of the iterator handle per item (for-in ran 2.5x Lucee).
     ForInStep(u32),
+
+    // Apply the default of declared parameter `idx` (named `Name`): pop the
+    // evaluated default and bind it exactly as a supplied argument is bound —
+    // the frame's local under the param's key, plus the `arguments` scope
+    // (the eager struct, or the lazy frame's supplied bit). Replaces
+    // `Dup; StoreLocal(name); SeedArgumentKey(name)`: the general store routed
+    // every default through the full variable-store path, which re-scans the
+    // parameter list per store (~200 ns per default; Lucee ~24), and in modern
+    // localmode it made the default a LOCAL (Lucee keeps it in `arguments`).
+    ApplyParamDefault(Name, u32),
 
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
@@ -1677,11 +1691,12 @@ impl BytecodeOp {
             Self::TakeSlot(..) => 133,
             Self::WriteText(..) => 134,
             Self::ForInStep(..) => 135,
+            Self::ApplyParamDefault(..) => 136,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 136] = [
+    pub const CENSUS_NAMES: [&'static str; 137] = [
         "Null",
         "True",
         "False",
@@ -1818,6 +1833,7 @@ impl BytecodeOp {
         "TakeSlot",
         "WriteText",
         "ForInStep",
+        "ApplyParamDefault",
     ];
 }
 
@@ -4892,22 +4908,15 @@ impl CfmlCompiler {
         for (idx, param) in func.params.iter().enumerate() {
             if let Some(ref default_expr) = param.default {
                 let jump_idx = func_instructions.len();
-                func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0)); // placeholder
-                // Set the local variable
+                func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0, idx as u32)); // placeholder
+                // Evaluate the default
                 self.compile_expression(default_expr, &mut func_instructions);
-                // Seed the local AND the `arguments` key from the default, WITHOUT reading
-                // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
-                // wrong for a parameter named after a built-in scope: since GH #312 a bare
-                // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
-                // seeded `arguments.cookie` with the live cookie scope instead of "D".
-                // `Dup` keeps the freshly-evaluated value on the stack for
-                // `SeedArgumentKey`, which consumes it: the local is stored by name
-                // (so slot behaviour is untouched) and the frame's OWN `arguments`
-                // scope gets the same value. Emitting `LoadLocal("arguments")` here
-                // is what used to force the whole function onto the eager path.
-                func_instructions.push(BytecodeOp::Dup);
-                func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
-                func_instructions.push(BytecodeOp::SeedArgumentKey(Name::from(&param.name)));
+                // Bind the default as a supplied argument would be (`ApplyParamDefault`):
+                // the param's local plus its `arguments` entry, WITHOUT reading the param
+                // back by bare name (a param named after a scope, `function f( cookie =
+                // "D" )`, would read the live scope — GH #312) and without naming
+                // `arguments` (which would force the function onto the eager path).
+                func_instructions.push(BytecodeOp::ApplyParamDefault(Name::from(&param.name), idx as u32));
                 // A DEFAULT is type-checked exactly like a supplied argument
                 // (Lucee: `function f( numeric n = "abc" )` throws on `f()`).
                 // A supplied argument is checked by the VM at bind time, which
@@ -4917,7 +4926,7 @@ impl CfmlCompiler {
                     func_instructions.push(BytecodeOp::ValidateParamType(idx));
                 }
                 func_instructions[jump_idx] =
-                    BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len());
+                    BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len(), idx as u32);
             }
         }
 
@@ -6589,27 +6598,20 @@ impl CfmlCompiler {
                 for (idx, param) in closure.params.iter().enumerate() {
                     if let Some(ref default_expr) = param.default {
                         let jump_idx = func_instructions.len();
-                        func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0));
+                        func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0, idx as u32));
                         self.compile_expression(default_expr, &mut func_instructions);
-                        // Seed the local AND the `arguments` key from the default, WITHOUT reading
-                        // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
-                        // wrong for a parameter named after a built-in scope: since GH #312 a bare
-                        // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
-                        // seeded `arguments.cookie` with the live cookie scope instead of "D".
-                        // `Dup` keeps the freshly-evaluated value on the stack for
-                        // `SeedArgumentKey`, which consumes it: the local is stored by name
-                        // (so slot behaviour is untouched) and the frame's OWN `arguments`
-                        // scope gets the same value. Emitting `LoadLocal("arguments")` here
-                        // is what used to force the whole function onto the eager path.
-                        func_instructions.push(BytecodeOp::Dup);
-                        func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
-                        func_instructions.push(BytecodeOp::SeedArgumentKey(Name::from(&param.name)));
+                        // Bind the default as a supplied argument would be (`ApplyParamDefault`):
+                        // the param's local plus its `arguments` entry, WITHOUT reading the param
+                        // back by bare name (a param named after a scope, `function f( cookie =
+                        // "D" )`, would read the live scope — GH #312) and without naming
+                        // `arguments` (which would force the function onto the eager path).
+                        func_instructions.push(BytecodeOp::ApplyParamDefault(Name::from(&param.name), idx as u32));
                         // Type-check the applied default (see compile_function_decl).
                         if declared_type_is_checkable(param.param_type.as_deref()) {
                             func_instructions.push(BytecodeOp::ValidateParamType(idx));
                         }
                         func_instructions[jump_idx] =
-                            BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len());
+                            BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len(), idx as u32);
                     }
                 }
                 for s in &closure.body {
@@ -6695,27 +6697,20 @@ impl CfmlCompiler {
                 for (idx, param) in arrow.params.iter().enumerate() {
                     if let Some(ref default_expr) = param.default {
                         let jump_idx = func_instructions.len();
-                        func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0));
+                        func_instructions.push(BytecodeOp::JumpIfArgPresent(Name::from(&param.name), 0, idx as u32));
                         self.compile_expression(default_expr, &mut func_instructions);
-                        // Seed the local AND the `arguments` key from the default, WITHOUT reading
-                        // the parameter back by bare name. A `LoadLocal(param.name)` read-back is
-                        // wrong for a parameter named after a built-in scope: since GH #312 a bare
-                        // scope name always resolves to the SCOPE, so `function f( cookie = "D" )`
-                        // seeded `arguments.cookie` with the live cookie scope instead of "D".
-                        // `Dup` keeps the freshly-evaluated value on the stack for
-                        // `SeedArgumentKey`, which consumes it: the local is stored by name
-                        // (so slot behaviour is untouched) and the frame's OWN `arguments`
-                        // scope gets the same value. Emitting `LoadLocal("arguments")` here
-                        // is what used to force the whole function onto the eager path.
-                        func_instructions.push(BytecodeOp::Dup);
-                        func_instructions.push(BytecodeOp::StoreLocal(Name::from(&param.name)));
-                        func_instructions.push(BytecodeOp::SeedArgumentKey(Name::from(&param.name)));
+                        // Bind the default as a supplied argument would be (`ApplyParamDefault`):
+                        // the param's local plus its `arguments` entry, WITHOUT reading the param
+                        // back by bare name (a param named after a scope, `function f( cookie =
+                        // "D" )`, would read the live scope — GH #312) and without naming
+                        // `arguments` (which would force the function onto the eager path).
+                        func_instructions.push(BytecodeOp::ApplyParamDefault(Name::from(&param.name), idx as u32));
                         // Type-check the applied default (see compile_function_decl).
                         if declared_type_is_checkable(param.param_type.as_deref()) {
                             func_instructions.push(BytecodeOp::ValidateParamType(idx));
                         }
                         func_instructions[jump_idx] =
-                            BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len());
+                            BytecodeOp::JumpIfArgPresent(Name::from(&param.name), func_instructions.len(), idx as u32);
                     }
                 }
                 self.compile_expression(&arrow.body, &mut func_instructions);
