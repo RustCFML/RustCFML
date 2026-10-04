@@ -4040,6 +4040,11 @@ struct FusedParentPlan {
     /// copied it all again — the merge is now done once, here, from the raw
     /// caller locals.
     env_first: bool,
+    /// For a lexical closure with an env: the closure's own function value,
+    /// installed as the frame's env carrier (`frame_closure_env` reads its
+    /// `captured_scope`, which IS the env). Reusing it is a refcount bump; the
+    /// carrier used to be a freshly allocated placeholder function per call.
+    carrier: Option<CfmlValue>,
 }
 
 /// A frame's `local` scope after it escaped as a value (GH #465): the shared
@@ -8337,9 +8342,32 @@ impl CfmlVirtualMachine {
     /// fused mutation ops only looked at `locals`, so `x++` etc. silently no-opped
     /// when `x` lived in the component scope, and `for (x = 1; x lte n; x++)` in a
     /// CFC-method closure looped forever (the Wheels view.assetsSpec hang).
+    /// Run a frame-side write into the frame's OWN closure env (`f`), keeping
+    /// `reconciled` (the version `reconcile_closure_env_into_locals` last saw)
+    /// in step when the frame was already in sync: a write this frame made
+    /// itself is already in its locals, so it must not make the next reconcile
+    /// walk the whole env. Before this every `x = …` / `i++` in a frame that had
+    /// defined a closure bumped the env version, and every closure call from it
+    /// paid a full env walk (+~8 ns per frame variable per call). A write from
+    /// anywhere else (a closure, another frame sharing the env) still shows.
+    #[inline]
+    fn env_own_write<R>(
+        m: &mut ValueMap,
+        reconciled: &mut u32,
+        f: impl FnOnce(&mut ValueMap) -> R,
+    ) -> R {
+        let in_sync = m.version() == *reconciled;
+        let r = f(m);
+        if in_sync {
+            *reconciled = m.version();
+        }
+        r
+    }
+
     fn apply_numeric_delta(
         locals: &mut ValueMap,
         closure_env: Option<&Arc<std::sync::RwLock<ValueMap>>>,
+        env_reconciled: &mut u32,
         name: &cfml_common::name::Name,
         op: impl Fn(&CfmlValue) -> Result<CfmlValue, CfmlError>,
     ) -> Result<(), CfmlError> {
@@ -8351,7 +8379,7 @@ impl CfmlVirtualMachine {
             if let Some(env) = closure_env {
                 let mut m = env.write().unwrap();
                 if m.contains_key(name) {
-                    m.insert(name, new_val);
+                    Self::env_own_write(&mut m, env_reconciled, |m| m.insert(name, new_val));
                 }
             }
             return Ok(());
@@ -11154,6 +11182,8 @@ impl CfmlVirtualMachine {
                                             if f.captured_scope.as_ref().is_some_and(|s| Arc::ptr_eq(s, env))
                                     );
                                 let mut m = env.write().unwrap();
+                                let m = &mut *m;
+                                let in_sync = m.version() == env_reconciled_version;
                                 if is_own_closure {
                                     if let CfmlValue::Function(f) = &val {
                                         let mut stripped = (**f).clone();
@@ -11162,6 +11192,30 @@ impl CfmlVirtualMachine {
                                     }
                 } else if m.contains_key(name) {
                                     m.insert(name, val);
+                                } else if declared_locals.contains_key(name.key())
+                                    || func.params.iter().any(|p| p.eq_ignore_ascii_case(name.as_str()))
+                                {
+                                    // A `var` local (or parameter) first assigned AFTER
+                                    // a closure captured this frame: write it through
+                                    // too. Lucee's closure scope is a live reference to
+                                    // the defining function's locals, so a callback
+                                    // handed to another function sees a variable its
+                                    // definer assigned later. Only the definer's own
+                                    // locals: an undeclared name is a `variables` write
+                                    // and must not enter the env. Same capture rules
+                                    // as the seed (function values are stripped).
+                                    if let Some(cv) = Self::closure_env_capture_value(
+                                        name.as_str(),
+                                        &val,
+                                        &declared_locals,
+                                        &func.params,
+                                    ) {
+                                        m.insert(name, cv);
+                                    }
+                                }
+                                // This frame's own write: see `env_own_write`.
+                                if in_sync {
+                                    env_reconciled_version = m.version();
                                 }
                             }
                         }
@@ -14161,7 +14215,7 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    catch_op!(ops::locals::op_increment(&mut locals, &mut slots, &closure_env, op, name));
+                    catch_op!(ops::locals::op_increment(&mut locals, &mut slots, &closure_env, &mut env_reconciled_version, op, name));
                 }
                 BytecodeOp::AddLocalConst(name, k) | BytecodeOp::AddSlotConst(_, name, k) => {
                     // §109/§102: in modern localmode a bare compound write claims
@@ -14184,7 +14238,7 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    catch_op!(ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, op, name, *k));
+                    catch_op!(ops::locals::op_add_local_const(&mut locals, &mut slots, &closure_env, &mut env_reconciled_version, op, name, *k));
                 }
                 BytecodeOp::MulLocalConst(name, k) | BytecodeOp::MulSlotConst(_, name, k) => {
                     // §109/§102: in modern localmode a bare compound write claims
@@ -14207,7 +14261,7 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    catch_op!(ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, op, name, *k));
+                    catch_op!(ops::locals::op_mul_local_const(&mut locals, &mut slots, &closure_env, &mut env_reconciled_version, op, name, *k));
                 }
                 BytecodeOp::Decrement(name) | BytecodeOp::DecrementSlot(_, name) => {
                     // §109/§102: in modern localmode a bare compound write claims
@@ -14229,7 +14283,7 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    catch_op!(ops::locals::op_decrement(&mut locals, &mut slots, &closure_env, op, name));
+                    catch_op!(ops::locals::op_decrement(&mut locals, &mut slots, &closure_env, &mut env_reconciled_version, op, name));
                 }
 
                 // Exception handling
@@ -24207,11 +24261,19 @@ impl CfmlVirtualMachine {
         self.frame_has_local_scope
     }
 
+    /// Diagnostics: `RUSTCFML_CLOSURE_CALLER_SCAN=1` restores the per-call scan
+    /// of the caller's locals into a lexical closure frame (A/B and bisection).
+    fn closure_caller_scan_forced() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RUSTCFML_CLOSURE_CALLER_SCAN").is_ok_and(|v| v == "1"))
+    }
+
     fn fused_call_parent_plan(
         &self,
-        func_ref: &cfml_common::dynamic::CfmlFunction,
+        func_arc: &Arc<cfml_common::dynamic::CfmlFunction>,
         parent_locals: &ValueMap,
     ) -> FusedParentPlan {
+        let func_ref: &cfml_common::dynamic::CfmlFunction = func_arc;
         let is_closure_expr =
             func_ref.name.starts_with("__closure_") || func_ref.name.starts_with("__arrow_");
         let filter = if is_closure_expr {
@@ -24229,6 +24291,8 @@ impl CfmlVirtualMachine {
             lexical: Self::is_closure_value(func_ref),
             env_first: func_ref.captured_scope.is_some()
                 && !parent_locals.contains_key(&*cfml_common::key::well_known::THIS),
+            carrier: (func_ref.captured_scope.is_some() && Self::is_closure_value(func_ref))
+                .then(|| CfmlValue::Function(Arc::clone(func_arc))),
         }
     }
 
@@ -24332,7 +24396,7 @@ impl CfmlVirtualMachine {
                     if let Some(env_arc) = plan.env.as_ref() {
                         locals.insert(
                             cfml_common::key::well_known::CLOSURE_FRAME_ENV.clone(),
-                            Self::closure_env_marker(env_arc),
+                            plan.carrier.clone().unwrap_or_else(|| Self::closure_env_marker(env_arc)),
                         );
                         env_marker = true;
                     }
@@ -24376,7 +24440,17 @@ impl CfmlVirtualMachine {
             }
             }
         }
-        // Pass 2: caller locals.
+        // Pass 2: caller locals. Not for a lexical closure that carries its own
+        // env: that env is a live reference to its defining frame (the frame
+        // writes its locals through to it), so names resolve through the chain
+        // and the caller — which may not even be the definer — has nothing to
+        // contribute. Scanning it here was a probe per caller local on every
+        // closure call.
+        let caller = if plan.lexical && plan.env.is_some() && !Self::closure_caller_scan_forced() {
+            None
+        } else {
+            caller
+        };
         if let Some(caller) = caller {
             if counting {
                 use std::sync::atomic::Ordering::Relaxed;

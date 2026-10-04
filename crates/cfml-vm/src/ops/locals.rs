@@ -372,6 +372,7 @@ pub(crate) fn op_increment(
     locals: &mut ValueMap,
     slots: &mut [Option<CfmlValue>],
     closure_env: &Option<Arc<RwLock<ValueMap>>>,
+    env_reconciled: &mut u32,
     op: &BytecodeOp,
     name: &Name,
 ) -> Result<(), CfmlError> {
@@ -382,7 +383,7 @@ pub(crate) fn op_increment(
             return Ok(());
         }
     }
-    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
+    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), env_reconciled, name, |val| {
         numeric_step(val, 1, false)
     })
 }
@@ -393,6 +394,7 @@ pub(crate) fn op_decrement(
     locals: &mut ValueMap,
     slots: &mut [Option<CfmlValue>],
     closure_env: &Option<Arc<RwLock<ValueMap>>>,
+    env_reconciled: &mut u32,
     op: &BytecodeOp,
     name: &Name,
 ) -> Result<(), CfmlError> {
@@ -402,7 +404,7 @@ pub(crate) fn op_decrement(
             return Ok(());
         }
     }
-    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
+    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), env_reconciled, name, |val| {
         numeric_step(val, -1, false)
     })
 }
@@ -413,6 +415,7 @@ pub(crate) fn op_add_local_const(
     locals: &mut ValueMap,
     slots: &mut [Option<CfmlValue>],
     closure_env: &Option<Arc<RwLock<ValueMap>>>,
+    env_reconciled: &mut u32,
     op: &BytecodeOp,
     name: &Name,
     k: i64,
@@ -423,7 +426,7 @@ pub(crate) fn op_add_local_const(
             return Ok(());
         }
     }
-    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
+    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), env_reconciled, name, |val| {
         numeric_step(val, k, false)
     })
 }
@@ -434,6 +437,7 @@ pub(crate) fn op_mul_local_const(
     locals: &mut ValueMap,
     slots: &mut [Option<CfmlValue>],
     closure_env: &Option<Arc<RwLock<ValueMap>>>,
+    env_reconciled: &mut u32,
     op: &BytecodeOp,
     name: &Name,
     k: i64,
@@ -444,7 +448,7 @@ pub(crate) fn op_mul_local_const(
             return Ok(());
         }
     }
-    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), name, |val| {
+    CfmlVirtualMachine::apply_numeric_delta(locals, closure_env.as_ref(), env_reconciled, name, |val| {
         numeric_step(val, k, true)
     })
 }
