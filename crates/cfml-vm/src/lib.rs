@@ -11157,6 +11157,9 @@ impl CfmlVirtualMachine {
                 // frame.
                 BytecodeOp::SetScopePath(sp) => {
                     let value = stack.pop().unwrap_or(CfmlValue::Null);
+                    if self.store_parts_in_place(&sp.parts, &value, &locals, func, &inherited_or_param_keys, &declared_locals) {
+                        continue;
+                    }
                     if let Err(e) = self.store_runtime_path_parts(
                         &sp.path,
                         &sp.parts,
@@ -11168,6 +11171,9 @@ impl CfmlVirtualMachine {
                     }
                 }
                 BytecodeOp::SetDynamicVar => {
+                    if self.try_set_path_in_place(&mut stack, &locals, func, &inherited_or_param_keys, &declared_locals) {
+                        continue;
+                    }
                     if let Err(e) = ops::frame::op_set_dynamic_var(self, &mut stack, &mut locals, effective_local_mode_modern) {
                         ip = self.route_call_error(e, &mut stack)?;
                     }
@@ -24904,6 +24910,146 @@ impl CfmlVirtualMachine {
 
     /// Store through a dotted path whose text is only known at runtime. Splits,
     /// then defers to [`Self::store_runtime_path_parts`].
+    /// Fast path for `SetDynamicVar`: a dotted store whose ROOT is a container
+    /// this frame already holds, written by walking that container in place.
+    ///
+    /// Every static assignment path of three or more segments (`local.r.k = v`,
+    /// `variables.cache.k = v`, `arguments.a.k = v`, `s.a.b = v`) compiles to
+    /// `SetDynamicVar`, and the generic `store_runtime_path` resolved the root
+    /// scope by VALUE: for `local` it built a copy of the whole local scope,
+    /// walked it, and wrote the copy back over the frame — 451 ns per store vs
+    /// Lucee's 65 (bench/structarr/dotset.cfm), with similar 2-3x gaps for the
+    /// other roots. Containers are reference-typed, so mutating the one the frame
+    /// holds is the same write without the round trip.
+    ///
+    /// Only taken when the answer is certain: non-null value (null deletes),
+    /// root already a struct/component in the frame, and the root is one of —
+    /// `local.<v>` (in a function frame; not a parameter or inherited key),
+    /// `variables` (the frame's live struct), `arguments` (the live struct on an
+    /// eager frame, or an un-shadowed parameter on a lazy one), or a plain
+    /// non-reserved name held in the frame's locals. Anything else returns
+    /// false and takes the generic path unchanged.
+    fn try_set_path_in_place(
+        &mut self,
+        stack: &mut Vec<CfmlValue>,
+        locals: &ValueMap,
+        func: &BytecodeFunction,
+        inherited: &InheritedKeys,
+        declared: &DeclaredLocals,
+    ) -> bool {
+        let n = stack.len();
+        if n < 2 {
+            return false;
+        }
+        let path = match &stack[n - 2] {
+            CfmlValue::String(p) => p.clone(),
+            _ => return false,
+        };
+        let parts: Vec<&str> = path.split('.').collect();
+        if !self.store_parts_in_place(&parts, &stack[n - 1], locals, func, inherited, declared) {
+            return false;
+        }
+        let value = stack.pop().unwrap_or(CfmlValue::Null);
+        stack.pop();
+        stack.push(value);
+        true
+    }
+
+    /// The decision + walk behind [`Self::try_set_path_in_place`], over an
+    /// already-split path (so `SetScopePath`'s compile-time segments use it
+    /// directly). Writes `value` and returns true, or touches nothing and
+    /// returns false for the generic store to handle.
+    fn store_parts_in_place<S: AsRef<str>>(
+        &mut self,
+        parts: &[S],
+        value: &CfmlValue,
+        locals: &ValueMap,
+        func: &BytecodeFunction,
+        inherited: &InheritedKeys,
+        declared: &DeclaredLocals,
+    ) -> bool {
+        if matches!(value, CfmlValue::Null) || parts.len() < 2 || parts.iter().any(|p| p.as_ref().is_empty()) {
+            return false;
+        }
+        let is_container = |v: &CfmlValue| {
+            #[cfg(feature = "component-instance")]
+            if matches!(v, CfmlValue::Instance(_)) {
+                return true;
+            }
+            matches!(v, CfmlValue::Struct(_))
+        };
+        let root0 = parts[0].as_ref();
+        let p1 = parts[1].as_ref();
+        // (container to walk from, index of the first key to walk)
+        let target: Option<(CfmlValue, usize)> = if root0.eq_ignore_ascii_case("local") {
+            if parts.len() < 3 || !self.current_frame_has_local_scope() {
+                None
+            } else {
+                let k = cfml_common::key::Key::new(p1);
+                if inherited.contains_key(&k) {
+                    None
+                } else {
+                    locals.get(&k).filter(|v| is_container(v)).map(|v| (v.clone(), 2))
+                }
+            }
+        } else if root0.eq_ignore_ascii_case("variables") {
+            if parts.len() < 3 {
+                None
+            } else {
+                match locals.get(&*cfml_common::key::well_known::VARIABLES) {
+                    Some(v @ CfmlValue::Struct(_)) => Some((v.clone(), 1)),
+                    _ => None,
+                }
+            }
+        } else if root0.eq_ignore_ascii_case("arguments") {
+            if parts.len() < 3 {
+                None
+            } else if let Some(v @ CfmlValue::Struct(_)) =
+                locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+            {
+                Some((v.clone(), 1))
+            } else {
+                let k = cfml_common::key::Key::new(p1);
+                let is_param = func.params.iter().any(|p| p.eq_ignore_ascii_case(p1));
+                if is_param && !declared.contains_key(&k) {
+                    locals.get(&k).filter(|v| is_container(v)).map(|v| (v.clone(), 2))
+                } else {
+                    None
+                }
+            }
+        } else {
+            const RESERVED: &[&str] = &[
+                "this", "super", "static", "thread", "request", "application", "session",
+                "server", "client", "cgi", "url", "form", "cookie", "attributes", "caller",
+                "cfthread",
+            ];
+            if RESERVED.iter().any(|r| root0.eq_ignore_ascii_case(r)) {
+                None
+            } else {
+                let k = cfml_common::key::Key::new(root0);
+                locals.get(&k).filter(|v| is_container(v)).map(|v| (v.clone(), 1))
+            }
+        };
+        let Some((root, start)) = target else { return false };
+        if parts.len() <= start {
+            return false;
+        }
+        #[cfg(feature = "component-instance")]
+        Self::store_member_path_in_place(&root, &parts[start..], value.clone());
+        // Without flyweight instances the generic store's own walk is the
+        // equivalent: auto-vivify intermediate structs, set the leaf.
+        #[cfg(not(feature = "component-instance"))]
+        if let CfmlValue::Struct(ref s) = root {
+            let keys = &parts[start..];
+            let mut cur = s.clone();
+            for key in &keys[..keys.len() - 1] {
+                cur = cur.get_or_insert_struct(key.as_ref());
+            }
+            cur.insert(keys[keys.len() - 1].as_ref(), value.clone());
+        }
+        true
+    }
+
     fn store_runtime_path(
         &mut self,
         path: &str,

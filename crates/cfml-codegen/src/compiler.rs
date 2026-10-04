@@ -5648,22 +5648,30 @@ impl CfmlCompiler {
                             // auto-vivify. Stack on entry is [value]; SetDynamicVar
                             // wants [path, value] and pushes the value back (the
                             // expression's result), so no trailing Pop here.
+                            // `Dup; SetScopePath` has exactly the stack effect of
+                            // the `String; Swap; SetDynamicVar` it replaces (the
+                            // value stays for the caller's Pop or outer store),
+                            // but the path is split once here rather than on
+                            // every execution — and this arm, not the
+                            // statement one, is what a plain `a.b.c = v;`
+                            // statement compiles through.
                             if let Some(path) =
                                 Self::scope_rooted_nested_path(&access.object, &access.member)
                             {
-                                instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::SetDynamicVar);
+                                instructions.push(BytecodeOp::Dup);
+                                instructions.push(BytecodeOp::SetScopePath(
+                                    std::sync::Arc::new(ScopePath::new(path)),
+                                ));
                             } else if let Some(path) =
                                 Self::bare_rooted_nested_path(&access.object, &access.member)
                             {
                                 // Undeclared bare root ≥2 levels deep in value
                                 // position (`x = (copies.request.cgi = v)`):
-                                // auto-vivify through the runtime store, which
-                                // pushes the value back for the outer store.
-                                instructions.push(BytecodeOp::String(std::sync::Arc::new(path)));
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::SetDynamicVar);
+                                // auto-vivify through the runtime store.
+                                instructions.push(BytecodeOp::Dup);
+                                instructions.push(BytecodeOp::SetScopePath(
+                                    std::sync::Arc::new(ScopePath::new(path)),
+                                ));
                             } else if want_value
                                 && matches!(&*access.object, Expression::Identifier(id) if is_reserved_scope_name(&id.name))
                             {
