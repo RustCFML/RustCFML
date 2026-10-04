@@ -14247,6 +14247,22 @@ impl CfmlVirtualMachine {
                     // Pop the object (receiver)
                     let object = stack.pop().unwrap_or(CfmlValue::Null);
 
+                    // The hottest members on a plain array/struct, answered
+                    // directly (see `member_fast_path`).
+                    if method_arg_names.is_none() {
+                        match self.member_fast_path(&object, method_name.lower(), &mut extra_args) {
+                            Some(Ok(v)) => {
+                                stack.push(v);
+                                continue;
+                            }
+                            Some(Err(e)) => {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
+
                     // Phase C.3 — Slice 3: flyweight Instance dispatch. Self-contained
                     // (shared-Arc state → no write-back), so it handles the call fully
                     // and skips the marker write-back machinery below. Feature-gated.
@@ -15469,6 +15485,11 @@ impl CfmlVirtualMachine {
                 BytecodeOp::ForInPrepare => { ops::access::op_for_in_prepare(self, &mut stack); }
                 BytecodeOp::ForInElement => { ops::access::op_for_in_element(self, &mut stack, &mut ip, &locals)?; }
                 BytecodeOp::ForInExit => { ops::access::op_for_in_exit(self, &mut stack); }
+                BytecodeOp::ForInStep(end) => {
+                    if ops::access::op_for_in_step(self, &mut stack, &mut ip, &locals, *end)? {
+                        continue;
+                    }
+                }
                 BytecodeOp::WriteText(text) => {
                     // Same rules as the `__writetext` intercept it replaces.
                     if self.enable_cfoutput_only <= 0 {
@@ -25048,6 +25069,64 @@ impl CfmlVirtualMachine {
             cur.insert(keys[keys.len() - 1].as_ref(), value.clone());
         }
         true
+    }
+
+    /// `a.append(v)`, `a.len()`, `a.isEmpty()`, `s.len()`, `s.isEmpty()`,
+    /// `s.keyExists(k)` on a plain array/struct, positional args only — the
+    /// member forms Preside leans on (~2,300 call sites). The generic member
+    /// path lowercases the name, probes the receiver's shape, looks the BIF up by
+    /// name, and runs the mutating-method write-back: `a.append(x)` cost 202 ns
+    /// against 33 ns for `arrayAppend(a, x)` (Lucee: 175). Results are exactly
+    /// the member contracts (verified on Lucee 7.1, bench/structarr/member_probe.cfm):
+    /// `append` mutates in place and returns the receiver; the struct answers
+    /// come from the same stdlib functions as `structCount`/`structIsEmpty`/
+    /// `structKeyExists`. A struct holding its own member under the method's
+    /// name (a UDF `s.append`) or any component/marker struct falls through.
+    /// `None` = not handled here.
+    fn member_fast_path(
+        &self,
+        object: &CfmlValue,
+        method_lower: &str,
+        args: &mut Vec<CfmlValue>,
+    ) -> Option<CfmlResult> {
+        match object {
+            CfmlValue::Array(a) => match (method_lower, args.len()) {
+                ("append", 1) => {
+                    a.push(args.pop().unwrap_or(CfmlValue::Null));
+                    Some(Ok(object.clone()))
+                }
+                ("len", 0) => Some(Ok(CfmlValue::Int(a.len() as i64))),
+                ("isempty", 0) => Some(Ok(CfmlValue::Bool(a.len() == 0))),
+                _ => None,
+            },
+            CfmlValue::Struct(st) => {
+                // The registered `structCount` / `structIsEmpty` / `structKeyExists`
+                // themselves, through the VM's own registry (the stdlib crate is
+                // not a VM dependency in every build).
+                let bif = match (method_lower, args.len()) {
+                    ("len", 0) => "structcount",
+                    ("isempty", 0) => "structisempty",
+                    ("keyexists", 1) => "structkeyexists",
+                    _ => return None,
+                };
+                let f = self.builtin_names_lc.get(bif)?.1;
+                // Plain data structs only: a component / scope / shim marker, or a
+                // member of that name (a UDF that should be called), go generic.
+                if st.get_ci(method_lower).is_some()
+                    || st.contains_key("__name")
+                    || st.contains_key("__arguments_scope")
+                    || st.contains_key("__java_shim")
+                    || st.contains_key("__java_class")
+                {
+                    return None;
+                }
+                let mut call_args = Vec::with_capacity(1 + args.len());
+                call_args.push(object.clone());
+                call_args.append(args);
+                Some(f(call_args))
+            }
+            _ => None,
+        }
     }
 
     fn store_runtime_path(
@@ -44346,6 +44425,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::ForInPrepare => (1, 1),     // iterable → iterable'
         BytecodeOp::ForInElement => (1, 2),     // iterable + idx → element
         BytecodeOp::ForInExit => (0, 1),        // iterable → (nothing)
+        BytecodeOp::ForInStep(_) => (1, 2),     // iterable + idx → element (or exit)
         BytecodeOp::ArgConcatWriteThrough(_) => (0, 1),
         BytecodeOp::WriteText(_) => (0, 0),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),

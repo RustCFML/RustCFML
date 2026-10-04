@@ -780,6 +780,54 @@ pub(crate) fn op_for_in_element(
 /// entry and puts the saved row back. Entries above it (a labelled `continue`
 /// that skipped an inner loop's exit) are unwound with it; matching on the
 /// query's identity keeps the stack in step either way.
+/// `ForInStep(end)`: [iterable, idx] -> [element], or exit the loop. Returns
+/// true when it jumped (the caller `continue`s without advancing `ip`).
+/// Exactly `IterLen; Lte; JumpIfFalse(end); <iter>; <idx>; ForInElement`: the
+/// length is read live each step (a body that deletes ends the loop early, as
+/// on Lucee), and the element comes from `op_for_in_element` except for an
+/// array, read directly.
+pub(crate) fn op_for_in_step(
+    vm: &mut CfmlVirtualMachine,
+    stack: &mut Vec<CfmlValue>,
+    ip: &mut usize,
+    locals: &ValueMap,
+    end: u32,
+) -> Result<bool, CfmlError> {
+    let idx = stack.pop().unwrap_or(CfmlValue::Null);
+    let iter = stack.pop().unwrap_or(CfmlValue::Null);
+    let i: i64 = match &idx {
+        CfmlValue::Int(i) => *i,
+        // The index is a compiler temporary seeded with 1 and bumped by
+        // `Increment`, so it is always an Int; a Double is tolerated anyway.
+        CfmlValue::Double(d) => *d as i64,
+        _ => 0,
+    };
+    if let CfmlValue::Array(a) = &iter {
+        let len = a.len() as i64;
+        if i > len {
+            *ip = end as usize;
+            return Ok(true);
+        }
+        let v = if i >= 1 { a.get((i - 1) as usize).unwrap_or(CfmlValue::Null) } else { CfmlValue::Null };
+        stack.push(v);
+        return Ok(false);
+    }
+    stack.push(iter.clone());
+    op_iter_len(stack);
+    let len = match stack.pop() {
+        Some(CfmlValue::Int(n)) => n,
+        _ => 0,
+    };
+    if i > len {
+        *ip = end as usize;
+        return Ok(true);
+    }
+    stack.push(iter);
+    stack.push(CfmlValue::Int(i));
+    op_for_in_element(vm, stack, ip, locals)?;
+    Ok(false)
+}
+
 #[inline]
 pub(crate) fn op_for_in_exit(vm: &mut CfmlVirtualMachine, stack: &mut Vec<CfmlValue>) {
     if let Some(CfmlValue::Query(q)) = stack.pop() {

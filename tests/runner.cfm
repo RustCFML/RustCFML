@@ -1192,6 +1192,7 @@ include "harness.cfm";
 <cf_runtest file="functions/test_local_scope_live.cfm">
 <cf_runtest file="functions/test_local_scope_live_loop_store.cfm">
 <cf_runtest file="functions/test_nested_path_store.cfm">
+<cf_runtest file="functions/test_member_fast_path.cfm">
 <!--- Elvis ?: absorbs exceptions from its left operand, not just undefined reads (GH #329). --->
 <cf_runtest file="functions/test_elvis_error_scope.cfm">
 

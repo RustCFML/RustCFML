@@ -1516,6 +1516,13 @@ pub enum BytecodeOp {
     // `Util.getInheritedMetaData` loop (4.4x slower than Lucee).
     WriteText(std::sync::Arc<str>),
 
+    // One step of a for-in loop: stack [iterable, idx] -> [element] when
+    // idx <= the iterable's LIVE length (as `IterLen` measures it), else pops
+    // both and jumps to the target. Replaces `IterLen; Lte; JumpIfFalse;
+    // LoadLocal iter; LoadLocal idx; ForInElement` — six dispatches and a
+    // second clone of the iterator handle per item (for-in ran 2.5x Lucee).
+    ForInStep(u32),
+
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
     CallNamed(Box<Vec<String>>, usize),
@@ -1669,11 +1676,12 @@ impl BytecodeOp {
             Self::TakeLocal(..) => 132,
             Self::TakeSlot(..) => 133,
             Self::WriteText(..) => 134,
+            Self::ForInStep(..) => 135,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 135] = [
+    pub const CENSUS_NAMES: [&'static str; 136] = [
         "Null",
         "True",
         "False",
@@ -1809,6 +1817,7 @@ impl BytecodeOp {
         "TakeLocal",
         "TakeSlot",
         "WriteText",
+        "ForInStep",
     ];
 }
 
@@ -4304,6 +4313,18 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::Integer(1));
         instructions.push(BytecodeOp::StoreLocal(Name::from(&idx_var)));
 
+        // `for (var x in …)` declares x once, before the loop: the declaration
+        // is idempotent, and inside the loop it re-ran the declare-local
+        // bookkeeping on every item.
+        let hoisted_decl = !for_in.variable.contains('.')
+            || (for_in.variable.starts_with("local.")
+                && !for_in.variable["local.".len()..].contains('.')
+                && self.local_is_scope());
+        if hoisted_decl && (for_in.var_declared || for_in.variable.starts_with("local.")) {
+            let n = for_in.variable.strip_prefix("local.").unwrap_or(&for_in.variable);
+            instructions.push(BytecodeOp::DeclareLocal(Name::from(n)));
+        }
+
         let loop_start = instructions.len();
 
         // cfloop-array only: idx <= length-at-entry, patched to loop_end below.
@@ -4324,19 +4345,12 @@ impl CfmlCompiler {
         // FormsService deletes fieldset entries inside `for (mField in
         // fields)`), which read Null while GetIndex was lenient and throws now
         // that it matches Lucee (§107). Lucee re-checks the size each step.
-        instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
+        // ...and fetch iterable[idx] (over a query, also moving its current
+        // row to idx) — both in the one `ForInStep`.
         instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
-        instructions.push(BytecodeOp::IterLen);
-        instructions.push(BytecodeOp::Lte);
-
+        instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
         let jump_false_idx = instructions.len();
-        instructions.push(BytecodeOp::JumpIfFalse(0));
-
-        // Set loop variable = iterable[idx] (over a query, also moves its
-        // current row to idx).
-        instructions.push(BytecodeOp::LoadLocal(Name::from(&iter_var)));
-        instructions.push(BytecodeOp::LoadLocal(Name::from(&idx_var)));
-        instructions.push(BytecodeOp::ForInElement);
+        instructions.push(BytecodeOp::ForInStep(0));
         // GH #351: `for ( local.X in … )` at TEMPLATE level. `local` is an
         // ordinary variable there, so the loop variable is `variables.local.X`
         // and stripping the prefix would write a bare `X` that the body's
@@ -4423,9 +4437,7 @@ impl CfmlCompiler {
             // (tests/core/test_forin_loop_variable_scope.cfm). The compiler's own
             // `__iter_`/`__idx_`/`__cap_` temporaries stay declared-local above.
             // `for (var x in …)` and `for (local.x in …)` ARE local (Lucee 7.1).
-            if for_in.var_declared || for_in.variable.starts_with("local.") {
-                instructions.push(BytecodeOp::DeclareLocal(Name::from(&loop_var_name)));
-            }
+            // (Declared once before the loop — see `hoisted_decl`.)
             instructions.push(BytecodeOp::StoreLocal(Name::from(loop_var_name)));
         }
         self.loop_stack.push((
@@ -4448,7 +4460,7 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::Jump(loop_start));
 
         let loop_end = instructions.len();
-        instructions[jump_false_idx] = BytecodeOp::JumpIfFalse(loop_end);
+        instructions[jump_false_idx] = BytecodeOp::ForInStep(loop_end as u32);
         if let Some(j) = cap_jump_idx {
             instructions[j] = BytecodeOp::JumpIfFalse(loop_end);
         }
