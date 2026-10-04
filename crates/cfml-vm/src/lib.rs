@@ -2382,6 +2382,16 @@ pub struct CfmlVirtualMachine {
     /// `is_some()` test per op and nothing else. Saved and restored around
     /// each call like `frame_has_local_scope`. See [`EscapedLocal`] (GH #465).
     escaped_local: Option<EscapedLocal>,
+    /// Whether the executing frame reconciles an escaped `local` handle at its
+    /// op boundaries (its body passed `local_may_escape`). Only such a frame may
+    /// be handed the PERSISTENT handle: in any other frame nothing keeps the
+    /// handle in step with the frame, so a second runtime-path use (`local.v.x =`
+    /// compiles to `SetDynamicVar`, which the static scan does not see) read and
+    /// wrote back a stale snapshot — resetting a `for` counter and looping
+    /// forever (GH #465 follow-up: Wheels' `local.validation.args =
+    /// Duplicate(arguments)` in a loop). Such frames get a fresh view per use,
+    /// exactly the pre-#465 behaviour.
+    local_watch: bool,
     /// Call-dispatch Lever D1 (scope pooling) — free-list of emptied per-call
     /// `locals` maps. `execute_function_body` pops one at entry (pre-sized) and
     /// pushes it back (cleared) at a non-escaping success exit, so warm calls
@@ -4735,6 +4745,7 @@ impl CfmlVirtualMachine {
             frame_ctx: Vec::new(),
             frame_has_local_scope: false,
             escaped_local: None,
+            local_watch: false,
             #[cfg(feature = "scope-pool")]
             locals_pool: Vec::new(),
             stack_pool: Vec::new(),
@@ -8404,6 +8415,7 @@ impl CfmlVirtualMachine {
         // The callee starts with no escaped `local`; the caller's handle (if
         // any) is restored with its frame below.
         let escaped_local_before = self.escaped_local.take();
+        let local_watch_before = self.local_watch;
         self.frame_has_local_scope =
             !func.is_template_frame || self.include_share_local_keys.is_some();
         let try_depth_before = self.try_stack.len();
@@ -8466,6 +8478,7 @@ impl CfmlVirtualMachine {
         self.frame_ctx.truncate(frame_ctx_before);
         self.frame_has_local_scope = frame_has_local_scope_before;
         self.escaped_local = escaped_local_before;
+        self.local_watch = local_watch_before;
         self.try_stack.truncate(try_depth_before);
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
@@ -9836,6 +9849,7 @@ impl CfmlVirtualMachine {
         // GH #465: only a body that can hand `local` out as a value pays the
         // per-op reconciliation check (a register-resident bool everywhere else).
         let watch_local_escape = Self::local_may_escape(func);
+        self.local_watch = watch_local_escape;
 
         // An op's error goes to this frame's open `try`, if any (GH #451).
         macro_rules! catch_op {
@@ -26484,6 +26498,9 @@ impl CfmlVirtualMachine {
     /// visibility rules — which lets a site WITHOUT those rules to hand
     /// (`getVariable("local")`, `evaluate("local")`) hand out the same handle.
     pub(crate) fn escaped_local_handle(&mut self, view: impl FnOnce() -> ValueMap) -> CfmlStruct {
+        if !self.local_watch {
+            return CfmlStruct::new(view());
+        }
         if let Some(esc) = self.escaped_local.as_ref() {
             return esc.handle.clone();
         }
