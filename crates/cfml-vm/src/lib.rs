@@ -15449,6 +15449,16 @@ impl CfmlVirtualMachine {
                 BytecodeOp::ForInPrepare => { ops::access::op_for_in_prepare(self, &mut stack); }
                 BytecodeOp::ForInElement => { ops::access::op_for_in_element(self, &mut stack, &mut ip, &locals)?; }
                 BytecodeOp::ForInExit => { ops::access::op_for_in_exit(self, &mut stack); }
+                BytecodeOp::WriteText(text) => {
+                    // Same rules as the `__writetext` intercept it replaces.
+                    if self.enable_cfoutput_only <= 0 {
+                        self.output_buffer.push_str(text);
+                        if let Err(e) = self.check_auto_flush() {
+                            let e = self.wrap_error(e);
+                            ip = self.route_call_error(e, &mut stack)?;
+                        }
+                    }
+                }
                 BytecodeOp::ArgConcatWriteThrough(name) => {
                     // See the op's doc. Pops the duplicated result; the following
                     // StoreLocal stores the original.
@@ -44174,6 +44184,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::ForInElement => (1, 2),     // iterable + idx → element
         BytecodeOp::ForInExit => (0, 1),        // iterable → (nothing)
         BytecodeOp::ArgConcatWriteThrough(_) => (0, 1),
+        BytecodeOp::WriteText(_) => (0, 0),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object
         BytecodeOp::NewObject(n) | BytecodeOp::NewObjectNamed(_, n) => (1, n + 1), // class + args → instance

@@ -1506,6 +1506,16 @@ pub enum BytecodeOp {
     TakeLocal(Name),
     TakeSlot(u16, Name),
 
+    // A template's literal text: `__writeText("<literal>")` as a statement, which
+    // is what the tag preprocessor emits for every run of text (and whitespace)
+    // between tags. Appends to the current output buffer with exactly the
+    // `__writeText` rules (suppressed while enableCFOutputOnly > 0, auto-flush
+    // checked). It used to be LoadGlobal + Call through the generic
+    // `call_function` path — name lowercasing and the intercept guard chain per
+    // blank line — which was the largest single item in ColdBox's tag-based
+    // `Util.getInheritedMetaData` loop (4.4x slower than Lucee).
+    WriteText(std::sync::Arc<str>),
+
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
     CallNamed(Box<Vec<String>>, usize),
@@ -1658,11 +1668,12 @@ impl BytecodeOp {
             Self::ForInExit => 131,
             Self::TakeLocal(..) => 132,
             Self::TakeSlot(..) => 133,
+            Self::WriteText(..) => 134,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 134] = [
+    pub const CENSUS_NAMES: [&'static str; 135] = [
         "Null",
         "True",
         "False",
@@ -1797,6 +1808,7 @@ impl BytecodeOp {
         "ForInExit",
         "TakeLocal",
         "TakeSlot",
+        "WriteText",
     ];
 }
 
@@ -2877,6 +2889,23 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::Return);
     }
 
+    /// `__writeText("<literal>")` — the tag preprocessor's text statement — with
+    /// its literal, for the `WriteText` op. `None` for any other shape (an
+    /// interpolated or computed argument keeps the generic call).
+    fn literal_write_text(expr: &Expression) -> Option<std::sync::Arc<str>> {
+        let Expression::FunctionCall(call) = expr else { return None };
+        let Expression::Identifier(ref id) = *call.name else { return None };
+        if !id.name.eq_ignore_ascii_case("__writetext") || call.arguments.len() != 1 {
+            return None;
+        }
+        match &call.arguments[0] {
+            Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                Some(std::sync::Arc::from(s.as_str()))
+            }
+            _ => None,
+        }
+    }
+
     fn compile_statement(&mut self, stmt: &Statement, instructions: &mut Vec<BytecodeOp>) {
         if let Some(line) = Self::stmt_line(stmt) {
             instructions.push(BytecodeOp::LineInfo(line, 0));
@@ -2884,6 +2913,10 @@ impl CfmlCompiler {
 
         match stmt {
             Statement::Expression(expr_stmt) => {
+                if let Some(text) = Self::literal_write_text(&expr_stmt.expr) {
+                    instructions.push(BytecodeOp::WriteText(text));
+                    return;
+                }
                 // A bare identifier used as a statement (`j;`) is dead code:
                 // reading a variable has no side effects and the result is
                 // discarded, so emit nothing. Lucee/ACF evaluate such a

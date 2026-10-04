@@ -508,6 +508,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_metadata_implements_extends.cfm">
 <cf_runtest file="oop/test_gcm_path_metadata_cache.cfm">
 <cf_runtest file="oop/test_component_path_double_dot.cfm">
+<cf_runtest file="tags/test_write_text_op.cfm">
 <cf_runtest file="oop/test_component_bool_attr.cfm">
 <cf_runtest file="oop/test_chained_writeback_clobber.cfm">
 <cf_runtest file="oop/test_instance_shares_injected_component.cfm">
