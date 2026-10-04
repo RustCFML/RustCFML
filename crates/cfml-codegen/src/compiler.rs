@@ -5731,6 +5731,17 @@ impl CfmlCompiler {
                                         instructions.push(BytecodeOp::Dup);
                                     }
                                     instructions.push(BytecodeOp::StoreLocalScopeKey(Name::from(&access.member)));
+                                } else if ident.name.eq_ignore_ascii_case("variables") && self.local_is_scope() {
+                                    // `variables.x = v` inside a function: one op
+                                    // that writes into the frame's live `variables`
+                                    // struct, instead of loading the scope by name,
+                                    // `SetProperty`, and storing the scope back
+                                    // (149 ns vs Lucee's 59 in a component method).
+                                    // Not in value position here (that case took the
+                                    // branch above), so the value is consumed.
+                                    instructions.push(BytecodeOp::SetScopePath(std::sync::Arc::new(
+                                        ScopePath::new(format!("{}.{}", ident.name, access.member)),
+                                    )));
                                 } else {
                                     // SetProperty needs [obj, value].
                                     self.compile_expression(&access.object, instructions);

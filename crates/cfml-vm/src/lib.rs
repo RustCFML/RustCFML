@@ -10506,6 +10506,20 @@ impl CfmlVirtualMachine {
                             let same = match held {
                                 Some(cur) => same_reference(cur, top),
                                 None if !routes_to_scope => false,
+                                // `variables.x = v` stores the `variables` scope
+                                // itself back after `SetProperty` mutated it in
+                                // place. The frame holds that scope under its
+                                // internal `__variables` key, so the name probe
+                                // above misses it and the store took the full
+                                // routing path (139 ns per `variables.x =` vs
+                                // Lucee's 61).
+                                None if name.key() == &*cfml_common::key::well_known::VARIABLES_SCOPE
+                                    && locals
+                                        .get(&*cfml_common::key::well_known::VARIABLES)
+                                        .is_some_and(|cur| same_reference(cur, top)) =>
+                                {
+                                    true
+                                }
                                 None => {
                                     let via_vars = if direct_frame && !name.is_reserved_word() {
                                         scope_cache
@@ -25014,9 +25028,9 @@ impl CfmlVirtualMachine {
                 }
             }
         } else if root0.eq_ignore_ascii_case("variables") {
-            if parts.len() < 3 {
-                None
-            } else {
+            // Two segments too (`variables.x = v` inside a function compiles to
+            // `SetScopePath`): the leaf goes straight into the live struct.
+            {
                 match locals.get(&*cfml_common::key::well_known::VARIABLES) {
                     Some(v @ CfmlValue::Struct(_)) => Some((v.clone(), 1)),
                     _ => None,

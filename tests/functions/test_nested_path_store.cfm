@@ -47,5 +47,15 @@ pageRoot.a.b = "page";
 assert("bare root at page level", pageRoot.a.b, "page");
 variables.pageVar.x.y = 1;
 assert("variables root at page level", variables.pageVar.x.y, 1);
+h = new oop.NestedStoreHolder();
+h.bump().bump().nest().bump();
+assert("variables.x = v in a component method persists on the instance", h.read(), "3/b3/2");
+assert("variables.x = v from a closure inside a method lands on the instance", h.viaClosure(), "c");
+other = new oop.NestedStoreHolder();
+other.bump();
+assert("another instance has its own variables", listFirst(other.read(), "/"), 1);
+function pageUdfSets() { variables.fromPageUdf = "p"; }
+pageUdfSets();
+assert("variables.x = v in a page UDF writes the page scope", variables.fromPageUdf, "p");
 suiteEnd();
 </cfscript>
