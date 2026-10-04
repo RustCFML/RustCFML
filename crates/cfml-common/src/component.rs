@@ -865,6 +865,88 @@ pub fn make_instance_value(
     CfmlValue::Instance(handle)
 }
 
+/// The per-instance data of a finished instance of a DECLARATION-ONLY class (no
+/// pseudo-constructor statements, literal property defaults — the compiler marks
+/// such a template `__declarative`). Every construction of such a class yields
+/// equal data, so later instances are built from a copy of this instead of
+/// running the class body again. See [`instance_from_prototype`].
+#[cfg(feature = "component-instance")]
+pub struct InstancePrototype {
+    pub class: std::sync::Arc<ClassBlueprint>,
+    this_data: crate::dynamic::ValueMap,
+    vars_data: crate::dynamic::ValueMap,
+}
+
+#[cfg(feature = "component-instance")]
+fn prototype_data(scope: &CfmlStruct) -> crate::dynamic::ValueMap {
+    scope.with_read(|m| {
+        let mut out = crate::dynamic::ValueMap::with_capacity_and_hasher(m.len(), Default::default());
+        for (k, v) in m.iter() {
+            // Same partition as `partition_data_map`: data only — the shared
+            // `static` scope and the method table are re-attached per instance.
+            if matches!(v, CfmlValue::Function(_)) || is_reserved_component_key(k) {
+                continue;
+            }
+            out.insert(k.clone(), v.deep_copy());
+        }
+        out
+    })
+}
+
+#[cfg(feature = "component-instance")]
+impl Instance {
+    /// Snapshot this (freshly constructed, pre-`init`) instance as a prototype.
+    /// `None` for an instance with per-instance native parent state.
+    pub fn prototype(&self) -> Option<InstancePrototype> {
+        if self.native_parent.is_some() {
+            return None;
+        }
+        Some(InstancePrototype {
+            class: self.class.clone(),
+            this_data: prototype_data(&self.this_members),
+            vars_data: prototype_data(&self.variables_members),
+        })
+    }
+}
+
+/// A new instance whose data is a deep copy of `proto`'s — what executing the
+/// class body would have produced — with the same bookkeeping as
+/// [`make_instance_value`]: method tables, the shared `static` scope, the
+/// `variables.this` aliases and cycle-GC registration. The copy is deep so
+/// struct/array defaults are fresh per instance, as re-evaluating the literal is.
+#[cfg(feature = "component-instance")]
+pub fn instance_from_prototype(proto: &InstancePrototype, instance_id: u64) -> CfmlValue {
+    let copy = |m: &crate::dynamic::ValueMap| {
+        let mut out = crate::dynamic::ValueMap::with_capacity_and_hasher(m.len(), Default::default());
+        for (k, v) in m.iter() {
+            out.insert(k.clone(), v.deep_copy());
+        }
+        out
+    };
+    let class = proto.class.clone();
+    let this_members = CfmlStruct::new_untracked(copy(&proto.this_data));
+    let variables_members = CfmlStruct::new_untracked(copy(&proto.vars_data));
+    this_members.set_method_table(class.method_values.clone());
+    variables_members.set_method_table(class.method_values.clone());
+    if let Some(ref stat) = class.static_scope {
+        variables_members.insert("__static".to_string(), stat.clone());
+    }
+    variables_members.set_this_alias_if_changed(&this_members);
+    let inst = Instance {
+        class,
+        this_members,
+        variables_members,
+        instance_id,
+        native_parent: None,
+        call_name: None,
+    };
+    crate::perf_counters::bump(&crate::perf_counters::INSTANCES_CREATED);
+    let handle: InstanceRef = std::sync::Arc::new(parking_lot::RwLock::new(inst));
+    crate::cycle_gc::log_instance(&handle);
+    handle.read().variables_members.set_this_instance_alias(&handle);
+    CfmlValue::Instance(handle)
+}
+
 /// Retarget any top-level data member whose struct backing IS `marker_ptr` to the
 /// live instance handle (§5.2 self-reference audit). Shallow by design: the
 /// documented C.2.3 case is the direct `variables[classname] = this`; deeper
@@ -974,6 +1056,7 @@ pub fn is_reserved_component_key(k: &str) -> bool {
         "__implements_fqns",
         "__implements_src",
         "__accessors",
+        "__declarative",
         "__is_interface",
         "__is_super",
         "__class_name",
@@ -1448,6 +1531,7 @@ mod reserved_key_tests {
             "__static",
             "__source_file",
             "__accessors",
+            "__declarative",
             "__is_super",
             "__cfc_body__",
             "__java_shim",

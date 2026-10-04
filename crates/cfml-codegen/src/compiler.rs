@@ -5214,6 +5214,23 @@ impl CfmlCompiler {
             prop_count += 1;
         }
 
+        // Declaration-only body: no pseudo-constructor statements, and every
+        // property default is a literal. Executing such a body yields the same
+        // per-instance data every time, so the VM may build later instances by
+        // copying the first one instead of running the body again (see
+        // `ctor_prototype_lookup`). Anything else — a statement, a default that
+        // calls or reads something — keeps the marker off.
+        let declarative = component.body.is_empty()
+            && component
+                .properties
+                .iter()
+                .all(|p| p.default.as_ref().is_none_or(is_literal_expression));
+        if declarative {
+            instructions.push(BytecodeOp::String(std::sync::Arc::new("__declarative".to_string())));
+            instructions.push(BytecodeOp::True);
+            prop_count += 1;
+        }
+
         // Build the base struct
         instructions.push(BytecodeOp::BuildStruct(prop_count));
 
@@ -7050,5 +7067,24 @@ mod slot_tests {
         );
         assert!(f.slot_names.iter().all(|n| n.lower() != "request"));
         assert!(f.slot_names.iter().all(|n| n.lower() != "p"));
+    }
+}
+
+/// A constant expression whose every evaluation yields an equal, fresh value:
+/// a scalar literal, or an array / struct literal built only from such.
+fn is_literal_expression(e: &Expression) -> bool {
+    match e {
+        Expression::Literal(_) => true,
+        Expression::Array(a) => a.elements.iter().all(is_literal_expression),
+        Expression::Struct(st) => st
+            .pairs
+            .iter()
+            .all(|(k, v)| {
+                // A bare key (`{a: 1}`) parses as an identifier but names the key;
+                // it is not evaluated.
+                (is_literal_expression(k) || matches!(k, Expression::Identifier(_)))
+                    && is_literal_expression(v)
+            }),
+        _ => false,
     }
 }

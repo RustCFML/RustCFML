@@ -3124,6 +3124,15 @@ pub struct CfmlVirtualMachine {
     /// `exists()` storm when a request instantiates the same component many times.
     /// Same key/value shape as the production layer (see [`ComponentPathEntry`]).
     pub request_component_cache: FxHashMap<u64, ComponentPathEntry>,
+    /// Prototypes of DECLARATION-ONLY classes constructed this request, keyed
+    /// like `request_component_cache` (see `ctor_prototype_lookup`).
+    #[cfg(feature = "component-instance")]
+    ctor_prototypes:
+        FxHashMap<u64, (ComponentPathEntry, Arc<cfml_common::component::InstancePrototype>)>,
+    /// Pseudo-constructor bodies NOT marked `__declarative` executed so far this
+    /// request. A construction that leaves it unchanged ran only declarative
+    /// bodies (its own and every parent's), so its result is a valid prototype.
+    ctor_nondeclarative_runs: u64,
     /// See [`ClassRecord`]. Keyed like `request_component_cache`.
     class_records: FxHashMap<u64, Arc<ClassRecord>>,
     /// Request-scoped memo of [`Self::build_inheritance_metadata`], keyed by
@@ -4909,6 +4918,9 @@ impl CfmlVirtualMachine {
             static_holders: HashMap::new(),
             class_meta_cache: FxHashMap::default(),
             request_component_cache: FxHashMap::default(),
+            #[cfg(feature = "component-instance")]
+            ctor_prototypes: FxHashMap::default(),
+            ctor_nondeclarative_runs: 0,
             class_records: FxHashMap::default(),
             component_inherit_meta_cache: HashMap::new(),
             component_path_meta_cache: HashMap::new(),
@@ -13569,6 +13581,21 @@ impl CfmlVirtualMachine {
                             CfmlValue::String(s) => Some(s.clone()),
                             _ => None,
                         };
+                        // A declaration-only class with an `init` already built
+                        // this request: copy its prototype instead (see
+                        // `ctor_from_prototype`). Same instance-before-init shape
+                        // the `has_user_init` path below produces.
+                        #[cfg(feature = "component-instance")]
+                        let from_proto: Option<CfmlValue> = match &class_ref {
+                            CfmlValue::String(s) => self.ctor_from_prototype(s, &locals, Some(s.as_str()), true),
+                            _ => None,
+                        };
+                        #[cfg(not(feature = "component-instance"))]
+                        let from_proto: Option<CfmlValue> = None;
+                        let nondecl_before = self.ctor_nondeclarative_runs;
+                        let instance = if let Some(v) = from_proto {
+                            v
+                        } else {
                         // Resolve the component template
                         let template = if let CfmlValue::Struct(s) = &class_ref {
                             CfmlValue::Struct(s.clone())
@@ -13653,6 +13680,15 @@ impl CfmlVirtualMachine {
                             self.to_instance_value(instance, call_name.as_deref().map(String::as_str))
                         } else {
                             instance
+                        };
+                        #[cfg(feature = "component-instance")]
+                        if has_user_init {
+                            if let CfmlValue::String(s) = &class_ref {
+                                self.ctor_prototype_record(s, &locals, &instance, nondecl_before);
+                            }
+                        }
+                        let _ = nondecl_before;
+                        instance
                         };
 
                         // Locate init() (a Function) on either representation.
@@ -20133,6 +20169,13 @@ impl CfmlVirtualMachine {
                         if obj_type.eq_ignore_ascii_case("component") {
                             let comp_name = args[1].as_str_cow();
                             _co.lap(12);
+                            #[cfg(feature = "component-instance")]
+                            if let Some(v) =
+                                self.ctor_from_prototype(&comp_name, parent_locals, Some(&comp_name), false)
+                            {
+                                return Ok(v);
+                            }
+                            let nondecl_before = self.ctor_nondeclarative_runs;
                             if let Some(template) =
                                 self.resolve_component_template(&comp_name, parent_locals)
                             {
@@ -20149,6 +20192,9 @@ impl CfmlVirtualMachine {
                                 #[cfg(feature = "component-instance")]
                                 let instance = self.to_instance_value(instance, Some(&comp_name));
                                 _co.lap(15);
+                                #[cfg(feature = "component-instance")]
+                                self.ctor_prototype_record(&comp_name, parent_locals, &instance, nondecl_before);
+                                let _ = nondecl_before;
                                 return Ok(instance);
                             }
                             // Unresolved component path: throw rather than return
@@ -34666,6 +34712,124 @@ impl CfmlVirtualMachine {
     /// Allocate the next stable per-instance component id. Process-global and
     /// monotonic so ids stay unique across cfthreads. Starts at 1 so a `0`/absent
     /// `__instance_id` is unambiguously "no identity" in the write-back guards.
+    /// Key parts for the prototype map — the same identity the component path
+    /// cache resolves by (name as written, caller dir, base template, mappings).
+    #[cfg(feature = "component-instance")]
+    fn ctor_prototype_key(&self, class_name: &str) -> (u64, &str, &str, u64) {
+        let source_dir = component_cache_source_dir(self.source_file.as_deref());
+        let base = self.base_template_path.as_deref().unwrap_or(COMPONENT_CACHE_NONE);
+        let fp = self.mappings_fingerprint;
+        (component_cache_hash(class_name, source_dir, base, fp), source_dir, base, fp)
+    }
+
+    /// Whether `class_name` would resolve through a template held in scope
+    /// (steps 1-3 of the resolver) rather than the file — never prototyped.
+    #[cfg(feature = "component-instance")]
+    fn ctor_name_shadowed(&self, class_name: &str, locals: &ValueMap) -> bool {
+        matches!(locals.get(class_name), Some(CfmlValue::Struct(_)))
+            || matches!(self.globals.get(class_name), Some(CfmlValue::Struct(_)))
+            || (self.component_template_globals > 0 && !class_name.contains(['.', '/']))
+    }
+
+    /// Build an instance of a DECLARATION-ONLY class from the prototype its first
+    /// construction this request left (see `ctor_prototype_record`), instead of
+    /// resolving the template and running its body again. Such a class's body
+    /// produces equal data every time, so this is the same result — the parent
+    /// chain, method tables, static scope and blueprint are all per class.
+    /// `require_init`: only for a class with an `init` (the `new` operator's
+    /// instance-before-init path; a class without one keeps its marker path).
+    #[cfg(feature = "component-instance")]
+    fn ctor_from_prototype(
+        &mut self,
+        class_name: &str,
+        locals: &ValueMap,
+        call_name: Option<&str>,
+        require_init: bool,
+    ) -> Option<CfmlValue> {
+        if self.ctor_prototypes.is_empty()
+            || self.meta_template_depth > 0
+            || self.ctor_name_shadowed(class_name, locals)
+        {
+            return None;
+        }
+        let proto = {
+            let (key, source_dir, base, fp) = self.ctor_prototype_key(class_name);
+            let (entry, proto) = self.ctor_prototypes.get(&key)?;
+            if !entry.matches(class_name, source_dir, base, fp) {
+                return None;
+            }
+            proto.clone()
+        };
+        if require_init && proto.class.method_values.get("init").is_none() {
+            return None;
+        }
+        #[cfg(feature = "observability")]
+        let footer = self
+            .interest
+            .contains(observe::Interest::TEMPLATE)
+            .then(|| {
+                self.template_frame_begin();
+                std::time::Instant::now()
+            });
+        let value = cfml_common::component::instance_from_prototype(&proto, Self::next_component_id());
+        if let (Some(cn), CfmlValue::Instance(inst)) = (call_name, &value) {
+            if !cn.is_empty() && cn != proto.class.name.as_str() {
+                inst.write().call_name = Some(Arc::from(cn));
+            }
+        }
+        #[cfg(feature = "observability")]
+        if let Some(start) = footer {
+            let us = start.elapsed().as_micros() as i64;
+            let src = proto.class.source_file.clone();
+            self.template_frame_end(&src, Some("<constructor>"), us);
+        }
+        // Construction is where the collector's incremental sweep (and the
+        // `--max-memory` guard riding on it) gets its chance; keep that.
+        cfml_common::cycle_gc::collect_incremental();
+        Some(value)
+    }
+
+    /// After an ordinary construction: if it ran only declaration-only bodies
+    /// (`ctor_nondeclarative_runs` unchanged) and produced a flyweight instance,
+    /// keep that instance's data as the class's prototype for this request.
+    /// Only for a name that resolves through the file to a class whose name does
+    /// not depend on the caller (a dotted path naming the class itself).
+    #[cfg(feature = "component-instance")]
+    fn ctor_prototype_record(
+        &mut self,
+        class_name: &str,
+        locals: &ValueMap,
+        instance: &CfmlValue,
+        nondecl_before: u64,
+    ) {
+        if self.ctor_nondeclarative_runs != nondecl_before
+            || self.meta_template_depth > 0
+            || !class_name.contains(['.', '/', '\\'])
+            || self.ctor_name_shadowed(class_name, locals)
+        {
+            return;
+        }
+        let CfmlValue::Instance(inst) = instance else { return };
+        let (key, source_dir, base, fp) = self.ctor_prototype_key(class_name);
+        if self.ctor_prototypes.contains_key(&key) {
+            return;
+        }
+        let Some(proto) = inst.read().prototype() else { return };
+        if proto.class.source_file.is_empty()
+            || !proto.class.name.eq_ignore_ascii_case(&Self::dotted_component_name(class_name))
+        {
+            return;
+        }
+        let entry = ComponentPathEntry {
+            class_name: Box::from(class_name),
+            source_dir: Box::from(source_dir),
+            base_template: Box::from(base),
+            mappings_fp: fp,
+            path: Arc::from(proto.class.source_file.as_str()),
+        };
+        self.ctor_prototypes.insert(key, (entry, Arc::new(proto)));
+    }
+
     fn next_component_id() -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -37294,6 +37458,13 @@ impl CfmlVirtualMachine {
                 None
             };
             _ct.lap(9);
+            // A body the compiler did not mark declaration-only ran: nothing this
+            // construction produced may serve as a prototype.
+            if !matches!(&result, Some(CfmlValue::Struct(t))
+                if matches!(t.get("__declarative"), Some(CfmlValue::Bool(true))))
+            {
+                self.ctor_nondeclarative_runs += 1;
+            }
             // The body ran with the class's FULL method set on the template
             // `this` (see `pending_pseudo_ctor_inherited_table`). From here on the
             // template must carry only the class's OWN methods: the inheritance

@@ -510,6 +510,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_gcm_path_metadata_cache.cfm">
 <cf_runtest file="oop/test_metadata_forms_shared.cfm">
 <cf_runtest file="oop/test_accessor_methods_per_class.cfm">
+<cf_runtest file="oop/test_declarative_ctor_prototype.cfm">
 <cf_runtest file="oop/test_component_path_double_dot.cfm">
 <cf_runtest file="tags/test_write_text_op.cfm">
 <cf_runtest file="oop/test_component_bool_attr.cfm">
