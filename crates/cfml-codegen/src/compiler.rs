@@ -5220,7 +5220,16 @@ impl CfmlCompiler {
         // Store as a component template in local scope first
         instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
 
-        // Generate accessor methods if accessors="true" (BEFORE storing globally)
+        // Generate accessor methods if accessors="true". They are attached with
+        // the declared methods by the class's single `DefineComponentMethods`
+        // op (ahead of them, which keeps the old key order), so they live in
+        // the per-class method table like any method. They used to be built
+        // with a `DefineFunction` + `SetProperty` pair EACH, re-run by the
+        // pseudo-constructor on every instance (+~1.3 us per `new` for three
+        // properties; Lucee +0.6). A method the class declares itself wins, as
+        // on Lucee, so its generated twin is not emitted at all.
+        let user_defines = |n: &str| component.functions.iter().any(|f| f.name.eq_ignore_ascii_case(n));
+        let mut accessor_gids: Vec<usize> = Vec::new();
         if component.accessors {
             for prop in &component.properties {
                 // Generate getter: getPropertyName()
@@ -5272,21 +5281,10 @@ impl CfmlCompiler {
             chain_tier: 0,
             slot_names: Vec::new(),
                 };
-                self.push_function(getter_func);
-                let getter_gid = self.program.functions.last().unwrap().global_id as usize;
-                instructions.push(BytecodeOp::DefineFunction(getter_gid));
-                // Stack: [getter_func]
-
-                // Add getter to component: component[getter_name] = getter_func
-                // Stack: [getter_func]
-                // Load component: [getter_func, component]
-                // Swap: [component, getter_func]
-                // SetProperty(getter_name): sets component.getter_name = getter_func, stack is [component]
-                // StoreLocal: []
-                instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
-                instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(Name::from(&getter_name)));
-                instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
+                if !user_defines(&getter_name) {
+                    self.push_function(getter_func);
+                    accessor_gids.push(self.program.functions.last().unwrap().global_id as usize);
+                }
 
                 // Generate setter: setPropertyName(value)
                 //
@@ -5346,16 +5344,10 @@ impl CfmlCompiler {
             chain_tier: 0,
             slot_names: Vec::new(),
                 };
-                self.push_function(setter_func);
-                let setter_gid = self.program.functions.last().unwrap().global_id as usize;
-                instructions.push(BytecodeOp::DefineFunction(setter_gid));
-                // Stack: [setter_func]
-
-                // Add setter to component (same pattern)
-                instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
-                instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(Name::from(&setter_name)));
-                instructions.push(BytecodeOp::StoreLocal(Name::from(&component.name)));
+                if !user_defines(&setter_name) {
+                    self.push_function(setter_func);
+                    accessor_gids.push(self.program.functions.last().unwrap().global_id as usize);
+                }
             }
         }
 
@@ -5376,7 +5368,8 @@ impl CfmlCompiler {
         // doc). Going through the holder LOCAL — never `LoadLocal(func.name)` —
         // also keeps a method named after a scope word (`function local(){}`)
         // from loading the scope instead.
-        let mut gids: Vec<usize> = Vec::with_capacity(component.functions.len());
+        let mut gids: Vec<usize> = accessor_gids;
+        gids.reserve(component.functions.len());
         for func in &component.functions {
             let mut scratch: Vec<BytecodeOp> = Vec::new();
             gids.push(self.compile_function_decl(func, &mut scratch));
