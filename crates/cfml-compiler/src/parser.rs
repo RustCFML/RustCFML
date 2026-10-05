@@ -8,6 +8,8 @@ use std::convert::TryFrom;
 
 pub struct Parser {
     tokens: Vec<TokenWithLoc>,
+    /// Keyword source spellings by token index (see `Lexer::raw_spellings`).
+    raw_spellings: Vec<(u32, Box<str>)>,
     current: usize,
     /// Map from token index → javadoc comment text immediately preceding it.
     doc_comments: std::collections::HashMap<usize, String>,
@@ -82,8 +84,10 @@ impl Parser {
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let doc_comments = lexer.doc_comments().iter().cloned().collect();
+        let raw_spellings = lexer.take_raw_spellings();
         Self {
             tokens,
+            raw_spellings,
             current: 0,
             doc_comments,
             expr_depth: 0,
@@ -99,8 +103,8 @@ impl Parser {
             if let Token::Error(msg) = &tok.token {
                 return Err(ParseError {
                     message: msg.clone(),
-                    line: tok.location.start.line,
-                    column: tok.location.start.column,
+                    line: tok.location.start.line as usize,
+                    column: tok.location.start.column as usize,
                 });
             }
         }
@@ -134,11 +138,12 @@ impl Parser {
     /// (the common case, which stores no text). Keyword tokens carry no text of
     /// their own, so without this every keyword used as a name — a struct key, a
     /// method name, a segment of a dotted component path — came back lowercased.
-    /// See `TokenWithLoc::raw` (GH #381).
+    /// See `Lexer::raw_spellings` (GH #381).
     fn consumed_keyword_name(&self, canonical: &str) -> String {
         if self.current > 0 {
-            if let Some(raw) = self.tokens[self.current - 1].raw.as_deref() {
-                return raw.to_string();
+            let idx = (self.current - 1) as u32;
+            if let Ok(i) = self.raw_spellings.binary_search_by_key(&idx, |(k, _)| *k) {
+                return self.raw_spellings[i].1.to_string();
             }
         }
         canonical.to_string()
@@ -204,8 +209,8 @@ impl Parser {
         let loc = self.current_location();
         ParseError {
             message: format!("{} (found {:?})", message, self.peek(0)),
-            line: loc.start.line,
-            column: loc.start.column,
+            line: loc.start.line as usize,
+            column: loc.start.column as usize,
         }
     }
 
@@ -250,9 +255,9 @@ impl Parser {
                 if func.return_type.is_none() {
                     func.return_type = captured_rt;
                 }
-                return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
+                return Ok(CfmlNode::Statement(Statement::FunctionDecl(Box::new(FunctionDecl {
                     func,
-                })));
+                }))));
             }
             if self.match_token(&Token::Static) {
                 // Capture optional return type after static (including dotted names)
@@ -264,9 +269,9 @@ impl Parser {
                     if func.return_type.is_none() {
                         func.return_type = captured_rt;
                     }
-                    return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
+                    return Ok(CfmlNode::Statement(Statement::FunctionDecl(Box::new(FunctionDecl {
                         func,
-                    })));
+                    }))));
                 }
             }
         }
@@ -276,7 +281,7 @@ impl Parser {
         }
 
         if self.match_token(&Token::If) {
-            return Ok(CfmlNode::Statement(Statement::If(self.parse_if()?)));
+            return Ok(CfmlNode::Statement(Statement::If(Box::new(self.parse_if()?))));
         }
 
         if self.match_token(&Token::For) {
@@ -292,7 +297,7 @@ impl Parser {
         }
 
         if self.match_token(&Token::Switch) {
-            return Ok(CfmlNode::Statement(Statement::Switch(self.parse_switch()?)));
+            return Ok(CfmlNode::Statement(Statement::Switch(Box::new(self.parse_switch()?))));
         }
 
         if self.match_token(&Token::Try) {
@@ -401,9 +406,9 @@ impl Parser {
         }
 
         if self.match_token(&Token::Function) {
-            return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
+            return Ok(CfmlNode::Statement(Statement::FunctionDecl(Box::new(FunctionDecl {
                 func: self.parse_function()?,
-            })));
+            }))));
         }
 
         // Bare-typed top-level function: `struct function f() {...}` (no access
@@ -438,9 +443,9 @@ impl Parser {
                 if func.return_type.is_none() && !captured_rt.is_empty() {
                     func.return_type = Some(captured_rt);
                 }
-                return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
+                return Ok(CfmlNode::Statement(Statement::FunctionDecl(Box::new(FunctionDecl {
                     func,
-                })));
+                }))));
             }
         }
 
@@ -457,15 +462,15 @@ impl Parser {
             let mut component = self.parse_component()?;
             self.apply_doc_to_metadata(comp_doc_idx, &mut component.metadata);
             return Ok(CfmlNode::Statement(Statement::ComponentDecl(
-                ComponentDecl { component },
+                Box::new(ComponentDecl { component }),
             )));
         }
 
         if self.match_token(&Token::Interface) {
             return Ok(CfmlNode::Statement(Statement::InterfaceDecl(
-                InterfaceDecl {
+                Box::new(InterfaceDecl {
                     interface: self.parse_interface()?,
-                },
+                }),
             )));
         }
 
@@ -855,12 +860,12 @@ impl Parser {
                         }
                     }
                 }
-                return Ok(CfmlNode::Statement(Statement::Assignment(Assignment {
+                return Ok(CfmlNode::Statement(Statement::Assignment(Box::new(Assignment {
                     target,
                     value: cfhttp_call,
                     operator: AssignOp::Equal,
                     location: stmt_loc,
-                })));
+                }))));
             }
             self.current = http_start;
         }
@@ -1393,7 +1398,7 @@ impl Parser {
                 location: stmt_loc.clone(),
             }));
             stmts.extend(body);
-            stmts.push(Statement::Assignment(Assignment {
+            stmts.push(Statement::Assignment(Box::new(Assignment {
                 target: var_target,
                 value: Expression::FunctionCall(Box::new(FunctionCall {
                     name: Box::new(Expression::Identifier(Identifier {
@@ -1405,7 +1410,7 @@ impl Parser {
                 })),
                 operator: AssignOp::Equal,
                 location: stmt_loc.clone(),
-            }));
+            })));
             return Ok(CfmlNode::Statement(Statement::Output(Output {
                 body: stmts,
                 location: stmt_loc,
@@ -1930,12 +1935,12 @@ impl Parser {
             self.match_token(&Token::Semicolon);
 
             let target = self.expression_to_assign_target(&expr)?;
-            return Ok(CfmlNode::Statement(Statement::Assignment(Assignment {
+            return Ok(CfmlNode::Statement(Statement::Assignment(Box::new(Assignment {
                 target,
                 value,
                 operator: assign_op,
                 location: stmt_loc,
-            })));
+            }))));
         }
 
         // Check for postfix ++ / --
@@ -2140,12 +2145,12 @@ impl Parser {
             let value = self.parse_expression()?;
             self.match_token(&Token::Semicolon);
             let target = self.expression_to_assign_target(&expr)?;
-            return Ok(Statement::Assignment(Assignment {
+            return Ok(Statement::Assignment(Box::new(Assignment {
                 target,
                 value,
                 operator,
                 location: loc,
-            }));
+            })));
         }
         self.match_token(&Token::Semicolon);
         Ok(Statement::Expression(ExpressionStatement { expr, location: loc }))
@@ -2274,13 +2279,13 @@ impl Parser {
                     let iterable = self.parse_expression()?;
                     self.consume(&Token::RParen)?;
                     let body = self.parse_block_or_statement()?;
-                    return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
                         var_declared: has_var,
                         variable: name,
                         iterable,
                         body,
                         location: loc,
-                    })));
+                    }))));
                 }
             }
         }
@@ -2377,13 +2382,13 @@ impl Parser {
             }
         };
 
-        Ok(CfmlNode::Statement(Statement::For(For {
+        Ok(CfmlNode::Statement(Statement::For(Box::new(For {
             init,
             condition,
             increment,
             body,
             location: loc,
-        })))
+        }))))
     }
 
     fn parse_var_no_semicolon(&mut self) -> Result<Var, ParseError> {
@@ -2504,12 +2509,12 @@ impl Parser {
         // (`local.v`) becomes a StructAccess target, not a Variable named
         // "local.v" — see `ident` above and `assign_target_from_dotted`.
         let assign = |name: String, value: Expression| {
-            Statement::Assignment(Assignment {
+            Statement::Assignment(Box::new(Assignment {
                 target: self.assign_target_from_dotted(&name, loc),
                 value,
                 operator: AssignOp::Equal,
                 location: loc,
-            })
+            }))
         };
         // Unique temp suffix for synthesized loop variables.
         let uniq = self.current;
@@ -2542,13 +2547,13 @@ impl Parser {
             }));
             let init = Statement::Var(Var { name: idx.clone(), value: Some(from), location: loc });
             let increment = bin(ident(&idx), BinaryOpType::Add, step);
-            return Ok(CfmlNode::Statement(Statement::For(For {
+            return Ok(CfmlNode::Statement(Statement::For(Box::new(For {
                 init: Some(Box::new(init)),
                 condition: Some(cond),
                 increment: Some(Box::new(bin(ident(&idx), BinaryOpType::Assign, increment))),
                 body,
                 location: loc,
-            })));
+            }))));
         }
 
         // 2) times=N — repeat the body N times.
@@ -2557,13 +2562,13 @@ impl Parser {
             let init = Statement::Var(Var { name: counter.clone(), value: Some(int(1)), location: loc });
             let cond = bin(ident(&counter), BinaryOpType::LessEqual, times);
             let increment = bin(ident(&counter), BinaryOpType::Assign, bin(ident(&counter), BinaryOpType::Add, int(1)));
-            return Ok(CfmlNode::Statement(Statement::For(For {
+            return Ok(CfmlNode::Statement(Statement::For(Box::new(For {
                 init: Some(Box::new(init)),
                 condition: Some(cond),
                 increment: Some(Box::new(increment)),
                 body,
                 location: loc,
-            })));
+            }))));
         }
 
         // 3) condition="…" — while loop. The condition attribute is an
@@ -2613,27 +2618,27 @@ impl Parser {
                         assign(arr_tmp.clone(), array),
                         assign(cap_tmp.clone(), call("arrayLen", vec![ident(&arr_tmp)])),
                     ],
-                    Statement::For(For {
+                    Statement::For(Box::new(For {
                         init: Some(Box::new(init)),
                         condition: Some(cond),
                         increment: Some(Box::new(increment)),
                         body: for_body,
                         location: loc,
-                    }),
+                    })),
                     loc,
                 ));
             }
             // item (or index) alone names the element binding.
             if let Some(binding) = item.clone().or(index.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
-                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
                     var_declared: false,
                     variable: name,
                     // Codegen marker: cfloop-array bound is min(entry, live) on Lucee.
                     iterable: call("__cfloop_array_iter", vec![array]),
                     body,
                     location: loc,
-                })));
+                }))));
             }
         }
 
@@ -2662,25 +2667,25 @@ impl Parser {
                 // Hoist the split list into a temp so it is built once.
                 return Ok(self.wrap_with_preamble(
                     vec![assign(list_tmp.clone(), call("listToArray", vec![list, delims_expr()]))],
-                    Statement::For(For {
+                    Statement::For(Box::new(For {
                         init: Some(Box::new(init)),
                         condition: Some(cond),
                         increment: Some(Box::new(increment)),
                         body: for_body,
                         location: loc,
-                    }),
+                    })),
                     loc,
                 ));
             }
             if let Some(binding) = index.clone().or(item.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
-                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
                     var_declared: false,
                     variable: name,
                     iterable: call("listToArray", vec![list, delims_expr()]),
                     body,
                     location: loc,
-                })));
+                }))));
             }
         }
 
@@ -2700,23 +2705,23 @@ impl Parser {
                 for_body.extend(body);
                 return Ok(self.wrap_with_preamble(
                     vec![assign(coll_tmp.clone(), collection.clone())],
-                    Statement::ForIn(ForIn {
+                    Statement::ForIn(Box::new(ForIn {
                         var_declared: false,
                         variable: key_n,
                         iterable: call("structKeyArray", vec![ident(&coll_tmp)]),
                         body: for_body,
                         location: loc,
-                    }),
+                    })),
                     loc,
                 ));
             }
-            return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+            return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
                 var_declared: false,
                 variable: item_n,
                 iterable: collection,
                 body,
                 location: loc,
-            })));
+            }))));
         }
 
         // 7) query=q (+ optional index|item). Without a binding, reassign the
@@ -2724,13 +2729,13 @@ impl Parser {
         if let Some(query) = get("query") {
             if let Some(binding) = index.clone().or(item.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "row".to_string());
-                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
                     var_declared: false,
                     variable: name,
                     iterable: query,
                     body,
                     location: loc,
-                })));
+                }))));
             }
             // No binding — cursor model (Lucee/ACF): the query variable STAYS the
             // query; each iteration moves the query's current-row cursor via the
@@ -2758,7 +2763,7 @@ impl Parser {
                 for_body.push(assign(qname.clone(), ident(&q_tmp)));
             }
             for_body.extend(body);
-            let for_loop = Statement::For(For {
+            let for_loop = Statement::For(Box::new(For {
                 init: Some(Box::new(Statement::Var(Var {
                     name: i_tmp.clone(),
                     value: Some(int(1)),
@@ -2772,7 +2777,7 @@ impl Parser {
                 ))),
                 body: for_body,
                 location: loc,
-            });
+            }));
             // Run [hoist…, loop, reset] exactly once via a one-shot `for`.
             let mut once_body = vec![
                 assign(q_tmp.clone(), query),
@@ -2787,13 +2792,13 @@ impl Parser {
             let init = Statement::Var(Var { name: once.clone(), value: Some(int(0)), location: loc });
             let cond = bin(ident(&once), BinaryOpType::Less, int(1));
             let inc = bin(ident(&once), BinaryOpType::Assign, bin(ident(&once), BinaryOpType::Add, int(1)));
-            return Ok(CfmlNode::Statement(Statement::For(For {
+            return Ok(CfmlNode::Statement(Statement::For(Box::new(For {
                 init: Some(Box::new(init)),
                 condition: Some(cond),
                 increment: Some(Box::new(inc)),
                 body: once_body,
                 location: loc,
-            })));
+            }))));
         }
 
         // 8) file=… (+ index|item) — iterate the file's lines, binding each to
@@ -2818,7 +2823,7 @@ impl Parser {
                 let end = get("endline").or(to.clone()).unwrap_or_else(null_lit);
                 let characters = get("characters").unwrap_or_else(null_lit);
                 let charset = get("charset").unwrap_or_else(null_lit);
-                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
                     var_declared: false,
                     variable: name,
                     iterable: call(
@@ -2827,12 +2832,12 @@ impl Parser {
                     ),
                     body,
                     location: loc,
-                })));
+                }))));
             }
             return Err(ParseError {
                 message: "loop file requires an item or index attribute".to_string(),
-                line: loc.start.line,
-                column: loc.start.column,
+                line: loc.start.line as usize,
+                column: loc.start.column as usize,
             });
         }
 
@@ -2894,13 +2899,13 @@ impl Parser {
             }))),
             location: loc,
         }));
-        CfmlNode::Statement(Statement::For(For {
+        CfmlNode::Statement(Statement::For(Box::new(For {
             init: Some(Box::new(init)),
             condition: Some(cond),
             increment: Some(Box::new(inc)),
             body,
             location: loc,
-        }))
+        })))
     }
 
     fn parse_while(&mut self) -> Result<While, ParseError> {
@@ -3120,7 +3125,7 @@ impl Parser {
                 }
             }
             let last_part = parts.last().unwrap().to_string();
-            Statement::Assignment(Assignment {
+            Statement::Assignment(Box::new(Assignment {
                 target: if parts.len() == 1 {
                     AssignTarget::StructAccess(
                         Box::new(Expression::Identifier(Identifier {
@@ -3135,17 +3140,17 @@ impl Parser {
                 value: default_val,
                 operator: AssignOp::Equal,
                 location: loc,
-            })
+            }))
         } else {
-            Statement::Assignment(Assignment {
+            Statement::Assignment(Box::new(Assignment {
                 target: AssignTarget::Variable(var_name.to_string()),
                 value: default_val,
                 operator: AssignOp::Equal,
                 location: loc,
-            })
+            }))
         };
 
-        CfmlNode::Statement(Statement::If(If {
+        CfmlNode::Statement(Statement::If(Box::new(If {
             condition: Expression::UnaryOp(Box::new(UnaryOp {
                 operator: UnaryOpType::Not,
                 operand: Box::new(condition),
@@ -3155,7 +3160,7 @@ impl Parser {
             else_if: vec![],
             else_branch: None,
             location: loc,
-        }))
+        })))
     }
 
     /// Parse cfscript `param` statement:
@@ -3386,7 +3391,7 @@ impl Parser {
             expr: validate_call,
             location: loc,
         });
-        CfmlNode::Statement(Statement::If(If {
+        CfmlNode::Statement(Statement::If(Box::new(If {
             condition: Expression::Literal(Literal {
                 value: LiteralValue::Bool(true),
                 location: loc,
@@ -3395,7 +3400,7 @@ impl Parser {
             else_if: vec![],
             else_branch: None,
             location: loc,
-        }))
+        })))
     }
 
     /// Parse a comma-separated `key = expr` list inside the parens of a
@@ -3717,7 +3722,7 @@ impl Parser {
                     location: loc,
                 })];
                 stmts.extend(body);
-                stmts.push(Statement::Assignment(Assignment {
+                stmts.push(Statement::Assignment(Box::new(Assignment {
                     target: var_target,
                     value: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -3729,7 +3734,7 @@ impl Parser {
                     })),
                     operator: AssignOp::Equal,
                     location: loc,
-                }));
+                })));
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }
             "cfquery" => {
@@ -3812,12 +3817,12 @@ impl Parser {
                 }));
                 let mut stmts = vec![
                     // __cfquery_params = [];
-                    Statement::Assignment(Assignment {
+                    Statement::Assignment(Box::new(Assignment {
                         target: AssignTarget::Variable("__cfquery_params".to_string()),
                         value: Expression::Array(Array { elements: vec![], location: loc }),
                         operator: AssignOp::Equal,
                         location: loc,
-                    }),
+                    })),
                     // __cfsavecontent_start();
                     Statement::Expression(ExpressionStatement {
                         expr: call("__cfsavecontent_start", vec![]),
@@ -3875,12 +3880,12 @@ impl Parser {
                     location: loc,
                 });
                 let mut stmts = vec![
-                    Statement::Assignment(Assignment {
+                    Statement::Assignment(Box::new(Assignment {
                         target: AssignTarget::Variable("__cfzip_params".to_string()),
                         value: Expression::Array(Array { elements: vec![], location: loc }),
                         operator: AssignOp::Equal,
                         location: loc,
-                    }),
+                    })),
                 ];
                 stmts.extend(body);
                 let zip_call = call("cfzip", vec![
@@ -3888,12 +3893,12 @@ impl Parser {
                     Expression::Identifier(Identifier { name: "__cfzip_params".to_string(), location: loc }),
                 ]);
                 stmts.push(match result_var {
-                    Some(name) if !name.is_empty() => Statement::Assignment(Assignment {
+                    Some(name) if !name.is_empty() => Statement::Assignment(Box::new(Assignment {
                         target: AssignTarget::Variable(name),
                         value: zip_call,
                         operator: AssignOp::Equal,
                         location: loc,
-                    }),
+                    })),
                     _ => Statement::Expression(ExpressionStatement { expr: zip_call, location: loc }),
                 });
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
@@ -3919,12 +3924,12 @@ impl Parser {
                     .map(|(k, v)| (str_lit(k), v.clone()))
                     .collect();
                 let mut stmts = vec![
-                    Statement::Assignment(Assignment {
+                    Statement::Assignment(Box::new(Assignment {
                         target: AssignTarget::Variable("__cfinvoke_args".to_string()),
                         value: Expression::Struct(Struct { pairs: seed_pairs, ordered: false, location: loc }),
                         operator: AssignOp::Equal,
                         location: loc,
-                    }),
+                    })),
                 ];
                 stmts.extend(body);
                 let args_expr = pick("argumentcollection").unwrap_or_else(||
@@ -3989,21 +3994,21 @@ impl Parser {
                 }));
                 let mut stmts = vec![
                     // __cfhttp_params = [];
-                    Statement::Assignment(Assignment {
+                    Statement::Assignment(Box::new(Assignment {
                         target: AssignTarget::Variable("__cfhttp_params".to_string()),
                         value: Expression::Array(Array { elements: vec![], location: loc }),
                         operator: AssignOp::Equal,
                         location: loc,
-                    }),
+                    })),
                 ];
                 stmts.extend(body);
                 // RESULT = cfhttp({ ...attrs, params: __cfhttp_params });
-                stmts.push(Statement::Assignment(Assignment {
+                stmts.push(Statement::Assignment(Box::new(Assignment {
                     target: self.assign_target_from_dotted(&result_name, loc),
                     value: call("cfhttp", vec![opts_struct]),
                     operator: AssignOp::Equal,
                     location: loc,
-                }));
+                })));
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }
             "cflock" => {
@@ -4045,13 +4050,13 @@ impl Parser {
                 });
                 // if (__cflock_start(attrs)) { try { body } finally { __cflock_end } } —
                 // a throwOnTimeout="false" timeout skips the body.
-                let lock_stmt = Statement::If(If {
+                let lock_stmt = Statement::If(Box::new(If {
                     condition: lock_start_call,
                     then_branch: vec![try_stmt],
                     else_if: vec![],
                     else_branch: None,
                     location: loc,
-                });
+                }));
                 CfmlNode::Statement(Statement::Output(Output {
                     body: vec![lock_stmt],
                     location: loc,
@@ -4169,12 +4174,12 @@ impl Parser {
                 // statements in the body append to (mirrors the angle-bracket
                 // runtime cfmail path). __cfmail forwards them as parts/params.
                 for arr in ["__cfmail_params", "__cfmail_parts"] {
-                    stmts.push(Statement::Assignment(Assignment {
+                    stmts.push(Statement::Assignment(Box::new(Assignment {
                         target: AssignTarget::Variable(arr.to_string()),
                         value: Expression::Array(Array { elements: vec![], location: loc }),
                         operator: AssignOp::Equal,
                         location: loc,
-                    }));
+                    })));
                 }
                 stmts.push(Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
@@ -4187,7 +4192,7 @@ impl Parser {
                     location: loc,
                 }));
                 stmts.extend(body);
-                stmts.push(Statement::Assignment(Assignment {
+                stmts.push(Statement::Assignment(Box::new(Assignment {
                     target: AssignTarget::Variable(capture_var.clone()),
                     value: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -4198,7 +4203,7 @@ impl Parser {
                     })),
                     operator: AssignOp::Equal,
                     location: loc,
-                }));
+                })));
                 // Build {attrs..., body: __cfmail_body_capture}
                 let mut pairs: Vec<(Expression, Expression)> = attrs.iter().map(|(k, v)| (
                     Expression::Literal(Literal {
@@ -4409,13 +4414,13 @@ impl Parser {
         // if (__cflock_start(attrs)) { try { ... } finally { __cflock_end } } — a
         // throwOnTimeout="false" timeout skips the body and continues.
         let output = Statement::Output(Output {
-            body: vec![Statement::If(If {
+            body: vec![Statement::If(Box::new(If {
                 condition: lock_start_call,
                 then_branch: vec![try_stmt],
                 else_if: vec![],
                 else_branch: None,
                 location: loc,
-            })],
+            }))],
             location: loc,
         });
 
@@ -5894,8 +5899,8 @@ impl Parser {
         } else {
             Err(ParseError {
                 message: format!("Expected {:?}, found {:?}", token, self.peek(0)),
-                line: self.current_location().start.line,
-                column: self.current_location().start.column,
+                line: self.current_location().start.line as usize,
+                column: self.current_location().start.column as usize,
             })
         }
     }
@@ -7572,19 +7577,19 @@ fn try_lower_dynamic_param(
             }))),
             location: loc,
         }));
-        let assign = Statement::Assignment(Assignment {
+        let assign = Statement::Assignment(Box::new(Assignment {
             target: AssignTarget::ArrayAccess(Box::new(base), Box::new(key_expr)),
             value: default_val.clone(),
             operator: AssignOp::Equal,
             location: loc,
-        });
-        Some(Statement::If(If {
+        }));
+        Some(Statement::If(Box::new(If {
             condition: cond,
             then_branch: vec![assign],
             else_if: vec![],
             else_branch: None,
             location: loc,
-        }))
+        })))
     } else {
         // Shape 3: `base[key].lit1.lit2...litN` is the leaf.
         // Build expr `base[key].lit1...litN-1` (parent of leaf) and the leaf member name.
@@ -7622,19 +7627,19 @@ fn try_lower_dynamic_param(
             location: loc,
         }));
         // Body: parent.leaf = default
-        let assign = Statement::Assignment(Assignment {
+        let assign = Statement::Assignment(Box::new(Assignment {
             target: AssignTarget::StructAccess(Box::new(parent), leaf),
             value: default_val.clone(),
             operator: AssignOp::Equal,
             location: loc,
-        });
-        Some(Statement::If(If {
+        }));
+        Some(Statement::If(Box::new(If {
             condition: cond,
             then_branch: vec![assign],
             else_if: vec![],
             else_branch: None,
             location: loc,
-        }))
+        })))
     }
 }
 

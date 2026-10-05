@@ -161,6 +161,12 @@ pub struct CfmlCompiler {
     in_component_method: bool,
     /// Compiling a component's pseudo-constructor body (where `this` always exists).
     in_component_body: bool,
+    /// Reused instruction buffers for function bodies (a stack: closures and
+    /// nested functions compile while their parent's buffer is in use). A body
+    /// is built in a warm buffer and copied out once at its exact size, instead
+    /// of growing a fresh Vec by doubling and then `shrink_to_fit`-copying it —
+    /// the largest code-generation allocation for a big component.
+    instr_scratch: Vec<Vec<BytecodeOp>>,
     /// True while compiling an assignment that appears in VALUE position — i.e.
     /// the RHS of an enclosing assignment (`a = b = c`), so the assignment must
     /// leave its assigned value on the stack for the outer store to consume. A
@@ -1883,6 +1889,21 @@ impl CfmlCompiler {
     /// check is what keeps a template `include`d from INSIDE a function working:
     /// it compiles as `__main__` (depth 0) but does own a shared `local` scope
     /// at run time.
+    fn take_instr_scratch(&mut self) -> Vec<BytecodeOp> {
+        self.instr_scratch.pop().unwrap_or_default()
+    }
+
+    /// Copy a finished body out at its exact size and keep the buffer.
+    fn finish_instr_scratch(&mut self, mut buf: Vec<BytecodeOp>) -> Vec<BytecodeOp> {
+        let out: Vec<BytecodeOp> = buf.drain(..).collect();
+        // Keep a handful of warm buffers; a pathological body must not pin a
+        // huge one for the rest of the compile.
+        if self.instr_scratch.len() < 8 && buf.capacity() <= 1 << 16 {
+            self.instr_scratch.push(buf);
+        }
+        out
+    }
+
     fn local_is_scope(&self) -> bool {
         self.local_scope_depth > 0
     }
@@ -1934,6 +1955,7 @@ impl CfmlCompiler {
             current_fn_local_mode: None,
             in_component_method: false,
             in_component_body: false,
+            instr_scratch: Vec::new(),
             need_assign_value: false,
             source_file: None,
         }
@@ -2859,6 +2881,10 @@ impl CfmlCompiler {
     }
 
     fn stmt_line(stmt: &Statement) -> Option<usize> {
+        Self::stmt_line_u32(stmt).map(|l| l as usize)
+    }
+
+    fn stmt_line_u32(stmt: &Statement) -> Option<u32> {
         match stmt {
             Statement::Expression(e) => Some(e.location.start.line),
             Statement::Var(v) => Some(v.location.start.line),
@@ -4230,13 +4256,13 @@ impl CfmlCompiler {
         // while (true) { ... }
         let mut while_body = vec![
             assign(ident(&line), call("__cfloop_file_next", vec![ident(&handle)])),
-            Statement::If(If {
+            Statement::If(Box::new(If {
                 condition: call("isNull", vec![ident(&line)]),
                 then_branch: vec![Statement::Break(Break { label: None, location: loc })],
                 else_if: Vec::new(),
                 else_branch: None,
                 location: loc,
-            }),
+            })),
             // The loop variable is assigned exactly as the source spells it, so
             // `item="local.x"` / `item="ctx.item"` route through the ordinary
             // assignment path rather than a second implementation of it.
@@ -4886,7 +4912,7 @@ impl CfmlCompiler {
     /// load the scope itself rather than the just-defined function.
     fn compile_function_decl(&mut self, func: &Function, instructions: &mut Vec<BytecodeOp>) -> usize {
         // Compile the function body into a separate BytecodeFunction
-        let mut func_instructions = Vec::new();
+        let mut func_instructions = self.take_instr_scratch();
 
         self.function_depth += 1;
         // GH #351: a declared function body owns a `local` scope.
@@ -4974,7 +5000,7 @@ impl CfmlCompiler {
                     source_file_value: Default::default(),
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
-            instructions: func_instructions,
+            instructions: self.finish_instr_scratch(func_instructions),
             source_file: self.source_file.clone(),
             global_id: next_global_fn_id(),
             declared_local_mode: declared_mode,
@@ -6622,7 +6648,7 @@ impl CfmlCompiler {
                 let saved_tag_pairs = std::mem::take(&mut self.tag_pair_stack);
         let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
 
-                let mut func_instructions = Vec::new();
+                let mut func_instructions = self.take_instr_scratch();
                 // Emit default parameter value preamble for closures.
                 // Presence is tested against the `arguments` scope
                 // (JumpIfArgPresent), NOT `LoadLocal + IsNull`: the VM no longer
@@ -6675,7 +6701,7 @@ impl CfmlCompiler {
                     source_file_value: Default::default(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
-                    instructions: func_instructions,
+                    instructions: self.finish_instr_scratch(func_instructions),
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: effective_declared,
@@ -6725,7 +6751,7 @@ impl CfmlCompiler {
                 let saved_loops = std::mem::take(&mut self.loop_stack);
                 let saved_tag_pairs = std::mem::take(&mut self.tag_pair_stack);
         let saved_catch_vars = std::mem::take(&mut self.catch_var_stack);
-                let mut func_instructions = Vec::new();
+                let mut func_instructions = self.take_instr_scratch();
                 // Emit default parameter value preamble for arrow functions.
                 // Uses JumpIfArgPresent (arguments-scope presence) for the same
                 // reason as closures/named functions — see GitHub #255 / #240.
@@ -6771,7 +6797,7 @@ impl CfmlCompiler {
                     source_file_value: Default::default(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
-                    instructions: func_instructions,
+                    instructions: self.finish_instr_scratch(func_instructions),
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: arrow_effective,

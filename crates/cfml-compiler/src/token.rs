@@ -151,7 +151,19 @@ pub enum Token {
 
 impl Token {
     pub fn keyword(s: &str) -> Option<Token> {
-        match s.to_lowercase().as_str() {
+        // Every keyword is short ASCII: fold into a stack buffer instead of
+        // allocating a lowercase String for every identifier the lexer sees
+        // (~11k allocations for one large component).
+        const MAX: usize = 32;
+        if s.len() > MAX || !s.is_ascii() {
+            return None;
+        }
+        let mut buf = [0u8; MAX];
+        for (d, b) in buf.iter_mut().zip(s.bytes()) {
+            *d = b.to_ascii_lowercase();
+        }
+        let lower = std::str::from_utf8(&buf[..s.len()]).ok()?;
+        match lower {
             "if" => Some(Token::If),
             "else" => Some(Token::Else),
             "elseif" => Some(Token::ElseIf),

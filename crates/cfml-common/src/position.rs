@@ -2,13 +2,16 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Position {
-    pub line: usize,
-    pub column: usize,
+    /// `u32`, not `usize`: a position sits in every token and every syntax-tree
+    /// node (twice, start and end), and halving it shrank a big component's
+    /// compile-time allocation. No source file reaches 4 billion lines.
+    pub line: u32,
+    pub column: u32,
 }
 
 impl Position {
     pub fn new(line: usize, column: usize) -> Self {
-        Self { line, column }
+        Self { line: line as u32, column: column as u32 }
     }
 
     pub fn start() -> Self {

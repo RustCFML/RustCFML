@@ -110,14 +110,18 @@ pub enum AccessModifier {
 }
 
 #[derive(Debug, Clone)]
+/// Large variants are boxed: a statement list's element is the size of the
+/// LARGEST variant, and `ComponentDecl` (216 B) / `FunctionDecl` / `If` made
+/// every statement in every block 216 bytes. Boxed, the enum is ~96 B, which
+/// cut a big component's parse allocation.
 pub enum Statement {
     Expression(ExpressionStatement),
-    Assignment(Assignment),
+    Assignment(Box<Assignment>),
     Return(Return),
-    If(If),
-    Switch(Switch),
-    For(For),
-    ForIn(ForIn),
+    If(Box<If>),
+    Switch(Box<Switch>),
+    For(Box<For>),
+    ForIn(Box<ForIn>),
     While(While),
     Do(Do),
     Break(Break),
@@ -127,9 +131,9 @@ pub enum Statement {
     Rethrow(SourceLocation),
     Import(Import),
     Var(Var),
-    ComponentDecl(ComponentDecl),
-    InterfaceDecl(InterfaceDecl),
-    FunctionDecl(FunctionDecl),
+    ComponentDecl(Box<ComponentDecl>),
+    InterfaceDecl(Box<InterfaceDecl>),
+    FunctionDecl(Box<FunctionDecl>),
     Output(Output),
     Include(Include),
 }

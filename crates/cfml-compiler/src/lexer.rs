@@ -17,12 +17,6 @@ pub struct Lexer {
     /// capture time). The parser consults this to attach `@annotations` to the
     /// following component / function / property declaration.
     doc_comments: Vec<(usize, String)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TokenWithLoc {
-    pub token: Token,
-    pub location: SourceLocation,
     /// The word EXACTLY as it was written, kept only for a keyword whose source
     /// spelling is not already its canonical lowercase form (`Public`, `Query`,
     /// `Component`, …).
@@ -38,7 +32,17 @@ pub struct TokenWithLoc {
     ///
     /// `None` for identifiers (which carry their own text) and for a keyword
     /// already written in lowercase, so the common case costs no allocation.
-    pub raw: Option<Box<str>>,
+    ///
+    /// Kept as `(token index, spelling)` in token order — a side table rather
+    /// than a field on every token, which cost 16 bytes on each of a big
+    /// component's ~25k tokens for a value that is almost always `None`.
+    raw_spellings: Vec<(u32, Box<str>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenWithLoc {
+    pub token: Token,
+    pub location: SourceLocation,
 }
 
 impl Lexer {
@@ -49,8 +53,13 @@ impl Lexer {
         // and copied it log2(n) times — the largest single item in a big
         // component's compile.
         let tokens = Vec::with_capacity(source.len() / 6 + 16);
+        // One allocation at the final size: `collect()` from `Chars` starts at a
+        // quarter of the byte length and doubles twice for ASCII source,
+        // allocating ~1.75x the buffer and copying it along the way.
+        let mut chars: Vec<char> = Vec::with_capacity(source.len());
+        chars.extend(source.chars());
         Self {
-            source: source.chars().collect(),
+            source: chars,
             pos: 0,
             line: 1,
             column: 1,
@@ -58,7 +67,14 @@ impl Lexer {
             token_start_line: 1,
             token_start_column: 1,
             doc_comments: Vec::new(),
+            raw_spellings: Vec::new(),
         }
+    }
+
+    /// Keyword source spellings captured by the most recent `tokenize()` (see
+    /// `raw_spellings`), handed over to the parser.
+    pub fn take_raw_spellings(&mut self) -> Vec<(u32, Box<str>)> {
+        std::mem::take(&mut self.raw_spellings)
     }
 
     /// Javadoc comments captured during the most recent `tokenize()`, paired
@@ -72,7 +88,6 @@ impl Lexer {
             self.scan_token();
         }
         self.tokens.push(TokenWithLoc {
-                    raw: None,
             token: Token::Eof,
             location: SourceLocation::new(
                 Position::new(self.line, self.column),
@@ -145,7 +160,7 @@ impl Lexer {
             Position::new(self.token_start_line, self.token_start_column),
             Position::new(self.line, self.column),
         );
-        self.tokens.push(TokenWithLoc { token, location, raw: None });
+        self.tokens.push(TokenWithLoc { token, location });
     }
 
     fn scan_token(&mut self) {
@@ -507,7 +522,6 @@ impl Lexer {
                         if self.current() == ')' || self.current() == ']' { depth -= 1; }
                         if self.current() == quote && depth <= 0 {
                             self.tokens.push(TokenWithLoc {
-                    raw: None,
                                 token: Token::Error(format!(
                                     "Unterminated '#' interpolation in string: a '#' opened an interpolation that was never closed before the end of the string literal. Escape a literal hash as '##'."
                                 )),
@@ -525,7 +539,6 @@ impl Lexer {
                     if self.is_at_end() {
                         // Ran to EOF without a closing '#'.
                         self.tokens.push(TokenWithLoc {
-                    raw: None,
                             token: Token::Error(format!(
                                 "Unterminated '#' interpolation in string: a '#' opened an interpolation that was never closed before end of file. Escape a literal hash as '##'."
                             )),
@@ -556,7 +569,6 @@ impl Lexer {
                 }
                 // Emit InterpolatedStringStart, then parts, then InterpolatedStringEnd
                 self.tokens.push(TokenWithLoc {
-                    raw: None,
                     token: Token::InterpolatedStringStart,
                     location: SourceLocation::new(
                         Position::new(start_line, start_column),
@@ -566,7 +578,6 @@ impl Lexer {
                 for (is_expr, content) in parts {
                     if is_expr {
                         self.tokens.push(TokenWithLoc {
-                    raw: None,
                             token: Token::InterpolatedExpr(content),
                             location: SourceLocation::new(
                                 Position::new(start_line, start_column),
@@ -575,7 +586,6 @@ impl Lexer {
                         });
                     } else {
                         self.tokens.push(TokenWithLoc {
-                    raw: None,
                             token: Token::String(content),
                             location: SourceLocation::new(
                                 Position::new(start_line, start_column),
@@ -585,7 +595,6 @@ impl Lexer {
                     }
                 }
                 self.tokens.push(TokenWithLoc {
-                    raw: None,
                     token: Token::InterpolatedStringEnd,
                     location: SourceLocation::new(
                         Position::new(start_line, start_column),
@@ -595,7 +604,6 @@ impl Lexer {
             } else {
                 // No interpolation, emit as regular string
                 self.tokens.push(TokenWithLoc {
-                    raw: None,
                     token: Token::String(current_str),
                     location: SourceLocation::new(
                         Position::new(start_line, start_column),
@@ -714,7 +722,6 @@ impl Lexer {
         };
 
         self.tokens.push(TokenWithLoc {
-                    raw: None,
             token,
             location: SourceLocation::new(
                 Position::new(self.line, start_column),
@@ -740,7 +747,7 @@ impl Lexer {
         // Keep the source spelling for a keyword that was not written in
         // lowercase — after a dot the parser turns keyword tokens back into
         // property/path names, and a keyword token carries no text of its own.
-        // See `TokenWithLoc::raw` (GH #381).
+        // See `Lexer::raw_spellings` (GH #381).
         let (token, raw) = match Token::keyword(&value) {
             Some(kw) => {
                 let raw = if value.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -753,8 +760,10 @@ impl Lexer {
             None => (Token::Identifier(value), None),
         };
 
+        if let Some(raw) = raw {
+            self.raw_spellings.push((self.tokens.len() as u32, raw));
+        }
         self.tokens.push(TokenWithLoc {
-            raw,
             token,
             location: SourceLocation::new(
                 Position::new(self.line, start_column),
