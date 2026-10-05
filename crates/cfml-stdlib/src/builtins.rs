@@ -21,7 +21,11 @@ use std::sync::Arc;
 use regex::Regex;
 use once_cell::sync::Lazy;
 use serde_json;
-use chrono::{NaiveDateTime, NaiveDate, NaiveTime, Datelike, Timelike, Local, Utc, TimeZone};
+use chrono::{NaiveDateTime, NaiveTime, Datelike, Timelike};
+#[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
+use chrono::NaiveDate;
+#[cfg(feature = "postgres_db")]
+use chrono::{Utc, TimeZone};
 
 // Pre-compiled regex patterns used by isValid() and other builtins.
 // Hoisted to module-level Lazy statics to avoid recompiling on every call.
@@ -621,45 +625,46 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("bitMaskClear".to_string(), fn_bit_mask_clear);
 
     // ---- Date/Time functions ----
-    f.insert("now".to_string(), fn_now);
-    f.insert("createDate".to_string(), fn_create_date);
-    f.insert("createDateTime".to_string(), fn_create_date_time);
-    f.insert("createTime".to_string(), fn_create_time);
-    f.insert("createODBCDate".to_string(), fn_create_odbc_date);
-    f.insert("createODBCDateTime".to_string(), fn_create_odbc_date_time);
-    f.insert("createODBCTime".to_string(), fn_create_odbc_time);
-    f.insert("dateAdd".to_string(), fn_date_add);
-    f.insert("dateDiff".to_string(), fn_date_diff);
-    f.insert("dateFormat".to_string(), fn_date_format);
-    f.insert("timeFormat".to_string(), fn_time_format);
-    f.insert("dateTimeFormat".to_string(), fn_date_time_format);
-    f.insert("parseDateTime".to_string(), fn_parse_date_time);
-    f.insert("datePart".to_string(), fn_date_part);
-    f.insert("dateCompare".to_string(), fn_date_compare);
-    f.insert("year".to_string(), fn_year);
-    f.insert("month".to_string(), fn_month);
-    f.insert("day".to_string(), fn_day);
-    f.insert("hour".to_string(), fn_hour);
-    f.insert("minute".to_string(), fn_minute);
-    f.insert("second".to_string(), fn_second);
-    f.insert("dayOfWeek".to_string(), fn_day_of_week);
+    f.insert("now".to_string(), crate::dates::fn_now);
+    f.insert("createDate".to_string(), crate::dates::fn_create_date);
+    f.insert("createDateTime".to_string(), crate::dates::fn_create_date_time);
+    f.insert("createTime".to_string(), crate::dates::fn_create_time);
+    f.insert("createODBCDate".to_string(), crate::dates::fn_create_odbc_date);
+    f.insert("createODBCDateTime".to_string(), crate::dates::fn_create_odbc_date_time);
+    f.insert("createODBCTime".to_string(), crate::dates::fn_create_odbc_time);
+    f.insert("dateAdd".to_string(), crate::dates::fn_date_add);
+    f.insert("dateDiff".to_string(), crate::dates::fn_date_diff);
+    f.insert("dateFormat".to_string(), crate::dates::fn_date_format);
+    f.insert("timeFormat".to_string(), crate::dates::fn_time_format);
+    f.insert("dateTimeFormat".to_string(), crate::dates::fn_date_time_format);
+    f.insert("parseDateTime".to_string(), crate::dates::fn_parse_date_time);
+    f.insert("datePart".to_string(), crate::dates::fn_date_part);
+    f.insert("dateCompare".to_string(), crate::dates::fn_date_compare);
+    f.insert("year".to_string(), crate::dates::fn_year);
+    f.insert("month".to_string(), crate::dates::fn_month);
+    f.insert("day".to_string(), crate::dates::fn_day);
+    f.insert("hour".to_string(), crate::dates::fn_hour);
+    f.insert("minute".to_string(), crate::dates::fn_minute);
+    f.insert("second".to_string(), crate::dates::fn_second);
+    f.insert("dayOfWeek".to_string(), crate::dates::fn_day_of_week);
     f.insert("dayOfWeekAsString".to_string(), fn_day_of_week_as_string);
     f.insert("dayOfWeekShortAsString".to_string(), fn_day_of_week_short_as_string);
-    f.insert("dayOfYear".to_string(), fn_day_of_year);
-    f.insert("daysInMonth".to_string(), fn_days_in_month);
-    f.insert("daysInYear".to_string(), fn_days_in_year);
-    f.insert("firstDayOfMonth".to_string(), fn_first_day_of_month);
+    f.insert("dayOfYear".to_string(), crate::dates::fn_day_of_year);
+    f.insert("daysInMonth".to_string(), crate::dates::fn_days_in_month);
+    f.insert("daysInYear".to_string(), crate::dates::fn_days_in_year);
+    f.insert("firstDayOfMonth".to_string(), crate::dates::fn_first_day_of_month);
     f.insert("isLeapYear".to_string(), fn_is_leap_year);
     f.insert("monthAsString".to_string(), fn_month_as_string);
     f.insert("monthShortAsString".to_string(), fn_month_short_as_string);
-    f.insert("quarter".to_string(), fn_quarter);
-    f.insert("week".to_string(), fn_week);
-    f.insert("millisecond".to_string(), fn_millisecond);
-    f.insert("dateConvert".to_string(), fn_date_convert);
-    f.insert("getNumericDate".to_string(), fn_get_numeric_date);
-    f.insert("getHTTPTimeString".to_string(), fn_get_http_time_string);
-    f.insert("nowServer".to_string(), fn_now_server);
-    f.insert("getTickCount".to_string(), fn_get_tick_count);
+    f.insert("quarter".to_string(), crate::dates::fn_quarter);
+    f.insert("week".to_string(), crate::dates::fn_week);
+    f.insert("millisecond".to_string(), crate::dates::fn_millisecond);
+    f.insert("dateConvert".to_string(), crate::dates::fn_date_convert);
+    f.insert("getNumericDate".to_string(), crate::dates::fn_get_numeric_date);
+    f.insert("isNumericDate".to_string(), crate::dates::fn_is_numeric_date);
+    f.insert("getHTTPTimeString".to_string(), crate::dates::fn_get_http_time_string);
+    f.insert("nowServer".to_string(), crate::dates::fn_now);
+    f.insert("getTickCount".to_string(), crate::dates::fn_get_tick_count);
     f.insert("getFunctionList".to_string(), fn_get_function_list);
     f.insert("getTagData".to_string(), fn_get_tag_data);
     f.insert("getFunctionCalledName".to_string(), fn_get_function_called_name);
@@ -842,7 +847,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("lsParseNumber".to_string(), fn_ls_parse_number);
 
     // ---- System functions ----
-    f.insert("getTickCount".to_string(), fn_get_tick_count);
+    f.insert("getTickCount".to_string(), crate::dates::fn_get_tick_count);
     f.insert("getFunctionList".to_string(), fn_get_function_list);
     f.insert("getCurrentTemplatePath".to_string(), fn_get_current_template_path);
     f.insert("getBaseTemplatePath".to_string(), fn_get_base_template_path);
@@ -1350,13 +1355,6 @@ thread_local! {
 /// because the VM (its only writer) cannot depend on `cfml-stdlib` on wasm32.
 pub use cfml_common::clock::set_request_timezone;
 
-/// The zone an instant should be reported in: the request zone when one is set,
-/// otherwise the system zone.
-fn reporting_zone() -> Option<chrono_tz::Tz> {
-    cfml_common::clock::request_timezone()
-        .and_then(|id| id.parse::<chrono_tz::Tz>().ok())
-}
-
 fn xorshift64(state: u64) -> u64 {
     let mut x = state;
     x ^= x << 13;
@@ -1450,7 +1448,8 @@ fn fn_len(args: Vec<CfmlValue>) -> CfmlResult {
         // and re-appended the tail of the delayed-Sticker `<!--ds:…:ds-->` marker
         // into the response).
         Some(CfmlValue::String(s)) => Ok(CfmlValue::Int(s.chars().count() as i64)),
-        Some(CfmlValue::Bool(_)) | Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(
+        Some(CfmlValue::Bool(_)) | Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_))
+        | Some(CfmlValue::DateTime(_)) => Ok(
             CfmlValue::Int(args.first().unwrap().as_string().chars().count() as i64),
         ),
         Some(CfmlValue::Array(a)) => Ok(CfmlValue::Int(a.len() as i64)),
@@ -4718,6 +4717,7 @@ fn fn_is_simple_value(args: Vec<CfmlValue>) -> CfmlResult {
                 | CfmlValue::Int(_)
                 | CfmlValue::Double(_)
                 | CfmlValue::TimeSpan(_)
+                | CfmlValue::DateTime(_)
                 | CfmlValue::String(_)
         )
     )))
@@ -4766,7 +4766,10 @@ fn fn_is_date(args: Vec<CfmlValue>) -> CfmlResult {
     // ParseDateTime/CreateDate, so IsDate must reject numerics up front.
     // A timespan IS a date in Lucee (isDate(createTimeSpan(...)) is true) — it is
     // a duration on the date/time axis. Report true before the numeric guard.
-    if matches!(args.first().map(|v| v.query_column_scalar()), Some(CfmlValue::TimeSpan(_))) {
+    if matches!(
+        args.first().map(|v| v.query_column_scalar()),
+        Some(CfmlValue::TimeSpan(_)) | Some(CfmlValue::DateTime(_))
+    ) {
         return Ok(CfmlValue::Bool(true));
     }
     match args.first().map(|v| v.query_column_scalar()) {
@@ -5163,6 +5166,10 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             // Note isNumeric("5.3.2") stays FALSE on both engines; only isValid
             // and the declared-type check take the fallback.
             "float" => fn_is_numeric(vec![value.clone()]),
+            // A date has a numeric value (Lucee: isValid("numeric", now()) is true).
+            "numeric" | "double" if matches!(value.query_column_scalar(), CfmlValue::DateTime(_)) => {
+                Ok(CfmlValue::Bool(true))
+            }
             "numeric" | "double" => {
                 let numeric = matches!(
                     fn_is_numeric(vec![value.clone()]),
@@ -5179,6 +5186,9 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             }
             "boolean" => fn_is_boolean(vec![value.clone()]),
             "date" | "datetime" => fn_is_date(vec![value.clone()]),
+            "time" if matches!(value.query_column_scalar(), CfmlValue::DateTime(_)) => {
+                Ok(CfmlValue::Bool(true))
+            }
             "time" => {
                 // Lucee: a bare time-of-day (6:15 PM, 18:15, 06:15:30) OR a
                 // parseable date/datetime *string* ("2020-01-01" -> true) is a
@@ -5768,781 +5778,93 @@ fn fn_bit_mask_clear(args: Vec<CfmlValue>) -> CfmlResult {
 // DATE/TIME HELPERS
 // ===============================================
 
-/// Convert 2-digit year to 4-digit: 0-29 → 2000-2029, 30-99 → 1930-1999
-fn short_year(y: i64) -> i64 {
-    if y >= 0 && y <= 29 { 2000 + y }
-    else if y >= 30 && y <= 99 { 1900 + y }
-    else { y }
-}
-
-/// Days in a given month/year
-fn days_in_month_calc(year: i32, month: u32) -> u32 {
-    match month {
-        1 => 31,
-        2 => if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 { 29 } else { 28 },
-        3 => 31, 4 => 30, 5 => 31, 6 => 30,
-        7 => 31, 8 => 31, 9 => 30, 10 => 31, 11 => 30, 12 => 31,
-        _ => 30,
-    }
-}
-
-/// Add months to a NaiveDateTime, clamping day to valid range
-fn add_months(dt: &NaiveDateTime, months: i64) -> Option<NaiveDateTime> {
-    let total = (dt.year() as i64) * 12 + (dt.month0() as i64) + months;
-    let new_year = total.div_euclid(12) as i32;
-    let new_month = (total.rem_euclid(12) as u32) + 1;
-    let max_day = days_in_month_calc(new_year, new_month);
-    let new_day = dt.day().min(max_day);
-    NaiveDate::from_ymd_opt(new_year, new_month, new_day)
-        .and_then(|d| d.and_hms_opt(dt.hour(), dt.minute(), dt.second()))
-}
-
-/// Parse ODBC literal: {d '...'}, {t '...'}, {ts '...'}
-fn parse_odbc_literal(s: &str) -> Option<NaiveDateTime> {
-    let start = s.find('\'')?;
-    let end = s.rfind('\'')?;
-    if start >= end { return None; }
-    let inner = &s[start+1..end];
-    let lower = s.to_lowercase();
-    if lower.starts_with("{ts ") {
-        NaiveDateTime::parse_from_str(inner, "%Y-%m-%d %H:%M:%S").ok()
-    } else if lower.starts_with("{d ") {
-        NaiveDate::parse_from_str(inner, "%Y-%m-%d").ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-    } else if lower.starts_with("{t ") {
-        NaiveTime::parse_from_str(inner, "%H:%M:%S").ok()
-            .and_then(|t| NaiveDate::from_ymd_opt(2000, 1, 1).map(|d| d.and_time(t)))
-    } else {
-        None
-    }
-}
-
-/// Central date parser: tries ODBC, ISO 8601, common US/EU formats, time-only, date serial
-/// Parse a CFML datetime and return it as epoch seconds in the LOCAL zone —
-/// the zone CFML dates are naive in, so `now()` round-trips.
-pub(crate) fn parse_datetime_to_epoch_secs(s: &str) -> Option<i64> {
-    use chrono::TimeZone;
-    let naive = parse_cfml_date(s)?;
-    match chrono::Local.from_local_datetime(&naive) {
-        chrono::offset::LocalResult::Single(dt) => Some(dt.timestamp()),
-        // Ambiguous or skipped instants (DST boundaries) — take the earlier.
-        chrono::offset::LocalResult::Ambiguous(dt, _) => Some(dt.timestamp()),
-        chrono::offset::LocalResult::None => Some(naive.and_utc().timestamp()),
-    }
-}
-
-/// Expand a bare year the way Lucee's date parser does: a value below 100 is a
-/// two-digit year in the fixed window **1930–2029**.
-///
-/// Probed on Lucee 7.1.0 — `1.1.29` → 2029 but `1.1.30` → 1930, `1.1.00` → 2000,
-/// `1.1.99` → 1999. Note this is a FIXED window, not the JDK's default
-/// "80 years before now" sliding one (which in 2026 would put the break at 1946
-/// and read `30` as 2030). Three-or-more-digit values are literal years, so
-/// `1.1.026` is 2026 and `1.1.2020` is 2020.
-fn expand_two_digit_year(y: i32) -> i32 {
-    match y {
-        0..=29 => 2000 + y,
-        30..=99 => 1900 + y,
-        other => other,
-    }
-}
-
-/// Parse Lucee's dot-separated date forms: `A.B.C`, optionally followed by a
-/// time (`5.3.2 10:30:00`).
-///
-/// Which of A/B/C is the day, month and year is decided positionally, exactly as
-/// Lucee decides it — verified against Lucee 7.1.0 across 35 probes:
-///
-/// | input | Lucee | rule |
-/// |---|---|---|
-/// | `2020.11.5` | 2020-11-05 | A is a full year → Y.M.D |
-/// | `31.12.2020` | 2020-12-31 | A can't be a month, C is a full year → D.M.Y |
-/// | `13.1.2` | 2013-01-02 | A can't be a month, C isn't a year → Y.M.D |
-/// | `5.3.2` | 2002-05-03 | A could be a month → **M.D.Y** |
-/// | `10.20.30` | 1930-10-20 | M.D.Y, and `30` is 1930 |
-/// | `0.1.2` | rejected | month 0 — the M.D.Y reading is the ONLY one tried |
-///
-/// The last row is the subtle one and the reason this is not simply "try every
-/// ordering": `0.1.2` would parse fine as Y.M.D (2000-01-02), and Lucee still
-/// rejects it. A component that *could* be a month commits the string to M.D.Y,
-/// pass or fail. Getting that wrong would make us accept dates Lucee refuses,
-/// which for GH #411 means accepting a `numeric` argument Lucee rejects.
-///
-/// This is how `numeric` accepts `"5.3.2"`: Lucee's `numeric` cast falls back to
-/// a date cast, and `5.3.2` is 3 May 2002. It is not a version-string rule — the
-/// acceptance set tracks date validity exactly, leap years included (`2.29.2004`
-/// passes, `2.29.2005` does not).
-fn parse_dotted_date(s: &str) -> Option<NaiveDateTime> {
-    let (date_part, time_part) = match s.split_once(char::is_whitespace) {
-        Some((d, t)) => (d, t.trim()),
-        None => (s, ""),
-    };
-
-    let mut parts = date_part.split('.');
-    let (a, b, c) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() {
-        return None; // four or more components is not a date on either engine
-    }
-    // Digits only: no signs, no exponents, no empty components. This is what
-    // keeps `1.2.3.4`, `-1.2.3`, `5..3` and `a.b.c` out.
-    if [a, b, c].iter().any(|p| p.is_empty() || !p.bytes().all(|ch| ch.is_ascii_digit())) {
-        return None;
-    }
-    let (a, b, c): (i32, i32, i32) = (a.parse().ok()?, b.parse().ok()?, c.parse().ok()?);
-
-    let (year, month, day) = if a >= 100 {
-        (a, b, c)
-    } else if a > 12 {
-        if c >= 100 { (c, b, a) } else { (a, b, c) }
-    } else {
-        (c, a, b)
-    };
-
-    let date = NaiveDate::from_ymd_opt(
-        expand_two_digit_year(year),
-        u32::try_from(month).ok()?,
-        u32::try_from(day).ok()?,
-    )?;
-
-    if time_part.is_empty() {
-        return date.and_hms_opt(0, 0, 0);
-    }
-    for fmt in &["%H:%M:%S", "%I:%M:%S %p", "%H:%M", "%I:%M %p"] {
-        if let Ok(t) = NaiveTime::parse_from_str(time_part, fmt) {
-            return Some(date.and_time(t));
-        }
-    }
-    None
-}
-
+/// A date string as a wall clock in the request zone. The parser itself lives
+/// in `cfml_common::datetime::parse`, shared with the VM.
 fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
-    let s = s.trim();
-    if s.is_empty() { return None; }
-
-    // ODBC literals
-    if s.starts_with('{') {
-        return parse_odbc_literal(s);
-    }
-
-    // DateTime formats (most specific first). `%.f` optionally consumes a
-    // fractional-seconds component (".177"), so the fractional variants also
-    // match values with no fraction.
-    for fmt in &[
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        // Slash-separated ISO order — `2020/1/2`, which Lucee parses (and
-        // `isDate()`/`isValid("date",…)` accept) but we used to reject while
-        // accepting the dashed form. Unambiguous against `%m/%d/%Y` below: a
-        // leading 4-digit year can't be a month, and a leading month can't be
-        // a year with a valid day left over.
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %I:%M:%S %p",
-        "%m/%d/%Y %I:%M %p",
-        "%m/%d/%Y %H:%M",
-        "%d %b %Y %H:%M:%S",
-        "%b %d, %Y %H:%M:%S",
-        "%B %d, %Y %H:%M:%S",
-        "%d-%b-%Y %H:%M:%S",
-        // Month-name forms without a comma (Lucee/ACF accept these) — e.g.
-        // "January 1 1970 00:00", used by cbsecurity's JwtService epoch base.
-        "%B %d %Y %H:%M:%S",
-        "%b %d %Y %H:%M:%S",
-        "%B %d %Y %H:%M",
-        "%b %d %Y %H:%M",
-        // Lucee's own serializeJSON date form, offset-less variant:
-        // "August, 25 2026 09:00:14". The comma sits after the MONTH here, not
-        // after the day, so none of the "%B %d, %Y" patterns above match it.
-        // See the offset-bearing variant just below (GH #365).
-        "%B, %d %Y %H:%M:%S",
-        "%b, %d %Y %H:%M:%S",
-        "%B, %d %Y %H:%M",
-        "%b, %d %Y %H:%M",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(dt);
-        }
-    }
-
-    // Lucee's serializeJSON date form WITH the trailing UTC offset:
-    // `serializeJSON({d: createDateTime(2026,8,25,9,0,14)})` emits
-    // {"D":"August, 25 2026 09:00:14 +0000"} on Lucee 7.0.5, and Lucee's date
-    // parser reads it straight back. We rejected it, so every date a Lucee
-    // deployment had written into a JSON/jsonb column became unreadable after
-    // switching engines — isDate() false, dateDiff "Invalid date2" (GH #365).
-    // Our own serializeJSON writes "yyyy-mm-dd HH:mm:ss", which both engines
-    // parse, so the gap is one-directional and this is the recovering half.
-    // Wall-clock fields as written, matching the RFC 3339 branch below.
-    for fmt in &["%B, %d %Y %H:%M:%S %z", "%b, %d %Y %H:%M:%S %z"] {
-        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
-            // Report the instant in the REQUEST zone, falling back to the
-            // system zone — `Local` alone ignored setTimeZone (see REQUEST_TZ).
-            return Some(match reporting_zone() {
-                Some(tz) => dt.with_timezone(&tz).naive_local(),
-                None => dt.with_timezone(&Local).naive_local(),
-            });
-        }
-    }
-
-    // Date-only formats → midnight
-    for fmt in &[
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%m/%d/%Y",
-        "%m-%d-%Y",
-        "%d %b %Y",
-        "%b %d, %Y",
-        "%B %d, %Y",
-        "%d-%b-%Y",
-        "%B %d %Y",
-        "%b %d %Y",
-        // Month-comma order, date only (GH #365 — see the datetime list above).
-        "%B, %d %Y",
-        "%b, %d %Y",
-    ] {
-        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
-            return d.and_hms_opt(0, 0, 0);
-        }
-    }
-
-    // Dot-separated dates — `5.3.2`, `31.12.2020`, `2020.11.5`, with an optional
-    // trailing time. Lucee parses these; we rejected them outright (GH #411).
-    if let Some(dt) = parse_dotted_date(s) {
-        return Some(dt);
-    }
-
-    // Time-only → base date 2000-01-01
-    for fmt in &["%H:%M:%S", "%I:%M:%S %p", "%H:%M"] {
-        if let Ok(t) = NaiveTime::parse_from_str(s, fmt) {
-            return NaiveDate::from_ymd_opt(2000, 1, 1).map(|d| d.and_time(t));
-        }
-    }
-
-    // RFC 3339 / ISO 8601 with a timezone offset or 'Z' suffix
-    // ("2026-06-10T07:20:42.177+00:00", "...Z").
-    //
-    // The offset is HONOURED and the result expressed in the server's timezone,
-    // which is what Lucee does for every offset-bearing form (probed on Lucee
-    // 7.1.0.204 under Europe/London: "2026-08-25T09:00:14Z" -> 10:00:14,
-    // "...-05:00" -> 15:00:14). We previously returned the wall-clock fields as
-    // written, discarding the offset — so a stored UTC timestamp read back on a
-    // non-UTC server was wrong by exactly that server's offset, and by six hours
-    // for the -05:00 case. Invisible wherever the server runs in UTC (CI, most
-    // containers), silently wrong everywhere else. Found alongside GH #365.
-    //
-    // `parse_cfml_datetime_utc` remains the accessor for the absolute instant.
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Local).naive_local());
-    }
-
-    // Date serial number (days since 1899-12-30, OLE Automation date)
-    if let Ok(n) = s.parse::<f64>() {
-        if n.is_finite() {
-            let base = NaiveDate::from_ymd_opt(1899, 12, 30)?;
-            let days = n.floor() as i64;
-            let frac = n - n.floor();
-            // Round to the nearest millisecond (NOT truncate) — the fraction is
-            // a float, so 51 seconds can land at 50.9999s and truncate to 50.
-            // Milliseconds also preserve sub-second precision through a
-            // date -> serial -> date round-trip.
-            let ms = (frac * 86_400_000.0).round() as i64;
-            // try_days/try_milliseconds return None on overflow instead of
-            // panicking ("TimeDelta::days out of bounds") — a bare epoch-millis
-            // value like 1.7e12 parsed as a date serial would otherwise crash.
-            return base.and_hms_opt(0, 0, 0)
-                .and_then(|dt| chrono::Duration::try_days(days).and_then(|d| dt.checked_add_signed(d)))
-                .and_then(|dt| chrono::Duration::try_milliseconds(ms).and_then(|d| dt.checked_add_signed(d)));
-        }
-    }
-
-    None
+    cfml_common::datetime::parse::parse_local(s)
 }
 
-/// Determines whether `m`/`mm` means month or minute
-#[derive(Clone, Copy)]
-enum FormatMode { Date, Time, DateTime }
 
-fn month_name_full(m: u32) -> &'static str {
-    match m {
-        1 => "January", 2 => "February", 3 => "March", 4 => "April",
-        5 => "May", 6 => "June", 7 => "July", 8 => "August",
-        9 => "September", 10 => "October", 11 => "November", 12 => "December",
-        _ => "",
-    }
-}
-fn month_name_short(m: u32) -> &'static str {
-    match m {
-        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
-        _ => "",
-    }
-}
-fn day_name_full(w: chrono::Weekday) -> &'static str {
-    match w {
-        chrono::Weekday::Mon => "Monday", chrono::Weekday::Tue => "Tuesday",
-        chrono::Weekday::Wed => "Wednesday", chrono::Weekday::Thu => "Thursday",
-        chrono::Weekday::Fri => "Friday", chrono::Weekday::Sat => "Saturday",
-        chrono::Weekday::Sun => "Sunday",
-    }
-}
-fn day_name_short(w: chrono::Weekday) -> &'static str {
-    match w {
-        chrono::Weekday::Mon => "Mon", chrono::Weekday::Tue => "Tue",
-        chrono::Weekday::Wed => "Wed", chrono::Weekday::Thu => "Thu",
-        chrono::Weekday::Fri => "Fri", chrono::Weekday::Sat => "Sat",
-        chrono::Weekday::Sun => "Sun",
-    }
-}
-fn hour12(h: u32) -> u32 {
-    match h % 12 { 0 => 12, other => other }
-}
 
-/// Resolve preset mask names into actual mask patterns
-fn resolve_preset(mask: &str, mode: &FormatMode) -> String {
-    let lower = mask.to_lowercase();
-    match mode {
-        FormatMode::Date => match lower.as_str() {
-            "" => "dd-mmm-yy".into(),
-            "short" => "m/d/yy".into(),
-            "medium" => "mmm d, yyyy".into(),
-            "long" => "mmmm d, yyyy".into(),
-            "full" => "dddd, mmmm d, yyyy".into(),
-            _ => mask.into(),
-        },
-        FormatMode::Time => match lower.as_str() {
-            "" => "hh:mm tt".into(),
-            "short" => "h:mm tt".into(),
-            "medium" => "h:mm:ss tt".into(),
-            "long" | "full" => "h:mm:ss tt".into(),
-            _ => mask.into(),
-        },
-        FormatMode::DateTime => match lower.as_str() {
-            "" => "dd-mmm-yyyy HH:nn:ss".into(),
-            "short" => "m/d/yy h:nn tt".into(),
-            "medium" => "mmm d, yyyy h:nn:ss tt".into(),
-            "long" => "mmmm d, yyyy h:nn:ss tt".into(),
-            "full" => "dddd, mmmm d, yyyy h:nn:ss tt".into(),
-            _ => mask.into(),
-        },
-    }
-}
 
-/// Match a format token at position `pos` in the mask character array
-fn match_format_token(chars: &[char], pos: usize, dt: &NaiveDateTime, mode: FormatMode) -> Option<(usize, String)> {
-    let remaining = chars.len() - pos;
-    // 4-char tokens
-    if remaining >= 4 {
-        let four: String = chars[pos..pos+4].iter().collect();
-        match four.to_lowercase().as_str() {
-            "dddd" => return Some((4, day_name_full(dt.weekday()).into())),
-            "mmmm" => return Some((4, match mode {
-                FormatMode::Time => format!("{:02}", dt.minute()),
-                _ => month_name_full(dt.month()).into(),
-            })),
-            "yyyy" => return Some((4, format!("{:04}", dt.year()))),
-            _ => {}
-        }
-    }
-    // 3-char tokens
-    if remaining >= 3 {
-        let three: String = chars[pos..pos+3].iter().collect();
-        match three.to_lowercase().as_str() {
-            "ddd" => return Some((3, day_name_short(dt.weekday()).into())),
-            "mmm" => return Some((3, match mode {
-                FormatMode::Time => format!("{:02}", dt.minute()),
-                _ => month_name_short(dt.month()).into(),
-            })),
-            _ => {}
-        }
-    }
-    // 2-char tokens
-    if remaining >= 2 {
-        let two: String = chars[pos..pos+2].iter().collect();
-        match two.as_str() {
-            "dd" | "DD" => return Some((2, format!("{:02}", dt.day()))),
-            "mm" | "MM" => return Some((2, match mode {
-                FormatMode::Time => format!("{:02}", dt.minute()),
-                _ => format!("{:02}", dt.month()),
-            })),
-            "yy" | "YY" => return Some((2, format!("{:02}", dt.year() % 100))),
-            "HH" => return Some((2, format!("{:02}", dt.hour()))),
-            "hh" => return Some((2, format!("{:02}", hour12(dt.hour())))),
-            "nn" | "NN" => return Some((2, format!("{:02}", dt.minute()))),
-            "ss" | "SS" => return Some((2, format!("{:02}", dt.second()))),
-            "tt" | "TT" => return Some((2, if dt.hour() < 12 { "AM".into() } else { "PM".into() })),
-            _ => {}
-        }
-    }
-    // 1-char tokens
-    if remaining >= 1 {
-        match chars[pos] {
-            'd' | 'D' => return Some((1, format!("{}", dt.day()))),
-            'm' | 'M' => return Some((1, match mode {
-                FormatMode::Time => format!("{}", dt.minute()),
-                _ => format!("{}", dt.month()),
-            })),
-            'y' | 'Y' => return Some((1, format!("{:02}", dt.year() % 100))),
-            'H' => return Some((1, format!("{}", dt.hour()))),
-            'h' => return Some((1, format!("{}", hour12(dt.hour())))),
-            'n' | 'N' => return Some((1, format!("{}", dt.minute()))),
-            's' | 'S' => return Some((1, format!("{}", dt.second()))),
-            't' | 'T' => return Some((1, if dt.hour() < 12 { "A".into() } else { "P".into() })),
-            'l' | 'L' => {
-                // Milliseconds, zero-padded to the run length, at most three:
-                // Lucee formats 5ms as `l`=5, `ll`=05, `lll`=005, and `llll` as
-                // `lll` followed by `l`. This arm emitted "000" per letter, so
-                // the common `HH:nn:ss.lll` mask printed nine zeros.
-                let run = chars[pos..]
-                    .iter()
-                    .take(3)
-                    .take_while(|c| c.eq_ignore_ascii_case(&'l'))
-                    .count();
-                let ms = dt.nanosecond() / 1_000_000;
-                return Some((run, format!("{:0width$}", ms, width = run)));
-            }
-            _ => {}
-        }
-    }
-    None
-}
 
-/// Format a NaiveDateTime using a CFML mask string
-fn format_cfml_date(dt: &NaiveDateTime, mask: &str, mode: FormatMode) -> String {
-    let resolved = match mask.to_lowercase().as_str() {
-        "" | "short" | "medium" | "long" | "full" => resolve_preset(mask, &mode),
-        _ => mask.to_string(),
-    };
-    let chars: Vec<char> = resolved.chars().collect();
-    let mut result = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        // Single-quoted segments are emitted verbatim (Java SimpleDateFormat
-        // convention, also used by Lucee/ACF). `''` inside or outside a quoted
-        // segment yields a literal apostrophe.
-        if chars[i] == '\'' {
-            if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                result.push('\'');
-                i += 2;
-                continue;
-            }
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\'' {
-                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                        result.push('\'');
-                        i += 2;
-                    } else {
-                        i += 1;
-                        break;
-                    }
-                } else {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        if let Some((len, replacement)) = match_format_token(&chars, i, dt, mode) {
-            result.push_str(&replacement);
-            i += len;
-        } else {
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-    result
-}
+
+
+
+
+
+
+
+
+
 
 // ===============================================
 // DATE/TIME FUNCTIONS
 // ===============================================
 
-fn fn_now(_args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::string(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()))
-}
-
-fn fn_create_date(args: Vec<CfmlValue>) -> CfmlResult {
-    let year = short_year(get_int(&args, 0));
-    let month = get_int(&args, 1);
-    let day = get_int(&args, 2);
-    // Lucee/ACF treat createDate() as a midnight timestamp, not a date-only
-    // value, so it compares equal to createDateTime(y,m,d,0,0,0) and to
-    // DateAdd("d",1,...). Emit the full datetime representation to match.
-    Ok(CfmlValue::string(format!("{:04}-{:02}-{:02} 00:00:00", year, month, day)))
-}
-
-fn fn_create_date_time(args: Vec<CfmlValue>) -> CfmlResult {
-    let year = short_year(get_int(&args, 0));
-    let month = get_int(&args, 1);
-    let day = get_int(&args, 2);
-    let hour = get_int(&args, 3);
-    let minute = get_int(&args, 4);
-    let second = get_int(&args, 5);
-    Ok(CfmlValue::string(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, month, day, hour, minute, second
-    )))
-}
-
-fn fn_create_time(args: Vec<CfmlValue>) -> CfmlResult {
-    let hour = get_int(&args, 0);
-    let minute = get_int(&args, 1);
-    let second = get_int(&args, 2);
-    Ok(CfmlValue::string(format!("{:02}:{:02}:{:02}", hour, minute, second)))
-}
-
-fn fn_create_odbc_date(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    if let Some(dt) = parse_cfml_date(&s) {
-        Ok(CfmlValue::string(format!("{{d '{}'}}", dt.format("%Y-%m-%d"))))
-    } else {
-        Ok(CfmlValue::string(format!("{{d '{}'}}", s)))
-    }
-}
-
-fn fn_create_odbc_date_time(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    if let Some(dt) = parse_cfml_date(&s) {
-        Ok(CfmlValue::string(format!("{{ts '{}'}}", dt.format("%Y-%m-%d %H:%M:%S"))))
-    } else {
-        Ok(CfmlValue::string(format!("{{ts '{}'}}", s)))
-    }
-}
-
-fn fn_create_odbc_time(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    if let Some(dt) = parse_cfml_date(&s) {
-        Ok(CfmlValue::string(format!("{{t '{}'}}", dt.format("%H:%M:%S"))))
-    } else {
-        Ok(CfmlValue::string(format!("{{t '{}'}}", s)))
-    }
-}
-
-fn fn_date_add(args: Vec<CfmlValue>) -> CfmlResult {
-    let part = get_str(&args, 0).to_lowercase();
-    let number = get_int(&args, 1);
-    let date_str = get_str(&args, 2);
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-
-    let result: Option<NaiveDateTime> = match part.as_str() {
-        "yyyy" => add_months(&dt, number * 12),
-        "q" => add_months(&dt, number * 3),
-        "m" => add_months(&dt, number),
-        // try_* variants return None on overflow rather than panicking, so an
-        // out-of-range delta surfaces as a clean "Date arithmetic overflow".
-        "y" | "d" => chrono::Duration::try_days(number).and_then(|x| dt.checked_add_signed(x)),
-        "w" => chrono::Duration::try_days(number).and_then(|x| dt.checked_add_signed(x)),
-        "ww" => chrono::Duration::try_weeks(number).and_then(|x| dt.checked_add_signed(x)),
-        "h" => chrono::Duration::try_hours(number).and_then(|x| dt.checked_add_signed(x)),
-        "n" => chrono::Duration::try_minutes(number).and_then(|x| dt.checked_add_signed(x)),
-        "s" => chrono::Duration::try_seconds(number).and_then(|x| dt.checked_add_signed(x)),
-        "l" => chrono::Duration::try_milliseconds(number).and_then(|x| dt.checked_add_signed(x)),
-        // Unknown datepart: Lucee/ACF throw an `expression` error rather than
-        // silently no-op'ing. Frameworks rely on the throw — e.g. Preside's
-        // RulesEngineTimePeriodService wraps dateAdd in try/catch and returns an
-        // empty struct when the user-supplied unit is invalid.
-        _ => {
-            return Err(CfmlError::expression(format!(
-                "invalid datepart identifier [{}] for function dateAdd",
-                get_str(&args, 0)
-            )));
+/// The number a `dayOfWeekAsString` / `monthAsString` call names: a number
+/// (truncated, as Lucee's int cast does), or — a lenient extra — a date, which
+/// gives its own day of week / month.
+fn calendar_index_arg(args: &[CfmlValue], from_date: impl Fn(&cfml_common::datetime::CfmlDate) -> i64) -> Result<i64, CfmlError> {
+    let v = args.first().map(|v| v.query_column_scalar()).unwrap_or(&CfmlValue::Null);
+    match v {
+        CfmlValue::Int(i) => Ok(*i),
+        CfmlValue::Double(d) => Ok(d.trunc() as i64),
+        CfmlValue::DateTime(d) => Ok(from_date(d)),
+        other => {
+            let t = other.as_string();
+            if let Some(n) = cfml_common::numeric::numeric_string_value(t.trim()) {
+                return Ok(n.trunc() as i64);
+            }
+            match cfml_common::datetime::parse::parse_date(t.trim()) {
+                Some(d) => Ok(from_date(&d)),
+                None => Err(CfmlError::expression(format!("can't cast [{}] string to a number value", t))),
+            }
         }
-    };
-
-    match result {
-        Some(r) => Ok(CfmlValue::string(r.format("%Y-%m-%d %H:%M:%S").to_string())),
-        None => Err(CfmlError::runtime("Date arithmetic overflow".into())),
     }
 }
 
-fn fn_date_diff(args: Vec<CfmlValue>) -> CfmlResult {
-    let part = get_str(&args, 0).to_lowercase();
-    let date1 = parse_cfml_date(&get_str(&args, 1))
-        .ok_or_else(|| CfmlError::runtime("Invalid date1".into()))?;
-    let date2 = parse_cfml_date(&get_str(&args, 2))
-        .ok_or_else(|| CfmlError::runtime("Invalid date2".into()))?;
-
-    let diff = match part.as_str() {
-        "yyyy" => date2.year() as i64 - date1.year() as i64,
-        "q" => {
-            let q1 = (date1.year() as i64) * 4 + ((date1.month() as i64 - 1) / 3);
-            let q2 = (date2.year() as i64) * 4 + ((date2.month() as i64 - 1) / 3);
-            q2 - q1
-        }
-        "m" => {
-            (date2.year() as i64 - date1.year() as i64) * 12
-                + date2.month() as i64 - date1.month() as i64
-        }
-        "y" | "d" => (date2 - date1).num_days(),
-        "w" => (date2 - date1).num_days() / 7,
-        "ww" => (date2 - date1).num_days() / 7,
-        "h" => (date2 - date1).num_hours(),
-        "n" => (date2 - date1).num_minutes(),
-        "s" => (date2 - date1).num_seconds(),
-        "l" => (date2 - date1).num_milliseconds(),
-        // Unknown datepart: Lucee/ACF throw an `expression` error (mirrors the
-        // dateAdd fix) rather than silently returning 0.
-        _ => {
-            return Err(CfmlError::expression(format!(
-                "invalid datepart identifier [{}] for function dateDiff",
-                get_str(&args, 0)
-            )));
-        }
-    };
-    Ok(CfmlValue::Int(diff))
-}
-
-fn fn_date_format(args: Vec<CfmlValue>) -> CfmlResult {
-    let date_str = get_str(&args, 0);
-    // Lucee returns an empty string for a blank date in the FORMAT functions
-    // (dateFormat/timeFormat/dateTimeFormat) — unlike dateAdd/year/parseDateTime,
-    // which throw a cast error. Masa's admin content-edit + staging views pass
-    // empty date columns straight to dateTimeFormat(); throwing 500'd the page.
-    if date_str.trim().is_empty() {
-        return Ok(CfmlValue::string(String::new()));
+fn day_of_week_name(args: &[CfmlValue], short: bool) -> CfmlResult {
+    let dow = calendar_index_arg(args, |d| d.local().weekday().number_from_sunday() as i64)?;
+    if !(1..=7).contains(&dow) {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [{}], first Argument [dayOfWeek] is invalid, must be between 1 and 7 now [{}]",
+            if short { "DayOfWeekShortAsString" } else { "DayOfWeekAsString" },
+            dow
+        )));
     }
-    let mask = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-    Ok(CfmlValue::string(format_cfml_date(&dt, &mask, FormatMode::Date)))
-}
-
-fn fn_time_format(args: Vec<CfmlValue>) -> CfmlResult {
-    let date_str = get_str(&args, 0);
-    // Blank input → "" (Lucee parity; see fn_date_format).
-    if date_str.trim().is_empty() {
-        return Ok(CfmlValue::string(String::new()));
-    }
-    let mask = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-    Ok(CfmlValue::string(format_cfml_date(&dt, &mask, FormatMode::Time)))
-}
-
-fn fn_date_time_format(args: Vec<CfmlValue>) -> CfmlResult {
-    let date_str = get_str(&args, 0);
-    // Blank input → "" (Lucee parity; see fn_date_format).
-    if date_str.trim().is_empty() {
-        return Ok(CfmlValue::string(String::new()));
-    }
-    let mask = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-    Ok(CfmlValue::string(format_cfml_date(&dt, &mask, FormatMode::DateTime)))
-}
-
-fn fn_parse_date_time(args: Vec<CfmlValue>) -> CfmlResult {
-    let s = get_str(&args, 0);
-    match parse_cfml_date(&s) {
-        Some(dt) => Ok(CfmlValue::string(dt.format("%Y-%m-%d %H:%M:%S").to_string())),
-        None => Err(CfmlError::runtime(format!("Cannot parse date: {}", s))),
-    }
-}
-
-fn fn_year(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.year() as i64))
-}
-
-fn fn_month(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.month() as i64))
-}
-
-fn fn_day(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.day() as i64))
-}
-
-fn fn_hour(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.hour() as i64))
-}
-
-fn fn_minute(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.minute() as i64))
-}
-
-fn fn_second(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.second() as i64))
-}
-
-/// CFML dayOfWeek: 1=Sunday, 2=Monday, ..., 7=Saturday
-fn fn_day_of_week(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.weekday().number_from_sunday() as i64))
+    let names = if short { &crate::dates::DAYS_SHORT } else { &crate::dates::DAYS };
+    Ok(CfmlValue::string(names[(dow - 1) as usize].to_string()))
 }
 
 fn fn_day_of_week_as_string(args: Vec<CfmlValue>) -> CfmlResult {
-    let input = get_str(&args, 0);
-    // Accept either a day number (1-7) or a date string
-    let dow = if let Ok(n) = input.parse::<i64>() {
-        n
-    } else if let Some(dt) = parse_cfml_date(&input) {
-        dt.weekday().number_from_sunday() as i64
-    } else {
-        return Ok(CfmlValue::string(String::new()));
-    };
-    let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    Ok(CfmlValue::string(names.get((dow - 1) as usize).unwrap_or(&"").to_string()))
+    day_of_week_name(&args, false)
 }
 
 fn fn_day_of_week_short_as_string(args: Vec<CfmlValue>) -> CfmlResult {
-    let input = get_str(&args, 0);
-    let dow = if let Ok(n) = input.parse::<i64>() {
-        n
-    } else if let Some(dt) = parse_cfml_date(&input) {
-        dt.weekday().number_from_sunday() as i64
-    } else {
-        return Ok(CfmlValue::string(String::new()));
-    };
-    let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    Ok(CfmlValue::string(names.get((dow - 1) as usize).unwrap_or(&"").to_string()))
+    day_of_week_name(&args, true)
 }
 
-fn fn_day_of_year(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(dt.ordinal() as i64))
+fn month_name_of(args: &[CfmlValue], short: bool) -> CfmlResult {
+    let m = calendar_index_arg(args, |d| d.local().month() as i64)?;
+    if !(1..=12).contains(&m) {
+        return Err(CfmlError::expression(format!(
+            "invalid month definition in function monthAsString, must be between 1 and 12 now [{}]",
+            args.first().map(|v| v.as_string()).unwrap_or_default()
+        )));
+    }
+    let names = if short { &crate::dates::MONTHS_SHORT } else { &crate::dates::MONTHS };
+    Ok(CfmlValue::string(names[(m - 1) as usize].to_string()))
 }
 
-fn fn_days_in_month(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(days_in_month_calc(dt.year(), dt.month()) as i64))
+fn fn_month_as_string(args: Vec<CfmlValue>) -> CfmlResult {
+    month_name_of(&args, false)
 }
 
-fn fn_days_in_year(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    let y = dt.year();
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    Ok(CfmlValue::Int(if leap { 366 } else { 365 }))
+fn fn_month_short_as_string(args: Vec<CfmlValue>) -> CfmlResult {
+    month_name_of(&args, true)
 }
 
-/// Returns the day-of-year for the first day of the date's month
-fn fn_first_day_of_month(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    let first = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    Ok(CfmlValue::Int(first.ordinal() as i64))
-}
 
 fn fn_is_leap_year(args: Vec<CfmlValue>) -> CfmlResult {
     let input = get_str(&args, 0);
@@ -6557,179 +5879,7 @@ fn fn_is_leap_year(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Bool((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
 }
 
-fn fn_month_as_string(args: Vec<CfmlValue>) -> CfmlResult {
-    let input = get_str(&args, 0);
-    let month = if let Ok(m) = input.parse::<i64>() {
-        m
-    } else if let Some(dt) = parse_cfml_date(&input) {
-        dt.month() as i64
-    } else {
-        return Ok(CfmlValue::string(String::new()));
-    };
-    Ok(CfmlValue::string(month_name_full(month as u32).to_string()))
-}
 
-fn fn_month_short_as_string(args: Vec<CfmlValue>) -> CfmlResult {
-    let input = get_str(&args, 0);
-    let month = if let Ok(m) = input.parse::<i64>() {
-        m
-    } else if let Some(dt) = parse_cfml_date(&input) {
-        dt.month() as i64
-    } else {
-        return Ok(CfmlValue::string(String::new()));
-    };
-    Ok(CfmlValue::string(month_name_short(month as u32).to_string()))
-}
-
-/// quarter(date) - returns 1-4 based on the month of the date
-fn fn_quarter(args: Vec<CfmlValue>) -> CfmlResult {
-    let input = get_str(&args, 0);
-    let month = if let Ok(m) = input.parse::<i64>() {
-        // Legacy: accept a raw month number
-        m
-    } else if let Some(dt) = parse_cfml_date(&input) {
-        dt.month() as i64
-    } else {
-        return Ok(CfmlValue::Int(0));
-    };
-    Ok(CfmlValue::Int(((month - 1) / 3) + 1))
-}
-
-fn fn_week(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    // CFML week: ISO week number
-    Ok(CfmlValue::Int(dt.iso_week().week() as i64))
-}
-
-/// datePart(datepart, date) - extracts the specified part from a date
-fn fn_date_part(args: Vec<CfmlValue>) -> CfmlResult {
-    let part = get_str(&args, 0).to_lowercase();
-    let dt = parse_cfml_date(&get_str(&args, 1))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    let val = match part.as_str() {
-        "yyyy" => dt.year() as i64,
-        "q" => ((dt.month() as i64 - 1) / 3) + 1,
-        "m" => dt.month() as i64,
-        "y" => dt.ordinal() as i64,
-        "d" => dt.day() as i64,
-        "w" => dt.weekday().number_from_sunday() as i64,
-        "ww" => dt.iso_week().week() as i64,
-        "h" => dt.hour() as i64,
-        "n" => dt.minute() as i64,
-        "s" => dt.second() as i64,
-        "l" => 0, // milliseconds not tracked
-        _ => return Err(CfmlError::runtime(format!("Invalid datepart: {}", part))),
-    };
-    Ok(CfmlValue::Int(val))
-}
-
-/// dateCompare(date1, date2 [, datePart]) - returns -1, 0, or 1
-fn fn_date_compare(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt1 = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date1".into()))?;
-    let dt2 = parse_cfml_date(&get_str(&args, 1))
-        .ok_or_else(|| CfmlError::runtime("Invalid date2".into()))?;
-    let part = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "s".into() };
-
-    // Truncate precision based on datepart
-    let (v1, v2) = match part.as_str() {
-        "yyyy" => (
-            NaiveDate::from_ymd_opt(dt1.year(), 1, 1).unwrap().and_hms_opt(0,0,0).unwrap(),
-            NaiveDate::from_ymd_opt(dt2.year(), 1, 1).unwrap().and_hms_opt(0,0,0).unwrap(),
-        ),
-        "m" => (
-            NaiveDate::from_ymd_opt(dt1.year(), dt1.month(), 1).unwrap().and_hms_opt(0,0,0).unwrap(),
-            NaiveDate::from_ymd_opt(dt2.year(), dt2.month(), 1).unwrap().and_hms_opt(0,0,0).unwrap(),
-        ),
-        "d" => (
-            dt1.date().and_hms_opt(0,0,0).unwrap(),
-            dt2.date().and_hms_opt(0,0,0).unwrap(),
-        ),
-        "h" => (
-            dt1.date().and_hms_opt(dt1.hour(), 0, 0).unwrap(),
-            dt2.date().and_hms_opt(dt2.hour(), 0, 0).unwrap(),
-        ),
-        "n" => (
-            dt1.date().and_hms_opt(dt1.hour(), dt1.minute(), 0).unwrap(),
-            dt2.date().and_hms_opt(dt2.hour(), dt2.minute(), 0).unwrap(),
-        ),
-        _ => (dt1, dt2), // "s" or default: full precision
-    };
-
-    let cmp = if v1 < v2 { -1i64 } else if v1 > v2 { 1 } else { 0 };
-    Ok(CfmlValue::Int(cmp))
-}
-
-fn fn_millisecond(args: Vec<CfmlValue>) -> CfmlResult {
-    let dt = parse_cfml_date(&get_str(&args, 0))
-        .ok_or_else(|| CfmlError::runtime("Invalid date".into()))?;
-    let millis = dt.and_utc().timestamp_subsec_millis() as i64;
-    Ok(CfmlValue::Int(millis))
-}
-
-fn fn_date_convert(args: Vec<CfmlValue>) -> CfmlResult {
-    let conversion_type = get_str(&args, 0).to_lowercase();
-    let date_str = get_str(&args, 1);
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-
-    let result = match conversion_type.as_str() {
-        "local2utc" => {
-            let local_dt = Local.from_local_datetime(&dt)
-                .single()
-                .ok_or_else(|| CfmlError::runtime("Ambiguous or invalid local time".into()))?;
-            local_dt.with_timezone(&Utc).naive_utc()
-        }
-        "utc2local" => {
-            let utc_dt = Utc.from_utc_datetime(&dt);
-            utc_dt.with_timezone(&Local).naive_local()
-        }
-        _ => return Err(CfmlError::runtime(
-            format!("Invalid conversion type: {}. Use 'local2utc' or 'utc2local'.", conversion_type)
-        )),
-    };
-
-    Ok(CfmlValue::string(result.format("%Y-%m-%d %H:%M:%S").to_string()))
-}
-
-fn fn_get_numeric_date(args: Vec<CfmlValue>) -> CfmlResult {
-    let date_str = get_str(&args, 0);
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-
-    let epoch = NaiveDate::from_ymd_opt(1899, 12, 30).unwrap().and_hms_opt(0, 0, 0).unwrap();
-    let duration = dt - epoch;
-    let days = duration.num_days() as f64;
-    let remaining_secs = duration.num_seconds() - (duration.num_days() * 86400);
-    let frac = remaining_secs as f64 / 86400.0;
-
-    Ok(CfmlValue::Double(days + frac))
-}
-
-fn fn_get_http_time_string(args: Vec<CfmlValue>) -> CfmlResult {
-    let date_str = get_str(&args, 0);
-    let dt = parse_cfml_date(&date_str)
-        .ok_or_else(|| CfmlError::runtime(format!("Invalid date: {}", date_str)))?;
-
-    Ok(CfmlValue::string(dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()))
-}
-
-fn fn_now_server(_args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::string(Local::now().format("%Y-%m-%d %H:%M:%S").to_string()))
-}
-
-fn fn_get_tick_count(args: Vec<CfmlValue>) -> CfmlResult {
-    let unit = args.first()
-        .and_then(|v| if let CfmlValue::String(s) = v { Some(s.to_lowercase()) } else { None })
-        .unwrap_or_else(|| "milli".to_string());
-    let val = match unit.as_str() {
-        "nano" => cfml_common::clock::now_unix_nanos() as i64,
-        "second" => cfml_common::clock::now_unix_secs() as i64,
-        _ => cfml_common::clock::now_unix_millis() as i64,
-    };
-    Ok(CfmlValue::Int(val))
-}
 
 fn fn_get_function_called_name(_args: Vec<CfmlValue>) -> CfmlResult {
     // VM-intercepted — this stub only runs if the VM intercept misses (e.g.
@@ -7331,6 +6481,13 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
         CfmlValue::TimeSpan(d) => {
             let _ = write!(out, "{}", d);
         }
+        // Lucee's JSON date form, in the request zone:
+        // "July, 01 2026 09:05:03 +0100".
+        CfmlValue::DateTime(d) => {
+            let tz = cfml_common::datetime::current_zone();
+            let text = crate::dates::java_format("MMMM, dd yyyy HH:mm:ss Z", d, &tz).unwrap_or_default();
+            write_json_str(out, &text);
+        }
         CfmlValue::String(s) => write_json_str(out, s),
         CfmlValue::Array(arr) => {
             let ptr = arr.backing_ptr();
@@ -7591,6 +6748,22 @@ fn serialize_cfml_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
         CfmlValue::Double(d) => d.to_string(),
         // A timespan serializes as its numeric (fractional-day) value, like Lucee.
         CfmlValue::TimeSpan(d) => d.to_string(),
+        // `createDateTime(2026,7,1,9,5,3,0,"Europe/London")`, as Lucee writes it.
+        CfmlValue::DateTime(d) => {
+            let tz = cfml_common::datetime::current_zone();
+            let w = d.local_in(&tz);
+            format!(
+                "createDateTime({},{},{},{},{},{},{},\"{}\")",
+                w.year(),
+                w.month(),
+                w.day(),
+                w.hour(),
+                w.minute(),
+                w.second(),
+                d.subsec_nanos() / 1_000_000,
+                tz.name()
+            )
+        }
         CfmlValue::String(s) => cfml_literal_string(s),
         CfmlValue::Array(arr) => {
             let ptr = arr.backing_ptr();
@@ -8036,6 +7209,7 @@ fn fn_is_json(args: Vec<CfmlValue>) -> CfmlResult {
             | CfmlValue::Int(_)
             | CfmlValue::Double(_)
             | CfmlValue::TimeSpan(_)
+            | CfmlValue::DateTime(_)
             | CfmlValue::String(_),
         ) => {}
         _ => return Ok(CfmlValue::Bool(false)),
@@ -8982,6 +8156,17 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
             "java.lang.comparable",
         ],
         CfmlValue::Bool(_) => &["java.lang.boolean"],
+        // Every CFML date is a lucee.runtime.type.dt.DateTimeImpl, which extends
+        // java.util.Date (GH #471). The idiomatic "is this a real date object,
+        // not a date-like string" test.
+        CfmlValue::DateTime(_) => &[
+            "java.util.date",
+            "java.lang.comparable",
+            "java.lang.cloneable",
+            "java.io.serializable",
+            "lucee.runtime.type.dt.datetime",
+            "lucee.runtime.type.dt.datetimeimpl",
+        ],
         // A CFML numeric is a java.lang.Double in Lucee irrespective of whether
         // RustCFML stored it as Int or Double, so both map to the same aliases.
         CfmlValue::Int(_) | CfmlValue::Double(_) => &[
@@ -9704,7 +8889,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
     enum Entry {
         Scalar(CfmlValue),
-        Row { name: String, directory: String, size: u64, is_dir: bool, modified: String, mode: String },
+        Row { name: String, directory: String, size: u64, is_dir: bool, modified: CfmlValue, mode: String },
     }
 
     fn list_dir(
@@ -9819,7 +9004,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                         row.insert("directory".to_string(), CfmlValue::string(directory));
                         row.insert("size".to_string(), CfmlValue::Int(size as i64));
                         row.insert("type".to_string(), CfmlValue::string(if is_dir { "Dir" } else { "File" }));
-                        row.insert("dateLastModified".to_string(), CfmlValue::string(modified));
+                        row.insert("dateLastModified".to_string(), modified);
                         row.insert("attributes".to_string(), CfmlValue::string(String::new()));
                         row.insert("mode".to_string(), CfmlValue::string(mode));
                         q.add_row(row);
@@ -9879,17 +9064,12 @@ fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
     info.insert("canRead".to_string(), CfmlValue::Bool(!meta.permissions().readonly()));
     info.insert("canWrite".to_string(), CfmlValue::Bool(!meta.permissions().readonly()));
     if let Ok(modified) = meta.modified() {
-        let secs = modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        // Emit a CFML date string (local time) so IsDate()/date functions accept
-        // it — Lucee's getFileInfo().lastmodified is a date, and callers (e.g.
-        // Preside's getObjectInfo) assert IsDate() on it. A raw epoch int failed.
-        use chrono::TimeZone;
-        let lm = chrono::Local
-            .timestamp_opt(secs as i64, 0)
-            .single()
-            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
-        info.insert("lastModified".to_string(), CfmlValue::string(lm));
+        // A date, as Lucee's getFileInfo().lastmodified is (Preside's
+        // getObjectInfo asserts IsDate() on it).
+        info.insert(
+            "lastModified".to_string(),
+            CfmlValue::DateTime(cfml_common::datetime::from_system_time(modified)),
+        );
     }
     Ok(CfmlValue::strukt(info))
 }
@@ -12691,6 +11871,24 @@ fn coerce_by_sqltype_value(val: &CfmlValue, sqltype: &str) -> CfmlValue {
             }
         }
         s if s == "cf_sql_null" => CfmlValue::Null,
+        // Temporal types: the value as a date (a date string parses), narrowed
+        // to the declared kind so the driver binds a DATE / TIME / TIMESTAMP.
+        s if s.contains("timestamp") || s.ends_with("datetime") || s.ends_with("_date") || s == "date"
+            || s.ends_with("_time") || s == "time" =>
+        {
+            use cfml_common::datetime::DateKind;
+            let kind = if s.contains("timestamp") || s.ends_with("datetime") {
+                DateKind::DateTime
+            } else if s.ends_with("_date") || s == "date" {
+                DateKind::Date
+            } else {
+                DateKind::Time
+            };
+            match crate::dates::to_date(val) {
+                Some(d) => CfmlValue::DateTime(d.with_kind(kind)),
+                None => val.clone(),
+            }
+        }
         _ => val.clone(),
     }
 }
@@ -13917,6 +13115,8 @@ fn cfml_to_sqlite(val: &CfmlValue) -> rusqlite::types::Value {
         CfmlValue::Double(d) => SqlValue::Real(*d),
         CfmlValue::String(s) => SqlValue::Text((**s).clone()),
         CfmlValue::Binary(b) => SqlValue::Blob(b.clone()),
+        // SQLite has no date type: store the plain text form, not `{ts '…'}`.
+        CfmlValue::DateTime(d) => SqlValue::Text(d.to_db_text()),
         _ => SqlValue::Text(val.as_string()),
     }
 }
@@ -14333,6 +13533,30 @@ fn cfml_to_mysql_value(val: &CfmlValue) -> mysql::Value {
         CfmlValue::Double(d) => mysql::Value::from(*d),
         CfmlValue::String(s) => mysql::Value::from(s.as_str()),
         CfmlValue::Binary(b) => mysql::Value::Bytes(b.clone()),
+        // A date binds as a MySQL date/time value (wall clock in the request
+        // zone), keeping its fractional seconds; a `cf_sql_date`/`cf_sql_time`
+        // param has already been narrowed to that kind.
+        CfmlValue::DateTime(d) => {
+            let w = crate::dates::db_wall(d);
+            let us = w.nanosecond() / 1000;
+            match d.kind() {
+                cfml_common::datetime::DateKind::Date => {
+                    mysql::Value::Date(w.year() as u16, w.month() as u8, w.day() as u8, 0, 0, 0, 0)
+                }
+                cfml_common::datetime::DateKind::Time => {
+                    mysql::Value::Time(false, 0, w.hour() as u8, w.minute() as u8, w.second() as u8, us)
+                }
+                cfml_common::datetime::DateKind::DateTime => mysql::Value::Date(
+                    w.year() as u16,
+                    w.month() as u8,
+                    w.day() as u8,
+                    w.hour() as u8,
+                    w.minute() as u8,
+                    w.second() as u8,
+                    us,
+                ),
+            }
+        }
         _ => mysql::Value::from(val.as_string()),
     }
 }
@@ -14357,22 +13581,22 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
             }
         }
         // DATE / DATETIME / TIMESTAMP all arrive as `Value::Date`; a DATE column
-        // (and a DATETIME at midnight) carries all-zero time fields. Lucee/ACF
-        // surface EVERY temporal column as a full datetime — a DATE becomes a
-        // datetime at midnight, and a DATETIME never drops its (possibly
-        // midnight) time. Always emit the full `YYYY-MM-DD HH:MM:SS` form (the
-        // same canonical datetime string now()/createDateTime produce), so the
-        // time component is never lost. (GH #273 — the old all-zero-time
-        // heuristic collapsed a real DATETIME to a bare date.)
-        mysql::Value::Date(y, mo, d, h, mi, s, _us) => {
-            CfmlValue::string(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s))
+        // carries all-zero time fields. Lucee/ACF surface EVERY temporal column
+        // as a date-time — a DATE is midnight — with the column's fractional
+        // seconds (truncated to milliseconds, GH #441).
+        mysql::Value::Date(y, mo, d, h, mi, s, us) => {
+            match cfml_common::datetime::naive(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32, us * 1000) {
+                Some(wall) => CfmlValue::DateTime(crate::dates::from_db_wall(&wall)),
+                // MySQL's zero date (0000-00-00) has no calendar value.
+                None => CfmlValue::string(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)),
+            }
         }
-        // TIME columns — CFML idiom is the epoch-style 1899-12-30 prefix so
-        // dateFormat/timeFormat work. `days` can carry overflow; fold into hours.
-        mysql::Value::Time(neg, days, h, mi, s, _us) => {
-            let total_h = (days as u64) * 24 + h as u64;
-            let sign = if neg { "-" } else { "" };
-            CfmlValue::string(format!("1899-12-30 {}{:02}:{:02}:{:02}", sign, total_h, mi, s))
+        // TIME columns are a java.sql.Time on Lucee: a date on 1970-01-01.
+        // `days` carries the part beyond 24 hours (TIME spans ±838 hours).
+        mysql::Value::Time(neg, days, h, mi, s, us) => {
+            let n = ((days as i128 * 24 + h as i128) * 3600 + mi as i128 * 60 + s as i128) * 1_000_000_000
+                + us as i128 * 1000;
+            CfmlValue::DateTime(crate::dates::from_db_time(if neg { -n } else { n }))
         }
     }
 }
@@ -14631,6 +13855,9 @@ enum PgParam {
     Double(f64),
     Text(String),
     Bytes(Vec<u8>),
+    /// A CFML date: bound at its instant (timestamptz) or as its wall clock in
+    /// the request zone (timestamp/date/time), keeping fractional seconds.
+    Date(cfml_common::datetime::CfmlDate),
 }
 
 /// Append `s` to the postgres wire buffer as raw text bytes and report a
@@ -14851,6 +14078,17 @@ impl postgres::types::ToSql for PgParam {
             },
 
             PgParam::Bytes(b) => b.to_sql(ty, out),
+
+            PgParam::Date(d) => {
+                let wall = crate::dates::db_wall(d);
+                match *ty {
+                    Type::TIMESTAMP => wall.to_sql(ty, out),
+                    Type::TIMESTAMPTZ => Utc.from_utc_datetime(&d.utc()).to_sql(ty, out),
+                    Type::DATE => wall.date().to_sql(ty, out),
+                    Type::TIME => wall.time().to_sql(ty, out),
+                    _ => write_pg_text(&d.to_plain_string(), out),
+                }
+            }
         }
     }
 
@@ -14883,6 +14121,7 @@ impl postgres::types::ToSql for PgParam {
                 Type::INT2 | Type::INT4 | Type::INT8 | Type::OID
                     | Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC | Type::BOOL
             ),
+            PgParam::Date(_) => matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ | Type::DATE | Type::TIME),
             PgParam::Text(_) => matches!(
                 *ty,
                 Type::UUID | Type::INT2 | Type::INT4 | Type::INT8 | Type::OID
@@ -14906,6 +14145,7 @@ fn cfml_to_pg_param(val: &CfmlValue) -> PgParam {
         CfmlValue::Double(d) => PgParam::Double(*d),
         CfmlValue::String(s) => PgParam::Text((**s).clone()),
         CfmlValue::Binary(b) => PgParam::Bytes(b.clone()),
+        CfmlValue::DateTime(d) => PgParam::Date(*d),
         // A query-column proxy stands in for its first-row scalar (defensive:
         // prepare_pg_statements already flattens these).
         CfmlValue::QueryColumn(..) => cfml_to_pg_param(val.query_column_scalar()),
@@ -15057,26 +14297,29 @@ fn postgres_row_to_cfml_typed(row: &postgres::Row, col_idx: usize) -> CfmlValue 
             Ok(Some(u)) => CfmlValue::string(u.hyphenated().to_string()),
             _ => CfmlValue::Null,
         },
+        // Temporal columns are dates (GH #441), as on Lucee: `timestamp` is a
+        // wall clock in the request zone, `timestamptz` an instant, `date` is
+        // midnight, `time` a java.sql.Time on 1970-01-01.
         Type::TIMESTAMP => match row.try_get::<_, Option<NaiveDateTime>>(col_idx) {
-            Ok(Some(d)) => CfmlValue::string(d.format("%Y-%m-%d %H:%M:%S").to_string()),
+            Ok(Some(d)) => CfmlValue::DateTime(crate::dates::from_db_wall(&d)),
             _ => CfmlValue::Null,
         },
-        // TIMESTAMPTZ stored in UTC; render in local TZ to match Lucee's
-        // session-TZ behavior on a host with the same default TZ.
         Type::TIMESTAMPTZ => match row.try_get::<_, Option<chrono::DateTime<Utc>>>(col_idx) {
-            Ok(Some(d)) => CfmlValue::string(
-                d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()
-            ),
+            Ok(Some(d)) => CfmlValue::DateTime(crate::dates::from_db_utc(&d.naive_utc())),
             _ => CfmlValue::Null,
         },
         Type::DATE => match row.try_get::<_, Option<NaiveDate>>(col_idx) {
-            Ok(Some(d)) => CfmlValue::string(d.format("%Y-%m-%d").to_string()),
+            Ok(Some(d)) => match d.and_hms_opt(0, 0, 0) {
+                Some(w) => CfmlValue::DateTime(crate::dates::from_db_wall(&w)),
+                None => CfmlValue::Null,
+            },
             _ => CfmlValue::Null,
         },
-        // TIME has no native date portion; CFML idiom is the epoch-style
-        // 1899-12-30 prefix so dateFormat/timeFormat work.
         Type::TIME => match row.try_get::<_, Option<NaiveTime>>(col_idx) {
-            Ok(Some(t)) => CfmlValue::string(format!("1899-12-30 {}", t.format("%H:%M:%S"))),
+            Ok(Some(t)) => {
+                let n = t.num_seconds_from_midnight() as i128 * 1_000_000_000 + t.nanosecond() as i128;
+                CfmlValue::DateTime(crate::dates::from_db_time(n))
+            }
             _ => CfmlValue::Null,
         },
         // TIMETZ: postgres-types has no FromSql impl; use our 12-byte parser
@@ -15219,6 +14462,12 @@ enum MssqlParam {
     Double(f64),
     Str(String),
     Bytes(Vec<u8>),
+    /// A CFML date as its wall clock in the request zone (datetime2, so the
+    /// fractional seconds survive), or its date / time part for a
+    /// `cf_sql_date` / `cf_sql_time` param.
+    DateTime(NaiveDateTime),
+    Date(NaiveDate),
+    Time(NaiveTime),
 }
 
 #[cfg(feature = "mssql_db")]
@@ -15236,6 +14485,9 @@ impl tiberius::ToSql for MssqlParam {
             MssqlParam::Double(d) => ColumnData::F64(Some(*d)),
             MssqlParam::Str(s) => ColumnData::String(Some(Cow::Borrowed(s.as_str()))),
             MssqlParam::Bytes(b) => ColumnData::Binary(Some(Cow::Borrowed(b.as_slice()))),
+            MssqlParam::DateTime(w) => w.to_sql(),
+            MssqlParam::Date(d) => d.to_sql(),
+            MssqlParam::Time(t) => t.to_sql(),
         }
     }
 }
@@ -15252,6 +14504,14 @@ fn mssql_bind_params(params: &[CfmlValue]) -> Vec<MssqlParam> {
         CfmlValue::Int(n) => MssqlParam::Int(n),
         CfmlValue::Double(d) => MssqlParam::Double(d),
         CfmlValue::Binary(b) => MssqlParam::Bytes(b),
+        CfmlValue::DateTime(d) => {
+            let w = crate::dates::db_wall(&d);
+            match d.kind() {
+                cfml_common::datetime::DateKind::Date => MssqlParam::Date(w.date()),
+                cfml_common::datetime::DateKind::Time => MssqlParam::Time(w.time()),
+                cfml_common::datetime::DateKind::DateTime => MssqlParam::DateTime(w),
+            }
+        }
         other => MssqlParam::Str(other.as_string()),
     }).collect()
 }
@@ -15502,27 +14762,31 @@ fn mssql_column_to_cfml_typed(row: &tiberius::Row, col_idx: usize) -> CfmlValue 
                 Ok(Some(n)) => CfmlValue::string(n.to_string()),
                 _ => CfmlValue::Null,
             },
-        // DATETIME / DATETIME2 / smalldatetime → "%Y-%m-%d %H:%M:%S".
+        // Temporal columns are dates (GH #441): DATETIME / DATETIME2 /
+        // smalldatetime a wall clock in the request zone, DATE midnight, TIME a
+        // java.sql.Time on 1970-01-01, DATETIMEOFFSET an instant.
         ColumnType::Datetime | ColumnType::Datetime2 | ColumnType::Datetime4 | ColumnType::Datetimen =>
             match row.try_get::<NaiveDateTime, _>(col_idx) {
-                Ok(Some(d)) => CfmlValue::string(d.format("%Y-%m-%d %H:%M:%S").to_string()),
+                Ok(Some(d)) => CfmlValue::DateTime(crate::dates::from_db_wall(&d)),
                 _ => CfmlValue::Null,
             },
         ColumnType::Daten => match row.try_get::<NaiveDate, _>(col_idx) {
-            Ok(Some(d)) => CfmlValue::string(d.format("%Y-%m-%d").to_string()),
+            Ok(Some(d)) => match d.and_hms_opt(0, 0, 0) {
+                Some(w) => CfmlValue::DateTime(crate::dates::from_db_wall(&w)),
+                None => CfmlValue::Null,
+            },
             _ => CfmlValue::Null,
         },
         ColumnType::Timen => match row.try_get::<NaiveTime, _>(col_idx) {
-            Ok(Some(t)) => CfmlValue::string(format!("1899-12-30 {}", t.format("%H:%M:%S"))),
+            Ok(Some(t)) => {
+                let n = t.num_seconds_from_midnight() as i128 * 1_000_000_000 + t.nanosecond() as i128;
+                CfmlValue::DateTime(crate::dates::from_db_time(n))
+            }
             _ => CfmlValue::Null,
         },
-        // DATETIMEOFFSET stored in UTC + offset; render in local TZ to match
-        // CFML's session-TZ-style behavior, consistent with the PG TIMESTAMPTZ path.
         ColumnType::DatetimeOffsetn =>
             match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(col_idx) {
-                Ok(Some(d)) => CfmlValue::string(
-                    d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()
-                ),
+                Ok(Some(d)) => CfmlValue::DateTime(crate::dates::from_db_utc(&d.naive_utc())),
                 _ => CfmlValue::Null,
             },
         // Binary types → CFML Binary.
@@ -16459,14 +15723,10 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
 
                     let file_type = if is_dir { "Dir" } else { "File" };
                     let size = if is_dir { 0i64 } else { metadata.len() as i64 };
-                    let modified = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| {
-                            let dt: chrono::DateTime<chrono::Local> = t.into();
-                            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                        })
-                        .unwrap_or_default();
+                    let modified = match metadata.modified() {
+                        Ok(t) => CfmlValue::DateTime(cfml_common::datetime::from_system_time(t)),
+                        Err(_) => CfmlValue::string(String::new()),
+                    };
 
                     let should_include = match type_filter {
                         "dir" => is_dir,
@@ -16484,7 +15744,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                         );
                         row.insert("type", CfmlValue::string(file_type));
                         row.insert("size", CfmlValue::Int(size));
-                        row.insert("datelastmodified", CfmlValue::string(modified));
+                        row.insert("datelastmodified", modified);
                         rows.push(row);
                     }
 
@@ -20207,7 +19467,7 @@ fn fn_ls_date_format(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))]
     };
-    fn_date_format(pass_args)
+    crate::dates::fn_date_format(pass_args)
 }
 
 fn fn_ls_time_format(args: Vec<CfmlValue>) -> CfmlResult {
@@ -20216,7 +19476,7 @@ fn fn_ls_time_format(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))]
     };
-    fn_time_format(pass_args)
+    crate::dates::fn_time_format(pass_args)
 }
 
 fn fn_ls_date_time_format(args: Vec<CfmlValue>) -> CfmlResult {
@@ -20225,7 +19485,7 @@ fn fn_ls_date_time_format(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))]
     };
-    fn_date_time_format(pass_args)
+    crate::dates::fn_date_time_format(pass_args)
 }
 
 /// Resolve the locale an `ls*` call should format in: the explicit argument at
@@ -20380,7 +19640,7 @@ fn fn_ls_parse_currency(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_ls_parse_date_time(args: Vec<CfmlValue>) -> CfmlResult {
-    fn_parse_date_time(vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))])
+    crate::dates::fn_parse_date_time(vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))])
 }
 
 fn fn_ls_number_format(args: Vec<CfmlValue>) -> CfmlResult {
@@ -20414,11 +19674,11 @@ fn fn_ls_number_format(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_ls_week(args: Vec<CfmlValue>) -> CfmlResult {
-    fn_week(vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))])
+    crate::dates::fn_week(vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))])
 }
 
 fn fn_ls_day_of_week(args: Vec<CfmlValue>) -> CfmlResult {
-    fn_day_of_week(vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))])
+    crate::dates::fn_day_of_week(vec![args.first().cloned().unwrap_or(CfmlValue::string(String::new()))])
 }
 
 // ---- Exception functions ----

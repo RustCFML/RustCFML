@@ -673,42 +673,17 @@ fn now_epoch_secs() -> u64 {
     cfml_common::clock::now_unix_secs()
 }
 
-/// Parse a CFML date/datetime string for cookie-expiry rendering. Mirrors the
-/// common formats accepted by the stdlib `parse_cfml_date`, including the
-/// `createDateTime` output form (`%Y-%m-%d %H:%M:%S`).
+/// A cookie-expiry date as a UTC wall clock. A CFML date names an instant in
+/// the request zone (`{ts '…'}` included), so it goes through the shared date
+/// parser; the cookie formats (`Tue, 14-Jul-2026 06:30:57 GMT`) are tried too.
 fn parse_cookie_expiry_date(s: &str) -> Option<chrono::NaiveDateTime> {
-    use chrono::{NaiveDate, NaiveDateTime};
-    for fmt in &[
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-        "%d-%b-%Y %H:%M:%S",
-        "%a, %d-%b-%Y %H:%M:%S GMT",
-        "%a, %d %b %Y %H:%M:%S GMT",
-        // Month-name forms (comma-less too) — dateConvert reuses this parser and
-        // cbsecurity's JwtService passes "January 1 1970 00:00".
-        "%B %d %Y %H:%M:%S",
-        "%b %d %Y %H:%M:%S",
-        "%B %d %Y %H:%M",
-        "%b %d %Y %H:%M",
-        "%B %d, %Y %H:%M:%S",
-        "%B %d, %Y %H:%M",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+    if let Some(d) = cfml_common::datetime::parse::parse_date(s) {
+        return Some(d.utc());
+    }
+    for fmt in &["%a, %d-%b-%Y %H:%M:%S GMT", "%a, %d %b %Y %H:%M:%S GMT"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
             return Some(dt);
         }
-    }
-    for fmt in &["%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d-%b-%Y", "%B %d %Y", "%b %d %Y", "%B %d, %Y"] {
-        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
-            return d.and_hms_opt(0, 0, 0);
-        }
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.naive_utc());
     }
     None
 }
@@ -6425,7 +6400,7 @@ impl CfmlVirtualMachine {
         meta.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
         meta.insert(
             "starttime".to_string(),
-            CfmlValue::string(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+            CfmlValue::DateTime(cfml_common::datetime::CfmlDate::now()),
         );
         meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
         let cf = self.get_or_create_cfthread_scope();
@@ -6466,10 +6441,8 @@ impl CfmlVirtualMachine {
             "starttime".to_string(),
             carried(
                 "starttime",
-                CfmlValue::string(
-                    (chrono::Local::now() - chrono::Duration::milliseconds(r.elapsed))
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
+                CfmlValue::DateTime(
+                    cfml_common::datetime::CfmlDate::now().plus_millis(-(r.elapsed as i64)),
                 ),
             ),
         );
@@ -19429,30 +19402,6 @@ impl CfmlVirtualMachine {
                     m.insert("isDSTon".to_string(), CfmlValue::Bool(info.is_dst()));
                     return Ok(CfmlValue::strukt(m));
                 }
-                "dateconvert" => {
-                    // dateConvert(type, date) — local<->utc using the current
-                    // request timezone (falls back to the system zone).
-                    let conv = args.first().map(|v| v.as_string().to_lowercase()).unwrap_or_default();
-                    let date_str = args.get(1).map(|v| v.as_string()).unwrap_or_default();
-                    let dt = parse_cookie_expiry_date(&date_str).ok_or_else(|| {
-                        CfmlError::runtime(format!("dateConvert(): invalid date [{}]", date_str))
-                    })?;
-                    let zone = tz::resolve_tz(&self.current_timezone_id()).unwrap_or(chrono_tz::Tz::UTC);
-                    let out = match conv.as_str() {
-                        "local2utc" => tz::local_to_utc(&zone, dt).ok_or_else(|| {
-                            CfmlError::runtime("dateConvert(): ambiguous local time".to_string())
-                        })?,
-                        "utc2local" => tz::utc_to_local(&zone, dt),
-                        other => {
-                            return Err(CfmlError::runtime(format!(
-                                "dateConvert(): invalid conversion type [{}]. Use \
-                                 'local2utc' or 'utc2local'.",
-                                other
-                            )))
-                        }
-                    };
-                    return Ok(CfmlValue::string(out.format("%Y-%m-%d %H:%M:%S").to_string()));
-                }
                 "getapplicationmetadata" | "getapplicationsettings" => {
                     // `getApplicationSettings()` is an alias for
                     // `getApplicationMetadata()` (Lucee/ACF) — both must surface
@@ -28853,6 +28802,144 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Member functions of a date (Lucee 7.1): its datetime members, mapped to
+    /// the BIFs with the date at Lucee's `member-position`, plus the
+    /// `java.util.Date` methods Lucee reflects onto the value. Setters return
+    /// the changed date; `is_mutating_method` (every `setX`) writes it back to
+    /// the receiver variable.
+    fn call_date_member(
+        &mut self,
+        d: cfml_common::datetime::CfmlDate,
+        m: &str,
+        method: &str,
+        extra: &mut Vec<CfmlValue>,
+    ) -> CfmlResult {
+        use cfml_common::datetime::{self, DateField};
+        use chrono::{Datelike, Timelike};
+        let tz = datetime::current_zone();
+        let other = |extra: &Vec<CfmlValue>| -> Result<datetime::CfmlDate, CfmlError> {
+            let v = extra.first().cloned().unwrap_or(CfmlValue::Null);
+            datetime::value_to_date(&v).ok_or_else(|| {
+                CfmlError::expression(format!("can't cast [{}] to date value", v.as_string()))
+            })
+        };
+        let field = match m {
+            "setyear" => Some(DateField::Year),
+            "setmonth" => Some(DateField::Month),
+            "setday" => Some(DateField::Day),
+            "sethour" => Some(DateField::Hour),
+            "setminute" => Some(DateField::Minute),
+            "setsecond" => Some(DateField::Second),
+            "setmillisecond" => Some(DateField::Millisecond),
+            _ => None,
+        };
+        if let Some(f) = field {
+            let v = extra.first().cloned().unwrap_or(CfmlValue::Null);
+            let n = to_number(&v).ok_or_else(|| {
+                CfmlError::expression(format!("can't cast [{}] string to a number value", v.as_string()))
+            })? as i64;
+            let zone = match extra.get(1) {
+                Some(z) if !z.as_string().trim().is_empty() => {
+                    tz::resolve_tz(&z.as_string()).unwrap_or(tz)
+                }
+                _ => tz,
+            };
+            return Ok(CfmlValue::DateTime(datetime::set_field(d, &zone, f, n)));
+        }
+        let w = d.local_in(&tz);
+        match m {
+            "getclass" => {
+                let class_name = match d.kind() {
+                    datetime::DateKind::DateTime => "lucee.runtime.type.dt.DateTimeImpl",
+                    datetime::DateKind::Date => "lucee.runtime.type.dt.DateImpl",
+                    datetime::DateKind::Time => "lucee.runtime.type.dt.TimeImpl",
+                };
+                let mut shim = ValueMap::default();
+                shim.insert("__java_class".to_string(), CfmlValue::string("java.lang.class".to_string()));
+                shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                shim.insert("__class_name".to_string(), CfmlValue::string(class_name.to_string()));
+                return Ok(CfmlValue::strukt(shim));
+            }
+            "gettime" => return Ok(CfmlValue::Int(d.epoch_millis())),
+            "tostring" => return Ok(CfmlValue::string(d.to_cfml_string())),
+            "duplicate" | "clone" => return Ok(CfmlValue::DateTime(d)),
+            "before" | "after" | "equals" | "compareto" => {
+                let o = other(extra)?;
+                let ord = d.epoch_millis().cmp(&o.epoch_millis());
+                return Ok(match m {
+                    "before" => CfmlValue::Bool(ord == std::cmp::Ordering::Less),
+                    "after" => CfmlValue::Bool(ord == std::cmp::Ordering::Greater),
+                    "equals" => CfmlValue::Bool(ord == std::cmp::Ordering::Equal),
+                    _ => CfmlValue::Int(ord as i64),
+                });
+            }
+            "hashcode" => {
+                let ms = d.epoch_millis();
+                return Ok(CfmlValue::Int((ms ^ ((ms as u64) >> 32) as i64) as i32 as i64));
+            }
+            "gettimezoneoffset" => {
+                return Ok(CfmlValue::Int(-(d.offset_secs_in(&tz) as i64) / 60));
+            }
+            "getyear" => return Ok(CfmlValue::Int(w.year() as i64 - 1900)),
+            "getmonth" => return Ok(CfmlValue::Int(w.month0() as i64)),
+            "getdate" => return Ok(CfmlValue::Int(w.day() as i64)),
+            "getday" => return Ok(CfmlValue::Int(w.weekday().num_days_from_sunday() as i64)),
+            "gethours" => return Ok(CfmlValue::Int(w.hour() as i64)),
+            "getminutes" => return Ok(CfmlValue::Int(w.minute() as i64)),
+            "getseconds" => return Ok(CfmlValue::Int(w.second() as i64)),
+            "toinstant" => return Ok(java_time::instant_from_millis(d.epoch_millis())),
+            _ => {}
+        }
+        // (BIF, where the date goes: 0 = first, 1 = second, 2 = third)
+        let (bif, pos) = match m {
+            "add" => ("dateAdd", 2),
+            "diff" => ("dateDiff", 2),
+            "compare" => ("dateCompare", 0),
+            "part" => ("datePart", 1),
+            "day" => ("day", 0),
+            "dayofweek" => ("dayOfWeek", 0),
+            "lsdayofweek" => ("lsDayOfWeek", 0),
+            "dayofyear" => ("dayOfYear", 0),
+            "daysinmonth" => ("daysInMonth", 0),
+            "daysinyear" => ("daysInYear", 0),
+            "firstdayofmonth" => ("firstDayOfMonth", 0),
+            "hour" => ("hour", 0),
+            "millisecond" => ("millisecond", 0),
+            "minute" => ("minute", 0),
+            "month" => ("month", 0),
+            "quarter" => ("quarter", 0),
+            "second" => ("second", 0),
+            "week" => ("week", 0),
+            "year" => ("year", 0),
+            "dateformat" => ("dateFormat", 0),
+            "datetimeformat" | "format" => ("dateTimeFormat", 0),
+            "timeformat" => ("timeFormat", 0),
+            "lsdateformat" => ("lsDateFormat", 0),
+            "lsdatetimeformat" => ("lsDateTimeFormat", 0),
+            "lstimeformat" => ("lsTimeFormat", 0),
+            "numberformat" => ("numberFormat", 0),
+            "tojson" => ("serializeJSON", 0),
+            _ => {
+                return Err(self.wrap_error(CfmlError::expression(format!(
+                    "The function [{}] does not exist in the Datetime. Available functions are [add, compare, \
+                     dateFormat, dateTimeFormat, day, dayOfWeek, dayOfYear, daysInMonth, daysInYear, diff, \
+                     duplicate, firstDayOfMonth, format, getMetadata, hour, lSDateFormat, lSDateTimeFormat, \
+                     lsDayOfWeek, lSTimeFormat, millisecond, minute, month, numberFormat, part, quarter, second, \
+                     setDay, setHour, setMilliSecond, setMinute, setMonth, setSecond, setYear, timeFormat, \
+                     toJson, week, year].",
+                    method
+                ))));
+            }
+        };
+        let mut args = std::mem::take(extra);
+        args.insert(pos.min(args.len()), CfmlValue::DateTime(d));
+        let lower = bif.to_lowercase();
+        match self.builtin_lookup_ci(bif, &lower) {
+            Some((_, f)) => f(args),
+            None => Err(CfmlError::runtime(format!("Function [{}] is not available", bif))),
+        }
+    }
+
     fn call_member_function_impl(
         &mut self,
         object: &CfmlValue,
@@ -28883,6 +28970,12 @@ impl CfmlVirtualMachine {
             );
             err.stack_trace = self.build_stack_trace();
             return Err(err);
+        }
+
+        // A date has Lucee's datetime member functions and the java.util.Date
+        // methods, nothing else (GH #441).
+        if let CfmlValue::DateTime(d) = object {
+            return self.call_date_member(*d, &method_lower, method, extra_args);
         }
 
         // WebSocket `canJoin(socket, room)` authorization gate. When a channel
@@ -31794,62 +31887,20 @@ impl CfmlVirtualMachine {
             return Ok(CfmlValue::string(object.to_string_sorted()));
         }
 
-        // Lucee parity: `dateValue.getTime()` (java.util.Date.getTime) returns
-        // epoch milliseconds. RustCFML dates are formatted strings, so parse the
-        // receiver as a CFML date (local time) and return its UNIX-epoch millis.
-        // Without this, `Now().getTime()` returned Null → the null-delete
-        // assignment guard wiped the assigned-into local (Wheels propertiesSpec
-        // "epoch works": `epochtime = Now().getTime()` then "Variable
-        // 'epochtime' is undefined"). Only applies when the receiver actually
-        // parses as a date, so a plain string falls through unchanged.
+        // `getTime()` on a STRING that names a date: a date value answers this
+        // in `call_date_member`; this keeps the call working for a date held
+        // as text (a superset — Lucee has no string `getTime`). Wheels'
+        // propertiesSpec does `epochtime = Now().getTime()`.
         if method_lower == "gettime" {
-            let raw = object.as_string();
-            let s = raw.trim().trim_start_matches("{ts '").trim_end_matches("'}").trim();
-            // Try the datetime forms RustCFML emits (Now/createDateTime), then a
-            // date-only form (midnight). cfml-stdlib's full date parser isn't
-            // linkable here (it's an optional dep), and these cover the strings
-            // the engine produces for date values.
-            let parsed = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                        .ok()
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                });
-            if let Some(dt) = parsed {
-                use chrono::TimeZone;
-                if let chrono::LocalResult::Single(local_dt) =
-                    chrono::Local.from_local_datetime(&dt)
-                {
-                    return Ok(CfmlValue::Double(local_dt.timestamp_millis() as f64));
-                }
+            if let Some(d) = cfml_common::datetime::parse::parse_date(object.as_string().trim()) {
+                return Ok(CfmlValue::Int(d.epoch_millis()));
             }
         }
 
-        // Lucee parity: `dateValue.toInstant()` (java.util.Date.toInstant) yields
-        // a java.time.Instant. RustCFML dates are formatted strings; parse the
-        // receiver as a date and hand back an Instant shim so ColdBox's
-        // ChronoUnit (`cfDate.toInstant().atZone(zone)`) can bridge a CF date into
-        // the java.time world. Only fires when the receiver parses as a date.
+        // `toInstant()` on a date held as text (see `gettime` above).
         if method_lower == "toinstant" {
-            let raw = object.as_string();
-            let s = raw.trim().trim_start_matches("{ts '").trim_end_matches("'}").trim();
-            let parsed = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                        .ok()
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                });
-            if let Some(dt) = parsed {
-                use chrono::TimeZone;
-                if let chrono::LocalResult::Single(local_dt) =
-                    chrono::Local.from_local_datetime(&dt)
-                {
-                    return Ok(java_time::instant_from_millis(local_dt.timestamp_millis()));
-                }
+            if let Some(d) = cfml_common::datetime::parse::parse_date(object.as_string().trim()) {
+                return Ok(java_time::instant_from_millis(d.epoch_millis()));
             }
         }
 
@@ -32018,6 +32069,7 @@ impl CfmlVirtualMachine {
             CfmlValue::Bool(_) => Some("Boolean"),
             CfmlValue::Binary(_) => Some("Binary"),
             CfmlValue::TimeSpan(_) => Some("TimeSpan"),
+            CfmlValue::DateTime(_) => Some("Datetime"),
             CfmlValue::String(_) => Some("String"),
             _ => None,
         };
@@ -34550,11 +34602,7 @@ impl CfmlVirtualMachine {
     fn session_builtin_keys(&self, rec: &SessionData) -> Vec<(String, CfmlValue)> {
         let cfid = self.session_id.clone().unwrap_or_default();
         let app = self.current_application_name.clone().unwrap_or_default();
-        let date = |secs: u64| {
-            let utc = chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
-            let local: chrono::DateTime<chrono::Local> = utc.into();
-            CfmlValue::string(local.format("%Y-%m-%d %H:%M:%S").to_string())
-        };
+        let date = |secs: u64| CfmlValue::DateTime(cfml_common::datetime::from_epoch_secs(secs as i64));
         vec![
             ("cfid".to_string(), CfmlValue::string(cfid.clone())),
             ("cftoken".to_string(), CfmlValue::string("0".to_string())),
@@ -40763,7 +40811,7 @@ impl CfmlVirtualMachine {
                 "type".to_string(),
                 CfmlValue::string(if *is_dir { "Dir" } else { "File" }.to_string()),
             );
-            row.insert("dateLastModified".to_string(), CfmlValue::string(date));
+            row.insert("dateLastModified".to_string(), date);
             row.insert("attributes".to_string(), CfmlValue::string(String::new()));
             row.insert(
                 "mode".to_string(),
@@ -44247,17 +44295,6 @@ pub(crate) fn to_number(val: &CfmlValue) -> Option<f64> {
     }
 }
 
-/// CFML numeric ("serial") date value: whole days since 1899-12-30, with the
-/// time-of-day carried in the fraction. Sub-second precision is preserved via
-/// milliseconds (Lucee's serials carry the fractional part exactly).
-fn cfml_date_to_serial(dt: &chrono::NaiveDateTime) -> f64 {
-    let epoch = chrono::NaiveDate::from_ymd_opt(1899, 12, 30)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
-    (*dt - epoch).num_milliseconds() as f64 / 86_400_000.0
-}
-
 /// Numeric coercion for the arithmetic operators (`+`, `-`, `*`). Unlike
 /// `to_number`, a date/datetime STRING coerces to its CFML serial value so that
 /// `now() + 1` (add a day), `date + createTimeSpan(...)`, and `dateB - dateA`
@@ -44269,12 +44306,13 @@ pub(crate) fn to_arith_number(val: &CfmlValue) -> Option<f64> {
     if let Some(n) = to_number(val) {
         return Some(n);
     }
-    if let CfmlValue::String(s) = val.query_column_scalar() {
-        if let Some(dt) = try_parse_cfml_datetime(s) {
-            return Some(cfml_date_to_serial(&dt));
-        }
+    match val.query_column_scalar() {
+        // Lucee's DateTimeImpl.castToDoubleValue: the numeric date, in the
+        // request zone, so `now() + 1` is a day later.
+        CfmlValue::DateTime(d) => Some(d.to_numeric()),
+        CfmlValue::String(s) => try_parse_cfml_datetime(s).map(|d| d.to_numeric()),
+        _ => None,
     }
-    None
 }
 
 /// `numeric_op` for the arithmetic ops: identical, except a non-numeric
@@ -44374,6 +44412,12 @@ pub(crate) fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     };
     match (a, b) {
         (CfmlValue::Null, CfmlValue::Null) => true,
+        // A date equals what names the same whole second (Lucee).
+        (CfmlValue::DateTime(d), other) | (other, CfmlValue::DateTime(d))
+            if !matches!(other, CfmlValue::Null) =>
+        {
+            compare_date_with(d, other) == Some(std::cmp::Ordering::Equal)
+        }
         (CfmlValue::Null, _) | (_, CfmlValue::Null) => false,
         // NativeObjects compare by identity. Two CfmlValue references that
         // hold the same Arc are equal; freshly-constructed instances are not,
@@ -44426,7 +44470,7 @@ pub(crate) fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
             if let (Some(da), Some(db)) =
                 (try_parse_cfml_datetime(x), try_parse_cfml_datetime(y))
             {
-                return da == db;
+                return da.cmp_seconds(&db) == std::cmp::Ordering::Equal;
             }
             x.eq_ignore_ascii_case(y)
         }
@@ -44515,6 +44559,8 @@ pub(crate) fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
         (CfmlValue::String(x), CfmlValue::String(y)) => x.eq_ignore_ascii_case(y),
         // Boolean category.
         (CfmlValue::Bool(x), CfmlValue::Bool(y)) => x == y,
+        // Dates: the same instant (`Date.equals`, to the millisecond and below).
+        (CfmlValue::DateTime(x), CfmlValue::DateTime(y)) => x.epoch_nanos() == y.epoch_nanos(),
         // Reference types — identity (same shared backing store).
         (CfmlValue::Array(x), CfmlValue::Array(y)) => x.backing_ptr() == y.backing_ptr(),
         (CfmlValue::Struct(x), CfmlValue::Struct(y)) => x.backing_ptr() == y.backing_ptr(),
@@ -44544,7 +44590,7 @@ pub(crate) fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
 /// dates even when their textual forms differ — e.g. a plain
 /// `1990-01-01 00:00:00` (a DB column) vs the `{ts '1990-01-01 00:00:00'}`
 /// literal `createODBCDateTime` produces. (GH #273)
-fn try_parse_cfml_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
+fn try_parse_cfml_datetime(s: &str) -> Option<cfml_common::datetime::CfmlDate> {
     let s = s.trim();
     // Quick reject: a date needs a digit AND a date separator (`-`/`/`) or the
     // ODBC-literal `{` marker. Plain words/identifiers never reach the parser.
@@ -44553,35 +44599,39 @@ fn try_parse_cfml_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
     if !has_digit || !has_sep {
         return None;
     }
-    // Unwrap an ODBC date/time literal: `{ts '...'}` / `{d '...'}` / `{t '...'}`.
-    let inner: String = if let Some(rest) = s.strip_prefix('{') {
-        let rest = rest.trim_end_matches('}').trim();
-        let rest = rest
-            .strip_prefix("ts ")
-            .or_else(|| rest.strip_prefix("d "))
-            .or_else(|| rest.strip_prefix("t "))
-            .unwrap_or(rest);
-        rest.trim().trim_matches('\'').trim().to_string()
-    } else {
-        s.to_string()
-    };
-    let inner = inner.trim();
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-    ] {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(inner, fmt) {
-            return Some(dt);
-        }
+    // Numbers are not dates here (`"-1"` is a number, not a date serial).
+    if cfml_common::numeric::numeric_string_value(s).is_some() {
+        return None;
     }
-    for fmt in ["%Y-%m-%d", "%m/%d/%Y"] {
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(inner, fmt) {
-            return d.and_hms_opt(0, 0, 0);
+    cfml_common::datetime::parse::parse_date(s)
+}
+
+/// Lucee `OpUtil.compare(Date, Object)`: a date against anything simple.
+/// Dates compare to the whole second (`getTime() / 1000`); a number is read as
+/// a numeric date; a string that is a number compares as one, a string that is
+/// a date as a date, and any other string against the date's `{ts '…'}` form.
+/// `None` for a complex value (Lucee throws "can't compare complex object
+/// types as simple value").
+fn compare_date_with(d: &cfml_common::datetime::CfmlDate, other: &CfmlValue) -> Option<std::cmp::Ordering> {
+    use cfml_common::datetime::CfmlDate;
+    let by_number = |n: f64| CfmlDate::from_numeric(n).map(|o| d.cmp_seconds(&o));
+    match other.query_column_scalar() {
+        CfmlValue::DateTime(o) => Some(d.cmp_seconds(o)),
+        CfmlValue::Int(i) => by_number(*i as f64),
+        CfmlValue::Double(f) | CfmlValue::TimeSpan(f) => by_number(*f),
+        CfmlValue::Bool(b) => by_number(if *b { 1.0 } else { 0.0 }),
+        CfmlValue::Null => Some(d.to_cfml_string().to_lowercase().cmp(&String::new())),
+        CfmlValue::String(s) => {
+            if let Some(n) = cfml_common::numeric::numeric_string_value(s) {
+                return by_number(n);
+            }
+            if let Some(o) = cfml_common::datetime::parse::parse_date(s.trim()) {
+                return Some(d.cmp_seconds(&o));
+            }
+            Some(d.to_cfml_string().to_lowercase().cmp(&s.to_lowercase()))
         }
+        _ => None,
     }
-    None
 }
 
 pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
@@ -44605,6 +44655,8 @@ pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
     };
     match (a, b) {
         (CfmlValue::Int(x), CfmlValue::Int(y)) => x.cmp(y) as i32,
+        (CfmlValue::DateTime(d), other) => compare_date_with(d, other).map_or(0, |o| o as i32),
+        (other, CfmlValue::DateTime(d)) => compare_date_with(d, other).map_or(0, |o| -(o as i32)),
         (CfmlValue::Double(x), CfmlValue::Double(y)) => x.partial_cmp(y).map_or(0, |o| o as i32),
         (CfmlValue::Int(x), CfmlValue::Double(y)) => {
             (*x as f64).partial_cmp(y).map_or(0, |o| o as i32)
@@ -44629,7 +44681,7 @@ pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
             if let (Some(da), Some(db)) =
                 (try_parse_cfml_datetime(x), try_parse_cfml_datetime(y))
             {
-                return da.cmp(&db) as i32;
+                return da.cmp_seconds(&db) as i32;
             }
             x.to_lowercase().cmp(&y.to_lowercase()) as i32
         }

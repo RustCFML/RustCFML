@@ -1,6 +1,7 @@
 //! CFML Standard Library
 
 pub mod builtins;
+pub mod dates;
 pub mod file_handles;
 #[cfg(feature = "image_support")]
 pub mod image;

@@ -164,11 +164,10 @@ fn stamp_file_facts(handle: &mut ValueMap, path: &str) {
     let mtime = meta
         .and_then(|m| m.modified().ok())
         .unwrap_or(std::time::UNIX_EPOCH);
-    let local: chrono::DateTime<chrono::Local> = mtime.into();
     handle.insert("size".to_string(), CfmlValue::Int(size));
     handle.insert(
         "lastmodified".to_string(),
-        CfmlValue::string(local.format("%Y-%m-%d %H:%M:%S").to_string()),
+        CfmlValue::DateTime(cfml_common::datetime::from_system_time(mtime)),
     );
 }
 

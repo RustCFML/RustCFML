@@ -190,6 +190,7 @@ fn err_not_a_container(target: &CfmlValue, key: &CfmlValue) -> cfml_common::vm::
     let type_name = match target {
         CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::TimeSpan(_) => "Number".to_string(),
         CfmlValue::Bool(_) => "Boolean".to_string(),
+        CfmlValue::DateTime(_) => "Datetime".to_string(),
         CfmlValue::String(_) => "String".to_string(),
         CfmlValue::Function(f) => format!("user defined function ({})", f.name),
         CfmlValue::Closure(_) => "user defined function (closure)".to_string(),
@@ -364,6 +365,7 @@ pub(crate) fn op_set_index(
         | CfmlValue::Int(_)
         | CfmlValue::Double(_)
         | CfmlValue::TimeSpan(_)
+        | CfmlValue::DateTime(_)
         | CfmlValue::String(_)
         | CfmlValue::Function(_)
         | CfmlValue::Closure(_) => {

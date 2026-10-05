@@ -1268,6 +1268,8 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         match v {
             CfmlValue::Int(n) => *n,
             CfmlValue::Double(d) => *d as i64,
+            // A CFML date is a java.util.Date: its instant.
+            CfmlValue::DateTime(d) => d.epoch_millis(),
             other => other.as_string().trim().parse::<i64>().unwrap_or(0),
         }
     };
@@ -6460,8 +6462,10 @@ pub fn handle_java_gregoriancalendar(
             }
         }
         "settime" => {
-            // Takes a java.util.Date shim (or bare epoch millis).
+            // Takes a java.util.Date — a CFML date, a Date shim — or bare epoch
+            // millis. (`cal.setTime(now())` used to read the date as 0.)
             let ms = match args.first() {
+                Some(CfmlValue::DateTime(d)) => d.epoch_millis(),
                 Some(CfmlValue::Struct(s)) => s
                     .get("__millis")
                     .map(|v| v.as_string().trim().parse::<i64>().unwrap_or(0))
@@ -7323,6 +7327,7 @@ fn parse_dateformat_arg(arg: &CfmlValue, tz: &chrono_tz::Tz) -> Option<(NaiveDat
         Some((crate::tz::utc_to_local(tz, utc), info.total_secs, info.is_dst()))
     };
     match arg {
+        CfmlValue::DateTime(d) => from_epoch_millis(d.epoch_millis()),
         CfmlValue::Int(n) => from_epoch_millis(*n),
         CfmlValue::Double(d) => from_epoch_millis(*d as i64),
         CfmlValue::Struct(s) if s.contains_key("__millis") => {

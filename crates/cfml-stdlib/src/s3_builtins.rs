@@ -343,7 +343,11 @@ fn presign_expiry_secs(v: Option<&CfmlValue>) -> u64 {
             if let Ok(mins) = trimmed.parse::<u64>() {
                 return mins.saturating_mul(60);
             }
-            match crate::builtins::parse_datetime_to_epoch_secs(trimmed) {
+            let target = match other {
+                CfmlValue::DateTime(d) => Some(d.epoch_secs()),
+                _ => cfml_common::datetime::parse::parse_date(trimmed).map(|d| d.epoch_secs()),
+            };
+            match target {
                 // Lucee measures the window from the call, so an expiry
                 // already in the past yields no window rather than a wrap.
                 Some(target) => {

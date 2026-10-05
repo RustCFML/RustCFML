@@ -94,7 +94,11 @@ pub fn tool_result(value: &CfmlValue) -> Value {
     match value {
         CfmlValue::Null => json!({ "content": [], "isError": false }),
         CfmlValue::String(s) => json!({ "content": [text_block(s)], "isError": false }),
-        CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::TimeSpan(_) => {
+        CfmlValue::Bool(_)
+        | CfmlValue::Int(_)
+        | CfmlValue::Double(_)
+        | CfmlValue::TimeSpan(_)
+        | CfmlValue::DateTime(_) => {
             json!({ "content": [text_block(&value.as_string())], "isError": false })
         }
         CfmlValue::Binary(bytes) => json!({

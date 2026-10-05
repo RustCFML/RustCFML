@@ -32,7 +32,7 @@ pub(crate) const DEFERRED_TO_VM: &[&str] = &[
     "__cfinvoke", "__cfsavecontent_start", "__cfsavecontent_end", "invoke",
     "getbasetemplatepath", "getfunctioncalledname", "gettimezone", "sleep",
     "settimezone", "getlocale", "setlocale", "gettimezoneinfo",
-    "dateconvert", "expandpath", "sanitizehtml", "isdefined",
+    "expandpath", "sanitizehtml", "isdefined",
     "setencoding", "__cfparam", "queryexecute", "cfdbinfo",
     "dbinfo", "cfhttp", "queryregisterfunction", "__cftransaction_start",
     "__cftransaction_commit", "__cftransaction_rollback", "__cftransaction_end", "__writetext",

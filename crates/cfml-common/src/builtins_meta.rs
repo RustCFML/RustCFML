@@ -105,7 +105,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "isarray", "isbinary", "isboolean", "isclosure", "iscustomfunction", "isdate", "isdebugmode",
     "isdefined", "isempty", "isflushed", "isimage", "isimagefile", "isinstanceof",
     "isinthread", "isjson",
-    "isleapyear", "isnull", "isnumeric", "isobject", "ispdfobject", "isquery", "issimplevalue",
+    "isleapyear", "isnull", "isnumeric", "isnumericdate", "isobject", "ispdfobject", "isquery", "issimplevalue",
     "isspreadsheetfile", "isspreadsheetobject", "isstruct", "isuserinrole", "isuserloggedin",
     "isvalid", "isxml", "isxmlattribute", "isxmldoc", "isxmlelem", "isxmlnode", "isxmlroot",
     "javacast", "jsstringformat", "jwtdecode", "jwtsign", "jwtverify", "lcase", "left", "len",

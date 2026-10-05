@@ -106,16 +106,14 @@ fn parse_sort_spec(q: &CfmlQuery, spec: &str) -> Option<Vec<(usize, bool)>> {
     }
 }
 
-/// `dateLastModified`: the entry's modification time as a local-time CFML date
-/// string (what `getFileInfo().lastModified` reports, and what `isDate()`
-/// accepts). Empty when the filesystem cannot say.
-pub fn date_last_modified(meta: Option<&std::fs::Metadata>) -> String {
-    use chrono::TimeZone;
-    meta.and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| chrono::Local.timestamp_opt(d.as_secs() as i64, 0).single())
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default()
+/// `dateLastModified`: the entry's modification time as a date (Lucee gives a
+/// date object, as `getFileInfo().lastModified` does). An empty string when
+/// the filesystem cannot say.
+pub fn date_last_modified(meta: Option<&std::fs::Metadata>) -> crate::dynamic::CfmlValue {
+    match meta.and_then(|m| m.modified().ok()) {
+        Some(t) => crate::dynamic::CfmlValue::DateTime(crate::datetime::from_system_time(t)),
+        None => crate::dynamic::CfmlValue::string(String::new()),
+    }
 }
 
 /// `mode`: the Unix permission bits in octal (`644`, `755`), as Lucee reports

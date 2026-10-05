@@ -174,6 +174,13 @@ fn release(mut state: CallState) {
 impl CallState {
     fn push(&mut self, v: CfmlValue) -> ValueHandle {
         let slot = self.slab.len() as u32;
+        // The ABI has no date type: an extension sees a date as its string
+        // form (which it can hand back to any date function), so the string
+        // accessors work on it.
+        let v = match v {
+            CfmlValue::DateTime(d) => CfmlValue::string(d.to_cfml_string()),
+            other => other,
+        };
         self.slab.push(v);
         ValueHandle { slot, gen: self.generation }
     }
@@ -283,7 +290,9 @@ unsafe extern "C" fn h_val_type(raw: *mut Ctx, h: ValueHandle) -> u32 {
             CfmlValue::Int(_) => abi::ty::INT,
             CfmlValue::Double(_) => abi::ty::DOUBLE,
             CfmlValue::TimeSpan(_) => abi::ty::TIMESPAN,
-            CfmlValue::String(_) => abi::ty::STRING,
+            // The extension ABI has no date type: a date crosses as its string
+            // form, which every date function accepts back.
+            CfmlValue::String(_) | CfmlValue::DateTime(_) => abi::ty::STRING,
             CfmlValue::Array(_) | CfmlValue::QueryColumn(_, _) => abi::ty::ARRAY,
             CfmlValue::Struct(_) => abi::ty::STRUCT,
             CfmlValue::Binary(_) => abi::ty::BINARY,

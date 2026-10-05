@@ -1573,6 +1573,7 @@ name = "cfml-common"
 version = "0.717.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "indexmap",
  "js-sys",
  "log",

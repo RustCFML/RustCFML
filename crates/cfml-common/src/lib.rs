@@ -9,6 +9,7 @@ pub mod charset;
 pub mod clock;
 pub mod component;
 pub mod cycle_gc;
+pub mod datetime;
 pub mod dirlist;
 pub mod dynamic;
 pub mod encodings;

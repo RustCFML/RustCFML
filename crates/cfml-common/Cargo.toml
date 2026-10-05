@@ -65,6 +65,7 @@ indexmap = { workspace = true, features = ["serde"] }
 rustc-hash = { workspace = true }
 log = { workspace = true }
 chrono = "0.4"
+chrono-tz = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

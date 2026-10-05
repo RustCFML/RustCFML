@@ -70,6 +70,8 @@ fn make_zone(class: &str, id: &str) -> CfmlValue {
 /// Read `__dt_millis` off an instant-bearing shim arg.
 fn arg_millis(v: &CfmlValue) -> Option<i64> {
     match v {
+        // A CFML date is a java.util.Date: its instant.
+        CfmlValue::DateTime(d) => Some(d.epoch_millis()),
         CfmlValue::Struct(s) => match s.get("__dt_millis") {
             Some(CfmlValue::Int(n)) => Some(n),
             Some(other) => other.as_string().trim().parse::<i64>().ok(),

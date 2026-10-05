@@ -244,12 +244,27 @@ thread_local! {
     /// `cargo build` never compiles.
     static REQUEST_TZ: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// The same zone, resolved once when it is set. A date value renders in
+    /// the request zone every time it is stringified, so resolving the id per
+    /// render would put a string parse on the hot path.
+    static REQUEST_TZ_RESOLVED: std::cell::Cell<Option<chrono_tz::Tz>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Publish the request timezone to the date parser. Called by the VM wherever
 /// its own `timezone` field is assigned; `None` restores the system zone.
 pub fn set_request_timezone(id: Option<String>) {
-    REQUEST_TZ.with(|t| *t.borrow_mut() = id.filter(|s| !s.is_empty()));
+    let id = id.filter(|s| !s.is_empty());
+    let resolved = id.as_deref().and_then(crate::datetime::zone::resolve_tz);
+    REQUEST_TZ_RESOLVED.with(|t| t.set(resolved));
+    REQUEST_TZ.with(|t| *t.borrow_mut() = id);
+}
+
+/// The request timezone, resolved. `None` when no request zone is set (or the
+/// id did not resolve), so the system zone applies.
+#[inline]
+pub fn request_tz() -> Option<chrono_tz::Tz> {
+    REQUEST_TZ_RESOLVED.with(|t| t.get())
 }
 
 /// The request timezone's IANA id, if one is set.

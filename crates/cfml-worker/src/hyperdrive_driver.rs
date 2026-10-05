@@ -81,6 +81,8 @@ impl WireParam {
             CfmlValue::Int(i) => WireParam::Int(*i),
             CfmlValue::Double(d) => WireParam::Float(*d),
             CfmlValue::String(s) => WireParam::Str((**s).clone()),
+            // A date crosses the wire as its plain text form, not `{ts '…'}`.
+            CfmlValue::DateTime(d) => WireParam::Str(d.to_db_text()),
             other => WireParam::Str(other.as_string()),
         }
     }

@@ -120,9 +120,10 @@ CFML values are frequently strings (form and URL values are untyped). Because Po
 
 ### Date/time, JSON, and `vector` parameters
 
-CFML date/time values (and ISO-ish date strings) bind to `timestamp`, `timestamptz`,
-`date`, and `time` columns; a `timestamptz` value with no zone is interpreted as
-UTC. ISO 8601 / RFC 3339 strings carrying a numeric offset, a `Z` (Zulu/UTC)
+CFML date values bind to `timestamp`, `date` and `time` columns as their wall
+clock in the request time zone, and to `timestamptz` at their instant, keeping
+fractional seconds. Date strings bind too; a zone-less string bound to
+`timestamptz` is interpreted as UTC. ISO 8601 / RFC 3339 strings carrying a numeric offset, a `Z` (Zulu/UTC)
 suffix, and/or fractional seconds also bind — `"2026-06-10T07:20:42.177+00:00"`,
 `"...Z"`, `"...177"` — so a record read out (and serialized in that exact shape)
 can be re-bound and saved back. For a `timestamptz` column the offset is honoured

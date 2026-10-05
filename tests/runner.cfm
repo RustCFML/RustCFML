@@ -304,6 +304,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_conversion.cfm" />
 <cf_runtest file="stdlib/test_file_handles.cfm" />
 <cf_runtest file="stdlib/test_timespan_type.cfm" />
+<cf_runtest file="stdlib/test_date_lucee_parity.cfm" />
 <cf_runtest file="stdlib/test_json.cfm" />
 <cf_runtest file="stdlib/test_serialize.cfm" />
 <cf_runtest file="stdlib/test_serializejson_control_chars.cfm" />

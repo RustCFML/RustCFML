@@ -96,6 +96,13 @@ pub fn compare_sql(a: &CfmlValue, b: &CfmlValue) -> Option<Ordering> {
         (CfmlValue::Int(ia), CfmlValue::Bool(bb)) => {
             return Some(ia.cmp(&(if *bb { 1i64 } else { 0i64 })));
         }
+        // Dates compare as instants; a date against a date string parses the
+        // string, against a number reads it as a numeric date.
+        (CfmlValue::DateTime(da), CfmlValue::DateTime(db)) => {
+            return Some(da.epoch_nanos().cmp(&db.epoch_nanos()));
+        }
+        (CfmlValue::DateTime(d), other) => return Some(date_vs(d, other)),
+        (other, CfmlValue::DateTime(d)) => return Some(date_vs(d, other).reverse()),
         _ => {}
     }
     let (ca, cb) = (classify(a)?, classify(b)?);
@@ -111,6 +118,20 @@ pub fn compare_sql(a: &CfmlValue, b: &CfmlValue) -> Option<Ordering> {
             None => str_cmp(&x, &fmt_num(y)),
         },
     })
+}
+
+fn date_vs(d: &cfml_common::datetime::CfmlDate, other: &CfmlValue) -> Ordering {
+    use cfml_common::datetime::{parse, CfmlDate};
+    let as_date = match other {
+        CfmlValue::Int(i) => CfmlDate::from_numeric(*i as f64),
+        CfmlValue::Double(f) => CfmlDate::from_numeric(*f),
+        CfmlValue::String(s) => parse::parse_date(s.trim()),
+        _ => None,
+    };
+    match as_date {
+        Some(o) => d.epoch_nanos().cmp(&o.epoch_nanos()),
+        None => str_cmp(&d.to_cfml_string(), &other.as_string()),
+    }
 }
 
 /// Total order for sorting / MIN / MAX. NULL sorts before every non-NULL value.
@@ -162,6 +183,11 @@ pub fn append_group_key(key: &mut String, v: &CfmlValue) {
         CfmlValue::String(s) => {
             key.push('S');
             key.push_str(&s.to_lowercase());
+            key.push('\u{1}');
+        }
+        CfmlValue::DateTime(d) => {
+            key.push('D');
+            key.push_str(&d.epoch_nanos().to_string());
             key.push('\u{1}');
         }
         other => {

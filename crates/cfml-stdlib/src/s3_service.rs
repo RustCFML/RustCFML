@@ -115,13 +115,7 @@ where
 
 fn local_datetime(dt: &aws_sdk_s3::primitives::DateTime) -> CfmlValue {
     let millis = dt.to_millis().unwrap_or(0);
-    match chrono::DateTime::from_timestamp_millis(millis) {
-        Some(utc) => {
-            let local: chrono::DateTime<chrono::Local> = utc.into();
-            CfmlValue::string(local.format("%Y-%m-%d %H:%M:%S").to_string())
-        }
-        None => CfmlValue::Null,
-    }
+    CfmlValue::DateTime(cfml_common::datetime::CfmlDate::from_epoch_millis(millis))
 }
 
 /// `checkS3Access()` — `listBuckets()` succeeded. Never throws.

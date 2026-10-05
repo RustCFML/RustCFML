@@ -832,10 +832,9 @@ fn java_shim_string(s: &CfmlStruct) -> Option<String> {
             CfmlValue::Double(d) => *d as i64,
             other => other.as_string().trim().parse::<i64>().unwrap_or(0),
         };
-        if let Some(utc) = chrono::DateTime::from_timestamp_millis(millis) {
-            let local: chrono::DateTime<chrono::Local> = utc.into();
-            return Some(local.format("%Y-%m-%d %H:%M:%S").to_string());
-        }
+        // Lucee's Caster.toString(java.util.Date) is the date's `{ts '…'}`
+        // form, in the request zone.
+        return Some(crate::datetime::CfmlDate::from_epoch_millis(millis).to_cfml_string());
     }
     // java.lang.StringBuilder / StringBuffer -> buffered contents.
     if let Some(b) = s.get("__buffer") {
@@ -2053,6 +2052,11 @@ pub enum CfmlValue {
     /// class-name sniff) and `timespan`-typed params. Treat it as `Double`
     /// everywhere except those introspection sites.
     TimeSpan(f64),
+    /// A CFML date: an instant (see `crate::datetime`). Converts to its
+    /// `{ts '…'}` string form wherever a string is wanted, as on Lucee, but
+    /// keeps sub-second precision and reads its calendar fields in the request
+    /// zone. Dates used to be `String`s, which lost milliseconds (GH #441).
+    DateTime(crate::datetime::CfmlDate),
     /// CFML string value. Wrapped in `Arc<String>` (v0.87.0) so cloning a
     /// `CfmlValue::String` is an `Arc::clone` (refcount bump) instead of a
     /// heap allocation + copy. Mutating string ops (rare in CFML — strings
@@ -2133,6 +2137,7 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Int(i) => f.debug_tuple("Int").field(i).finish(),
             CfmlValue::Double(d) => f.debug_tuple("Double").field(d).finish(),
             CfmlValue::TimeSpan(d) => f.debug_tuple("TimeSpan").field(d).finish(),
+            CfmlValue::DateTime(d) => f.debug_tuple("DateTime").field(d).finish(),
             CfmlValue::String(s) => f.debug_tuple("String").field(s).finish(),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
@@ -2306,6 +2311,7 @@ impl CfmlValue {
             // distinct identity is surfaced only via getClass()/the timespan
             // type-check, which match the variant directly.
             CfmlValue::TimeSpan(_) => "Double",
+            CfmlValue::DateTime(_) => "Date",
             CfmlValue::String(_) => "String",
             CfmlValue::Array(_) => "Array",
             // Lucee@7: `isArray(q.col)` is false — QueryColumn is a string proxy
@@ -2342,6 +2348,11 @@ impl CfmlValue {
             CfmlValue::Int(i) => Ok(*i != 0),
             CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Ok(*d != 0.0),
             CfmlValue::Null => Ok(false),
+            // Lucee: "Can't cast Date [Fri, 02-Jan-2026 10:20:30 GMT] to boolean value".
+            CfmlValue::DateTime(d) => Err(CfmlError::expression(format!(
+                "Can't cast Date [{}] to boolean value",
+                crate::datetime::http_string(d, true)
+            ))),
             CfmlValue::String(s) => {
                 let trimmed = s.trim();
                 if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes") {
@@ -2386,6 +2397,7 @@ impl CfmlValue {
             CfmlValue::Int(i) => *i != 0,
             CfmlValue::Double(d) => *d != 0.0,
             CfmlValue::TimeSpan(d) => *d != 0.0,
+            CfmlValue::DateTime(_) => true,
             CfmlValue::String(s) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
@@ -2667,6 +2679,7 @@ impl CfmlValue {
             // Stringifies exactly like its fractional-day Double value, so string
             // concatenation and number-via-string coercion are unchanged.
             CfmlValue::TimeSpan(d) => (format_double(*d), true),
+            CfmlValue::DateTime(d) => (d.to_cfml_string(), true),
             CfmlValue::String(s) => ((**s).clone(), true),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
@@ -4061,6 +4074,23 @@ impl serde::Serialize for CfmlValue {
             CfmlValue::Double(d) => s.serialize_f64(*d),
             // serializeJSON emits a timespan as its numeric (fractional-day) value.
             CfmlValue::TimeSpan(d) => s.serialize_f64(*d),
+            // Tagged so a session/cache round trip gives a date back, at full
+            // precision (the string form drops everything below a second).
+            CfmlValue::DateTime(d) => {
+                let mut map = s.serialize_map(Some(4))?;
+                map.serialize_entry("_cftype", "datetime")?;
+                map.serialize_entry("secs", &d.epoch_secs())?;
+                map.serialize_entry("nanos", &d.subsec_nanos())?;
+                map.serialize_entry(
+                    "kind",
+                    match d.kind() {
+                        crate::datetime::DateKind::DateTime => "ts",
+                        crate::datetime::DateKind::Date => "d",
+                        crate::datetime::DateKind::Time => "t",
+                    },
+                )?;
+                map.end()
+            }
             CfmlValue::String(st) => s.serialize_str(st),
             CfmlValue::Array(a) => {
                 let snap = a.snapshot();
@@ -4211,6 +4241,25 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                             }
                         }
                         return Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)));
+                    }
+                }
+                "datetime" => {
+                    let num = |k: &str| -> Option<i64> {
+                        match map.get(k)? {
+                            CfmlValue::Int(i) => Some(*i),
+                            CfmlValue::Double(d) => Some(*d as i64),
+                            other => other.as_string().trim().parse().ok(),
+                        }
+                    };
+                    if let (Some(secs), Some(nanos)) = (num("secs"), num("nanos")) {
+                        let kind = match map.get("kind").map(|k| k.as_string()).as_deref() {
+                            Some("d") => crate::datetime::DateKind::Date,
+                            Some("t") => crate::datetime::DateKind::Time,
+                            _ => crate::datetime::DateKind::DateTime,
+                        };
+                        return Ok(CfmlValue::DateTime(
+                            crate::datetime::CfmlDate::from_epoch(secs, nanos).with_kind(kind),
+                        ));
                     }
                 }
                 _ => {}

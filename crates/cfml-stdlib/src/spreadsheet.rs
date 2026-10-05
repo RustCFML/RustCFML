@@ -123,6 +123,9 @@ impl CfmlSpreadsheet {
             CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => { cell.set_value_number(*d); }
             CfmlValue::Bool(b) => { cell.set_value_bool(*b); }
             CfmlValue::Null => { cell.set_value(""); }
+            // A date writes its plain text form (what a cell got when dates were
+            // strings), not `{ts '…'}`.
+            CfmlValue::DateTime(d) => { cell.set_value(d.to_db_text()); }
             other => { cell.set_value(other.as_string()); }
         }
         Ok(())

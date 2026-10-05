@@ -57,6 +57,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
 | [39](#39) | `.cfconfig.json` placeholders expand single-pass (GH #306) | 🌟 won't-fix |
+| [117](#117) | Dates are values, not shared objects; a few date edges (GH #441) | 🌟 by design |
 
 **Part D — Implemented, with documented edges 🏗**
 
@@ -523,6 +524,27 @@ not to add a second pass. Pinned by `env_value_with_dollar_brace_is_not_recursed
 
 ---
 
+<a id="117"></a>
+
+## 117. Dates — where RustCFML's date value differs from Lucee's `DateTimeImpl` 🌟 *(divergence, GH [#441](https://github.com/RustCFML/RustCFML/issues/441))*
+
+Since v0.718.0 a date is a value: an instant with millisecond precision, read in the
+request time zone. It prints as `{ts '…'}`, compares to the second, has the datetime
+member functions and follows Lucee's calendar arithmetic, including daylight saving
+(`tests/stdlib/test_date_lucee_parity.cfm`, green on both engines). What still differs:
+
+| Behaviour | Lucee 7.1 | RustCFML |
+|---|---|---|
+| `x = d; d.setDay(5);` | `x` changes too (one shared mutable object) | `x` keeps its value; only `d` is updated |
+| Untyped date param in `queryExecute` | bound as the `{ts '…'}` string; MySQL reads `NULL` | bound as a native date/time |
+| `parseDateTime(s, pattern)` | pattern applied; its `SSS` reads seconds, so milliseconds are lost | pattern ignored; `s` is parsed as usual, milliseconds kept |
+| `getTickCount("nano" \| "micro")` | `System.nanoTime()`, arbitrary origin | nanoseconds / microseconds since the epoch |
+| Dates before 1900 (`createTime` uses 1899-12-30) | standard offset when printing, historical rules in calendar fields | the zone's standard offset everywhere |
+| `getMetadata(date)` | the Java class | a `{type: "Date"}` struct, as for other simple values |
+| A date passed to a `.rcx` extension | — | its `{ts '…'}` string (the ABI has no date type) |
+
+Precision beyond milliseconds is an opt-in follow-up: GH [#479](https://github.com/RustCFML/RustCFML/issues/479).
+
 # Part D — Implemented, with documented edges 🏗
 
 The feature works. What follows are the known corners, scoping decisions and "by design"
@@ -697,8 +719,8 @@ it on serializing stores: a check at the `session.x = ...` write site (fails fas
 at the call, **catchable**), and a persist-time deep walk (the airtight gate,
 which also catches values smuggled in via reference mutation, e.g.
 `local.x = {}; session.box = local.x; local.x.p = new C()`; this fires at the
-request boundary and is **not** catchable). Dates are strings and binary/query
-have JSON round-trip forms, so the allowed set covers everything that serializes.
+request boundary and is **not** catchable). Dates, binary and queries
+have tagged JSON round-trip forms, so the allowed set covers everything that serializes.
 Behaviour verified against Lucee (in-memory allows a CFC; #236, v0.397.0).
 
 ### 12d. Session expiry — background reaper + read-path exactness — *new*

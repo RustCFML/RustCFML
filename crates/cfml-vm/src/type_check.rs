@@ -149,6 +149,7 @@ pub fn value_label(value: &CfmlValue, component_name: &dyn Fn(&CfmlValue) -> Opt
             "Object type [Number]".to_string()
         }
         CfmlValue::Bool(_) => "Object type [Boolean]".to_string(),
+        CfmlValue::DateTime(_) => "Object type [DateTime]".to_string(),
         CfmlValue::Array(_) => "Object type [Array]".to_string(),
         // Named by the cell it proxies, not as an Array — otherwise a mismatch
         // on `q.col` reported a type the value does not actually have.
@@ -324,11 +325,14 @@ pub fn satisfies_target(value: &CfmlValue, target: Target<'_>, declared: &str, e
                 | CfmlValue::Int(_)
                 | CfmlValue::Double(_)
                 | CfmlValue::TimeSpan(_)
+                | CfmlValue::DateTime(_)
                 | CfmlValue::Bool(_)
                 | CfmlValue::Binary(_)
         ),
         Target::Numeric | Target::TimeSpan => match value {
             CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::TimeSpan(_) => true,
+            // A date has a numeric value (its numeric date).
+            CfmlValue::DateTime(_) => true,
             // A boolean IS numeric to Lucee (true -> 1).
             CfmlValue::Bool(_) => true,
             // ...and so is a DATE, because Lucee's numeric cast falls back to a
@@ -347,11 +351,11 @@ pub fn satisfies_target(value: &CfmlValue, target: Target<'_>, declared: &str, e
             CfmlValue::String(s) => boolean_string(s),
             _ => false,
         },
-        // Dates are strings in RustCFML's value model, so this is a parse
-        // check plus the numeric-serial form — `0` is a valid date to Lucee,
-        // and so is the STRING `"1"`, which `isValid("date", …)` rejects.
+        // A date, a string that parses as one, or the numeric-serial form —
+        // `0` is a valid date to Lucee, and so is the STRING `"1"`, which
+        // `isValid("date", …)` rejects.
         Target::DateTime => match value {
-            CfmlValue::Int(_) | CfmlValue::Double(_) => true,
+            CfmlValue::DateTime(_) | CfmlValue::Int(_) | CfmlValue::Double(_) => true,
             CfmlValue::String(s) => numeric_string(s) || env.is_valid("date", value),
             _ => false,
         },
@@ -370,9 +374,8 @@ pub fn satisfies_target(value: &CfmlValue, target: Target<'_>, declared: &str, e
         // a query does not.
         Target::Struct => matches!(value, CfmlValue::Struct(_)) || (env.is_component)(value),
         Target::Query => matches!(value, CfmlValue::Query(_)),
-        // Bytes, or anything simple Lucee can turn into bytes. A date is a
-        // string here, so `binary <- now()` is accepted where Lucee rejects
-        // it — a consequence of the value model, not of this check.
+        // Bytes, or anything simple Lucee can turn into bytes. A date is not
+        // (`binary <- now()` is rejected, as on Lucee).
         Target::Binary => matches!(
             value,
             CfmlValue::Binary(_)

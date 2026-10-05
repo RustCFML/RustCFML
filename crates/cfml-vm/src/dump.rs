@@ -127,6 +127,7 @@ fn render_html(
         | CfmlValue::Int(_)
         | CfmlValue::Double(_)
         | CfmlValue::TimeSpan(_)
+        | CfmlValue::DateTime(_)
         | CfmlValue::String(_)
         | CfmlValue::Binary(_) => {
             out.push_str("<div class=\"rcf-dump\"><table><tr><td>");
