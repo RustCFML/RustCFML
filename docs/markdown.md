@@ -317,6 +317,198 @@ page.setFrontMatter( { title = "New title", draft = false } );
 
 ---
 
+## Worked example: a report from a query
+
+This builds a monthly report three ways at once: with builder methods only, with
+markdown snippets, and from a query with per-column formatting. Then it edits the
+result.
+
+```cfml
+orders = queryNew(
+    "ref,customer,placed,status,total,notes",
+    "varchar,varchar,date,varchar,double,varchar",
+    [
+        [ "A-1001", "Acme_Corp", createDate( 2026, 9, 2 ),  "paid",    1240.5, "" ],
+        [ "A-1002", "C* Labs",   createDate( 2026, 9, 14 ), "overdue", 980,    "Chased **twice**, see [ticket 412](https://help.example/412)" ],
+        [ "A-1003", "Globex",    createDate( 2026, 9, 27 ), "paid",    15200,  "" ]
+    ]
+);
+
+report = MarkdownDocument()
+    // 1. Builder only: no markdown syntax anywhere.
+    .heading( "September orders" )
+    .paragraph( [
+        "Prepared for ",
+        { text = "Finance", bold = true },
+        " on ",
+        { text = dateFormat( createDate( 2026, 10, 1 ), "d mmmm yyyy" ) },
+        "."
+    ] )
+
+    // 2. A markdown snippet, where it reads better than runs.
+    .paragraph( "Totals include VAT. Questions go to [the help desk](https://help.example)." )
+
+    // 3. A query, formatted per column.
+    .heading( "All orders", 2 )
+    .table(
+        data          = orders,
+        columnList    = "ref,customer,placed,total,notes",
+        headers       = "Ref,Customer,Placed,**Total**,Notes",
+        columnFormats = {
+            placed = { dateFormat = "d mmm" },
+            total  = { numberFormat = "9,999.00", align = "right" },
+            notes  = { format = "markdown" }
+        }
+    )
+
+    // 4. Several blocks as one snippet.
+    .heading( "Next steps", 2 )
+    .markdown( "
+        - Chase overdue orders by **Friday**
+        - Close the month
+
+        > Owner: Finance operations
+    " );
+
+// Edit it afterwards: by heading text, without knowing positions or ids.
+overdue = queryExecute( "select ref from orders where status = 'overdue'", {}, { dbtype = "query" } );
+
+report
+    .appendToSection( "All orders", "#overdue.recordCount# order is overdue: **#markdownEscape( overdue.ref )#**." )
+    .moveSectionBefore( "Next steps", "All orders" );
+
+fileWrite( expandPath( "./september.md" ), report.toMarkdown() );
+html = report.toHtml();
+```
+
+`report.toMarkdown()` gives:
+
+```markdown
+# September orders
+
+Prepared for **Finance** on 1 October 2026.
+
+Totals include VAT. Questions go to [the help desk](https://help.example).
+
+## Next steps
+
+- Chase overdue orders by **Friday**
+- Close the month
+
+> Owner: Finance operations
+
+## All orders
+
+| Ref | Customer | Placed | **Total** | Notes |
+| --- | --- | --- | --: | --- |
+| A-1001 | Acme\_Corp | 2 Sep | 1,240.50 |  |
+| A-1002 | C\* Labs | 14 Sep | 980.00 | Chased **twice**, see [ticket 412](https://help.example/412) |
+| A-1003 | Globex | 27 Sep | 15,200.00 |  |
+
+1 order is overdue: **A-1002**.
+```
+
+What to notice:
+
+- **Query data stays literal.** `Acme_Corp` and `C* Labs` are written as `Acme\_Corp`
+  and `C\* Labs`, so they render exactly as typed instead of turning into italics.
+  Only the `notes` column opted in to markdown, so its bold and link render.
+- **`columnFormats`** applies the date and number masks and right-aligns `total`.
+  The `headers` list is markdown because you wrote it (`**Total**`).
+- **The multi-line snippet is indented** to match the code around it. Content given
+  to `.markdown()` and the insert methods has its shared indentation removed, so
+  that indentation doesn't turn it into a code block.
+- **The snippet has no heading in it.** In a CFML string `#` must be doubled, so a
+  level-2 heading would have to be written `"#### Next steps"`. Using `.heading()`
+  for headings and snippets for the rest avoids that.
+- **`markdownEscape()`** guards the one value that came from data and went into a
+  markdown string.
+- **Edits find their place by heading text.** `appendToSection( "All orders", … )`
+  adds after the table, and `moveSectionBefore` moves the whole "Next steps" section
+  (its heading, list and quote) as one unit.
+
+`report.outline()` now returns:
+
+```json
+[ { "id": "b1",  "level": 1, "text": "September orders", "position": 1 },
+  { "id": "b32", "level": 2, "text": "Next steps",       "position": 4 },
+  { "id": "b5",  "level": 2, "text": "All orders",       "position": 7 } ]
+```
+
+## Worked example: editing an existing file
+
+Load a markdown file, change its front matter, add a section, and add to an existing
+list, then write it back.
+
+`post.md` before:
+
+```markdown
+---
+title: Release notes
+draft: true
+---
+
+# Release notes
+
+## v2.1
+
+- Faster exports
+
+## v2.0
+
+- New dashboard
+```
+
+```cfml
+path = expandPath( "./post.md" );
+post = MarkdownDocument( fileRead( path ) );
+
+// The list under "v2.1" is the second block of that section.
+fixes = post.section( "v2.1" ).ids[ 2 ];
+
+post
+    .setFrontMatter( { title = "Release notes", draft = false } )
+    .insertBefore( "v2.1", MarkdownDocument().heading( "v2.2", 2 ).list( [ "Markdown export" ] ) )
+    .append( fixes, "Fixed: the date filter" );
+
+fileWrite( path, post.toMarkdown() );
+```
+
+`post.md` after:
+
+```markdown
+---
+title: Release notes
+draft: false
+---
+
+# Release notes
+
+## v2.2
+
+- Markdown export
+
+## v2.1
+
+- Faster exports
+- Fixed: the date filter
+
+## v2.0
+
+- New dashboard
+```
+
+- Another `MarkdownDocument` can be inserted like any other content: its blocks are
+  copied in. That is a tidy way to build a heading and its content without writing
+  `#` in a string.
+- `append( listId, "…" )` adds an item to the existing list. Appending
+  `"- Fixed: …"` to the section instead would start a second list, which is what that
+  markdown means.
+- The front matter is rewritten from the struct; the body is untouched apart from the
+  edits.
+
+---
+
 ## The struct form
 
 `toStruct()` returns the document as plain CFML data, and `MarkdownDocument( struct )`
