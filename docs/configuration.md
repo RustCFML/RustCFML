@@ -169,6 +169,7 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `dotNotationUpperCase` | bool | `true` | Force upper-case struct keys (classic CF) |
 | `locale` | string | `""` | IETF BCP 47 (e.g. `en-GB`). Empty = system |
 | `timezone` | string | `""` | IANA tz name. Empty = system |
+| `datePrecision` | `"millisecond"` \| `"microsecond"` \| `"nanosecond"` | `"millisecond"` | Sub-second precision new dates keep (parsed strings, `now()`, database reads). The default is Lucee's; raise it to keep `DATETIME(6)` / `DATETIME2` / `timestamp` fractions through a read and write-back. Per application: `this.datePrecision`, or `application action="update" datePrecision="…"` for the rest of a request. See [Dates beyond milliseconds](#dates-beyond-milliseconds) |
 | `whitespaceCompressionEnabled` | bool | `false` | Global `cfsetting enableCFOutputOnly=true` |
 | `trustedCache` | bool | `false` | Skip recompile when template mtime unchanged |
 | `reportAsLucee` | bool | `false` | Report `server.coldfusion.productname` as `"Lucee"` instead of `"RustCFML"`. RustCFML targets the Lucee dialect and always advertises `server.lucee`, but some frameworks (e.g. ColdBox's mapping-helper selection) branch specifically on `productname == "Lucee"`. `server.lucee.versionName` stays `"RustCFML"` regardless |
@@ -177,6 +178,29 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `applicationTimeout` | `"d,h,m,s"` | `"1,0,0,0"` | Application scope timeout |
 | `sessionTimeout` | `"d,h,m,s"` | `"0,0,30,0"` | Session scope timeout |
 | `clientTimeout` | `"d,h,m,s"` | `"7,0,0,0"` | Client scope timeout |
+
+### Dates beyond milliseconds
+
+A date keeps milliseconds by default, as on Lucee. With `datePrecision` raised to
+`microsecond` or `nanosecond` (GH #479), dates made from then on keep more:
+
+```cfml
+// Application.cfc
+this.datePrecision = "microsecond";
+```
+
+- `microsecond( d )` / `nanosecond( d )` read the sub-second part (0–999999 /
+  0–999999999); `datePart( "us" | "ns", d )` does the same.
+- `dateAdd( "us" | "ns", n, d )` and `dateDiff( "us" | "ns", a, b )`.
+- `dateCompare( a, b, "l" | "us" | "ns" )` compares to that unit. `==`, `<` and
+  `compare()` still compare to the whole second, as on Lucee.
+- `dateTimeFormat( d, "HH:nn:ss.llllll" )` prints up to nine fraction digits (one
+  per `l`).
+- MySQL `DATETIME(6)`/`TIME(6)`, PostgreSQL `timestamp`/`time` and SQL Server
+  `DATETIME2`/`TIME` columns are read and written at the kept precision.
+
+Unchanged: a date's string form (`{ts '…'}`), `serializeJSON` (Lucee's form has no
+fraction) and `getNumericDate()` (a double; milliseconds).
 
 ### `session`
 

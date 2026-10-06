@@ -197,6 +197,12 @@ fn week_of_month(date: NaiveDate) -> i64 {
 /// Lucee `DateAdd._call`.
 pub fn date_add(datepart: &str, number: i64, d: CfmlDate, tz: &Tz) -> Result<CfmlDate, CfmlError> {
     let part = datepart.to_lowercase();
+    // Sub-millisecond units (GH #479, not in Lucee, which rejects them).
+    match part.as_str() {
+        "us" => return Ok(d.plus_nanos(number as i128 * 1_000).with_kind(DateKind::DateTime)),
+        "ns" => return Ok(d.plus_nanos(number as i128).with_kind(DateKind::DateTime)),
+        _ => {}
+    }
     let n = number as i32 as i64; // Java narrows to int for the calendar parts
     let first = if part.chars().count() == 1 { part.chars().next().unwrap_or('\0') } else { '\0' };
     let r = match first {
@@ -276,8 +282,12 @@ pub fn date_diff(datepart: &str, left: CfmlDate, right: CfmlDate, tz: &Tz) -> Re
             (ms_right - ms_left) / 1000
         }
     };
+    let nanos_diff = || -> Result<i128, CfmlError> { Ok(right.epoch_nanos() - left.epoch_nanos()) };
     let dp = match part.as_str() {
         "l" => return Ok(ms_right - ms_left),
+        // GH #479: microseconds / nanoseconds between the two instants.
+        "us" => return Ok(clamp_i64(nanos_diff()? / 1_000)),
+        "ns" => return Ok(clamp_i64(nanos_diff()?)),
         "s" => return Ok(diff_seconds()),
         "n" => return Ok(diff_seconds() / 60),
         "h" => return Ok(diff_seconds() / 3600),
@@ -306,6 +316,12 @@ pub fn date_diff(datepart: &str, left: CfmlDate, right: CfmlDate, tz: &Tz) -> Re
     } else {
         Ok(diff_call(dp, left, right, tz))
     }
+}
+
+/// A nanosecond count as an i64, saturating (an i64 of nanoseconds spans only
+/// ±292 years).
+fn clamp_i64(n: i128) -> i64 {
+    n.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 /// Sign of the first non-zero difference among `diffs`: -1 if it is negative.
@@ -403,6 +419,21 @@ fn working_days_diff(left: CfmlDate, right: CfmlDate, tz: &Tz) -> i64 {
 /// Lucee `DateCompare.call`.
 pub fn date_compare(left: CfmlDate, right: CfmlDate, datepart: &str, tz: &Tz) -> Result<i64, CfmlError> {
     let part = datepart.trim().to_lowercase();
+    // GH #479: compare below the second. Lucee rejects these parts.
+    let unit: Option<i128> = match part.as_str() {
+        "l" => Some(1_000_000),
+        "us" => Some(1_000),
+        "ns" => Some(1),
+        _ => None,
+    };
+    if let Some(u) = unit {
+        let (a, b) = (left.epoch_nanos().div_euclid(u), right.epoch_nanos().div_euclid(u));
+        return Ok(match a.cmp(&b) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        });
+    }
     // 0 year, 1 month, 2 day, 3 hour, 4 minute, 5 second
     let depth = match part.as_str() {
         "s" => 5,
@@ -446,7 +477,11 @@ pub fn date_part(datepart: &str, d: CfmlDate, tz: &Tz) -> Result<i64, CfmlError>
     let part = datepart.to_lowercase();
     let l = d.local_in(tz);
     let first = if part.chars().count() == 1 { part.chars().next().unwrap_or('\0') } else { '\0' };
-    Ok(if part == "yyyy" {
+    Ok(if part == "us" {
+        (d.subsec_nanos() / 1_000) as i64
+    } else if part == "ns" {
+        d.subsec_nanos() as i64
+    } else if part == "yyyy" {
         l.year() as i64
     } else if part == "ww" {
         continuing_week_of_year(l.date())
@@ -1416,6 +1451,15 @@ pub fn fn_second(args: Vec<CfmlValue>) -> CfmlResult {
 }
 pub fn fn_millisecond(args: Vec<CfmlValue>) -> CfmlResult {
     field(&args, |d, _| (d.subsec_nanos() / 1_000_000) as i64)
+}
+/// `microsecond(date)`: the microseconds within the second, 0–999999
+/// (GH #479). Beyond milliseconds only when `datePrecision` keeps them.
+pub fn fn_microsecond(args: Vec<CfmlValue>) -> CfmlResult {
+    field(&args, |d, _| (d.subsec_nanos() / 1_000) as i64)
+}
+/// `nanosecond(date)`: the nanoseconds within the second, 0–999999999.
+pub fn fn_nanosecond(args: Vec<CfmlValue>) -> CfmlResult {
+    field(&args, |d, _| d.subsec_nanos() as i64)
 }
 pub fn fn_day_of_week(args: Vec<CfmlValue>) -> CfmlResult {
     field(&args, |_, w| dow(w))

@@ -106,7 +106,7 @@ Read today: `this.name`, `this.mappings`, `this.sessionManagement`, `this.sessio
 `this.customTagPaths`, `this.localMode`, `this.sessionStorage`, `this.cache`,
 `this.lazySessionCreation`, `this.datasources`, `this.datasource`,
 `this.sessioncookie` (secure/httponly/samesite/domain/path — see §12e),
-`this.timezone`, `this.locale`.
+`this.timezone`, `this.locale`, `this.datePrecision` (RustCFML-only, GH #479).
 
 `this.timezone` and `this.locale` seed the same request state the cfconfig
 `runtime.*` keys use; Application.cfc overrides the server baseline, and `setTimeZone()`/`setLocale()` still override Application.cfc later in
@@ -543,7 +543,7 @@ member functions and follows Lucee's calendar arithmetic, including daylight sav
 | `getMetadata(date)` | the Java class | a `{type: "Date"}` struct, as for other simple values |
 | A date passed to a `.rcx` extension | — | its `{ts '…'}` string (the ABI has no date type) |
 
-Precision beyond milliseconds is an opt-in follow-up: GH [#479](https://github.com/RustCFML/RustCFML/issues/479).
+Precision beyond milliseconds is opt-in (`datePrecision`, GH [#479](https://github.com/RustCFML/RustCFML/issues/479)); see `docs/configuration.md`.
 
 # Part D — Implemented, with documented edges 🏗
 

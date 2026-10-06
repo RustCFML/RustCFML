@@ -659,6 +659,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("quarter".to_string(), crate::dates::fn_quarter);
     f.insert("week".to_string(), crate::dates::fn_week);
     f.insert("millisecond".to_string(), crate::dates::fn_millisecond);
+    f.insert("microsecond".to_string(), crate::dates::fn_microsecond);
+    f.insert("nanosecond".to_string(), crate::dates::fn_nanosecond);
     f.insert("dateConvert".to_string(), crate::dates::fn_date_convert);
     f.insert("getNumericDate".to_string(), crate::dates::fn_get_numeric_date);
     f.insert("isNumericDate".to_string(), crate::dates::fn_is_numeric_date);

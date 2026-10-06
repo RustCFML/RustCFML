@@ -3016,6 +3016,10 @@ pub struct CfmlVirtualMachine {
     /// `runtime.timezone` — IANA tz name (e.g. `Europe/London`). Empty =
     /// system timezone. Consumed by now() and date formatters.
     pub timezone: String,
+    /// `runtime.datePrecision` / `this.datePrecision`: the sub-second
+    /// precision new dates keep (GH #479). Published to the date code's
+    /// thread-local like the timezone.
+    pub date_precision: cfml_common::datetime::Precision,
     /// `runtime.whitespaceCompressionEnabled` — global equivalent of
     /// `cfsetting enableCFOutputOnly=true`. Defaults `false`.
     pub whitespace_compression: bool,
@@ -3902,6 +3906,7 @@ pub struct ThreadSeed {
     pub dot_notation_upper: bool,
     pub locale: String,
     pub timezone: String,
+    pub date_precision: cfml_common::datetime::Precision,
     pub whitespace_compression: bool,
     pub session_timeout_secs: u64,
     pub application_timeout_secs: u64,
@@ -4876,6 +4881,7 @@ impl CfmlVirtualMachine {
             dot_notation_upper: true,
             locale: String::new(),
             timezone: String::new(),
+            date_precision: cfml_common::datetime::Precision::Millisecond,
             whitespace_compression: false,
             session_timeout_secs: 1800,
             application_timeout_secs: 86_400,
@@ -5165,10 +5171,14 @@ impl CfmlVirtualMachine {
                 .unwrap_or_else(|| r.locale.clone());
             cfml_common::locale::set_current_locale(&self.locale);
         }
-        if !r.timezone.is_empty() {
-            self.timezone = r.timezone.clone();
-            cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
-        }
+        // Published unconditionally: a serve-mode worker thread is reused, so
+        // a zone left by the previous request's setTimeZone() (or precision by
+        // its this.datePrecision) must not carry over.
+        self.timezone = r.timezone.clone();
+        cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
+        self.date_precision = cfml_common::datetime::Precision::parse(&r.date_precision)
+            .unwrap_or(cfml_common::datetime::Precision::Millisecond);
+        cfml_common::datetime::set_precision(self.date_precision);
         self.whitespace_compression = r.whitespace_compression_enabled;
         if let Some(secs) = cfml_config::RuntimeCfg::parse_timeout_seconds(&r.session_timeout) {
             self.session_timeout_secs = secs;
@@ -5965,6 +5975,7 @@ impl CfmlVirtualMachine {
             dot_notation_upper: self.dot_notation_upper,
             locale: self.locale.clone(),
             timezone: self.timezone.clone(),
+            date_precision: self.date_precision,
             whitespace_compression: self.whitespace_compression,
             session_timeout_secs: self.session_timeout_secs,
             application_timeout_secs: self.application_timeout_secs,
@@ -6030,6 +6041,8 @@ impl CfmlVirtualMachine {
         cfml_common::locale::set_current_locale(&self.locale);
         self.timezone = seed.timezone;
         cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
+        self.date_precision = seed.date_precision;
+        cfml_common::datetime::set_precision(self.date_precision);
         self.whitespace_compression = seed.whitespace_compression;
         self.session_timeout_secs = seed.session_timeout_secs;
         self.application_timeout_secs = seed.application_timeout_secs;
@@ -28905,6 +28918,8 @@ impl CfmlVirtualMachine {
             "firstdayofmonth" => ("firstDayOfMonth", 0),
             "hour" => ("hour", 0),
             "millisecond" => ("millisecond", 0),
+            "microsecond" => ("microsecond", 0),
+            "nanosecond" => ("nanosecond", 0),
             "minute" => ("minute", 0),
             "month" => ("month", 0),
             "quarter" => ("quarter", 0),
@@ -42043,6 +42058,15 @@ impl CfmlVirtualMachine {
         }
         self.app_cfc_template = Some(CfmlValue::strukt(meta));
 
+        // `datePrecision` (GH #479) applies from here to the end of the request,
+        // as `this.datePrecision` would.
+        if let Some(p) = get("dateprecision")
+            .and_then(|v| cfml_common::datetime::Precision::parse(&v.as_string()))
+        {
+            self.date_precision = p;
+            cfml_common::datetime::set_precision(p);
+        }
+
         // 2. Bind the named application scope. Skipped when this request is
         //    already on that application (an Application.cfc bound it, or the
         //    tag ran twice) so a live scope handle is never swapped out from
@@ -43414,6 +43438,15 @@ impl CfmlVirtualMachine {
                 self.timezone = tz::canonical_name(&zone);
                 cfml_common::clock::set_request_timezone(Some(self.timezone.clone()));
             }
+        }
+        // `this.datePrecision` (GH #479): an unknown value is ignored, like an
+        // unknown timezone.
+        if let Some(p) = config
+            .get("dateprecision")
+            .and_then(|v| cfml_common::datetime::Precision::parse(&v.as_string()))
+        {
+            self.date_precision = p;
+            cfml_common::datetime::set_precision(p);
         }
         if let Some(loc) = config
             .get("locale")

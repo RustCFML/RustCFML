@@ -347,6 +347,10 @@ pub struct RuntimeCfg {
     pub dot_notation_upper_case: bool,
     pub locale: String,
     pub timezone: String,
+    /// Sub-second precision new dates keep: `millisecond` (default, Lucee's),
+    /// `microsecond` or `nanosecond` (GH #479). `this.datePrecision` overrides.
+    #[serde(rename = "datePrecision")]
+    pub date_precision: String,
     #[serde(rename = "whitespaceCompressionEnabled")]
     #[serde(deserialize_with = "de_lenient_bool")]
     pub whitespace_compression_enabled: bool,
@@ -406,6 +410,7 @@ impl Default for RuntimeCfg {
             dot_notation_upper_case: true,
             locale: String::new(),
             timezone: String::new(),
+            date_precision: String::new(),
             whitespace_compression_enabled: false,
             trusted_cache: false,
             // Report as Lucee by default (opt out with `reportAsLucee: false`).

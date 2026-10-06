@@ -111,7 +111,7 @@ function dpRun() {
 	assert("dateDiff h across spring forward", dateDiff("h", createDateTime(2026, 3, 28, 12, 0, 0), createDateTime(2026, 3, 29, 12, 0, 0)), 23);
 	assert("dateDiff d across spring forward", dateDiff("d", createDateTime(2026, 3, 28, 12, 0, 0), createDateTime(2026, 3, 29, 12, 0, 0)), 1);
 	assert("dateDiff wd", dateDiff("wd", d, d), 0);
-	dpThrows("dateDiff bad datepart", function() { return dateDiff("us", d, d); }, "valid values has to be [l, q, s, n, h, d, m, y, yyyy, w, ww, wd]");
+	dpThrows("dateDiff bad datepart", function() { return dateDiff("x", d, d); }, "valid values has to be [l, q, s, n, h, d, m, y, yyyy, w, ww, wd]");
 
 	// ---- comparison is to the second
 	assertTrue("== ignores milliseconds", d == dms);
@@ -120,7 +120,7 @@ function dpRun() {
 	assert("dateCompare default is seconds", dateCompare(d, dms), 0);
 	assert("dateCompare d", dateCompare(d, d2, "d"), -1);
 	assert("dateCompare m", dateCompare(d, createDate(2026, 1, 28), "m"), 0);
-	dpThrows("dateCompare l is not a datepart", function() { return dateCompare(d, dms, "l"); }, "valid values has to be [s,n,h,d,m,y,yyyy]");
+	dpThrows("dateCompare bad datepart", function() { return dateCompare(d, dms, "x"); }, "valid values has to be [s,n,h,d,m,y,yyyy]");
 	assertTrue("date equals its plain string", d == "2026-01-02 10:20:30");
 	assertTrue("date equals its {ts} string", d == "{ts '2026-01-02 10:20:30'}");
 	assertTrue("date equals a string with ms", d == "2026-01-02 10:20:30.999");
