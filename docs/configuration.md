@@ -370,6 +370,22 @@ The resolved directory is readable from CFML as
 | `secureJSON` | bool | `false` | Prepend `secureJSONPrefix` to `serializeJSON` output |
 | `secureJSONPrefix` | string | `"//"` | Hijack-prevention prefix |
 
+### `markdown`
+
+Defaults for `markdown()`, `htmlToMarkdown()`, `<cfmarkdown>` and `MarkdownDocument()`.
+A per-call options struct overrides them. See [markdown.md](markdown.md).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `gfm` | bool | `true` | Tables, strikethrough, task lists, autolinks |
+| `footnotes` | bool | `false` | `[^1]` footnotes |
+| `frontMatter` | bool | `true` | A leading `---` block is front matter, not content |
+| `unsafe` | bool | `false` | Output raw HTML and every link target. Off: raw HTML dropped, `javascript:` etc. blanked. BoxLang's `bx-markdown` behaves as `true` |
+| `escapeHtml` | bool | `false` | With `unsafe` off, show raw HTML as text instead of dropping it |
+| `anchors` | bool | `false` | Heading ids and anchor links (BoxLang default: on) |
+| `hardBreaks` | bool | `false` | Every newline is a `<br>` |
+| `tableClass` | string | `""` | `class` on rendered tables (BoxLang default: `"table"`) |
+
 ### `urlRewriting`
 
 | Key | Type | Default | Notes |

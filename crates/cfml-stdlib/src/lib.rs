@@ -11,6 +11,8 @@ pub mod spreadsheet;
 pub mod xmp;
 #[cfg(feature = "html")]
 pub mod html_dom;
+#[cfg(feature = "markdown")]
+pub mod markdown;
 #[cfg(feature = "pdf")]
 pub mod pdf;
 pub mod db_driver;

@@ -19,7 +19,7 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet", "svg", "pdf"]
+default = ["http", "database", "xml", "security", "smtp", "html", "zip_support", "yaml", "jsonschema", "image_support", "spreadsheet", "svg", "pdf", "markdown"]
 # Native spreadsheet support — Spreadsheet* BIFs, the fluent Spreadsheet()
 # builder, and <cfspreadsheet>. Read+edit+write .xlsx via the pure-Rust
 # `umya-spreadsheet` (POI-style open→mutate→save with styles/charts/images
@@ -53,6 +53,10 @@ mssql_db = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "tokio?/rt-multi-thre
 all-databases = ["sqlite", "mysql_db", "postgres_db", "mssql_db"]
 xml = ["quick-xml"]
 html = ["scraper", "ego-tree", "dep:html5ever"]
+# Markdown: markdown() / htmlToMarkdown() / MarkdownDocument() / <cfmarkdown>.
+# comrak is pure Rust and builds for wasm32, so this joins the wasm feature lists.
+# htmlToMarkdown walks the `html` feature's scraper DOM, hence the implication.
+markdown = ["dep:comrak", "html"]
 zip_support = ["dep:zip"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:tokio", "tokio?/rt-multi-thread"]
 
@@ -129,6 +133,10 @@ scraper = { version = "0.22", optional = true, features = ["atomic", "determinis
 # re-export. Same version scraper resolves, so this adds no crate to the tree.
 html5ever = { version = "0.29", optional = true }
 ego-tree = { version = "0.10", optional = true }
+# CommonMark + GFM parser and formatter. Used only at the edges: parse into our
+# own tree (which carries ids), and build a throwaway comrak arena to render.
+# Default features OFF: they pull the CLI and syntect-onig (a C regex library).
+comrak = { version = "0.56", optional = true, default-features = false }
 # Pure-Rust xlsx read+edit+write (POI-model round-trip: styles/charts/images
 # preserved). Primary spreadsheet engine. Native-only (see `spreadsheet` feature).
 umya-spreadsheet = { version = "3", optional = true }

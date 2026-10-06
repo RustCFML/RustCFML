@@ -722,6 +722,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             "cffinally" => return ("}\n".to_string(), close_end - start),
             "cfscript" => return (String::new(), close_end - start),
             "cfsavecontent" => return (String::new(), close_end - start),
+            "cfmarkdown" => return (String::new(), close_end - start),
             "cftransaction" => return (String::new(), close_end - start),
             "cfwhile" => return ("}\n".to_string(), close_end - start),
             "cfsilent" => return (String::new(), close_end - start),
@@ -1862,6 +1863,35 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // content and `variable=` was never set.
                 record_missing_end_tag("cfsavecontent");
                 (format!("__cfsavecontent_start();\n"), tag_end - start)
+            }
+        }
+        "cfmarkdown" => {
+            // BoxLang's `bx:markdown`: capture the body, render it with
+            // markdown(), and either output the HTML or store it in
+            // `variable`. The body is dedented, so markdown indented to match
+            // the surrounding template is not read as a code block. Any other
+            // attribute is a markdown() option (`unsafe="true"`, `anchors`, …).
+            let variable = attrs.get("variable").cloned();
+            let mut opts: Vec<String> = vec!["\"dedent\": true".to_string()];
+            for (k, v) in attrs.iter() {
+                if k.eq_ignore_ascii_case("variable") {
+                    continue;
+                }
+                opts.push(format!("\"{}\": \"{}\"", k.replace('"', ""), v.replace('"', "\"\"")));
+            }
+            let call = format!("markdown(__cfsavecontent_end(), {{ {} }})", opts.join(", "));
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmarkdown") {
+                let body: String = chars[tag_end..end_tag_pos].iter().collect();
+                let close_end = find_tag_end(chars, end_tag_pos, len);
+                let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
+                let tail = match variable {
+                    Some(v) => format!("{} = {};\n", v, call),
+                    None => format!("writeOutput({});\n", call),
+                };
+                (format!("__cfsavecontent_start();\n{}{}", body_script, tail), close_end - start)
+            } else {
+                record_missing_end_tag("cfmarkdown");
+                (String::new(), tag_end - start)
             }
         }
         "cftransaction" => {

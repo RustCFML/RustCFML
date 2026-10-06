@@ -83,6 +83,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [50](#50) | AntiSamy sanitiser — cosmetic divergences from the Java library | 🏗 edges |
 | [51](#51) | Tag-mode parsing — two constructs compile here that Lucee rejects | 🏗 edges |
 | [53](#53) | `private`/`package` methods are gated on CALLS, not on member reads | 🏗 edges |
+| [118](#118) | Markdown: safe by default (unlike BoxLang), reference links resolved | 🏗 by design |
 
 **Part E — Environment-specific 🌍**
 
@@ -1778,6 +1779,28 @@ shipping a silent no-op; throwing instead would be a RESTRICTIVE divergence — 
 kind that can break an app that works on Lucee. We do neither, and leave those
 two operations working as they always did. Code that relies on either is already
 broken on Lucee, in the quieter direction.
+
+---
+
+## 118. Markdown — safe by default, reference links resolved 🏗
+
+Built-in markdown (`markdown()`, `htmlToMarkdown()`, `MarkdownDocument()`,
+`<cfmarkdown>`; see [markdown.md](markdown.md)) has no Lucee counterpart. It takes its
+function and tag shapes from BoxLang's `bx-markdown`, with these deliberate edges:
+
+- **Raw HTML is dropped and dangerous link targets are blanked by default.**
+  `bx-markdown` (flexmark) passes raw HTML through. Markdown in CFML apps is often
+  user- or agent-supplied, so an XSS-by-default function is the wrong trade.
+  `{ unsafe = true }` per call, or `markdown.unsafe` in `.cfconfig.json`, restores
+  pass-through. BoxLang also turns heading anchors on and gives tables
+  `class="table"` by default; here they are the `anchors` and `tableClass` options.
+- **Reference links are resolved.** `MarkdownDocument` stores `[x][ref]` as a link
+  with its URL and writes it back inline. Link reference definitions are not kept.
+- **`toMarkdown()` is not byte-for-byte the source.** It re-parses to the same tree
+  (checked over every CommonMark and GFM spec example), but picks its own markers, and
+  bold directly inside bold is written as plain bold.
+- `writeDump( doc )` shows a generic native-object box. Use `doc.outline()` or
+  `doc.toStruct()` to look inside.
 
 ---
 

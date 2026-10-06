@@ -33,7 +33,7 @@ cfml-vm = { path = "../cfml-vm", default-features = false }
 # parity: xml/html/yaml/jsonschema/zip + security (crypto/hashing). Without this
 # they were silently absent (e.g. isValid("xml",…), xmlParse, encrypt, bcrypt).
 # `security` pulls `rand`→`getrandom`, which needs its `js` backend on wasm.
-cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security", "image_support"] }
+cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security", "image_support", "markdown"] }
 getrandom = { version = "0.2", features = ["js"] }
 
 # wasm-pack runs Binaryen's `wasm-opt -O` as a post-build step. The bundled

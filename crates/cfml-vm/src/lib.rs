@@ -25949,6 +25949,32 @@ impl CfmlVirtualMachine {
                 "host" | "provider" | "server" => 6,
                 _ => return None,
             }),
+            // BoxLang's bx-markdown names: `markdown( markdown= )`,
+            // `htmlToMarkdown( html= )`. `options` is our superset.
+            "markdown" => Some(match arg_lc {
+                "markdown" | "txt" | "text" | "source" => 0,
+                "options" => 1,
+                _ => return None,
+            }),
+            "htmltomarkdown" => Some(match arg_lc {
+                "html" | "markup" | "source" => 0,
+                "options" => 1,
+                _ => return None,
+            }),
+            "markdowndocument" => Some(match arg_lc {
+                "source" | "markdown" | "document" => 0,
+                "options" => 1,
+                "html" => 2,
+                _ => return None,
+            }),
+            "markdownescape" => Some(match arg_lc {
+                "text" | "string" | "value" => 0,
+                _ => return None,
+            }),
+            "ismarkdowndocument" => Some(match arg_lc {
+                "value" | "object" => 0,
+                _ => return None,
+            }),
             _ => None,
         }
     }
@@ -25987,7 +26013,16 @@ impl CfmlVirtualMachine {
     }
 
     fn builtin_has_named_sig(builtin_lc: &str) -> bool {
-        matches!(builtin_lc, "directorylist" | "s3generatepresignedurl")
+        matches!(
+            builtin_lc,
+            "directorylist"
+                | "s3generatepresignedurl"
+                | "markdown"
+                | "htmltomarkdown"
+                | "markdowndocument"
+                | "markdownescape"
+                | "ismarkdowndocument"
+        )
     }
 
     /// Route legacy `org.mindrot.jbcrypt.BCrypt` instance methods onto the native

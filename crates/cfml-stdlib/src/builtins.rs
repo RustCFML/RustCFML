@@ -1133,6 +1133,16 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     #[cfg(feature = "html")]
     f.insert("htmlDocument".to_string(), crate::html_dom::fn_html_document);
 
+    // ---- Markdown (see markdown/mod.rs) ----
+    #[cfg(feature = "markdown")]
+    {
+        f.insert("markdown".to_string(), crate::markdown::fn_markdown);
+        f.insert("htmlToMarkdown".to_string(), crate::markdown::fn_html_to_markdown);
+        f.insert("MarkdownDocument".to_string(), crate::markdown::fn_markdown_document);
+        f.insert("isMarkdownDocument".to_string(), crate::markdown::fn_is_markdown_document);
+        f.insert("markdownEscape".to_string(), crate::markdown::fn_markdown_escape);
+    }
+
     // ---- XML functions ----
     #[cfg(feature = "xml")]
     {
@@ -2655,7 +2665,7 @@ fn add_thousands_separator(s: &str) -> String {
     result
 }
 
-fn fn_number_format(args: Vec<CfmlValue>) -> CfmlResult {
+pub(crate) fn fn_number_format(args: Vec<CfmlValue>) -> CfmlResult {
     let n = get_float(&args, 0);
     let mask = get_str(&args, 1);
     if mask.is_empty() {
@@ -19940,7 +19950,7 @@ fn cfml_to_yaml(v: &CfmlValue) -> serde_yaml::Value {
 
 /// yamlDeserialize( content ) — parse a YAML string into native CFML values.
 #[cfg(feature = "yaml")]
-fn fn_yaml_deserialize(args: Vec<CfmlValue>) -> CfmlResult {
+pub(crate) fn fn_yaml_deserialize(args: Vec<CfmlValue>) -> CfmlResult {
     let content = get_str(&args, 0);
     let v: serde_yaml::Value = serde_yaml::from_str(&content)
         .map_err(|e| CfmlError::runtime(format!("yamlDeserialize: invalid YAML: {}", e)))?;
@@ -19951,7 +19961,7 @@ fn fn_yaml_deserialize(args: Vec<CfmlValue>) -> CfmlResult {
 /// value to a YAML string; optionally also write it to `filepath` (BoxLang
 /// parity). Returns the YAML string. `charset` is accepted but ignored (UTF-8).
 #[cfg(feature = "yaml")]
-fn fn_yaml_serialize(args: Vec<CfmlValue>) -> CfmlResult {
+pub(crate) fn fn_yaml_serialize(args: Vec<CfmlValue>) -> CfmlResult {
     let data = args.first().cloned().unwrap_or(CfmlValue::Null);
     let yaml = serde_yaml::to_string(&cfml_to_yaml(&data))
         .map_err(|e| CfmlError::runtime(format!("yamlSerialize: {}", e)))?;

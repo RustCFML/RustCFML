@@ -144,6 +144,9 @@ pub struct RustCfmlConfig {
     /// classic footer. See `docs/observability-*.md`.
     pub observability: ObservabilityCfg,
     pub security: SecurityCfg,
+    /// Defaults for `markdown()`, `htmlToMarkdown()` and `MarkdownDocument()`.
+    /// A per-call options struct overrides them key by key. See `docs/markdown.md`.
+    pub markdown: MarkdownCfg,
     /// Model Context Protocol — the server this app exposes. See `docs/mcp.md`.
     pub mcp: McpCfg,
     /// Remote MCP servers this app can connect to with `mcpClient( name )`.
@@ -1558,6 +1561,50 @@ impl McpOAuth {
     /// True when the resource-server seams are switched on.
     pub fn enabled(&self) -> bool {
         !self.authorization_servers.is_empty()
+    }
+}
+
+/// App-wide markdown defaults. Safe by default: raw HTML is dropped and
+/// dangerous URL schemes are blanked unless `unsafe` is set. BoxLang's
+/// `bx-markdown` passes raw HTML through; set `unsafe: true` to match it.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct MarkdownCfg {
+    /// GitHub Flavored Markdown: tables, strikethrough, task lists, autolinks.
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub gfm: bool,
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub footnotes: bool,
+    /// Recognise a leading `---` front matter block and keep it out of the body.
+    #[serde(rename = "frontMatter", deserialize_with = "de_lenient_bool")]
+    pub front_matter: bool,
+    #[serde(rename = "unsafe", deserialize_with = "de_lenient_bool")]
+    pub unsafe_html: bool,
+    /// With `unsafe` off, show raw HTML as text instead of dropping it.
+    #[serde(rename = "escapeHtml", deserialize_with = "de_lenient_bool")]
+    pub escape_html: bool,
+    /// Heading ids and anchor links (BoxLang `anchorLinks`).
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub anchors: bool,
+    #[serde(rename = "hardBreaks", deserialize_with = "de_lenient_bool")]
+    pub hard_breaks: bool,
+    /// `class` attribute on rendered `<table>` elements (BoxLang uses `"table"`).
+    #[serde(rename = "tableClass")]
+    pub table_class: String,
+}
+
+impl Default for MarkdownCfg {
+    fn default() -> Self {
+        Self {
+            gfm: true,
+            footnotes: false,
+            front_matter: true,
+            unsafe_html: false,
+            escape_html: false,
+            anchors: false,
+            hard_breaks: false,
+            table_class: String::new(),
+        }
     }
 }
 

@@ -68,6 +68,9 @@ accepted = [
     # Unicode data license, used by the ICU crates (icu_*, zerovec, yoke, ...)
     # that reach us via idna/url. Notice-only, but must be reproduced.
     "Unicode-3.0",
+    # Unicode-3.0's predecessor, same notice-only terms. finl_unicode (Unicode
+    # character categories), reached via comrak for the markdown feature.
+    "Unicode-DFS-2016",
     # webpki-roots (Mozilla CA bundle). Notice-only.
     "CDLA-Permissive-2.0",
 

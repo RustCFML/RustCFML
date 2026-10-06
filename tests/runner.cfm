@@ -254,6 +254,8 @@ include "harness.cfm";
 
 <!--- HtmlDocument(): the mutable HTML DOM behind the jsoup adapter. --->
 <cf_runtest file="stdlib/test_html_document.cfm" rustcfmlOnly="true" why="HtmlDocument() is a RustCFML builtin — Lucee has no equivalent (its callers reach for the jsoup jar instead)" />
+<cf_runtest file="stdlib/test_markdown.cfm" rustcfmlOnly="true" why="Lucee has no markdown BIFs (markdown() / htmlToMarkdown() are BoxLang bx-markdown names; the tag is bx:markdown)" />
+<cf_runtest file="stdlib/test_markdown_document.cfm" rustcfmlOnly="true" why="MarkdownDocument() is a RustCFML builtin with no Lucee equivalent" />
 <cf_runtest file="stdlib/test_qrcode_and_svg.cfm" rustcfmlOnly="true" why="qrCodeGenerate() and imageReadSvg() are RustCFML builtins — Lucee has neither (its callers reach for the qrgen and batik jars)" />
 <cf_runtest file="stdlib/test_pdf.cfm" rustcfmlOnly="true" why="the Pdf* builtins are RustCFML-only — Lucee has no equivalent (its callers reach for the PDFBox jar)" />
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm" />

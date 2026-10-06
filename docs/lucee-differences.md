@@ -37,6 +37,11 @@ These are *not* bugs; they are guarded only so the shared suite stays green.
   — RustCFML adds a `"counter"` form returning an incrementing per-instance
   integer. Standard CF / Lucee ignore the argument.
 
+- **Markdown** (`tests/stdlib/test_markdown.cfm`, `tests/stdlib/test_markdown_document.cfm`)
+  — `markdown()`, `htmlToMarkdown()`, `markdownEscape()`, `MarkdownDocument()` and
+  `<cfmarkdown>` are built in here (BoxLang's `bx-markdown` names); Lucee has no
+  markdown functions. See [markdown.md](markdown.md).
+
 ### B1. Timezone display names — verified table, not full CLDR
 RustCFML backs `getTimeZoneInfo()`, `setTimeZone()`/`getTimeZone()`,
 `dateConvert()` and the `java.text.DateFormat` shim's `z`/`zzzz` fields with the

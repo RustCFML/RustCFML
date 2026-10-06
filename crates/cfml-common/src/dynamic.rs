@@ -1961,6 +1961,14 @@ pub trait CfmlNative: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Optional deep-copy hook for `duplicate()`. `Some(copy)` returns an
+    /// independent object; `None` (the default) keeps the old behaviour of
+    /// sharing the handle, which is what an `.rcx` class that never thought
+    /// about copying gets.
+    fn duplicate(&self) -> Option<CfmlValue> {
+        None
+    }
+
     /// Optional property read. Used when a CFC declares
     /// `extends="rust:Name"` and host code reads `this.X` (or `inst.X`)
     /// for a key the CFC struct doesn't define. Default returns `None` —
@@ -3218,6 +3226,18 @@ impl CfmlValue {
 
     fn deep_copy_guarded(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
         match self {
+            // A native that knows how to copy itself does; the rest stay
+            // shared handles. `try_read`: a native whose method is running
+            // (and so holds its own lock) is shared rather than deadlocked.
+            CfmlValue::NativeObject(o) => {
+                let ptr = Arc::as_ptr(o) as *const () as usize;
+                if let Some(existing) = seen.get(&ptr) {
+                    return existing.clone();
+                }
+                let copy = o.try_read().ok().and_then(|g| g.duplicate()).unwrap_or_else(|| self.clone());
+                seen.insert(ptr, copy.clone());
+                copy
+            }
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
                 if let Some(existing) = seen.get(&ptr) {

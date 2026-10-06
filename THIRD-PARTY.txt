@@ -18,17 +18,18 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 581 crate(s)
+  MIT License (MIT) — 587 crate(s)
   Apache License 2.0 (Apache-2.0) — 47 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
   ISC License (ISC) — 8 crate(s)
   Mozilla Public License 2.0 (MPL-2.0) — 8 crate(s)
-  BSD 2-Clause "Simplified" License (BSD-2-Clause) — 6 crate(s)
+  BSD 2-Clause "Simplified" License (BSD-2-Clause) — 7 crate(s)
   zlib License (Zlib) — 3 crate(s)
   Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0) — 2 crate(s)
   BSD Zero Clause License (0BSD) — 1 crate(s)
   MIT No Attribution (MIT-0) — 1 crate(s)
+  Unicode License Agreement - Data Files and Software (2016) (Unicode-DFS-2016) — 1 crate(s)
 
 Dependencies
 ------------
@@ -105,6 +106,8 @@ Dependencies
   kamadak-exif 0.6.1 — https://github.com/kamadak/exif-rs
 [BSD-2-Clause]
   mutate_once 0.1.2 — https://github.com/kamadak/mutate_once-rs
+[BSD-2-Clause]
+  comrak 0.56.0 — https://github.com/kivikakk/comrak
 [BSD-3-Clause]
   matchit 0.8.4 — https://github.com/ibraheemdev/matchit
 [BSD-3-Clause]
@@ -360,6 +363,8 @@ Dependencies
 [MIT]
   stable_deref_trait 1.2.1 — https://github.com/storyyeller/stable_deref_trait
 [MIT]
+  caseless 0.2.2 — https://github.com/unicode-rs/rust-caseless
+[MIT]
   bytecount 0.6.9 — https://github.com/llogiq/bytecount
 [MIT]
   foreign-types-shared 0.1.1 — https://github.com/sfackler/foreign-types
@@ -394,6 +399,7 @@ Dependencies
   as-slice 0.2.1 — https://github.com/japaric/as-slice
 [MIT]
   fearless_simd 0.4.1 — https://github.com/linebender/fearless_simd
+  fearless_simd 1.0.0 — https://github.com/linebender/fearless_simd
   kurbo 0.13.1 — https://github.com/linebender/kurbo
   peniko 0.6.1 — https://github.com/linebender/peniko
   polycool 0.4.0 — https://github.com/linebender/kurbo
@@ -559,6 +565,8 @@ Dependencies
 [MIT]
   ctutils 0.4.2 — https://github.com/RustCrypto/utils
 [MIT]
+  fearless_simd_macros 0.1.0 — https://github.com/linebender/fearless_simd
+[MIT]
   anstream 1.0.0 — https://github.com/rust-cli/anstyle.git
   anstyle-parse 1.0.0 — https://github.com/rust-cli/anstyle.git
   anstyle-query 1.1.5 — https://github.com/rust-cli/anstyle.git
@@ -658,6 +666,8 @@ Dependencies
 [MIT]
   crc32fast 1.5.0 — https://github.com/srijs/rust-crc32fast
 [MIT]
+  typed-arena 2.0.2 — https://github.com/SimonSapin/rust-typed-arena
+[MIT]
   libmimalloc-sys 0.1.49 — https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys
 [MIT]
   asynchronous-codec 0.6.2 — https://github.com/mxinden/asynchronous-codec
@@ -721,6 +731,8 @@ Dependencies
   fluent-uri 0.4.1 — https://github.com/yescallop/fluent-uri-rs
 [MIT]
   convert_case 0.10.0 — https://github.com/rutrum/convert-case
+[MIT]
+  memchr-n 0.1.9 — https://github.com/Dr-Emann/memchr_n
 [MIT]
   agnostic-io 0.2.0 — https://github.com/al8n/agnostic
   agnostic-lite 0.6.2 — https://github.com/al8n/agnostic
@@ -821,6 +833,7 @@ Dependencies
   event-listener 5.4.1 — https://github.com/smol-rs/event-listener
   fast-float2 0.2.3 — https://github.com/Alexhuszagh/fast-float-rust
   fastrand 2.4.1 — https://github.com/smol-rs/fastrand
+  finl_unicode 1.5.0 — https://github.com/dahosek/finl_unicode
   group 0.13.0 — https://github.com/zkcrypto/group
   io-enum 1.2.1 — https://github.com/taiki-e/io-enum
   itoa 1.0.18 — https://github.com/dtolnay/itoa
@@ -1036,6 +1049,8 @@ Dependencies
   zerotrie 0.2.4 — https://github.com/unicode-org/icu4x
   zerovec-derive 0.11.3 — https://github.com/unicode-org/icu4x
   zerovec 0.11.6 — https://github.com/unicode-org/icu4x
+[Unicode-DFS-2016]
+  finl_unicode 1.5.0 — https://github.com/dahosek/finl_unicode
 [Zlib]
   zlib-rs 0.6.6 — https://github.com/trifectatechfoundation/zlib-rs
 [Zlib]
@@ -3676,6 +3691,23 @@ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
 LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
 OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 SUCH DAMAGE.
+
+================================================================================
+BSD 2-Clause "Simplified" License (BSD-2-Clause)
+
+Applies to:
+  - comrak 0.56.0
+================================================================================
+
+Copyright (c) <year> <owner> 
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
@@ -6356,6 +6388,36 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - caseless 0.2.2
+================================================================================
+
+Copyright (c) 2017 Simon Sapin
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - bytecount 0.6.9
 ================================================================================
 
@@ -6838,6 +6900,7 @@ MIT License (MIT)
 
 Applies to:
   - fearless_simd 0.4.1
+  - fearless_simd 1.0.0
   - kurbo 0.13.1
   - peniko 0.6.1
   - polycool 0.4.0
@@ -9073,6 +9136,39 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - fearless_simd_macros 0.1.0
+================================================================================
+
+Copyright (c) 2026 The Fearless SIMD authors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - anstream 1.0.0
   - anstyle-parse 1.0.0
   - anstyle-query 1.1.5
@@ -9909,6 +10005,35 @@ Applies to:
 MIT License
 
 Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - typed-arena 2.0.2
+================================================================================
+
+MIT License
+
+Copyright (c) 2018 The typed-arena developers
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -10796,6 +10921,35 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - memchr-n 0.1.9
+================================================================================
+
+MIT License
+
+Copyright (c) 2026 Zachary Dremann
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - agnostic-io 0.2.0
   - agnostic-lite 0.6.2
   - agnostic-net 0.3.1
@@ -11281,6 +11435,7 @@ Applies to:
   - event-listener 5.4.1
   - fast-float2 0.2.3
   - fastrand 2.4.1
+  - finl_unicode 1.5.0
   - group 0.13.0
   - io-enum 1.2.1
   - itoa 1.0.18
@@ -14165,6 +14320,36 @@ SPDX-License-Identifier: Unicode-3.0
 
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+
+================================================================================
+Unicode License Agreement - Data Files and Software (2016) (Unicode-DFS-2016)
+
+Applies to:
+  - finl_unicode 1.5.0
+================================================================================
+
+UNICODE, INC. LICENSE AGREEMENT - DATA FILES AND SOFTWARE
+
+Unicode Data Files include all data files under the directories http://www.unicode.org/Public/, http://www.unicode.org/reports/, http://www.unicode.org/cldr/data/, http://source.icu-project.org/repos/icu/, and http://www.unicode.org/utility/trac/browser/.
+
+Unicode Data Files do not include PDF online code charts under the directory http://www.unicode.org/Public/.
+
+Software includes any source code published in the Unicode Standard or under the directories http://www.unicode.org/Public/, http://www.unicode.org/reports/, http://www.unicode.org/cldr/data/, http://source.icu-project.org/repos/icu/, and http://www.unicode.org/utility/trac/browser/.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING UNICODE INC.'S DATA FILES ("DATA FILES"), AND/OR SOFTWARE ("SOFTWARE"), YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2016 Unicode, Inc. All rights reserved. Distributed under the Terms of Use in http://www.unicode.org/copyright.html.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of the Unicode data files and any associated documentation (the "Data Files") or Unicode software and any associated documentation (the "Software") to deal in the Data Files or Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, and/or sell copies of the Data Files or Software, and to permit persons to whom the Data Files or Software are furnished to do so, provided that either
+
+     (a) this copyright and permission notice appear with all copies of the Data Files or Software, or
+     (b) this copyright and permission notice appear in associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall not be used in advertising or otherwise to promote the sale, use or other dealings in these Data Files or Software without prior written authorization of the copyright holder.
 
 ================================================================================
 zlib License (Zlib)

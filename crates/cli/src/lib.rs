@@ -982,6 +982,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     populate_datasource_registry(&cfconfig);
     populate_default_mail_server(&cfconfig);
     cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
+    cfml_stdlib::markdown::set_defaults(&cfconfig.markdown);
     cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
         csrf_enabled: cfconfig.security.csrf_enabled,
         secure_json: cfconfig.security.secure_json,
@@ -2449,6 +2450,7 @@ async fn async_run_server(
     populate_datasource_registry(&cfconfig);
     populate_default_mail_server(&cfconfig);
     cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
+    cfml_stdlib::markdown::set_defaults(&cfconfig.markdown);
     cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
         csrf_enabled: cfconfig.security.csrf_enabled,
         secure_json: cfconfig.security.secure_json,
@@ -5244,6 +5246,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             populate_datasource_registry(&cfconfig);
             populate_default_mail_server(&cfconfig);
             cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
+            cfml_stdlib::markdown::set_defaults(&cfconfig.markdown);
             cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
                 csrf_enabled: cfconfig.security.csrf_enabled,
                 secure_json: cfconfig.security.secure_json,
@@ -5270,6 +5273,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             populate_datasource_registry(&cfconfig);
             populate_default_mail_server(&cfconfig);
             cfml_stdlib::builtins::set_regex_cache_cap(cfconfig.runtime.regex_cache_size);
+            cfml_stdlib::markdown::set_defaults(&cfconfig.markdown);
             cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
                 csrf_enabled: cfconfig.security.csrf_enabled,
                 secure_json: cfconfig.security.secure_json,

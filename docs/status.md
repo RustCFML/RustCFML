@@ -32,6 +32,7 @@ Tag preprocessor converts CFML tags to CFScript. Supports: cfset, cfoutput, cfif
 - **Locale (13)**: lsDateFormat, lsTimeFormat, lsDateTimeFormat, lsCurrencyFormat, lsEuroCurrencyFormat, lsIsDate, lsIsNumeric, lsIsCurrency, lsParseCurrency, lsParseDateTime, lsNumberFormat, lsWeek, lsDayOfWeek
 - **Error Handling**: cfcatch.tagContext (stack trace array with template, line, id, raw_trace, column), exceptionKeyExists
 - **XML/HTML (11+)**: xmlParse, xmlSearch, isXML, xmlNew, xmlElemNew, xmlChildPos, xmlGetNodeType, xmlHasChild, isXMLDoc/Elem/Node/Root/Attribute, htmlParse
+- **Markdown (5 + tag)**: markdown, htmlToMarkdown, markdownEscape, MarkdownDocument (fluent, editable tree: build, insert/move by id, position or heading, sections, tables from queries, struct/JSON form), isMarkdownDocument, `<cfmarkdown>`. CommonMark 0.31 + GFM, safe by default. See [markdown.md](markdown.md)
 - **Caching (8)**: cachePut, cacheGet, cacheDelete, cacheClear, cacheKeyExists, cacheCount, cacheGetAll, cacheGetAllIds
 - **Higher-Order Generics**: collectionEach/Map/Filter/Reduce/Some/Every, stringEach/Map/Filter/Reduce/Some/Every/Sort, each (generic)
 - **Utility (23+)**: writeOutput, writeDump, dump, sleep, duplicate, writeLog, systemOutput, trace, location, applicationStop, getApplicationMetadata, getApplicationSettings, getFileFromPath, getCanonicalPath, getTemplatePath, setLocale, getLocale, setTimeZone, getTimeZone, getBaseTemplatePath, getCurrentTemplatePath, getDirectoryFromPath, setVariable, getVariable, getEnvironmentVariable

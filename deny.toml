@@ -37,6 +37,7 @@ allow = [
     "CC0-1.0",
     "NCSA",
     "Unicode-3.0",
+    "Unicode-DFS-2016",
     "CDLA-Permissive-2.0",
     # Weak copyleft — see the extended note in about.toml before adding more.
     # Present via the default `cluster` (memberlist*) and `html`
