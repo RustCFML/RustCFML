@@ -27,6 +27,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_keyword_loop_variables.cfm" />
 <cf_runtest file="core/test_parser_lucee_shapes.cfm" />
 <cf_runtest file="core/test_throw_mixed_args_superset.cfm" rustcfmlOnly="true" why="Lucee refuses to COMPILE a file containing throw( type=.., 'msg' ); RustCFML accepts it and raises at the call, so the assertion cannot run there" />
+<cf_runtest file="core/test_tag_call_optional_commas.cfm" />
 <cf_runtest file="core/test_elvis_error_scope.cfm" />
 <cf_runtest file="core/test_arguments_scope_dispatch.cfm" />
 <cf_runtest file="core/test_unscoped_scope_cascade.cfm" />

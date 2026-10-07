@@ -4473,8 +4473,13 @@ impl Parser {
             }
             let value = self.parse_expression()?;
             named.push((key, value));
-            if comma_separated && !self.match_token(&Token::Comma) {
-                break;
+            // In the parenthesised call form the comma is OPTIONAL: Lucee's
+            // tag-in-script syntax accepts `cfthrow( type="x" message="y" )`
+            // with whitespace alone between attributes, and lets the two
+            // separators mix. Termination is decided by the lookahead below in
+            // both forms.
+            if comma_separated {
+                self.match_token(&Token::Comma);
             }
             // Continue only while another `identifier =/:` pair follows.
             if !(matches!(self.peek(0), Token::Identifier(_))
@@ -6595,7 +6600,13 @@ impl Parser {
                     }));
                 }
             } else if self.match_token(&Token::LParen) {
-                let args = self.parse_arguments()?;
+                // Tag-in-script calls (`cfTag(attr=… attr=…)`) may separate
+                // their attributes with whitespace instead of commas — see
+                // `parse_arguments_inner`. Only the cfXXX() form gets that
+                // licence, matching Lucee.
+                let tag_call = matches!(&expr, Expression::Identifier(id)
+                    if id.name.len() > 2 && id.name[..2].eq_ignore_ascii_case("cf"));
+                let args = self.parse_arguments_inner(tag_call)?;
                 self.consume(&Token::RParen)?;
                 expr = Expression::FunctionCall(Box::new(FunctionCall {
                     name: Box::new(expr),
@@ -6691,6 +6702,27 @@ impl Parser {
     }
 
     fn parse_arguments(&mut self) -> Result<Vec<Expression>, ParseError> {
+        self.parse_arguments_inner(false)
+    }
+
+    /// True when the next two tokens open a named-argument binding
+    /// (`name =` / `name :`). Used to let the tag-in-script call form continue
+    /// an argument list without a comma.
+    fn named_binding_ahead(&self) -> bool {
+        (matches!(self.peek(0), Token::Identifier(_)) || self.is_identifier_like())
+            && matches!(self.peek(1), Token::Equal | Token::Colon)
+    }
+
+    /// `optional_commas` accepts Lucee's tag-in-script call form, where the
+    /// attributes of a `cfTag(...)` call may be separated by whitespace alone:
+    /// `cfthrow( type="Invalid Token" message="…" )`. Lucee allows this ONLY for
+    /// the cfXXX() tag aliases — a UDF or BIF call written that way is a
+    /// compile error there ("Closing [)] for function call [f] not found"), so
+    /// the caller decides. Mixing the two separators is fine, as it is on Lucee.
+    fn parse_arguments_inner(
+        &mut self,
+        optional_commas: bool,
+    ) -> Result<Vec<Expression>, ParseError> {
         let mut args = Vec::new();
 
         if self.check(&Token::RParen) {
@@ -6781,7 +6813,9 @@ impl Parser {
                     collected.push((None, self.parse_expression()?));
                 }
             }
-            if !self.match_token(&Token::Comma) {
+            if !self.match_token(&Token::Comma)
+                && !(optional_commas && self.named_binding_ahead())
+            {
                 break;
             }
         }
