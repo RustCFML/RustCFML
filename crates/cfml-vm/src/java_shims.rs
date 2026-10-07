@@ -5153,6 +5153,16 @@ pub fn java_regex_to_rust(pattern: &str) -> String {
             i += 2;
             continue;
         }
+        if c == '[' && chars.get(i + 1) == Some(&':') {
+            // Java has no POSIX bracket classes: `[[:space:]]` is the union of
+            // a nested class holding the characters `:space` — it matches ":"
+            // and not " " (verified on Lucee 7.1). The regex crate would read
+            // it as ASCII whitespace, so escape the colon to keep Java's
+            // reading. (Wanted whitespace? Java spells it `\s`/`\p{Space}`.)
+            out.push_str("[\\:");
+            i += 2;
+            continue;
+        }
         out.push(c);
         i += 1;
     }
@@ -5458,6 +5468,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
         // Matcher.group([n]) — group 0 is the whole match.
         "group" => {
             if let CfmlValue::Struct(s) = object {
+                require_match(s)?;
                 let idx = args
                     .first()
                     .and_then(|a| a.as_string().trim().parse::<usize>().ok())
@@ -5474,10 +5485,30 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             }
             Ok(CfmlValue::Int(0))
         }
+        // Matcher.regionStart() / regionEnd() — the bounds set by region(); the
+        // whole input until then (and again after reset()).
+        "regionstart" => {
+            if let CfmlValue::Struct(s) = object {
+                return Ok(s.get("__regionstart").unwrap_or(CfmlValue::Int(0)));
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        "regionend" => {
+            if let CfmlValue::Struct(s) = object {
+                return Ok(match s.get("__regionend") {
+                    Some(v) => v,
+                    None => CfmlValue::Int(
+                        s.get("__input").map(|v| v.as_str_cow().chars().count()).unwrap_or(0) as i64,
+                    ),
+                });
+            }
+            Ok(CfmlValue::Int(0))
+        }
         // Matcher.start([n]) / end([n]) — 0-based char offset of the most recent
         // match (or group n). Populated by `java_matcher_step` after find()/etc.
         "start" | "end" => {
             if let CfmlValue::Struct(s) = object {
+                require_match(s)?;
                 let group_arg = args.first().and_then(|a| a.as_string().trim().parse::<usize>().ok());
                 let (single_key, group_key) = if method == "start" {
                     ("__start", "__startgroups")
@@ -5498,6 +5529,19 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             Ok(CfmlValue::Int(-1))
         }
         _ => Err(CfmlError::shim_unhandled(method)),
+    }
+}
+
+/// Java's `group()`/`start()`/`end()` throw when there is no current match —
+/// before the first find(), after one that failed, and after region()/reset().
+/// (A group that did not take part in a SUCCESSFUL match is null / -1 instead.)
+fn require_match(s: &cfml_common::dynamic::CfmlStruct) -> Result<(), CfmlError> {
+    match s.get("__matched") {
+        Some(CfmlValue::Bool(true)) => Ok(()),
+        _ => Err(CfmlError::new(
+            "No match found".to_string(),
+            CfmlErrorType::Custom("java.lang.IllegalStateException".to_string()),
+        )),
     }
 }
 
@@ -5545,24 +5589,49 @@ pub fn java_matcher_step(
             None => 0,
         }
     };
+    // The region set by `region(start, end)` — the whole input by default.
+    // Searching a SLICE of it gives Java's default bounds for free: anchoring
+    // (`^`/`$` match at the region edges) and opaque (`\b` cannot see past
+    // them). Match offsets come back relative to the slice; `abs` restores them.
+    let (region_byte, region_char) = match s.get("__regionstartbyte") {
+        Some(_) => (int_key("__regionstartbyte").max(0) as usize, int_key("__regionstart").max(0)),
+        None => (0, 0),
+    };
+    let region_end_byte = match s.get("__regionendbyte") {
+        Some(_) => int_key("__regionendbyte").max(0) as usize,
+        None => input.len(),
+    };
+    let region = input
+        .get(region_byte..region_end_byte.min(input.len()))
+        .unwrap_or("");
+    let abs = |rel: usize| region_byte + rel;
+
     let (from_byte, from_char) = match mode {
-        MatchMode::Find => (int_key("__findpos").max(0) as usize, int_key("__findposchar").max(0)),
-        _ => (0, 0),
+        MatchMode::Find => {
+            let at = int_key("__findpos").max(0) as usize;
+            if at < region_byte {
+                (region_byte, region_char)
+            } else {
+                (at, int_key("__findposchar").max(0))
+            }
+        }
+        _ => (region_byte, region_char),
     };
 
     let caps = match mode {
         MatchMode::Find => {
-            if from_byte > input.len() || !input.is_char_boundary(from_byte) {
+            let rel = from_byte - region_byte;
+            if rel > region.len() || !region.is_char_boundary(rel) {
                 None
             } else {
-                re.captures_at(input, from_byte)
+                re.captures_at(region, rel)
             }
         }
         MatchMode::Matches => re
-            .captures(input)
-            .filter(|c| c.get(0).map(|m| m.start() == 0 && m.end() == input.len()).unwrap_or(false)),
+            .captures(region)
+            .filter(|c| c.get(0).map(|m| m.start() == 0 && m.end() == region.len()).unwrap_or(false)),
         MatchMode::LookingAt => re
-            .captures(input)
+            .captures(region)
             .filter(|c| c.get(0).map(|m| m.start() == 0).unwrap_or(false)),
     };
 
@@ -5593,7 +5662,10 @@ pub fn java_matcher_step(
     let (start_groups, end_groups): (Vec<CfmlValue>, Vec<CfmlValue>) = match &caps {
         Some(caps) => (0..re.captures_len())
             .map(|i| match caps.get(i) {
-                Some(m) => (CfmlValue::Int(char_off(m.start())), CfmlValue::Int(char_off(m.end()))),
+                Some(m) => (
+                    CfmlValue::Int(char_off(abs(m.start()))),
+                    CfmlValue::Int(char_off(abs(m.end()))),
+                ),
                 None => (CfmlValue::Int(-1), CfmlValue::Int(-1)),
             })
             .unzip(),
@@ -5609,10 +5681,10 @@ pub fn java_matcher_step(
     ns.insert("__endgroups".to_string(), CfmlValue::array(end_groups));
     if let (MatchMode::Find, Some(caps)) = (&mode, &caps) {
         let m = caps.get(0).expect("group 0 always participates");
-        let (mut next_byte, mut next_char) = (m.end(), char_off(m.end()));
+        let (mut next_byte, mut next_char) = (abs(m.end()), char_off(abs(m.end())));
         if m.start() == m.end() {
             // Java: after an empty match the next search starts one char on.
-            match input[next_byte..].chars().next() {
+            match region[m.end()..].chars().next() {
                 Some(c) => {
                     next_byte += c.len_utf8();
                     next_char += 1;
@@ -5624,6 +5696,79 @@ pub fn java_matcher_step(
         ns.insert("__findposchar".to_string(), CfmlValue::Int(next_char));
     }
     Ok((matched, CfmlValue::strukt(ns)))
+}
+
+/// `Matcher.region(start, end)` and `Matcher.reset([input])`. Both return the
+/// matcher itself, discard the current match and rewind the cursor to the
+/// region start, so — like `find()` — the VM writes the result back to the
+/// matcher variable. `region` bounds every later find()/matches()/lookingAt()
+/// to `[start, end)` (0-based char offsets, as Java reports them); `reset`
+/// lifts the region again and, given an argument, swaps in a new input.
+pub fn java_matcher_reset(
+    s: &cfml_common::dynamic::CfmlStruct,
+    method: &str,
+    args: &[CfmlValue],
+) -> Result<CfmlValue, CfmlError> {
+    let mut ns = s.snapshot();
+    if method == "region" {
+        let input_v = s.get("__input").unwrap_or(CfmlValue::Null);
+        let input = input_v.as_str_cow();
+        let len = input.chars().count() as i64;
+        let arg = |i: usize| -> i64 {
+            match args.get(i) {
+                Some(CfmlValue::Int(n)) => *n,
+                Some(CfmlValue::Double(d)) => *d as i64,
+                Some(v) => v.as_string().trim().parse::<f64>().map(|d| d as i64).unwrap_or(-1),
+                None => -1,
+            }
+        };
+        let (start, end) = (arg(0), arg(1));
+        // Java's own checks, in Java's order, with Java's (terse) messages.
+        let oob = |msg: &str| {
+            CfmlError::new(
+                msg.to_string(),
+                CfmlErrorType::Custom("java.lang.IndexOutOfBoundsException".to_string()),
+            )
+        };
+        if start < 0 || start > len {
+            return Err(oob("start"));
+        }
+        if end < 0 || end > len {
+            return Err(oob("end"));
+        }
+        if start > end {
+            return Err(oob("start > end"));
+        }
+        let byte_at = |c: i64| -> i64 {
+            input.char_indices().nth(c as usize).map(|(b, _)| b).unwrap_or(input.len()) as i64
+        };
+        let (start_byte, end_byte) = (byte_at(start), byte_at(end));
+        ns.insert("__regionstart".to_string(), CfmlValue::Int(start));
+        ns.insert("__regionend".to_string(), CfmlValue::Int(end));
+        ns.insert("__regionstartbyte".to_string(), CfmlValue::Int(start_byte));
+        ns.insert("__regionendbyte".to_string(), CfmlValue::Int(end_byte));
+        ns.insert("__findpos".to_string(), CfmlValue::Int(start_byte));
+        ns.insert("__findposchar".to_string(), CfmlValue::Int(start));
+    } else {
+        if let Some(new_input) = args.first() {
+            let new_input = match new_input {
+                v @ CfmlValue::String(_) => v.clone(),
+                other => CfmlValue::string(other.as_string()),
+            };
+            ns.insert("__input".to_string(), new_input);
+        }
+        for k in ["__regionstart", "__regionend", "__regionstartbyte", "__regionendbyte"] {
+            ns.shift_remove(k);
+        }
+        ns.insert("__findpos".to_string(), CfmlValue::Int(0));
+        ns.insert("__findposchar".to_string(), CfmlValue::Int(0));
+    }
+    for k in ["__start", "__end", "__startgroups", "__endgroups"] {
+        ns.shift_remove(k);
+    }
+    ns.insert("__matched".to_string(), CfmlValue::Bool(false));
+    ns.insert("__groups".to_string(), CfmlValue::array(Vec::new()));
+    Ok(CfmlValue::strukt(ns))
 }
 
 // ===============================================================

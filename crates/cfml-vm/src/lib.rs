@@ -29246,6 +29246,16 @@ impl CfmlVirtualMachine {
                     self.method_this_writeback = Some(new_matcher);
                     return Ok(CfmlValue::Bool(matched));
                 }
+                // Matcher.region()/reset() rewind the matcher and return it
+                // (Java returns `this`, so `p.matcher(s).region(a, b)` chains).
+                if java_class == "java.util.regex.matcher"
+                    && matches!(method_lower.as_str(), "region" | "reset")
+                {
+                    let new_matcher = java_shims::java_matcher_reset(s, &method_lower, extra_args)
+                        .map_err(|e| self.wrap_error(e))?;
+                    self.method_this_writeback = Some(new_matcher.clone());
+                    return Ok(new_matcher);
+                }
 
                 // Special: Iterator.next() returns the current element AND
                 // advances the cursor; the advanced iterator must be written
