@@ -610,6 +610,12 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
     }).unwrap_or_else(|| format!("{}.cfm", tag_name.to_lowercase()));
     let path = format!("{}/{}", taglib.trim_end_matches('/'), tag_file);
     let path_expr = format!("\"{}\"", escape_for_string_literal(&path));
+    // The tag's name as written after the prefix, passed as a trailing argument
+    // so the VM can give the invocation its Lucee identity (CF_<NAME>) in
+    // getBaseTagList()/getBaseTagData(). The spec above is a plain template
+    // path, the same shape <cfmodule template=…> lowers to, so the name cannot
+    // be recovered from it.
+    let tag_name_expr = format!("\"{}\"", escape_for_string_literal(&tag_name.to_lowercase()));
 
     // Build attributes struct
     let mut attr_parts = Vec::new();
@@ -626,14 +632,17 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
         let body_script = tags_to_script_inner(&body_source, imports, in_cfoutput);
         let close_end = find_tag_end(chars, body_start, len);
         let result = format!(
-            "__cfcustomtag_start({}, {});\n{}\n__cfcustomtag_end();\n",
-            path_expr, attrs_expr, body_script
+            "__cfcustomtag_start({}, {}, {});\n{}\n__cfcustomtag_end();\n",
+            path_expr, attrs_expr, tag_name_expr, body_script
         );
         (result, close_end - start)
     } else {
         // XML-style self-closing custom tags still run the end phase.
         let run_end = is_self_closing_tag(chars, tag_end);
-        let result = format!("__cfcustomtag({}, {}, {});\n", path_expr, attrs_expr, run_end);
+        let result = format!(
+            "__cfcustomtag({}, {}, {}, {});\n",
+            path_expr, attrs_expr, run_end, tag_name_expr
+        );
         (result, tag_end - start)
     }
 }
