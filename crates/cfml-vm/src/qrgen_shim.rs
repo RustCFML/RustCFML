@@ -96,7 +96,7 @@ pub fn dispatch(
 ) -> CfmlResult {
     if class_lower == STREAM_CLASS {
         return match method {
-            "tobytearray" => Ok(get(object, "__bytes").unwrap_or(CfmlValue::Binary(Vec::new()))),
+            "tobytearray" => Ok(get(object, "__bytes").unwrap_or(CfmlValue::binary(Vec::new()))),
             "size" => Ok(CfmlValue::Int(match get(object, "__bytes") {
                 Some(CfmlValue::Binary(b)) => b.len() as i64,
                 _ => 0,
@@ -205,7 +205,7 @@ pub fn dispatch(
                 "__bytes".to_string(),
                 match binary {
                     CfmlValue::Binary(b) => CfmlValue::Binary(b),
-                    other => CfmlValue::Binary(other.as_string().into_bytes()),
+                    other => CfmlValue::binary(other.as_string().into_bytes()),
                 },
             );
             Ok(CfmlValue::strukt(stream))

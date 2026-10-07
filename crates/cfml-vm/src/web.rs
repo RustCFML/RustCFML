@@ -161,7 +161,7 @@ fn request_body_content(content_type: &str, body: &[u8]) -> CfmlValue {
     }
     let is_binary = !(content_type.is_empty() || is_text_mime_type(content_type));
     if is_binary {
-        CfmlValue::Binary(body.to_vec())
+        CfmlValue::binary(body.to_vec())
     } else {
         CfmlValue::string(String::from_utf8_lossy(body).to_string())
     }
@@ -1059,7 +1059,7 @@ mod tests {
             other => panic!("expected struct, got {:?}", other),
         };
         match content {
-            Some(CfmlValue::Binary(b)) => assert_eq!(b, bytes),
+            Some(CfmlValue::Binary(b)) => assert_eq!(b.as_slice(), bytes),
             other => panic!("a binary body must arrive as Binary, got {:?}", other),
         }
     }

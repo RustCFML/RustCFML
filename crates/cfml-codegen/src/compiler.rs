@@ -5178,6 +5178,19 @@ impl CfmlCompiler {
     }
 
     fn compile_component(&mut self, component: &Component, instructions: &mut Vec<BytecodeOp>) {
+        // Tag-syntax components turn the whitespace between their tags into
+        // `__writeText("…")` statements in the pseudo-constructor. Under
+        // `output="false"` that text is discarded at runtime anyway, but the
+        // statements still ran on every construction and — worse — made the
+        // body look non-declarative, so the class never took the prototype path
+        // (ColdBox's tag-based Mapping: 33 KB / 35 µs per instance instead of
+        // ~0.6 KB / 1 µs). Drop them here.
+        let silent = component_output_disabled(component);
+        let body: Vec<&Statement> = component
+            .body
+            .iter()
+            .filter(|st| !(silent && is_literal_text_output(st)))
+            .collect();
         // Build the component as a struct containing:
         // 1. Metadata keys (__name, __extends, __implements, __metadata)
         // 2. __variables scope with property defaults
@@ -5260,7 +5273,7 @@ impl CfmlCompiler {
         // copying the first one instead of running the body again (see
         // `ctor_prototype_lookup`). Anything else — a statement, a default that
         // calls or reads something — keeps the marker off.
-        let declarative = component.body.iter().all(is_literal_scope_assignment)
+        let declarative = body.iter().all(|st| is_literal_scope_assignment(st))
             && component
                 .properties
                 .iter()
@@ -5523,13 +5536,13 @@ impl CfmlCompiler {
 
         // Compile component body statements (e.g., this.name = "xxx", this.mappings = {...})
         // These execute as init code that modifies the component struct via `this`
-        if !component.body.is_empty() {
+        if !body.is_empty() {
             // Bind `this` to the component struct so `this.xxx = val` works
             instructions.push(BytecodeOp::LoadLocal(Name::from(&component.name)));
             instructions.push(BytecodeOp::StoreLocal(Name::intern("this")));
 
             let prev_in_body = std::mem::replace(&mut self.in_component_body, true);
-            for stmt in &component.body {
+            for stmt in &body {
                 self.compile_statement(stmt, instructions);
             }
             self.in_component_body = prev_in_body;
@@ -7144,6 +7157,25 @@ fn is_literal_expression(e: &Expression) -> bool {
 /// <literal>`, `this.x = <literal>` or a bare `x = <literal>` (a component-body
 /// bare name is a `variables` key). Running it again on a fresh instance stores
 /// an equal, fresh value — so it does not stop the body being declaration-only.
+/// The component declares `output="false"` (or `no`/`0`): its pseudo-constructor
+/// emits nothing, so literal text output there is a no-op.
+fn component_output_disabled(component: &Component) -> bool {
+    component.metadata.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("output")
+            && ["false", "no", "0"].iter().any(|f| v.trim().eq_ignore_ascii_case(f))
+    })
+}
+
+/// A `__writeText("literal")` statement — what the tag preprocessor emits for
+/// template text between tags.
+fn is_literal_text_output(st: &Statement) -> bool {
+    let Statement::Expression(es) = st else { return false };
+    let Expression::FunctionCall(fc) = &es.expr else { return false };
+    matches!(fc.name.as_ref(), Expression::Identifier(id) if id.name.eq_ignore_ascii_case("__writeText"))
+        && fc.arguments.len() == 1
+        && matches!(&fc.arguments[0], Expression::Literal(Literal { value: LiteralValue::String(_), .. }))
+}
+
 fn is_literal_scope_assignment(st: &Statement) -> bool {
     // A script-body `variables.a = 1;` parses as an expression statement holding
     // an assignment `BinaryOp`; the `Statement::Assignment` form comes from tags.

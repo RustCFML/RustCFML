@@ -138,11 +138,11 @@ pub fn freed_bytes() -> Option<(u64, u64)> {
 
 /// Adds its lifetime to [`COLLECTION_NANOS`], and the bytes the pass freed on
 /// this thread to the freed-bytes totals, on every exit path.
-struct CollectionTimer(std::time::Instant, u64);
+struct CollectionTimer(std::time::Instant, crate::mem_account::ThreadTotals);
 
 impl CollectionTimer {
     fn start() -> Self {
-        Self(std::time::Instant::now(), crate::mem_account::thread_totals().freed)
+        Self(std::time::Instant::now(), crate::mem_account::thread_totals())
     }
 }
 
@@ -150,16 +150,32 @@ impl Drop for CollectionTimer {
     fn drop(&mut self) {
         COLLECTION_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SWEEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        if crate::mem_account::is_enabled() {
-            let freed = crate::mem_account::thread_totals().freed.saturating_sub(self.1);
+        // NET of what the pass allocated itself: its node map, membership set
+        // and counts (~160 B per entry walked) are freed before it returns, and
+        // counting those frees reported a boot sweep that reclaimed 6.5k nodes
+        // as "120 MB freed".
+        let freed = if crate::mem_account::is_enabled() {
+            let now = crate::mem_account::thread_totals();
+            let freed = now.freed.saturating_sub(self.1.freed);
+            let scratch = now.allocated.saturating_sub(self.1.allocated);
+            let freed = freed.saturating_sub(scratch);
             FREED_BYTES_TOTAL.fetch_add(freed, Ordering::Relaxed);
             FREED_BYTES_LAST.store(freed, Ordering::Relaxed);
-            let _ = REQUEST_GC.try_with(|g| {
-                let (n, b) = g.get();
-                g.set((n + 1, b + freed));
-            });
-        }
+            freed
+        } else {
+            0
+        };
+        let _ = REQUEST_GC.try_with(|g| {
+            let (n, b) = g.get();
+            g.set((n + 1, b + freed));
+        });
     }
+}
+
+/// Sweeps run on this thread since the request began (see `reset_request_census`
+/// callers). Lets the VM tell whether a `collect_incremental()` call swept.
+pub fn request_sweeps() -> u64 {
+    REQUEST_GC.with(|g| g.get().0)
 }
 
 /// One logged allocation, held weakly so the log never extends an object's

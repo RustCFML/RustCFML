@@ -317,7 +317,7 @@ fn parse_request(arg: &CfmlValue) -> Result<Request, CfmlError> {
                     // path with no value cannot be honoured, and saying so is
                     // better than uploading nothing.
                     let content = match attr(&p, "value") {
-                        Some(CfmlValue::Binary(b)) => b.clone(),
+                        Some(CfmlValue::Binary(b)) => b.to_vec(),
                         Some(CfmlValue::Null) | None => {
                             return Err(CfmlError::new(
                                 "cfhttp: <cfhttpparam type=\"file\"> needs a value= holding \
@@ -566,7 +566,7 @@ pub fn cfhttp_worker(args: Vec<CfmlValue>) -> CfmlResult {
     let file_content = if req.get_as_binary {
         let b64 = resp.get("bodyBase64").and_then(|v| v.as_str()).unwrap_or("");
         match base64_decode(b64) {
-            Ok(bytes) => CfmlValue::Binary(bytes),
+            Ok(bytes) => CfmlValue::binary(bytes),
             Err(e) => {
                 return Err(CfmlError::runtime(format!(
                     "cfhttp: getAsBinary response could not be decoded: {}",

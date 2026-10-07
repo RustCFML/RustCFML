@@ -52,7 +52,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | § | Item | Status |
 |---|---|---|
 | [15](#15) | Struct iteration order (insertion, not HashMap) | 🌟 won't-fix |
-| [17](#17) | `objectSave()`/`objectLoad()` binary format | 🌟 by design |
+| [17](#17) | `objectSave()`/`objectLoad()` binary format (not JVM-compatible) | 🌟 by design |
 | [20](#20) | `binary.equals()` compares by value | 🌟 by design |
 | [21](#21) | `server.coldfusion.supportedLocales` | 🌟 by design |
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
@@ -407,9 +407,10 @@ JDBC numeric `UPDATE_RULE`/`DELETE_RULE` codes — *is* matched; see §10.)
 
 ACF/Lucee implement `objectSave()` / `objectLoad()` via **Java object serialization**
 (a JVM-native binary blob). RustCFML has no JVM, so it uses its own **self-describing
-internal format**: a magic header (`RCFMLOBJ\x01`) followed by the value serialized
-as JSON via `CfmlValue`'s serde impl (Binary/Query are tagged with `_cftype` markers
-so they reconstruct exactly). Consequences:
+internal format**: a magic header (`RCFMLOBJ\x02`) followed by a compact binary
+encoding (`cfml_common::objcodec`) — strings and binaries as length-prefixed raw
+bytes, explicit type tags. Blobs in the earlier format (`RCFMLOBJ\x01`, JSON) are
+still read, so existing cache files keep loading. Consequences:
 
 - **Not wire-compatible with the JVM engines.** A blob produced by ACF/Lucee cannot
   be `objectLoad()`ed here, and vice-versa. This is fine for the common use case —
@@ -417,12 +418,15 @@ so they reconstruct exactly). Consequences:
   `DiskStore` marshaller saves then loads). `objectLoad()` on a foreign/JVM blob
   throws a clear error rather than corrupting silently.
 - **Components / closures / functions serialize to `null`.** They cannot be
-  reconstituted without their defining program. Scalars, structs, arrays, and
-  queries round-trip with full fidelity. (Lucee can serialize a live CFC instance's
-  state; RustCFML does not.)
-- Struct key **insertion order** is preserved (see also §15), and whole-number
-  doubles collapse to `Int` on load — the same normalisation the JSON path applies
-  everywhere else.
+  reconstituted without their defining program. Scalars, structs, arrays, queries,
+  dates and binaries round-trip with full fidelity, including `Double` vs `Int` and
+  timespans. (Lucee can serialize a live CFC instance's state; RustCFML does not.)
+- Struct key **insertion order and case** are preserved (see also §15).
+- An older RustCFML (before v0.720.0) cannot read a format-2 blob. ColdBox's
+  `DiskStore` treats an unreadable entry as a miss, so downgrading only costs one
+  re-render per cached object.
+- The file forms work as on Lucee: `objectSave( value, filePath )` writes the bytes
+  (and still returns them), `objectLoad( filePath )` reads them.
 
 <a id="20"></a>
 

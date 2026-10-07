@@ -178,7 +178,7 @@ pub(crate) fn java_cached_regex(
 /// - anything else, via its UTF-8 string form (lenient fallback).
 fn java_byte_array(v: &CfmlValue) -> Vec<u8> {
     match v {
-        CfmlValue::Binary(b) => b.clone(),
+        CfmlValue::Binary(b) => b.to_vec(),
         CfmlValue::Array(a) => a
             .snapshot()
             .iter()
@@ -934,7 +934,7 @@ pub fn handle_java_messagedigest(
             shim.insert("__algorithm".to_string(), CfmlValue::string(algorithm));
             // Accumulate the fed bytes verbatim (raw byte[]), so binary input
             // hashes correctly — a lossy UTF-8 String round-trip would corrupt it.
-            shim.insert("__data".to_string(), CfmlValue::Binary(Vec::new()));
+            shim.insert("__data".to_string(), CfmlValue::binary(Vec::new()));
             Ok(CfmlValue::strukt(shim))
         }
         "update" => {
@@ -943,7 +943,7 @@ pub fn handle_java_messagedigest(
             // RustCFML run the same interop code without rewrites.
             if let CfmlValue::Struct(ref shim) = object {
                 let mut current = match shim.get("__data") {
-                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(CfmlValue::Binary(b)) => b.to_vec(),
                     Some(other) => other.as_string().into_bytes(),
                     None => Vec::new(),
                 };
@@ -952,7 +952,7 @@ pub fn handle_java_messagedigest(
                     None => {}
                 };
                 let mut new_shim = shim.snapshot();
-                new_shim.insert("__data".to_string(), CfmlValue::Binary(current));
+                new_shim.insert("__data".to_string(), CfmlValue::binary(current));
                 Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
@@ -964,7 +964,7 @@ pub fn handle_java_messagedigest(
             // is a final chunk to feed before finishing (Java's digest(byte[])).
             if let CfmlValue::Struct(ref shim) = object {
                 let mut data = match shim.get("__data") {
-                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(CfmlValue::Binary(b)) => b.to_vec(),
                     Some(other) => other.as_string().into_bytes(),
                     None => Vec::new(),
                 };
@@ -996,7 +996,7 @@ pub fn handle_java_messagedigest(
         "reset" => {
             if let CfmlValue::Struct(ref shim) = object {
                 let mut new_shim = shim.snapshot();
-                new_shim.insert("__data".to_string(), CfmlValue::Binary(Vec::new()));
+                new_shim.insert("__data".to_string(), CfmlValue::binary(Vec::new()));
                 Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
@@ -1037,7 +1037,7 @@ fn message_digest_hash(algorithm: &str, data: &[u8]) -> CfmlResult {
         Some("SHA512") => sha2::Sha512::digest(data).to_vec(),
         _ => return Err(CfmlError::no_such_algorithm(algorithm)),
     };
-    Ok(CfmlValue::Binary(bytes))
+    Ok(CfmlValue::binary(bytes))
 }
 
 pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
@@ -1242,7 +1242,7 @@ pub fn handle_java_base64(method: &str, args: Vec<CfmlValue>, object: &CfmlValue
         // encode() returns a byte[] of the ASCII encoding, not a String.
         "encode" => {
             let data = java_byte_array(args.first().unwrap_or(&CfmlValue::Null));
-            Ok(CfmlValue::Binary(
+            Ok(CfmlValue::binary(
                 b64_encode(&data, variant, pad).into_bytes(),
             ))
         }
@@ -1254,7 +1254,7 @@ pub fn handle_java_base64(method: &str, args: Vec<CfmlValue>, object: &CfmlValue
                 Some(other) => other.as_string(),
                 None => String::new(),
             };
-            Ok(CfmlValue::Binary(b64_decode(&text)))
+            Ok(CfmlValue::binary(b64_decode(&text)))
         }
         _ => Err(CfmlError::shim_unhandled(method)),
     }
@@ -2251,7 +2251,7 @@ pub fn handle_java_files(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue
             };
             // Content is a byte[] (CFML Array of ints), Binary, or a string.
             let bytes: Vec<u8> = match args.get(1) {
-                Some(CfmlValue::Binary(b)) => b.clone(),
+                Some(CfmlValue::Binary(b)) => b.to_vec(),
                 Some(v @ CfmlValue::Array(_)) => java_byte_array(v),
                 Some(other) => other.as_string().into_bytes(),
                 None => Vec::new(),
@@ -3135,7 +3135,7 @@ pub fn handle_java_bytebuffer(
     // Build a fresh buffer struct wrapping `backing`, cursor at 0.
     let make = |backing: Vec<u8>| -> CfmlValue {
         let mut shim = java_shim_map("java.nio.bytebuffer");
-        shim.insert("__buffer".to_string(), CfmlValue::Binary(backing));
+        shim.insert("__buffer".to_string(), CfmlValue::binary(backing));
         shim.insert("__position".to_string(), CfmlValue::Int(0));
         CfmlValue::strukt(shim)
     };
@@ -3143,7 +3143,7 @@ pub fn handle_java_bytebuffer(
     let state = |obj: &CfmlValue| -> Option<(Vec<u8>, usize)> {
         if let CfmlValue::Struct(s) = obj {
             let buf = match s.get("__buffer") {
-                Some(CfmlValue::Binary(b)) => b,
+                Some(CfmlValue::Binary(b)) => (*b).clone(),
                 _ => Vec::new(),
             };
             let pos = match s.get("__position") {
@@ -3159,7 +3159,7 @@ pub fn handle_java_bytebuffer(
     // a buffer passed into a function still sees the write — cf. StringBuilder).
     let commit = |obj: &CfmlValue, buf: Vec<u8>, pos: usize| {
         if let CfmlValue::Struct(s) = obj {
-            s.insert("__buffer".to_string(), CfmlValue::Binary(buf));
+            s.insert("__buffer".to_string(), CfmlValue::binary(buf));
             s.insert("__position".to_string(), CfmlValue::Int(pos as i64));
         }
     };
@@ -3315,20 +3315,20 @@ pub fn handle_java_bytearrayoutputstream(
     let buf_of = |obj: &CfmlValue| -> Vec<u8> {
         if let CfmlValue::Struct(s) = obj {
             if let Some(CfmlValue::Binary(b)) = s.get("__buffer") {
-                return b;
+                return (*b).clone();
             }
         }
         Vec::new()
     };
     let commit = |obj: &CfmlValue, buf: Vec<u8>| {
         if let CfmlValue::Struct(s) = obj {
-            s.insert("__buffer".to_string(), CfmlValue::Binary(buf));
+            s.insert("__buffer".to_string(), CfmlValue::binary(buf));
         }
     };
     match method {
         "init" => {
             let mut shim = java_shim_map("java.io.bytearrayoutputstream");
-            shim.insert("__buffer".to_string(), CfmlValue::Binary(Vec::new()));
+            shim.insert("__buffer".to_string(), CfmlValue::binary(Vec::new()));
             Ok(CfmlValue::strukt(shim))
         }
         // write(int) writes the low 8 bits; write(byte[]) / write(byte[],off,len)
@@ -5431,7 +5431,13 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
         // can write the advanced state back) populate the capture groups.
         "matcher" => {
             let regex_str = object_regex();
-            let input = args.first().map(|a| a.as_string()).unwrap_or_default();
+            // Share the caller's string rather than copying it: Preside scans a
+            // whole rendered page this way (once per regex, every request).
+            let input = match args.first() {
+                Some(v @ CfmlValue::String(_)) => v.clone(),
+                Some(other) => CfmlValue::string(other.as_string()),
+                None => CfmlValue::string(String::new()),
+            };
             let re = compile(&regex_str)?;
             let group_count = re.captures_len() as i64 - 1;
             let mut shim = ValueMap::default();
@@ -5441,10 +5447,11 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("__regex".to_string(), CfmlValue::string(regex_str));
-            shim.insert("__input".to_string(), CfmlValue::string(input));
+            shim.insert("__input".to_string(), input);
             shim.insert("__groupcount".to_string(), CfmlValue::Int(group_count));
             shim.insert("__matched".to_string(), CfmlValue::Bool(false));
-            shim.insert("__findindex".to_string(), CfmlValue::Int(0));
+            shim.insert("__findpos".to_string(), CfmlValue::Int(0));
+            shim.insert("__findposchar".to_string(), CfmlValue::Int(0));
             shim.insert("__groups".to_string(), CfmlValue::array(Vec::new()));
             Ok(CfmlValue::strukt(shim))
         }
@@ -5506,17 +5513,24 @@ pub enum MatchMode {
 
 /// Advance a `java.util.regex.Matcher` shim one step. Returns
 /// `(matched, updated_matcher)`: the updated struct carries the refreshed
-/// `__groups`/`__matched` (and, for `Find`, the incremented `__findindex`) and
-/// must be written back to the matcher variable so a subsequent `group(n)`
-/// sees this step's captures. `find()` walks non-overlapping matches
-/// left-to-right exactly like Java's `Matcher.find()`, so `while (m.find())`
-/// terminates.
+/// `__groups`/`__matched` (and, for `Find`, the advanced cursor) and must be
+/// written back to the matcher variable so a subsequent `group(n)` sees this
+/// step's captures. `find()` resumes where the previous match ended, exactly
+/// like Java's `Matcher.find()` — after an EMPTY match it moves on one
+/// character — so `while (m.find())` terminates.
+///
+/// The cursor is a byte offset plus its char offset. This used to copy the
+/// whole input out of the matcher on every step and find the next match with
+/// `captures_iter(..).nth(k)`, rescanning from the start — a `while (m.find())`
+/// loop was quadratic in matches and allocated the page size per call.
 pub fn java_matcher_step(
     s: &cfml_common::dynamic::CfmlStruct,
     mode: MatchMode,
 ) -> Result<(bool, CfmlValue), CfmlError> {
     let regex_str = s.get("__regex").map(|v| v.as_string()).unwrap_or_default();
-    let input = s.get("__input").map(|v| v.as_string()).unwrap_or_default();
+    let input_v = s.get("__input").unwrap_or(CfmlValue::Null);
+    let input = input_v.as_str_cow();
+    let input: &str = &input;
     let re = java_cached_regex(&regex_str).map_err(|e| {
         CfmlError::runtime(format!(
             "java.util.regex.Matcher: invalid pattern [{}]: {}",
@@ -5524,25 +5538,45 @@ pub fn java_matcher_step(
         ))
     })?;
 
-    let find_index = s
-        .get("__findindex")
-        .and_then(|v| v.as_string().trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let int_key = |k: &str| -> i64 {
+        match s.get(k) {
+            Some(CfmlValue::Int(n)) => n,
+            Some(v) => v.as_string().trim().parse::<i64>().unwrap_or(0),
+            None => 0,
+        }
+    };
+    let (from_byte, from_char) = match mode {
+        MatchMode::Find => (int_key("__findpos").max(0) as usize, int_key("__findposchar").max(0)),
+        _ => (0, 0),
+    };
 
     let caps = match mode {
-        MatchMode::Find => re.captures_iter(&input).nth(find_index),
+        MatchMode::Find => {
+            if from_byte > input.len() || !input.is_char_boundary(from_byte) {
+                None
+            } else {
+                re.captures_at(input, from_byte)
+            }
+        }
         MatchMode::Matches => re
-            .captures(&input)
+            .captures(input)
             .filter(|c| c.get(0).map(|m| m.start() == 0 && m.end() == input.len()).unwrap_or(false)),
         MatchMode::LookingAt => re
-            .captures(&input)
+            .captures(input)
             .filter(|c| c.get(0).map(|m| m.start() == 0).unwrap_or(false)),
     };
 
     let mut ns = s.snapshot();
     let matched = caps.is_some();
-    // Convert a byte offset into the (0-based) char offset Java's Matcher uses.
-    let char_off = |byte: usize| -> i64 { input[..byte].chars().count() as i64 };
+    // Byte offset → the (0-based) char offset Java's Matcher reports. Every
+    // offset of a match lies at or after the search start, so count from there.
+    let char_off = |byte: usize| -> i64 {
+        if byte >= from_byte {
+            from_char + input[from_byte..byte].chars().count() as i64
+        } else {
+            input[..byte].chars().count() as i64
+        }
+    };
     let groups: Vec<CfmlValue> = match &caps {
         Some(caps) => (0..re.captures_len())
             .map(|i| {
@@ -5573,8 +5607,21 @@ pub fn java_matcher_step(
     ns.insert("__end".to_string(), group0_end);
     ns.insert("__startgroups".to_string(), CfmlValue::array(start_groups));
     ns.insert("__endgroups".to_string(), CfmlValue::array(end_groups));
-    if matches!(mode, MatchMode::Find) && matched {
-        ns.insert("__findindex".to_string(), CfmlValue::Int((find_index + 1) as i64));
+    if let (MatchMode::Find, Some(caps)) = (&mode, &caps) {
+        let m = caps.get(0).expect("group 0 always participates");
+        let (mut next_byte, mut next_char) = (m.end(), char_off(m.end()));
+        if m.start() == m.end() {
+            // Java: after an empty match the next search starts one char on.
+            match input[next_byte..].chars().next() {
+                Some(c) => {
+                    next_byte += c.len_utf8();
+                    next_char += 1;
+                }
+                None => next_byte += 1, // past the end: the next find() fails
+            }
+        }
+        ns.insert("__findpos".to_string(), CfmlValue::Int(next_byte as i64));
+        ns.insert("__findposchar".to_string(), CfmlValue::Int(next_char));
     }
     Ok((matched, CfmlValue::strukt(ns)))
 }

@@ -346,6 +346,9 @@ pub(crate) fn op_set_index(
         // `Invalid index [n] for Native Array, can't expand Native Arrays`
         // — Lucee will not grow a native array to fit.
         CfmlValue::Binary(bytes) => {
+            // Copy-on-write: a binary shared with another variable is
+            // unaffected, exactly as when `Binary` held a plain `Vec`.
+            let bytes = std::sync::Arc::make_mut(bytes);
             let one_based = subscript_position(&index)?;
             if one_based < 1 || (one_based as usize) > bytes.len() {
                 return Err(cfml_common::vm::CfmlError::expression(format!(

@@ -438,7 +438,7 @@ unsafe extern "C" fn h_new_binary(raw: *mut Ctx, s: StrRef) -> ValueHandle {
     } else {
         std::slice::from_raw_parts(s.ptr, s.len).to_vec()
     };
-    make(raw, CfmlValue::Binary(bytes))
+    make(raw, CfmlValue::binary(bytes))
 }
 
 unsafe extern "C" fn h_arr_new(raw: *mut Ctx, cap: usize) -> ValueHandle {

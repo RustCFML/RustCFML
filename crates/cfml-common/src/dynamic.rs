@@ -2106,7 +2106,13 @@ pub enum CfmlValue {
     /// through both); `duplicate(a)` deep-copies. The `Arc` is the indirection,
     /// so no `Box` is needed. See `CfmlQuery`.
     Query(CfmlQuery),
-    Binary(Vec<u8>),
+    /// Binary data (Java `byte[]` on Lucee). A value type held in an `Arc`
+    /// like `String`: reading or passing a binary variable is a refcount bump,
+    /// and the rare in-place edit goes through `Arc::make_mut` (copy-on-write).
+    /// It was a bare `Vec<u8>`, so every read COPIED the bytes — a ColdBox
+    /// DiskStore cache hit copied its ~200 KB blob just to hand it to
+    /// `objectLoad()`.
+    Binary(Arc<Vec<u8>>),
     /// Instance of a Rust-backed class registered via
     /// `CfmlVirtualMachine::register_native_class`. Method dispatch goes
     /// through the `CfmlNative` trait.
@@ -2894,6 +2900,12 @@ impl CfmlValue {
     #[inline]
     pub fn string(s: impl Into<String>) -> Self {
         CfmlValue::String(Arc::new(s.into()))
+    }
+
+    /// Construct a `CfmlValue::Binary` from owned bytes.
+    #[inline]
+    pub fn binary(bytes: Vec<u8>) -> Self {
+        CfmlValue::Binary(Arc::new(bytes))
     }
 
     /// Construct a `CfmlValue::Array` from an owned `Vec`, wrapping in the
@@ -4236,6 +4248,16 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
         while let Some((k, v)) = a.next_entry::<String, CfmlValue>()? {
             map.insert(k, v);
         }
+        Ok(CfmlValue::from_json_map(map))
+    }
+}
+
+impl CfmlValue {
+    /// Finish a deserialized JSON object: a `_cftype`-tagged map (what
+    /// `objectSave`/serialization writes for Binary, Query and DateTime values)
+    /// becomes that value again; anything else is a struct. Shared by the serde
+    /// visitor and `objectLoad`'s direct reader so the two cannot drift.
+    pub fn from_json_map(map: ValueMap) -> CfmlValue {
         // Detect tagged special types
         if let Some(CfmlValue::String(t)) = map.get("_cftype") {
             match t.as_str() {
@@ -4245,7 +4267,7 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                             .step_by(2)
                             .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
                             .collect();
-                        return Ok(CfmlValue::Binary(bytes));
+                        return CfmlValue::binary(bytes);
                     }
                 }
                 "query" => {
@@ -4260,7 +4282,7 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                                 }
                             }
                         }
-                        return Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)));
+                        return CfmlValue::Query(CfmlQuery::from_parts(columns, rows));
                     }
                 }
                 "datetime" => {
@@ -4277,15 +4299,15 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                             Some("t") => crate::datetime::DateKind::Time,
                             _ => crate::datetime::DateKind::DateTime,
                         };
-                        return Ok(CfmlValue::DateTime(
+                        return CfmlValue::DateTime(
                             crate::datetime::CfmlDate::from_epoch(secs, nanos).with_kind(kind),
-                        ));
+                        );
                     }
                 }
                 _ => {}
             }
         }
-        Ok(CfmlValue::strukt(map))
+        CfmlValue::strukt(map)
     }
 }
 

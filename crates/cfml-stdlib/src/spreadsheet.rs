@@ -1954,7 +1954,7 @@ impl CfmlNative for CfmlSpreadsheet {
                 let col = arg_u32(a, 1, "column")?;
                 Ok(self.get_cell_hyperlink(row, col))
             }
-            "readbinary" | "tobinary" => Ok(CfmlValue::Binary(self.to_binary()?)),
+            "readbinary" | "tobinary" => Ok(CfmlValue::binary(self.to_binary()?)),
             "getcellformula" => {
                 let row = arg_u32(a, 0, "row")?;
                 let col = arg_u32(a, 1, "column")?;

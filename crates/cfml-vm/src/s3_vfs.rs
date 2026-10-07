@@ -23,11 +23,9 @@ fn err(msg: impl Into<String>) -> CfmlError {
     CfmlError::new(msg.into(), CfmlErrorType::Custom("S3".to_string()))
 }
 
-fn is_s3_string(v: &CfmlValue) -> Option<String> {
-    match v {
-        CfmlValue::String(s) if s.to_lowercase().starts_with("s3://") => Some((**s).clone()),
-        _ => None,
-    }
+/// `s` starts with `s3://`, any case — without lowercasing a copy of it.
+fn str_is_s3(s: &str) -> bool {
+    s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("s3://"))
 }
 
 fn nth_string(args: &[CfmlValue], idx: usize) -> Option<&str> {
@@ -57,6 +55,12 @@ impl CfmlVirtualMachine {
     /// `fileRead("/logs/today.txt")` resolve to
     /// `s3://key:sec@bucket/logs/today.txt`.
     fn resolve_s3_mapping(&self, path: &str) -> Option<String> {
+        // This runs on every file/directory BIF. Most applications have no s3
+        // mapping at all, so reject non-s3 mappings without allocating (it
+        // used to lowercase every mapping path and copy the argument per call).
+        if !self.mappings.iter().any(|m| str_is_s3(&m.path)) {
+            return None;
+        }
         // Mapping names are normalized to /name/ at parse time. Match prefix.
         let path_with_slash = if path.starts_with('/') {
             path.to_string()
@@ -64,7 +68,7 @@ impl CfmlVirtualMachine {
             format!("/{}", path)
         };
         for m in &self.mappings {
-            if !m.path.to_lowercase().starts_with("s3://") {
+            if !str_is_s3(&m.path) {
                 continue;
             }
             if path_with_slash.starts_with(&m.name) {
@@ -114,11 +118,11 @@ impl CfmlVirtualMachine {
         // decide whether to intercept *before* we know the resolved URL, so
         // try the cheap "already s3://" path first, then fall through to a
         // mapping rewrite.
-        let first_raw = nth_string(args, 0)?.to_string();
+        let first_raw = nth_string(args, 0)?;
         let (path, came_from_mapping) =
-            if is_s3_string(&CfmlValue::string(first_raw.clone())).is_some() {
-                (first_raw, false)
-            } else if let Some(rewritten) = self.resolve_s3_mapping(&first_raw) {
+            if str_is_s3(first_raw) {
+                (first_raw.to_string(), false)
+            } else if let Some(rewritten) = self.resolve_s3_mapping(first_raw) {
                 (rewritten, true)
             } else {
                 return None;
@@ -154,9 +158,7 @@ impl CfmlVirtualMachine {
         // mapping-or-direct logic, returning the parsed URL + a "from mapping"
         // flag so we know whether to apply the prefix.
         let resolve_dst = |raw: &str| -> Result<(S3Url, bool), CfmlError> {
-            let (resolved, from_mapping) = if is_s3_string(&CfmlValue::string(raw.to_string()))
-                .is_some()
-            {
+            let (resolved, from_mapping) = if str_is_s3(raw) {
                 (raw.to_string(), false)
             } else if let Some(rewritten) = self.resolve_s3_mapping(raw) {
                 (rewritten, true)
@@ -196,7 +198,7 @@ impl CfmlVirtualMachine {
                 .map(CfmlValue::string),
 
             "filereadbinary" => s3_get_object(&client, &url.bucket, &src_key)
-                .map(CfmlValue::Binary),
+                .map(CfmlValue::binary),
 
             "fileexists" => s3_head_object(&client, &url.bucket, &src_key).map(CfmlValue::Bool),
 
@@ -205,7 +207,7 @@ impl CfmlVirtualMachine {
 
             "filewrite" => {
                 let body = match args.get(1) {
-                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(CfmlValue::Binary(b)) => b.to_vec(),
                     Some(CfmlValue::String(s)) => s.as_bytes().to_vec(),
                     Some(v) => v.as_string().into_bytes(),
                     None => return Some(Err(err("fileWrite: missing content argument"))),
@@ -221,7 +223,7 @@ impl CfmlVirtualMachine {
                     Err(_) => Vec::new(),
                 };
                 let addition = match args.get(1) {
-                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(CfmlValue::Binary(b)) => b.to_vec(),
                     Some(CfmlValue::String(s)) => s.as_bytes().to_vec(),
                     Some(v) => v.as_string().into_bytes(),
                     None => return Some(Err(err("fileAppend: missing content argument"))),

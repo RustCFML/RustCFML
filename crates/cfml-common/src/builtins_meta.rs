@@ -228,7 +228,7 @@ pub const VM_INTERCEPTED: &[&str] = &[
     "label", "listeach", "listevery", "listfilter", "listmap", "listreduce", "listreduceright",
     "listsome", "local", "local2utc", "location",
     "mcp", "mcpaudio", "mcpclient", "mcpconnect", "mcpimage", "mcpnotify", "mcpresource",
-    "mcpresourcelink", "mcpsessions", "mcptext", "name", "no", "numeric", "output",
+    "mcpresourcelink", "mcpsessions", "mcptext", "name", "no", "numeric", "objectload", "objectsave", "output",
     "precisionevaluate", "profilenow", "queryaddrow", "queryeach", "queryevery",
     "queryexecute", "queryfilter", "querymap", "queryreduce", "queryregisterfunction",
     "querysetcell", "querysome", "querysort", "request", "runasync",

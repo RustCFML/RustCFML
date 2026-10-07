@@ -1274,7 +1274,7 @@ fn get_str(args: &[CfmlValue], idx: usize) -> String {
 ///   what a CFML caller passing a plain string means.
 fn get_bytes(args: &[CfmlValue], idx: usize) -> Vec<u8> {
     match args.get(idx) {
-        Some(CfmlValue::Binary(b)) => b.clone(),
+        Some(CfmlValue::Binary(b)) => b.to_vec(),
         Some(CfmlValue::Array(a)) => a
             .snapshot()
             .iter()
@@ -1928,8 +1928,8 @@ fn fn_span_excluding(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_compare(args: Vec<CfmlValue>) -> CfmlResult {
-    let a = get_str(&args, 0);
-    let b = get_str(&args, 1);
+    let a = args.first().map(|v| v.as_str_cow()).unwrap_or_default();
+    let b = args.get(1).map(|v| v.as_str_cow()).unwrap_or_default();
     Ok(CfmlValue::Int(match a.cmp(&b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -1938,9 +1938,9 @@ fn fn_compare(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_compare_no_case(args: Vec<CfmlValue>) -> CfmlResult {
-    let a = get_str(&args, 0).to_lowercase();
-    let b = get_str(&args, 1).to_lowercase();
-    Ok(CfmlValue::Int(match a.cmp(&b) {
+    let a = args.first().map(|v| v.as_str_cow()).unwrap_or_default();
+    let b = args.get(1).map(|v| v.as_str_cow()).unwrap_or_default();
+    Ok(CfmlValue::Int(match cfml_common::text::cmp_ignore_case(&a, &b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
@@ -2269,13 +2269,17 @@ fn fn_to_binary(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::String(s)) => base64_decode_bytes(s.as_str()),
         other => base64_decode_bytes(&other.map(|v| v.as_string()).unwrap_or_default()),
     };
-    Ok(CfmlValue::Binary(bytes))
+    Ok(CfmlValue::binary(bytes))
 }
 
 /// Magic header prefixing an `objectSave()` blob. Lets `objectLoad()` recognise
 /// its own output and produce a clear error (rather than a cryptic JSON parse
 /// failure) if handed something that isn't RustCFML-serialized.
 const OBJECT_SAVE_MAGIC: &[u8] = b"RCFMLOBJ\x01";
+/// Format 2: the same 8-byte prefix, version byte 2, then
+/// `cfml_common::objcodec`'s compact binary encoding (strings as raw bytes, like
+/// Lucee's Java serialization). Format 1 (JSON) is still read.
+const OBJECT_SAVE_MAGIC_V2: &[u8] = b"RCFMLOBJ\x02";
 
 /// `objectSave(value)` — serialize any CFML value to a binary blob.
 ///
@@ -2290,12 +2294,11 @@ const OBJECT_SAVE_MAGIC: &[u8] = b"RCFMLOBJ\x01";
 /// reconstituted without their defining program); documented in known-issues.
 fn fn_object_save(args: Vec<CfmlValue>) -> CfmlResult {
     let value = args.first().unwrap_or(&CfmlValue::Null);
-    let body = serde_json::to_vec(value)
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(OBJECT_SAVE_MAGIC_V2);
+    cfml_common::objcodec::encode(value, &mut out)
         .map_err(|e| CfmlError::runtime(format!("objectSave: failed to serialize value: {e}")))?;
-    let mut out = Vec::with_capacity(OBJECT_SAVE_MAGIC.len() + body.len());
-    out.extend_from_slice(OBJECT_SAVE_MAGIC);
-    out.extend_from_slice(&body);
-    Ok(CfmlValue::Binary(out))
+    Ok(CfmlValue::binary(out))
 }
 
 /// `objectLoad(binary)` — inflate a blob produced by `objectSave()`.
@@ -2303,27 +2306,34 @@ fn fn_object_save(args: Vec<CfmlValue>) -> CfmlResult {
 /// Accepts a Binary value (the normal case; ColdBox calls `toBinary()` on a
 /// base64 string first) or a String (treated as raw UTF-8 bytes) for leniency.
 fn fn_object_load(args: Vec<CfmlValue>) -> CfmlResult {
-    // Consume the argument rather than borrowing it: a `Binary` blob moves out
-    // instead of being deep-copied. `b.clone()` here duplicated the WHOLE blob
-    // (a ~100KB cached page, in ColdBox's DiskStore) purely to read it once.
-    let bytes: Vec<u8> = match args.into_iter().next() {
-        Some(CfmlValue::Binary(b)) => b,
-        // `CfmlValue::String` is an `Arc<String>`; take the buffer when we hold
-        // the only reference, copy only when it is genuinely shared.
-        Some(CfmlValue::String(s)) => match std::sync::Arc::try_unwrap(s) {
-            Ok(owned) => owned.into_bytes(),
-            Err(shared) => shared.as_bytes().to_vec(),
-        },
-        Some(other) => other.as_string().into_bytes(),
+    // Borrow the blob: a `Binary` (or string) is shared, so reading it is free.
+    // It used to be copied whenever the caller still held it in a variable —
+    // the whole ~200 KB page on every ColdBox DiskStore cache hit.
+    let held = args.into_iter().next();
+    let owned_text;
+    let bytes: &[u8] = match &held {
+        Some(CfmlValue::Binary(b)) => b.as_slice(),
+        Some(CfmlValue::String(s)) => s.as_bytes(),
+        Some(other) => {
+            owned_text = other.as_string();
+            owned_text.as_bytes()
+        }
         None => {
             return Err(CfmlError::runtime(
                 "objectLoad: requires a binary argument".to_string(),
             ))
         }
     };
-    let body = if bytes.starts_with(OBJECT_SAVE_MAGIC) {
-        &bytes[OBJECT_SAVE_MAGIC.len()..]
-    } else {
+    object_load_bytes(bytes)
+}
+
+/// Decode an `objectSave()` blob of either format.
+pub(crate) fn object_load_bytes(bytes: &[u8]) -> CfmlResult {
+    if let Some(body) = bytes.strip_prefix(OBJECT_SAVE_MAGIC_V2) {
+        return cfml_common::objcodec::decode(body)
+            .map_err(|e| CfmlError::runtime(format!("objectLoad: failed to deserialize value: {e}")));
+    }
+    let Some(body) = bytes.strip_prefix(OBJECT_SAVE_MAGIC) else {
         // Not our header — could be a JVM-serialized blob from another engine.
         return Err(CfmlError::runtime(
             "objectLoad: input was not produced by RustCFML's objectSave \
@@ -2331,6 +2341,7 @@ fn fn_object_load(args: Vec<CfmlValue>) -> CfmlResult {
                 .to_string(),
         ));
     };
+    // Format 1: JSON (blobs written before format 2, e.g. existing cache files).
     serde_json::from_slice::<CfmlValue>(body)
         .map_err(|e| CfmlError::runtime(format!("objectLoad: failed to deserialize value: {e}")))
 }
@@ -2419,7 +2430,7 @@ fn fn_csv_format_row(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_binary_encode(args: Vec<CfmlValue>) -> CfmlResult {
     let bytes = match args.first() {
-        Some(CfmlValue::Binary(b)) => b.clone(),
+        Some(CfmlValue::Binary(b)) => b.to_vec(),
         Some(other) => other.as_string().into_bytes(),
         None => Vec::new(),
     };
@@ -2435,11 +2446,11 @@ fn fn_binary_decode(args: Vec<CfmlValue>) -> CfmlResult {
     let input = get_str(&args, 0);
     let encoding = get_str(&args, 1).to_lowercase();
     match encoding.as_str() {
-        "hex" => Ok(CfmlValue::Binary(hex_decode_bytes(&input))),
-        "base64" => Ok(CfmlValue::Binary(base64_decode_bytes(&input))),
+        "hex" => Ok(CfmlValue::binary(hex_decode_bytes(&input))),
+        "base64" => Ok(CfmlValue::binary(base64_decode_bytes(&input))),
         "utf-8" | "us-ascii" => {
             // Convert string directly to bytes
-            Ok(CfmlValue::Binary(input.as_bytes().to_vec()))
+            Ok(CfmlValue::binary(input.as_bytes().to_vec()))
         }
         _ => Err(CfmlError::runtime(format!("Unsupported encoding: {}", encoding))),
     }
@@ -5477,7 +5488,13 @@ fn fn_java_cast(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let type_name = get_str(&args, 0).to_lowercase();
         match type_name.as_str() {
-            "string" => Ok(CfmlValue::string(args[1].as_string())),
+            // Already a string: share it (strings are copy-on-write). Preside
+            // passes a whole rendered page through `JavaCast("string", …)` per
+            // regex scan, which copied it every time.
+            "string" => Ok(match &args[1] {
+                CfmlValue::String(_) => args[1].clone(),
+                other => CfmlValue::string(other.as_string()),
+            }),
             "int" | "integer" | "long" => Ok(CfmlValue::Int(get_int(&args, 1))),
             "double" | "float" => Ok(CfmlValue::Double(get_float(&args, 1))),
             "boolean" => Ok(CfmlValue::Bool(args[1].is_true())),
@@ -8574,7 +8591,7 @@ fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
     // a UTF-16 file came back as mojibake.
     let cs = charset_arg(&args, 1, "read", &path)?;
     match std::fs::read(&path) {
-        Ok(bytes) => Ok(CfmlValue::string(cfml_common::charset::decode(&bytes, cs))),
+        Ok(bytes) => Ok(CfmlValue::string(cfml_common::charset::decode_vec(bytes, cs))),
         // Lucee surfaces a missing file from fileRead() as an `expression` error
         // (only fileReadBinary uses FileNotFoundException) — match that asymmetry.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -8601,7 +8618,7 @@ fn fn_file_write(args: Vec<CfmlValue>) -> CfmlResult {
     // already bytes and is written untouched whatever the charset says.
     let cs = charset_arg(&args, 2, "write to", &path)?;
     let result = match args.get(1) {
-        Some(CfmlValue::Binary(bytes)) => std::fs::write(&path, bytes),
+        Some(CfmlValue::Binary(bytes)) => std::fs::write(&path, bytes.as_slice()),
         _ => std::fs::write(
             &path,
             cfml_common::charset::encode(&with_optional_newline(&args, 1, 3), cs),
@@ -9202,12 +9219,12 @@ fn charset_name_arg(args: &[CfmlValue], index: usize, fn_name: &str) -> Result<c
 fn fn_charset_decode(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
     let cs = charset_name_arg(&args, 1, "charsetDecode")?;
-    Ok(CfmlValue::Binary(cfml_common::charset::encode(&s, cs)))
+    Ok(CfmlValue::binary(cfml_common::charset::encode(&s, cs)))
 }
 
 fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
     let bytes = match args.first() {
-        Some(CfmlValue::Binary(b)) => b.clone(),
+        Some(CfmlValue::Binary(b)) => b.to_vec(),
         // A native Java byte[] surfaces in CFML as an Array of SIGNED-byte ints
         // (e.g. `String.getBytes()`, `ByteArrayOutputStream.toByteArray()` — see
         // GH #271/#276). Lucee's charsetEncode accepts that byte[] directly; treat
@@ -9737,7 +9754,7 @@ fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> CfmlValue {
     if std::io::Read::read_to_end(&mut reader, &mut body).is_err() {
         body.clear();
     }
-    CfmlValue::Binary(body)
+    CfmlValue::binary(body)
 }
 
 #[cfg(feature = "http")]
@@ -9844,7 +9861,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                         .map(|(_, v)| v)
                                         .filter(|v| !matches!(v, CfmlValue::Null));
                                     let file_bytes = match inline {
-                                        Some(CfmlValue::Binary(b)) => b.clone(),
+                                        Some(CfmlValue::Binary(b)) => b.to_vec(),
                                         Some(other) => other.as_string().into_bytes(),
                                         None => match std::fs::read(&file_path) {
                                             Ok(b) => b,
@@ -13126,7 +13143,7 @@ fn cfml_to_sqlite(val: &CfmlValue) -> rusqlite::types::Value {
         CfmlValue::Int(i) => SqlValue::Integer(*i),
         CfmlValue::Double(d) => SqlValue::Real(*d),
         CfmlValue::String(s) => SqlValue::Text((**s).clone()),
-        CfmlValue::Binary(b) => SqlValue::Blob(b.clone()),
+        CfmlValue::Binary(b) => SqlValue::Blob(b.to_vec()),
         // SQLite has no date type: store the plain text form, not `{ts '…'}`.
         CfmlValue::DateTime(d) => SqlValue::Text(d.to_db_text()),
         _ => SqlValue::Text(val.as_string()),
@@ -13144,7 +13161,7 @@ fn sqlite_to_cfml(val: rusqlite::types::Value) -> CfmlValue {
         SqlValue::Integer(i) => CfmlValue::Int(i),
         SqlValue::Real(d) => CfmlValue::Double(d),
         SqlValue::Text(s) => CfmlValue::string(s),
-        SqlValue::Blob(b) => CfmlValue::Binary(b),
+        SqlValue::Blob(b) => CfmlValue::binary(b),
     }
 }
 
@@ -13544,7 +13561,7 @@ fn cfml_to_mysql_value(val: &CfmlValue) -> mysql::Value {
         CfmlValue::Int(i) => mysql::Value::from(*i),
         CfmlValue::Double(d) => mysql::Value::from(*d),
         CfmlValue::String(s) => mysql::Value::from(s.as_str()),
-        CfmlValue::Binary(b) => mysql::Value::Bytes(b.clone()),
+        CfmlValue::Binary(b) => mysql::Value::Bytes(b.to_vec()),
         // A date binds as a MySQL date/time value (wall clock in the request
         // zone), keeping its fractional seconds; a `cf_sql_date`/`cf_sql_time`
         // param has already been narrowed to that kind.
@@ -13589,7 +13606,7 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
         mysql::Value::Bytes(b) => {
             match String::from_utf8(b.clone()) {
                 Ok(s) => CfmlValue::string(s),
-                Err(_) => CfmlValue::Binary(b),
+                Err(_) => CfmlValue::binary(b),
             }
         }
         // DATE / DATETIME / TIMESTAMP all arrive as `Value::Date`; a DATE column
@@ -14156,7 +14173,7 @@ fn cfml_to_pg_param(val: &CfmlValue) -> PgParam {
         CfmlValue::Int(i) => PgParam::Int(*i),
         CfmlValue::Double(d) => PgParam::Double(*d),
         CfmlValue::String(s) => PgParam::Text((**s).clone()),
-        CfmlValue::Binary(b) => PgParam::Bytes(b.clone()),
+        CfmlValue::Binary(b) => PgParam::Bytes(b.to_vec()),
         CfmlValue::DateTime(d) => PgParam::Date(*d),
         // A query-column proxy stands in for its first-row scalar (defensive:
         // prepare_pg_statements already flattens these).
@@ -14303,7 +14320,7 @@ fn postgres_row_to_cfml_typed(row: &postgres::Row, col_idx: usize) -> CfmlValue 
                 Ok(Some(s)) => CfmlValue::string(s), _ => CfmlValue::Null,
             },
         Type::BYTEA => match row.try_get::<_, Option<Vec<u8>>>(col_idx) {
-            Ok(Some(b)) => CfmlValue::Binary(b), _ => CfmlValue::Null,
+            Ok(Some(b)) => CfmlValue::binary(b), _ => CfmlValue::Null,
         },
         Type::UUID => match row.try_get::<_, Option<uuid::Uuid>>(col_idx) {
             Ok(Some(u)) => CfmlValue::string(u.hyphenated().to_string()),
@@ -14515,7 +14532,7 @@ fn mssql_bind_params(params: &[CfmlValue]) -> Vec<MssqlParam> {
         CfmlValue::Bool(b) => MssqlParam::Bool(b),
         CfmlValue::Int(n) => MssqlParam::Int(n),
         CfmlValue::Double(d) => MssqlParam::Double(d),
-        CfmlValue::Binary(b) => MssqlParam::Bytes(b),
+        CfmlValue::Binary(b) => MssqlParam::Bytes(std::sync::Arc::try_unwrap(b).unwrap_or_else(|a| (*a).clone())),
         CfmlValue::DateTime(d) => {
             let w = crate::dates::db_wall(&d);
             match d.kind() {
@@ -14804,7 +14821,7 @@ fn mssql_column_to_cfml_typed(row: &tiberius::Row, col_idx: usize) -> CfmlValue 
         // Binary types → CFML Binary.
         ColumnType::BigVarBin | ColumnType::BigBinary | ColumnType::Image =>
             match row.try_get::<&[u8], _>(col_idx) {
-                Ok(Some(b)) => CfmlValue::Binary(b.to_vec()),
+                Ok(Some(b)) => CfmlValue::binary(b.to_vec()),
                 _ => CfmlValue::Null,
             },
         // String / character types — all map to CFML String.
@@ -16645,7 +16662,7 @@ fn run_block_cipher(
 fn cipher_iv_arg(args: &[CfmlValue]) -> Option<Vec<u8>> {
     match args.get(4) {
         None | Some(CfmlValue::Null) => None,
-        Some(CfmlValue::Binary(b)) => Some(b.clone()),
+        Some(CfmlValue::Binary(b)) => Some(b.to_vec()),
         Some(other) => Some(other.as_string().into_bytes()),
     }
 }
@@ -16981,7 +16998,7 @@ fn fn_random_bytes(args: Vec<CfmlValue>) -> CfmlResult {
 
     let mut buf = vec![0u8; count as usize];
     rand::rngs::OsRng.fill_bytes(&mut buf);
-    Ok(CfmlValue::Binary(buf))
+    Ok(CfmlValue::binary(buf))
 }
 
 // `security` — inserting randomBytes() above took over the #[cfg] that used to
@@ -18656,7 +18673,7 @@ fn fn_file_read_binary(args: Vec<CfmlValue>) -> CfmlResult {
     }
     let path = get_str(&args, 0);
     match std::fs::read(&path) {
-        Ok(bytes) => Ok(CfmlValue::Binary(bytes)),
+        Ok(bytes) => Ok(CfmlValue::binary(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(CfmlError::file_not_found(format!("The file [{}] does not exist", path)))
         }
@@ -20402,7 +20419,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                         p_entry.clone()
                     };
                     let bytes = match content {
-                        CfmlValue::Binary(b) => b.clone(),
+                        CfmlValue::Binary(b) => b.to_vec(),
                         other => other.as_string().into_bytes(),
                     };
                     zip_writer.start_file(&name, options).map_err(|e| CfmlError::runtime(e.to_string()))?;
@@ -20588,7 +20605,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 .map_err(|e| CfmlError::runtime(format!("cfzip: entry '{}' not found: {}", entry_path, e)))?;
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
-            Ok(CfmlValue::Binary(buf))
+            Ok(CfmlValue::binary(buf))
         }
         "delete" => {
             if file_path.is_empty() || entry_path.is_empty() {

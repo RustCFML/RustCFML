@@ -103,7 +103,7 @@ fn cfcontent_file_serves_binary_bytes_verbatim() {
     let s = serve(r##"<cfcontent file="#expandPath('/logo.png')#" type="image/png">"##);
     match s.body {
         Some(CfmlValue::Binary(bytes)) => {
-            assert_eq!(bytes, PNG_BYTES, "binary file must stream verbatim");
+            assert_eq!(bytes.as_slice(), PNG_BYTES, "binary file must stream verbatim");
         }
         other => panic!("expected Binary response_body, got {:?}", other),
     }

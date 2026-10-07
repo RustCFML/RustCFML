@@ -82,7 +82,7 @@ pub struct TraceRow {
 #[derive(Default)]
 pub struct DebugData {
     pub queries: Vec<QueryRow>,
-    pub templates: Vec<TemplateHit>,
+    pub templates: TemplateAgg,
     pub exceptions: Vec<ExceptionRow>,
     pub generic: Vec<GenericRow>,
     pub traces: Vec<TraceRow>,
@@ -248,12 +248,8 @@ impl VmObserver for DebugCollector {
 
     fn on_template(&self, t: &TemplateEvent) {
         if let Ok(mut d) = self.inner.lock() {
-            d.templates.push(TemplateHit {
-                path: t.path.to_string(),
-                method: t.method.unwrap_or_default().to_string(),
-                time: t.elapsed_us,
-                alloc: t.alloc_bytes,
-            });
+            d.templates
+                .record(t.path, t.method.unwrap_or_default(), t.elapsed_us, t.alloc_bytes);
         }
     }
 
@@ -284,6 +280,7 @@ impl VmObserver for DebugCollector {
 // ── Aggregation ─────────────────────────────────────────────────────────────
 
 /// One aggregated `pages` row.
+#[derive(Clone)]
 struct PageAgg {
     id: String,
     count: i64,
@@ -300,6 +297,7 @@ struct PageAgg {
 
 /// One method within a `PageAgg` — a CFC row is usually many *different*
 /// methods, so the count on the file row alone hides where the time went.
+#[derive(Clone)]
 struct MethodAgg {
     name: String,
     count: i64,
@@ -307,10 +305,78 @@ struct MethodAgg {
     alloc: u64,
 }
 
-/// Aggregate template hits into `pages` rows, optionally leading with the main
-/// page. The main page is listed first, then each included template in encounter
-/// order — matching Lucee's habit of showing the requested page plus every
-/// `<cfinclude>`/render below it.
+impl PageAgg {
+    fn new(id: &str) -> Self {
+        PageAgg { id: id.to_string(), count: 0, min: i64::MAX, max: i64::MIN, total: 0, alloc: 0, methods: Vec::new() }
+    }
+
+    fn add(&mut self, method: &str, time: i64, alloc: u64) {
+        self.count += 1;
+        self.total += time;
+        self.alloc += alloc;
+        self.min = self.min.min(time);
+        self.max = self.max.max(time);
+        if method.is_empty() {
+            return;
+        }
+        // Method names are case-insensitive in CFML; fold `getFoo`/`GETFOO`
+        // into one row, keeping the casing first seen.
+        if let Some(m) = self.methods.iter_mut().find(|m| m.name.eq_ignore_ascii_case(method)) {
+            m.count += 1;
+            m.total += time;
+            m.alloc += alloc;
+        } else {
+            self.methods.push(MethodAgg { name: method.to_string(), count: 1, total: time, alloc });
+        }
+    }
+}
+
+/// Template executions aggregated AS THEY HAPPEN into one row per file (and
+/// per method within it), in first-encounter order.
+///
+/// This used to keep one `TemplateHit` per execution — two freshly allocated
+/// strings each — and aggregate at render time by cloning the whole list and
+/// searching it linearly per hit. A Preside boot makes ~715k timed calls: the
+/// footer's own bookkeeping was ~180 MB, and because a hit was recorded after
+/// the frame's byte count was taken, that allocation landed on the CALLER's
+/// row (anything making many small calls looked heavy). Memory is now per row.
+#[derive(Default)]
+pub struct TemplateAgg {
+    pages: Vec<PageAgg>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl TemplateAgg {
+    pub fn record(&mut self, path: &str, method: &str, time: i64, alloc: u64) {
+        let i = match self.index.get(path) {
+            Some(&i) => i,
+            None => {
+                self.pages.push(PageAgg::new(path));
+                self.index.insert(path.to_string(), self.pages.len() - 1);
+                self.pages.len() - 1
+            }
+        };
+        self.pages[i].add(method, time, alloc);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    #[cfg(test)]
+    fn from_hits(hits: &[TemplateHit]) -> Self {
+        let mut a = TemplateAgg::default();
+        for h in hits {
+            a.record(&h.path, &h.method, h.time, h.alloc);
+        }
+        a
+    }
+}
+
+/// Aggregated `pages` rows, optionally leading with the main page. The main page
+/// is listed first, then each included template in encounter order — matching
+/// Lucee's habit of showing the requested page plus every `<cfinclude>`/render
+/// below it.
 ///
 /// The main page's time is the request total MINUS every recorded frame, not the
 /// total itself. Only includes, component methods and custom tags open a timed
@@ -327,79 +393,35 @@ struct MethodAgg {
 /// the page's own cost. The request total is still reported on its own, in the
 /// summary line above this table.
 fn aggregate_pages_with_main(
-    templates: &[TemplateHit],
+    templates: &TemplateAgg,
     main_page: Option<&str>,
     total_us: i64,
     total_alloc: u64,
 ) -> Vec<PageAgg> {
-    let mut hits: Vec<TemplateHit> = Vec::new();
+    let mut out: Vec<PageAgg> = Vec::with_capacity(templates.pages.len() + 1);
     if let Some(p) = main_page {
         // Template hits are never clipped (unlike queries, which have
         // `max_records`), so this subtraction can't silently over-credit the
         // page. `max(0)` guards only against per-frame microsecond truncation.
-        let frames_us: i64 = templates.iter().map(|t| t.time).sum();
+        let frames_us: i64 = templates.pages.iter().map(|t| t.total).sum();
         // The same residual in bytes: what the request allocated outside every
         // timed frame is the page's own.
-        let frames_alloc: u64 = templates.iter().map(|t| t.alloc).sum();
-        hits.push(TemplateHit {
-            path: p.to_string(),
-            method: String::new(),
-            time: (total_us - frames_us).max(0),
-            alloc: total_alloc.saturating_sub(frames_alloc),
-        });
-    }
-    hits.extend_from_slice(templates);
-    aggregate_pages(&hits)
-}
-
-fn aggregate_pages(templates: &[TemplateHit]) -> Vec<PageAgg> {
-    let mut out: Vec<PageAgg> = Vec::new();
-    for t in templates {
-        let page = match out.iter_mut().position(|p| p.id == t.path) {
-            Some(i) => {
-                let p = &mut out[i];
-                p.count += 1;
-                p.total += t.time;
-                p.alloc += t.alloc;
-                p.min = p.min.min(t.time);
-                p.max = p.max.max(t.time);
-                p
-            }
-            None => {
-                out.push(PageAgg {
-                    id: t.path.clone(),
-                    count: 1,
-                    min: t.time,
-                    max: t.time,
-                    total: t.time,
-                    alloc: t.alloc,
-                    methods: Vec::new(),
-                });
-                out.last_mut().expect("just pushed")
-            }
-        };
-        if t.method.is_empty() {
-            continue;
+        let frames_alloc: u64 = templates.pages.iter().map(|t| t.alloc).sum();
+        let mut main = PageAgg::new(p);
+        main.add("", (total_us - frames_us).max(0), total_alloc.saturating_sub(frames_alloc));
+        // The main page re-entered as a frame (included again) folds into its row.
+        if let Some(&i) = templates.index.get(p) {
+            let t = &templates.pages[i];
+            main.count += t.count;
+            main.total += t.total;
+            main.alloc += t.alloc;
+            main.min = main.min.min(t.min);
+            main.max = main.max.max(t.max);
+            main.methods = t.methods.clone();
         }
-        // Method names are case-insensitive in CFML; fold `getFoo`/`GETFOO`
-        // into one row, keeping the casing first seen.
-        if let Some(m) = page
-            .methods
-            .iter_mut()
-            .find(|m| m.name.eq_ignore_ascii_case(&t.method))
-        {
-            m.count += 1;
-            m.total += t.time;
-            m.alloc += t.alloc;
-        } else {
-            page.methods.push(MethodAgg {
-                name: t.method.clone(),
-                count: 1,
-                total: t.time,
-                alloc: t.alloc,
-            });
-        }
+        out.push(main);
     }
+    out.extend(templates.pages.iter().filter(|t| Some(t.id.as_str()) != main_page).cloned());
     // Busiest method first within each file — that's the one you're looking for.
     for p in &mut out {
         p.methods.sort_by(|a, b| b.total.cmp(&a.total));
@@ -1622,7 +1644,7 @@ mod tests {
             TemplateHit { path: "/svc.cfc".into(), method: "b".into(), time: 3_000, alloc: 0 },
             TemplateHit { path: "/svc.cfc".into(), method: "c".into(), time: 500, alloc: 0 },
         ];
-        let pages = aggregate_pages_with_main(&hits, Some("/index.cfm"), 10_000, 0);
+        let pages = aggregate_pages_with_main(&TemplateAgg::from_hits(&hits), Some("/index.cfm"), 10_000, 0);
 
         // The requested page reports what it spent in its OWN body, not the
         // request total — booking the total here double-counted every frame
@@ -1641,7 +1663,7 @@ mod tests {
 
         // A page that did all its work inside frames reports zero rather than
         // going negative on per-frame microsecond truncation.
-        let all_in_frames = aggregate_pages_with_main(&hits, Some("/index.cfm"), 6_000, 0);
+        let all_in_frames = aggregate_pages_with_main(&TemplateAgg::from_hits(&hits), Some("/index.cfm"), 6_000, 0);
         assert_eq!(all_in_frames.iter().find(|p| p.id == "/index.cfm").unwrap().total, 0);
     }
 
@@ -2017,7 +2039,7 @@ mod tests {
             TemplateHit { path: "/a.cfm".into(), method: String::new(), time: 10, alloc: 300 },
             TemplateHit { path: "/svc.cfc".into(), method: "go".into(), time: 10, alloc: 200 },
         ];
-        let pages = aggregate_pages_with_main(&hits, Some("/index.cfm"), 100, 1000);
+        let pages = aggregate_pages_with_main(&TemplateAgg::from_hits(&hits), Some("/index.cfm"), 100, 1000);
         assert_eq!(pages[0].alloc, 500, "1000 allocated, 500 of it in frames");
         assert_eq!(pages[2].methods[0].alloc, 200);
     }

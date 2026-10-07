@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn binary_resources_use_blob_not_text() {
         // A client rejects base64 delivered in `text`, and vice versa.
-        let r = resource_result("doc://x", None, &CfmlValue::Binary(b"foo".to_vec()));
+        let r = resource_result("doc://x", None, &CfmlValue::binary(b"foo".to_vec()));
         assert_eq!(r["contents"][0]["blob"], "Zm9v");
         assert!(r["contents"][0].get("text").is_none());
         assert_eq!(r["contents"][0]["mimeType"], "application/octet-stream");

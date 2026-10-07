@@ -94,7 +94,7 @@ fn key_error(msg: impl std::fmt::Display) -> CfmlError {
 /// `Binary` verbatim, anything else via its UTF-8 string form.
 fn bytes_of(v: &CfmlValue) -> Vec<u8> {
     match v {
-        CfmlValue::Binary(b) => b.clone(),
+        CfmlValue::Binary(b) => b.to_vec(),
         CfmlValue::Array(a) => a
             .snapshot()
             .iter()
@@ -202,8 +202,8 @@ fn digest_and_scheme(digest: SigDigest, data: &[u8]) -> (Vec<u8>, Pkcs1v15Sign) 
 fn public_key_value(n: &[u8], e: &[u8]) -> CfmlValue {
     let mut m = shim(PUBLIC_KEY_CLASS);
     m.insert("__algorithm".to_string(), CfmlValue::string("RSA".to_string()));
-    m.insert("__n".to_string(), CfmlValue::Binary(n.to_vec()));
-    m.insert("__e".to_string(), CfmlValue::Binary(e.to_vec()));
+    m.insert("__n".to_string(), CfmlValue::binary(n.to_vec()));
+    m.insert("__e".to_string(), CfmlValue::binary(e.to_vec()));
     CfmlValue::strukt(m)
 }
 
@@ -532,7 +532,7 @@ pub fn handle_java_signature(method: &str, args: Vec<CfmlValue>, object: &CfmlVa
             }
             let mut m = shim(SIGNATURE_CLASS);
             m.insert("__algorithm".to_string(), CfmlValue::string(requested));
-            m.insert("__data".to_string(), CfmlValue::Binary(Vec::new()));
+            m.insert("__data".to_string(), CfmlValue::binary(Vec::new()));
             Ok(CfmlValue::strukt(m))
         }
         "getalgorithm" => Ok(CfmlValue::string(field_string(object, "__algorithm"))),
@@ -566,7 +566,7 @@ pub fn handle_java_signature(method: &str, args: Vec<CfmlValue>, object: &CfmlVa
             }
             // Reset the accumulated input, as Java's init* does: the same
             // instance is routinely re-inited for a second verification.
-            state.insert("__data".to_string(), CfmlValue::Binary(Vec::new()));
+            state.insert("__data".to_string(), CfmlValue::binary(Vec::new()));
             state.insert("__key".to_string(), key.clone());
             state.insert(
                 "__mode".to_string(),
@@ -584,7 +584,7 @@ pub fn handle_java_signature(method: &str, args: Vec<CfmlValue>, object: &CfmlVa
             if let Some(chunk) = args.first() {
                 data.extend_from_slice(&bytes_of(chunk));
             }
-            state.insert("__data".to_string(), CfmlValue::Binary(data));
+            state.insert("__data".to_string(), CfmlValue::binary(data));
             Ok(CfmlValue::Null)
         }
         "verify" => {
@@ -633,7 +633,7 @@ pub fn handle_java_signature(method: &str, args: Vec<CfmlValue>, object: &CfmlVa
                     &digest_bytes(digest, &data),
                 )?,
             };
-            Ok(CfmlValue::Binary(signed))
+            Ok(CfmlValue::binary(signed))
         }
         _ => Err(CfmlError::shim_unhandled(method)),
     }
@@ -700,7 +700,7 @@ pub fn handle_java_keyfactory(method: &str, args: Vec<CfmlValue>, object: &CfmlV
             RsaPrivateKey::from_pkcs8_der(&der).map_err(key_error)?;
             let mut m = shim(PRIVATE_KEY_CLASS);
             m.insert("__algorithm".to_string(), CfmlValue::string("RSA".to_string()));
-            m.insert("__pkcs8".to_string(), CfmlValue::Binary(der));
+            m.insert("__pkcs8".to_string(), CfmlValue::binary(der));
             Ok(CfmlValue::strukt(m))
         }
         _ => Err(CfmlError::shim_unhandled(method)),
@@ -741,7 +741,7 @@ fn ec_public_key_value(der: Vec<u8>) -> CfmlResult {
         "__curve".to_string(),
         CfmlValue::string(curve.std_name().to_string()),
     );
-    m.insert("__der".to_string(), CfmlValue::Binary(der));
+    m.insert("__der".to_string(), CfmlValue::binary(der));
     Ok(CfmlValue::strukt(m))
 }
 
@@ -754,7 +754,7 @@ fn ec_private_key_value(der: Vec<u8>) -> CfmlResult {
         "__curve".to_string(),
         CfmlValue::string(curve.std_name().to_string()),
     );
-    m.insert("__pkcs8".to_string(), CfmlValue::Binary(der));
+    m.insert("__pkcs8".to_string(), CfmlValue::binary(der));
     Ok(CfmlValue::strukt(m))
 }
 
@@ -773,7 +773,7 @@ pub fn handle_java_key_object(
                 let mut m = shim(class);
                 m.insert(
                     "__der".to_string(),
-                    CfmlValue::Binary(args.first().map(bytes_of).unwrap_or_default()),
+                    CfmlValue::binary(args.first().map(bytes_of).unwrap_or_default()),
                 );
                 Ok(CfmlValue::strukt(m))
             }
@@ -782,7 +782,7 @@ pub fn handle_java_key_object(
                 // the JWKS path. Both arrive as BigInteger shims.
                 let mut m = shim(class);
                 let magnitude = |i: usize| -> CfmlValue {
-                    CfmlValue::Binary(
+                    CfmlValue::binary(
                         args.get(i)
                             .map(|v| field_bytes(v, "__magnitude"))
                             .unwrap_or_default(),
@@ -821,25 +821,25 @@ pub fn handle_java_key_object(
         )),
         "getencoded" => match class {
             X509_SPEC_CLASS | PKCS8_SPEC_CLASS => {
-                Ok(CfmlValue::Binary(field_bytes(object, "__der")))
+                Ok(CfmlValue::binary(field_bytes(object, "__der")))
             }
-            PRIVATE_KEY_CLASS => Ok(CfmlValue::Binary(field_bytes(object, "__pkcs8"))),
+            PRIVATE_KEY_CLASS => Ok(CfmlValue::binary(field_bytes(object, "__pkcs8"))),
             PUBLIC_KEY_CLASS => {
                 // An EC public key carries its SPKI verbatim; only the RSA path
                 // has to re-encode from the modulus/exponent pair it stores.
                 let der = field_bytes(object, "__der");
                 if !der.is_empty() {
-                    return Ok(CfmlValue::Binary(der));
+                    return Ok(CfmlValue::binary(der));
                 }
                 use rsa::pkcs8::EncodePublicKey;
                 let key = rsa_public_from_key_shim(object)?;
                 let der = key.to_public_key_der().map_err(key_error)?;
-                Ok(CfmlValue::Binary(der.as_bytes().to_vec()))
+                Ok(CfmlValue::binary(der.as_bytes().to_vec()))
             }
             _ => Ok(CfmlValue::Null),
         },
-        "getmodulus" => Ok(CfmlValue::Binary(field_bytes(object, "__n"))),
-        "getpublicexponent" => Ok(CfmlValue::Binary(field_bytes(object, "__e"))),
+        "getmodulus" => Ok(CfmlValue::binary(field_bytes(object, "__n"))),
+        "getpublicexponent" => Ok(CfmlValue::binary(field_bytes(object, "__e"))),
         _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
@@ -936,8 +936,8 @@ pub fn handle_java_keypairgenerator(
                 };
                 let mut m = shim(KEYPAIR_CLASS);
                 m.insert("__algorithm".to_string(), CfmlValue::string(algorithm));
-                m.insert("__pkcs8".to_string(), CfmlValue::Binary(private));
-                m.insert("__der".to_string(), CfmlValue::Binary(public));
+                m.insert("__pkcs8".to_string(), CfmlValue::binary(private));
+                m.insert("__der".to_string(), CfmlValue::binary(public));
                 Ok(CfmlValue::strukt(m))
             }
         }
@@ -958,7 +958,7 @@ pub fn handle_java_keypair(method: &str, _args: Vec<CfmlValue>, object: &CfmlVal
             }
             let mut m = shim(PRIVATE_KEY_CLASS);
             m.insert("__algorithm".to_string(), CfmlValue::string(algorithm));
-            m.insert("__pkcs8".to_string(), CfmlValue::Binary(der));
+            m.insert("__pkcs8".to_string(), CfmlValue::binary(der));
             Ok(CfmlValue::strukt(m))
         }
         "getpublic" => {
@@ -1012,7 +1012,7 @@ pub fn handle_java_biginteger(
                 _ => (0, Vec::new()),
             };
             m.insert("__signum".to_string(), CfmlValue::Int(signum));
-            m.insert("__magnitude".to_string(), CfmlValue::Binary(magnitude));
+            m.insert("__magnitude".to_string(), CfmlValue::binary(magnitude));
             Ok(CfmlValue::strukt(m))
         }
         "bitlength" => {
@@ -1044,7 +1044,7 @@ pub fn handle_java_biginteger(
                 text
             }))
         }
-        "tobytearray" => Ok(CfmlValue::Binary(field_bytes(object, "__magnitude"))),
+        "tobytearray" => Ok(CfmlValue::binary(field_bytes(object, "__magnitude"))),
         _ => Err(CfmlError::shim_unhandled(method)),
     }
 }
@@ -1203,7 +1203,7 @@ mod tests {
     fn biginteger_is_signum_magnitude_not_twos_complement() {
         // High bit set: a two's-complement read would go negative and report a
         // different bitLength.
-        let magnitude = CfmlValue::Binary(vec![0xFFu8; 256]);
+        let magnitude = CfmlValue::binary(vec![0xFFu8; 256]);
         let big = handle_java_biginteger("init", vec![CfmlValue::Int(1), magnitude], &CfmlValue::Null)
             .unwrap();
         let bits = handle_java_biginteger("bitlength", vec![], &big).unwrap();

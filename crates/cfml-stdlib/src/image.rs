@@ -280,7 +280,7 @@ pub fn coerce_to_image(v: &CfmlValue) -> CfmlResult {
         }
         CfmlValue::Binary(b) => {
             let (img, format) = decode_bytes(b)?;
-            Ok(CfmlImage::new(img, String::new(), format).with_raw(b.clone()).into_value())
+            Ok(CfmlImage::new(img, String::new(), format).with_raw(b.to_vec()).into_value())
         }
         CfmlValue::String(s) => {
             let s = s.as_str();
@@ -361,7 +361,7 @@ pub fn fn_image_read(args: Vec<CfmlValue>) -> CfmlResult {
         }
         Some(CfmlValue::Binary(b)) => {
             let (img, format) = decode_bytes(b)?;
-            Ok(CfmlImage::new(img, String::new(), format).with_raw(b.clone()).into_value())
+            Ok(CfmlImage::new(img, String::new(), format).with_raw(b.to_vec()).into_value())
         }
         Some(CfmlValue::String(s)) => {
             let s = s.as_str();
@@ -1501,7 +1501,7 @@ impl CfmlImage {
             _ => self.format,
         };
         let bytes = self.encode(format, None)?;
-        Ok(CfmlValue::Binary(bytes))
+        Ok(CfmlValue::binary(bytes))
     }
 
     /// write(destination [, quality=0.75] [, overwrite=true]).
@@ -2143,7 +2143,7 @@ pub fn fn_qr_code_generate(args: Vec<CfmlValue>) -> CfmlResult {
     }
 
     let encoded = CfmlImage::new(dynamic, String::new(), format).encode(format, None)?;
-    Ok(CfmlValue::Binary(encoded))
+    Ok(CfmlValue::binary(encoded))
 }
 
 fn format_from_name(name: &str) -> Result<ImageFormat, CfmlError> {

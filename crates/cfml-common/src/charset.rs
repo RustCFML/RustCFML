@@ -131,6 +131,26 @@ fn encode_utf16(text: &str, big_endian: bool) -> Vec<u8> {
 /// correctly even when the caller asks for UTF-8 (probed), so a file written by
 /// one engine reads back on the other regardless of the declared charset. Only
 /// the single-byte encodings, which cannot carry a BOM, skip the sniff.
+/// [`decode`] for a buffer the caller owns: valid UTF-8 (the usual case) becomes
+/// the `String` in place — no second copy of the file. `fileRead` of a 275 KB
+/// cached page allocated 550 KB through the borrowing form.
+pub fn decode_vec(mut bytes: Vec<u8>, cs: Charset) -> String {
+    if matches!(cs, Charset::Utf8) {
+        match sniff_bom(&bytes) {
+            Some((Charset::Utf8, skip)) => {
+                bytes.drain(..skip);
+            }
+            Some(_) => return decode(&bytes, cs),
+            None => {}
+        }
+        return match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+    }
+    decode(&bytes, cs)
+}
+
 pub fn decode(bytes: &[u8], cs: Charset) -> String {
     match cs {
         Charset::Latin1 => bytes.iter().map(|&b| b as char).collect(),
@@ -467,5 +487,28 @@ mod tests {
         assert_eq!(resolve("US-ASCII"), Some(Charset::UsAscii));
         assert_eq!(resolve("not-a-charset"), None);
         assert_eq!(resolve(""), None);
+    }
+}
+
+#[cfg(test)]
+mod decode_vec_tests {
+    use super::*;
+
+    #[test]
+    fn decode_vec_matches_decode() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"plain ascii".to_vec(),
+            "caf\u{e9} \u{1F600}".as_bytes().to_vec(),
+            [&[0xEF, 0xBB, 0xBF][..], b"bom utf8"].concat(),
+            vec![0xFF, 0xFE, b'h', 0, b'i', 0],
+            vec![0xFE, 0xFF, 0, b'h', 0, b'i'],
+            vec![b'a', 0xC3, b'b', 0xFF],
+            Vec::new(),
+        ];
+        for cs in [Charset::Utf8, Charset::Latin1, Charset::Utf16Le] {
+            for c in &cases {
+                assert_eq!(decode_vec(c.clone(), cs), decode(c, cs), "{cs:?} {c:?}");
+            }
+        }
     }
 }

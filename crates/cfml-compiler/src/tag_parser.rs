@@ -1051,6 +1051,24 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(output) = attrs.get("output") {
                 sig.push_str(&format!(" output=\"{}\"", output));
             }
+            // Every other attribute is function metadata — `hint`, `description`,
+            // `roles`, and framework annotations such as WireBox's `provider` /
+            // `inject`. They were dropped here, so tag-syntax CFCs reported no
+            // `hint` in getMetaData().functions (Lucee does). Emitted in source
+            // order as literal script attributes (`"` and `#` doubled), and only
+            // for identifier-shaped names the script parser accepts.
+            for key in &attr_order {
+                let k = key.as_str();
+                if ["name", "access", "returntype", "output"].iter().any(|x| k.eq_ignore_ascii_case(x))
+                    || !k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if let Some(v) = attrs.get(key) {
+                    sig.push_str(&format!(" {}=\"{}\"", k, v.replace('"', "\"\"").replace('#', "##")));
+                }
+            }
             sig.push_str(" {\n");
 
             // `output="true"` means the body is processed AS IF INSIDE

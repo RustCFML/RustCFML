@@ -263,7 +263,7 @@ async fn driver(
                     // JSON text frame.
                     let send = if frame.ev.is_none() {
                         if let CfmlValue::Binary(bytes) = &frame.d {
-                            sink.send(Message::Binary(bytes.clone().into())).await
+                            sink.send(Message::Binary(bytes.to_vec().into())).await
                         } else {
                             sink.send(Message::Text(serialize_frame(&frame).into())).await
                         }
@@ -374,7 +374,7 @@ async fn driver(
                 handle_message_result(&state, &info, &conn_id, &session_id, reply_ref, r).await;
             }
             Message::Binary(b) => {
-                let payload = CfmlValue::Binary(b.to_vec());
+                let payload = CfmlValue::binary(b.to_vec());
                 let r = dispatch(
                     &state,
                     &info,

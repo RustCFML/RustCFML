@@ -492,9 +492,9 @@ fn queries_are_readable_and_writable_over_handles() {
 #[test]
 fn binary_round_trips_without_being_stringified() {
     let m = load();
-    let out = call(&m, "abiReverseBin", vec![CfmlValue::Binary(vec![1, 2, 3, 0, 255])]);
+    let out = call(&m, "abiReverseBin", vec![CfmlValue::binary(vec![1, 2, 3, 0, 255])]);
     match out {
-        CfmlValue::Binary(b) => assert_eq!(b, vec![255, 0, 3, 2, 1]),
+        CfmlValue::Binary(b) => assert_eq!(*b, vec![255, 0, 3, 2, 1]),
         other => panic!("expected Binary, got {other:?}"),
     }
 }

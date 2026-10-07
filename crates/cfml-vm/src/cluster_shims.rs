@@ -74,7 +74,7 @@ impl CfmlVirtualMachine {
             WRAPPER_CLASS => self.cluster_wrapper_method(method, args, object),
             MESSAGE_CLASS => match method {
                 "getbuffer" | "getrawbuffer" | "getarray" => {
-                    Ok(obj_field(object, "__buffer").unwrap_or(CfmlValue::Binary(Vec::new())))
+                    Ok(obj_field(object, "__buffer").unwrap_or(CfmlValue::binary(Vec::new())))
                 }
                 "getlength" => Ok(CfmlValue::Int(match obj_field(object, "__buffer") {
                     Some(CfmlValue::Binary(b)) => b.len() as i64,
@@ -215,7 +215,7 @@ impl CfmlVirtualMachine {
             "sendmessage" => {
                 let id = sub_id(object).ok_or_else(|| unsupported(CLASS, "sendMessage before init"))?;
                 let payload = match args.first() {
-                    Some(CfmlValue::Binary(b)) => b.clone(),
+                    Some(CfmlValue::Binary(b)) => b.to_vec(),
                     Some(v) => v.as_string().into_bytes(),
                     None => Vec::new(),
                 };

@@ -383,7 +383,7 @@ pub const VIEW_CLASS: &str = "org.jgroups.View";
 
 fn message_shim(bytes: Vec<u8>) -> CfmlValue {
     let mut m = shim(MESSAGE_CLASS);
-    m.insert("__buffer".to_string(), CfmlValue::Binary(bytes));
+    m.insert("__buffer".to_string(), CfmlValue::binary(bytes));
     CfmlValue::strukt(m)
 }
 

@@ -229,6 +229,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_hash_unknown_algorithm.cfm" />
 <cf_runtest file="stdlib/test_java_shim_silent_noops.cfm" />
 <cf_runtest file="stdlib/test_string_functions.cfm" />
+<cf_runtest file="stdlib/test_compare_case_folding.cfm" />
 <cf_runtest file="stdlib/test_replace_nocase_unicode.cfm" />
 <cf_runtest file="stdlib/test_encode_for_xml_lucee.cfm" />
 <cf_runtest file="stdlib/test_string_functions_regex.cfm" />
@@ -394,6 +395,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_ini_functions.cfm" />
 <cf_runtest file="stdlib/test_directorylist.cfm" />
 <cf_runtest file="stdlib/test_objectsave.cfm" />
+<cf_runtest file="stdlib/test_binary_shared_value.cfm" />
 <cf_runtest file="stdlib/test_writedump.cfm" />
 <cf_runtest file="stdlib/test_cfdirectory_type_filter.cfm" />
 <cf_runtest file="stdlib/test_cfhttp.cfm" />
@@ -517,6 +519,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_accessor_methods_per_class.cfm" />
 <cf_runtest file="oop/test_declarative_ctor_prototype.cfm" />
 <cf_runtest file="oop/test_component_path_double_dot.cfm" />
+<cf_runtest file="oop/test_tag_component_silent_body.cfm" />
 <cf_runtest file="tags/test_write_text_op.cfm" />
 <cf_runtest file="oop/test_component_bool_attr.cfm" />
 <cf_runtest file="oop/test_chained_writeback_clobber.cfm" />
@@ -759,6 +762,7 @@ include "harness.cfm";
 
 <!--- --- Java Shims --- --->
 <cf_runtest file="java_shims/test_all.cfm" />
+<cf_runtest file="java_shims/test_regex_matcher_cursor.cfm" />
 <!--- Needs a live S3 endpoint via S3SHIM_TEST_* env vars; skips otherwise. --->
 <cf_runtest file="java_shims/test_s3storageprovider_shim.cfm" />
 <cf_runtest file="java_shims/test_java_util_concurrent_pool.cfm" />

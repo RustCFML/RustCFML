@@ -98,12 +98,12 @@ fn to_bytes(v: &CfmlValue) -> Vec<u8> {
     if let CfmlValue::Struct(s) = v {
         if s.contains_key("__java_shim") {
             if let Some(CfmlValue::Binary(b)) = s.get("__key") {
-                return b;
+                return (*b).clone();
             }
         }
     }
     match v {
-        CfmlValue::Binary(b) => b.clone(),
+        CfmlValue::Binary(b) => b.to_vec(),
         CfmlValue::Array(a) => {
             let items = a.snapshot();
             // A char[] arrives as one-character strings; a byte[] as ints.
@@ -216,13 +216,13 @@ pub fn handle_secret_key_spec(
                 (key, args.get(1).map(|v| v.as_string()).unwrap_or_default())
             };
             let mut m = shim(SECRET_KEY_SPEC_CLASS);
-            m.insert("__key".to_string(), CfmlValue::Binary(key));
+            m.insert("__key".to_string(), CfmlValue::binary(key));
             m.insert("__algorithm".to_string(), CfmlValue::string(algorithm));
             Ok(CfmlValue::strukt(m))
         }
         "getalgorithm" => Ok(CfmlValue::string(field_str(object, "__algorithm"))),
         "getencoded" => Ok(signed_array(&match field(object, "__key") {
-            Some(CfmlValue::Binary(b)) => b,
+            Some(CfmlValue::Binary(b)) => (*b).clone(),
             _ => Vec::new(),
         })),
         "getformat" => Ok(CfmlValue::string("RAW".to_string())),
@@ -255,13 +255,13 @@ pub fn handle_mac(
         "init" => {
             let key = args.first().map(to_bytes).unwrap_or_default();
             if let CfmlValue::Struct(s) = object {
-                s.insert("__key".to_string(), CfmlValue::Binary(key));
+                s.insert("__key".to_string(), CfmlValue::binary(key));
             }
             Ok(CfmlValue::Null)
         }
         "reset" => {
             if let CfmlValue::Struct(s) = object {
-                s.insert("__pending".to_string(), CfmlValue::Binary(Vec::new()));
+                s.insert("__pending".to_string(), CfmlValue::binary(Vec::new()));
             }
             Ok(CfmlValue::Null)
         }
@@ -270,14 +270,14 @@ pub fn handle_mac(
         // contract), then resets.
         "update" => {
             let mut pending = match field(object, "__pending") {
-                Some(CfmlValue::Binary(b)) => b,
+                Some(CfmlValue::Binary(b)) => (*b).clone(),
                 _ => Vec::new(),
             };
             if let Some(a) = args.first() {
                 pending.extend_from_slice(&to_bytes(a));
             }
             if let CfmlValue::Struct(s) = object {
-                s.insert("__pending".to_string(), CfmlValue::Binary(pending));
+                s.insert("__pending".to_string(), CfmlValue::binary(pending));
             }
             Ok(CfmlValue::Null)
         }
@@ -294,7 +294,7 @@ pub fn handle_mac(
                 }
             };
             let mut message = match field(object, "__pending") {
-                Some(CfmlValue::Binary(b)) => b,
+                Some(CfmlValue::Binary(b)) => (*b).clone(),
                 _ => Vec::new(),
             };
             if let Some(a) = args.first() {
@@ -303,7 +303,7 @@ pub fn handle_mac(
             let alg = field_str(object, "__algorithm");
 
             let hex = hmac(vec![
-                CfmlValue::Binary(message),
+                CfmlValue::binary(message),
                 CfmlValue::Binary(key),
                 CfmlValue::string(alg),
             ])?
@@ -312,7 +312,7 @@ pub fn handle_mac(
             // Java resets the Mac after doFinal, so a second message does not
             // silently inherit the first one's bytes.
             if let CfmlValue::Struct(s) = object {
-                s.insert("__pending".to_string(), CfmlValue::Binary(Vec::new()));
+                s.insert("__pending".to_string(), CfmlValue::binary(Vec::new()));
             }
             Ok(signed_array(&decode_hex(&hex)))
         }
@@ -342,11 +342,11 @@ pub fn handle_pbe_key_spec(
             let mut m = shim(PBE_KEY_SPEC_CLASS);
             m.insert(
                 "__password".to_string(),
-                CfmlValue::Binary(args.first().map(to_bytes).unwrap_or_default()),
+                CfmlValue::binary(args.first().map(to_bytes).unwrap_or_default()),
             );
             m.insert(
                 "__salt".to_string(),
-                CfmlValue::Binary(args.get(1).map(to_bytes).unwrap_or_default()),
+                CfmlValue::binary(args.get(1).map(to_bytes).unwrap_or_default()),
             );
             let num = |i: usize| -> i64 {
                 args.get(i)
@@ -360,7 +360,7 @@ pub fn handle_pbe_key_spec(
         "getiterationcount" => Ok(CfmlValue::Int(field_int(object, "__iterations", 0))),
         "getkeylength" => Ok(CfmlValue::Int(field_int(object, "__keylength", 0))),
         "getsalt" => Ok(signed_array(&match field(object, "__salt") {
-            Some(CfmlValue::Binary(b)) => b,
+            Some(CfmlValue::Binary(b)) => (*b).clone(),
             _ => Vec::new(),
         })),
         // Java hands back a char[]; a CFML caller almost always just wants it
@@ -376,7 +376,7 @@ pub fn handle_pbe_key_spec(
         )),
         "clearpassword" => {
             if let CfmlValue::Struct(s) = object {
-                s.insert("__password".to_string(), CfmlValue::Binary(Vec::new()));
+                s.insert("__password".to_string(), CfmlValue::binary(Vec::new()));
             }
             Ok(CfmlValue::Null)
         }
@@ -422,7 +422,7 @@ pub fn handle_secret_key_factory(
                 }
             };
             let salt = match field(&spec, "__salt") {
-                Some(CfmlValue::Binary(b)) => b,
+                Some(CfmlValue::Binary(b)) => (*b).clone(),
                 _ => Vec::new(),
             };
             let iterations = field_int(&spec, "__iterations", 0);
@@ -431,14 +431,14 @@ pub fn handle_secret_key_factory(
             let b64 = pbkdf(vec![
                 CfmlValue::string(field_str(object, "__algorithm")),
                 CfmlValue::Binary(password),
-                CfmlValue::Binary(salt),
+                CfmlValue::binary(salt),
                 CfmlValue::Int(iterations),
                 CfmlValue::Int(key_length),
             ])?
             .as_string();
 
             let mut m = shim(SECRET_KEY_CLASS);
-            m.insert("__key".to_string(), CfmlValue::Binary(decode_base64(&b64)));
+            m.insert("__key".to_string(), CfmlValue::binary(decode_base64(&b64)));
             m.insert(
                 "__algorithm".to_string(),
                 CfmlValue::string(field_str(object, "__algorithm")),
@@ -479,7 +479,7 @@ pub fn handle_secure_random(
                     .unwrap_or(0);
                 let bytes = random_bytes(n.max(0))?;
                 return Ok(signed_array(&match bytes {
-                    CfmlValue::Binary(b) => b,
+                    CfmlValue::Binary(b) => (*b).clone(),
                     other => to_bytes(&other),
                 }));
             }
@@ -503,7 +503,7 @@ pub fn handle_secure_random(
                 return Ok(CfmlValue::Null);
             }
             let bytes = match random_bytes(len as i64)? {
-                CfmlValue::Binary(b) => b,
+                CfmlValue::Binary(b) => (*b).clone(),
                 other => to_bytes(&other),
             };
             for (i, b) in bytes.iter().enumerate().take(len) {
@@ -513,7 +513,7 @@ pub fn handle_secure_random(
         }
         "nextint" => {
             let bytes = match random_bytes(4)? {
-                CfmlValue::Binary(b) => b,
+                CfmlValue::Binary(b) => (*b).clone(),
                 other => to_bytes(&other),
             };
             let raw = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -537,7 +537,7 @@ pub fn handle_secure_random(
         }
         "nextlong" => {
             let bytes = match random_bytes(8)? {
-                CfmlValue::Binary(b) => b,
+                CfmlValue::Binary(b) => (*b).clone(),
                 other => to_bytes(&other),
             };
             let mut a = [0u8; 8];
@@ -546,14 +546,14 @@ pub fn handle_secure_random(
         }
         "nextboolean" => {
             let bytes = match random_bytes(1)? {
-                CfmlValue::Binary(b) => b,
+                CfmlValue::Binary(b) => (*b).clone(),
                 other => to_bytes(&other),
             };
             Ok(CfmlValue::Bool(bytes[0] & 1 == 1))
         }
         "nextdouble" | "nextfloat" => {
             let bytes = match random_bytes(8)? {
-                CfmlValue::Binary(b) => b,
+                CfmlValue::Binary(b) => (*b).clone(),
                 other => to_bytes(&other),
             };
             let mut a = [0u8; 8];

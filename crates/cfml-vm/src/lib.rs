@@ -34,6 +34,7 @@ mod intercepts_common;
 mod intercepts_extensions;
 mod intercepts_deferred;
 mod intercepts_querydir;
+mod intercepts_objectio;
 mod intercepts_varpath;
 mod intercepts_output;
 mod intercepts_realtime;
@@ -5767,6 +5768,40 @@ impl CfmlVirtualMachine {
                 alloc_bytes,
             });
         }
+    }
+
+    /// Run the cycle collector's incremental sweep check (a no-op until the
+    /// request's tracked-allocation log reaches its budget). When a sweep runs
+    /// and the debug footer is collecting, it gets its own `(cycle collector)`
+    /// row, credited as a CHILD of the open frame the way `<compile>` is — it
+    /// used to land in whatever constructor happened to trigger it (a 2-method
+    /// `LogLevels` showed 118 KB per instance on a Preside boot).
+    fn collect_incremental_observed(&mut self) {
+        #[cfg(feature = "observability")]
+        if self.interest.contains(observe::Interest::TEMPLATE) {
+            let sweeps = cfml_common::cycle_gc::request_sweeps();
+            let t0 = std::time::Instant::now();
+            let a0 = self
+                .mem_meter
+                .is_some()
+                .then(|| cfml_common::mem_account::thread_totals().allocated);
+            cfml_common::cycle_gc::collect_incremental();
+            if cfml_common::cycle_gc::request_sweeps() != sweeps {
+                let us = t0.elapsed().as_micros() as i64;
+                let bytes = a0.map_or(0, |a| {
+                    cfml_common::mem_account::thread_totals().allocated.saturating_sub(a)
+                });
+                if let Some(child) = self.tmpl_child_us_stack.last_mut() {
+                    *child += us;
+                }
+                if let Some(parent) = self.tmpl_alloc_stack.last_mut() {
+                    parent.1 += bytes;
+                }
+                self.fire_template("(cycle collector)", Some("<sweep>"), us, bytes);
+            }
+            return;
+        }
+        cfml_common::cycle_gc::collect_incremental();
     }
 
     /// Mark the start of a timed template/method frame: push a fresh child-time
@@ -17040,6 +17075,13 @@ impl CfmlVirtualMachine {
                 }
             }
 
+            if intercepts_objectio::handles(&name_lower) {
+                match self.dispatch_objectio(&name_lower, args.clone(), parent_locals) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
+                }
+            }
+
             // Reflective variable paths need the CALLING frame's scope chain, so
             // they take `parent_locals` on top of the usual (name, args).
             // Introspection that must include loaded extensions.
@@ -20655,7 +20697,7 @@ impl CfmlVirtualMachine {
                             // equally correct for text payloads (bytes are bytes).
                             match self.vfs.read(&file_path) {
                                 Ok(bytes) => {
-                                    self.response_body = Some(CfmlValue::Binary(bytes));
+                                    self.response_body = Some(CfmlValue::binary(bytes));
                                 }
                                 Err(e) => {
                                     return Err(CfmlError::runtime(format!(
@@ -26136,7 +26178,7 @@ impl CfmlVirtualMachine {
                 let bytes = std::fs::read(&path).unwrap_or_default();
                 (CfmlValue::string(path), bytes)
             }
-            CfmlValue::Binary(b) => (CfmlValue::Binary(b.clone()), b.clone()),
+            CfmlValue::Binary(b) => (CfmlValue::Binary(b.clone()), b.to_vec()),
             other => {
                 let path = other.as_string();
                 let bytes = std::fs::read(&path).unwrap_or_default();
@@ -34883,7 +34925,7 @@ impl CfmlVirtualMachine {
         }
         // Construction is where the collector's incremental sweep (and the
         // `--max-memory` guard riding on it) gets its chance; keep that.
-        cfml_common::cycle_gc::collect_incremental();
+        self.collect_incremental_observed();
         Some(value)
     }
 
@@ -37958,7 +38000,7 @@ impl CfmlVirtualMachine {
             // The next ordinary construction picks the log up, by which time
             // the frame temporaries in it are dead and cheap to skip.
             if self.meta_template_depth == 0 {
-                cfml_common::cycle_gc::collect_incremental();
+                self.collect_incremental_observed();
             }
             // First construction of this class under this key in the request:
             // record what every later construction can take from one probe.
@@ -40532,7 +40574,7 @@ impl CfmlVirtualMachine {
                 Some(
                     self.vfs
                         .read(&path)
-                        .map(CfmlValue::Binary)
+                        .map(CfmlValue::binary)
                         .map_err(|e| CfmlError::runtime(format!("fileReadBinary: {}", e))),
                 )
             }
@@ -44451,10 +44493,14 @@ pub(crate) fn arith_operand(v: &CfmlValue) -> Result<f64, CfmlError> {
 /// are all true while `2 == "true"` is false (2 ≠ 1). `None` for anything else,
 /// including the empty string (`isBoolean("")` is false → `"" == "false"` false).
 fn bool_literal_to_num(s: &str) -> Option<f64> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" => Some(1.0),
-        "false" | "no" => Some(0.0),
-        _ => None,
+    // No lowercased copy: this runs on every string `==`, mostly to say "no".
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes") {
+        Some(1.0)
+    } else if s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no") {
+        Some(0.0)
+    } else {
+        None
     }
 }
 
@@ -44751,7 +44797,7 @@ pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
             {
                 return da.cmp_seconds(&db) as i32;
             }
-            x.to_lowercase().cmp(&y.to_lowercase()) as i32
+            cfml_common::text::cmp_ignore_case(x, y) as i32
         }
         _ => {
             // Mixed String/number (and other combos). Lucee: if BOTH operands are
@@ -44769,7 +44815,7 @@ pub(crate) fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
             };
             match (num(a), num(b)) {
                 (Some(x), Some(y)) => x.partial_cmp(&y).map_or(0, |o| o as i32),
-                _ => a.as_string().to_lowercase().cmp(&b.as_string().to_lowercase()) as i32,
+                _ => cfml_common::text::cmp_ignore_case(&a.as_str_cow(), &b.as_str_cow()) as i32,
             }
         }
     }

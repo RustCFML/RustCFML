@@ -139,9 +139,9 @@ pub fn cfhttp_write_body_to_file(
         )));
     }
     let target = dir_path.join(file_name);
-    let bytes: Vec<u8> = match body {
-        CfmlValue::Binary(b) => b.clone(),
-        other => other.as_string().into_bytes(),
+    let bytes: std::borrow::Cow<[u8]> = match body {
+        CfmlValue::Binary(b) => std::borrow::Cow::Borrowed(b.as_slice()),
+        other => std::borrow::Cow::Owned(other.as_string().into_bytes()),
     };
     std::fs::write(&target, bytes).map_err(|e| {
         CfmlError::io_exception(format!("cannot write [{}]: {}", target.display(), e))

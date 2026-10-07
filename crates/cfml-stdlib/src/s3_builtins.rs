@@ -50,7 +50,7 @@ fn client_for_args(
 /// charset (default UTF-8); Binary is passed through; numbers are stringified.
 fn value_to_bytes(v: &CfmlValue, _charset: Option<&str>) -> Result<Vec<u8>, CfmlError> {
     match v {
-        CfmlValue::Binary(b) => Ok(b.clone()),
+        CfmlValue::Binary(b) => Ok(b.to_vec()),
         CfmlValue::String(s) => Ok(s.as_bytes().to_vec()),
         CfmlValue::Int(i) => Ok(i.to_string().into_bytes()),
         CfmlValue::Double(d) => Ok(d.to_string().into_bytes()),
@@ -82,7 +82,7 @@ pub fn fn_s3_read_binary(args: Vec<CfmlValue>) -> CfmlResult {
     let (k, s, h) = cred_args(&args, 2);
     let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
     let bytes = s3_get_object(&client, &bucket, &cfg.full_key(&object))?;
-    Ok(CfmlValue::Binary(bytes))
+    Ok(CfmlValue::binary(bytes))
 }
 
 /// S3Write(bucket, object, value [, charset, mimeType, acl, location, accessKeyId, secretKey, host])

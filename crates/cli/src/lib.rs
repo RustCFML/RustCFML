@@ -3924,7 +3924,7 @@ fn build_success_response(
     // diagnostic placeholder text and corrupt the response.
     let body = if let Some(ref body_override) = response.response_body {
         match body_override {
-            CfmlValue::Binary(bytes) => axum::body::Body::from(bytes.clone()),
+            CfmlValue::Binary(bytes) => axum::body::Body::from(bytes.to_vec()),
             other => axum::body::Body::from(other.as_string()),
         }
     } else {

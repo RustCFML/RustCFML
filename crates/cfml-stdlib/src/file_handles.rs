@@ -249,7 +249,7 @@ pub fn read_binary(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Double(d) if *d > 0.0 => Some(*d as u64),
         _ => None,
     });
-    Ok(CfmlValue::Binary(read_bytes("fileReadBinary", &args, n)?))
+    Ok(CfmlValue::binary(read_bytes("fileReadBinary", &args, n)?))
 }
 
 fn read_bytes(fn_name: &str, args: &[CfmlValue], n: Option<u64>) -> Result<Vec<u8>, CfmlError> {

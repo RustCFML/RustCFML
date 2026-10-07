@@ -223,7 +223,7 @@ impl CfmlNative for CfmlPdf {
 /// The bytes behind a path, a Binary, or an existing Pdf object.
 fn source_bytes(v: Option<&CfmlValue>) -> Result<(Vec<u8>, String), CfmlError> {
     match v {
-        Some(CfmlValue::Binary(b)) => Ok((b.clone(), String::new())),
+        Some(CfmlValue::Binary(b)) => Ok((b.to_vec(), String::new())),
         Some(other) => {
             let path = other.as_string();
             if path.trim().is_empty() {
