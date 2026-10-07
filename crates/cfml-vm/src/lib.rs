@@ -13439,6 +13439,16 @@ impl CfmlVirtualMachine {
                                 ip = self.route_call_error(e, &mut stack)?;
                                 continue;
                             }
+                            if let CfmlValue::Query(ref q) = *obj {
+                                // `q.col = v` sets the current row's cell (GH #478).
+                                let q = q.clone();
+                                if let Err(e) =
+                                    ops::access::query_dot_store(&q, prop_name.as_str(), value)
+                                {
+                                    ip = self.route_call_error(e, &mut stack)?;
+                                }
+                                continue;
+                            }
                             if let Some(s) = obj.as_cfml_struct() {
                                 s.insert(prop_name.key(), value);
                             } else {
@@ -13478,6 +13488,11 @@ impl CfmlVirtualMachine {
                             let is_compound_receiver = |v: &CfmlValue| {
                                 v.as_cfml_struct().is_some()
                                     || v.as_component().is_some_and(|c| c.is_instance_backed())
+                                    // A query found up the cascade takes the
+                                    // cell write below, instead of being passed
+                                    // over and shadowed by a vivified struct
+                                    // (GH #478).
+                                    || matches!(v, CfmlValue::Query(_))
                             };
                             let existing_arg = if let Some(CfmlValue::Struct(args_scope)) =
                                 locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
@@ -13522,6 +13537,17 @@ impl CfmlVirtualMachine {
                                 match &existing {
                                     CfmlValue::Struct(st) => {
                                         st.insert(prop_name.key(), value);
+                                    }
+                                    CfmlValue::Query(q) => {
+                                        let q = q.clone();
+                                        if let Err(e) = ops::access::query_dot_store(
+                                            &q,
+                                            prop_name.as_str(),
+                                            value,
+                                        ) {
+                                            ip = self.route_call_error(e, &mut stack)?;
+                                            continue;
+                                        }
                                     }
                                     _ => existing.set(prop_name.to_string(), value),
                                 }
@@ -19879,6 +19905,18 @@ impl CfmlVirtualMachine {
                                                 "required".to_string(),
                                                 CfmlValue::Bool(p.required),
                                             );
+                                            // `default`, exactly as the UDF
+                                            // metadata path reports it: the
+                                            // literal for a literal default,
+                                            // "[runtime expression]" otherwise.
+                                            // Frameworks read parameter defaults
+                                            // from component metadata (WireBox,
+                                            // TestBox, Preside's REST reader), and
+                                            // this path omitted the key entirely
+                                            // (GH #468).
+                                            if let Some(ref d) = p.default {
+                                                pm.insert("default".to_string(), d.clone());
+                                            }
                                             for (k, v) in &p.annotations {
                                                 pm.insert(
                                                     k.clone(),
@@ -22098,7 +22136,14 @@ impl CfmlVirtualMachine {
                         } else {
                             let mut cs = ValueMap::default();
                             cs.insert(name.clone(), cookie_val);
-                            self.globals.insert("cookie".to_string(), CfmlValue::strukt(cs));
+                            // Marked like the request-built scope, so a later
+                            // long-form write through it is collapsed to its
+                            // value too (GH #480).
+                            let scope = CfmlValue::strukt(cs);
+                            if let CfmlValue::Struct(ref st) = scope {
+                                st.mark_cookie_scope();
+                            }
+                            self.globals.insert("cookie".to_string(), scope);
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -25072,10 +25117,10 @@ impl CfmlVirtualMachine {
         root: &CfmlValue,
         keys: &[S],
         value: CfmlValue,
-    ) {
+    ) -> Result<(), CfmlError> {
         let (leaf, mids) = match keys.split_last() {
             Some(x) => x,
-            None => return,
+            None => return Ok(()),
         };
         let leaf = leaf.as_ref();
         let mut cur = root.clone();
@@ -25085,6 +25130,11 @@ impl CfmlVirtualMachine {
                 CfmlValue::Struct(s) => match s.get_ci(k) {
                     Some(v @ CfmlValue::Struct(_)) => v,
                     Some(v @ CfmlValue::Instance(_)) => v,
+                    // A query intermediate is DESCENDED INTO, not replaced:
+                    // `args.detail.col = v` sets the cell of the query held in
+                    // `detail`. Replacing it with a fresh struct lost the whole
+                    // recordset (GH #478).
+                    Some(v @ CfmlValue::Query(_)) => v,
                     _ => {
                         let ns = CfmlValue::strukt(ValueMap::default());
                         s.insert(k, ns.clone());
@@ -25104,7 +25154,7 @@ impl CfmlVirtualMachine {
                         ns
                     }
                 },
-                _ => return, // non-navigable intermediate
+                _ => return Ok(()), // non-navigable intermediate
             };
             cur = next;
         }
@@ -25117,8 +25167,12 @@ impl CfmlVirtualMachine {
             CfmlValue::Instance(inst) => {
                 inst.read().set_public_member(leaf.to_string(), value);
             }
+            CfmlValue::Query(q) => {
+                ops::access::query_dot_store(q, leaf, value)?;
+            }
             _ => {}
         }
+        Ok(())
     }
 
     /// Store through a dotted path whose text is only known at runtime. Splits,
@@ -25248,7 +25302,11 @@ impl CfmlVirtualMachine {
             return false;
         }
         #[cfg(feature = "component-instance")]
-        Self::store_member_path_in_place(&root, &parts[start..], value.clone());
+        if Self::store_member_path_in_place(&root, &parts[start..], value.clone()).is_err() {
+            // The in-place walk refused (e.g. a write to a query column that
+            // doesn't exist). Fall back to the generic store, which raises it.
+            return false;
+        }
         // Without flyweight instances the generic store's own walk is the
         // equivalent: auto-vivify intermediate structs, set the leaf.
         #[cfg(not(feature = "component-instance"))]
@@ -25401,7 +25459,7 @@ impl CfmlVirtualMachine {
             // an in-place walk persists without any store-back of `a`.
             #[cfg(feature = "component-instance")]
             if matches!(root, CfmlValue::Instance(_)) {
-                Self::store_member_path_in_place(&root, &parts[1..], value);
+                Self::store_member_path_in_place(&root, &parts[1..], value)?;
                 return Ok(());
             }
             let root = if matches!(root, CfmlValue::Struct(_)) {
@@ -25419,7 +25477,7 @@ impl CfmlVirtualMachine {
             // byte-for-byte (no Instances exist there).
             #[cfg(feature = "component-instance")]
             if matches!(root, CfmlValue::Struct(_)) {
-                Self::store_member_path_in_place(&root, &parts[1..], value);
+                Self::store_member_path_in_place(&root, &parts[1..], value)?;
             }
             #[cfg(not(feature = "component-instance"))]
             if let CfmlValue::Struct(ref s) = root {
@@ -26017,7 +26075,10 @@ impl CfmlVirtualMachine {
                 "value" | "object" => 0,
                 _ => return None,
             }),
-            _ => None,
+            // Every other builtin's declared parameter names (GH #482). The
+            // hand-written arms above take precedence; they cover intercepts
+            // whose signature is not a plain BIF signature.
+            _ => cfml_common::builtin_params::param_slot(builtin_lc, arg_lc),
         }
     }
 
@@ -26064,7 +26125,7 @@ impl CfmlVirtualMachine {
                 | "markdowndocument"
                 | "markdownescape"
                 | "ismarkdowndocument"
-        )
+        ) || cfml_common::builtin_params::has_signature(builtin_lc)
     }
 
     /// Route legacy `org.mindrot.jbcrypt.BCrypt` instance methods onto the native
@@ -29040,6 +29101,24 @@ impl CfmlVirtualMachine {
         arg_names: Option<&[String]>,
         caller_locals: &ValueMap,
     ) -> CfmlResult {
+        // A `q.col` reference is a proxy for the CURRENT ROW's cell (Lucee treats
+        // it as a string, not a column), so member calls act on that cell:
+        // `q.name.len()`, `q.name.reFind("^_")`. Without this the proxy matched
+        // no arm of the receiver match below and every such call returned an
+        // empty value — Preside's widget auto-discovery read
+        // `!views.name.reFind("^_")` as true and registered partial views as
+        // widgets (GH #475).
+        if matches!(object, CfmlValue::QueryColumn(..)) {
+            let scalar = object.query_column_scalar().clone();
+            return self.call_member_function_impl(
+                &scalar,
+                method,
+                extra_args,
+                arg_names,
+                caller_locals,
+            );
+        }
+
         let method_lower = method.to_lowercase();
         // Caller's `__variables` (set by the CallMethod op). Used as a fallback
         // for a receiver that has no `__variables` of its own yet — the
@@ -30371,14 +30450,19 @@ impl CfmlVirtualMachine {
                     if !matches!(extra_args.first(), Some(CfmlValue::Function(_))) =>
                 {
                     let target = match extra_args.first() {
-                        Some(v) => v.as_string(),
+                        Some(v) => v.clone(),
                         None => return Ok(CfmlValue::Int(-1)),
                     };
                     let items = arr.snapshot();
+                    // Structural comparison, shared with arrayFind/arrayContains.
+                    // Comparing string forms made every query equal to every
+                    // other one, so the first query in the array always matched
+                    // (GH #473).
+                    let eq = |x: &CfmlValue| cfml_common::equality::deep_equal(x, &target, false);
                     let found = if method_lower == "lastindexof" {
-                        items.iter().rposition(|x| x.as_string() == target)
+                        items.iter().rposition(eq)
                     } else {
-                        items.iter().position(|x| x.as_string() == target)
+                        items.iter().position(eq)
                     };
                     return Ok(CfmlValue::Int(
                         found.map(|i| i as i64).unwrap_or(-1),
@@ -31064,6 +31148,16 @@ impl CfmlVirtualMachine {
                 // The rest of Lucee's query member API. Each maps onto its
                 // standalone BIF; which of them hand back the query rather than
                 // the BIF's status value is `query_member_returns_receiver`.
+                // Java's `Object.equals` reaches a query on Lucee, where two
+                // queries are equal when their columns and cells are (GH #473).
+                // Without this arm the member call threw "does not exist in the
+                // Query".
+                "equals" => {
+                    let other = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
+                    return Ok(CfmlValue::Bool(cfml_common::equality::deep_equal(
+                        &object, &other, false,
+                    )));
+                }
                 "deleterow" => Some("queryDeleteRow"),
                 "deletecolumn" => Some("queryDeleteColumn"),
                 "append" => Some("queryAppend"),
@@ -35060,7 +35154,13 @@ impl CfmlVirtualMachine {
             cfml_common::component::blueprint_census::register(&bp);
             bp
         };
-        let blueprint = if source_file.is_empty() {
+        // A class whose pseudo-constructor includes a template through a runtime
+        // path has a per-INSTANCE method set, so it cannot share one cached
+        // blueprint: the second instance was handed the first one's methods
+        // whatever its own include resolved to (GH #481). Build a fresh one and
+        // do not file it.
+        let dyn_include = matches!(s.get("__dyn_include"), Some(CfmlValue::Bool(true)));
+        let blueprint = if source_file.is_empty() || dyn_include {
             build_bp(self, &s, &source_file)
         } else {
             // The file's first name is filed under the bare source path; a second
@@ -35938,6 +36038,13 @@ impl CfmlVirtualMachine {
             Some(CfmlValue::String(p)) if !p.is_empty() => p,
             _ => return,
         };
+        // A class whose pseudo-constructor includes a template through a
+        // runtime path has no single method set: each instance keeps its own
+        // methods inline rather than being stripped and handed the table the
+        // FIRST instance produced (GH #481).
+        if matches!(s.get("__dyn_include"), Some(CfmlValue::Bool(true))) {
+            return;
+        }
         let vars = match s.get(&*cfml_common::key::well_known::VARIABLES) {
             Some(CfmlValue::Struct(vs)) => Some(vs),
             _ => None,
@@ -37446,11 +37553,26 @@ impl CfmlVirtualMachine {
                     // `variables` first, then runs the pseudo-constructor, so a
                     // method called mid-body sees the full table). The values are
                     // the class-invariant cached `Arc`s (`method_arc_for`).
+                    // Only THIS class's own methods: `program.functions` is
+                    // program-wide, and a method declared by a template that an
+                    // earlier construction's pseudo-constructor `include`d is in
+                    // there too, carrying the INCLUDED file as its source. Hoisting
+                    // those gave a later instance the first instance's helper
+                    // functions, whatever its own include path resolved to
+                    // (GH #481). A function with no source file keeps the old
+                    // behaviour.
                     let own: Vec<Arc<BytecodeFunction>> = self
                         .program
                         .functions
                         .iter()
-                        .filter(|bf| bf.is_component_method && !bf.name.starts_with("__"))
+                        .filter(|bf| {
+                            bf.is_component_method
+                                && !bf.name.starts_with("__")
+                                && bf
+                                    .source_file
+                                    .as_deref()
+                                    .is_none_or(|sf| sf == &*cfc_path)
+                        })
                         .cloned()
                         .collect();
                     for bf in own {
@@ -39505,8 +39627,8 @@ impl CfmlVirtualMachine {
     /// The struct form `cookie.x = {value=.., expires=.., httponly=..}` is
     /// Lucee's, and is rendered with the same attribute handling as the tag.
     pub fn flush_cookie_scope_writes(&mut self) {
-        let current = match self.globals.get("cookie") {
-            Some(CfmlValue::Struct(s)) => s.snapshot(),
+        let (current, attrs) = match self.globals.get("cookie") {
+            Some(CfmlValue::Struct(s)) => (s.snapshot(), s.cookie_attrs()),
             _ => return,
         };
         let already_set: Vec<String> = self
@@ -39528,15 +39650,24 @@ impl CfmlVirtualMachine {
             if already_set.iter().any(|n| n == &key.to_lowercase()) {
                 continue;
             }
-            let unchanged = self
-                .initial_cookies
-                .iter()
-                .any(|(n, v)| n.eq_ignore_ascii_case(key) && *v == value.as_string());
+            // A cookie written in attribute form is always emitted: its value
+            // may equal the incoming one while the attributes (httpOnly, path,
+            // expires) are the point of the write.
+            let attrs = attrs.get(&key.to_lowercase()).cloned();
+            let unchanged = attrs.is_none()
+                && self
+                    .initial_cookies
+                    .iter()
+                    .any(|(n, v)| n.eq_ignore_ascii_case(key) && *v == value.as_string());
             if unchanged {
                 continue;
             }
+            let rendered = match &attrs {
+                Some(a) => render_cookie_scope_entry(key, a),
+                None => render_cookie_scope_entry(key, value),
+            };
             self.response_headers
-                .push(("Set-Cookie".to_string(), render_cookie_scope_entry(key, value)));
+                .push(("Set-Cookie".to_string(), rendered));
         }
     }
 

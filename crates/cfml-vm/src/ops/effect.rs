@@ -270,7 +270,15 @@ pub(crate) fn op_jump_if_not_null(stack: &[CfmlValue], ip: &mut usize, target: u
     // Peek at the top of stack - if not null, jump (leave value on stack)
     // If null, continue (leave null on stack)
     if let Some(val) = stack.last() {
-        if !matches!(val, CfmlValue::Null) {
+        // A `q.col` proxy is never `Null` itself, but it stands in for the
+        // current row's cell: when that cell is NULL, `q.col ?: default` must
+        // take the default, as on Lucee (GH #477).
+        let is_null = match val {
+            CfmlValue::Null => true,
+            CfmlValue::QueryColumn(..) => matches!(val.query_column_scalar(), CfmlValue::Null),
+            _ => false,
+        };
+        if !is_null {
             *ip = target;
         }
     }

@@ -5266,6 +5266,23 @@ impl CfmlCompiler {
             prop_count += 1;
         }
 
+        // A pseudo-constructor `include` whose path is not a literal can resolve
+        // to a DIFFERENT template per instance, so the methods it declares are
+        // not class-invariant. Mark the class: the VM then keeps each instance's
+        // methods inline instead of sharing one per-class method table built by
+        // the first construction, which gave every later instance the first
+        // template's functions (GH #481).
+        if body.iter().any(|st| match st {
+            Statement::Include(i) => !matches!(i.path, Expression::Literal(_)),
+            _ => false,
+        }) {
+            instructions.push(BytecodeOp::String(std::sync::Arc::new(
+                "__dyn_include".to_string(),
+            )));
+            instructions.push(BytecodeOp::True);
+            prop_count += 1;
+        }
+
         // Declaration-only body: every pseudo-constructor statement is a plain
         // literal assignment to `variables.x` / `this.x` / a bare name, and every
         // property default is a literal. Executing such a body yields the same

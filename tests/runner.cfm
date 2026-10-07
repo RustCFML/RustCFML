@@ -1243,4 +1243,22 @@ include "harness.cfm";
 <!--- <cfapplication> is implemented, not a "tag not implemented" 500 (GH #374). --->
 <cf_runtest file="tags/test_cfapplication_tag.cfm" />
 
+<!--- Built-in functions bind named arguments BY NAME (GH #482). --->
+<cf_runtest file="stdlib/test_gh482_builtin_named_args.cfm" />
+
+<!--- serializeJSON query formats, toBinary's base64 alphabet, query equality
+      in arrayFind/indexOf (GH #469, #472, #473). --->
+<cf_runtest file="stdlib/test_gh469_472_473_serialize_binary_find.cfm" />
+
+<!--- A q.col reference reads and writes the CURRENT ROW (GH #475, #477, #478). --->
+<cf_runtest file="types/test_gh475_477_478_query_column_ref.cfm" />
+
+<!--- Component metadata parameter defaults; a pseudo-constructor include whose
+      path varies is resolved per instance (GH #468, #481). --->
+<cf_runtest file="oop/test_gh468_481_component_meta_and_dyn_include.cfm" />
+
+<!--- A cookie set in long form reads back as its value in the same request
+      (GH #480). Serve-mode only; skips on the CLI. --->
+<cf_runtest file="server/test_cookie_struct_form_readback.cfm" />
+
 <cfscript> printSummary(); </cfscript>

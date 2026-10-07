@@ -351,7 +351,14 @@ pub fn build_web_scopes(
         }
         cookies
     };
-    globals.insert("cookie".to_string(), CfmlValue::strukt(cookie_scope));
+    // Marked so a long-form write (`cookie.x = {value=.., httpOnly=..}`) is
+    // collapsed to its value on the way in, with the attributes kept for the
+    // response render (GH #480).
+    let cookie_scope = CfmlValue::strukt(cookie_scope);
+    if let CfmlValue::Struct(ref cs) = cookie_scope {
+        cs.mark_cookie_scope();
+    }
+    globals.insert("cookie".to_string(), cookie_scope);
 
     let mut headers_struct = ValueMap::default();
     for (name, value) in headers {

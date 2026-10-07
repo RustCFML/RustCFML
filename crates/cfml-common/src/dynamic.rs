@@ -677,6 +677,18 @@ pub struct StructInner {
     /// STRUCT, like `read_only`, so an alias of the scope is treated the same
     /// way the scope itself is.
     pub persistent_scope: bool,
+    /// Set on the request's `cookie` scope. CFML's long form
+    /// `cookie.x = {value=.., httpOnly=.., path=..}` is a *write instruction*,
+    /// not the value: Lucee reads the cookie back as its string within the same
+    /// request. [`CfmlStruct::insert`] therefore collapses such a struct to its
+    /// `value` and parks the attributes in [`Self::cookie_attrs`], where the
+    /// response-time `Set-Cookie` render picks them up (GH #480). The flag lives
+    /// on the struct, like `read_only`, so every write path — `cookie.x =`,
+    /// `cookie["x"] =`, `structInsert` — is covered by one choke point.
+    pub cookie_scope: bool,
+    /// Attributes of cookies written in long form, keyed by lower-cased name.
+    /// Empty (and never allocated into) on every struct but the cookie scope.
+    pub cookie_attrs: std::collections::HashMap<String, CfmlValue>,
     /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
     /// private `__variables` struct, a read of the `this` key resolves to the
     /// upgraded handle — the component's live public scope — rather than a
@@ -1183,6 +1195,8 @@ impl CfmlStruct {
             shape_id: next_shape_id(),
             read_only: false,
             persistent_scope: false,
+            cookie_scope: false,
+            cookie_attrs: std::collections::HashMap::new(),
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -1218,6 +1232,8 @@ impl CfmlStruct {
             shape_id: next_shape_id(),
             read_only: false,
             persistent_scope: false,
+            cookie_scope: false,
+            cookie_attrs: std::collections::HashMap::new(),
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -1239,6 +1255,18 @@ impl CfmlStruct {
     #[inline]
     pub fn mark_read_only(&self) {
         self.0.write().read_only = true;
+    }
+
+    /// Mark this struct as the request's `cookie` scope — see
+    /// [`StructInner::cookie_scope`].
+    pub fn mark_cookie_scope(&self) {
+        self.0.write().cookie_scope = true;
+    }
+
+    /// Attributes recorded for cookies written in long form, keyed by
+    /// lower-cased cookie name.
+    pub fn cookie_attrs(&self) -> std::collections::HashMap<String, CfmlValue> {
+        self.0.read().cookie_attrs.clone()
     }
 
     /// Mark this struct as a persistent scope (application / session / server),
@@ -1600,6 +1628,30 @@ impl CfmlStruct {
     /// stored, so a write under a different casing updates in place and the
     /// first-written casing survives, with no side index to maintain.
     pub fn insert(&self, key: impl IntoKey, value: CfmlValue) -> Option<CfmlValue> {
+        // The cookie scope collapses CFML's long form
+        // `cookie.x = {value=.., httpOnly=..}` to the plain value, keeping the
+        // attributes for the response render (see `StructInner::cookie_scope`,
+        // GH #480). Only a struct-valued write even looks at the flag, so every
+        // other insert in the engine is untouched.
+        if matches!(value, CfmlValue::Struct(_)) && self.0.read().cookie_scope {
+            let k = key.into_key();
+            let plain = match &value {
+                CfmlValue::Struct(attrs) => attrs.get_ci("value").map(|v| CfmlValue::string(v.as_string())),
+                _ => None,
+            };
+            if let Some(plain) = plain {
+                self.0
+                    .write()
+                    .cookie_attrs
+                    .insert(k.as_str().to_ascii_lowercase(), value);
+                return self.insert_inner(k, plain);
+            }
+            return self.insert_inner(k, value);
+        }
+        self.insert_inner(key, value)
+    }
+
+    fn insert_inner(&self, key: impl IntoKey, value: CfmlValue) -> Option<CfmlValue> {
         let mut g = self.0.write();
         let prev = g.map.insert(key, value);
         if prev.is_none() {

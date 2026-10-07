@@ -3165,80 +3165,10 @@ fn fn_array_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 /// Deep, order-insensitive value equality for the array find/contains family.
-/// Lucee's `arrayFind`/`arrayContains` match COMPLEX needles (structs/arrays)
-/// by deep equality — struct keys compare case-insensitively and regardless of
-/// insertion order, arrays compare element-wise. Scalars fall back to the same
-/// string comparison the callers used before (so numeric `20` still matches the
-/// string `"20"`); `nocase` lowercases scalar comparisons.
-fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
-    match (a, b) {
-        (CfmlValue::Struct(sa), CfmlValue::Struct(sb)) => {
-            // Identity short-circuit: two references to the SAME backing handle
-            // are equal without walking their contents. This is both correct (a
-            // value equals itself) and essential for cycle safety — a
-            // self-referential struct graph (e.g. a Wheels model with a circular
-            // association: `profile.author = author; author.profile = profile`)
-            // would otherwise recurse forever here. Lucee compares CFC instances
-            // by reference, so `arrayContains(visited, obj)` detects an
-            // already-seen object by identity, which is exactly how Wheels'
-            // `allErrors(includeAssociations=true)` breaks the cycle. (Wheels
-            // model.errorsSpec "handles circular reference" stack-overflowed the
-            // whole TestBox suite without this.)
-            if sa.backing_ptr() == sb.backing_ptr() {
-                return true;
-            }
-            if sa.len() != sb.len() {
-                return false;
-            }
-            for (k, va) in sa.iter() {
-                match sb.get_ci(&k) {
-                    Some(vb) => {
-                        if !cfml_deep_equal(&va, &vb, nocase) {
-                            return false;
-                        }
-                    }
-                    None => return false,
-                }
-            }
-            true
-        }
-        (CfmlValue::Array(aa), CfmlValue::Array(ab)) => {
-            // Same identity short-circuit as Struct (above) — same backing
-            // handle is equal without recursing, so a cyclic array graph is safe.
-            if aa.backing_ptr() == ab.backing_ptr() {
-                return true;
-            }
-            let sa = aa.snapshot();
-            let sb = ab.snapshot();
-            sa.len() == sb.len()
-                && sa
-                    .iter()
-                    .zip(sb.iter())
-                    .all(|(x, y)| cfml_deep_equal(x, y, nocase))
-        }
-        // A complex value never equals a scalar (or a struct-vs-array mismatch).
-        (CfmlValue::Struct(_), _) | (_, CfmlValue::Struct(_)) => false,
-        (CfmlValue::Array(_), _) | (_, CfmlValue::Array(_)) => false,
-        // Flyweight component instances compare by REFERENCE (Lucee/ACF parity —
-        // same as the marker backing-ptr identity above). Without this an Instance
-        // fell to the `_ => as_string()` arm below, where EVERY component
-        // stringifies to "<Component>" → any two components compared EQUAL, so
-        // `arrayContains(seen, obj)` matched the first component of any class
-        // (breaking Wheels' circular-association cycle detection).
-        _ if a.as_component().is_some_and(|c| c.is_instance_backed())
-            || b.as_component().is_some_and(|c| c.is_instance_backed()) =>
-        {
-            cfml_common::component::same_component_instance(a, b)
-        }
-        _ => {
-            if nocase {
-                a.as_string().eq_ignore_ascii_case(&b.as_string())
-            } else {
-                a.as_string() == b.as_string()
-            }
-        }
-    }
-}
+/// It lives in `cfml-common` because the VM's member dispatch (`indexOf`,
+/// `lastIndexOf`) needs the same comparison and does not depend on this crate —
+/// see [`cfml_common::equality::deep_equal`] for the rules.
+pub use cfml_common::equality::deep_equal as cfml_deep_equal;
 
 /// `arrayContains( array, value [, substringMatch] )` — the 1-based index of the
 /// first match, `0` when absent (GH #358). We used to return a boolean, which
@@ -3782,6 +3712,14 @@ fn fn_array_last(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
+    // A `q.col` proxy stands in for the CURRENT ROW's cell, so test that cell —
+    // not the column, which is never "empty" and reported a NULL cell as
+    // non-empty (GH #477: every Preside form-builder form rendered blank
+    // because `!IsEmpty( formRecord.access_condition ?: "" )` was true).
+    let args = match args.first() {
+        Some(v @ CfmlValue::QueryColumn(..)) => vec![v.query_column_scalar().clone()],
+        _ => args,
+    };
     match args.first() {
         Some(CfmlValue::String(s)) => Ok(CfmlValue::Bool(s.is_empty())),
         Some(CfmlValue::Array(arr)) => Ok(CfmlValue::Bool(arr.is_empty())),
@@ -4720,12 +4658,24 @@ fn fn_struct_key_translate(args: Vec<CfmlValue>) -> CfmlResult {
 // TYPE CHECKING FUNCTIONS
 // ===============================================
 
+/// A `q.col` proxy is the current row's cell in a scalar context, so a NULL cell
+/// reads as null here (GH #477) — the proxy itself is never `CfmlValue::Null`.
+fn arg0_is_null(args: &[CfmlValue]) -> bool {
+    match args.first() {
+        None | Some(CfmlValue::Null) => true,
+        Some(v @ CfmlValue::QueryColumn(..)) => {
+            matches!(v.query_column_scalar(), CfmlValue::Null)
+        }
+        _ => false,
+    }
+}
+
 fn fn_is_null(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Bool(matches!(args.first(), None | Some(CfmlValue::Null))))
+    Ok(CfmlValue::Bool(arg0_is_null(&args)))
 }
 
 fn fn_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Bool(!matches!(args.first(), None | Some(CfmlValue::Null))))
+    Ok(CfmlValue::Bool(!arg0_is_null(&args)))
 }
 
 fn fn_is_simple_value(args: Vec<CfmlValue>) -> CfmlResult {
@@ -6390,14 +6340,52 @@ fn fn_ws_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 // JSON FUNCTIONS
 // ===============================================
 
+/// Query layout selected by `serializeJSON`'s second argument. Lucee accepts
+/// booleans *and* the strings "row", "column" and "struct"; "struct" emits an
+/// array of row objects, which is the usual shape for a JSON API (GH #469).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryJsonFormat {
+    Row,
+    Column,
+    Struct,
+}
+
+impl QueryJsonFormat {
+    fn from_arg(v: Option<&CfmlValue>) -> Self {
+        match v {
+            None | Some(CfmlValue::Null) => QueryJsonFormat::Row,
+            Some(CfmlValue::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "row" => QueryJsonFormat::Row,
+                "column" => QueryJsonFormat::Column,
+                "struct" => QueryJsonFormat::Struct,
+                // Anything else keeps the boolean reading ("true"/"yes"/"1").
+                other => {
+                    if matches!(other, "true" | "yes" | "1") {
+                        QueryJsonFormat::Column
+                    } else {
+                        QueryJsonFormat::Row
+                    }
+                }
+            },
+            Some(other) => {
+                if other.is_true() {
+                    QueryJsonFormat::Column
+                } else {
+                    QueryJsonFormat::Row
+                }
+            }
+        }
+    }
+}
+
 pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     let mut visited: Vec<usize> = Vec::new();
     // serializeJSON(data [, serializeQueryByColumns] [, useSecureJSONPrefix]).
     // The second arg controls query layout: false (default) emits row-oriented
     // DATA (array of row arrays); true emits column-oriented DATA (a struct
     // keyed by uppercased column name) plus a ROWCOUNT. Matches Lucee 6.
-    let by_columns = args.get(1).map(|v| v.is_true()).unwrap_or(false);
-    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited, by_columns);
+    let qfmt = QueryJsonFormat::from_arg(args.get(1));
+    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited, qfmt);
     let flags = security_flags();
     if flags.secure_json && !flags.secure_json_prefix.is_empty() {
         Ok(CfmlValue::string(format!("{}{}", flags.secure_json_prefix, body)))
@@ -6406,9 +6394,9 @@ pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, by_columns: bool) -> String {
+fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, qfmt: QueryJsonFormat) -> String {
     let mut out = String::new();
-    write_json_value(val, &mut out, visited, by_columns);
+    write_json_value(val, &mut out, visited, qfmt);
     out
 }
 
@@ -6452,7 +6440,7 @@ fn write_json_str(out: &mut String, s: &str) {
 /// cycles — e.g. a TestBox mock holds `this.mockBox`, whose generator holds the
 /// mock back. Without the guard such a cycle recurses until the native stack
 /// overflows and aborts the process. On revisiting a container we emit `null`.
-fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>, by_columns: bool) {
+fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>, qfmt: QueryJsonFormat) {
     use std::fmt::Write as _;
     // Phase C.3 — Slice 4: a flyweight instance serializes its public DATA members
     // directly (no methods, no `__` filter — the data map is already clean, so
@@ -6488,7 +6476,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                 first = false;
                 write_json_str(out, k);
                 out.push(':');
-                write_json_value(v, out, visited, by_columns);
+                write_json_value(v, out, visited, qfmt);
             }
             out.push('}');
             if id.is_some() {
@@ -6532,7 +6520,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                     out.push(',');
                 }
                 first = false;
-                write_json_value(&v, out, visited, by_columns);
+                write_json_value(&v, out, visited, qfmt);
             }
             out.push(']');
             visited.pop();
@@ -6544,7 +6532,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                 return;
             }
             visited.push(ptr);
-            write_json_struct(s, out, visited, by_columns);
+            write_json_struct(s, out, visited, qfmt);
             visited.pop();
         }
         CfmlValue::Query(q) => {
@@ -6567,7 +6555,26 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                     }
                     out.push(']');
                 };
-                if by_columns {
+                if qfmt == QueryJsonFormat::Struct {
+                    // Array of row objects, keys in the column's declared case.
+                    out.push('[');
+                    for r in 0..row_count {
+                        if r > 0 {
+                            out.push(',');
+                        }
+                        out.push('{');
+                        for (ci, col) in d.columns.iter().enumerate() {
+                            if ci > 0 {
+                                out.push(',');
+                            }
+                            write_json_str(out, col);
+                            out.push(':');
+                            write_json_value(&d.data[ci][r], out, visited, qfmt);
+                        }
+                        out.push('}');
+                    }
+                    out.push(']');
+                } else if qfmt == QueryJsonFormat::Column {
                     let _ = write!(out, "{{\"ROWCOUNT\":{},\"COLUMNS\":", row_count);
                     write_columns(out);
                     out.push_str(",\"DATA\":{");
@@ -6581,7 +6588,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                             if r > 0 {
                                 out.push(',');
                             }
-                            write_json_value(&d.data[ci][r], out, visited, by_columns);
+                            write_json_value(&d.data[ci][r], out, visited, qfmt);
                         }
                         out.push(']');
                     }
@@ -6599,7 +6606,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                             if ci > 0 {
                                 out.push(',');
                             }
-                            write_json_value(&d.data[ci][r], out, visited, by_columns);
+                            write_json_value(&d.data[ci][r], out, visited, qfmt);
                         }
                         out.push(']');
                     }
@@ -6621,7 +6628,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
             // first-row scalar in scalar contexts. Serializing a struct/array
             // holding a query cell must emit the value, not drop it to null
             // (Lucee/ACF/BoxLang treat a query cell as a simple value).
-            write_json_value(val.query_column_scalar(), out, visited, by_columns)
+            write_json_value(val.query_column_scalar(), out, visited, qfmt)
         }
         // Binary serializes to its base64 text, like Lucee (GH #359). This used
         // to fall into the `null` arm below, so a struct carrying binary lost
@@ -6638,7 +6645,7 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
     }
 }
 
-fn write_json_struct(s: &CfmlStruct, out: &mut String, visited: &mut Vec<usize>, by_columns: bool) {
+fn write_json_struct(s: &CfmlStruct, out: &mut String, visited: &mut Vec<usize>, qfmt: QueryJsonFormat) {
     // A struct carrying CFC instance markers (`__variables` plus a
     // `this`/`__name` marker) is a component instance — this engine
     // materialises CFCs as marker-bearing structs. Lucee/ACF serialize
@@ -6679,7 +6686,7 @@ fn write_json_struct(s: &CfmlStruct, out: &mut String, visited: &mut Vec<usize>,
         first = false;
         write_json_str(out, &k);
         out.push(':');
-        write_json_value(&v, out, visited, by_columns);
+        write_json_value(&v, out, visited, qfmt);
     }
 
     // For a CFC, accessor-`property` values that were never written to the
@@ -6715,7 +6722,7 @@ fn write_json_struct(s: &CfmlStruct, out: &mut String, visited: &mut Vec<usize>,
                     first = false;
                     write_json_str(out, &pname);
                     out.push(':');
-                    write_json_value(&pv, out, visited, by_columns);
+                    write_json_value(&pv, out, visited, qfmt);
                 }
             }
         }
@@ -15341,26 +15348,38 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
     let sql: &str = &final_sql;
 
     if mysql_returns_rows(sql) {
-        let result: Vec<Row> = conn.exec(sql, &params)
+        // Columns come from the RESULT-SET metadata, exactly as on the
+        // non-transaction path (execute_mysql_on_conn). Deriving them from the
+        // first row left a zero-row result with no columns at all inside
+        // `transaction { }`, so reading any column of an empty result threw
+        // "Column [X] not found in query" — Preside's trashPage, which runs in a
+        // transaction and reads a column of an already-trashed page, failed and
+        // rolled back (GH #474).
+        let mut result = conn.exec_iter(sql, &params)
             .map_err(|e| CfmlError::database(format!("queryExecute: MySQL query error: {}", e)))?;
-        let (raw_columns, col_types): (Vec<String>, Vec<mysql::consts::ColumnType>) =
-            if let Some(first_row) = result.first() {
-                let cols = first_row.columns_ref();
-                (
-                    cols.iter().map(|c| c.name_str().to_string()).collect(),
-                    cols.iter().map(|c| c.column_type()).collect(),
-                )
-            } else {
-                (vec![], vec![])
-            };
+        let cols_meta = result.columns();
+        let raw_columns: Vec<String> = cols_meta
+            .as_ref()
+            .iter()
+            .map(|c| c.name_str().to_string())
+            .collect();
+        let col_types: Vec<mysql::consts::ColumnType> = cols_meta
+            .as_ref()
+            .iter()
+            .map(|c| c.column_type())
+            .collect();
         let (columns, keep) = dedup_result_columns(raw_columns);
-        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::with_capacity(result.len())).collect();
-        for mut row in result {
+        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::new()).collect();
+        for row_result in result.by_ref() {
+            let mut row = row_result.map_err(|e| {
+                CfmlError::database(format!("queryExecute: MySQL query error: {}", e))
+            })?;
             for (out_i, &src_i) in keep.iter().enumerate() {
                 let val: mysql::Value = row.take(src_i).unwrap_or(mysql::Value::NULL);
                 data[out_i].push(mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
             }
         }
+        drop(result);
         build_query_result_columnar(columns, data, sql, return_type)
     } else {
         mysql_run_mutation(conn, sql, &params).map_err(|e| match e {
@@ -16045,12 +16064,18 @@ pub(crate) fn base64_decode_bytes(s: &str) -> Vec<u8> {
     // `toBase64`, JWT segments, a DiskStore blob) needs no filtered copy at all,
     // so decode straight out of the borrowed input. Only genuinely wrapped input
     // pays for the extra buffer.
+    // Anything outside the base64 alphabet is DROPPED, not decoded as zero bits
+    // (GH #472): Lucee skips invalid characters and decodes what remains, so
+    // `toBinary("!!!notbase64")` is the 6 bytes of `notbase64`, not 9 bytes with
+    // three fabricated leading zeros. `=` is kept — padding is positional and the
+    // loops below read it as end-of-data.
     let raw = s.as_bytes();
-    let needs_filter = raw.iter().any(|&b| b == b'\n' || b == b'\r' || b == b' ');
+    let valid = |b: u8| b == b'=' || B64_REVERSE[b as usize] != B64_INVALID;
+    let needs_filter = raw.iter().any(|&b| !valid(b));
     let filtered: Vec<u8>;
     let chars: &[u8] = if needs_filter {
         let mut c: Vec<u8> = Vec::with_capacity(raw.len());
-        c.extend(raw.iter().copied().filter(|&b| b != b'\n' && b != b'\r' && b != b' '));
+        c.extend(raw.iter().copied().filter(|&b| valid(b)));
         filtered = c;
         &filtered
     } else {
@@ -16877,13 +16902,13 @@ fn fn_jwt_sign(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             let mut visited = Vec::new();
-            serialize_value(&CfmlValue::strukt(map), &mut visited, false)
+            serialize_value(&CfmlValue::strukt(map), &mut visited, QueryJsonFormat::Row)
         }
         CfmlValue::String(s) => (**s).clone(),
         CfmlValue::Null => "{}".to_string(),
         other => {
             let mut visited = Vec::new();
-            serialize_value(other, &mut visited, false)
+            serialize_value(other, &mut visited, QueryJsonFormat::Row)
         }
     };
     let payload_b64 = base64url_encode(payload_json.as_bytes());

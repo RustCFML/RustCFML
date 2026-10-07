@@ -1260,9 +1260,13 @@ reasonable with it; Lucee rejects it. Measured against **Lucee 7.1.0.204**:
 |---|---|---|
 | `binaryDecode( "DEADBEE", "hex" )` (odd length) | throws `lucee.runtime.coder.CoderException` | drops the trailing nibble → 3 bytes |
 | `binaryDecode( "DEADBEZZ", "hex" )` (non-hex char) | throws `lucee.runtime.coder.CoderException` | decodes the bad char as `0` → `DEADBE00` |
-| `toBinary( "QU*D" )` (non-alphabet char) | 2 bytes (`4140`) | 3 bytes (`414003`) |
+| `toBinary( "QU*D" )` (non-alphabet char) | 2 bytes (`4140`) | 2 bytes (`4140`) — **matches since v0.721.0** |
 
-These rows predate the v0.611.0 codec rewrite (a pure speed change — `toBinary`
+`toBinary` now agrees with Lucee: a character outside the base64 alphabet is
+SKIPPED and the rest decodes, rather than contributing zero bits and fabricating
+leading bytes (GH #472). The hex rows above still diverge.
+
+The remaining rows predate the v0.611.0 codec rewrite (a pure speed change — `toBinary`
 went from a linear alphabet scan to a 256-entry reverse table, ~7.9x faster on a
 28KB blob — which preserved the tolerant behaviour deliberately so no app's
 output moved).

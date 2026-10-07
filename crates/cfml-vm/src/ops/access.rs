@@ -594,6 +594,44 @@ pub(crate) fn op_get_index(
 }
 
 #[inline]
+/// `q.col = value` — Lucee sets the CURRENT ROW's cell and throws when the
+/// column doesn't exist. Without this the write fell through to the generic
+/// member store and REPLACED the query with a one-key struct, losing every
+/// other column and row (GH #478).
+///
+/// An Array/`QueryColumn` value still replaces the whole column: that is the
+/// outer step of the indexed write-back `q.col[row] = v`, which hands the
+/// modified column back wholesale.
+pub(crate) fn query_dot_store(
+    q: &cfml_common::dynamic::CfmlQuery,
+    column: &str,
+    value: CfmlValue,
+) -> Result<(), CfmlError> {
+    match value {
+        CfmlValue::QueryColumn(a, _) => {
+            q.set_column(column, a.as_ref().clone());
+            Ok(())
+        }
+        CfmlValue::Array(a) => {
+            q.set_column(column, a.snapshot());
+            Ok(())
+        }
+        other => {
+            if !q.has_column_ci(column) {
+                return Err(CfmlError::runtime(format!(
+                    "column [{}] does not exist",
+                    column.to_uppercase()
+                )));
+            }
+            // `current_row` is 1-based and defaults to 1, so a write outside a
+            // query loop lands on row 1 — as on Lucee.
+            let row0 = q.current_row().saturating_sub(1);
+            q.set_cell(row0, column.to_string(), other);
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn op_set_property(
     stack: &mut Vec<CfmlValue>,
     name: &Name,
@@ -712,6 +750,11 @@ pub(crate) fn op_set_property(
             match &obj {
                 CfmlValue::Struct(s) => {
                     s.insert(name.key(), value);
+                }
+                CfmlValue::Query(q) => {
+                    let r = query_dot_store(q, name.as_str(), value);
+                    stack.push(obj);
+                    return r;
                 }
                 _ => obj.set(name.to_string(), value),
             }
