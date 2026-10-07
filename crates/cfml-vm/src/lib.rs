@@ -4540,8 +4540,9 @@ pub(crate) struct TryHandler {
 /// `tests/tags/test_getbasetag_functions.cfm`).
 #[derive(Clone)]
 struct BaseTagEntry {
-    /// Uppercased ancestry name: `CF_MYTAG` for a `<cf_mytag>` invocation,
-    /// `CFMODULE` for a `<cfmodule>`/`module` one.
+    /// Uppercased ancestry name: `CF_MYTAG` for a `<cf_mytag>` or a
+    /// cfimport-prefixed `<p:mytag>` invocation, `CFMODULE` for a
+    /// `<cfmodule>`/`module` one.
     name: String,
     /// The tag's live Arc-backed `variables` scope — what `getBaseTagData()`
     /// hands back. Sharing the Arc (rather than snapshotting) is the whole
@@ -23594,7 +23595,9 @@ impl CfmlVirtualMachine {
                     let (bt_name, bt_findable) = if name_lower == "__cfmodule" {
                         ("CFMODULE".to_string(), false)
                     } else {
-                        Self::base_tag_identity(&path_spec)
+                        // A cfimport-prefixed tag passes its name as the fourth argument.
+                        let import_tag = args.get(3).map(|v| v.as_string());
+                        Self::base_tag_identity(&path_spec, import_tag.as_deref())
                     };
                     self.base_tag_stack.push(BaseTagEntry {
                         name: bt_name,
@@ -23706,7 +23709,10 @@ impl CfmlVirtualMachine {
                     // must see the host as its element 2 (Lucee-measured).
                     // `__cfcustomtag_end` pops it.
                     let base_depth = self.base_tag_stack.len();
-                    let (bt_name, bt_findable) = Self::base_tag_identity(&path_spec);
+                    // A cfimport-prefixed tag passes its name as the third argument.
+                    let import_tag = args.get(2).map(|v| v.as_string());
+                    let (bt_name, bt_findable) =
+                        Self::base_tag_identity(&path_spec, import_tag.as_deref());
                     self.base_tag_stack.push(BaseTagEntry {
                         name: bt_name,
                         tag_vars: tag_vars.clone(),
@@ -33656,12 +33662,17 @@ impl CfmlVirtualMachine {
     /// `getBaseTagData(name)` may find it.
     ///
     /// `<cf_mytag>` lowers to the `__cf_:mytag` spec and is listed (and found)
-    /// as `CF_MYTAG`. Everything else reached this way is a `cfmodule`
-    /// invocation, which Lucee lists as `CFMODULE` but refuses to look up by
-    /// name — so it is pushed unfindable rather than omitted, because it must
-    /// still occupy a position in `getBaseTagList()`.
-    fn base_tag_identity(path_spec: &str) -> (String, bool) {
-        if let Some(tag) = path_spec.strip_prefix("__cf_:") {
+    /// as `CF_MYTAG`. A cfimport-prefixed `<p:mytag>` lowers to a plain
+    /// template path, the same as `<cfmodule template=…>`, so the compiler
+    /// passes its name (`import_tag`); Lucee lists and finds it as `CF_MYTAG`
+    /// too, without the prefix. Everything else is a `cfmodule` invocation,
+    /// which Lucee lists as `CFMODULE` but refuses to look up by that name — so
+    /// it is pushed unfindable rather than omitted, because it must still
+    /// occupy a position in `getBaseTagList()`.
+    fn base_tag_identity(path_spec: &str, import_tag: Option<&str>) -> (String, bool) {
+        if let Some(tag) = import_tag.filter(|t| !t.is_empty()) {
+            (format!("CF_{}", tag.to_uppercase()), true)
+        } else if let Some(tag) = path_spec.strip_prefix("__cf_:") {
             (format!("CF_{}", tag.to_uppercase()), true)
         } else {
             ("CFMODULE".to_string(), false)

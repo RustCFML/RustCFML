@@ -19,7 +19,10 @@
 //     (leg D) — but a cfmodule-invoked host is NOT (its body runs in the
 //     caller's context with no CFMODULE ancestor added);
 //   - cfmodule-invoked tags appear in getBaseTagList() as CFMODULE but
-//     getBaseTagData("CFMODULE") cannot find them (leg E).
+//     getBaseTagData("CFMODULE") cannot find them (leg E);
+//   - a cfimport-prefixed tag is listed and found as CF_<NAME>, exactly like
+//     its cf_ form: the prefix is not part of the name (legs F and G,
+//     measured on Lucee 7.0.4.34 and Lucee 5.3.10, which agree).
 
 suiteBegin("getBaseTagList()/getBaseTagData(): custom-tag ancestry built-ins");
 
@@ -115,6 +118,53 @@ assert( "E: module-invoked tag's own getBaseTagList() entry is CFMODULE", modPro
 assertTrue( "E: getBaseTagData('CFMODULE') cannot find module entries (saw: " & ( modProbe.cfmodule_lookup ?: "(missing)" ) & ")",
     findNoCase( "(threw:", modProbe.cfmodule_lookup ?: "" ) GT 0 );
 
+// (legs F and G follow in tag syntax; cleanup is at the end)
+</cfscript>
+
+<!--- ── F: a cfimport-prefixed tag has the same identity as its cf_ form:
+       it is listed as CF_<NAME> (the prefix is not part of the name, and the
+       name is uppercased however it is written) and found by that name. --->
+<cfimport taglib="." prefix="btl">
+<cfset structDelete(request, "btimp") />
+<cfset structDelete(request, "btimpcase") />
+<cfset request.bt_imp_err = "" />
+<cftry>
+    <btl:basetag_probe marker="imp-1" report="btimp" />
+    <btl:BaseTag_Probe marker="imp-case" report="btimpcase" />
+    <cfcatch type="any"><cfset request.bt_imp_err = "THREW: " & cfcatch.message /></cfcatch>
+</cftry>
+
+<cfscript>
+assert( "F: cfimport-prefixed probe completes", request.bt_imp_err EQ "" ? "ok" : request.bt_imp_err, "ok" );
+impProbe = request.btimp ?: {};
+assert( "F: a prefixed tag's own entry is CF_<NAME>, not CFMODULE", impProbe.first ?: "(missing)", "CF_BASETAG_PROBE" );
+assert( "F: element 2 is still the suite runner", impProbe.parent_name ?: "(missing)", "CF_RUNTEST" );
+assert( "F: a prefixed tag is found by CF_<NAME>", impProbe.self_marker ?: "(missing)", "imp-1" );
+impCase = request.btimpcase ?: {};
+assert( "F: the name is uppercased however it is written", impCase.first ?: "(missing)", "CF_BASETAG_PROBE" );
+assert( "F: and the mixed-case tag is found by CF_<NAME> too", impCase.self_marker ?: "(missing)", "imp-case" );
+</cfscript>
+
+<!--- ── G: a cfimport-prefixed host is in its body tags' ancestry, and a
+       body tag reads the host's attributes through getBaseTagData(). --->
+<cfset structDelete(request, "btimpbody") />
+<cfset request.bt_impbody_err = "" />
+<cftry>
+    <btl:basetag_outer marker="imp-outer"><btl:basetag_probe marker="imp-body" report="btimpbody" /></btl:basetag_outer>
+    <cfcatch type="any"><cfset request.bt_impbody_err = "THREW: " & cfcatch.message /></cfcatch>
+</cftry>
+
+<cfscript>
+assert( "G: prefixed host with a prefixed body tag completes", request.bt_impbody_err EQ "" ? "ok" : request.bt_impbody_err, "ok" );
+impBody = request.btimpbody ?: {};
+assert( "G: element 2 of the body tag is the prefixed host", impBody.parent_name ?: "(missing)", "CF_BASETAG_OUTER" );
+assert( "G: the body tag reads the host's attributes via getBaseTagData", impBody.parent_marker ?: "(missing)", "imp-outer" );
+
+structDelete(request, "btimp");
+structDelete(request, "btimpcase");
+structDelete(request, "btimpbody");
+structDelete(request, "bt_imp_err");
+structDelete(request, "bt_impbody_err");
 structDelete(request, "btprobe");
 structDelete(request, "btnested");
 structDelete(request, "btbody");
