@@ -750,7 +750,13 @@ impl Lexer {
         // See `Lexer::raw_spellings` (GH #381).
         let (token, raw) = match Token::keyword(&value) {
             Some(kw) => {
-                let raw = if value.bytes().any(|b| b.is_ascii_uppercase()) {
+                // Also keep it for an ALIAS spelling — `le` and `ge` lex to the
+                // same tokens as `lte`/`gte`, so without the source text the
+                // parser can only hand back the canonical name. A variable the
+                // app called `le` then became `lte` on one side of an assignment
+                // and not the other, which read back empty rather than failing.
+                let is_alias = value.eq_ignore_ascii_case("le") || value.eq_ignore_ascii_case("ge");
+                let raw = if is_alias || value.bytes().any(|b| b.is_ascii_uppercase()) {
                     Some(value.into_boxed_str())
                 } else {
                     None

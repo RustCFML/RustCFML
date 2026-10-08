@@ -5694,7 +5694,16 @@ impl Parser {
             | Token::Function | Token::Var | Token::Throw | Token::Component
             | Token::Interface | Token::Package | Token::Remote
             | Token::Public | Token::Private | Token::Extends | Token::Implements
-            | Token::ImpKeyword
+            // The BINARY operator words. None of them can begin an expression,
+            // so in a position that wants an identifier they are unambiguous —
+            // and CFML lets an app use them as ordinary names: Preside's
+            // SharePoint wrapper has `catch ( any le ) {}`, which is a parse
+            // error if `le` is only ever the <= operator. (`not` is excluded: it
+            // is a PREFIX operator, so `not x` really is an expression.)
+            | Token::ImpKeyword | Token::Contains | Token::EqKeyword | Token::NeqKeyword
+            | Token::GtKeyword | Token::GteKeyword | Token::LtKeyword | Token::LteKeyword
+            | Token::ModKeyword | Token::IsKeyword | Token::XorKeyword | Token::EqvKeyword
+            | Token::AndKeyword | Token::OrKeyword
         )
     }
 
@@ -5761,6 +5770,23 @@ impl Parser {
             // CF/BoxLang (e.g. `var imp = ...`). The operator is consumed at the
             // parse_imp precedence level before primary/identifier contexts see it.
             Token::ImpKeyword => { self.advance(); Ok(self.consumed_keyword_name("imp")) }
+            // The rest of the binary operator words, for the same reason: they
+            // are operators only BETWEEN two operands, and each precedence level
+            // consumes them before an identifier position is ever reached. See
+            // `is_identifier_like_at`.
+            Token::Contains => { self.advance(); Ok(self.consumed_keyword_name("contains")) }
+            Token::EqKeyword => { self.advance(); Ok(self.consumed_keyword_name("eq")) }
+            Token::NeqKeyword => { self.advance(); Ok(self.consumed_keyword_name("neq")) }
+            Token::GtKeyword => { self.advance(); Ok(self.consumed_keyword_name("gt")) }
+            Token::GteKeyword => { self.advance(); Ok(self.consumed_keyword_name("gte")) }
+            Token::LtKeyword => { self.advance(); Ok(self.consumed_keyword_name("lt")) }
+            Token::LteKeyword => { self.advance(); Ok(self.consumed_keyword_name("lte")) }
+            Token::ModKeyword => { self.advance(); Ok(self.consumed_keyword_name("mod")) }
+            Token::IsKeyword => { self.advance(); Ok(self.consumed_keyword_name("is")) }
+            Token::XorKeyword => { self.advance(); Ok(self.consumed_keyword_name("xor")) }
+            Token::EqvKeyword => { self.advance(); Ok(self.consumed_keyword_name("eqv")) }
+            Token::AndKeyword => { self.advance(); Ok(self.consumed_keyword_name("and")) }
+            Token::OrKeyword => { self.advance(); Ok(self.consumed_keyword_name("or")) }
             _ => Err(self.parse_error("Expected identifier")),
         }
     }
@@ -7057,10 +7083,41 @@ impl Parser {
                 name: "implements".to_string(),
                 location: self.current_location(),
             })),
-            Token::ImpKeyword => Ok(Expression::Identifier(Identifier {
-                name: "imp".to_string(),
-                location: self.current_location(),
-            })),
+            // The BINARY operator words in EXPRESSION position are ordinary
+            // identifiers: an operator needs a left operand, and each precedence
+            // level consumes it long before parse_primary (which is only reached
+            // where a VALUE is expected) ever sees the token. Lucee accepts all
+            // of them as variable names — Preside's SharePoint wrapper has
+            // `catch ( any le )`, and a bare `le` then has to READ as that
+            // variable too, or the catch block silently sees nothing.
+            // `consumed_keyword_name` recovers the source spelling, so an alias
+            // (`le`, `ge`) stays the name the app actually wrote rather than
+            // collapsing to the canonical `lte`/`gte`.
+            Token::ImpKeyword | Token::Contains | Token::EqKeyword | Token::NeqKeyword
+            | Token::GtKeyword | Token::GteKeyword | Token::LtKeyword | Token::LteKeyword
+            | Token::ModKeyword | Token::IsKeyword | Token::XorKeyword | Token::EqvKeyword
+            | Token::AndKeyword | Token::OrKeyword => {
+                let canonical = match token {
+                    Token::ImpKeyword => "imp",
+                    Token::Contains => "contains",
+                    Token::EqKeyword => "eq",
+                    Token::NeqKeyword => "neq",
+                    Token::GtKeyword => "gt",
+                    Token::GteKeyword => "gte",
+                    Token::LtKeyword => "lt",
+                    Token::LteKeyword => "lte",
+                    Token::ModKeyword => "mod",
+                    Token::IsKeyword => "is",
+                    Token::XorKeyword => "xor",
+                    Token::EqvKeyword => "eqv",
+                    Token::AndKeyword => "and",
+                    _ => "or",
+                };
+                Ok(Expression::Identifier(Identifier {
+                    name: self.consumed_keyword_name(canonical),
+                    location: self.current_location(),
+                }))
+            }
             // Error-handling / switch keywords used as ordinary identifiers in
             // EXPRESSION position (Lucee/ACF accept any keyword as a variable
             // name). parse_primary is only reached where a value is expected, so

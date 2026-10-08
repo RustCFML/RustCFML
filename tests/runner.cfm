@@ -927,6 +927,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_expandpath_leading_double_slash.cfm" />
 <cf_runtest file="tags/test_mapping_prefix_boundary.cfm" />
 <cf_runtest file="stdlib/test_regex_dot_matches_newline.cfm" />
+<cf_runtest file="core/test_operator_words_as_identifiers.cfm" />
 <!--- - component_soft_keyword: `component` is a SOFT keyword on Lucee/ACF/BoxLang --->
 <!--- (a CFC introducer only when it begins a declaration; otherwise an ordinary --->
 <!--- identifier). RustCFML used to treat it as a HARD reserved keyword, so a --->
