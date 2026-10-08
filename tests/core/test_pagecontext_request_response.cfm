@@ -54,5 +54,37 @@ assertFalse("getPageContext().getResponse() returns a non-null response object",
 assertTrue("request.getRequestURL() yields a non-empty simple value",
     isSimpleValue(pgctxReqUrl) && len(pgctxReqUrl) && left(pgctxReqUrl, 1) != "(");
 
+// --- getClass() on the bridge objects ---
+// cbjavaloader's JavaLoader and lucee-spreadsheet both open with
+// `getPageContext().getClass().getClassLoader()`. getClass() answered NULL
+// here, so the chained getClassLoader() threw "cannot call method
+// [getClassLoader] on a null value" and took Preside's boot down with it.
+pgctxClass = pgctxPc.getClass();
+assertFalse("getPageContext().getClass() is not null", isNull(pgctxClass));
+assertTrue("...and names the page context class",
+    findNoCase("pagecontext", pgctxClass.getName()) > 0);
+assertFalse("...and getClassLoader() off it is not null",
+    isNull(pgctxClass.getClassLoader()));
+assertFalse("the request object reports a class too",
+    isNull(pgctxPc.getRequest().getClass()));
+// The classloader answers the plumbing calls; only INSTANTIATING a loaded
+// class fails, which is what "no JVM" actually means.
+pgctxLoader = pgctxClass.getClassLoader();
+assertFalse("classLoader.getParent() is not null", isNull(pgctxLoader.getParent()));
+// loadClass is probed with a class that EXISTS on a real JVM — the compiler
+// class cbjavaloader reaches for (com.sun.tools.javac.api.JavacTool) is not on
+// Lucee's classpath and throws there, so it is no good as a cross-engine probe.
+assert("classLoader.loadClass() names the class",
+    pgctxLoader.loadClass("java.lang.String").getName(), "java.lang.String");
+if (isRustCFML()) {
+    // Without a JVM the class lookup still answers; instantiating is what fails.
+    assert("a class Lucee does not carry still resolves by name",
+        pgctxLoader.loadClass("com.sun.tools.javac.api.JavacTool").getName(),
+        "com.sun.tools.javac.api.JavacTool");
+    assertThrows("newInstance on a loaded class fails without a JVM", function() {
+        pgctxLoader.loadClass("com.sun.tools.javac.api.JavacTool").newInstance();
+    });
+}
+
 suiteEnd();
 </cfscript>

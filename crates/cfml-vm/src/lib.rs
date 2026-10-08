@@ -29278,6 +29278,26 @@ impl CfmlVirtualMachine {
                     .map(|v| v.as_str_cow().to_lowercase())
                     .unwrap_or_default();
 
+                // The servlet bridge answers `getClass()` here, because its
+                // dispatchers below return early for every method and handed
+                // back null for this one — which is how
+                // `getPageContext().getClass().getClassLoader()` (cbjavaloader,
+                // lucee-spreadsheet) died on a null. Every OTHER shim keeps its
+                // own `getclass` arm, where one exists (POI reports concrete
+                // XSSF/HSSF classes), and otherwise reaches the generic
+                // `getclass` fallback further down.
+                if method_lower == "getclass"
+                    && extra_args.is_empty()
+                    && matches!(
+                        java_class.as_str(),
+                        java_shims::SERVLET_PAGE_CONTEXT_CLASS
+                            | java_shims::SERVLET_REQUEST_CLASS
+                            | java_shims::SERVLET_RESPONSE_CLASS
+                    )
+                {
+                    return Ok(java_shims::class_shim_for_shim(s));
+                }
+
                 // Servlet bridge: getPageContext() and its request/response
                 // objects. Dispatched here (not via the generic shim match) so
                 // the response side can read/write `self.response_status` /
@@ -32143,6 +32163,14 @@ impl CfmlVirtualMachine {
         // [getName] on a null value". (Components are handled above — TestBox
         // uses getMetadata().name for those.)
         if method_lower == "getclass" {
+            // A java shim that got here declined the method in its own handler;
+            // it still knows its class, and "lucee.runtime.type.StructImpl"
+            // would be a lie.
+            if let CfmlValue::Struct(ref s) = object {
+                if s.contains_key("__java_shim") {
+                    return Ok(java_shims::class_shim_for_shim(s));
+                }
+            }
             let class_name = match &object {
                 CfmlValue::Bool(_) => "java.lang.Boolean",
                 CfmlValue::Int(_) => "java.lang.Integer",

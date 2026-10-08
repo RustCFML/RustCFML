@@ -4648,6 +4648,30 @@ pub fn make_class_shim(class_name: &str) -> CfmlValue {
     CfmlValue::strukt(shim)
 }
 
+/// The `java.lang.Class` shim for a Java-shim receiver — what `x.getClass()`
+/// answers for any shimmed object. The shims store their class two ways
+/// (`__class_name` when a shim carries a display name of its own, otherwise the
+/// `__java_class` dispatch key), and the dispatch keys are lowercased, so the
+/// handful of classes whose real casing callers can see are restored here.
+/// Without this, `getPageContext().getClass()` was null and the cbjavaloader /
+/// lucee-spreadsheet idiom `getPageContext().getClass().getClassLoader()` blew
+/// up with "cannot call method [getClassLoader] on a null value".
+pub fn class_shim_for_shim(shim: &cfml_common::dynamic::CfmlStruct) -> CfmlValue {
+    let name = shim
+        .get("__class_name")
+        .map(|v| v.as_string())
+        .filter(|n| !n.is_empty())
+        .or_else(|| shim.get("__java_class").map(|v| v.as_string()))
+        .unwrap_or_else(|| "java.lang.Object".to_string());
+    let canonical = match name.as_str() {
+        SERVLET_PAGE_CONTEXT_CLASS => "lucee.runtime.PageContextImpl",
+        SERVLET_REQUEST_CLASS => "lucee.runtime.net.http.HttpServletRequestWrap",
+        SERVLET_RESPONSE_CLASS => "lucee.runtime.net.http.HttpServletResponseDummy",
+        other => other,
+    };
+    make_class_shim(canonical)
+}
+
 pub fn handle_java_class(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     let class_name = if let CfmlValue::Struct(ref shim) = object {
         shim.get("__class_name").map(|v| v.as_string()).unwrap_or_default()
@@ -4664,6 +4688,12 @@ pub fn handle_java_class(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             let name = args.first().map(|a| a.as_string()).unwrap_or_default();
             Ok(make_class_shim(&name))
         }
+        // Class.getClassLoader() — a deferred ClassLoader, which answers the
+        // classloader plumbing (getParent/loadClass/addURL/...) and only fails
+        // when something actually tries to INSTANTIATE a loaded class. That is
+        // the chain cbjavaloader's JavaLoader walks at init
+        // (`getPageContext().getClass().getClassLoader()` as the parent loader).
+        "getclassloader" => Ok(make_deferred_java("java.lang.ClassLoader")),
         "getname" | "getcanonicalname" | "gettypename" => Ok(CfmlValue::string(class_name)),
         "getsimplename" => {
             let simple = class_name.rsplit('.').next().unwrap_or(&class_name).to_string();
