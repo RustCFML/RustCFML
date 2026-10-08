@@ -821,6 +821,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("queryColumnData".to_string(), fn_query_column_data as BuiltinFunction);
     f.insert("queryColumnArray".to_string(), fn_query_column_array as BuiltinFunction);
     f.insert("queryCurrentRow".to_string(), fn_query_current_row as BuiltinFunction);
+    f.insert("queryRenameColumn".to_string(), fn_query_rename_column as BuiltinFunction);
+    f.insert("queryToStruct".to_string(), fn_query_to_struct as BuiltinFunction);
     f.insert("__querySetRow".to_string(), fn_query_move_cursor as BuiltinFunction);
     // QoQ custom-function registration (VM-intercepted).
     f.insert("queryRegisterFunction".to_string(), fn_query_register_function_stub as BuiltinFunction);
@@ -7467,21 +7469,27 @@ fn fn_query_get_cell(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
             let column = args[1].as_string();
+            if !q.has_column_ci(&column) {
+                return Err(CfmlError::runtime(format!(
+                    "Column [{}] not found in query",
+                    column
+                )));
+            }
+            // Lucee defaults to the LAST row, and hands back "" for a row
+            // outside the query rather than throwing.
             let row_idx = if args.len() >= 3 {
                 (get_int(&args, 2) as usize).saturating_sub(1)
             } else {
-                0
+                q.row_count().saturating_sub(1)
             };
             if let Some(row) = q.get_row(row_idx) {
-                let col_lower = column.to_lowercase();
                 for (k, v) in &row {
-                    if k.eq_ignore_ascii_case(&col_lower) {
+                    if k.eq_ignore_ascii_case(&column) {
                         return Ok(v.clone());
                     }
                 }
-                return Ok(CfmlValue::Null);
             }
-            return Err(CfmlError::runtime(format!("queryGetCell: row {} is out of range", row_idx + 1)));
+            return Ok(CfmlValue::string(String::new()));
         }
     }
     Err(CfmlError::runtime("queryGetCell requires a query and column name".to_string()))
@@ -18383,19 +18391,87 @@ fn fn_query_get_result(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::strukt(result))
 }
 
+/// The values of one query column, or Lucee's "not found" error. Lucee throws
+/// for an unknown column on every one of queryColumnData/valueArray/valueList/
+/// getCell/toStruct (verified 7.1.0.204) — returning a blank-filled array
+/// instead silently produced empty-string columns downstream.
+pub fn query_column_values(
+    q: &cfml_common::dynamic::CfmlQuery,
+    col: &str,
+) -> Result<Vec<CfmlValue>, CfmlError> {
+    q.with_read(|d| match d.column_data_ci(col) {
+        Some(v) => Ok(v.clone()),
+        None => Err(CfmlError::runtime(format!(
+            "Column [{}] not found in query, Columns are [{}]",
+            col,
+            d.columns
+                .iter()
+                .map(|c| c.to_uppercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    })
+}
+
 fn fn_query_column_data(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Query(q)) => {
             let col = get_str(&args, 1);
-            let values = q.with_read(|d| {
-                d.column_data_ci(&col)
-                    .cloned()
-                    .unwrap_or_else(|| vec![CfmlValue::string(String::new()); d.row_count()])
-            });
-            Ok(CfmlValue::array(values))
+            Ok(CfmlValue::array(query_column_values(q, &col)?))
         }
         _ => Err(CfmlError::runtime("queryColumnData() requires a query".to_string())),
     }
+}
+
+/// `queryRenameColumn(query, oldName, newName)` — Lucee renames in place and
+/// returns nothing. An unknown source column is an error there, not a no-op.
+fn fn_query_rename_column(args: Vec<CfmlValue>) -> CfmlResult {
+    let q = match args.get(0) {
+        Some(CfmlValue::Query(q)) => q,
+        _ => return Err(CfmlError::runtime("queryRenameColumn() requires a query".to_string())),
+    };
+    let from = get_str(&args, 1);
+    let to = get_str(&args, 2);
+    let renamed = q.with_write(|d| match d.column_index_ci(&from) {
+        Some(idx) => {
+            d.columns[idx] = to.clone();
+            true
+        }
+        None => false,
+    });
+    if !renamed {
+        return Err(CfmlError::runtime(format!(
+            "Cannot rename Column [{}] to [{}], original column doesn't exist",
+            from, to
+        )));
+    }
+    Ok(CfmlValue::Null)
+}
+
+/// `queryToStruct(query, key)` — a struct of row-structs keyed by that column's
+/// value (Lucee 7.1). Later rows win on a duplicate key, as they do there.
+fn fn_query_to_struct(args: Vec<CfmlValue>) -> CfmlResult {
+    let q = match args.get(0) {
+        Some(CfmlValue::Query(q)) => q,
+        _ => return Err(CfmlError::runtime("queryToStruct() requires a query".to_string())),
+    };
+    let key = get_str(&args, 1);
+    if !q.has_column_ci(&key) {
+        return Err(CfmlError::runtime(format!(
+            "Column [{}] not found in query",
+            key
+        )));
+    }
+    let mut out = ValueMap::default();
+    for row in q.rows() {
+        let k = row
+            .iter()
+            .find(|(c, _)| c.eq_ignore_ascii_case(&key))
+            .map(|(_, v)| v.as_string())
+            .unwrap_or_default();
+        out.insert(k, CfmlValue::strukt(row));
+    }
+    Ok(CfmlValue::strukt(out))
 }
 
 fn fn_query_current_row(args: Vec<CfmlValue>) -> CfmlResult {
@@ -18439,12 +18515,7 @@ fn fn_value_array(args: Vec<CfmlValue>) -> CfmlResult {
     })?;
     if let CfmlValue::Query(q) = arg {
         let col = get_str(&args, 1);
-        let values = q.with_read(|d| {
-            d.column_data_ci(&col)
-                .cloned()
-                .unwrap_or_else(|| vec![CfmlValue::string(String::new()); d.row_count()])
-        });
-        return Ok(CfmlValue::array(values));
+        return Ok(CfmlValue::array(query_column_values(q, &col)?));
     }
     if let Some(items) = arg.as_array_or_query_column() {
         return Ok(CfmlValue::array(items));

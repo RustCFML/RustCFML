@@ -268,5 +268,57 @@ assert("the columnList PROPERTY still uppercases", namesQ.columnList, "COLA,FULL
 assert("getColumnList(false) preserves casing", namesQ.getColumnList(false), "ColA,fullName");
 assert("getColumnList(true) uppercases", namesQ.getColumnList(true), "COLA,FULLNAME");
 
+// --- The rest of Lucee 7.1's query member surface ---
+// Preside calls `qry.valueArray( col )`; it threw "The function [valueArray]
+// does not exist in the Query" (a 500 through Bootstrap.onError). The whole
+// member list Lucee reports was filled in at the same time, each verified
+// against Lucee 7.1.0.204.
+memQ = queryNew("id,name", "integer,varchar", [[1, "Alice"], [2, "Bob"]]);
+assert("member valueArray", arrayToList(memQ.valueArray("name")), "Alice,Bob");
+assert("member valueArray is case-insensitive", arrayToList(memQ.valueArray("NAME")), "Alice,Bob");
+assert("member valueList", memQ.valueList("name"), "Alice,Bob");
+assert("member valueList takes a delimiter", memQ.valueList("name", "|"), "Alice|Bob");
+assert("member valueList takes an empty delimiter", memQ.valueList("name", ""), "AliceBob");
+assert("member columnCount", memQ.columnCount(), 2);
+assert("member columnExists", memQ.columnExists("name"), true);
+assert("member columnExists on a missing column", memQ.columnExists("nope"), false);
+assert("member keyExists", memQ.keyExists("id"), true);
+assert("member currentRow", memQ.currentRow(), 1);
+assert("member isEmpty", memQ.isEmpty(), false);
+assert("member isEmpty on an empty query", queryNew("a").isEmpty(), true);
+assert("member rowData", memQ.rowData(2).name, "Bob");
+assert("member getCell", memQ.getCell("name", 1), "Alice");
+// Lucee's getCell defaults to the LAST row, and answers "" for a row outside
+// the query rather than throwing.
+assert("getCell defaults to the last row", memQ.getCell("name"), "Bob");
+assert("getCell past the end is empty", memQ.getCell("name", 99), "");
+assert("member toStruct keys by the named column", memQ.toStruct("id")["2"].name, "Bob");
+assert("member getMetadata", memQ.getMetadata()[2].name, "name");
+assert("member toJson", isJSON(memQ.toJson()), true);
+dupQ = memQ.duplicate();
+dupQ.addRow({id: 3, name: "Carol"});
+assert("member duplicate is independent", memQ.recordCount & "/" & dupQ.recordCount, "2/3");
+dupQ.renameColumn("name", "nm");
+assert("member renameColumn", dupQ.columnList, "ID,NM");
+assert("queryRenameColumn standalone", dupQ.columnList, "ID,NM");
+// The member form of each hands back the receiver (GH #430); only standalone
+// queryEach returns null.
+assert("member each returns the query", isQuery(memQ.each(function(r) {})), true);
+
+// An unknown column is an ERROR on every one of these, not a blank column —
+// queryColumnData used to hand back an array of empty strings, which surfaced
+// downstream as silently empty data.
+assertThrows("queryColumnData on a missing column throws", function() { queryColumnData(memQ, "nope"); });
+assertThrows("member valueArray on a missing column throws", function() { memQ.valueArray("nope"); });
+assertThrows("member valueList on a missing column throws", function() { memQ.valueList("nope"); });
+assertThrows("member getCell on a missing column throws", function() { memQ.getCell("nope", 1); });
+assertThrows("member toStruct on a missing column throws", function() { memQ.toStruct("nope"); });
+assertThrows("member renameColumn of a missing column throws", function() { memQ.renameColumn("nope", "x"); });
+// RustCFML has no indexed queries, so the *ByIndex members report what Lucee
+// reports for an unindexed one.
+assertThrows("rowByIndex on an unindexed query throws", function() { memQ.rowByIndex(2); });
+assertThrows("getCellByIndex on an unindexed query throws", function() { memQ.getCellByIndex(2, 2); });
+assertThrows("rowDataByIndex on an unindexed query throws", function() { memQ.rowDataByIndex(2); });
+
 suiteEnd();
 </cfscript>

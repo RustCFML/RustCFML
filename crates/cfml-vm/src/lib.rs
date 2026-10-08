@@ -31140,6 +31140,58 @@ impl CfmlVirtualMachine {
                 // to the names builtin; without this arm it fell through to
                 // `_ => None` and quietly returned Null.
                 "columnarray" => Some("queryColumnArray"),
+                // The rest of Lucee 7.1's query member surface. Each was
+                // verified against Lucee 7.1.0.204; without these arms the call
+                // threw "The function [x] does not exist in the Query" — which is
+                // how `q.valueArray(col)` (Preside's Bootstrap/onError path) blew
+                // up with a 500.
+                "valuearray" => Some("queryColumnData"),
+                "valuelist" => {
+                    let col = extra_args.first().map(|c| c.as_string()).unwrap_or_default();
+                    let values = cfml_stdlib::query_column_values(q, &col)?;
+                    let delim = extra_args
+                        .get(1)
+                        .map(|d| d.as_string())
+                        .unwrap_or_else(|| ",".to_string());
+                    return Ok(CfmlValue::string(
+                        values
+                            .iter()
+                            .map(|v| v.as_string())
+                            .collect::<Vec<_>>()
+                            .join(&delim),
+                    ));
+                }
+                "columncount" => Some("queryColumnCount"),
+                "columnexists" | "keyexists" => Some("queryColumnExists"),
+                "currentrow" => Some("queryCurrentRow"),
+                "duplicate" => Some("duplicate"),
+                "getcell" => Some("queryGetCell"),
+                "rowdata" => Some("queryRowData"),
+                "getmetadata" => Some("getMetadata"),
+                "isempty" => {
+                    return Ok(CfmlValue::Bool(q.row_count() == 0));
+                }
+                // Lucee binds the receiver as numberFormat's FIRST argument, so
+                // `q.numberFormat(mask)` is numberFormat(query, mask) there too —
+                // odd, but it is the behaviour, and a second argument errors.
+                "numberformat" => Some("numberFormat"),
+                "renamecolumn" => Some("queryRenameColumn"),
+                "tostruct" => Some("queryToStruct"),
+                "tojson" => Some("serializeJSON"),
+                // Lucee's *ByIndex members read a query built with an INDEX.
+                // RustCFML has no indexed queries, so they always report what
+                // Lucee reports for an unindexed one rather than silently
+                // answering with the positional row.
+                "getcellbyindex" | "rowbyindex" | "rowdatabyindex" => {
+                    let idx = extra_args
+                        .first()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    return Err(CfmlError::runtime(format!(
+                        "Query is not indexed, index [{}] not found",
+                        idx
+                    )));
+                }
                 "addrow" => Some("queryAddRow"),
                 // Lucee exposes queryAddColumn as a member too; without this arm
                 // `q.addColumn(...)` threw "does not exist in the Query."
@@ -31184,7 +31236,10 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    return Ok(CfmlValue::Null);
+                    // The MEMBER form hands back the receiver on Lucee, as the
+                    // array and struct members do (GH #430); only the standalone
+                    // queryEach returns null.
+                    return Ok(object.clone());
                 }
                 "map" => {
                     if let Some(callback) = extra_args.first().cloned() {
