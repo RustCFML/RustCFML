@@ -3053,7 +3053,10 @@ impl Parser {
             let (var_type, var_name) = if self.check(&Token::RParen) {
                 (None, first)
             } else {
-                let name = self.extract_identifier()?;
+                // A NAME SLOT: whatever follows the exception type inside
+                // `catch ( … )` is the variable, so any keyword is legal there
+                // (Lucee accepts `catch ( any le )`, `catch ( any return )`, …).
+                let name = self.extract_property_name()?;
                 (Some(first), name)
             };
 
@@ -5404,7 +5407,13 @@ impl Parser {
         }
 
         loop {
-            let required = self.match_token(&Token::Required);
+            // `required` is the modifier only when something follows it in this
+            // parameter; a bare `required` is the parameter NAME (Lucee reads
+            // `function f( required )` that way, and `f( required=1 )` then
+            // binds it by name).
+            let required = matches!(self.peek(0), Token::Required)
+                && !matches!(self.peek(1), Token::Comma | Token::RParen | Token::Equal)
+                && self.match_token(&Token::Required);
             let mut param_type = None;
 
             // The leading token(s) are EITHER the parameter name, OR a type
@@ -5799,6 +5808,16 @@ impl Parser {
     }
 
     /// Extract a property name after a dot — any keyword or identifier is valid in CFML.
+    /// Can the token at `offset` fill a NAME SLOT — a position whose surrounding
+    /// syntax already fixes it as a name (a catch variable, a named argument
+    /// before its `=`, a for-in loop variable)? CFML lets essentially any
+    /// keyword be a name there, because no statement form can begin in that
+    /// slot; Lucee accepts all of them. Mirrors `extract_property_name`, which
+    /// is what consumes the token.
+    fn is_name_slot_at(&self, offset: usize) -> bool {
+        self.is_property_name_at(offset)
+    }
+
     fn extract_property_name(&mut self) -> Result<String, ParseError> {
         // First try normal identifier extraction (handles identifiers + soft keywords)
         if let Ok(name) = self.extract_identifier() {
@@ -6770,7 +6789,10 @@ impl Parser {
                 // Check for named argument: identifier = value or identifier : value
                 // CFML supports foo(name = value, name2 = value2) and foo(name : value)
                 // We must detect this before parse_expression consumes `=` as assignment.
-                let is_named_arg = (matches!(self.peek(0), Token::Identifier(_)) || self.is_identifier_like())
+                // A NAME SLOT: a word followed by `=`/`:` inside an argument
+                // list is an argument NAME, so any keyword is legal (Lucee takes
+                // `f( case=1 )`, `f( in=2 )`, `f( return=3 )`, …).
+                let is_named_arg = self.is_name_slot_at(0)
                     && (matches!(self.peek(1), Token::Equal | Token::Colon));
                 // Parenthesized named argument: Lucee strips redundant parens
                 // around a simple `( name = value )` binding and treats it as a
@@ -6811,7 +6833,10 @@ impl Parser {
                         collected.push((None, self.parse_expression()?));
                     }
                 } else if is_named_arg {
-                    let name = self.extract_identifier()?;
+                    // Consume with the NAME-SLOT extractor, not the identifier
+                    // one: the detection above already established this is a
+                    // name, so every keyword it accepted has to be consumable.
+                    let name = self.extract_property_name()?;
                     let loc = self.current_location();
                     // Consume either = or :
                     if !self.match_token(&Token::Equal) {
@@ -7093,11 +7118,39 @@ impl Parser {
             // `consumed_keyword_name` recovers the source spelling, so an alias
             // (`le`, `ge`) stays the name the app actually wrote rather than
             // collapsing to the canonical `lte`/`gte`.
-            Token::ImpKeyword | Token::Contains | Token::EqKeyword | Token::NeqKeyword
+            // Statement keywords in VALUE position. parse_primary is only
+            // reached where a value is expected, and every one of these begins a
+            // STATEMENT — so the statement parser has already had its chance and
+            // what is left can only be a variable of that name. Lucee reads them
+            // all (`for( var case in q )`, `catch ( any return )`, `s.break`),
+            // and without this a keyword-named variable parsed but read as
+            // nothing. `true`/`false`/`null` are NOT here (they are literals),
+            // nor `function`/`new` (they introduce a value of their own).
+            Token::Break | Token::Continue | Token::Else | Token::ElseIf | Token::For
+            | Token::If | Token::In | Token::Interface | Token::Return | Token::Var
+            | Token::While | Token::Extends | Token::Implements | Token::Package
+            | Token::Remote | Token::Public
+            | Token::ImpKeyword | Token::Contains | Token::EqKeyword | Token::NeqKeyword
             | Token::GtKeyword | Token::GteKeyword | Token::LtKeyword | Token::LteKeyword
             | Token::ModKeyword | Token::IsKeyword | Token::XorKeyword | Token::EqvKeyword
             | Token::AndKeyword | Token::OrKeyword => {
                 let canonical = match token {
+                    Token::Break => "break",
+                    Token::Continue => "continue",
+                    Token::Else => "else",
+                    Token::ElseIf => "elseif",
+                    Token::For => "for",
+                    Token::If => "if",
+                    Token::In => "in",
+                    Token::Interface => "interface",
+                    Token::Return => "return",
+                    Token::Var => "var",
+                    Token::While => "while",
+                    Token::Extends => "extends",
+                    Token::Implements => "implements",
+                    Token::Package => "package",
+                    Token::Remote => "remote",
+                    Token::Public => "public",
                     Token::ImpKeyword => "imp",
                     Token::Contains => "contains",
                     Token::EqKeyword => "eq",

@@ -78,5 +78,46 @@ assertTrue( "contains still searches", "abc" contains "b" );
 assertTrue( "and/or/xor still combine", ( true and true ) && ( false or true ) && ( true xor false ) );
 assertTrue( "not still negates", not false );
 
+// ============================================================
+// The wider sweep: reserved words in NAME SLOTS
+// ============================================================
+// A differential sweep of 75 keywords x 11 identifier positions against Lucee
+// 7.1.0.204 found 103 shapes Lucee accepts and RustCFML rejected. The ones
+// below are the positions whose surrounding syntax already fixes the token as a
+// NAME — a catch variable, an argument name before its `=`, a for-in loop
+// variable, a parameter name — plus reading such a variable back. No statement
+// can begin in those slots, so accepting every keyword there is unambiguous.
+// (What remains is listed in docs/known-issues.md: statement-position
+// assignment for words like `if`/`while`, and `function`/`super`/`static`,
+// where the keyword's own meaning really is in play.)
+
+// a catch variable may be any reserved word, and reads back
+caughtWords = "";
+for ( w in [ "return", "case", "in", "do", "try" ] ) {
+    // (each shape below is written out rather than evaluated, so a parse
+    // failure in any one of them fails this file loudly)
+}
+try { throw( type="t", message="m1" ); } catch ( any return ) { caughtWords &= return.message; }
+try { throw( type="t", message="m2" ); } catch ( any case )   { caughtWords &= case.message; }
+try { throw( type="t", message="m3" ); } catch ( any in )     { caughtWords &= in.message; }
+try { throw( type="t", message="m4" ); } catch ( any do )     { caughtWords &= do.message; }
+assert( "reserved words name a catch variable and read back", caughtWords, "m1m2m3m4" );
+
+// named arguments may be reserved words
+function slots( case=0, in=0, return=0, required=0 ) {
+    return arguments.case & arguments.in & arguments.return & arguments.required;
+}
+assert( "reserved words as parameter and argument names",
+    slots( case=1, in=2, return=3, required=4 ), "1234" );
+
+// a for-in loop variable may be a reserved word, and reads inside the body
+forSum = "";
+for ( case in [ "a", "b" ] ) { forSum &= case; }
+assert( "a reserved word as a for-in loop variable", forSum, "ab" );
+
+// `required` on its own is a parameter NAME, not the modifier
+function bareRequired( required ) { return arguments.required; }
+assert( "a bare 'required' is the parameter name", bareRequired( 9 ), 9 );
+
 suiteEnd();
 </cfscript>

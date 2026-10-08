@@ -2196,6 +2196,38 @@ allocation accounting wired to the abort path.
 Tests: `crates/cli/tests/max_memory.rs` (503 → finish → reopen, end to end) and
 the unit tests in `crates/cli/src/memory_limit.rs`.
 
+## 82. Reserved words as identifiers — what still diverges from Lucee
+
+A differential sweep (75 keywords x 11 identifier positions, run against Lucee
+7.1.0.204; the generator lives in this file's history) found **103** shapes
+Lucee accepts as names and RustCFML rejected. v0.722.0 closes 76 of them: every
+position whose surrounding syntax already fixes the token as a NAME — a catch
+variable, an argument name before its `=`, a for-in loop variable, a parameter
+name — plus reading such a variable back in value position, and the binary
+operator words (`eq`, `le`, `mod`, `contains`, …) everywhere.
+
+**The 27 that remain**, all cases where the keyword's own meaning is genuinely
+in play at that position:
+
+| position | words |
+|---|---|
+| `X = 1` (statement) | `for` `function` `if` `import` `include` `interface` `lock` `null` `rethrow` `super` `switch` `this` `throw` `var` `while` |
+| `var X = 1` | `function` `null` `static` `super` |
+| `catch ( any X )` | `function` `new` `static` `super` |
+| `for ( X in … )` | `function` `static` `super` |
+| `function X()` | `super` |
+
+Closing these means a lookahead at statement start (`if` followed by `=` is an
+assignment, not an `if`), which is how `abort`, `component` and `loop` are
+already handled. None has been reported from real code — `le` (GH: Preside's
+SharePoint wrapper, `catch ( any le )`) was, and is fixed.
+
+RustCFML is also a **superset** in 13 shapes Lucee rejects: `true`/`false`/`not`
+as struct keys and named arguments, `true = 1` and `return = 1` as assignments,
+`local` as a catch/loop variable, and functions named `array`/`query`/`struct`.
+Accepting more is not a wrong-result divergence, but `true = 1` silently
+assigning is worth tightening if it ever masks a typo.
+
 ## 81. CFML regex: `.` matches a newline; `^`/`$` stay single-line
 
 Lucee compiles the CFML regex functions DOTALL, so `.` matches a line
