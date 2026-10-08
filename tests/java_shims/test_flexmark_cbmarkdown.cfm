@@ -79,5 +79,26 @@ assertTrue( "the bold round-trips", findNoCase( "**bold**", backToMd ) > 0 );
 assertTrue( "the renderer accepts a bare string",
     findNoCase( "<em>x</em>", renderer.render( "*x*" ) ) > 0 );
 
+// --- the path cbjavaloader actually takes ---
+// JavaLoader.create() wraps every loaded class in a JavaProxy
+// (`createObject( "java", "coldfusion.runtime.java.JavaProxy" ).init( class )`)
+// before handing it back, so the shimmed class has to survive that wrap — a
+// bare loadClass() test passes while the real module still breaks.
+function jcreate( className ) {
+    return createObject( "java", "coldfusion.runtime.java.JavaProxy" )
+        .init( loader.loadClass( arguments.className ) );
+}
+proxyTables = jcreate( "com.vladsch.flexmark.ext.tables.TablesExtension" );
+assert( "a proxied class keeps its static fields", proxyTables.CLASS_NAME, "tables.CLASS_NAME" );
+
+proxyParser   = jcreate( "com.vladsch.flexmark.parser.Parser" );
+proxyRenderer = jcreate( "com.vladsch.flexmark.html.HtmlRenderer" );
+proxyOptions  = jcreate( "com.vladsch.flexmark.util.data.MutableDataSet" ).init()
+    .set( proxyTables.CLASS_NAME, "table" )
+    .set( proxyParser.EXTENSIONS, [ proxyTables.create() ] );
+proxyHtml = proxyRenderer.builder( proxyOptions ).build()
+    .render( proxyParser.builder( proxyOptions ).build().parse( "**hi**" ) );
+assertTrue( "the proxied pipeline renders", findNoCase( "<strong>hi</strong>", proxyHtml ) > 0 );
+
 suiteEnd();
 </cfscript>

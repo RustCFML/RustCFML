@@ -4830,6 +4830,16 @@ pub fn handle_java_classloader(
         // create reports the right name. URLClassLoader.init(urls) and the
         // proxy's no-arg .init() just return the (deferred) receiver.
         "init" => match args.first() {
+            // `JavaProxy.init( flexmarkClass )` — cbjavaloader wraps EVERY class
+            // it loads in a proxy, so the shimmed class must survive the wrap or
+            // the proxy swallows it and its static fields vanish. (The flexmark
+            // shim is already the class handle; there is nothing to adopt.)
+            Some(CfmlValue::Struct(s))
+                if s.get("__java_class").map(|v| v.as_string()).as_deref()
+                    == Some(crate::java_shims_flexmark::FLEXMARK_CLASS) =>
+            {
+                Ok(args.first().cloned().unwrap_or(CfmlValue::Null))
+            }
             Some(CfmlValue::Struct(s))
                 if s.get("__java_class").map(|v| v.as_string()).as_deref()
                     == Some("java.lang.class") =>
