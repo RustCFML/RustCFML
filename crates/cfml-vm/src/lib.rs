@@ -19006,23 +19006,21 @@ impl CfmlVirtualMachine {
                         // first, then the serve-mode webroot, then (CLI mode)
                         // the entry template's parent directory.
                         let mut found = None;
+                        let rel_lower = rel.to_lowercase();
                         for mapping in &self.mappings {
-                            let prefix = mapping.name.trim_end_matches('/');
                             // Skip the "/" root mapping (empty prefix matches every
                             // path): it must NOT shadow a more specific runtime
                             // mapping. The webroot/base fallback below handles the
                             // genuine root case identically.
-                            if prefix.is_empty() {
+                            let Some(remainder) =
+                                Self::mapping_remainder(&rel_lower, &rel, &mapping.name)
+                            else {
                                 continue;
-                            }
-                            if rel.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                                let remainder = &rel[prefix.len()..];
-                                let remainder = remainder.trim_start_matches('/');
-                                let candidate =
-                                    std::path::PathBuf::from(&mapping.path).join(remainder);
-                                found = Some(candidate);
-                                break;
-                            }
+                            };
+                            let candidate =
+                                std::path::PathBuf::from(&mapping.path).join(remainder);
+                            found = Some(candidate);
+                            break;
                         }
                         let candidate = found.unwrap_or_else(|| {
                             let stripped = rel.trim_start_matches('/');
@@ -33857,16 +33855,20 @@ impl CfmlVirtualMachine {
         }
         let path_lower = include_path.to_lowercase();
         for mapping in &self.mappings {
-            let prefix_lower = mapping.name.to_lowercase();
-            if path_lower.starts_with(&prefix_lower)
-                || (mapping.name == "/" && path_lower.starts_with('/'))
+            // Segment-boundary match (see `mapping_remainder`): a "/app" mapping
+            // must not claim "/application/...".
+            let remainder = if mapping.name == "/" {
+                if !path_lower.starts_with('/') {
+                    continue;
+                }
+                include_path[1..].trim_start_matches('/')
+            } else {
+                match Self::mapping_remainder(&path_lower, include_path, &mapping.name) {
+                    Some(r) => r,
+                    None => continue,
+                }
+            };
             {
-                let remainder = if mapping.name == "/" {
-                    &include_path[1..]
-                } else {
-                    &include_path[mapping.name.len()..]
-                };
-                let remainder = remainder.trim_start_matches('/');
                 let resolved = format!("{}/{}", mapping.path.trim_end_matches('/'), remainder);
                 if let Some(real) = self.template_path_exists(&resolved, fold) {
                     return Some(real);
@@ -39942,6 +39944,26 @@ impl CfmlVirtualMachine {
     /// mapping-resolution branch of `expandPath` so file BIFs and `ExpandPath`
     /// agree on mapped paths. Returns `None` when no mapping prefix matches
     /// (caller keeps the path as a plain web-root/absolute path).
+    /// The part of `rel` after a mapping `prefix`, or `None` when the mapping
+    /// does not own that path.
+    ///
+    /// The match must land on a path-segment boundary: `/app` owns `/app/x` but
+    /// NOT `/application/x`. Getting this wrong does not fail loudly — it
+    /// silently splices the mapping target onto the wrong remainder, so
+    /// `expandPath( "/application/extensions/…" )` under Preside's `/app`
+    /// mapping returned `<webroot>/application` + `lication/extensions/…`.
+    fn mapping_remainder<'p>(rel_lower: &str, rel: &'p str, prefix: &str) -> Option<&'p str> {
+        let prefix = prefix.trim_end_matches(['/', '\\']);
+        if prefix.is_empty() {
+            return None;
+        }
+        let after = rel_lower.strip_prefix(&prefix.to_lowercase())?;
+        if !after.is_empty() && !after.starts_with(['/', '\\']) {
+            return None;
+        }
+        Some(rel[prefix.len()..].trim_start_matches(['/', '\\']))
+    }
+
     fn resolve_leading_slash_mapping(&self, raw: &str) -> Option<String> {
         if self.mappings.is_empty() {
             return None;

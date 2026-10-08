@@ -57,6 +57,13 @@ component {
     // _getAllObjectPaths prefix-strip. Points at tests/oop/ via tests/tags/../oop/.
     this.mappings["/dotdotprobe"] = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/../oop/";
 
+    // A mapping whose name is a PREFIX of a real sibling directory name, used by
+    // tags/test_mapping_prefix_boundary.cfm. "/wheelsmap" is a strict prefix of
+    // the "/wheelsmapprobe" mapping above AND of the "wheelsmapprobe" path
+    // segment, so a prefix match that ignores segment boundaries claims paths it
+    // does not own. Points at tests/oop/.
+    this.mappings["/wheelsmap"] = getDirectoryFromPath(getCurrentTemplatePath()) & "oop/";
+
     // Custom tag path for tests/tags/test_customtag_path_deep_search.cfm.
     // The control tag sits at the path ROOT (ctpath_shallow.cfm); the gap tag
     // one subdirectory down (nested/ctpath_deep.cfm). Lucee searches custom

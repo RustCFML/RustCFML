@@ -925,6 +925,7 @@ include "harness.cfm";
 <!--- cfdirectory(ExpandPath("//plugins")) hits a nonexistent dir, throws, and --->
 <!--- $init aborts — every request 500s on a pristine Wheels app. --->
 <cf_runtest file="tags/test_expandpath_leading_double_slash.cfm" />
+<cf_runtest file="tags/test_mapping_prefix_boundary.cfm" />
 <!--- - component_soft_keyword: `component` is a SOFT keyword on Lucee/ACF/BoxLang --->
 <!--- (a CFC introducer only when it begins a declaration; otherwise an ordinary --->
 <!--- identifier). RustCFML used to treat it as a HARD reserved keyword, so a --->
