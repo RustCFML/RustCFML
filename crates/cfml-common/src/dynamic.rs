@@ -2619,6 +2619,19 @@ impl CfmlValue {
     /// and `var x = mock(...)` deleted `x` → "Variable X undefined". Sorting the
     /// keys makes our `toString()` content-deterministic like Lucee's, so the
     /// setup and call hashes match. See docs/known-issues.md §15.
+    /// The arguments scope's internal bookkeeping keys. They back positional
+    /// `arguments[i]` access and the scope sentinel. Every CFML-visible view of
+    /// a struct already hides them — `structKeyList`, `structCount`,
+    /// `serializeJson`, a `collection` loop — and a STRINGIFICATION must too:
+    /// ColdBox's WireBox Builder puts a captured arguments scope straight into
+    /// its DSLDependencyNotFoundException message, so the leak surfaced
+    /// verbatim in a user-facing Preside error as
+    /// `{__arguments_params: [...], __arguments_scope: true, ...}`.
+    #[inline]
+    fn is_internal_arguments_key(k: &str) -> bool {
+        k == "__arguments_scope" || k == "__arguments_params"
+    }
+
     pub fn to_string_sorted(&self) -> String {
         let mut path: Vec<usize> = Vec::new();
         let mut memo: HashMap<usize, String> = HashMap::new();
@@ -2685,8 +2698,11 @@ impl CfmlValue {
                     return (cached.clone(), true);
                 }
                 path.push(ptr);
-                let mut entries: Vec<(String, CfmlValue)> =
-                    s.iter().map(|(k, v)| (k.as_str().to_string(), v)).collect();
+                let mut entries: Vec<(String, CfmlValue)> = s
+                    .iter()
+                    .filter(|(k, _)| !Self::is_internal_arguments_key(k.as_str()))
+                    .map(|(k, v)| (k.as_str().to_string(), v))
+                    .collect();
                 entries.sort_by(|a, b| {
                     a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0))
                 });
@@ -2822,7 +2838,10 @@ impl CfmlValue {
                 // cycles, but holding the lock across the walk would turn any
                 // case it did not catch into a deadlock rather than a "{...}".
                 let entries: Vec<(Key, CfmlValue)> = s.with_map(|m| {
-                    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    m.iter()
+                        .filter(|(k, _)| !Self::is_internal_arguments_key(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
                 });
                 let items: Vec<String> = entries
                     .into_iter()
