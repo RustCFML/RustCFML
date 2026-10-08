@@ -349,15 +349,34 @@ fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
         return Ok(std::sync::Arc::clone(&e.re));
     }
     let translated = translate_cfml_regex(pat);
-    // Fast path: the `regex` crate. On a compile error, retry with `fancy-regex`,
-    // which supports lookaround and backreferences (a genuinely-malformed pattern
-    // fails both and the caller falls back to its no-match behavior).
+    // `.` MATCHES A NEWLINE in CFML's regex functions (Lucee compiles them
+    // DOTALL; verified on 7.1.0.204: `reReplace( "a\nb", "a.b", "X" )` is "X"
+    // there and `reFind( "a.b", "a\nb" )` is 1). Rust's default is the opposite,
+    // which silently turns a whole-string pattern into a no-match on any
+    // multi-line subject — and `reReplace` returns the subject UNCHANGED when it
+    // does not match, so the failure is invisible at the call site.
+    //
+    // Preside's SqlRunner splits a statement on its `where` with
+    // `reReplaceNoCase( sql, "^(.*?\swhere)\s.*$", "\1" )` and concatenates the
+    // two halves; against a statement whose filter spans lines that returned the
+    // WHOLE statement as the "pre" half, so every null-param pass appended
+    // another copy of the tail and MariaDB rejected the result (ERROR 1064).
+    //
+    // `^` and `$` stay single-line (NOT multiline) — Lucee agrees there:
+    // `reFind( "a$", "a\nb" )` is 0 on both engines.
+    //
+    // The `java.util.regex` shim compiles through its own `java_cached_regex`
+    // and keeps Java's default (dot does not match a line terminator), which is
+    // correct for code that asked for Java semantics by name.
     let re = match regex::RegexBuilder::new(&translated)
+        .dot_matches_new_line(true)
         .dfa_size_limit(REGEX_DFA_CACHE_BYTES)
         .build()
     {
         Ok(r) => CfRegex::Std(r),
-        Err(_) => match fancy_regex::Regex::new(&translated) {
+        // fancy-regex has no builder flag for this; the inline group is
+        // equivalent and a later `(?-s)` in the pattern still overrides it.
+        Err(_) => match fancy_regex::Regex::new(&format!("(?s){}", translated)) {
             Ok(r) => CfRegex::Fancy(r),
             Err(_) => return Err(()),
         },

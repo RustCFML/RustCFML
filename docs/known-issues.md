@@ -2196,6 +2196,36 @@ allocation accounting wired to the abort path.
 Tests: `crates/cli/tests/max_memory.rs` (503 → finish → reopen, end to end) and
 the unit tests in `crates/cli/src/memory_limit.rs`.
 
+## 81. CFML regex: `.` matches a newline; `^`/`$` stay single-line
+
+Lucee compiles the CFML regex functions DOTALL, so `.` matches a line
+terminator: `reReplace( "a#chr(10)#b", "a.b", "X" )` is `"X"` and
+`reFind( "a.b", "a#chr(10)#b" )` is `1`. Rust's regex crate defaults the other
+way and RustCFML inherited that until v0.722.0.
+
+The failure mode is silent, which is what makes it worth recording.
+`reReplace` returns its **subject unchanged** when the pattern does not match,
+so a whole-string pattern against a multi-line subject raises nothing — the
+caller simply carries on with the wrong value. Preside's `SqlRunner` splits a
+statement at its `where` and rejoins the halves:
+
+```cfml
+preClause  = sql.reReplaceNoCase( "^(.*?\swhere)\s.*$", "\1" );
+postClause = sql.reReplaceNoCase( "^.*?\swhere\s", " " );
+return preClause & postClause;
+```
+
+For a statement whose filter spanned several lines the first pattern never
+matched, `preClause` came back as the whole statement, and the rejoin appended
+the tail to it — once per null parameter. MariaDB rejected the result with
+ERROR 1064 pointing at the second copy of the where clause.
+
+`^` and `$` are **not** multiline on either engine (`reFind( "a$",
+"a#chr(10)#b" )` is `0` on both), and an explicit `(?-s)` still restores the
+non-DOTALL meaning. The `java.util.regex` shim compiles through its own cache
+and keeps Java's default — dot does not match a line terminator there, which is
+what code asking for Java semantics by name expects.
+
 ## 80. The regex caches were bounded by entry count, not by bytes — 1.3 GB of a Wheels run (fixed v0.653.6) 📌
 
 **What the heap profiler showed.** Of ~2 GB live at the peak of a Wheels
