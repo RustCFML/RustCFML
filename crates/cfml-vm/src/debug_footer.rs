@@ -56,6 +56,9 @@ pub struct ExceptionRow {
     pub detail: String,
     pub src: String,
     pub line: usize,
+    /// Did this one escape every try/catch? A request that renders usually
+    /// raises plenty of caught exceptions; exactly one of them killed it.
+    pub uncaught: bool,
     /// `(template, line)` frames, outermost first.
     pub stack: Vec<(String, usize)>,
 }
@@ -261,6 +264,7 @@ impl VmObserver for DebugCollector {
                 detail: e.detail.to_string(),
                 src: e.src.to_string(),
                 line: e.line,
+                uncaught: e.uncaught,
                 stack: e.stack.clone(),
             });
         }
@@ -921,7 +925,15 @@ fn render_comment(data: &DebugData, total_us: i64) -> String {
     if !data.exceptions.is_empty() {
         s.push_str(&format!("  Exceptions: {}\n", data.exceptions.len()));
         for e in &data.exceptions {
-            s.push_str(&format!("    {}: {}\n", e.etype, e.message.replace('\n', " ")));
+            s.push_str(&format!(
+                "    {}{}: {}\n",
+                if e.uncaught { "UNCAUGHT " } else { "" },
+                e.etype,
+                e.message.replace('\n', " ")
+            ));
+            for (tmpl, line) in e.stack.iter().take(8) {
+                s.push_str(&format!("      at {}:{}\n", tmpl, line));
+            }
             if !e.detail.is_empty() {
                 s.push_str(&format!("      detail: {}\n", e.detail.replace('\n', " ")));
             }
@@ -1202,12 +1214,29 @@ fn render_html(
         ));
         for e in &data.exceptions {
             s.push_str(&format!(
-                "<div style=\"color:#900\"><b>{}</b>: {} <small>({}:{})</small></div>\n",
+                "<div style=\"color:#900\">{}<b>{}</b>: {} <small>({}:{})</small></div>\n",
+                if e.uncaught { "<b>UNCAUGHT</b> " } else { "" },
                 esc(&e.etype),
                 esc(&e.message),
                 esc(&e.src),
                 e.line,
             ));
+            // Where it was RAISED. The `src` above is only the innermost
+            // template; for an error rethrown by a framework handler (Preside's
+            // Bootstrap.onError) that is the handler, not the code that failed,
+            // which left no way to find the culprit from the footer alone.
+            if !e.stack.is_empty() {
+                let frames: Vec<String> = e
+                    .stack
+                    .iter()
+                    .take(8)
+                    .map(|(tmpl, line)| format!("{}:{}", esc(tmpl), line))
+                    .collect();
+                s.push_str(&format!(
+                    "<div style=\"color:#900;margin:0 0 4px 1em\"><small>at {}</small></div>\n",
+                    frames.join("<br>at "),
+                ));
+            }
             // Lucee shows the detail too, and it is usually where the useful
             // half of a framework error lives (the SQL, the driver message).
             if !e.detail.is_empty() {
