@@ -12725,6 +12725,51 @@ fn url_trailing_db_name(url: &str) -> String {
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+/// Is `RUSTCFML_SQL_TRACE` switched on? Read once; the result is cached.
+fn sql_trace_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+    match STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RUSTCFML_SQL_TRACE")
+                .map(|v| {
+                    let v = v.trim();
+                    !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+                })
+                .unwrap_or(false);
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+/// Write one statement (and its bind values) to stderr under `RUSTCFML_SQL_TRACE`.
+fn sql_trace(sql: &str, params: &CfmlValue, datasource: &str) {
+    if !sql_trace_enabled() {
+        return;
+    }
+    let ds = if datasource.is_empty() { "<default>" } else { datasource };
+    eprintln!("[sql-trace] datasource={ds} len={} sql>>>\n{sql}\n<<<sql", sql.len());
+    match params {
+        CfmlValue::Null => {}
+        CfmlValue::Struct(m) => {
+            for (k, v) in m.iter() {
+                eprintln!("[sql-trace]   :{k} = {}", v.as_string());
+            }
+        }
+        CfmlValue::Array(a) => {
+            for (i, v) in a.snapshot().iter().enumerate() {
+                eprintln!("[sql-trace]   ?{} = {}", i + 1, v.as_string());
+            }
+        }
+        other => eprintln!("[sql-trace]   params = {}", other.as_string()),
+    }
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     let sql = get_str(&args, 0);
     if sql.is_empty() {
@@ -12822,6 +12867,14 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
             }),
         _ => None,
     };
+
+    // `RUSTCFML_SQL_TRACE=1` writes every statement, verbatim, to stderr before
+    // it runs. Off by default and read once per process, so it costs an atomic
+    // load per query. It exists because an app-level SQL fault (a framework
+    // assembling a statement wrongly) is otherwise only visible through the
+    // database's own error text, which quotes a fragment — and an error page
+    // copied out of a browser is not a reliable transcript of the statement.
+    sql_trace(&sql, &params_arg, &datasource_label);
 
     if let Some(driver) = dynamic_driver {
         let r = driver.execute(&sql, &params_arg, &return_type)?;

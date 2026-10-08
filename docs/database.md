@@ -255,6 +255,27 @@ queryExecute("select 1", [], { datasource =
     "sqlserver://user:pass@host.database.windows.net:1433/db?trustServerCertificate=false" });
 ```
 
+## Tracing the SQL an app actually sends
+
+When a framework assembles a statement for you, the database's own error text is
+the only evidence of what it built — and it quotes a fragment, not the statement.
+Set `RUSTCFML_SQL_TRACE=1` and every statement is written to stderr, verbatim,
+with its bind values, just before it runs:
+
+```bash
+RUSTCFML_SQL_TRACE=1 rustcfml --serve 2> sql.log
+```
+
+```
+[sql-trace] datasource=preside len=412 sql>>>
+select `x`.`id` from `pobj_x` `x` where (a = :one)
+<<<sql
+[sql-trace]   :one = 42
+```
+
+Off by default, read once per process. Trace output contains your query
+parameters, so treat the log as sensitive and do not leave it on in production.
+
 ## Query-of-Queries
 
 Pass `dbtype="query"` to run an in-memory SQL `SELECT` over query variables already in scope — no datasource, no driver, no JDBC. The engine lives in `crates/cfml-qoq` and is pure Rust; it parallelises filter/projection/sort across cores (non-wasm).
