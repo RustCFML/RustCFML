@@ -4638,6 +4638,12 @@ pub fn handle_java_concurrenthashmap(
 /// Build a `java.lang.Class` shim carrying the given class name. Its
 /// getName()/getSimpleName()/forName() members come from `handle_java_class`.
 pub fn make_class_shim(class_name: &str) -> CfmlValue {
+    // flexmark classes are shimmed onto the built-in markdown engine rather
+    // than deferred — cbmarkdown (vendored into Preside extensions) builds its
+    // whole pipeline out of them at module load.
+    if crate::java_shims_flexmark::is_flexmark_class(class_name) {
+        return crate::java_shims_flexmark::make_flexmark_class(class_name);
+    }
     let mut shim = ValueMap::default();
     shim.insert(
         "__java_class".to_string(),
@@ -4711,6 +4717,9 @@ pub fn handle_java_class(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
 /// during boot and throws loudly the moment a genuinely-loaded class is invoked.
 /// See `handle_java_classloader`.
 pub fn make_deferred_java(class_name: &str) -> CfmlValue {
+    if crate::java_shims_flexmark::is_flexmark_class(class_name) {
+        return crate::java_shims_flexmark::make_flexmark_class(class_name);
+    }
     let mut shim = ValueMap::default();
     shim.insert(
         "__java_class".to_string(),

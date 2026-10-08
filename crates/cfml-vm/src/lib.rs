@@ -61,6 +61,7 @@ mod antisamy_shim;
 mod cmdline;
 mod java_security;
 mod java_shims;
+mod java_shims_flexmark;
 mod shim_util;
 mod xmp_shim;
 mod javax_crypto_shim;
@@ -26174,6 +26175,50 @@ impl CfmlVirtualMachine {
     /// Call a registered builtin by name (case-insensitive). Used by the Java
     /// shims that delegate to native BIFs (the crypto/yaml crates live in
     /// cfml-stdlib, reachable only through the builtin table).
+    /// flexmark shim dispatch. The shape-building lives in
+    /// `java_shims_flexmark`; the two methods that actually produce text are
+    /// here, because they run our `markdown()` / `htmlToMarkdown()` builtins.
+    fn dispatch_flexmark(
+        &self,
+        object: &CfmlValue,
+        method: &str,
+        args: Vec<CfmlValue>,
+    ) -> CfmlResult {
+        let kind = match object {
+            CfmlValue::Struct(s) => s.get("__fm_kind").map(|v| v.as_string()).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let opts = match object {
+            CfmlValue::Struct(s) => s.get("__fm_opts").unwrap_or(CfmlValue::Null),
+            _ => CfmlValue::Null,
+        };
+        match (kind.as_str(), method) {
+            ("renderer", "render") => {
+                let src = java_shims_flexmark::document_source(
+                    args.first().unwrap_or(&CfmlValue::Null),
+                );
+                self.call_named_builtin(
+                    "markdown",
+                    vec![
+                        CfmlValue::string(src),
+                        java_shims_flexmark::options_struct_from_dataset(&opts),
+                    ],
+                )
+            }
+            ("converter", "convert") => {
+                let html = args.first().map(|v| v.as_string()).unwrap_or_default();
+                self.call_named_builtin(
+                    "htmlToMarkdown",
+                    vec![
+                        CfmlValue::string(html),
+                        java_shims_flexmark::options_struct_from_dataset(&opts),
+                    ],
+                )
+            }
+            _ => java_shims_flexmark::handle_flexmark(method, args, object),
+        }
+    }
+
     fn call_named_builtin(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         let nl = name.to_lowercase();
         if let Some((_, b)) = self.builtin_lookup_ci(name, &nl) {
@@ -29312,6 +29357,12 @@ impl CfmlVirtualMachine {
                     }
                     java_shims::SERVLET_RESPONSE_CLASS => {
                         return self.dispatch_servlet_response(object, &method_lower, extra_args);
+                    }
+                    // flexmark (cbmarkdown) over our own markdown engine. The
+                    // VM owns it because rendering calls the markdown builtins.
+                    java_shims_flexmark::FLEXMARK_CLASS => {
+                        let args = std::mem::take(extra_args);
+                        return self.dispatch_flexmark(object, &method_lower, args);
                     }
                     _ => {}
                 }

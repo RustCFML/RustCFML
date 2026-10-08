@@ -1802,6 +1802,18 @@ function and tag shapes from BoxLang's `bx-markdown`, with these deliberate edge
   `{ unsafe = true }` per call, or `markdown.unsafe` in `.cfconfig.json`, restores
   pass-through. BoxLang also turns heading anchors on and gives tables
   `class="table"` by default; here they are the `anchors` and `tableClass` options.
+- **`com.vladsch.flexmark.*` is shimmed onto this engine.** ColdBox's `cbmarkdown`
+  module (vendored into several Preside extensions) builds a flexmark pipeline
+  through cbjavaloader at module load; with no JVM that used to fail and take the
+  application's boot with it. `Parser`, `HtmlRenderer`, `MutableDataSet`,
+  `FlexmarkHtmlConverter` and the extension classes are modelled over
+  `markdown()` / `htmlToMarkdown()`, so the module works unchanged. The shim
+  honours the options that describe OUTPUT — `TablesExtension.CLASS_NAME`,
+  `AnchorLinkExtension.ANCHORLINKS_SET_ID`, the GFM extension set,
+  `HtmlRenderer.ESCAPE_HTML` / `SUPPRESS_HTML` — and ignores flexmark's AST and
+  formatter knobs, which describe its internals rather than its output. Raw HTML
+  passes through on this path (flexmark's behaviour), unlike the `markdown()`
+  default above, since a pipeline the app wired up itself is trusted input.
 - **Reference links are resolved.** `MarkdownDocument` stores `[x][ref]` as a link
   with its URL and writes it back inline. Link reference definitions are not kept.
 - **`toMarkdown()` is not byte-for-byte the source.** It re-parses to the same tree
