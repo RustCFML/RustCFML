@@ -225,6 +225,18 @@ impl std::fmt::Display for CfmlErrorType {
 impl std::fmt::Display for CfmlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} Error: {}", self.error_type, self.message)?;
+        // `detail` is the other half of a CFML error — frameworks put the SQL,
+        // the driver message or the remediation there and keep `message` short.
+        // (It rides in `extras`; see the throw path in cfml-vm.)
+        if let Some(detail) = self
+            .extras
+            .as_ref()
+            .and_then(|m| m.iter().find(|(k, _)| k.eq_ignore_ascii_case("detail")))
+            .map(|(_, v)| v.as_string())
+            .filter(|d| !d.is_empty())
+        {
+            write!(f, "\n\nDetail: {}", detail)?;
+        }
         if !self.stack_trace.is_empty() {
             write!(f, "\n\nStack trace (most recent call first):")?;
             for (i, frame) in self.stack_trace.iter().enumerate() {

@@ -22697,6 +22697,23 @@ impl CfmlVirtualMachine {
                         }
                     }
 
+                    // Read the thrown type and detail off the struct BEFORE it
+                    // is moved into the exception value.
+                    let thrown_type = exception
+                        .get("type")
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    let thrown_extras: Vec<(String, String)> =
+                        ["detail", "errorcode", "extendedinfo"]
+                            .iter()
+                            .filter_map(|key| {
+                                exception
+                                    .get(key)
+                                    .map(|v| v.as_string())
+                                    .filter(|v| !v.is_empty())
+                                    .map(|v| (key.to_string(), v))
+                            })
+                            .collect();
                     Self::add_root_cause(&mut exception);
                     let error_val = CfmlValue::strukt(exception);
                     self.last_exception = Some(error_val.clone());
@@ -22707,8 +22724,28 @@ impl CfmlVirtualMachine {
                     // exception — it was already recorded above.
                     // `err` is only mutated under the observability feature; the
                     // `mut` is otherwise unused (e.g. the wasm/worker builds).
+                    //
+                    // The thrown TYPE and DETAIL ride along on the CfmlError.
+                    // They used to be dropped here, so an uncaught throw printed
+                    // "Runtime Error: <message>" with no detail at all — and
+                    // frameworks put the actionable half of the error THERE:
+                    // Preside's dbsync failure carries the SQL and the driver's
+                    // own message in `detail`, leaving the 500 page saying only
+                    // "an error occurred while altering a table".
                     #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
-                    let mut err = CfmlError::runtime(message);
+                    let mut err = if thrown_type.is_empty()
+                        || thrown_type.eq_ignore_ascii_case("application")
+                    {
+                        CfmlError::runtime(message)
+                    } else {
+                        CfmlError::new(message, CfmlErrorType::Custom(thrown_type))
+                    };
+                    // Carried as extras so `build_error_struct` reproduces the
+                    // thrown values when the error is caught a frame or more up
+                    // (they are merged onto the cfcatch struct verbatim).
+                    for (key, v) in thrown_extras {
+                        err = err.with_extras([(key, CfmlValue::string(v))]);
+                    }
                     #[cfg(feature = "observability")]
                     if self.interest.contains(observe::Interest::ERROR) {
                         err.stack_trace = self.build_stack_trace();
@@ -31148,7 +31185,21 @@ impl CfmlVirtualMachine {
                 "valuearray" => Some("queryColumnData"),
                 "valuelist" => {
                     let col = extra_args.first().map(|c| c.as_string()).unwrap_or_default();
-                    let values = cfml_stdlib::query_column_values(q, &col)?;
+                    // The column lookup is spelled out here rather than reusing the
+                    // stdlib helper: `cfml-stdlib` is not a dependency of the VM
+                    // on the wasm target.
+                    let values: Vec<CfmlValue> = q.with_read(|d| match d.column_data_ci(&col) {
+                        Some(v) => Ok(v.clone()),
+                        None => Err(CfmlError::runtime(format!(
+                            "Column [{}] not found in query, Columns are [{}]",
+                            col,
+                            d.columns
+                                .iter()
+                                .map(|c| c.to_uppercase())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))),
+                    })?;
                     let delim = extra_args
                         .get(1)
                         .map(|d| d.as_string())

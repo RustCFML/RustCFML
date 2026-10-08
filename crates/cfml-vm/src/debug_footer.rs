@@ -922,6 +922,9 @@ fn render_comment(data: &DebugData, total_us: i64) -> String {
         s.push_str(&format!("  Exceptions: {}\n", data.exceptions.len()));
         for e in &data.exceptions {
             s.push_str(&format!("    {}: {}\n", e.etype, e.message.replace('\n', " ")));
+            if !e.detail.is_empty() {
+                s.push_str(&format!("      detail: {}\n", e.detail.replace('\n', " ")));
+            }
         }
     }
     s.push_str("-->\n");
@@ -1205,6 +1208,14 @@ fn render_html(
                 esc(&e.src),
                 e.line,
             ));
+            // Lucee shows the detail too, and it is usually where the useful
+            // half of a framework error lives (the SQL, the driver message).
+            if !e.detail.is_empty() {
+                s.push_str(&format!(
+                    "<div style=\"color:#900;margin:0 0 4px 1em\"><pre style=\"margin:0;white-space:pre-wrap\">{}</pre></div>\n",
+                    esc(&e.detail),
+                ));
+            }
         }
     }
 
@@ -1625,7 +1636,7 @@ mod tests {
         c.on_error(&ErrorEvent {
             etype: "Custom.Boom",
             message: "kaboom",
-            detail: "",
+            detail: "the detail that explains it",
             src: "/index.cfm",
             line: 30,
             uncaught: true,
@@ -1749,6 +1760,9 @@ mod tests {
         );
         assert!(html.contains("Exceptions (1)"));
         assert!(html.contains("kaboom"));
+        // the detail is rendered too — it is where a framework error keeps the
+        // SQL / driver message that makes it diagnosable
+        assert!(html.contains("the detail that explains it"));
         assert!(html.contains("Generic data"));
         assert!(html.contains("controller"));
         // Section order: Execution Time first, then Files, then Queries.
