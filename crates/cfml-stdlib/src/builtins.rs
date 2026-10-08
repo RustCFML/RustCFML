@@ -4487,11 +4487,123 @@ fn struct_sort_number(v: &CfmlValue) -> Result<f64, CfmlError> {
     }
 }
 
+/// The CFML type name Lucee uses when it reports a failed cast.
+fn struct_sort_type_name(v: &CfmlValue) -> &'static str {
+    match v {
+        CfmlValue::Int(_) | CfmlValue::Double(_) => "Number",
+        CfmlValue::Bool(_) => "Boolean",
+        CfmlValue::String(_) => "String",
+        CfmlValue::Array(_) => "Array",
+        CfmlValue::Query(_) => "Query",
+        CfmlValue::Binary(_) => "Binary",
+        CfmlValue::Function(_) | CfmlValue::Closure(_) => "Function",
+        CfmlValue::Null => "null",
+        _ => "Struct",
+    }
+}
+
+/// A `structSort` text sort key, cast the way Lucee casts it. A complex value
+/// has no string reading and throws rather than sorting as some stringified
+/// form of itself.
+fn struct_sort_string(v: &CfmlValue) -> Result<String, CfmlError> {
+    match v {
+        CfmlValue::Array(_) | CfmlValue::Struct(_) | CfmlValue::Query(_) => {
+            Err(CfmlError::expression(format!(
+                "Can't cast Complex Object Type [{}] to String",
+                struct_sort_type_name(v)
+            )))
+        }
+        CfmlValue::Null => Ok(String::new()),
+        other => Ok(other.as_string()),
+    }
+}
+
+/// Resolve `structSort`'s `pathToSubElement` against one entry value.
+///
+/// Lucee parses the path as a variable declaration — dotted segments, each a
+/// CFML identifier, matched case-insensitively — and reports in this order:
+/// the entry value is cast to a collection FIRST (so a scalar entry fails even
+/// when the path itself is nonsense), then the path is parsed, then the segment
+/// is looked up. A missing key and a NULL value are both errors; neither is
+/// silently read as an empty sort key.
+fn struct_sort_sub_element(value: &CfmlValue, path: &str) -> Result<CfmlValue, CfmlError> {
+    let mut current = value.clone();
+    for segment in path.split('.') {
+        // An Array is a collection to Lucee too, so the cast succeeds and the
+        // path is then rejected as a variable name ("1" is not an identifier).
+        let s = match &current {
+            CfmlValue::Struct(s) => Some(s.clone()),
+            CfmlValue::Array(_) => None,
+            other => {
+                return Err(CfmlError::expression(format!(
+                    "Can't cast Object type [{}] to a value of type [collection]",
+                    struct_sort_type_name(other)
+                )))
+            }
+        };
+        // Lucee reports the WHOLE path, not the offending segment, when the
+        // path itself is malformed (empty, a leading dot, a numeric segment).
+        let mut chars = segment.chars();
+        let well_formed = match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        };
+        if !well_formed {
+            return Err(CfmlError::expression(format!(
+                "invalid variable declaration [{}]",
+                path
+            )));
+        }
+        let s = match s {
+            Some(s) => s,
+            None => {
+                return Err(CfmlError::expression(format!(
+                    "key [{}] doesn't exist",
+                    segment
+                )))
+            }
+        };
+        if !s.data_contains_key(segment) {
+            return Err(CfmlError::expression(format!(
+                "key [{}] doesn't exist",
+                segment
+            )));
+        }
+        match s.data_get(segment) {
+            None | Some(CfmlValue::Null) => {
+                return Err(CfmlError::expression(format!(
+                    "the value from key [{}]  is NULL, which is the same as not existing in CFML",
+                    segment
+                )))
+            }
+            Some(v) => current = v,
+        }
+    }
+    Ok(current)
+}
+
 fn fn_struct_sort(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_sort(a); }
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let sort_type = if args.len() > 1 { get_str(&args, 1).to_lowercase() } else { "text".to_string() };
         let sort_order = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "asc".to_string() };
+        // `pathToSubElement` picks the sub-value each entry is sorted BY, for
+        // every sort type — `structSort( filters, "numeric", "asc", "order" )`
+        // sorts on `filters[key].order`, not on `filters[key]`. Ignoring it
+        // made every such call throw "can't cast Complex Object Type [Struct]
+        // to a number value" the moment the entries were structs (the Preside
+        // EMS events listing). Lucee distinguishes an absent argument from an
+        // empty string: an empty path is a malformed path and throws.
+        let path: Option<String> = if args.len() > 3 {
+            match args.get(3) {
+                None | Some(CfmlValue::Null) => None,
+                Some(v) => Some(v.as_string()),
+            }
+        } else {
+            None
+        };
         let keys: Vec<String> = s.keys();
         // Decorate → sort → undecorate. The sort key for each entry is derived
         // ONCE, never inside the comparator: `sort_by` calls the comparator
@@ -4506,45 +4618,68 @@ fn fn_struct_sort(args: Vec<CfmlValue>) -> CfmlResult {
         // one whose per-render cost grew: measured 6.09 → 24.25 MB/render
         // between 3k and 6k requests while every other bucket stayed flat, and
         // it is why CPU/render climbed 15.5 → 28 ms over the life of a server.
-        // `textnocase` had the same shape, allocating two lowercased `String`s
-        // per comparison instead of one per key.
         //
-        // `sort_by` is stable and the comparator now sees only the derived key,
-        // so ties keep their original key order exactly as before — including
-        // under the `desc` reversal below, which is applied after the sort just
-        // as it was.
-        let mut keys: Vec<String> = match sort_type.as_str() {
+        // `sort_by` is stable and the comparator sees only the derived key, so
+        // ties keep the struct's own key order. `desc` REVERSES THE COMPARATOR
+        // rather than reversing the sorted keys afterwards: a post-reverse also
+        // flips the tied runs, which Lucee does not do.
+        let descending = sort_order == "desc";
+        // Resolve the sub-element once per entry, before any sort key is cast.
+        let values: Vec<CfmlValue> = keys
+            .iter()
+            .map(|k| {
+                let v = s.data_get(k.as_str()).unwrap_or(CfmlValue::Null);
+                match &path {
+                    Some(p) => struct_sort_sub_element(&v, p),
+                    None => Ok(v),
+                }
+            })
+            .collect::<Result<_, CfmlError>>()?;
+        let keys: Vec<String> = match sort_type.as_str() {
             "numeric" => {
                 // Lucee casts every value to a number and throws when it
                 // cannot (a struct, a non-numeric string); "" reads as 0 and a
                 // boolean as 1/0. Silently tying them hid the error.
                 let mut decorated: Vec<(f64, String)> = keys
                     .into_iter()
-                    .map(|k| {
-                        let n = match s.get(&k) {
-                            Some(v) => struct_sort_number(&v)?,
-                            None => 0.0,
-                        };
-                        Ok((n, k))
-                    })
+                    .zip(values.iter())
+                    .map(|(k, v)| Ok((struct_sort_number(v)?, k)))
                     .collect::<Result<_, CfmlError>>()?;
-                decorated
-                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                decorated.sort_by(|a, b| {
+                    let o = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                    if descending { o.reverse() } else { o }
+                });
                 decorated.into_iter().map(|(_, k)| k).collect()
             }
+            // Lucee's text sorts compare the entry VALUES, not the keys —
+            // `structSort( { a:"zebra", b:"apple" }, "text" )` is [b,a]. Sorting
+            // the keys only ever agreed with Lucee when the two happened to run
+            // in the same order, as they did in the one fixture that covered it.
             "textnocase" => {
-                let mut decorated: Vec<(String, String)> =
-                    keys.into_iter().map(|k| (k.to_lowercase(), k)).collect();
-                decorated.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut decorated: Vec<(String, String)> = keys
+                    .into_iter()
+                    .zip(values.iter())
+                    .map(|(k, v)| Ok((struct_sort_string(v)?.to_lowercase(), k)))
+                    .collect::<Result<_, CfmlError>>()?;
+                decorated.sort_by(|a, b| {
+                    let o = a.0.cmp(&b.0);
+                    if descending { o.reverse() } else { o }
+                });
                 decorated.into_iter().map(|(_, k)| k).collect()
             }
             _ => {
-                let mut k = keys;
-                k.sort();
-                k
+                let mut decorated: Vec<(String, String)> = keys
+                    .into_iter()
+                    .zip(values.iter())
+                    .map(|(k, v)| Ok((struct_sort_string(v)?, k)))
+                    .collect::<Result<_, CfmlError>>()?;
+                decorated.sort_by(|a, b| {
+                    let o = a.0.cmp(&b.0);
+                    if descending { o.reverse() } else { o }
+                });
+                decorated.into_iter().map(|(_, k)| k).collect()
             }
         };
-        if sort_order == "desc" { keys.reverse(); }
         Ok(CfmlValue::array(keys.into_iter().map(CfmlValue::string).collect()))
     } else {
         Ok(CfmlValue::array(Vec::new()))

@@ -223,6 +223,60 @@ sortedNoCase = structSort(ssNoCase, "textnocase");
 assert("structSort textnocase first", sortedNoCase[1], "A");
 assert("structSort textnocase last", sortedNoCase[3], "C");
 
+// ------------------------------------------------------------
+// structSort's 4th argument, pathToSubElement: the sub-value each entry is
+// sorted BY. This is the Preside EMS events-listing shape
+// (`structSort( filters, "numeric", "asc", "order" )` over a struct of
+// structs); ignoring the argument made it throw "can't cast Complex Object
+// Type [Struct] to a number value". The path is a dotted variable path,
+// matched case-insensitively, and applies to every sort type.
+// ------------------------------------------------------------
+ssPath = structNew("ordered");
+ssPath.upcoming = { futureOnly:true , order:3 };
+ssPath.past     = { futureOnly:false, order:1 };
+ssPath.calendar = { futureOnly:false, order:2 };
+assert("structSort path numeric asc" , arrayToList( structSort( ssPath, "numeric", "asc" , "order" ) ), "past,calendar,upcoming");
+assert("structSort path numeric desc", arrayToList( structSort( ssPath, "numeric", "desc", "order" ) ), "upcoming,calendar,past");
+
+assert("structSort path text"      , arrayToList( structSort( { a:{n:"zz"}, b:{n:"aa"} }, "text"      , "asc", "n" ) ), "b,a");
+assert("structSort path textnocase", arrayToList( structSort( { a:{n:"Zz"}, b:{n:"aa"} }, "textnocase", "asc", "n" ) ), "b,a");
+assert("structSort path is dotted" , arrayToList( structSort( { a:{x:{n:2}}, b:{x:{n:1}} }, "numeric", "asc", "x.n" ) ), "b,a");
+assert("structSort path segments are case-insensitive", arrayToList( structSort( { a:{Sub:{Nested:2}}, b:{sub:{nested:1}} }, "numeric", "asc", "SUB.NESTED" ) ), "b,a");
+
+// A path that cannot be resolved is an error, never a silently-empty sort key.
+assertThrows("structSort path over a missing key throws"  , function() { structSort( { a:{order:2}, b:{} }, "numeric", "asc", "order" ); });
+assertThrows("structSort path over a scalar entry throws" , function() { structSort( { a:1, b:2 }, "numeric", "asc", "order" ); });
+assertThrows("structSort empty path throws"               , function() { structSort( { a:{n:1}, b:{n:2} }, "numeric", "asc", "" ); });
+assertThrows("structSort malformed path throws"           , function() { structSort( { a:{order:2}, b:{order:1} }, "numeric", "asc", ".order" ); });
+assertThrows("structSort path onto a struct still throws" , function() { structSort( { a:{n:{z:1}}, b:{n:{z:2}} }, "numeric", "asc", "n" ); });
+
+// ------------------------------------------------------------
+// A text sort compares the entry VALUES, not the keys. The fixtures above
+// only ever agreed with Lucee because their keys and values happened to sort
+// in the same order.
+// ------------------------------------------------------------
+ssVals = structNew("ordered");
+ssVals.a = "zebra";
+ssVals.b = "apple";
+ssVals.c = "mango";
+assert("structSort text sorts values"          , arrayToList( structSort( ssVals, "text", "asc"  ) ), "b,c,a");
+assert("structSort text desc sorts values"     , arrayToList( structSort( ssVals, "text", "desc" ) ), "a,c,b");
+assert("structSort default type sorts values"  , arrayToList( structSort( ssVals ) ), "b,c,a");
+assert("structSort textnocase sorts values"    , arrayToList( structSort( ssVals, "textnocase", "asc" ) ), "b,c,a");
+assert("structSort text casts a number"        , arrayToList( structSort( { a:10, b:9 }, "text", "asc" ) ), "a,b");
+assertThrows("structSort text over a complex value throws", function() { structSort( { a:[1], b:[2] }, "text", "asc" ); });
+
+// desc reverses the COMPARATOR, not the sorted result: tied entries keep the
+// struct's own key order in both directions. A post-sort reverse() flipped
+// them, which Lucee does not do.
+ssDescTies = structNew("ordered");
+ssDescTies.d = { n:1 };
+ssDescTies.b = { n:0 };
+ssDescTies.a = { n:1 };
+ssDescTies.c = { n:0 };
+assert("structSort desc keeps tied runs in order", arrayToList( structSort( ssDescTies, "numeric", "desc", "n" ) ), "d,a,b,c");
+assert("structSort asc keeps tied runs in order" , arrayToList( structSort( ssDescTies, "numeric", "asc" , "n" ) ), "b,c,d,a");
+
 // ============================================================
 // StructEach (from Lucee structEach.cfc)
 // ============================================================
