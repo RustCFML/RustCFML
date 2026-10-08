@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 587 crate(s)
+  MIT License (MIT) — 591 crate(s)
   Apache License 2.0 (Apache-2.0) — 47 crate(s)
   Unicode License v3 (Unicode-3.0) — 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -614,7 +614,7 @@ Dependencies
 [MIT]
   rand_distr 0.6.0 — https://github.com/rust-random/rand_distr
 [MIT]
-  rand 0.10.1 — https://github.com/rust-random/rand
+  rand 0.10.3 — https://github.com/rust-random/rand
   rand 0.8.6 — https://github.com/rust-random/rand
   rand 0.9.4 — https://github.com/rust-random/rand
   rand_chacha 0.3.1 — https://github.com/rust-random/rand
@@ -744,8 +744,8 @@ Dependencies
   chrono-tz 0.10.4 — https://github.com/chronotope/chrono-tz
   chrono 0.4.45 — https://github.com/chronotope/chrono
   derivit-core 0.1.5 — https://github.com/al8n/derivit
-  engineioxide-core 0.1.0 — https://github.com/totodore/socketioxide
-  engineioxide 0.16.2 — https://github.com/totodore/socketioxide
+  engineioxide-core 0.2.0 — https://github.com/totodore/socketioxide
+  engineioxide 0.17.0 — https://github.com/totodore/socketioxide
   fxhash 0.2.1 — https://github.com/cbreeden/fxhash
   hexane 0.2.1 — https://github.com/automerge/automerge
   libm 0.2.16 — https://github.com/rust-lang/compiler-builtins
@@ -760,9 +760,9 @@ Dependencies
   profiling 1.0.18 — https://github.com/aclysma/profiling
   simd_helpers 0.1.0 — https://github.com/lu-zero/simd_helpers
   siphasher 1.0.3 — https://github.com/jedisct1/rust-siphash
-  socketioxide-core 0.16.1 — https://github.com/totodore/socketioxide
-  socketioxide-parser-common 0.16.1 — https://github.com/totodore/socketioxide
-  socketioxide 0.16.3 — https://github.com/totodore/socketioxide
+  socketioxide-core 0.17.0 — https://github.com/totodore/socketioxide
+  socketioxide-parser-common 0.17.0 — https://github.com/totodore/socketioxide
+  socketioxide 0.17.0 — https://github.com/totodore/socketioxide
   uuid-simd 0.8.0 — https://github.com/Nugine/simd
   viewit 0.1.5 — https://github.com/al8n/derivit
   vsimd 0.8.0 — https://github.com/Nugine/simd
@@ -775,10 +775,14 @@ Dependencies
   windows-result 0.4.1 — https://github.com/microsoft/windows-rs
   windows-strings 0.5.1 — https://github.com/microsoft/windows-rs
   windows-sys 0.52.0 — https://github.com/microsoft/windows-rs
+  windows-sys 0.60.2 — https://github.com/microsoft/windows-rs
   windows-sys 0.61.2 — https://github.com/microsoft/windows-rs
   windows-targets 0.52.6 — https://github.com/microsoft/windows-rs
+  windows-targets 0.53.5 — https://github.com/microsoft/windows-rs
   windows_x86_64_gnu 0.52.6 — https://github.com/microsoft/windows-rs
+  windows_x86_64_gnu 0.53.1 — https://github.com/microsoft/windows-rs
   windows_x86_64_msvc 0.52.6 — https://github.com/microsoft/windows-rs
+  windows_x86_64_msvc 0.53.1 — https://github.com/microsoft/windows-rs
   zune-inflate 0.2.54
 [MIT]
   tokio-stream 0.1.18 — https://github.com/tokio-rs/tokio
@@ -9485,7 +9489,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - rand 0.10.1
+  - rand 0.10.3
   - rand 0.8.6
   - rand 0.9.4
   - rand_chacha 0.3.1
@@ -10960,8 +10964,8 @@ Applies to:
   - chrono-tz 0.10.4
   - chrono 0.4.45
   - derivit-core 0.1.5
-  - engineioxide-core 0.1.0
-  - engineioxide 0.16.2
+  - engineioxide-core 0.2.0
+  - engineioxide 0.17.0
   - fxhash 0.2.1
   - hexane 0.2.1
   - libm 0.2.16
@@ -10976,9 +10980,9 @@ Applies to:
   - profiling 1.0.18
   - simd_helpers 0.1.0
   - siphasher 1.0.3
-  - socketioxide-core 0.16.1
-  - socketioxide-parser-common 0.16.1
-  - socketioxide 0.16.3
+  - socketioxide-core 0.17.0
+  - socketioxide-parser-common 0.17.0
+  - socketioxide 0.17.0
   - uuid-simd 0.8.0
   - viewit 0.1.5
   - vsimd 0.8.0
@@ -10991,10 +10995,14 @@ Applies to:
   - windows-result 0.4.1
   - windows-strings 0.5.1
   - windows-sys 0.52.0
+  - windows-sys 0.60.2
   - windows-sys 0.61.2
   - windows-targets 0.52.6
+  - windows-targets 0.53.5
   - windows_x86_64_gnu 0.52.6
+  - windows_x86_64_gnu 0.53.1
   - windows_x86_64_msvc 0.52.6
+  - windows_x86_64_msvc 0.53.1
   - zune-inflate 0.2.54
 ================================================================================
 
