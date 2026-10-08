@@ -83,7 +83,7 @@ socket2 = { version = "0.5", optional = true, features = ["all"] }
 # socket.io transport (Phase 3). Default features only — the modern socket.io
 # client speaks Engine.IO v4 (socketioxide's default); we own fan-out via our
 # own registry/Broker, so `state`/`extensions`/`v4` are unnecessary.
-socketioxide = "0.16.3"
+socketioxide = "=0.17.0"
 # Heap profiler (leak hunting). Off by default; build with `--features dhat-heap`
 # to swap in DHAT's global allocator and dump `dhat-heap.json` on clean shutdown.
 dhat = { version = "0.3", optional = true }

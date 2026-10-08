@@ -165,6 +165,11 @@ struct ConnEntry {
     /// P11). Recorded so disconnect can emit leave diffs and never leak a stale
     /// roster entry.
     presence_keys: HashSet<String>,
+    /// The HTTP handshake that opened this connection — headers, cookies, uri,
+    /// query string. Empty unless the transport recorded it. socket.io-lucee's
+    /// `socket.getHttpRequest()` is built from this, and Preside reads its
+    /// `PSID` cookie to resolve the session behind a socket.
+    handshake: ValueMap,
 }
 
 // `CfmlStruct` is not `Debug`, so derive can't reach through `data`. The other
@@ -321,9 +326,23 @@ impl WebSocketRegistry {
                 params,
                 session_id,
                 presence_keys: HashSet::new(),
+                handshake: ValueMap::default(),
             },
         );
         conn_id
+    }
+
+    /// Record the HTTP handshake behind a connection (see `ConnEntry.handshake`).
+    /// Separate from `register` so the transports can fill it in without every
+    /// caller of `register` having to care.
+    pub fn set_handshake(&self, conn_id: &str, handshake: ValueMap) {
+        if let Some(e) = self.inner.write().conns.get_mut(conn_id) {
+            e.handshake = handshake;
+        }
+    }
+
+    pub fn handshake_of(&self, conn_id: &str) -> Option<ValueMap> {
+        self.inner.read().conns.get(conn_id).map(|e| e.handshake.clone())
     }
 
     /// Remove a connection from the registry and every room it belonged to.

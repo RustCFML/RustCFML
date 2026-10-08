@@ -203,6 +203,52 @@ pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
     })
 }
 
+/// The HTTP handshake behind a connection, as CFML sees it: headers, cookies
+/// (name/value pairs), uri and query string. socket.io-lucee's
+/// `socket.getHttpRequest()` is built from this, and Preside reads its `PSID`
+/// cookie to resolve the session a socket belongs to — so it has to survive the
+/// upgrade rather than being read and dropped.
+pub(crate) fn handshake_map(
+    headers: &HeaderMap,
+    uri: &str,
+    query: Option<&str>,
+) -> cfml_common::dynamic::ValueMap {
+    use cfml_common::dynamic::{CfmlValue, ValueMap};
+    let mut hdrs = ValueMap::default();
+    for (k, v) in headers.iter() {
+        if let Ok(val) = v.to_str() {
+            hdrs.insert(k.as_str().to_string(), CfmlValue::string(val.to_string()));
+        }
+    }
+    let mut cookies = Vec::new();
+    if let Some(raw) = headers.get("cookie").and_then(|c| c.to_str().ok()) {
+        for part in raw.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (name, value) = match part.split_once('=') {
+                Some((n, v)) => (n.trim(), v.trim()),
+                None => (part, ""),
+            };
+            let mut c = ValueMap::default();
+            c.insert("name".to_string(), CfmlValue::string(name.to_string()));
+            c.insert("value".to_string(), CfmlValue::string(value.to_string()));
+            cookies.push(CfmlValue::strukt(c));
+        }
+    }
+    let mut m = ValueMap::default();
+    m.insert("headers".to_string(), CfmlValue::strukt(hdrs));
+    m.insert("cookies".to_string(), CfmlValue::array(cookies));
+    m.insert("uri".to_string(), CfmlValue::string(uri.to_string()));
+    m.insert(
+        "querystring".to_string(),
+        CfmlValue::string(query.unwrap_or_default().to_string()),
+    );
+    m.insert("remoteuser".to_string(), CfmlValue::string(String::new()));
+    m
+}
+
 /// axum handler for `GET /ws/{channel}`. Upgrades the connection and hands it
 /// to the driver. A 404 is returned for an unknown channel (no CFC).
 pub async fn ws_handler(
@@ -218,7 +264,8 @@ pub async fn ws_handler(
     };
     let session_id = session_id_from_headers(&headers);
     let params = parse_query(query.as_deref());
-    ws.on_upgrade(move |socket| driver(socket, state, info, session_id, params))
+    let handshake = handshake_map(&headers, &format!("/ws/{}", name), query.as_deref());
+    ws.on_upgrade(move |socket| driver(socket, state, info, session_id, params, handshake))
 }
 
 /// Parse a raw query string (`a=1&b=hi%20there`) into a CFML struct for
@@ -244,12 +291,14 @@ async fn driver(
     info: ChannelInfo,
     session_id: Option<String>,
     params: cfml_common::dynamic::ValueMap,
+    handshake: cfml_common::dynamic::ValueMap,
 ) {
     let registry = state.server_state.websocket.clone();
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SinkCmd>(OUTBOUND_QUEUE);
     let frame_sink: Arc<dyn FrameSink> = Arc::new(ChannelSink { tx });
     let conn_id = registry.register(&info.channel, frame_sink, session_id.clone(), params);
+    registry.set_handshake(&conn_id, handshake);
     // Opt the channel into resumability history (no-op when history=0).
     registry.set_history_cap(&info.channel, info.history);
 

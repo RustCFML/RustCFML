@@ -16,16 +16,17 @@
 //!     socket.io ack** (design principle P5), and
 //!   * fires `onConnect`/`onMessage`/`onError`/`onDisconnect` identically.
 //!
-//! Because socketioxide 0.16 has no catch-all event handler, the concrete set
-//! of `on="event"` names is scanned from the CFC at handshake
+//! The concrete set of `on="event"` names is scanned from the CFC at handshake
 //! ([`crate::websocket::extract_event_names`]) and a `socket.on` registered for
-//! each, plus the conventional `"message"` → `onMessage`.
+//! each, plus the conventional `"message"` → `onMessage`. The imperative
+//! surface additionally registers a catch-all (`on_fallback`), since a
+//! socket.io-lucee app keeps its listener names in CFML.
 
 use std::sync::Arc;
 
 use cfml_common::dynamic::CfmlValue;
 use cfml_vm::websocket::{FrameSink, WireEnvelope};
-use socketioxide::extract::{AckSender, Data, SocketRef};
+use socketioxide::extract::{AckSender, Data, Event, SocketRef};
 use socketioxide::layer::SocketIoLayer;
 use socketioxide::SocketIo;
 
@@ -155,6 +156,10 @@ async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
     let registry = state.server_state.websocket.clone();
     let sink: Arc<dyn FrameSink> = Arc::new(SocketIoSink::new(socket.clone()));
     let conn_id = registry.register(&info.channel, sink, session_id.clone(), params);
+    registry.set_handshake(
+        &conn_id,
+        crate::websocket::handshake_map(&parts.headers, &parts.uri.to_string(), parts.uri.query()),
+    );
     registry.set_history_cap(&info.channel, info.history);
 
     // Register the per-event handlers *before* the onConnect gate. socketioxide
@@ -342,6 +347,10 @@ async fn on_connect_imperative(socket: SocketRef, state: Arc<AppState>, ns: Stri
     // `$sioSend` route by it just like the fluent `io(channel)`.
     let conn_id =
         registry.register(&ns, sink.clone() as Arc<dyn FrameSink>, session_id.clone(), params);
+    registry.set_handshake(
+        &conn_id,
+        crate::websocket::handshake_map(&parts.headers, &parts.uri.to_string(), parts.uri.query()),
+    );
     cfml_vm::socketio_compat::compat().register_conn(&conn_id, &ns);
 
     // Run the namespace `connect` listener (builds the socket facade; may call
@@ -384,6 +393,42 @@ async fn on_connect_imperative(socket: SocketRef, state: Arc<AppState>, ns: Stri
                     )
                     .await;
                     // Non-null return → the client's ack (P5).
+                    if let Ok(Some(v)) = r {
+                        if !matches!(v, CfmlValue::Null) {
+                            let _ = ack.send(&v);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    // Catch-all for every other inbound event. socket.io-lucee keeps its
+    // per-socket listeners in CFML (`socket.on( event, cb )` stores a closure
+    // and tells the server nothing), so when a namespace is driven through the
+    // `SocketIoServerWrapper` shim there is no event list to subscribe to —
+    // without this, a client's events were silently dropped. It also closes the
+    // older gap where a `socket.on` registered AFTER connect was never wired.
+    {
+        let state = state.clone();
+        let ns_fb = ns.clone();
+        let conn_id_fb = conn_id.clone();
+        let session_id_fb = session_id.clone();
+        socket.on_fallback(
+            move |Event(event): Event, Data::<CfmlValue>(payload): Data<CfmlValue>, ack: AckSender| {
+                let state = state.clone();
+                let ns = ns_fb.clone();
+                let conn_id = conn_id_fb.clone();
+                let session_id = session_id_fb.clone();
+                async move {
+                    let r = dispatch_sio(
+                        &state,
+                        &ns,
+                        &conn_id,
+                        session_id,
+                        SioDispatch::SocketEvent { event, payload },
+                    )
+                    .await;
                     if let Ok(Some(v)) = r {
                         if !matches!(v, CfmlValue::Null) {
                             let _ = ack.send(&v);

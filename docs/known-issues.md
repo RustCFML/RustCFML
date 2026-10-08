@@ -1814,6 +1814,21 @@ function and tag shapes from BoxLang's `bx-markdown`, with these deliberate edge
   formatter knobs, which describe its internals rather than its output. Raw HTML
   passes through on this path (flexmark's behaviour), unlike the `markdown()`
   default above, since a pipeline the app wired up itself is trusted input.
+- **`com.pixl8.socketiolucee.SocketIoServerWrapper` is shimmed onto the engine's
+  own socket.io transport.** socket.io-lucee (and Preside's
+  `preside-ext-socket-io`, which vendors it) keeps the server/namespace/socket
+  model in CFML and delegates only the wire to an embedded Java server; that
+  `createObject` used to fail and take the application's boot with it. The
+  wrapper's outbound calls (`registerNamespace`, `socketSend`,
+  `socketDisconnect`, the start/stop/state set, `toJsonObj`) and its four inbound
+  listener callbacks (`onConnect`, `onSocketEvent`, `onDisconnecting`,
+  `onDisconnect`) are both modelled, and the HTTP handshake — headers, cookies,
+  URI, query string — is carried through the upgrade so `socket.getHttpRequest()`
+  works and Preside can resolve a socket's session from its `PSID` cookie.
+  **One difference**: the Java server binds its own `host:port`, while RustCFML
+  serves `/socket.io/` on the application's own port. `host` and `port` are
+  accepted and ignored, so a browser client configured to reach a separate
+  socket.io port has to be pointed at the application instead.
 - **Reference links are resolved.** `MarkdownDocument` stores `[x][ref]` as a link
   with its URL and writes it back inline. Link reference definitions are not kept.
 - **`toMarkdown()` is not byte-for-byte the source.** It re-parses to the same tree

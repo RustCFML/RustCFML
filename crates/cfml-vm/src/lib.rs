@@ -62,6 +62,7 @@ mod cmdline;
 mod java_security;
 mod java_shims;
 mod java_shims_flexmark;
+pub mod java_shims_socketio;
 mod shim_util;
 mod xmp_shim;
 mod javax_crypto_shim;
@@ -20631,6 +20632,12 @@ impl CfmlVirtualMachine {
                                 "java.util.optional" => {
                                     java_shims::handle_java_optional("init", empty_args, &CfmlValue::Null)
                                 }
+                                // socket.io-lucee's embedded Java server, over
+                                // the engine's own socket.io transport. See
+                                // java_shims_socketio.
+                                java_shims_socketio::SIO_WRAPPER_CLASS => {
+                                    Ok(java_shims_socketio::make_wrapper_shim())
+                                }
                                 // Preside's cfconcurrent helper jar — see
                                 // java_shims::make_lucee_proxy_class.
                                 java_shims::LUCEE_RUNNABLE_CLASS
@@ -29363,6 +29370,11 @@ impl CfmlVirtualMachine {
                     java_shims_flexmark::FLEXMARK_CLASS => {
                         let args = std::mem::take(extra_args);
                         return self.dispatch_flexmark(object, &method_lower, args);
+                    }
+                    // socket.io-lucee's Java server over our transport.
+                    java_shims_socketio::SIO_WRAPPER_CLASS => {
+                        let args = std::mem::take(extra_args);
+                        return self.dispatch_sio_wrapper(&method_lower, args);
                     }
                     _ => {}
                 }
@@ -43373,6 +43385,111 @@ impl CfmlVirtualMachine {
         Some(instance)
     }
 
+    /// `com.pixl8.socketiolucee.SocketIoServerWrapper` method dispatch — the
+    /// outbound half of socket.io-lucee's Java contract (see
+    /// `java_shims_socketio` for the full mapping).
+    fn dispatch_sio_wrapper(&mut self, method: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        let compat = crate::socketio_compat::compat();
+        let arg_s = |i: usize| args.get(i).map(|v| v.as_string()).unwrap_or_default();
+        match method {
+            // init( handlerCfc, contextRoot, appContext, host, port, … ).
+            // Only the handler CFC matters: it is the object the library expects
+            // its Java server to call back on. `host`/`port` are accepted and
+            // ignored — the transport is the application's own server.
+            "init" => {
+                if let Some(cfc) = args.first() {
+                    let fns = self.collect_reachable_fn_arcs(cfc);
+                    compat.set_wrapper(crate::socketio_compat::Handler {
+                        event: "wrapper".to_string(),
+                        callback: cfc.clone(),
+                        fns,
+                    });
+                }
+                Ok(java_shims_socketio::make_wrapper_shim())
+            }
+            "registernamespace" => {
+                compat.register_namespace(&arg_s(0));
+                Ok(CfmlValue::Null)
+            }
+            "startserver" => {
+                compat.set_wrapper_state("STARTED");
+                Ok(CfmlValue::Null)
+            }
+            "stopserver" => {
+                compat.set_wrapper_state("STOPPED");
+                Ok(CfmlValue::Null)
+            }
+            "isserverrunning" => Ok(CfmlValue::Bool(compat.wrapper_state() == "STARTED")),
+            "getserverstate" => Ok(CfmlValue::string(compat.wrapper_state())),
+            // socketSend( namespace, socketId, event, args [, ackId] ). `args`
+            // arrives as the library's array of event arguments; socket.io
+            // delivers a single payload here, so a one-element array unwraps.
+            "socketsend" => {
+                let socket_id = arg_s(1);
+                let event = arg_s(2);
+                let payload = match args.get(3) {
+                    Some(CfmlValue::Array(a)) => {
+                        let items = a.snapshot();
+                        match items.len() {
+                            0 => CfmlValue::Null,
+                            1 => items[0].clone(),
+                            _ => CfmlValue::array(items),
+                        }
+                    }
+                    Some(other) => other.clone(),
+                    None => CfmlValue::Null,
+                };
+                if let Some(ss) = self.server_state.as_ref() {
+                    let registry = ss.websocket.clone();
+                    let channel = registry
+                        .channel_of(&socket_id)
+                        .unwrap_or_else(|| arg_s(0));
+                    let frame = registry.msg(&channel, Some(event), payload);
+                    registry.emit_to(&socket_id, frame);
+                }
+                Ok(CfmlValue::Null)
+            }
+            "socketdisconnect" => {
+                let socket_id = arg_s(0);
+                if let Some(ss) = self.server_state.as_ref() {
+                    ss.websocket.close_conn(&socket_id, 1000, String::new());
+                }
+                compat.drop_conn(&socket_id);
+                Ok(CfmlValue::Null)
+            }
+            // The library pre-serializes every non-simple event argument and
+            // asks the Java side to turn it back into an object for the wire.
+            // Our transport carries CfmlValues, so deserializing is the whole
+            // job.
+            "tojsonobj" => self.call_named_builtin("deserializeJSON", vec![args.first().cloned().unwrap_or(CfmlValue::Null)]),
+            "tostring" => Ok(CfmlValue::string(
+                "com.pixl8.socketiolucee.SocketIoServerWrapper".to_string(),
+            )),
+            _ => Err(CfmlError::shim_unhandled(method)),
+        }
+    }
+
+    /// Call one of the four listener methods socket.io-lucee's Java server
+    /// invokes on its handler CFC. `Ok(None)` when no wrapper is in play, so the
+    /// engine's own imperative surface keeps its existing behaviour.
+    fn dispatch_sio_wrapper_callback(
+        &mut self,
+        method: &str,
+        args: Vec<CfmlValue>,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        let wrapper = match crate::socketio_compat::compat().wrapper() {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        for f in &wrapper.fns {
+            self.register_fn(f);
+        }
+        let cfc = wrapper.callback.clone();
+        let mut extra = args;
+        self.call_member_function(&cfc, method, &mut extra, None, &ValueMap::default())
+            .map(Some)
+    }
+
     /// Run a namespace-level listener (`connect` / `disconnect` /
     /// `disconnecting`) with a fresh socket facade as its sole argument.
     /// `Ok(None)` when no such listener is registered (a no-op).
@@ -43384,7 +43501,44 @@ impl CfmlVirtualMachine {
     ) -> Result<Option<CfmlValue>, CfmlError> {
         let handler = match crate::socketio_compat::compat().ns_handler(ns, event) {
             Some(h) => h,
-            None => return Ok(None),
+            // No engine-side listener: the namespace may belong to a
+            // socket.io-lucee wrapper, which keeps its listeners in CFML and
+            // expects the server to call it back instead.
+            None => {
+                let (cb, mut cb_args) = match event {
+                    "connect" => (
+                        "onConnect",
+                        vec![
+                            CfmlValue::string(ns.to_string()),
+                            CfmlValue::string(conn_id.to_string()),
+                            java_shims_socketio::initial_request(
+                                self.server_state
+                                    .as_ref()
+                                    .and_then(|ss| ss.websocket.handshake_of(conn_id)),
+                            ),
+                        ],
+                    ),
+                    "disconnecting" => (
+                        "onDisconnecting",
+                        vec![
+                            CfmlValue::string(ns.to_string()),
+                            CfmlValue::string(conn_id.to_string()),
+                        ],
+                    ),
+                    "disconnect" => (
+                        "onDisconnect",
+                        vec![
+                            CfmlValue::string(ns.to_string()),
+                            CfmlValue::string(conn_id.to_string()),
+                        ],
+                    ),
+                    _ => return Ok(None),
+                };
+                let prev = self.current_ws_channel.replace(ns.to_string());
+                let r = self.dispatch_sio_wrapper_callback(cb, std::mem::take(&mut cb_args));
+                self.current_ws_channel = prev;
+                return r;
+            }
         };
         for f in &handler.fns {
             self.register_fn(f);
@@ -43411,7 +43565,21 @@ impl CfmlVirtualMachine {
     ) -> Result<Option<CfmlValue>, CfmlError> {
         let handler = match crate::socketio_compat::compat().socket_handler(conn_id, event) {
             Some(h) => h,
-            None => return Ok(None),
+            // Same fall-through as `dispatch_sio_ns`: a wrapper-driven namespace
+            // keeps its per-socket listeners in CFML, reached through one
+            // `onSocketEvent` entry point.
+            None => {
+                let args = vec![
+                    CfmlValue::string(ns.to_string()),
+                    CfmlValue::string(conn_id.to_string()),
+                    CfmlValue::string(event.to_string()),
+                    CfmlValue::array(vec![payload]),
+                ];
+                let prev = self.current_ws_channel.replace(ns.to_string());
+                let r = self.dispatch_sio_wrapper_callback("onSocketEvent", args);
+                self.current_ws_channel = prev;
+                return r;
+            }
         };
         for f in &handler.fns {
             self.register_fn(f);

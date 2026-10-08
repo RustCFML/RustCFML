@@ -100,6 +100,16 @@ struct Inner {
     namespaces: HashMap<String, NsState>,
     /// Connection id → its per-socket listeners + data.
     conns: HashMap<ConnId, ConnState>,
+    /// The socket.io-lucee **wrapper** CFC, when an app drives this store
+    /// through `com.pixl8.socketiolucee.SocketIoServerWrapper` (Preside's
+    /// socket-io extension) rather than through the engine's own
+    /// `SocketIoServer`. That library keeps the whole server/namespace/socket
+    /// model in CFML and expects a Java object underneath to (a) carry its
+    /// outbound calls and (b) call four listener methods back on it. The
+    /// handler CFC is that callback target; see `java_shims_socketio`.
+    wrapper: Option<Handler>,
+    /// What the wrapper's `getServerState()` reports.
+    wrapper_state: Option<String>,
 }
 
 fn ns_key(ns: &str) -> String {
@@ -109,6 +119,32 @@ fn ns_key(ns: &str) -> String {
 }
 
 impl SocketIoCompat {
+    // ── socket.io-lucee wrapper (Java-shim surface) ───────────────────────
+
+    /// Adopt the wrapper's handler CFC — the object the Java library would call
+    /// `onConnect` / `onDisconnecting` / `onDisconnect` / `onSocketEvent` on.
+    pub fn set_wrapper(&self, handler: Handler) {
+        let mut inner = self.inner.write();
+        inner.wrapper = Some(handler);
+        inner.wrapper_state.get_or_insert_with(|| "NOTINITIALIZED".to_string());
+    }
+
+    pub fn wrapper(&self) -> Option<Handler> {
+        self.inner.read().wrapper.clone()
+    }
+
+    pub fn set_wrapper_state(&self, state: &str) {
+        self.inner.write().wrapper_state = Some(state.to_string());
+    }
+
+    pub fn wrapper_state(&self) -> String {
+        self.inner
+            .read()
+            .wrapper_state
+            .clone()
+            .unwrap_or_else(|| "NOTINITIALIZED".to_string())
+    }
+
     // ── namespaces ────────────────────────────────────────────────────────
 
     /// Mark a namespace as imperative-handled (idempotent). Called the moment
