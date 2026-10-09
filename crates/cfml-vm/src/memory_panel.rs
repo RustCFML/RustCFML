@@ -77,7 +77,9 @@ impl CfmlVirtualMachine {
             pots.push(MemoryPot {
                 name: "Other".to_string(),
                 bytes: live.saturating_sub(attributed),
-                detail: "requests in flight, the engine itself, database driver buffers".to_string(),
+                detail: "the REMAINDER, not a measurement: in-flight requests, database \
+                 driver buffers, the collector's own logs, and whatever the pots above \
+                 under-count".to_string(),
             });
         }
         (pots, snap.at.elapsed().as_secs())
@@ -102,6 +104,64 @@ fn estimate_pots(ss: &ServerState) -> Vec<MemoryPot> {
         bytes: bc,
         detail: format!("{} files", files),
     });
+
+    // Engine-owned tables are walked BEFORE the data scopes. `seen` credits a
+    // shared backing store to whichever pot reaches it first, and a class's
+    // method tables and blueprint metadata are the ENGINE's, merely referenced
+    // by the instances an application scope holds. Walking the application
+    // scope first charged them to it and left "Component classes" reading a
+    // fraction of what the class cache actually holds.
+    // Component classes, from the cross-request class cache: each class's
+    // method tables, its shared metadata (and cached getMetadata() result),
+    // plus its static scope.
+    let mut class_bytes = 0u64;
+    let class_n;
+    {
+        let classes = ss.class_caches.read();
+        class_n = classes.len();
+        let map_bytes = |m: &cfml_common::dynamic::ValueMap, seen: &mut HashSet<usize>| -> u64 {
+            m.iter()
+                .map(|(k, v)| 40 + k.as_str().len() as u64 + v.approx_heap_bytes(seen) as u64)
+                .sum::<u64>()
+        };
+        for e in classes.values() {
+            if let Some((a, b)) = &e.method_tables {
+                for t in [a, b] {
+                    if seen.insert(Arc::as_ptr(t) as usize) {
+                        class_bytes += map_bytes(t, &mut seen);
+                    }
+                }
+            }
+            if let Some(t) = &e.own_table {
+                if seen.insert(Arc::as_ptr(t) as usize) {
+                    class_bytes += map_bytes(t, &mut seen);
+                }
+            }
+            #[cfg(feature = "component-instance")]
+            for (_, bp) in &e.blueprints {
+                if seen.insert(Arc::as_ptr(bp) as usize) {
+                    class_bytes += bp.metadata.approx_heap_bytes(&mut seen) as u64;
+                    if let Some(m) = bp.metadata_cache.read().as_ref() {
+                        class_bytes += m.approx_heap_bytes(&mut seen) as u64;
+                    }
+                }
+            }
+        }
+    }
+    let statics = ss.static_scopes.read();
+    for e in statics.values() {
+        class_bytes += e.scope.with_read(|m| {
+            m.iter()
+                .map(|(k, v)| 40 + k.as_str().len() as u64 + v.approx_heap_bytes(&mut seen) as u64)
+                .sum::<u64>()
+        });
+    }
+    out.push(MemoryPot {
+        name: "Component classes".to_string(),
+        bytes: class_bytes,
+        detail: format!("{} classes, {} static scopes", class_n, statics.len()),
+    });
+    drop(statics);
 
     let apps = ss.applications.probe_states();
     let mut app_bytes = 0u64;
@@ -166,57 +226,6 @@ fn estimate_pots(ss: &ServerState) -> Vec<MemoryPot> {
         detail: format!("{} entries", cache_n),
     });
 
-    // Component classes, from the cross-request class cache: each class's
-    // method tables, its shared metadata (and cached getMetadata() result),
-    // plus its static scope.
-    let mut class_bytes = 0u64;
-    let class_n;
-    {
-        let classes = ss.class_caches.read();
-        class_n = classes.len();
-        let map_bytes = |m: &cfml_common::dynamic::ValueMap, seen: &mut HashSet<usize>| -> u64 {
-            m.iter()
-                .map(|(k, v)| 40 + k.as_str().len() as u64 + v.approx_heap_bytes(seen) as u64)
-                .sum::<u64>()
-        };
-        for e in classes.values() {
-            if let Some((a, b)) = &e.method_tables {
-                for t in [a, b] {
-                    if seen.insert(Arc::as_ptr(t) as usize) {
-                        class_bytes += map_bytes(t, &mut seen);
-                    }
-                }
-            }
-            if let Some(t) = &e.own_table {
-                if seen.insert(Arc::as_ptr(t) as usize) {
-                    class_bytes += map_bytes(t, &mut seen);
-                }
-            }
-            #[cfg(feature = "component-instance")]
-            for (_, bp) in &e.blueprints {
-                if seen.insert(Arc::as_ptr(bp) as usize) {
-                    class_bytes += bp.metadata.approx_heap_bytes(&mut seen) as u64;
-                    if let Some(m) = bp.metadata_cache.read().as_ref() {
-                        class_bytes += m.approx_heap_bytes(&mut seen) as u64;
-                    }
-                }
-            }
-        }
-    }
-    let statics = ss.static_scopes.read();
-    for e in statics.values() {
-        class_bytes += e.scope.with_read(|m| {
-            m.iter()
-                .map(|(k, v)| 40 + k.as_str().len() as u64 + v.approx_heap_bytes(&mut seen) as u64)
-                .sum::<u64>()
-        });
-    }
-    out.push(MemoryPot {
-        name: "Component classes".to_string(),
-        bytes: class_bytes,
-        detail: format!("{} classes, {} static scopes", class_n, statics.len()),
-    });
-    drop(statics);
 
     // The engine's own lookup caches (paths it has resolved). Small per entry;
     // their sizes are the key and value strings plus table overhead.
@@ -250,11 +259,28 @@ fn estimate_pots(ss: &ServerState) -> Vec<MemoryPot> {
     out.push(MemoryPot {
         name: "Engine lookup caches".to_string(),
         bytes: lookups,
-        detail: format!(
-            "{} entries; {} names interned",
-            lookup_n,
-            cfml_common::name::Name::interned_count()
-        ),
+        detail: format!("{} entries", lookup_n),
     });
+
+    // Interned identifier names. Counted here rather than folded into the
+    // lookup caches: the interner is never pruned, so it grows with the
+    // distinct identifiers the application's code uses and is worth seeing on
+    // its own.
+    out.push(MemoryPot {
+        name: "Interned names".to_string(),
+        bytes: cfml_common::name::Name::interned_bytes(),
+        detail: format!("{} names", cfml_common::name::Name::interned_count()),
+    });
+
+    // Compiled regular expressions. The pattern strings are exact; the
+    // compiled automaton behind each entry is not sizeable, so this is a
+    // floor — see `cfml_stdlib::builtins::regex_cache_census`.
+    let (re_n, re_bytes) = cfml_stdlib::builtins::regex_cache_census();
+    out.push(MemoryPot {
+        name: "Regex cache".to_string(),
+        bytes: re_bytes,
+        detail: format!("{} patterns; compiled automata not included", re_n),
+    });
+
     out
 }

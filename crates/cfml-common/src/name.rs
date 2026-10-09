@@ -103,6 +103,17 @@ impl Name {
     /// (`RUSTCFML_CACHE_CENSUS`): the interner is process-lifetime and never
     /// pruned, so a count that climbs across identical workloads means something
     /// is interning DYNAMIC strings, which this table can never give back.
+    /// Approximate bytes held by the interner: each distinct name's string
+    /// plus table overhead. Never pruned, so it grows with the distinct
+    /// identifiers an application uses.
+    pub fn interned_bytes() -> u64 {
+        INTERNER
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|m| m.keys().map(|k| 72 + k.len() as u64).sum::<u64>()))
+            .unwrap_or(0)
+    }
+
     pub fn interned_count() -> usize {
         INTERNER
             .read()

@@ -75,6 +75,22 @@ struct RegexEntry {
     hits: std::sync::atomic::AtomicU32,
 }
 
+/// Entries and approximate bytes held by the compiled-pattern cache, for the
+/// debug footer's memory panel. The pattern strings and per-entry overhead are
+/// exact; the compiled automaton behind each `Arc<CfRegex>` is NOT included —
+/// `regex` exposes no size for it — so this is a floor, not a total. Before
+/// this existed the whole cache fell into the panel's unattributed remainder,
+/// where a warm Preside server was carrying tens of megabytes of it.
+pub fn regex_cache_census() -> (usize, u64) {
+    match REGEX_CACHE.read() {
+        Ok(c) => (
+            c.len(),
+            c.keys().map(|k| 96 + k.len() as u64).sum::<u64>(),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
 /// Evict the least-USED quarter of a full cache, then halve every survivor's
 /// count so an old favourite cannot squat forever. Ties are broken by a hash
 /// of the pattern, never by recency.
