@@ -295,6 +295,9 @@ impl CfmlNative for FutureNative {
                 let slot = self.handle.lock().unwrap();
                 if let Some(h) = &*slot {
                     h.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Wake the shared timer: it is parked until the
+                    // next deadline, which for an hourly schedule is an hour.
+                    crate::schedule_wheel::wake();
                     return Ok(CfmlValue::Bool(true));
                 }
                 Ok(CfmlValue::Bool(false))
@@ -618,6 +621,7 @@ impl ExecutorPoolNative {
         if drop_queued {
             for t in g.queue.drain(..) {
                 t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::schedule_wheel::wake();
                 let _ = t.tx.send(discarded());
             }
         }

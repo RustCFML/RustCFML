@@ -43,6 +43,7 @@ pub mod application_store;
 /// Host side of the dynamic native-extension ABI (`.rcx`).
 pub mod foreign;
 pub mod async_kernel;
+pub mod schedule_wheel;
 pub mod dump;
 /// Observability/debugging hook bus (Phase 0) + the classic CF debug footer
 /// (Phase 1). Behind the `observability` feature; absent on the wasm crates.
@@ -27943,174 +27944,25 @@ impl CfmlVirtualMachine {
                         return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
                     }
 
-                    // Relay thread: sleep `delayMs`, then spawn the real
-                    // cfthread worker via spawn_fn, then forward its
-                    // ThreadResult out our own channel. The Future holds
-                    // our channel's rx side so .get() blocks until the
-                    // relay forwards. When a period is set the relay keeps
-                    // re-spawning instead of returning after the first run;
-                    // the Future still resolves on the FIRST run's result
-                    // (a periodic schedule has no single "final" outcome).
-                    let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
-                    let cancel_for_relay = outer_cancel.clone();
-                    // Census of LIVE schedule relays. Each one holds a ThreadSeed
-                    // for the life of its schedule, and for a
-                    // java.util.concurrent submission that seed's body is the
-                    // `{__async_invoke_target, __async_invoke_method}` sentinel
-                    // holding the receiver component — which reaches the whole
-                    // framework object graph. So the live relay count IS the
-                    // number of application generations pinned in memory, and a
-                    // count that climbs on an idle server means schedules are
-                    // being started faster than they are being cancelled.
-                    let _relay_guard = async_kernel::ScheduleRelayGuard::new();
-                    let join = std::thread::Builder::new()
-                        .name("rustcfml-schedule-relay".to_string())
-                        .spawn(move || {
-                            let _relay_guard = _relay_guard;
-                            // Cooperative-cancellable sleep: poll every
-                            // 50ms so cancel() takes effect promptly.
-                            // Returns false if cancelled while waiting.
-                            let step = std::time::Duration::from_millis(50);
-                            let sleep_until = |deadline: std::time::Instant| -> bool {
-                                loop {
-                                    if cancel_for_relay
-                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        return false;
-                                    }
-                                    let now = std::time::Instant::now();
-                                    if now >= deadline {
-                                        return true;
-                                    }
-                                    std::thread::sleep((deadline - now).min(step));
-                                }
-                            };
-
-                            let epoch = std::time::Instant::now();
-                            let first_at = epoch
-                                + std::time::Duration::from_millis(delay_ms.max(0) as u64);
-                            if !sleep_until(first_at) {
-                                let _ = tx.send(ThreadResult {
-                                    status: "TERMINATED".to_string(),
-                                    ..Default::default()
-                                });
-                                return;
-                            }
-
-                            let mut first = true;
-                            let mut run_at = first_at;
-                            loop {
-                                if let Some(ref pm) = permits {
-                                    if !pm.acquire(&cancel_for_relay) {
-                                        // Cancelled while queued behind a
-                                        // sibling run: the schedule is over.
-                                        let _ = tx.send(ThreadResult {
-                                            status: "TERMINATED".to_string(),
-                                            ..Default::default()
-                                        });
-                                        return;
-                                    }
-                                }
-                                let inner = spawn_fn(seed.clone());
-                                // Wait for the inner cfthread to publish.
-                                let res = inner.rx.recv().ok();
-                                if let Some(j) = {
-                                    let mut h = inner;
-                                    h.join.take()
-                                } {
-                                    let _ = j.join();
-                                }
-                                if let Some(ref pm) = permits {
-                                    pm.release();
-                                }
-                                let terminated = res
-                                    .as_ref()
-                                    .map(|r| r.status == "TERMINATED")
-                                    .unwrap_or(true);
-                                // A PERIODIC schedule's Future must NOT resolve
-                                // on the first run. The JVM's ScheduledFuture
-                                // stays pending for the life of the schedule —
-                                // `isDone()` is how callers ask "is this
-                                // heartbeat still running?". Publishing the
-                                // first result made isDone() true after one
-                                // tick, so Preside's AbstractHeartBeat.start()
-                                // saw its own heartbeat as stopped and
-                                // scheduled ANOTHER one on every call: relays
-                                // piled up until the adhoc-task heartbeat was
-                                // firing hundreds of times a second.
-                                // One-shot schedules keep first-run semantics.
-                                if first && period.is_none() {
-                                    if let Some(r) = res {
-                                        let _ = tx.send(r);
-                                    }
-                                    first = false;
-                                }
-                                // One-shot, or a run that threw: a periodic
-                                // task that fails is NOT rescheduled (same
-                                // as ScheduledExecutorService — otherwise a
-                                // permanently-broken body spins forever).
-                                let Some((period_ms, fixed_rate)) = period else {
-                                    return;
-                                };
-                                if terminated
-                                    || cancel_for_relay
-                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                {
-                                    // The schedule is over (cancelled, or a run
-                                    // threw). Only now does the Future resolve.
-                                    let _ = tx.send(ThreadResult {
-                                        status: "TERMINATED".to_string(),
-                                        ..Default::default()
-                                    });
-                                    return;
-                                }
-                                let period_dur =
-                                    std::time::Duration::from_millis(period_ms as u64);
-                                let next = if fixed_rate {
-                                    // Fixed-rate: advance from the previous
-                                    // run's start. If the body overran its
-                                    // period, SKIP the missed ticks rather
-                                    // than firing a catch-up burst (the
-                                    // classic scheduleAtFixedRate surprise);
-                                    // the schedule stays on its phase.
-                                    let mut n = run_at + period_dur;
-                                    let now = std::time::Instant::now();
-                                    while n <= now {
-                                        n += period_dur;
-                                    }
-                                    n
-                                } else {
-                                    // Fixed-delay: measured from the end of
-                                    // the run that just finished.
-                                    std::time::Instant::now() + period_dur
-                                };
-                                if !sleep_until(next) {
-                                    // Cancelled mid-wait: resolve the
-                                    // Future so isDone() reports true, the way
-                                    // a cancelled JVM ScheduledFuture does.
-                                    let _ = tx.send(ThreadResult {
-                                        status: "TERMINATED".to_string(),
-                                        ..Default::default()
-                                    });
-                                    return;
-                                }
-                                run_at = next;
-                            }
-                        })
-                        .map_err(|e| {
-                            CfmlError::runtime(format!(
-                                "_schedule: failed to spawn relay thread: {}",
-                                e
-                            ))
-                        })?;
-
-                    let handle = ThreadHandle {
-                        name: String::new(),
-                        rx,
-                        cancel: outer_cancel,
-                        join: Some(join),
-                        result: None,
-                    };
+                    // Hand the schedule to the shared timer (see
+                    // `schedule_wheel`). This used to be a thread per schedule
+                    // that slept toward its deadline in 50ms steps so a
+                    // cancel() would be noticed promptly — one thread AND 20
+                    // wake-ups a second each, whether or not anything was due.
+                    // 18 live Preside schedules sat at ~4% of a core doing
+                    // nothing else. Neither reference engine polls: Lucee waits
+                    // on a monitor for the whole interval and notify()s on
+                    // cancel, BoxLang hands the task to a shared
+                    // ScheduledThreadPoolExecutor whose DelayedWorkQueue parks
+                    // one leader thread on the earliest deadline.
+                    let handle = schedule_wheel::schedule(
+                        seed,
+                        spawn_fn,
+                        delay_ms,
+                        period,
+                        permits,
+                        outer_cancel,
+                    );
                     let fut = async_kernel::FutureNative::from_handle(handle);
                     return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
                 }
